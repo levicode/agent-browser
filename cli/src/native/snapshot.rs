@@ -32,11 +32,16 @@ mod document_identity_regressions {
                     "Page.getFrameTree" => json!({"frameTree": {"frame": {
                         "id": "child", "loaderId": server_document.lock().unwrap().clone()
                     }}}),
+                    "Page.createIsolatedWorld" => json!({"executionContextId": 7}),
                     "Accessibility.getFullAXTree" => json!({"nodes": [{
                         "nodeId": "1", "role": {"type": "role", "value": "button"},
                         "name": {"type": "string", "value": "Buy"}, "backendDOMNodeId": 42
                     }]}),
-                    "Runtime.evaluate" => json!({"result": {"type": "object", "value": []}}),
+                    "Runtime.evaluate" => {
+                        json!({"result": {"type": "object", "objectId": "cursor-array"}})
+                    }
+                    "Runtime.callFunctionOn" => json!({"result": {"type": "object", "value": []}}),
+                    "Runtime.getProperties" => json!({"result": []}),
                     _ => json!({}),
                 };
                 ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -66,6 +71,69 @@ mod document_identity_regressions {
         }
         server.abort();
         observations
+    }
+
+    #[tokio::test]
+    async fn cursor_handles_preserve_unnamed_nodes_without_dom_writes_and_fail_closed() {
+        for fail in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(text).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let response = match method {
+                        "Runtime.evaluate" => {
+                            assert_eq!(request["params"]["contextId"], 7);
+                            let source = request["params"]["expression"].as_str().unwrap();
+                            assert!(!source.contains("setAttribute("));
+                            assert!(!source.contains("removeAttribute("));
+                            if fail {
+                                json!({"result":{"type":"undefined"},"exceptionDetails":{"text":"capture failed"}})
+                            } else {
+                                json!({"result":{"type":"object","objectId":"array"}})
+                            }
+                        }
+                        "Runtime.callFunctionOn" => {
+                            if request["params"]["objectId"] == "array" {
+                                json!({"result":{"type":"object","value":[{"text":"","tagName":"span","hasCursorPointer":true}]}})
+                            } else {
+                                json!({"result":{"type":"object","objectId":"node"}})
+                            }
+                        }
+                        "Runtime.getProperties" => {
+                            json!({"result":[{"name":"0","value":{"objectId":"entry"}}]})
+                        }
+                        "DOM.describeNode" => json!({"node":{"backendNodeId":42}}),
+                        "Runtime.releaseObjectGroup" => json!({}),
+                        _ => panic!("Unexpected command {method}"),
+                    };
+                    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":response}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    if method == "Runtime.releaseObjectGroup" {
+                        break;
+                    }
+                }
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let result = find_cursor_interactive_elements(&client, "frame-session", 7).await;
+            if fail {
+                assert!(result.is_err());
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[&42].text, "");
+            }
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -181,11 +249,14 @@ fn normalize_snapshot_name(name: &str) -> String {
 
 #[derive(Default)]
 pub struct SnapshotOptions {
+    /// Issue exact backend-node capabilities instead of semantic fallback refs.
+    pub exact_refs: bool,
     pub selector: Option<String>,
     pub interactive: bool,
     pub compact: bool,
     pub depth: Option<usize>,
     pub urls: bool,
+    pub allowed_frame_documents: Option<HashMap<String, String>>,
 }
 
 struct TreeNode {
@@ -415,6 +486,28 @@ pub async fn take_snapshot(
     let loader = frame_tree
         .as_ref()
         .and_then(|tree| frame_loader(&tree["frameTree"], frame_id));
+    if !snapshot_frame_allowed(options, frame_id, loader) {
+        return Ok("(empty page)".into());
+    }
+    let target_frame = frame_id
+        .or_else(|| {
+            frame_tree
+                .as_ref()
+                .and_then(|tree| tree["frameTree"]["frame"]["id"].as_str())
+        })
+        .ok_or("Snapshot frame is unavailable")?;
+    let world = client
+        .send_command(
+            "Page.createIsolatedWorld",
+            Some(
+                serde_json::json!({"frameId":target_frame,"worldName":"agent-browser-exact-refs"}),
+            ),
+            Some(effective_session_id),
+        )
+        .await?;
+    let context_id = world["executionContextId"]
+        .as_i64()
+        .ok_or("Snapshot document realm is unavailable")?;
     let document_is_known =
         ref_map.observe_document(session_id, frame_id, effective_session_id, loader);
     // Ensure domains are enabled on the iframe session (defensive fallback
@@ -434,6 +527,21 @@ pub async fn take_snapshot(
             Some(effective_session_id),
         )
         .await?;
+
+    // Navigation may race the AX response. A new loader has not been approved;
+    // discard this child capture before refs or static text are published.
+    if frame_id.is_some() && options.allowed_frame_documents.is_some() {
+        let after = client
+            .send_command_no_params("Page.getFrameTree", Some(effective_session_id))
+            .await
+            .ok();
+        let after_loader = after
+            .as_ref()
+            .and_then(|tree| frame_loader(&tree["frameTree"], frame_id));
+        if !snapshot_frame_allowed(options, frame_id, after_loader) {
+            return Ok("(empty page)".into());
+        }
+    }
 
     let (mut tree_nodes, root_indices) = build_tree(&ax_tree.nodes);
 
@@ -482,9 +590,11 @@ pub async fn take_snapshot(
 
     // Pre-collect cursor-interactive elements so we can mark them with refs during tree building
     let cursor_elements: HashMap<i64, CursorElementInfo> =
-        find_cursor_interactive_elements(client, session_id)
+        find_cursor_interactive_elements(client, effective_session_id, context_id)
             .await
-            .unwrap_or_default();
+            .map_err(|_| {
+                "Cursor-interactive augmentation failed; snapshot is incomplete".to_string()
+            })?;
 
     promote_hidden_inputs(&mut tree_nodes, &cursor_elements);
 
@@ -506,7 +616,7 @@ pub async fn take_snapshot(
             should_ref = true;
         }
 
-        if should_ref {
+        if should_ref && (!options.exact_refs || node.backend_node_id.is_some()) {
             let nth = tracker.track(role, &node.name, idx);
             nodes_with_refs.push((idx, nth));
         }
@@ -527,12 +637,20 @@ pub async fn take_snapshot(
             .backend_node_id
             .filter(|_| document_is_known)
         {
-            if let Some(existing) = ref_map.durable_ref(session_id, frame_id, backend_node_id) {
+            if let Some(existing) =
+                ref_map.durable_ref(session_id, frame_id, backend_node_id, options.exact_refs)
+            {
                 existing.to_string()
             } else {
                 let allocated = format!("e{}", next_ref);
                 next_ref += 1;
-                ref_map.remember_durable_ref(session_id, frame_id, backend_node_id, &allocated);
+                ref_map.remember_durable_ref(
+                    session_id,
+                    frame_id,
+                    backend_node_id,
+                    &allocated,
+                    options.exact_refs,
+                );
                 allocated
             }
         } else {
@@ -541,15 +659,27 @@ pub async fn take_snapshot(
             allocated
         };
 
-        ref_map.add_with_frame(
-            ref_id.clone(),
-            tree_nodes[*idx].backend_node_id,
-            &tree_nodes[*idx].role,
-            &tree_nodes[*idx].name,
-            actual_nth,
-            frame_id,
-        );
-
+        if options.exact_refs {
+            ref_map.add_exact_with_frame(
+                ref_id.clone(),
+                node.backend_node_id
+                    .expect("exact refs require a backend node"),
+                &node.role,
+                &node.name,
+                actual_nth,
+                frame_id,
+            );
+            ref_map.bind_world(&ref_id, effective_session_id, context_id);
+        } else {
+            ref_map.add_with_frame(
+                ref_id.clone(),
+                node.backend_node_id,
+                &node.role,
+                &node.name,
+                actual_nth,
+                frame_id,
+            );
+        }
         tree_nodes[*idx].has_ref = true;
         tree_nodes[*idx].ref_id = Some(ref_id);
     }
@@ -639,40 +769,33 @@ pub async fn take_snapshot(
         render_tree(&tree_nodes, root_idx, 0, &mut output, options);
     }
 
-    // Recurse into child iframes: for each Iframe node with a backend_node_id,
-    // resolve the child frame ID and take a snapshot of its content.
-    // We only recurse from the main frame (frame_id == None) to avoid
-    // unbounded depth; nested iframes within iframes are not expanded.
-    if frame_id.is_none() {
-        let mut iframe_snapshots: Vec<(String, String)> = Vec::new(); // (ref_id, child_snapshot)
+    // Expand each document using its parent renderer. Same-process descendants
+    // of an OOPIF keep that renderer rather than accidentally using the top one.
+    {
+        let mut iframe_snapshots: Vec<(String, String)> = Vec::new();
         for node in tree_nodes.iter() {
             if node.role != "Iframe" || !node.has_ref {
                 continue;
             }
-            let Some(bid) = node.backend_node_id else {
-                continue;
-            };
+            let bid = node
+                .backend_node_id
+                .ok_or("Snapshot iframe has no DOM identity")?;
             let ref_id = node.ref_id.as_deref().unwrap_or("");
-            if let Ok(child_fid) = resolve_iframe_frame_id(client, session_id, bid).await {
-                // Snapshot the child frame; errors are silently ignored
-                // (e.g. cross-origin iframes)
-                if let Ok(child_text) = Box::pin(take_snapshot(
-                    client,
-                    session_id,
-                    options,
-                    ref_map,
-                    Some(&child_fid),
-                    iframe_sessions,
-                ))
-                .await
-                {
-                    if !child_text.is_empty()
-                        && child_text != "(empty page)"
-                        && child_text != "(no interactive elements)"
-                    {
-                        iframe_snapshots.push((ref_id.to_string(), child_text));
-                    }
-                }
+            let child_fid = resolve_iframe_frame_id(client, effective_session_id, bid).await?;
+            let child_text = Box::pin(take_snapshot(
+                client,
+                effective_session_id,
+                options,
+                ref_map,
+                Some(&child_fid),
+                iframe_sessions,
+            ))
+            .await?;
+            if !child_text.is_empty()
+                && child_text != "(empty page)"
+                && child_text != "(no interactive elements)"
+            {
+                iframe_snapshots.push((ref_id.to_string(), child_text));
             }
         }
 
@@ -725,6 +848,21 @@ pub async fn take_snapshot(
 }
 
 /// Resolve the child frame ID for an iframe element given its backendNodeId.
+fn snapshot_frame_allowed(
+    options: &SnapshotOptions,
+    frame_id: Option<&str>,
+    loader: Option<&str>,
+) -> bool {
+    match (&options.allowed_frame_documents, frame_id) {
+        (Some(allowed), Some(frame)) => loader.is_some_and(|loader| {
+            allowed
+                .get(frame)
+                .is_some_and(|expected| expected == loader)
+        }),
+        _ => true,
+    }
+}
+
 fn frame_loader<'a>(tree: &'a Value, frame_id: Option<&str>) -> Option<&'a str> {
     let frame = &tree["frame"];
     if frame_id.is_none() || frame["id"].as_str() == frame_id {
@@ -772,6 +910,7 @@ async fn resolve_iframe_frame_id(
 async fn find_cursor_interactive_elements(
     client: &CdpClient,
     session_id: &str,
+    context_id: i64,
 ) -> Result<HashMap<i64, CursorElementInfo>, String> {
     // Single JS evaluation that matches the v0.19.0 Node.js findCursorInteractiveElements():
     // - Uses querySelectorAll('*') to walk all elements
@@ -781,7 +920,7 @@ async fn find_cursor_interactive_elements(
     // - Skips elements with interactive ARIA roles
     // - Deduplicates inherited cursor:pointer from parent
     // - Skips empty text and zero-size elements
-    // - Tags each matched element with data-__ab-ci for batch backendNodeId resolution
+    // - Keeps each exact element in a remote object handle for backend identity
     let js = r#"
 (function() {
     var results = [];
@@ -846,8 +985,8 @@ async fn find_cursor_interactive_elements(
             }
         }
 
-        el.setAttribute('data-__ab-ci', String(results.length));
         results.push({
+            element: el,
             text: text,
             tagName: tagName,
             hasOnClick: hasOnClick,
@@ -862,119 +1001,43 @@ async fn find_cursor_interactive_elements(
 })()
 "#;
 
-    let result: EvaluateResult = client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &EvaluateParams {
-                expression: js.to_string(),
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(session_id),
-        )
-        .await?;
-
-    let elements: Vec<Value> = result
-        .result
-        .value
-        .and_then(|v| serde_json::from_value::<Vec<Value>>(v).ok())
-        .unwrap_or_default();
-
-    if elements.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    // Batch-resolve backendNodeIds: use DOM.getDocument to get the root nodeId,
-    // then DOM.querySelectorAll to get all tagged elements in a single call.
-    let doc: Value = client
+    let captured:Result<(Vec<Value>,HashMap<usize,i64>),String>=async {
+        let result:EvaluateResult=client.send_command_typed("Runtime.evaluate",&serde_json::json!({
+            "expression":js,"returnByValue":false,"awaitPromise":false,"contextId":context_id,"objectGroup":"agent-browser-cursor-scan"
+        }),Some(session_id)).await?;
+        if result.exception_details.is_some(){return Err("Cursor augmentation evaluation failed".into());}
+        let array=result.result.object_id.ok_or("Cursor augmentation handle is unavailable")?;
+        let metadata:EvaluateResult=client.send_command_typed("Runtime.callFunctionOn",&serde_json::json!({
+            "objectId":array,"functionDeclaration":"function(){return this.map(({element,...info})=>info)}","returnByValue":true
+        }),Some(session_id)).await?;
+        if metadata.exception_details.is_some(){return Err("Cursor augmentation metadata failed".into());}
+        let elements:Vec<Value>=metadata.result.value.and_then(|value|serde_json::from_value(value).ok()).ok_or("Cursor augmentation metadata is unavailable")?;
+        let properties=client.send_command("Runtime.getProperties",Some(serde_json::json!({"objectId":array,"ownProperties":true})),Some(session_id)).await?;
+        let entries:Vec<(usize,String)>=properties["result"].as_array().ok_or("Cursor augmentation properties are unavailable")?.iter().filter_map(|entry|{
+            Some((entry["name"].as_str()?.parse::<usize>().ok()?,entry["value"]["objectId"].as_str()?.to_string()))
+        }).collect();
+        if entries.len()!=elements.len(){return Err("Cursor augmentation lost an exact element".into());}
+        let descriptions=futures_util::future::join_all(entries.into_iter().map(|(index,object)|async move{
+            let node:EvaluateResult=client.send_command_typed("Runtime.callFunctionOn",&serde_json::json!({
+                "objectId":object,"functionDeclaration":"function(){return this.element}","returnByValue":false,"objectGroup":"agent-browser-cursor-scan"
+            }),Some(session_id)).await?;
+            if node.exception_details.is_some(){return Err("Cursor augmentation element is unavailable".to_string());}
+            let object=node.result.object_id.ok_or("Cursor augmentation element is unavailable")?;
+            let description=client.send_command("DOM.describeNode",Some(serde_json::json!({"objectId":object})),Some(session_id)).await?;
+            let backend=description["node"]["backendNodeId"].as_i64().ok_or("Cursor augmentation identity is unavailable")?;
+            Ok::<_,String>((index,backend))
+        })).await;
+        let identities:HashMap<usize,i64>=descriptions.into_iter().collect::<Result<_,_>>()?;
+        Ok((elements,identities))
+    }.await;
+    let _ = client
         .send_command(
-            "DOM.getDocument",
-            Some(serde_json::json!({ "depth": 0 })),
+            "Runtime.releaseObjectGroup",
+            Some(serde_json::json!({"objectGroup":"agent-browser-cursor-scan"})),
             Some(session_id),
         )
-        .await?;
-
-    let root_node_id = doc
-        .get("root")
-        .and_then(|r| r.get("nodeId"))
-        .and_then(|v| v.as_i64())
-        .ok_or("DOM.getDocument did not return root nodeId")?;
-
-    let query_result: Value = client
-        .send_command(
-            "DOM.querySelectorAll",
-            Some(serde_json::json!({
-                "nodeId": root_node_id,
-                "selector": "[data-__ab-ci]"
-            })),
-            Some(session_id),
-        )
-        .await?;
-
-    let node_ids: Vec<i64> = query_result
-        .get("nodeIds")
-        .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|v| v.as_i64()).collect())
-        .unwrap_or_default();
-
-    // Resolve backendNodeIds for each DOM node using concurrent CDP calls.
-    let describe_futures: Vec<_> = node_ids
-        .iter()
-        .map(|&node_id| {
-            client.send_command(
-                "DOM.describeNode",
-                Some(serde_json::json!({ "nodeId": node_id })),
-                Some(session_id),
-            )
-        })
-        .collect();
-
-    let describe_results = futures_util::future::join_all(describe_futures).await;
-
-    // Build a map from data-__ab-ci index to backendNodeId.
-    let mut idx_to_backend: HashMap<usize, i64> = HashMap::new();
-    for desc in describe_results.into_iter().flatten() {
-        let backend_id = desc
-            .get("node")
-            .and_then(|n| n.get("backendNodeId"))
-            .and_then(|v| v.as_i64());
-        let ci_attr = desc
-            .get("node")
-            .and_then(|n| n.get("attributes"))
-            .and_then(|a| a.as_array())
-            .and_then(|attrs| {
-                // attributes is a flat array: [name, value, name, value, ...]
-                attrs
-                    .iter()
-                    .enumerate()
-                    .find(|(_, v)| v.as_str() == Some("data-__ab-ci"))
-                    .and_then(|(i, _)| attrs.get(i + 1))
-                    .and_then(|v| v.as_str())
-                    .and_then(|s| s.parse::<usize>().ok())
-            });
-        if let (Some(bid), Some(idx)) = (backend_id, ci_attr) {
-            idx_to_backend.insert(idx, bid);
-        }
-    }
-
-    // Clean up the data attributes we injected for backendNodeId resolution.
-    let cleanup_js =
-        r#"(function(){ var els = document.querySelectorAll('[data-__ab-ci]'); for (var i = 0; i < els.length; i++) els[i].removeAttribute('data-__ab-ci'); return els.length; })()"#.to_string();
-    if let Err(e) = client
-        .send_command_typed::<EvaluateParams, EvaluateResult>(
-            "Runtime.evaluate",
-            &EvaluateParams {
-                expression: cleanup_js,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(session_id),
-        )
-        .await
-    {
-        eprintln!("[agent-browser] Warning: failed to clean up data-__ab-ci attributes: {e}");
-    }
-
+        .await;
+    let (elements, idx_to_backend) = captured?;
     // Build the map
     let mut map: HashMap<i64, CursorElementInfo> = HashMap::new();
     for (i, elem) in elements.iter().enumerate() {
@@ -1507,6 +1570,34 @@ fn collect_backend_node_ids(node: &Value, ids: &mut std::collections::HashSet<i6
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn child_frame_policy_requires_the_exact_approved_loader() {
+        let mut options = SnapshotOptions::default();
+        assert!(snapshot_frame_allowed(
+            &options,
+            Some("child"),
+            Some("first")
+        ));
+        options.allowed_frame_documents = Some(HashMap::from([("child".into(), "first".into())]));
+        assert!(snapshot_frame_allowed(
+            &options,
+            Some("child"),
+            Some("first")
+        ));
+        assert!(!snapshot_frame_allowed(
+            &options,
+            Some("child"),
+            Some("replacement")
+        ));
+        assert!(!snapshot_frame_allowed(
+            &options,
+            Some("other"),
+            Some("first")
+        ));
+        assert!(!snapshot_frame_allowed(&options, Some("child"), None));
+        assert!(snapshot_frame_allowed(&options, None, None));
+    }
+
     use super::*;
 
     #[test]

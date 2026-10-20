@@ -765,3 +765,13 @@ agent-browser screenshot output.png
 The `--allow-file-access` flag enables JavaScript to access other local files. Chromium only.
 
 See [Files & Clipboard](/files) for local files, uploads, downloads, screenshots, PDFs, and clipboard workflows.
+
+## Maintained fork extensions
+
+This fork provides a strict CLI-only adapter contract for `levicode/e2e`. It includes exact node registration (`ref`), target/context-bound attachment, explicit selection modes and dispatched-input classification. These extensions are not added to the public MCP tool set because e2e owns the dedicated endpoint and lifecycle; using a second MCP owner would violate that contract. Read the [maintained contract](https://github.com/levicode/agent-browser/blob/main/maintainer/CONTRACT.md) before substituting this binary for upstream.
+
+### Maintained native capability contract
+
+`capabilities --json` describes the compiled `e2e-exact-1` contract without starting a browser. `--expect-contract e2e-exact-1` rejects an incompatible live daemon before browser effects; it is a version assertion, not a runtime mode switch. `snapshot --exact-refs` uses immutable backend-node identity without semantic rebinding, while ordinary snapshots keep their upstream reference semantics through the same reference implementation. Exact identity does not make coordinate pointer dispatch atomic.
+
+The e2e consumer owns a dedicated browser and target/Fetch lifecycle. Scoped native attachment is passive; trace collection is read-only. See `maintainer/CONTRACT.md` in the maintained fork for boundaries and verification requirements.

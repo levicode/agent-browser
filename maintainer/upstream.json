@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/vercel-labs/agent-browser",
+  "baseCommit": "5ee8691339a5a002e4d7454eec95250253bc7419",
+  "previousValidatedBase": "1165952d74ceed98fdc2dd97190ad41f44dd0e24",
+  "forkRepository": "https://github.com/levicode/agent-browser",
+  "nativeVersion": "0.39.1-e2e.5",
+  "adapterContract": "e2e-exact-1",
+  "consumerEngineEpoch": "agent-browser-exact-6",
+  "support": {
+    "engine": "chromium",
+    "ownership": "dedicated-endpoint",
+    "platforms": [
+      "linux-x64",
+      "darwin-arm64",
+      "darwin-x64"
+    ]
+  },
+  "publication": "CI artifacts only; no automatic npm or GitHub release",
+  "rustToolchain": "1.99.1",
+  "buildProfile": "ci"
+}

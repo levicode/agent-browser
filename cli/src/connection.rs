@@ -469,6 +469,7 @@ pub struct DaemonOptions<'a> {
     pub cdp: Option<&'a str>,
     pub no_auto_dialog: bool,
     pub plugins: Option<&'a str>,
+    pub expected_contract: Option<&'a str>,
 }
 
 fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
@@ -802,6 +803,21 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     // this check is handled at request time: callers respawn via
     // ensure_daemon when the request fails with daemon_unreachable().
     if daemon_ready(session) {
+        // Contract clients must inspect the running daemon before version/config
+        // restart logic. Replacing it silently can discard exact ref identity.
+        if let Some(expected) = opts.expected_contract {
+            let response = send_command(
+                json!({"id":"contract-handshake","action":"capabilities","expectedContract":expected}),
+                session,
+            ).map_err(|error| format!("{}cannot verify running daemon: {}", crate::native::contract::CONTRACT_MISMATCH_PREFIX, error))?;
+            crate::native::contract::validate_capabilities(response.data.as_ref(), expected)?;
+            if !response.success || !daemon_version_matches(session) {
+                return Err(format!(
+                    "{}running daemon version differs; close it explicitly or use a new session",
+                    crate::native::contract::CONTRACT_MISMATCH_PREFIX
+                ));
+            }
+        }
         // Check version: if the running daemon is from a different CLI
         // version (e.g. after an upgrade), kill it and start a fresh one.
         if !daemon_version_matches(session) {
@@ -816,6 +832,9 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
             match ready_existing_daemon_result(session, opts, Duration::from_secs(1)) {
                 Some(result) => return Ok(result),
                 None => {
+                    if opts.expected_contract.is_some() {
+                        return Err(format!("{}daemon configuration changed; close it explicitly or use a new session", crate::native::contract::CONTRACT_MISMATCH_PREFIX));
+                    }
                     stop_existing_daemon_for_restart(session);
                     restarted = true;
                 }
@@ -1024,6 +1043,7 @@ enum SendError {
 /// Actions that only read state, so re-sending one after a lost response
 /// cannot change the page. Anything not listed is treated as mutating.
 const READ_ONLY_ACTIONS: &[&str] = &[
+    "capabilities",
     "url",
     "title",
     "snapshot",
@@ -1567,7 +1587,61 @@ mod tests {
             cdp: None,
             no_auto_dialog,
             plugins: None,
+            expected_contract: None,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mismatched_live_contract_is_not_restarted_or_sent_browser_commands() {
+        use std::os::unix::net::UnixListener;
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let session = "mismatched-contract";
+        let socket = get_socket_dir().join(format!("{session}.sock"));
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::write(
+            get_socket_dir().join(format!("{session}.version")),
+            "sentinel-version",
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            // ensure_daemon's readiness probe opens then drops one connection.
+            let (probe, _) = listener.accept().unwrap();
+            drop(probe);
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(stream.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            let command: Value = serde_json::from_str(&line).unwrap();
+            stream
+                .write_all(b"{\"success\":true,\"data\":{\"contractVersion\":\"e2e-exact-0\"}}\n")
+                .unwrap();
+            command
+        });
+        let mut options = test_daemon_options(None, false, None);
+        options.expected_contract = Some(crate::native::contract::CONTRACT_VERSION);
+        let error = ensure_daemon(session, &options)
+            .err()
+            .expect("contract mismatch must fail");
+        assert!(error.starts_with(crate::native::contract::CONTRACT_MISMATCH_PREFIX));
+        let command = server.join().unwrap();
+        assert_eq!(command["action"], "capabilities");
+        assert_eq!(command["expectedContract"], "e2e-exact-1");
+        assert_eq!(
+            fs::read_to_string(get_socket_dir().join(format!("{session}.version"))).unwrap(),
+            "sentinel-version"
+        );
+        assert!(
+            socket.exists(),
+            "mismatched daemon socket must not be cleaned/replaced"
+        );
     }
 
     #[test]

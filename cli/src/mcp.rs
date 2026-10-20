@@ -5,6 +5,13 @@
 //! so MCP behavior stays aligned with the normal CLI command surface. Daemon
 //! lifecycle settings, including the default idle timeout, use the same CLI
 //! parser and daemon as direct commands.
+//! Maintained fork boundary: the e2e exact-ref registration and scoped CDP
+//! attachment protocol are intentionally CLI-only. The e2e adapter owns those
+//! endpoint/lifecycle guarantees; exporting another MCP owner would violate them.
+//! Existing MCP tools still delegate to this binary and therefore inherit its
+//! documented single implementation and operation-specific reference semantics. See
+//! maintainer/CONTRACT.md. No new MCP parameters are silently accepted.
+//!
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 

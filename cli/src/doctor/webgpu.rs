@@ -231,6 +231,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
         cdp: None,
         no_auto_dialog: false,
         plugins: None,
+        expected_contract: None,
     };
 
     let started = Instant::now();

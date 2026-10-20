@@ -13149,3 +13149,121 @@ async fn e2e_mouse_interpolation_starts_at_last_element_interaction() {
     }
     assert_success(&execute_command(&json!({"id": "99", "action": "close"}), &mut state).await);
 }
+
+// Shared implementation regression coverage. The official binary comparison
+// runs separately; these tests exercise operation capabilities, not profiles.
+#[tokio::test]
+#[ignore]
+async fn e2e_shared_fill_preserves_browser_editing_and_clears_rich_content() {
+    let mut state = DaemonState::new();
+    assert_success(&execute_command(&json!({"action":"launch","headless":true}), &mut state).await);
+    assert_success(&execute_command(&json!({"action":"setcontent","html":"<input id='text' value='old'><textarea id='area'>old</textarea><div id='editor' contenteditable><b>old</b> rich text</div><input id='readonly' readonly value='keep'><input id='date' type='date' value='2026-10-20'>"}), &mut state).await);
+    assert_success(&execute_command(&json!({"action":"evaluate","script":"window.fillEvents=[];document.addEventListener('input',event=>fillEvents.push({id:event.target.id,trusted:event.isTrusted,type:event.inputType}));"}), &mut state).await);
+    for selector in ["#text", "#area", "#editor"] {
+        assert_success(
+            &execute_command(
+                &json!({"action":"fill","selector":selector,"value":"replacement"}),
+                &mut state,
+            )
+            .await,
+        );
+        let script = format!(
+            "document.querySelector({}).{}",
+            json!(selector),
+            if selector == "#editor" {
+                "textContent"
+            } else {
+                "value"
+            }
+        );
+        assert_evaluate(&mut state, "filled", &script, json!("replacement")).await;
+        assert_success(
+            &execute_command(&json!({"action":"clear","selector":selector}), &mut state).await,
+        );
+        assert_evaluate(&mut state, "cleared", &script, json!("")).await;
+    }
+    assert_evaluate(&mut state, "trusted", "['text','area','editor'].every(id=>fillEvents.some(event=>event.id===id&&event.trusted&&event.type==='insertText'))", json!(true)).await;
+    assert_evaluate(&mut state, "rich-clear", "fillEvents.some(event=>event.id==='editor'&&event.trusted&&event.type==='deleteContentBackward')", json!(true)).await;
+    let blocked = execute_command(
+        &json!({"action":"fill","selector":"#readonly","value":"bad"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(blocked["success"], false);
+    assert_evaluate(
+        &mut state,
+        "unchanged",
+        "document.querySelector('#readonly').value",
+        json!("keep"),
+    )
+    .await;
+    let invalid_date = execute_command(
+        &json!({"action":"fill","selector":"#date","value":"invalid"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(invalid_date["success"], false);
+    assert_evaluate(
+        &mut state,
+        "date-unchanged",
+        "document.querySelector('#date').value",
+        json!("2026-10-20"),
+    )
+    .await;
+    assert_success(
+        &execute_command(
+            &json!({"action":"fill","selector":"#date","value":"2026-11-01"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_evaluate(
+        &mut state,
+        "date-filled",
+        "document.querySelector('#date').value",
+        json!("2026-11-01"),
+    )
+    .await;
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_exact_snapshot_ref_never_rebinds_ordinary_ref_keeps_fallback() {
+    let mut state = DaemonState::new();
+    assert_success(&execute_command(&json!({"action":"launch","headless":true}), &mut state).await);
+    for exact in [false, true] {
+        assert_success(
+            &execute_command(
+                &json!({"action":"setcontent","html":"<button id='save'>Save</button>"}),
+                &mut state,
+            )
+            .await,
+        );
+        let snapshot =
+            execute_command(&json!({"action":"snapshot","exactRefs":exact}), &mut state).await;
+        assert_success(&snapshot);
+        assert_eq!(get_data(&snapshot)["exactRefs"], json!(exact));
+        let (reference, entry) = state
+            .ref_map
+            .entries_sorted()
+            .into_iter()
+            .find(|(_, entry)| entry.role == "button" && entry.name == "Save")
+            .unwrap();
+        assert_eq!(entry.is_exact(), exact);
+        assert_success(&execute_command(&json!({"action":"evaluate","script":"window.saved=0;document.querySelector('#save').outerHTML='<button id=save onclick=window.saved++>Save</button>';"}), &mut state).await);
+        let result = execute_command(
+            &json!({"action":"click","selector":format!("@{reference}")}),
+            &mut state,
+        )
+        .await;
+        if exact {
+            assert_error_code(&result, "node_stale");
+            assert_evaluate(&mut state, "not-rebound", "window.saved", json!(0)).await;
+        } else {
+            assert_success(&result);
+            assert_evaluate(&mut state, "fallback", "window.saved", json!(1)).await;
+        }
+    }
+    assert_success(&execute_command(&json!({"action":"close"}), &mut state).await);
+}

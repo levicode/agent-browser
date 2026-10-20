@@ -290,6 +290,9 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--headers",
         "--executable-path",
         "--cdp",
+        "--cdp-target",
+        "--expect-contract",
+        "--cdp-context",
         "--extension",
         "--init-script",
         "--enable",
@@ -378,6 +381,14 @@ pub struct Flags {
     pub headers: Option<String>,
     pub executable_path: Option<String>,
     pub cdp: Option<String>,
+    /// CLI-only immutable CDP page target; must be paired with cdp_context.
+    pub cdp_target: Option<String>,
+    /// Optional exact compiled-contract expectation; never selects a behavior mode.
+    pub expect_contract: Option<String>,
+    /// CLI-only browser context. Exactly "default" means no browserContextId.
+    pub cdp_context: Option<String>,
+    /// Caller assertion that the endpoint is dedicated and another owner handles Fetch/lifecycle.
+    pub cdp_dedicated: bool,
     pub extensions: Vec<String>,
     pub init_scripts: Vec<String>,
     pub enable: Vec<String>,
@@ -456,7 +467,49 @@ pub struct Flags {
     pub cli_input_mode: bool,
 }
 
+/// Scope IDs are opaque: do not trim, case-fold, or infer a default context.
+fn is_valid_cdp_scope_id(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with("--")
+        && !value.chars().any(|c| c.is_whitespace() || c.is_control())
+}
+
+/// Validate the CLI-only scope before main performs any command side effects.
+/// An empty target also records a malformed occurrence that a later duplicate
+/// must not erase. No new process exit is introduced into the flag parser.
+pub fn cdp_scope_error(flags: &Flags) -> Option<&'static str> {
+    if flags
+        .cdp_target
+        .as_deref()
+        .is_some_and(|v| !is_valid_cdp_scope_id(v))
+        || flags
+            .cdp_context
+            .as_deref()
+            .is_some_and(|v| !is_valid_cdp_scope_id(v))
+    {
+        return Some("--cdp-target and --cdp-context require separate, non-empty values without whitespace, control characters, or a leading '--'; do not use '=' syntax");
+    }
+    if flags.cdp_target.is_some() != flags.cdp_context.is_some() {
+        return Some("--cdp-target and --cdp-context must be supplied together");
+    }
+    if flags.cdp_target.is_some() && !flags.cdp.as_deref().is_some_and(|value| !value.is_empty()) {
+        return Some("--cdp-target and --cdp-context require --cdp");
+    }
+    if flags.cdp_target.is_some() && !flags.cdp_dedicated {
+        return Some("Scoped CDP requires --cdp-dedicated to declare a dedicated endpoint with companion-owned Fetch and target lifecycle");
+    }
+    if flags.cdp_dedicated && flags.cdp_target.is_none() {
+        return Some("--cdp-dedicated requires --cdp-target and --cdp-context");
+    }
+    None
+}
+
 pub fn parse_flags(args: &[String]) -> Flags {
+    // Values after -- never participate in global flag/config discovery.
+    let args = &args[..args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len())];
     let config = load_config(args).unwrap_or_else(|e| {
         eprintln!("{} {}", color::warning_indicator(), e);
         std::process::exit(1);
@@ -564,6 +617,10 @@ pub fn parse_flags(args: &[String]) -> Flags {
             .ok()
             .or(config.executable_path),
         cdp: env::var("AGENT_BROWSER_CDP").ok().or(config.cdp),
+        cdp_target: None,
+        expect_contract: None,
+        cdp_context: None,
+        cdp_dedicated: false,
         extensions,
         init_scripts,
         enable,
@@ -692,6 +749,9 @@ pub fn parse_flags(args: &[String]) -> Flags {
         cli_input_mode: false,
     };
 
+    // Fail closed if any occurrence is malformed, even if followed by a
+    // valid duplicate. The sentinel cannot be confused with a valid target ID.
+    let mut invalid_cdp_scope = false;
     let mut i = 0;
     let mut seen_command = false;
     while i < args.len() {
@@ -854,6 +914,37 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     flags.cli_enable = true;
                     i += 1;
                 }
+            }
+            "--cdp-dedicated" => {
+                let (value, consumed) = parse_bool_arg(args, i);
+                flags.cdp_dedicated = value;
+                if consumed {
+                    i += 1;
+                }
+            }
+            "--expect-contract" => {
+                flags.expect_contract = Some(args.get(i + 1).cloned().unwrap_or_default());
+                if args.get(i + 1).is_some() {
+                    i += 1;
+                }
+            }
+            value if value.starts_with("--expect-contract=") => {
+                flags.expect_contract = Some(String::new());
+            }
+            "--cdp-target" | "--cdp-context" => {
+                let value = args.get(i + 1).cloned().unwrap_or_default();
+                invalid_cdp_scope |= !is_valid_cdp_scope_id(&value);
+                if arg == "--cdp-target" {
+                    flags.cdp_target = Some(value);
+                } else {
+                    flags.cdp_context = Some(value);
+                }
+                if args.get(i + 1).is_some() {
+                    i += 1;
+                }
+            }
+            value if value.starts_with("--cdp-target=") || value.starts_with("--cdp-context=") => {
+                invalid_cdp_scope = true;
             }
             "--cdp" => {
                 if let Some(s) = args.get(i + 1) {
@@ -1144,6 +1235,9 @@ pub fn parse_flags(args: &[String]) -> Flags {
         }
         i += 1;
     }
+    if invalid_cdp_scope {
+        flags.cdp_target = Some(String::new());
+    }
     flags
 }
 
@@ -1157,6 +1251,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
 
     // Boolean flags that optionally take true/false
     const GLOBAL_BOOL_FLAGS: &[&str] = &[
+        "--cdp-dedicated",
         "--json",
         "--headed",
         "--webgpu",
@@ -1194,6 +1289,9 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--headers",
         "--executable-path",
         "--cdp",
+        "--cdp-target",
+        "--expect-contract",
+        "--cdp-context",
         "--extension",
         "--init-script",
         "--enable",
@@ -1228,6 +1326,10 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
     let mut seen_command = false;
     while i < args.len() {
         let arg = &args[i];
+        if arg == "--" && !skip_next {
+            result.extend_from_slice(&args[i..]);
+            break;
+        }
         if skip_next {
             skip_next = false;
             i += 1;
@@ -1273,6 +1375,174 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn expected_contract_flag_is_exact_and_not_a_profile() {
+        let input = args("--expect-contract e2e-exact-1 capabilities");
+        let flags = parse_flags(&input);
+        assert_eq!(flags.expect_contract.as_deref(), Some("e2e-exact-1"));
+        assert_eq!(clean_args(&input), vec!["capabilities"]);
+        assert!(parse_flags(&args("snapshot")).expect_contract.is_none());
+        assert_eq!(
+            parse_flags(&args("snapshot --expect-contract"))
+                .expect_contract
+                .as_deref(),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn scoped_cdp_requires_an_explicit_dedicated_declaration() {
+        for assertion in ["", "--cdp-dedicated false"] {
+            let input = args(&format!(
+                "--cdp 9222 --cdp-target t --cdp-context default {assertion} snapshot"
+            ));
+            assert!(cdp_scope_error(&parse_flags(&input)).is_some());
+        }
+        assert!(cdp_scope_error(&parse_flags(&args("--cdp-dedicated snapshot"))).is_some());
+    }
+
+    #[test]
+    fn cdp_scope_flags_parse_and_clean_in_either_position() {
+        for context in ["default", "context:opaque/1", "Default"] {
+            for input in [
+                format!("--cdp 9222 --cdp-dedicated --cdp-target target-1 --cdp-context {context} snapshot"),
+                format!("snapshot --cdp-context {context} --cdp-target target-1 --cdp-dedicated --cdp 9222"),
+            ] {
+                let input = args(&input);
+                let flags = parse_flags(&input);
+                assert_eq!(flags.cdp_target.as_deref(), Some("target-1"));
+                assert_eq!(flags.cdp_context.as_deref(), Some(context));
+                assert_eq!(cdp_scope_error(&flags), None);
+                assert_eq!(clean_args(&input), vec!["snapshot"]);
+            }
+        }
+    }
+
+    #[test]
+    fn cdp_scope_requires_a_complete_pair_and_cdp() {
+        for input in [
+            "--cdp-target target-1 snapshot",
+            "--cdp-context default snapshot",
+        ] {
+            let mut flags = parse_flags(&args(input));
+            flags.cdp = Some("9222".into());
+            assert_eq!(
+                cdp_scope_error(&flags),
+                Some("--cdp-target and --cdp-context must be supplied together")
+            );
+        }
+        let mut flags = parse_flags(&args(
+            "--cdp-target target-1 --cdp-context default snapshot",
+        ));
+        flags.cdp = None;
+        assert_eq!(
+            cdp_scope_error(&flags),
+            Some("--cdp-target and --cdp-context require --cdp")
+        );
+        flags.cdp = Some(String::new());
+        assert!(cdp_scope_error(&flags).is_some());
+        let flags = parse_flags(&args("snapshot"));
+        assert!(flags.cdp_target.is_none());
+        assert!(flags.cdp_context.is_none());
+        assert_eq!(cdp_scope_error(&flags), None);
+    }
+
+    #[test]
+    fn cdp_scope_rejects_malformed_values_and_equals_syntax() {
+        for flag in ["--cdp-target", "--cdp-context"] {
+            for value in [
+                "",
+                "white space",
+                "tab\tvalue",
+                "line\nvalue",
+                "control\u{0000}",
+                "del\u{007f}",
+                "space\u{00a0}value",
+                "--flag",
+            ] {
+                let mut input =
+                    args("--cdp 9222 --cdp-dedicated --cdp-target target-1 --cdp-context default snapshot");
+                input.extend([flag.to_string(), value.to_string()]);
+                let flags = parse_flags(&input);
+                assert!(cdp_scope_error(&flags).is_some(), "{flag} {value:?}");
+            }
+            let mut missing = args("--cdp 9222 snapshot");
+            missing.push(flag.to_string());
+            assert!(cdp_scope_error(&parse_flags(&missing)).is_some());
+            // Neither a malformed duplicate nor an equals-form flag may be
+            // silently overwritten by a later valid, separate-form pair.
+            for malformed in [
+                vec![format!("{flag}=opaque")],
+                vec![flag.to_string(), String::new()],
+            ] {
+                let mut input = args("--cdp 9222");
+                input.extend(malformed);
+                input.extend(args("--cdp-target target-1 --cdp-context default snapshot"));
+                assert!(cdp_scope_error(&parse_flags(&input)).is_some());
+            }
+        }
+    }
+
+    #[test]
+    fn cdp_scope_literal_values_never_change_scope() {
+        let input = args("--cdp 9222 --cdp-dedicated --cdp-target target-1 --cdp-context default fill @e1 -- --cdp-target other --cdp-context=other --cdp 9333");
+        let flags = parse_flags(&input);
+        assert_eq!(flags.cdp.as_deref(), Some("9222"));
+        assert_eq!(flags.cdp_target.as_deref(), Some("target-1"));
+        assert_eq!(flags.cdp_context.as_deref(), Some("default"));
+        assert_eq!(cdp_scope_error(&flags), None);
+        assert_eq!(
+            clean_args(&input),
+            args("fill @e1 -- --cdp-target other --cdp-context=other --cdp 9333")
+        );
+        let command = crate::commands::parse_command(&clean_args(&input), &flags).unwrap();
+        assert_eq!(
+            command["value"],
+            "--cdp-target other --cdp-context=other --cdp 9333"
+        );
+        let unscoped = args("fill @e1 -- --cdp-target=other --cdp-context default");
+        let flags = parse_flags(&unscoped);
+        assert!(flags.cdp_target.is_none());
+        assert!(flags.cdp_context.is_none());
+        assert_eq!(cdp_scope_error(&flags), None);
+    }
+
+    #[test]
+    fn cdp_scope_values_do_not_become_config_paths() {
+        assert_eq!(
+            extract_config_path(&args(
+                "--cdp-target --config --cdp-context default snapshot"
+            )),
+            None
+        );
+        assert_eq!(
+            extract_config_path(&args(
+                "--cdp-context --config --cdp-target target-1 snapshot"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn global_flags_stop_at_literal_boundary() {
+        let input = vec![
+            "--session".into(),
+            "owned".into(),
+            "fill".into(),
+            "@e1".into(),
+            "--".into(),
+            "--session".into(),
+            "payload".into(),
+            "--version".into(),
+        ];
+        let flags = parse_flags(&input);
+        assert_eq!(flags.session, "owned");
+        assert_eq!(
+            clean_args(&input),
+            vec!["fill", "@e1", "--", "--session", "payload", "--version"]
+        );
+    }
+
     use super::*;
     use crate::test_utils::EnvGuard;
 

@@ -580,3 +580,7 @@ That pulls in:
 - `references/proxy-support.md`: proxy configuration and CA certificates for HTTPS interception proxies
 - `references/webgpu.md` — screenshots/video of WebGPU pages (three.js, Babylon.js), Linux/CI setup
 - `templates/*` — starter shell scripts for auth, capture, form automation
+
+## Maintained fork boundary
+
+The `levicode/agent-browser` distribution adds the strict e2e CLI contract documented in `maintainer/CONTRACT.md`. Ordinary upstream instructions are not evidence that this fork has identical fallback or retry behavior. New node registration and CDP scope flags are adapter-internal CLI operations, not MCP tools. Use the e2e adapter for this contract rather than mixing direct MCP and adapter ownership.

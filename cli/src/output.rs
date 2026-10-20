@@ -2223,6 +2223,28 @@ Examples:
 "##
         }
 
+        "capabilities" => {
+            r##"
+agent-browser capabilities - Describe the compiled native contract
+
+Usage: agent-browser capabilities [--json]
+
+Returns a browser-free capability descriptor. It neither starts a daemon nor
+connects to a browser. --expect-contract validates compatibility, not a mode.
+The e2e consumer also verifies the running daemon before any browser effects.
+"##
+        }
+        "ref" => {
+            r##"
+agent-browser ref - Import an exact backend-node reference
+
+Usage: agent-browser ref <backend-node-id> [--frame <frame-id>]
+
+Imports a live, document-bound identity without role/name replacement fallback.
+An exact identity does not make coordinate pointer dispatch atomic.
+"##
+        }
+
         // === Snapshot ===
         "snapshot" => {
             r##"
@@ -2243,6 +2265,9 @@ Options:
       --delta          Return full state once, then unchanged or structural deltas
                        Deltas include ref changes and an exact treeChange line splice
       --full           Force full state and update the delta baseline
+      --exact-refs     Bind references to exact backend nodes, without semantic rebinding
+      --preserve-refs  Keep existing ref identities during diagnostic capture
+      --allowed-frame-documents <JSON>  Approved frame-to-loader identity map
 
 Global Options:
   --json               Output as JSON
@@ -4057,6 +4082,11 @@ Options:
   --no-webmcp                Disable default experimental WebMCP support for locally launched Chrome
                              (or AGENT_BROWSER_NO_WEBMCP env)
   --cdp <port|url>           Connect via CDP; root WebSocket query slash is optional
+  --expect-contract <version>  Require a compatible native contract before any browser input
+  --cdp-dedicated             Declare caller-owned dedicated endpoint for scoped attachment
+  --cdp-target <target-id>    Scope to this exact page; requires --cdp and --cdp-context
+  --cdp-context <context-id>  Exact context; use default for no browserContextId
+                            Scope flags take separate values, not --flag=value
   --pin-tab                  Pin the session to its bound tab (or AGENT_BROWSER_PIN_TAB env)
                              Commands fail with a tab_gone error instead of falling back
                              to another tab when the bound tab is closed. JSON includes
@@ -4216,6 +4246,17 @@ Examples:
   agent-browser screenshot --annotate    # Labeled screenshot for vision models
   agent-browser wait 2000               # Wait for slow pages to settle
   agent-browser --cdp 9222 snapshot      # Connect via CDP port
+  agent-browser capabilities --json
+  agent-browser --expect-contract e2e-exact-1 --cdp 9222 --cdp-dedicated --cdp-target TARGET --cdp-context default snapshot --exact-refs
+
+Maintained e2e CLI-only contract (not MCP):
+  ref <backend-node-id> --frame <frame-id>  Register an exact live node
+  click|dblclick <ref> --modifiers <keys>  Modified single dispatch
+  select <ref> --label|--index <values>    Explicit selection semantics
+  mouse state                            Read held pointer-button state
+  Stale refs fail instead of matching a same-name replacement.
+  An uncertain input result must not be automatically retried.
+  See maintainer/CONTRACT.md for the complete compatibility boundary.
   agent-browser --cdp 9222 --pin-tab open example.com  # Pin session to its own tab
   agent-browser --auto-connect snapshot  # Auto-discover running Chrome
   agent-browser stream enable            # Start runtime streaming on an auto-selected port

@@ -950,9 +950,22 @@ mod tests {
 
     #[test]
     fn test_state_list_returns_json() {
+        // Readers must share the environment lock with tests that replace HOME.
+        let guard = crate::test_utils::EnvGuard::new(&["HOME", "AGENT_BROWSER_NAMESPACE"]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("HOME", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let sessions = get_sessions_dir();
+        let empty = state_list().unwrap();
+        assert_eq!(empty["files"], json!([]));
+        assert_eq!(empty["directory"], sessions.to_string_lossy().as_ref());
+
+        fs::create_dir_all(&sessions).unwrap();
+        fs::write(sessions.join("fixture.json"), "{}").unwrap();
         let result = state_list().unwrap();
-        assert!(result.get("files").is_some());
-        assert!(result.get("directory").is_some());
+        assert_eq!(result["files"].as_array().unwrap().len(), 1);
+        assert_eq!(result["files"][0]["filename"], "fixture.json");
+        assert_eq!(result["directory"], sessions.to_string_lossy().as_ref());
     }
 
     #[test]

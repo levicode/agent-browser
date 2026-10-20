@@ -15,7 +15,7 @@ use crate::validation::{is_valid_session_name, session_name_error};
 
 use super::a11y;
 use super::auth;
-use super::browser::{should_track_target, BrowserManager, WaitUntil};
+use super::browser::{should_track_target, BrowserManager, CdpScope, WaitUntil};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -240,6 +240,10 @@ struct ScreenshotObservation {
 
 #[derive(Default)]
 struct DrainedEvents {
+    // Subscribed before the batch is drained: no destruction event can fall
+    // between collection and an eventual setup await. Other events remain in
+    // the daemon's ordinary receiver for its next drain.
+    lifecycle_events: Option<broadcast::Receiver<CdpEvent>>,
     pending_acks: Vec<i64>,
     new_targets: Vec<TargetCreatedEvent>,
     changed_targets: Vec<TargetInfoChangedEvent>,
@@ -254,12 +258,31 @@ struct DrainedEvents {
     /// Attached non-page targets that still need to be resumed when auto-attach
     /// pauses them, even though agent-browser does not track them as tabs.
     attached_other_sessions: Vec<String>,
+    /// Rejected child sessions and the flattened parent session that owns them.
+    /// These are detached without installing domains or running their Runtime.
+    rejected_scope_sessions: Vec<(String, Option<String>)>,
     /// Session IDs from Target.detachedFromTarget.
     detached_iframe_sessions: Vec<String>,
     /// (request_id, event session_id) pairs from `Network.loadingFinished`
     /// while HAR recording; bodies are fetched for these in
     /// `apply_drained_events` before Chrome evicts them (e.g. on navigation).
     har_finished_requests: Vec<(String, Option<String>)>,
+}
+
+async fn detach_out_of_scope_session(
+    client: &CdpClient,
+    session_id: &str,
+    parent_session_id: Option<&str>,
+) {
+    // Detachment is a Target-domain operation on the attachment's owner.
+    // Never resume a rejected target just to clean up its session.
+    let _ = client
+        .send_command_no_wait(
+            "Target.detachFromTarget",
+            Some(json!({ "sessionId": session_id })),
+            parent_session_id,
+        )
+        .await;
 }
 
 fn is_active_iframe_network_event(
@@ -541,6 +564,7 @@ impl SessionSetup {
 
 pub struct DaemonState {
     pub browser: Option<BrowserManager>,
+    cdp_scope: Option<CdpScope>,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
@@ -694,6 +718,7 @@ impl DaemonState {
             .is_some_and(|b| b.pinned);
         Self {
             browser: None,
+            cdp_scope: None,
             appium: None,
             safari_driver: None,
             webdriver_backend: None,
@@ -849,10 +874,15 @@ impl DaemonState {
         };
 
         let client = browser.client.clone();
+        let scope_guard = browser.scope_guard();
+        // Use upstream's lossless tap, including lifecycle revocation events.
+        // A detach must not be lost while paused requests are being resolved.
         let mut rx = browser.client.subscribe_methods(&[
             "Fetch.authRequired",
             "Target.attachedToTarget",
             "Fetch.requestPaused",
+            "Target.detachedFromTarget",
+            "Target.targetDestroyed",
         ]);
         let domain_filter = self.domain_filter.clone();
         let routes = self.routes.clone();
@@ -864,7 +894,22 @@ impl DaemonState {
         self.fetch_handler_task = Some(tokio::spawn(async move {
             loop {
                 match rx.recv().await {
+                    Some(event) if event.method == "Target.detachedFromTarget" => {
+                        if let Some(sid) = event.params.get("sessionId").and_then(Value::as_str) {
+                            scope_guard.revoke_session(sid);
+                        }
+                    }
+                    Some(event) if event.method == "Target.targetDestroyed" => {
+                        if let Some(target) = event.params.get("targetId").and_then(Value::as_str) {
+                            scope_guard.revoke_target(target);
+                        }
+                    }
                     Some(event) if event.method == "Fetch.authRequired" => {
+                        if !scope_guard.owns_debugger_pause()
+                            || !scope_guard.accepts_session(event.session_id.as_deref())
+                        {
+                            continue;
+                        }
                         let request_id = event
                             .params
                             .get("requestId")
@@ -873,6 +918,9 @@ impl DaemonState {
                             .to_string();
                         let sid = event.session_id.clone().unwrap_or_default();
                         let creds = proxy_credentials.read().await;
+                        if !scope_guard.accepts_session(Some(&sid)) {
+                            continue;
+                        }
                         if let Some((ref user, ref pass)) = *creds {
                             let _ = client
                                 .send_command(
@@ -915,6 +963,15 @@ impl DaemonState {
                         let target_info = event.params.get("targetInfo").and_then(|value| {
                             serde_json::from_value::<TargetInfo>(value.clone()).ok()
                         });
+                        if !scope_guard.accept_attachment(
+                            event.session_id.as_deref(),
+                            target_info.as_ref(),
+                            &sid,
+                        ) {
+                            detach_out_of_scope_session(&client, &sid, event.session_id.as_deref())
+                                .await;
+                            continue;
+                        }
                         // The recorder's screencast session shares a target
                         // with a page session that already carries the
                         // controls.
@@ -930,42 +987,64 @@ impl DaemonState {
 
                         let df = domain_filter.read().await.clone();
                         let has_proxy_creds = proxy_credentials.read().await.is_some();
-                        let controls_active = df.is_some() || has_proxy_creds;
+                        let controls_active =
+                            scope_guard.owns_debugger_pause() && (df.is_some() || has_proxy_creds);
                         let controls_result = if controls_active && target_needs_controls {
-                            async {
-                                if let Some(ref target) = target_info {
-                                    prepare_network_control_target_session(&client, &sid, target)
-                                        .await?;
-                                }
-                                if let Some(ref target) = target_info {
-                                    if target_is_worker_like(target) {
-                                        install_worker_network_controls_for_session(
-                                            &client,
-                                            &sid,
-                                            df.as_ref(),
-                                            has_proxy_creds,
-                                            target,
-                                        )
-                                        .await
-                                    } else {
-                                        install_network_controls_for_session(
-                                            &client,
-                                            &sid,
-                                            df.as_ref(),
-                                            has_proxy_creds,
-                                        )
-                                        .await
-                                    }
-                                } else {
-                                    Ok(())
-                                }
-                            }
-                            .await
+                            scope_guard
+                                .run_background(
+                                    &client,
+                                    target_info.as_ref().map(|target| target.target_id.as_str()),
+                                    Some(&sid),
+                                    Box::pin(async {
+                                        if !scope_guard.accepts_session(Some(&sid)) {
+                                            return Ok(());
+                                        }
+                                        if let Some(ref target) = target_info {
+                                            prepare_network_control_target_session(
+                                                &client,
+                                                &sid,
+                                                target,
+                                                scope_guard.owns_debugger_pause(),
+                                            )
+                                            .await?;
+                                        }
+                                        if !scope_guard.accepts_session(Some(&sid)) {
+                                            return Ok(());
+                                        }
+                                        if let Some(ref target) = target_info {
+                                            if target_is_worker_like(target) {
+                                                install_worker_network_controls_for_session(
+                                                    &client,
+                                                    &sid,
+                                                    df.as_ref(),
+                                                    has_proxy_creds,
+                                                    target,
+                                                )
+                                                .await
+                                            } else {
+                                                install_network_controls_for_session(
+                                                    &client,
+                                                    &sid,
+                                                    df.as_ref(),
+                                                    has_proxy_creds,
+                                                )
+                                                .await
+                                            }
+                                        } else {
+                                            Ok(())
+                                        }
+                                    }),
+                                )
+                                .await
+                                .map(|_| ())
                         } else {
                             Ok(())
                         };
 
-                        if controls_result.is_ok() {
+                        if controls_result.is_ok()
+                            && scope_guard.owns_debugger_pause()
+                            && scope_guard.accepts_session(Some(&sid))
+                        {
                             let _ = client
                                 .send_command_no_wait(
                                     "Runtime.runIfWaitingForDebugger",
@@ -981,6 +1060,12 @@ impl DaemonState {
                         }
                     }
                     Some(event) if event.method == "Fetch.requestPaused" => {
+                        if !scope_guard.owns_debugger_pause() {
+                            continue;
+                        }
+                        if !scope_guard.accepts_session(event.session_id.as_deref()) {
+                            continue;
+                        }
                         let request_id = event
                             .params
                             .get("requestId")
@@ -1027,18 +1112,23 @@ impl DaemonState {
                         let rt = routes.read().await;
                         let oh = origin_headers.read().await;
 
-                        resolve_fetch_paused(
-                            &client,
-                            df.as_ref(),
-                            &rt,
-                            &oh,
-                            &blocked_documents,
-                            &paused,
-                        )
-                        .await;
+                        if scope_guard.accepts_session(Some(&paused.session_id)) {
+                            resolve_fetch_paused(
+                                &client,
+                                df.as_ref(),
+                                &rt,
+                                &oh,
+                                &blocked_documents,
+                                &paused,
+                            )
+                            .await;
+                        }
                     }
                     Some(_) => continue,
-                    None => break,
+                    None => {
+                        scope_guard.invalidate();
+                        break;
+                    }
                 }
             }
         }));
@@ -1052,7 +1142,7 @@ impl DaemonState {
             task.abort();
         }
 
-        if !self.auto_dialog {
+        if !self.auto_dialog || self.cdp_scope.is_some() {
             return;
         }
 
@@ -1060,13 +1150,21 @@ impl DaemonState {
             return;
         };
 
+        if browser.is_scoped() {
+            return;
+        }
+
         let client = browser.client.clone();
+        let scope_guard = browser.scope_guard();
         let mut rx = browser.client.subscribe();
 
         self.dialog_handler_task = Some(tokio::spawn(async move {
             loop {
                 match rx.recv().await {
                     Ok(event) if event.method == "Page.javascriptDialogOpening" => {
+                        if !scope_guard.accepts_session(event.session_id.as_deref()) {
+                            continue;
+                        }
                         let dialog_type = event
                             .params
                             .get("type")
@@ -1096,7 +1194,12 @@ impl DaemonState {
                         }
                     }
                     Ok(_) => continue,
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        // A missed detach can invalidate a whole descendant chain.
+                        // Scoped proof cannot be reconstructed from a partial stream.
+                        scope_guard.invalidate();
+                        continue;
+                    }
                     Err(_) => break,
                 }
             }
@@ -1248,7 +1351,25 @@ impl DaemonState {
                 .unwrap_or_default();
     }
 
-    async fn apply_drained_events(&mut self, drained: DrainedEvents) -> Result<(), String> {
+    async fn apply_drained_events(&mut self, mut drained: DrainedEvents) -> Result<(), String> {
+        let mut lifecycle_events = drained.lifecycle_events.take().or_else(|| {
+            self.browser
+                .as_ref()
+                .map(|browser| browser.client.subscribe())
+        });
+        let scope_guard = self.browser.as_ref().map(|browser| browser.scope_guard());
+        if let Some(ref browser) = self.browser {
+            for (sid, parent_sid) in &drained.rejected_scope_sessions {
+                detach_out_of_scope_session(&browser.client, sid, parent_sid.as_deref()).await;
+            }
+        }
+        // A faster event subscriber can already have revoked these sessions.
+        if let Some(ref guard) = scope_guard {
+            self.iframe_sessions
+                .retain(|_, sid| guard.accepts_session(Some(sid.as_str())));
+            self.active_iframe_sessions
+                .retain(|sid| guard.accepts_session(Some(sid.as_str())));
+        }
         // Popups and externally closed pages can change the active top-level
         // target without changing iframe topology. Refresh after either kind
         // of event so network capture stays scoped to the active page.
@@ -1258,6 +1379,12 @@ impl DaemonState {
             if let Some(ref browser) = self.browser {
                 if let Ok(session_id) = browser.active_session_id() {
                     for ack_sid in drained.pending_acks {
+                        if scope_guard
+                            .as_ref()
+                            .is_some_and(|guard| !guard.accepts_session(Some(session_id)))
+                        {
+                            break;
+                        }
                         let _ = stream::ack_screencast_frame(&browser.client, session_id, ack_sid)
                             .await;
                     }
@@ -1274,34 +1401,62 @@ impl DaemonState {
 
         // Track cross-origin iframe sessions
         for (frame_id, iframe_sid) in &drained.attached_iframe_sessions {
+            if scope_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.accepts_session(Some(iframe_sid)))
+            {
+                continue;
+            }
             self.iframe_sessions
                 .insert(frame_id.clone(), iframe_sid.clone());
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
+            let controls_active = scope_guard
+                .as_ref()
+                .is_none_or(|guard| guard.owns_debugger_pause())
+                && (filter.is_some() || has_proxy_creds);
             let setup_result = if let Some(ref mgr) = self.browser {
-                async {
-                    mgr.prepare_domains_pub(iframe_sid).await?;
-                    let _ = mgr
-                        .client
-                        .send_command_no_params("DOM.enable", Some(iframe_sid.as_str()))
-                        .await;
-                    let _ = mgr
-                        .client
-                        .send_command_no_params("Accessibility.enable", Some(iframe_sid.as_str()))
-                        .await;
-                    if controls_active {
-                        install_network_controls_for_session(
-                            &mgr.client,
-                            iframe_sid,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                        )
-                        .await?;
-                    }
-                    mgr.resume_if_waiting_pub(iframe_sid).await
-                }
-                .await
+                let guard = mgr.scope_guard();
+                guard
+                    .run_background_events(
+                        lifecycle_events
+                            .as_mut()
+                            .ok_or("Missing background lifecycle stream")?,
+                        Some(frame_id.as_str()),
+                        Some(iframe_sid.as_str()),
+                        Box::pin(async {
+                            if scope_guard
+                                .as_ref()
+                                .is_some_and(|guard| !guard.accepts_session(Some(iframe_sid)))
+                            {
+                                return Ok(());
+                            }
+                            mgr.prepare_domains_pub(iframe_sid).await?;
+                            let _ = mgr
+                                .client
+                                .send_command_no_params("DOM.enable", Some(iframe_sid.as_str()))
+                                .await;
+                            let _ = mgr
+                                .client
+                                .send_command_no_params(
+                                    "Accessibility.enable",
+                                    Some(iframe_sid.as_str()),
+                                )
+                                .await;
+                            if controls_active {
+                                install_network_controls_for_session(
+                                    &mgr.client,
+                                    iframe_sid,
+                                    filter.as_ref(),
+                                    has_proxy_creds,
+                                )
+                                .await?;
+                            }
+                            mgr.resume_if_waiting_pub(iframe_sid).await
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
             } else {
                 Ok(())
             };
@@ -1319,62 +1474,87 @@ impl DaemonState {
         // Register top-level pages that browser-level auto-attach paused before
         // their first request. Controls must be installed before resuming.
         for (target_info, page_sid) in &drained.attached_page_sessions {
+            if scope_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.accepts_session(Some(page_sid)))
+            {
+                continue;
+            }
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
+            let controls_active = scope_guard
+                .as_ref()
+                .is_none_or(|guard| guard.owns_debugger_pause())
+                && (filter.is_some() || has_proxy_creds);
             let setup_result = if let Some(ref mut mgr) = self.browser {
-                async {
-                    mgr.prepare_domains_pub(page_sid).await?;
-                    if controls_active {
-                        install_network_controls_for_session(
-                            &mgr.client,
-                            page_sid,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                        )
-                        .await?;
-                    }
-
-                    let mut page_url = target_info.url.clone();
-                    if let Some(ref filter) = filter {
-                        if should_blank_existing_url(&page_url, filter) {
-                            let _ = mgr
-                                .client
-                                .send_command(
-                                    "Page.navigate",
-                                    Some(json!({ "url": "about:blank" })),
-                                    Some(page_sid),
+                let guard = mgr.scope_guard();
+                guard
+                    .run_background_events(
+                        lifecycle_events
+                            .as_mut()
+                            .ok_or("Missing background lifecycle stream")?,
+                        Some(target_info.target_id.as_str()),
+                        Some(page_sid.as_str()),
+                        Box::pin(async {
+                            if scope_guard
+                                .as_ref()
+                                .is_some_and(|guard| !guard.accepts_session(Some(page_sid)))
+                            {
+                                return Ok(());
+                            }
+                            mgr.prepare_domains_pub(page_sid).await?;
+                            if controls_active {
+                                install_network_controls_for_session(
+                                    &mgr.client,
+                                    page_sid,
+                                    filter.as_ref(),
+                                    has_proxy_creds,
                                 )
-                                .await;
-                            page_url = "about:blank".to_string();
-                        }
-                    }
+                                .await?;
+                            }
 
-                    // This handler drains `Target.attachedToTarget` for a
-                    // page that browser-level auto-attach discovered before
-                    // its own `Target.targetCreated` was drained (e.g. a
-                    // human-opened tab, or a JS-opened popup in the shared
-                    // Chrome). Explicit agent commands (`tab new`, `window
-                    // new`, `click --new-tab`) already register their own
-                    // page via `add_page` on their own path before this
-                    // event is ever drained, so this branch never runs for
-                    // agent-initiated tabs. `register_discovered_page` is the
-                    // single decision point shared with the
-                    // `Target.targetCreated` handler below: a pinned session
-                    // never activates a discovered target (that would steal
-                    // the active tab and overwrite its binding); a legacy
-                    // session follows it.
-                    mgr.register_discovered_page(
-                        &target_info.target_id,
-                        page_sid,
-                        page_url,
-                        target_info.title.clone(),
-                        target_info.target_type.clone(),
-                    );
+                            let mut page_url = target_info.url.clone();
+                            if let Some(ref filter) = filter {
+                                if should_blank_existing_url(&page_url, filter) {
+                                    let _ = mgr
+                                        .client
+                                        .send_command(
+                                            "Page.navigate",
+                                            Some(json!({ "url": "about:blank" })),
+                                            Some(page_sid),
+                                        )
+                                        .await;
+                                    page_url = "about:blank".to_string();
+                                }
+                            }
 
-                    mgr.resume_if_waiting_pub(page_sid).await
-                }
-                .await
+                            // This handler drains `Target.attachedToTarget` for a
+                            // page that browser-level auto-attach discovered before
+                            // its own `Target.targetCreated` was drained (e.g. a
+                            // human-opened tab, or a JS-opened popup in the shared
+                            // Chrome). Explicit agent commands (`tab new`, `window
+                            // new`, `click --new-tab`) already register their own
+                            // page via `add_page` on their own path before this
+                            // event is ever drained, so this branch never runs for
+                            // agent-initiated tabs. `register_discovered_page` is the
+                            // single decision point shared with the
+                            // `Target.targetCreated` handler below: a pinned session
+                            // never activates a discovered target (that would steal
+                            // the active tab and overwrite its binding); a legacy
+                            // session follows it.
+                            mgr.register_discovered_page(
+                                &target_info.target_id,
+                                page_sid,
+                                page_url,
+                                target_info.title.clone(),
+                                target_info.target_type.clone(),
+                            );
+
+                            mgr.resume_if_waiting_pub(page_sid).await
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
             } else {
                 Ok(())
             };
@@ -1390,34 +1570,62 @@ impl DaemonState {
         }
 
         for (target_info, worker_sid) in &drained.attached_worker_sessions {
+            if scope_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.accepts_session(Some(worker_sid)))
+            {
+                continue;
+            }
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
+            let controls_active = scope_guard
+                .as_ref()
+                .is_none_or(|guard| guard.owns_debugger_pause())
+                && (filter.is_some() || has_proxy_creds);
             let setup_result = if let Some(ref mgr) = self.browser {
-                async {
-                    prepare_network_control_target_session(&mgr.client, worker_sid, target_info)
-                        .await?;
-                    if controls_active {
-                        install_worker_network_controls_for_session(
-                            &mgr.client,
-                            worker_sid,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                            target_info,
-                        )
-                        .await?;
-                    }
-                    let _ = mgr
-                        .client
-                        .send_command_no_wait(
-                            "Runtime.runIfWaitingForDebugger",
-                            None,
-                            Some(worker_sid),
-                        )
-                        .await;
-                    Ok(())
-                }
-                .await
+                let guard = mgr.scope_guard();
+                guard
+                    .run_background_events(
+                        lifecycle_events
+                            .as_mut()
+                            .ok_or("Missing background lifecycle stream")?,
+                        Some(target_info.target_id.as_str()),
+                        Some(worker_sid.as_str()),
+                        Box::pin(async {
+                            if scope_guard
+                                .as_ref()
+                                .is_some_and(|guard| !guard.accepts_session(Some(worker_sid)))
+                            {
+                                return Ok(());
+                            }
+                            prepare_network_control_target_session(
+                                &mgr.client,
+                                worker_sid,
+                                target_info,
+                                !mgr.is_scoped(),
+                            )
+                            .await?;
+                            if controls_active {
+                                install_worker_network_controls_for_session(
+                                    &mgr.client,
+                                    worker_sid,
+                                    filter.as_ref(),
+                                    has_proxy_creds,
+                                    target_info,
+                                )
+                                .await?;
+                            }
+                            if scope_guard
+                                .as_ref()
+                                .is_none_or(|guard| guard.accepts_session(Some(worker_sid)))
+                            {
+                                mgr.resume_if_waiting_pub(worker_sid).await?;
+                            }
+                            Ok(())
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
             } else {
                 Ok(())
             };
@@ -1433,6 +1641,12 @@ impl DaemonState {
         }
 
         for sid in &drained.attached_other_sessions {
+            if scope_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.accepts_session(Some(sid)))
+            {
+                continue;
+            }
             if let Some(ref mgr) = self.browser {
                 let _ = mgr.resume_if_waiting_pub(sid).await;
             }
@@ -1445,66 +1659,106 @@ impl DaemonState {
 
         // Attach and register new targets
         for te in &drained.new_targets {
+            if drained
+                .destroyed_targets
+                .contains(&te.target_info.target_id)
+                || scope_guard
+                    .as_ref()
+                    .is_some_and(|guard| !guard.accepts_target(&te.target_info))
+            {
+                continue;
+            }
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
+            let controls_active = scope_guard
+                .as_ref()
+                .is_none_or(|guard| guard.owns_debugger_pause())
+                && (filter.is_some() || has_proxy_creds);
             let setup_result = if let Some(ref mut mgr) = self.browser {
-                async {
-                    let attach: AttachToTargetResult = mgr
-                        .client
-                        .send_command_typed(
-                            "Target.attachToTarget",
-                            &AttachToTargetParams {
-                                target_id: te.target_info.target_id.clone(),
-                                flatten: true,
-                            },
-                            None,
-                        )
-                        .await?;
-                    mgr.prepare_domains_pub(&attach.session_id).await?;
-                    if controls_active {
-                        install_network_controls_for_session(
-                            &mgr.client,
-                            &attach.session_id,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                        )
-                        .await?;
-                    }
-
-                    let mut page_url = te.target_info.url.clone();
-                    if let Some(ref filter) = filter {
-                        if should_blank_existing_url(&page_url, filter) {
-                            let _ = mgr
+                let guard = mgr.scope_guard();
+                guard
+                    .run_background_events(
+                        lifecycle_events
+                            .as_mut()
+                            .ok_or("Missing background lifecycle stream")?,
+                        Some(te.target_info.target_id.as_str()),
+                        None,
+                        Box::pin(async {
+                            if scope_guard
+                                .as_ref()
+                                .is_some_and(|guard| !guard.accepts_target(&te.target_info))
+                            {
+                                return Ok(());
+                            }
+                            let attach: AttachToTargetResult = mgr
                                 .client
-                                .send_command(
-                                    "Page.navigate",
-                                    Some(json!({ "url": "about:blank" })),
-                                    Some(&attach.session_id),
+                                .send_command_typed(
+                                    "Target.attachToTarget",
+                                    &AttachToTargetParams {
+                                        target_id: te.target_info.target_id.clone(),
+                                        flatten: true,
+                                    },
+                                    None,
                                 )
-                                .await;
-                            page_url = "about:blank".to_string();
-                        }
-                    }
+                                .await?;
+                            if scope_guard.as_ref().is_some_and(|guard| {
+                                !guard.accepts_target(&te.target_info)
+                                    || !guard.register_session(
+                                        &attach.session_id,
+                                        &te.target_info.target_id,
+                                        None,
+                                    )
+                            }) {
+                                detach_out_of_scope_session(&mgr.client, &attach.session_id, None)
+                                    .await;
+                                return Ok(());
+                            }
+                            mgr.prepare_domains_pub(&attach.session_id).await?;
+                            if controls_active {
+                                install_network_controls_for_session(
+                                    &mgr.client,
+                                    &attach.session_id,
+                                    filter.as_ref(),
+                                    has_proxy_creds,
+                                )
+                                .await?;
+                            }
 
-                    // Event-discovered target (e.g. a tab the human opened in the
-                    // shared Chrome, or a JS-opened popup): register it via the
-                    // same `register_discovered_page` decision point used by the
-                    // `Target.attachedToTarget` handler above, which activates it
-                    // only for legacy sessions; a pinned session never adopts a
-                    // discovered tab (that steal would also overwrite its
-                    // binding). Explicit commands (`tab new`, `window new`,
-                    // `click --new-tab`) activate via their own paths.
-                    mgr.register_discovered_page(
-                        &te.target_info.target_id,
-                        &attach.session_id,
-                        page_url,
-                        te.target_info.title.clone(),
-                        te.target_info.target_type.clone(),
-                    );
-                    mgr.resume_if_waiting_pub(&attach.session_id).await
-                }
-                .await
+                            let mut page_url = te.target_info.url.clone();
+                            if let Some(ref filter) = filter {
+                                if should_blank_existing_url(&page_url, filter) {
+                                    let _ = mgr
+                                        .client
+                                        .send_command(
+                                            "Page.navigate",
+                                            Some(json!({ "url": "about:blank" })),
+                                            Some(&attach.session_id),
+                                        )
+                                        .await;
+                                    page_url = "about:blank".to_string();
+                                }
+                            }
+
+                            // Event-discovered target (e.g. a tab the human opened in the
+                            // shared Chrome, or a JS-opened popup): register it via the
+                            // same `register_discovered_page` decision point used by the
+                            // `Target.attachedToTarget` handler above, which activates it
+                            // only for legacy sessions; a pinned session never adopts a
+                            // discovered tab (that steal would also overwrite its
+                            // binding). Explicit commands (`tab new`, `window new`,
+                            // `click --new-tab`) activate via their own paths.
+                            mgr.register_discovered_page(
+                                &te.target_info.target_id,
+                                &attach.session_id,
+                                page_url,
+                                te.target_info.title.clone(),
+                                te.target_info.target_type.clone(),
+                            );
+                            mgr.resume_if_waiting_pub(&attach.session_id).await
+                        }),
+                    )
+                    .await
+                    .map(|_| ())
             } else {
                 Ok(())
             };
@@ -1518,6 +1772,12 @@ impl DaemonState {
 
         // Update changed targets
         for te in &drained.changed_targets {
+            if scope_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.accepts_target(&te.target_info))
+            {
+                continue;
+            }
             if let Some(ref mut mgr) = self.browser {
                 mgr.update_page_target_info(&te.target_info);
             }
@@ -1558,6 +1818,12 @@ impl DaemonState {
                     let Some(sid) = event_sid.or_else(|| active_sid.clone()) else {
                         continue;
                     };
+                    if scope_guard
+                        .as_ref()
+                        .is_some_and(|guard| !guard.accepts_session(Some(&sid)))
+                    {
+                        continue;
+                    }
                     let Ok(result) = mgr
                         .client
                         .send_command(
@@ -1598,6 +1864,14 @@ impl DaemonState {
             }
         }
 
+        // A target may have disappeared while its setup future was running.
+        // Do not send follow-up topology reads through its cancelled session.
+        if let Some(ref guard) = scope_guard {
+            self.iframe_sessions
+                .retain(|_, sid| guard.accepts_session(Some(sid.as_str())));
+            self.active_iframe_sessions
+                .retain(|sid| guard.accepts_session(Some(sid.as_str())));
+        }
         if active_frame_scope_changed {
             self.refresh_active_iframe_sessions().await;
             if self.recording_state.active && self.recording_state.cursor {
@@ -1630,6 +1904,11 @@ impl DaemonState {
     }
 
     fn drain_cdp_events(&mut self) -> DrainedEvents {
+        let lifecycle_events = self
+            .browser
+            .as_ref()
+            .map(|browser| browser.client.subscribe());
+        let scope_guard = self.browser.as_ref().map(|browser| browser.scope_guard());
         let rx = match self.event_rx.as_mut() {
             Some(rx) => rx,
             None => return DrainedEvents::default(),
@@ -1645,6 +1924,7 @@ impl DaemonState {
         let mut attached_iframe_sessions: Vec<(String, String)> = Vec::new();
         let mut attached_worker_sessions: Vec<(TargetInfo, String)> = Vec::new();
         let mut attached_other_sessions: Vec<String> = Vec::new();
+        let mut rejected_scope_sessions: Vec<(String, Option<String>)> = Vec::new();
         let mut detached_iframe_sessions: Vec<String> = Vec::new();
         let mut har_finished_requests: Vec<(String, Option<String>)> = Vec::new();
 
@@ -1657,7 +1937,11 @@ impl DaemonState {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
                             {
-                                if should_track_target(&te.target_info) {
+                                if should_track_target(&te.target_info)
+                                    && scope_guard
+                                        .as_ref()
+                                        .is_none_or(|guard| guard.accepts_target(&te.target_info))
+                                {
                                     let already_tracked = self
                                         .browser
                                         .as_ref()
@@ -1674,7 +1958,11 @@ impl DaemonState {
                             if let Ok(te) = serde_json::from_value::<TargetInfoChangedEvent>(
                                 event.params.clone(),
                             ) {
-                                if should_track_target(&te.target_info) {
+                                if should_track_target(&te.target_info)
+                                    && scope_guard
+                                        .as_ref()
+                                        .is_none_or(|guard| guard.accepts_target(&te.target_info))
+                                {
                                     // If this target is not yet tracked (e.g. it was
                                     // initially filtered because its URL was
                                     // chrome://newtab/), promote it to a new target
@@ -1701,6 +1989,9 @@ impl DaemonState {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetDestroyedEvent>(event.params.clone())
                             {
+                                if let Some(ref guard) = scope_guard {
+                                    guard.revoke_target(&te.target_id);
+                                }
                                 let destroyed_active_target = self
                                     .browser
                                     .as_ref()
@@ -1730,41 +2021,49 @@ impl DaemonState {
                             continue;
                         }
                         "Target.attachedToTarget" => {
-                            if let (Some(sid), Some(target_info_value)) = (
-                                event.params.get("sessionId").and_then(|v| v.as_str()),
-                                event.params.get("targetInfo"),
-                            ) {
-                                match serde_json::from_value::<TargetInfo>(
-                                    target_info_value.clone(),
-                                ) {
-                                    // The recorder's screencast session is
-                                    // not a tab and must not have page
-                                    // domains enabled on it.
-                                    Ok(target_info)
-                                        if recording::owns_attachment(
-                                            &self.recording_state.capture_session,
-                                            &target_info.target_id,
-                                            sid,
-                                        ) => {}
-                                    Ok(target_info) if target_info.target_type == "iframe" => {
-                                        // For OOPIF targets, Chrome uses the frameId as
-                                        // the targetId, so we can key iframe_sessions by it.
-                                        attached_iframe_sessions
-                                            .push((target_info.target_id, sid.to_string()));
-                                    }
-                                    Ok(target_info) if should_track_target(&target_info) => {
-                                        attached_page_target_ids
-                                            .insert(target_info.target_id.clone());
-                                        attached_page_sessions.push((target_info, sid.to_string()));
-                                    }
-                                    Ok(target_info) if target_is_worker_like(&target_info) => {
-                                        attached_worker_sessions
-                                            .push((target_info, sid.to_string()));
-                                    }
-                                    _ => {
-                                        attached_other_sessions.push(sid.to_string());
-                                    }
+                            let Some(sid) = event.params.get("sessionId").and_then(Value::as_str)
+                            else {
+                                continue;
+                            };
+                            let target_info_value = event.params.get("targetInfo");
+                            let target_info = target_info_value.and_then(|value| {
+                                serde_json::from_value::<TargetInfo>(value.clone()).ok()
+                            });
+                            if scope_guard.as_ref().is_some_and(|guard| {
+                                !guard.accept_attachment(
+                                    event.session_id.as_deref(),
+                                    target_info.as_ref(),
+                                    sid,
+                                )
+                            }) {
+                                rejected_scope_sessions
+                                    .push((sid.to_string(), event.session_id.clone()));
+                                continue;
+                            }
+                            // Legacy mode ignored attachments with no targetInfo at all.
+                            if target_info_value.is_none() {
+                                continue;
+                            }
+                            match target_info {
+                                // The recording exemption is applied only after scope admission.
+                                Some(target_info)
+                                    if recording::owns_attachment(
+                                        &self.recording_state.capture_session,
+                                        &target_info.target_id,
+                                        sid,
+                                    ) => {}
+                                Some(target_info) if target_info.target_type == "iframe" => {
+                                    attached_iframe_sessions
+                                        .push((target_info.target_id, sid.to_string()));
                                 }
+                                Some(target_info) if should_track_target(&target_info) => {
+                                    attached_page_target_ids.insert(target_info.target_id.clone());
+                                    attached_page_sessions.push((target_info, sid.to_string()));
+                                }
+                                Some(target_info) if target_is_worker_like(&target_info) => {
+                                    attached_worker_sessions.push((target_info, sid.to_string()));
+                                }
+                                _ => attached_other_sessions.push(sid.to_string()),
                             }
                             continue;
                         }
@@ -1772,6 +2071,9 @@ impl DaemonState {
                             if let Some(sid) =
                                 event.params.get("sessionId").and_then(|v| v.as_str())
                             {
+                                if let Some(ref guard) = scope_guard {
+                                    guard.revoke_session(sid);
+                                }
                                 if let Some(frame_id) =
                                     self.iframe_sessions
                                         .iter()
@@ -1790,6 +2092,13 @@ impl DaemonState {
                             continue;
                         }
                         _ => {}
+                    }
+
+                    if scope_guard
+                        .as_ref()
+                        .is_some_and(|guard| !guard.accepts_session(event.session_id.as_deref()))
+                    {
+                        continue;
                     }
 
                     let session_matches = if let Some(ref browser) = self.browser {
@@ -2155,6 +2464,11 @@ impl DaemonState {
                                 // dialogs are handled by the background dialog_handler_task.
                                 // Skip tracking them to avoid a stale warning.
                                 let auto_handled = self.auto_dialog
+                                    && self.cdp_scope.is_none()
+                                    && self
+                                        .browser
+                                        .as_ref()
+                                        .is_none_or(|browser| !browser.is_scoped())
                                     && matches!(
                                         dialog_event.dialog_type.as_str(),
                                         "beforeunload" | "alert"
@@ -2180,6 +2494,9 @@ impl DaemonState {
                 }
                 Err(broadcast::error::TryRecvError::Empty) => break,
                 Err(broadcast::error::TryRecvError::Lagged(n)) => {
+                    if let Some(ref guard) = scope_guard {
+                        guard.invalidate();
+                    }
                     eprintln!("[agent-browser] Warning: CDP event buffer overflowed, {} events dropped. Network requests may be missing from HAR output.", n);
                     continue;
                 }
@@ -2195,6 +2512,7 @@ impl DaemonState {
         }
 
         DrainedEvents {
+            lifecycle_events,
             pending_acks,
             new_targets,
             changed_targets,
@@ -2203,6 +2521,7 @@ impl DaemonState {
             attached_iframe_sessions,
             attached_worker_sessions,
             attached_other_sessions,
+            rejected_scope_sessions,
             detached_iframe_sessions,
             har_finished_requests,
         }
@@ -2682,8 +3001,84 @@ fn policy_actions_for_command(
     actions
 }
 
+/// A scoped participant never becomes a second Fetch/auth or target lifecycle
+/// controller. Frame-document observation authorization is deliberately separate.
+fn validate_passive_scope_command(cmd: &Value) -> Result<(), String> {
+    let action = cmd.get("action").and_then(Value::as_str).unwrap_or("");
+    if matches!(action, "route" | "unroute" | "headers" | "offline")
+        || [
+            "headers",
+            "allowedDomains",
+            "proxy",
+            "proxyUsername",
+            "proxyPassword",
+        ]
+        .iter()
+        .any(|field| cmd.get(*field).is_some())
+    {
+        return Err("e2e_unsupported_capability".to_string());
+    }
+    Ok(())
+}
+
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
+    let id = cmd.get("id").and_then(Value::as_str).unwrap_or("");
+    if let Err(error) = super::contract::validate_expected_contract(cmd) {
+        return error_response(id, &error);
+    }
+    // This handshake must run before scope latching, event drains, policy,
+    // persistence, auto-launch or input state changes. It works without Chrome.
+    if cmd.get("action").and_then(Value::as_str) == Some("capabilities") {
+        return success_response(id, super::contract::capabilities());
+    }
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
+    // Latch before draining events, applying settings, or connecting. A daemon
+    // cannot shed or broaden its scope, even after its browser was closed.
+    if action != INTERNAL_DAEMON_SHUTDOWN_ACTION {
+        let id = cmd.get("id").and_then(Value::as_str).unwrap_or("");
+        let requested = match CdpScope::from_command(cmd) {
+            Ok(scope) => scope,
+            Err(error) => return error_response(id, &error),
+        };
+        if let Some(scope) = &state.cdp_scope {
+            if requested.as_ref() != Some(scope) {
+                return error_response(id, "CDP target/context scope is immutable for this daemon");
+            }
+        } else if requested.is_some() {
+            if has_active_browser_session(state) {
+                return error_response(id, "Cannot scope an already connected daemon");
+            }
+            state.cdp_scope = requested;
+        }
+        if state.cdp_scope.is_some() {
+            if let Err(error) = validate_passive_scope_command(cmd) {
+                return error_response(id, &error);
+            }
+        }
+        if state.cdp_scope.is_some()
+            && matches!(
+                action,
+                "inspect"
+                    | "cdp_url"
+                    | "state_save"
+                    | "state_load"
+                    | "trace_start"
+                    | "trace_stop"
+                    | "profiler_start"
+                    | "profiler_stop"
+                    | "recording_start"
+                    | "recording_stop"
+                    | "recording_restart"
+                    | "video_start"
+                    | "video_stop"
+                    | "waitfordownload"
+                    | "download"
+                    | "stream_enable"
+            )
+        {
+            return error_response(id, "e2e_unsupported_capability");
+        }
+    }
     // Unlike normal auth login, no-navigation mode must never launch a
     // browser or manufacture an about:blank page to satisfy the command.
     let auth_login_no_navigate = action == "auth_login"
@@ -2753,9 +3148,13 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         server.broadcast_command(action, &id, cmd_for_broadcast);
     }
 
-    // Drain and apply pending CDP events (console, errors, screencast frames, target lifecycle)
-    if let Err(e) = state.drain_cdp_events_background().await {
-        return error_response(&id, &super::browser::to_ai_friendly_error(&e));
+    // Shutdown does not need a live page and must not attach/probe/resume
+    // queued targets on its way out. Scope validation above still runs first.
+    let scoped_close = action == "close" && state.cdp_scope.is_some();
+    if !scoped_close {
+        if let Err(e) = state.drain_cdp_events_background().await {
+            return error_response(&id, &super::browser::to_ai_friendly_error(&e));
+        }
     }
 
     // Keep element resolution in sync with the `frame` selection (see
@@ -2901,6 +3300,17 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    // Keep the normal action-policy and confirmation checks above, but no
+    // restore transitions or event re-drains may resurrect a closing scope.
+    if scoped_close {
+        let mut response = match handle_close(state).await {
+            Ok(data) => success_response(&id, data),
+            Err(error) => error_response(&id, &super::browser::to_ai_friendly_error(&error)),
+        };
+        inject_lifecycle(&mut response, state, false, false, false);
+        return response;
+    }
+
     let restore_transition_closed_browser = match async {
         if auth_login_no_navigate && command_changes_restore_key(cmd, state) {
             return Err(
@@ -3029,6 +3439,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "evaluate" => handle_evaluate(cmd, state).await,
         "close" => handle_close(state).await,
         "snapshot" => handle_snapshot(cmd, state).await,
+        "ref" => handle_exact_ref(cmd, state).await,
         "screenshot" => handle_screenshot(cmd, state).await,
         "click" => handle_click(cmd, state).await,
         "dblclick" => handle_dblclick(cmd, state).await,
@@ -3184,6 +3595,9 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         "keydown" => handle_keydown(cmd, state).await,
         "keyup" => handle_keyup(cmd, state).await,
         "inserttext" => handle_inserttext(cmd, state).await,
+        "mousestate" => Ok(
+            json!({"x":state.mouse_state.x,"y":state.mouse_state.y,"buttons":state.mouse_state.buttons}),
+        ),
         "mousemove" => handle_mousemove(cmd, state).await,
         "mousedown" => handle_mousedown(cmd, state).await,
         "mouseup" => handle_mouseup(cmd, state).await,
@@ -3344,7 +3758,28 @@ fn maybe_persist_tab_binding(state: &mut DaemonState) -> Option<String> {
 /// re-bound to the persisted target, entered the `tab_gone` state (pin-tab,
 /// bound tab dead), or bound to a fresh tab (pin-tab, no prior binding).
 /// Returns false when no binding existed and the legacy selection stands.
+async fn enable_scoped_domains_or_rollback(state: &mut DaemonState) -> Result<(), String> {
+    let result = match state.browser.as_ref() {
+        Some(manager) => manager.enable_active_scoped_domains().await,
+        None => Ok(()),
+    };
+    if let Err(error) = result {
+        let _ = rollback_failed_launch(state).await;
+        return Err(error);
+    }
+    Ok(())
+}
+
 async fn apply_tab_binding_on_attach(state: &mut DaemonState) -> Result<bool, String> {
+    if state.cdp_scope.is_some() {
+        // The explicit target is authoritative. Persisted bindings must never
+        // restore a different page or manufacture a blank fallback page.
+        if let Some(manager) = state.browser.as_mut() {
+            manager.set_pin_tab(true);
+        }
+        state.pin_tab = true;
+        return Ok(true);
+    }
     let session = state.session_id.clone();
     // A corrupt or unreadable binding file is a recovery error, not a
     // first-time session: it may have carried pinned=true, and silently
@@ -3708,7 +4143,11 @@ fn allowed_domains_disallowed_chrome_arg(args: &[String]) -> Option<&'static str
     None
 }
 
-async fn prepare_auto_attached_session(client: &CdpClient, session_id: &str) -> Result<(), String> {
+async fn prepare_auto_attached_session(
+    client: &CdpClient,
+    session_id: &str,
+    owns_debugger_pause: bool,
+) -> Result<(), String> {
     client
         .send_command_no_params("Page.enable", Some(session_id))
         .await?;
@@ -3723,7 +4162,7 @@ async fn prepare_auto_attached_session(client: &CdpClient, session_id: &str) -> 
             "Target.setAutoAttach",
             Some(json!({
                 "autoAttach": true,
-                "waitForDebuggerOnStart": true,
+                "waitForDebuggerOnStart": owns_debugger_pause,
                 "flatten": true
             })),
             Some(session_id),
@@ -3751,11 +4190,12 @@ async fn prepare_network_control_target_session(
     client: &CdpClient,
     session_id: &str,
     target: &TargetInfo,
+    owns_debugger_pause: bool,
 ) -> Result<(), String> {
     if target_is_worker_like(target) {
         Ok(())
     } else {
-        prepare_auto_attached_session(client, session_id).await
+        prepare_auto_attached_session(client, session_id, owns_debugger_pause).await
     }
 }
 
@@ -3803,6 +4243,10 @@ async fn install_active_network_controls(
     handle_auth_requests: bool,
 ) -> Result<(), String> {
     let filter = state.domain_filter.read().await.clone();
+    if state.cdp_scope.is_some() && network_controls_required(filter.as_ref(), handle_auth_requests)
+    {
+        return Err("e2e_unsupported_capability".to_string());
+    }
     if !network_controls_required(filter.as_ref(), handle_auth_requests) {
         return Ok(());
     }
@@ -4081,10 +4525,17 @@ async fn auto_launch_inner(
     state: &mut DaemonState,
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
+    let mut options = launch_options_from_env();
+    if state.cdp_scope.is_some()
+        && (options.proxy_username.is_some()
+            || options.proxy_password.is_some()
+            || !current_allowed_domains(state).await.is_empty())
+    {
+        return Err("e2e_unsupported_capability".to_string());
+    }
     if has_active_browser_session(state) {
         close_before_implicit_relaunch(state).await?;
     }
-    let mut options = launch_options_from_env();
     let effective_ca_cert = state.effective_ca_cert.clone();
     apply_effective_ca_cert(&mut options, &effective_ca_cert);
     state.plugin_init_scripts.clear();
@@ -4097,6 +4548,9 @@ async fn auto_launch_inner(
     }
     let engine = env::var("AGENT_BROWSER_ENGINE").ok();
     let cdp = env::var("AGENT_BROWSER_CDP").ok();
+    if state.cdp_scope.is_some() && cdp.is_none() {
+        return Err("Scoped CDP sessions require an explicit CDP endpoint".to_string());
+    }
     let auto_connect = env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
     let provider = env::var("AGENT_BROWSER_PROVIDER").ok();
     validate_ca_cert_launch_mode(
@@ -4139,7 +4593,7 @@ async fn auto_launch_inner(
             restore_key: restore_key.as_deref(),
             storage_state,
         })?;
-        let mgr = BrowserManager::connect_cdp(&cdp).await?;
+        let mgr = BrowserManager::connect_cdp_scoped(&cdp, state.cdp_scope.clone()).await?;
         let hash = launch_hash(
             &options,
             &allowed_domains,
@@ -4156,12 +4610,15 @@ async fn auto_launch_inner(
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
+        enable_scoped_domains_or_rollback(state).await?;
         apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
         apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
         try_auto_restore_state(state).await;
-        try_load_storage_state(state, &storage_state_path).await;
+        if state.cdp_scope.is_none() {
+            try_load_storage_state(state, &storage_state_path).await;
+        }
         return Ok(());
     }
 
@@ -4578,6 +5035,11 @@ fn no_xvfb_from_launch_cmd(cmd: &Value) -> bool {
 }
 
 async fn try_auto_restore_state(state: &mut DaemonState) {
+    if state.cdp_scope.is_some() {
+        state.restore_status = "disabled_scoped_cdp".to_string();
+        state.restore_validation_pending = false;
+        return;
+    }
     let session_name = match state.session_name.as_deref() {
         Some(n) if !n.is_empty() => n.to_string(),
         _ => {
@@ -4743,6 +5205,11 @@ pub(crate) async fn maybe_autosave_restore_state(state: &mut DaemonState, interv
 pub(crate) async fn auto_save_restore_state(
     state: &mut DaemonState,
 ) -> Result<Option<String>, String> {
+    if state.cdp_scope.is_some() {
+        state.restore_save_status = "disabled_scoped_cdp".to_string();
+        state.restore_saved_path = None;
+        return Ok(None);
+    }
     validate_restore_if_pending(state).await;
 
     let Some(session_name) = state.session_name.clone() else {
@@ -4907,6 +5374,9 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         .unwrap_or_else(|| !headed_from_env());
     let cdp_url = cmd.get("cdpUrl").and_then(|v| v.as_str());
     let cdp_port = cmd.get("cdpPort").and_then(|v| v.as_u64());
+    if state.cdp_scope.is_some() && cdp_url.is_none() && cdp_port.is_none() {
+        return Err("Scoped CDP sessions require an explicit CDP endpoint".to_string());
+    }
     let auto_connect = cmd
         .get("autoConnect")
         .and_then(|v| v.as_bool())
@@ -4925,6 +5395,9 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         });
     let storage_state = cmd.get("storageState").and_then(|v| v.as_str());
     let storage_state_owned = storage_state.map(|s| s.to_string());
+    if state.cdp_scope.is_some() && storage_state.is_some() {
+        return Err("e2e_unsupported_capability".to_string());
+    }
     let engine = cmd
         .get("engine")
         .and_then(|v| v.as_str())
@@ -5050,6 +5523,13 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
         }
     }
     apply_effective_ca_cert(&mut launch_options, &effective_ca_cert);
+    if state.cdp_scope.is_some()
+        && (launch_options.proxy_username.is_some()
+            || launch_options.proxy_password.is_some()
+            || !allowed_domains.is_empty())
+    {
+        return Err("e2e_unsupported_capability".to_string());
+    }
 
     let external_launch =
         cdp_url.is_some() || cdp_port.is_some() || auto_connect || provider_name.is_some();
@@ -5160,11 +5640,13 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
 
     if let Some(url) = cdp_url {
         state.reset_input_state();
-        state.browser = Some(BrowserManager::connect_cdp(url).await?);
+        state.browser =
+            Some(BrowserManager::connect_cdp_scoped(url, state.cdp_scope.clone()).await?);
         state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
+        enable_scoped_domains_or_rollback(state).await?;
         apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
@@ -5177,11 +5659,14 @@ async fn handle_launch_inner(cmd: &Value, state: &mut DaemonState) -> Result<Val
 
     if let Some(port) = cdp_port {
         state.reset_input_state();
-        state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
+        state.browser = Some(
+            BrowserManager::connect_cdp_scoped(&port.to_string(), state.cdp_scope.clone()).await?,
+        );
         state.launch_hash = Some(new_hash);
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
+        enable_scoped_domains_or_rollback(state).await?;
         apply_tab_binding_on_attach_or_rollback(state).await?;
         state.update_stream_client().await;
         install_network_controls_or_close(state, has_proxy_auth).await?;
@@ -5765,6 +6250,176 @@ async fn handle_close(state: &mut DaemonState) -> Result<Value, String> {
 // Phase 2 handlers
 // ---------------------------------------------------------------------------
 
+fn exact_ref_frame_in_tree(tree: &Value, frame_id: &str) -> bool {
+    tree["frame"]["id"].as_str() == Some(frame_id)
+        || tree["childFrames"].as_array().is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| exact_ref_frame_in_tree(child, frame_id))
+        })
+}
+
+/// Registers a same-target backend node through the public CLI, never by role/name.
+/// Renderer-local Page.getFrameTree omits OOPIF children. Admit another
+/// renderer only through its root's exact parent chain from the active page.
+fn exact_ref_frame_scope(
+    top: &Value,
+    others: &[(String, Value)],
+) -> (HashSet<String>, Vec<String>) {
+    fn collect(tree: &Value, frames: &mut HashSet<String>) {
+        if let Some(id) = tree["frame"]["id"].as_str() {
+            frames.insert(id.to_string());
+        }
+        if let Some(children) = tree["childFrames"].as_array() {
+            for child in children {
+                collect(child, frames);
+            }
+        }
+    }
+    let mut frames = HashSet::new();
+    collect(top, &mut frames);
+    let mut sessions = Vec::new();
+    let mut pending: Vec<usize> = (0..others.len()).collect();
+    loop {
+        let before = pending.len();
+        pending.retain(|index| {
+            let (session, tree) = &others[*index];
+            let root = &tree["frameTree"]["frame"];
+            let proven = root["parentId"]
+                .as_str()
+                .is_some_and(|parent| frames.contains(parent));
+            if proven {
+                collect(&tree["frameTree"], &mut frames);
+                sessions.push(session.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if pending.len() == before {
+            break;
+        }
+    }
+    (frames, sessions)
+}
+
+async fn handle_exact_ref(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let backend_id = cmd
+        .get("backendNodeId")
+        .and_then(Value::as_i64)
+        .filter(|value| *value > 0)
+        .ok_or("Invalid backend node id")?;
+    let frame_id = cmd.get("frameId").and_then(Value::as_str);
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?.to_string();
+    let tree = mgr
+        .client
+        .send_command_no_params("Page.getFrameTree", Some(&session_id))
+        .await?;
+    let requested = frame_id
+        .or_else(|| tree["frameTree"]["frame"]["id"].as_str())
+        .ok_or("Active frame is unavailable")?;
+    let mut iframe_sessions: Vec<String> = state.iframe_sessions.values().cloned().collect();
+    iframe_sessions.sort();
+    iframe_sessions.dedup();
+    let guard = mgr.scope_guard();
+    let mut subtrees = Vec::new();
+    for candidate in iframe_sessions {
+        if candidate == session_id || !guard.accepts_session(Some(&candidate)) {
+            continue;
+        }
+        if let Ok(subtree) = mgr
+            .client
+            .send_command_no_params("Page.getFrameTree", Some(&candidate))
+            .await
+        {
+            subtrees.push((candidate, subtree));
+        }
+    }
+    let (frames, owned_sessions) = exact_ref_frame_scope(&tree["frameTree"], &subtrees);
+    if !frames.contains(requested) {
+        return Err("Exact ref frame does not belong to the active page".into());
+    }
+    let mut sessions = vec![session_id.clone()];
+    sessions.extend(owned_sessions);
+    let mut binding = None;
+    for candidate in sessions {
+        let Ok(world) = mgr
+            .client
+            .send_command(
+                "Page.createIsolatedWorld",
+                Some(json!({"frameId":requested,"worldName":"agent-browser-exact-refs"})),
+                Some(&candidate),
+            )
+            .await
+        else {
+            continue;
+        };
+        let Some(context) = world["executionContextId"].as_i64() else {
+            continue;
+        };
+        let Ok(resolved) = mgr
+            .client
+            .send_command(
+                "DOM.resolveNode",
+                Some(json!({"backendNodeId":backend_id,"executionContextId":context})),
+                Some(&candidate),
+            )
+            .await
+        else {
+            continue;
+        };
+        let Some(object) = resolved["object"]["objectId"].as_str() else {
+            continue;
+        };
+        let checked=mgr.client.send_command("Runtime.callFunctionOn",Some(json!({"objectId":object,"functionDeclaration":"function(){return this.nodeType===1&&this.isConnected&&this.ownerDocument===document}","returnByValue":true})),Some(&candidate)).await;
+        let _ = mgr
+            .client
+            .send_command(
+                "Runtime.releaseObject",
+                Some(json!({"objectId":object})),
+                Some(&candidate),
+            )
+            .await;
+        if checked
+            .as_ref()
+            .ok()
+            .and_then(|value| value["result"]["value"].as_bool())
+            == Some(true)
+        {
+            binding = Some((candidate, context));
+            break;
+        }
+    }
+    let (bound_session, context_id) =
+        binding.ok_or("Exact backend node does not belong to the requested connected document")?;
+    // Resolving through the active target session (or its attached frame session)
+    // rejects backend ids from a different tab. Connectedness is checked before
+    // publishing the ref; the normal action path checks it again at dispatch.
+    let next = state.ref_map.next_ref_num();
+    let ref_id = format!("e{next}");
+    state.ref_map.set_next_ref_num(next + 1);
+    state
+        .ref_map
+        .add_exact_with_frame(ref_id.clone(), backend_id, "", "", None, frame_id);
+    state
+        .ref_map
+        .bind_world(&ref_id, &bound_session, context_id);
+    if let Err(error) = super::element::resolve_element_object_id(
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        &format!("@{ref_id}"),
+        &state.iframe_sessions,
+    )
+    .await
+    {
+        state.ref_map.remove(&ref_id);
+        return Err(error);
+    }
+    Ok(json!({"ref":ref_id,"backendNodeId":backend_id,"frameId":frame_id}))
+}
+
 async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
@@ -5787,15 +6442,25 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
             .and_then(|v| v.as_u64())
             .map(|d| d as usize),
         urls: cmd.get("urls").and_then(|v| v.as_bool()).unwrap_or(false),
+        exact_refs: cmd
+            .get("exactRefs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        allowed_frame_documents: cmd
+            .get("allowedFrameDocuments")
+            .map(|value| serde_json::from_value::<HashMap<String, String>>(value.clone()))
+            .transpose()
+            .map_err(|_| "Invalid allowed frame documents".to_string())?,
     };
 
     let previous_refs = state.ref_map.ref_ids();
-    state.ref_map.begin_snapshot();
+    let mut snapshot_refs = state.ref_map.clone();
+    snapshot_refs.begin_snapshot();
     let tree = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
-        &mut state.ref_map,
+        &mut snapshot_refs,
         state.active_frame_id.as_deref(),
         &state.iframe_sessions,
     )
@@ -5803,19 +6468,29 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     let url = mgr.get_url().await.unwrap_or_default();
 
-    let refs: serde_json::Map<String, Value> = state
-        .ref_map
+    let refs: serde_json::Map<String, Value> = snapshot_refs
         .entries_sorted()
         .into_iter()
         .map(|(ref_id, entry)| {
             let mut obj = serde_json::Map::new();
             obj.insert("role".into(), Value::String(entry.role));
             obj.insert("name".into(), Value::String(entry.name));
+            obj.insert("backendNodeId".into(), json!(entry.backend_node_id));
+            obj.insert("frameId".into(), json!(entry.frame_id));
             (ref_id, Value::Object(obj))
         })
         .collect();
 
-    let current_refs = state.ref_map.ref_ids();
+    let current_refs = snapshot_refs.ref_ids();
+    if cmd
+        .get("preserveRefs")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        state.ref_map.merge_snapshot(snapshot_refs)?;
+    } else {
+        state.ref_map = snapshot_refs;
+    }
     let mut removed_refs = previous_refs
         .difference(&current_refs)
         .map(|ref_id| format!("@{}", ref_id))
@@ -5829,7 +6504,7 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     if !cmd.get("delta").and_then(Value::as_bool).unwrap_or(false) {
         return Ok(
-            json!({ "snapshot": tree, "origin": url, "refs": refs, "removedRefs": removed_refs }),
+            json!({ "snapshot": tree, "origin": url, "refs": refs, "removedRefs": removed_refs, "exactRefs": options.exact_refs, "complete":!options.interactive && !options.compact && options.depth.is_none() && options.selector.is_none() }),
         );
     }
 
@@ -5839,6 +6514,8 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         "compact": options.compact,
         "depth": options.depth,
         "urls": options.urls,
+        "exactRefs": options.exact_refs,
+        "allowedFrameDocuments":options.allowed_frame_documents,
     }))
     .unwrap_or_default();
     let previous = state.snapshot_revisions.get(&session_id).cloned();
@@ -5847,7 +6524,7 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         || previous
             .as_ref()
             .is_none_or(|entry| entry.url != url || entry.options != options_key);
-    let response = if force_full {
+    let mut response = if force_full {
         json!({
             "snapshot": { "kind": "full", "revision": revision, "tree": tree, "refs": refs },
             "origin": url,
@@ -5855,6 +6532,8 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     } else {
         snapshot_delta_response(previous.as_ref().unwrap(), revision, &tree, &refs, &url)
     };
+
+    response["exactRefs"] = json!(options.exact_refs);
 
     if state.snapshot_revisions.len() >= 32 && !state.snapshot_revisions.contains_key(&session_id) {
         if let Some(oldest_key) = state
@@ -6337,13 +7016,14 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .await?;
     }
 
-    let result = interaction::click(
+    let result = interaction::click_with_modifiers(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
         button,
         click_count,
+        cmd.get("modifiers").and_then(Value::as_i64).unwrap_or(0) as i32,
         &state.iframe_sessions,
     )
     .await?;
@@ -6368,11 +7048,14 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    let result = interaction::dblclick(
+    let result = interaction::click_with_modifiers(
         &mgr.client,
         &session_id,
         &state.ref_map,
         selector,
+        "left",
+        2,
+        cmd.get("modifiers").and_then(Value::as_i64).unwrap_or(0) as i32,
         &state.iframe_sessions,
     )
     .await?;
@@ -6587,6 +7270,7 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         &state.ref_map,
         selector,
         &values,
+        cmd.get("mode").and_then(Value::as_str).unwrap_or("auto"),
         &state.iframe_sessions,
     )
     .await?;
@@ -7515,8 +8199,17 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'text' parameter")?;
-            interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
-                .await?;
+            if cmd
+                .get("physical")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                interaction::type_keys_into_active_context(&mgr.client, &session_id, text, None)
+                    .await?;
+            } else {
+                interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
+                    .await?;
+            }
             return Ok(json!({ "typed": text }));
         }
         Some("insertText") => {
@@ -7633,6 +8326,23 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
         let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
         mgr.resolve_tab_ref(&tab_ref)?
     };
+    if cmd
+        .get("noActivate")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let result = state
+            .browser
+            .as_mut()
+            .ok_or("Browser not launched")?
+            .tab_bind_by_id(tab_id)
+            .await?;
+        state.ref_map.begin_snapshot();
+        state.active_frame_id = None;
+        state.webmcp.clear_invocations();
+        state.refresh_active_iframe_sessions().await;
+        return Ok(result);
+    }
     let dialog_session = state
         .pending_dialog
         .as_ref()
@@ -11106,24 +11816,25 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
     let (tab_id, session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
 
-        // Create a new browser context
-        let context_result = mgr
-            .client
-            .send_command_no_params("Target.createBrowserContext", None)
-            .await?;
-        let context_id = context_result
-            .get("browserContextId")
-            .and_then(|v| v.as_str())
-            .ok_or("Failed to create browser context")?
-            .to_string();
+        let create_params = if mgr.is_scoped() {
+            let mut params = mgr.target_parameters("about:blank");
+            params["newWindow"] = json!(true);
+            params
+        } else {
+            let context_result = mgr
+                .client
+                .send_command_no_params("Target.createBrowserContext", None)
+                .await?;
+            let context_id = context_result
+                .get("browserContextId")
+                .and_then(Value::as_str)
+                .ok_or("Failed to create browser context")?;
+            json!({"url":"about:blank", "browserContextId":context_id})
+        };
 
         let create_result: super::cdp::types::CreateTargetResult = mgr
             .client
-            .send_command_typed(
-                "Target.createTarget",
-                &json!({ "url": "about:blank", "browserContextId": context_id }),
-                None,
-            )
+            .send_command_typed("Target.createTarget", &create_params, None)
             .await?;
 
         let attach: super::cdp::types::AttachToTargetResult = mgr
@@ -11138,6 +11849,12 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             )
             .await?;
 
+        if !mgr
+            .scope_guard()
+            .register_session(&attach.session_id, &create_result.target_id, None)
+        {
+            return Err("Cannot establish scoped CDP window session".to_string());
+        }
         mgr.prepare_domains_pub(&attach.session_id).await?;
 
         let tab_id = mgr.assign_tab_id();
@@ -13414,10 +14131,21 @@ async fn move_mouse_interpolated(
             cursor.record(mouse_state.x, mouse_state.y, buttons);
         }
         if let Some((started, duration)) = schedule {
-            tokio::time::sleep_until(started + duration.mul_f64(i as f64 / steps as f64)).await;
+            wait_for_mouse_step_deadline(started, duration, i, steps).await;
         }
     }
     Ok(())
+}
+
+/// Each completed dispatch waits only until its slot on the original clock.
+/// A slow CDP reply can exhaust a slot, but must never start another full delay.
+async fn wait_for_mouse_step_deadline(
+    started: tokio::time::Instant,
+    duration: tokio::time::Duration,
+    step: usize,
+    steps: usize,
+) {
+    tokio::time::sleep_until(started + duration.mul_f64(step as f64 / steps as f64)).await;
 }
 
 fn interpolated_mouse_steps(
@@ -13713,7 +14441,25 @@ fn error_response(id: &str, error: &str) -> Value {
     });
     // Machine-readable code for "the bound tab no longer exists" so scripts
     // using --json can match on it instead of parsing the message.
-    if error.starts_with(super::browser::TAB_GONE_PREFIX) {
+    if error.starts_with(super::contract::CONTRACT_MISMATCH_PREFIX) {
+        resp["code"] = json!("contract_mismatch");
+        resp["data"] = json!({"dispatched":false});
+    } else if error == "e2e_not_actionable" || error == "e2e_unsupported_capability" {
+        resp["code"] = json!(if error == "e2e_not_actionable" {
+            "not_actionable"
+        } else {
+            "unsupported_capability"
+        });
+        resp["data"] = json!({"dispatched":false});
+    } else if let Some(ref_id) = error.strip_prefix(super::element::STALE_REF_PREFIX) {
+        if ref_id
+            .strip_prefix('e')
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            resp["code"] = json!("node_stale");
+            resp["data"] = json!({"dispatched":false});
+        }
+    } else if error.starts_with(super::browser::TAB_GONE_PREFIX) {
         resp["code"] = json!("tab_gone");
     } else if let Some((code, _)) = error.split_once(": ") {
         if code.starts_with("webmcp_") {
@@ -13745,11 +14491,84 @@ fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
 #[cfg(test)]
 mod tests {
     #[tokio::test]
+    async fn capabilities_are_browser_free_and_do_not_latch_scope() {
+        let mut state = DaemonState::new();
+        let result = execute_command(
+            &json!({
+                "id":"capabilities", "action":"capabilities",
+                "expectedContract":super::super::contract::CONTRACT_VERSION,
+                "cdpTarget":"ignored", "cdpContext":"ignored",
+                "defaultInputMode":"human", "restoreKey":"do-not-save"
+            }),
+            &mut state,
+        )
+        .await;
+        assert_eq!(result["success"], true);
+        assert_eq!(result["data"]["contractVersion"], "e2e-exact-1");
+        assert!(state.browser.is_none());
+        assert!(state.cdp_scope.is_none());
+        assert_eq!(state.input_mode, "instant");
+    }
+
+    #[tokio::test]
+    async fn mismatched_contract_rejects_before_launch_scope_or_settings() {
+        let mut state = DaemonState::new();
+        for action in ["capabilities", "launch", "click", "close"] {
+            let result = execute_command(
+                &json!({
+                    "id":"mismatch", "action":action, "expectedContract":"e2e-exact-0",
+                    "cdpTarget":"t", "cdpContext":"default", "cdpDedicated":true,
+                    "defaultInputMode":"human"
+                }),
+                &mut state,
+            )
+            .await;
+            assert_eq!(result["code"], "contract_mismatch");
+            assert_eq!(result["data"]["dispatched"], false);
+            assert!(state.browser.is_none());
+            assert!(state.cdp_scope.is_none());
+            assert_eq!(state.input_mode, "instant");
+        }
+    }
+
+    #[tokio::test]
+    async fn passive_scope_rejects_fetch_ownership_before_browser_start() {
+        for command in [
+            json!({"action":"route"}),
+            json!({"action":"unroute"}),
+            json!({"action":"navigate","headers":{"Authorization":"fake"}}),
+            json!({"action":"launch","allowedDomains":["example.test"]}),
+            json!({"action":"launch","proxy":{"username":"fixture"}}),
+        ] {
+            let mut state = DaemonState::new();
+            let mut command = command;
+            command["cdpTarget"] = json!("t");
+            command["cdpContext"] = json!("default");
+            command["cdpDedicated"] = json!(true);
+            let result = execute_command(&command, &mut state).await;
+            assert_eq!(result["code"], "unsupported_capability");
+            assert_eq!(result["data"]["dispatched"], false);
+            assert!(state.browser.is_none());
+        }
+        assert!(validate_passive_scope_command(&json!({
+            "action":"snapshot", "allowedFrameDocuments":{"frame":"https://example.test"}
+        }))
+        .is_ok());
+    }
+
+    #[tokio::test]
     async fn test_auth_login_releases_remote_objects_after_failures() {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
-        for failure in ["selection", "describe", "fill-exception", "fill-protocol"] {
+        for failure in [
+            "selection",
+            "describe",
+            "fill-exception",
+            "fill-protocol",
+            "gate-exception",
+            "gate-protocol",
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
@@ -13783,12 +14602,15 @@ mod tests {
                         "DOM.resolveNode" => {
                             json!({ "object": { "type": "object", "objectId": "login-node" } })
                         }
-                        "Runtime.callFunctionOn" if failure == "fill-exception" => json!({
+                        "Runtime.callFunctionOn" if request["params"]["functionDeclaration"].as_str().is_some_and(|source|source == "function() { return this.isConnected === true && (this.nodeType === 9 || this.ownerDocument === document); }") && !failure.starts_with("gate") => {
+                            json!({ "result": { "type": "boolean", "value": true } })
+                        }
+                        "Runtime.callFunctionOn" if failure == "fill-exception" || failure == "gate-exception" => json!({
                             "result": { "type": "object", "objectId": "rejected-result" },
                             "exceptionDetails": { "text": "Page exception",
                                 "exception": { "type": "object", "objectId": "exception" } }
                         }),
-                        "Runtime.callFunctionOn" if failure == "fill-protocol" => {
+                        "Runtime.callFunctionOn" if failure == "fill-protocol" || failure == "gate-protocol" => {
                             response["error"] = json!({ "code": -32000, "message": "CDP failure" });
                             Value::Null
                         }
@@ -13813,18 +14635,451 @@ mod tests {
             let filled = element.fill(&client, "session", "test-value").await;
             client.close().await;
             let (attempts, mut releases) = server.await.unwrap();
-            assert_eq!(filled.is_ok(), !failure.starts_with("fill"), "{failure}");
-            assert_eq!(attempts, if failure.starts_with("fill") { 1 } else { 2 });
+            let failed = failure.starts_with("fill") || failure.starts_with("gate");
+            assert_eq!(filled.is_ok(), !failed, "{failure}");
+            assert_eq!(attempts, if failed { 1 } else { 2 });
             let mut expected = match failure {
                 "selection" => vec!["exception", "rejected-result", "node-2", "login-node"],
                 "describe" => vec!["node-1", "node-2", "login-node"],
-                "fill-exception" => vec!["node-1", "rejected-result", "exception", "login-node"],
+                "fill-exception" | "gate-exception" => {
+                    vec!["node-1", "rejected-result", "exception", "login-node"]
+                }
                 _ => vec!["node-1", "login-node"],
             };
             releases.sort();
             expected.sort();
             assert_eq!(releases, expected, "{failure}");
         }
+    }
+
+    #[test]
+    fn scoped_lifetime_dispatch_future_stays_bounded() {
+        let mut state = DaemonState::new();
+        let command = json!({"id":"future-size","action":"tab_list"});
+        let future = execute_command(&command, &mut state);
+        let bytes = std::mem::size_of_val(&future);
+        // The test-thread default is 2 MiB; allow normal dispatch growth but
+        // never embed nested target-setup state machines near that stack limit.
+        assert!(bytes <= 512 * 1024, "Command dispatch future is {bytes} bytes; heap-box nested setup futures instead of raising thread stack limits");
+    }
+
+    #[tokio::test]
+    async fn scoped_dead_probe_setup_releases_command_lock_without_late_publication() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        for scenario in [
+            "queued-destroy",
+            "between-drain",
+            "attach-destroy",
+            "page-destroy",
+            "runtime-detach",
+            "live-unrelated",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let commands = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+            let observed = commands.clone();
+            let (stalled_tx, stalled_rx) = oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let mut stalled_tx = Some(stalled_tx);
+                let mut late: Option<Value> = None;
+                while let Some(Ok(message)) = ws.next().await {
+                    let text = match message {
+                        Message::Text(text) => text,
+                        Message::Close(_) => break,
+                        Message::Ping(payload) => {
+                            ws.send(Message::Pong(payload)).await.unwrap();
+                            continue;
+                        }
+                        _ => continue,
+                    };
+                    let command: Value = serde_json::from_str(&text).unwrap();
+                    observed.lock().unwrap().push(command.clone());
+                    let method = command["method"].as_str().unwrap();
+                    let probe_attach = method == "Target.attachToTarget"
+                        && command["params"]["targetId"] == "probe";
+                    let probe_session = command["sessionId"] == "probe-session";
+                    if method == "Browser.getVersion"
+                        && command["params"]["queueDestruction"] == true
+                    {
+                        if scenario == "queued-destroy" {
+                            let target = json!({"targetId":"probe","type":"page","url":"about:blank","title":"","browserContextId":"owned"});
+                            for event in [
+                                json!({"method":"Target.targetCreated","params":{"targetInfo":target.clone()}}),
+                                json!({"method":"Target.attachedToTarget","params":{"sessionId":"probe-session","targetInfo":target,"waitingForDebugger":false}}),
+                            ] {
+                                ws.send(Message::Text(event.to_string())).await.unwrap();
+                            }
+                        }
+                        ws.send(Message::Text(json!({"method":"Target.targetDestroyed","params":{"targetId":"probe"}}).to_string())).await.unwrap();
+                        stalled_tx.take().unwrap().send(()).unwrap();
+                    }
+                    let trigger = match scenario {
+                        "attach-destroy" => probe_attach,
+                        "runtime-detach" => probe_session && method == "Runtime.enable",
+                        _ => probe_session && method == "Page.enable",
+                    };
+                    if trigger && stalled_tx.is_some() {
+                        // Chromium can drop the renderer command reply when its
+                        // target goes away while the browser socket stays open.
+                        let event = if scenario == "runtime-detach" {
+                            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"probe-session"}})
+                        } else {
+                            json!({"method":"Target.targetDestroyed","params":{"targetId":if scenario == "live-unrelated" { "unrelated" } else { "probe" }}})
+                        };
+                        ws.send(Message::Text(event.to_string())).await.unwrap();
+                        stalled_tx.take().unwrap().send(()).unwrap();
+                        if scenario != "live-unrelated" {
+                            late = Some(command);
+                            continue;
+                        }
+                        // An unrelated target's death must not cancel this setup.
+                    }
+                    if method == "Browser.getVersion" {
+                        if let Some(previous) = late.take() {
+                            let result = if previous["method"] == "Target.attachToTarget" {
+                                json!({"sessionId":"probe-session"})
+                            } else {
+                                json!({})
+                            };
+                            ws.send(Message::Text(
+                                json!({"id":previous["id"],"result":result}).to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                    }
+                    let result = match method {
+                        "Target.getTargets" => {
+                            json!({"targetInfos":[{"targetId":"selected","type":"page","url":"about:blank","title":"","browserContextId":"owned"}]})
+                        }
+                        "Target.attachToTarget" => {
+                            json!({"sessionId":if probe_attach {"probe-session"} else {"selected-session"}})
+                        }
+                        "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
+                        "Browser.getVersion" => json!({"product":"independent-response"}),
+                        _ => json!({}),
+                    };
+                    ws.send(Message::Text(
+                        json!({"id":command["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+            });
+            let scope = CdpScope {
+                initial_target: "selected".into(),
+                context_id: Some("owned".into()),
+            };
+            let manager = BrowserManager::connect_cdp_scoped(&url, Some(scope.clone()))
+                .await
+                .unwrap();
+            let client = manager.client.clone();
+            let guard = manager.scope_guard();
+            let mut state = DaemonState::new();
+            state.cdp_scope = Some(scope);
+            state.browser = Some(manager);
+            state.subscribe_to_browser_events();
+            // No fetch subscriber: the lifetime watcher must work independently
+            // of consumers which can be blocked preparing the same target.
+            let state = Arc::new(tokio::sync::Mutex::new(state));
+            let background_state = state.clone();
+            let background = tokio::spawn(async move {
+                let mut state = background_state.lock().await;
+                let client = state.browser.as_ref().unwrap().client.clone();
+                if scenario == "queued-destroy" {
+                    client
+                        .send_command(
+                            "Browser.getVersion",
+                            Some(json!({"queueDestruction":true})),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                let mut drained = state.drain_cdp_events();
+                if scenario != "queued-destroy" {
+                    drained.new_targets.push(serde_json::from_value(json!({"targetInfo":{
+                        "targetId":"probe","type":"page","url":"about:blank","title":"","browserContextId":"owned"
+                    }})).unwrap());
+                }
+                if scenario == "between-drain" {
+                    // Destroyed after the ordinary batch was collected but
+                    // before setup starts: its retained watcher closes the gap.
+                    client
+                        .send_command(
+                            "Browser.getVersion",
+                            Some(json!({"queueDestruction":true})),
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                state.apply_drained_events(drained).await.unwrap();
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(2), stalled_rx)
+                .await
+                .unwrap()
+                .unwrap();
+            let tabs = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                let mut state = state.lock().await;
+                execute_command(&json!({"id":"list","action":"tab_list","cdpDedicated":true,"cdpTarget":"selected","cdpContext":"owned"}), &mut state).await
+            }).await.expect("A dead probe must release the command lock without the 30-second CDP timeout");
+            assert_eq!(tabs["success"], true, "{scenario}: {tabs}");
+            let tabs = tabs["data"]["tabs"].as_array().unwrap();
+            assert!(tabs
+                .iter()
+                .any(|tab| tab["targetId"] == "selected" && tab["active"] == true));
+            assert_eq!(
+                tabs.iter().any(|tab| tab["targetId"] == "probe"),
+                scenario == "live-unrelated",
+                "cancelled setup published a page: {scenario}"
+            );
+            assert!(guard.accepts_session(Some("selected-session")));
+            assert_eq!(
+                guard.accepts_session(Some("probe-session")),
+                scenario == "live-unrelated"
+            );
+            background.await.unwrap();
+            // A delayed reply keeps its old command id and cannot satisfy this
+            // unrelated request or resurrect the cancelled setup future.
+            let result = client
+                .send_command_no_params("Browser.getVersion", None)
+                .await
+                .unwrap();
+            assert_eq!(result["product"], "independent-response");
+            let mut state = state.lock().await;
+            assert_eq!(
+                state
+                    .browser
+                    .as_ref()
+                    .unwrap()
+                    .tab_list()
+                    .iter()
+                    .any(|tab| tab["targetId"] == "probe"),
+                scenario == "live-unrelated"
+            );
+            let close = tokio::time::timeout(std::time::Duration::from_secs(2), execute_command(
+                &json!({"id":"close","action":"close","cdpDedicated":true,"cdpTarget":"selected","cdpContext":"owned"}), &mut state)).await.unwrap();
+            assert_eq!(close["success"], true, "{scenario}: {close}");
+            drop(state);
+            tokio::time::timeout(std::time::Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let observed = commands.lock().unwrap();
+            assert!(!observed
+                .iter()
+                .any(|command| command["method"] == "Runtime.runIfWaitingForDebugger"));
+            if scenario != "live-unrelated" {
+                assert!(
+                    !observed
+                        .iter()
+                        .any(|command| command["sessionId"] == "probe-session"
+                            && command["method"] == "Network.enable"),
+                    "cancelled setup continued after detach"
+                );
+            }
+            if matches!(scenario, "queued-destroy" | "between-drain") {
+                assert!(
+                    !observed
+                        .iter()
+                        .any(|command| command["method"] == "Target.attachToTarget"
+                            && command["params"]["targetId"] == "probe"),
+                    "already-dead probe was attached"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_close_after_target_or_browser_loss_never_reconnects() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        for browser_lost in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+            let (lost_tx, lost_rx) = tokio::sync::oneshot::channel::<()>();
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                for expected in [
+                    "Target.getTargets",
+                    "Target.attachToTarget",
+                    "Runtime.evaluate",
+                ] {
+                    let Some(Ok(Message::Text(text))) = ws.next().await else {
+                        panic!("Missing scoped setup command");
+                    };
+                    let command: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(command["method"], expected);
+                    let result = match expected {
+                        "Target.getTargets" => {
+                            json!({"targetInfos":[{"targetId":"selected","type":"page","url":"about:blank","title":"","browserContextId":"owned"}]})
+                        }
+                        "Target.attachToTarget" => json!({"sessionId":"selected-session"}),
+                        _ => json!({"result":{"type":"number","value":1}}),
+                    };
+                    ws.send(Message::Text(
+                        json!({"id":command["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                ready_rx.await.unwrap();
+                if browser_lost {
+                    ws.close(None).await.unwrap();
+                }
+                lost_tx.send(()).unwrap();
+                if !browser_lost {
+                    loop {
+                        tokio::select! {
+                            connection = listener.accept() => panic!("Shutdown attempted to reconnect: {:?}", connection.is_ok()),
+                            message = ws.next() => match message {
+                                Some(Ok(Message::Text(text))) => panic!("Shutdown issued a browser command: {text}"),
+                                Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                                _ => {},
+                            }
+                        }
+                    }
+                }
+                assert!(
+                    tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                        .await
+                        .is_err(),
+                    "Shutdown created another CDP connection"
+                );
+            });
+            let scope = CdpScope {
+                initial_target: "selected".into(),
+                context_id: Some("owned".into()),
+            };
+            let mut manager = BrowserManager::connect_cdp_scoped(&url, Some(scope.clone()))
+                .await
+                .unwrap();
+            manager.remove_page_by_target_id("selected");
+            manager.scope_guard().invalidate();
+            ready_tx.send(()).unwrap();
+            lost_rx.await.unwrap();
+            let mut state = DaemonState::new();
+            state.cdp_scope = Some(scope.clone());
+            state.browser = Some(manager);
+            let (events, receiver) = broadcast::channel(2);
+            state.event_rx = Some(receiver);
+            events.send(CdpEvent {
+                method:"Target.attachedToTarget".into(), session_id:Some("selected-session".into()),
+                params:json!({"sessionId":"late-session","waitingForDebugger":true,"targetInfo":{"targetId":"late-frame","type":"iframe","url":"about:blank","title":""}}),
+            }).unwrap();
+            let command = json!({"id":"shutdown","action":"close","cdpDedicated":true,"cdpTarget":"selected","cdpContext":"owned"});
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                execute_command(&command, &mut state),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result["success"], true, "{result}");
+            assert_eq!(result["data"]["closed"], true);
+            assert!(state.browser.is_none());
+            assert_eq!(
+                state.cdp_scope.as_ref(),
+                Some(&scope),
+                "Shutdown must not shed immutable ownership"
+            );
+            assert_eq!(
+                execute_command(&command, &mut state).await["success"],
+                true,
+                "Already closed scoped shutdown remains idempotent"
+            );
+            let wrong = json!({"id":"wrong","action":"close","cdpDedicated":true,"cdpTarget":"foreign","cdpContext":"owned"});
+            assert_eq!(execute_command(&wrong, &mut state).await["success"], false);
+            tokio::time::timeout(std::time::Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_daemon_rejects_missing_or_changed_scope_before_effects() {
+        let mut state = DaemonState::new();
+        state.cdp_scope = Some(CdpScope {
+            initial_target: "selected".into(),
+            context_id: Some("context".into()),
+        });
+        for cmd in [
+            json!({"id":"scope", "action":"session_info"}),
+            json!({"id":"scope", "action":"session_info", "cdpDedicated":true,"cdpTarget":"other", "cdpContext":"context"}),
+            json!({"id":"scope", "action":"session_info", "cdpDedicated":true,"cdpTarget":"selected", "cdpContext":"default"}),
+        ] {
+            let result = execute_command(&cmd, &mut state).await;
+            assert_eq!(result["success"], false);
+            assert!(state.browser.is_none());
+            assert_eq!(state.cdp_scope.as_ref().unwrap().initial_target, "selected");
+        }
+        let matching = json!({"id":"scope", "action":"session_info", "cdpDedicated":true,"cdpTarget":"selected", "cdpContext":"context"});
+        assert_eq!(
+            execute_command(&matching, &mut state).await["success"],
+            true
+        );
+    }
+
+    #[test]
+    fn exact_ref_import_requires_active_parent_chain_for_oopif_trees() {
+        let top = json!({"frame":{"id":"active"},"childFrames":[{"frame":{"id":"local"}}]});
+        let trees = vec![
+            (
+                "nested-session".to_string(),
+                json!({"frameTree":{"frame":{"id":"nested","parentId":"remote"}}}),
+            ),
+            (
+                "foreign-session".to_string(),
+                json!({"frameTree":{"frame":{"id":"foreign","parentId":"another-page"}}}),
+            ),
+            (
+                "remote-session".to_string(),
+                json!({"frameTree":{"frame":{"id":"remote","parentId":"local"},"childFrames":[{"frame":{"id":"remote-local"}}]}}),
+            ),
+            (
+                "rootless-session".to_string(),
+                json!({"frameTree":{"frame":{"id":"rootless"}}}),
+            ),
+        ];
+        let (frames, sessions) = exact_ref_frame_scope(&top, &trees);
+        for frame in ["active", "local", "remote", "remote-local", "nested"] {
+            assert!(frames.contains(frame));
+        }
+        for frame in ["foreign", "rootless", "another-page"] {
+            assert!(!frames.contains(frame));
+        }
+        assert_eq!(sessions, vec!["remote-session", "nested-session"]);
+    }
+
+    #[test]
+    fn scoped_command_requires_an_explicit_valid_pair() {
+        for cmd in [
+            json!({"cdpTarget":"x","cdpContext":"default"}),
+            json!({"cdpDedicated":false,"cdpTarget":"x","cdpContext":"default"}),
+            json!({"cdpDedicated":true}),
+            json!({"cdpDedicated":true,"cdpTarget":"x"}),
+            json!({"cdpContext":"default"}),
+            json!({"cdpDedicated":true,"cdpTarget":"", "cdpContext":"default"}),
+            json!({"cdpDedicated":true,"cdpTarget":"x", "cdpContext":null}),
+            json!({"cdpDedicated":true,"cdpTarget":"x", "cdpContext":"bad context"}),
+        ] {
+            assert!(CdpScope::from_command(&cmd).is_err());
+        }
+        assert_eq!(
+            CdpScope::from_command(
+                &json!({"cdpDedicated":true,"cdpTarget":"x", "cdpContext":"default"})
+            )
+            .unwrap()
+            .unwrap()
+            .context_id,
+            None
+        );
     }
 
     #[tokio::test]
@@ -14422,6 +15677,206 @@ mod tests {
             "agent-browser-{label}-{}-{nanos}",
             std::process::id()
         ))
+    }
+
+    #[tokio::test]
+    async fn test_scoped_event_consumers_detach_foreign_sessions_without_runtime_or_credentials() {
+        use super::super::browser::CdpScope;
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://{}/devtools/browser/scope-events",
+            listener.local_addr().unwrap()
+        );
+        let commands = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let observed = commands.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut emitted = false;
+            while let Some(Ok(message)) = socket.next().await {
+                let text = match message {
+                    Message::Text(text) => text,
+                    Message::Close(_) => break,
+                    Message::Ping(payload) => {
+                        let _ = socket.send(Message::Pong(payload)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                observed.lock().unwrap().push(command.clone());
+                let method = command["method"].as_str().unwrap_or("");
+                if method == "Browser.getVersion" && !emitted {
+                    emitted = true;
+                    let foreign = json!({"targetId":"T-FOREIGN","type":"page","title":"foreign","url":"https://foreign.test/","browserContextId":"C-FOREIGN"});
+                    let root_iframe = json!({"targetId":"T-ROOT-IFRAME","type":"iframe","title":"frame","url":"https://frame.test/","browserContextId":"C-APPROVED"});
+                    let foreign_parent_worker = json!({"targetId":"T-WORKER","type":"worker","title":"worker","url":"https://worker.test/","browserContextId":"C-APPROVED"});
+                    let mismatch = json!({"targetId":"T-MISMATCH","type":"iframe","title":"frame","url":"https://frame.test/","browserContextId":"C-FOREIGN"});
+                    let popup = json!({"targetId":"T-POPUP","type":"page","title":"popup","url":"https://scope.test/","browserContextId":"C-APPROVED"});
+                    let frame = json!({"targetId":"T-IFRAME","type":"iframe","title":"frame","url":"https://scope.test/","browserContextId":"C-APPROVED"});
+                    let worker = json!({"targetId":"T-APPROVED-WORKER","type":"worker","title":"worker","url":"https://scope.test/","browserContextId":"C-APPROVED"});
+                    let manual = json!({"targetId":"T-MANUAL","type":"page","title":"manual","url":"https://scope.test/","browserContextId":"C-APPROVED"});
+                    let events = vec![
+                        json!({"method":"Target.targetCreated","params":{"targetInfo":manual}}),
+                        json!({"method":"Target.attachedToTarget","params":{"sessionId":"S-POPUP","targetInfo":popup,"waitingForDebugger":false}}),
+                        json!({"method":"Target.attachedToTarget","sessionId":"S-SELECTED","params":{"sessionId":"S-IFRAME","targetInfo":frame,"waitingForDebugger":false}}),
+                        json!({"method":"Target.attachedToTarget","sessionId":"S-SELECTED","params":{"sessionId":"S-APPROVED-WORKER","targetInfo":worker,"waitingForDebugger":false}}),
+                        json!({"method":"Target.targetCreated","params":{"targetInfo":foreign.clone()}}),
+                        json!({"method":"Target.targetInfoChanged","params":{"targetInfo":foreign.clone()}}),
+                        json!({"method":"Target.attachedToTarget","params":{"sessionId":"S-FOREIGN","targetInfo":foreign,"waitingForDebugger":true}}),
+                        json!({"method":"Target.attachedToTarget","params":{"sessionId":"S-ROOT-IFRAME","targetInfo":root_iframe,"waitingForDebugger":true}}),
+                        json!({"method":"Target.attachedToTarget","sessionId":"S-UNAPPROVED","params":{"sessionId":"S-WORKER","targetInfo":foreign_parent_worker,"waitingForDebugger":true}}),
+                        json!({"method":"Target.attachedToTarget","sessionId":"S-SELECTED","params":{"sessionId":"S-MALFORMED","targetInfo":{},"waitingForDebugger":true}}),
+                        json!({"method":"Target.attachedToTarget","sessionId":"S-SELECTED","params":{"sessionId":"S-MISMATCH","targetInfo":mismatch,"waitingForDebugger":true}}),
+                        json!({"method":"Fetch.authRequired","sessionId":"S-FOREIGN","params":{"requestId":"foreign-auth"}}),
+                        json!({"method":"Fetch.requestPaused","sessionId":"S-FOREIGN","params":{"requestId":"foreign-request","request":{"url":"https://foreign.test/","headers":{}},"resourceType":"Document"}}),
+                        json!({"method":"Page.javascriptDialogOpening","sessionId":"S-FOREIGN","params":{"type":"alert","message":"foreign"}}),
+                        // Each consumer must pass this ordered approved event
+                        // before the test checks that earlier foreign events did nothing.
+                        json!({"method":"Fetch.authRequired","sessionId":"S-SELECTED","params":{"requestId":"approved-auth"}}),
+                        json!({"method":"Page.javascriptDialogOpening","sessionId":"S-SELECTED","params":{"type":"alert","message":"approved"}}),
+                    ];
+                    for event in events {
+                        socket.send(Message::Text(event.to_string())).await.unwrap();
+                    }
+                }
+                let result = match method {
+                    "Target.getTargets" => {
+                        json!({"targetInfos":[{"targetId":"T-SELECTED","type":"page","title":"selected","url":"https://selected.test/","browserContextId":"C-APPROVED"}]})
+                    }
+                    "Target.attachToTarget" => {
+                        json!({"sessionId":if command["params"]["targetId"] == "T-MANUAL" { "S-MANUAL" } else { "S-SELECTED" }})
+                    }
+                    "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
+                    _ => json!({}),
+                };
+                let reply = json!({"id":command["id"],"result":result});
+                if socket.send(Message::Text(reply.to_string())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let manager = BrowserManager::connect_cdp_scoped(
+            &url,
+            Some(CdpScope {
+                initial_target: "T-SELECTED".to_string(),
+                context_id: Some("C-APPROVED".to_string()),
+            }),
+        )
+        .await
+        .unwrap();
+        let mut state = DaemonState::new();
+        state.browser = Some(manager);
+        state.auto_dialog = true;
+        *state.proxy_credentials.write().await =
+            Some(("fixture-user".into(), "fixture-password".into()));
+        // A recorder claim cannot grant a foreign attachment scope authority.
+        *state.recording_state.capture_session.lock().unwrap() = Some(recording::CaptureSession {
+            target_id: "T-FOREIGN".into(),
+            session_id: None,
+        });
+        state.subscribe_to_browser_events();
+        state.start_fetch_handler();
+        state.start_dialog_handler();
+        state
+            .browser
+            .as_ref()
+            .unwrap()
+            .client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        let drained = state.drain_cdp_events();
+        assert_eq!(drained.rejected_scope_sessions.len(), 5);
+        assert_eq!(drained.new_targets.len(), 1);
+        assert!(drained.changed_targets.is_empty());
+        assert_eq!(drained.attached_page_sessions.len(), 1);
+        assert_eq!(drained.attached_iframe_sessions.len(), 1);
+        assert_eq!(drained.attached_worker_sessions.len(), 1);
+        assert!(drained.attached_other_sessions.is_empty());
+        state.apply_drained_events(drained).await.unwrap();
+        if let Some(task) = state.fetch_handler_task.take() {
+            task.abort();
+        }
+        if let Some(task) = state.dialog_handler_task.take() {
+            task.abort();
+        }
+        state.browser.as_mut().unwrap().close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let observed = commands.lock().unwrap();
+        assert!(
+            !observed.iter().any(|command| {
+                command["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("Fetch."))
+                    || command["method"] == "Page.handleJavaScriptDialog"
+            }),
+            "passive scoped participants must never answer Fetch/auth/dialog events: {observed:?}"
+        );
+        for sid in [
+            "S-FOREIGN",
+            "S-ROOT-IFRAME",
+            "S-WORKER",
+            "S-MALFORMED",
+            "S-MISMATCH",
+        ] {
+            assert!(
+                observed
+                    .iter()
+                    .any(|c| c["method"] == "Target.detachFromTarget"
+                        && c["params"]["sessionId"] == sid),
+                "rejected session {sid} was not detached"
+            );
+            assert!(
+                !observed.iter().any(|c| c["sessionId"] == sid),
+                "rejected session received a renderer/network/dialog command: {observed:?}"
+            );
+        }
+        assert!(
+            observed
+                .iter()
+                .any(|c| c["method"] == "Target.detachFromTarget"
+                    && c["params"]["sessionId"] == "S-MISMATCH"
+                    && c["sessionId"] == "S-SELECTED"),
+            "child detachment must address its approved parent owner"
+        );
+        assert!(observed
+            .iter()
+            .filter(|c| c["method"] == "Target.attachToTarget")
+            .all(|c| matches!(
+                c["params"]["targetId"].as_str(),
+                Some("T-SELECTED" | "T-MANUAL")
+            )));
+        assert!(
+            !observed
+                .iter()
+                .any(|c| c["method"] == "Runtime.runIfWaitingForDebugger"),
+            "scoped background/drain resumed a companion-owned pause: {observed:?}"
+        );
+        for command in observed
+            .iter()
+            .filter(|c| c["method"] == "Target.setAutoAttach")
+        {
+            assert_eq!(
+                command["params"]["waitForDebuggerOnStart"], false,
+                "scoped consumer requested a pause: {command}"
+            );
+        }
+        for sid in ["S-POPUP", "S-IFRAME", "S-MANUAL"] {
+            assert!(
+                observed
+                    .iter()
+                    .any(|c| c["method"] == "Page.enable" && c["sessionId"] == sid),
+                "approved passive session was not prepared: {sid}"
+            );
+        }
     }
 
     #[test]
@@ -15994,10 +17449,39 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(interpolated_mouse_steps(10.0, 100, Some(3), true), 3);
     }
 
-    #[tokio::test]
+    /// Controlled in-memory replies advance only virtual time. Real socket
+    /// readiness and the host's parallel-test load cannot affect this schedule.
+    async fn assert_mouse_deadlines_with_mock_replies(reply_ms: u64, elapsed_ms: &[u64]) {
+        use tokio::time::{advance, Duration, Instant};
+
+        let started = Instant::now();
+        for (index, expected_ms) in elapsed_ms.iter().enumerate() {
+            // Stand in for the awaited CDP reply, not an additional pacing delay.
+            advance(Duration::from_millis(reply_ms)).await;
+            wait_for_mouse_step_deadline(
+                started,
+                Duration::from_millis(1000),
+                index + 1,
+                elapsed_ms.len(),
+            )
+            .await;
+            assert_eq!(started.elapsed(), Duration::from_millis(*expected_ms));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn mouse_move_duration_includes_cdp_response_latency() {
+        assert_mouse_deadlines_with_mock_replies(200, &[250, 500, 750, 1000]).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mouse_move_overdue_replies_do_not_add_pacing_delay() {
+        assert_mouse_deadlines_with_mock_replies(400, &[400, 800, 1200, 1600]).await;
+    }
+
+    #[tokio::test]
+    async fn mouse_move_sends_ordered_button_events_and_exact_endpoint() {
         use futures_util::{SinkExt, StreamExt};
-        use std::time::Duration;
         use tokio_tungstenite::tungstenite::Message;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -16015,7 +17499,6 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                     command["params"]["x"].as_f64().unwrap(),
                     command["params"]["y"].as_f64().unwrap(),
                 ));
-                tokio::time::sleep(Duration::from_millis(200)).await;
                 ws.send(Message::Text(
                     json!({ "id": command["id"], "result": {} }).to_string(),
                 ))
@@ -16029,16 +17512,15 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let history = Arc::new(std::sync::Mutex::new(
             recording::RecordingCursorHistory::default(),
         ));
-        let started = tokio::time::Instant::now();
         move_mouse_interpolated(
             &client,
             "page",
             &mut mouse,
             400.0,
             200.0,
-            1000,
+            0,
             Some(4),
-            true,
+            false,
             42,
             1,
             (0.0, 0.0),
@@ -16046,14 +17528,17 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         )
         .await
         .unwrap();
-        let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(1000));
-        assert!(
-            elapsed < Duration::from_millis(1600),
-            "response latency was added to the movement duration: {elapsed:?}"
-        );
         let positions = server.await.unwrap();
-        assert_eq!(positions.last(), Some(&(400.0, 200.0)));
+        assert_eq!(
+            positions,
+            vec![
+                (62.5, 31.25),
+                (200.0, 100.0),
+                (337.5, 168.75),
+                (400.0, 200.0)
+            ],
+            "the real transport must preserve every ordered eased step"
+        );
         assert_eq!((mouse.x, mouse.y), (400.0, 200.0));
     }
 
@@ -16291,6 +17776,49 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         attach_webmcp_availability(&mut resp, "navigate", &mut state).await;
 
         assert_eq!(resp, expected);
+    }
+
+    #[test]
+    fn exact_ref_frame_must_belong_to_active_page() {
+        let tree = json!({"frame":{"id":"main"},"childFrames":[{"frame":{"id":"child"},"childFrames":[{"frame":{"id":"nested"}}]}]});
+        assert!(exact_ref_frame_in_tree(&tree, "main"));
+        assert!(exact_ref_frame_in_tree(&tree, "nested"));
+        assert!(!exact_ref_frame_in_tree(&tree, "other-tab"));
+    }
+
+    #[test]
+    fn exact_ref_stale_is_machine_readable_before_dispatch() {
+        let response = error_response("cmd-exact-ref", "e2e_node_stale:e12");
+        assert_eq!(response["code"], "node_stale");
+        assert_eq!(response["data"]["dispatched"], false);
+        assert!(
+            error_response("cmd-page-error", "Evaluation error: e2e_node_stale:e12")
+                .get("code")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn only_closed_preinput_validation_errors_are_safe() {
+        for (message, code) in [
+            ("e2e_not_actionable", "not_actionable"),
+            ("e2e_unsupported_capability", "unsupported_capability"),
+        ] {
+            let value = error_response("test", message);
+            assert_eq!(value["code"], code);
+            assert_eq!(value["data"]["dispatched"], false);
+            assert!(
+                error_response("test", &format!("Evaluation failed: {message}"))
+                    .get("code")
+                    .is_none()
+            );
+        }
+        assert!(error_response(
+            "test",
+            "Double click target unavailable after input may have committed"
+        )
+        .get("code")
+        .is_none());
     }
 
     #[test]

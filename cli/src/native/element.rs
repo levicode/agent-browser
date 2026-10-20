@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use serde_json::Value;
 
@@ -13,14 +13,22 @@ pub struct RefEntry {
     pub nth: Option<usize>,
     pub selector: Option<String>,
     pub frame_id: Option<String>,
+    pub session_id: Option<String>,
+    pub context_id: Option<i64>,
     allow_role_fallback: bool,
+}
+
+impl RefEntry {
+    pub fn is_exact(&self) -> bool {
+        !self.allow_role_fallback
+    }
 }
 
 #[derive(Clone)]
 struct DocumentRefs {
     session: String,
     loader: String,
-    refs: HashMap<i64, String>,
+    refs: HashMap<(i64, bool), String>,
 }
 
 #[derive(Clone)]
@@ -28,6 +36,9 @@ pub struct RefMap {
     map: HashMap<String, RefEntry>,
     documents: HashMap<(String, Option<String>), DocumentRefs>,
     next_ref: usize,
+    // Preserve recent exact-ref retirement errors without retaining DOM metadata.
+    retired_exact: HashSet<String>,
+    retired_exact_order: VecDeque<String>,
 }
 
 impl RefMap {
@@ -36,6 +47,8 @@ impl RefMap {
             map: HashMap::new(),
             documents: HashMap::new(),
             next_ref: 1,
+            retired_exact: HashSet::new(),
+            retired_exact_order: VecDeque::new(),
         }
     }
 
@@ -68,6 +81,8 @@ impl RefMap {
                 nth,
                 selector: None,
                 frame_id: frame_id.map(|s| s.to_string()),
+                session_id: None,
+                context_id: None,
                 allow_role_fallback: true,
             },
         );
@@ -77,6 +92,10 @@ impl RefMap {
     /// used for actions that select a concrete DOM node before interacting;
     /// falling back by role/name could silently target a different element.
     pub fn add_exact_backend_node(&mut self, ref_id: String, backend_node_id: i64) {
+        if self.retired_exact.remove(&ref_id) {
+            self.retired_exact_order
+                .retain(|retired| retired != &ref_id);
+        }
         self.map.insert(
             ref_id,
             RefEntry {
@@ -86,9 +105,30 @@ impl RefMap {
                 nth: None,
                 selector: None,
                 frame_id: None,
+                session_id: None,
+                context_id: None,
                 allow_role_fallback: false,
             },
         );
+    }
+
+    /// Register an exact snapshot capability using the same primitive as explicit
+    /// DOM-node selection, while retaining descriptive snapshot metadata.
+    pub fn add_exact_with_frame(
+        &mut self,
+        ref_id: String,
+        backend_node_id: i64,
+        role: &str,
+        name: &str,
+        nth: Option<usize>,
+        frame_id: Option<&str>,
+    ) {
+        self.add_exact_backend_node(ref_id.clone(), backend_node_id);
+        let entry = self.map.get_mut(&ref_id).expect("ref was just inserted");
+        entry.role = role.to_string();
+        entry.name = name.to_string();
+        entry.nth = nth;
+        entry.frame_id = frame_id.map(str::to_string);
     }
 
     pub fn add_selector(
@@ -108,9 +148,18 @@ impl RefMap {
                 nth,
                 selector: Some(selector),
                 frame_id: None,
+                session_id: None,
+                context_id: None,
                 allow_role_fallback: true,
             },
         );
+    }
+
+    pub fn bind_world(&mut self, ref_id: &str, session_id: &str, context_id: i64) {
+        if let Some(entry) = self.map.get_mut(ref_id) {
+            entry.session_id = Some(session_id.to_string());
+            entry.context_id = Some(context_id);
+        }
     }
 
     pub fn get(&self, ref_id: &str) -> Option<&RefEntry> {
@@ -139,11 +188,73 @@ impl RefMap {
     }
 
     pub fn remove(&mut self, ref_id: &str) {
-        self.map.remove(ref_id);
+        if self
+            .map
+            .remove(ref_id)
+            .is_some_and(|entry| entry.is_exact())
+        {
+            self.retire_exact(ref_id.to_string());
+        }
+    }
+
+    /// Keep only bounded, session-local tombstones. Expired tombstones become
+    /// ordinary unknown-ref errors, never permission to rebind or replay input.
+    fn retire_exact(&mut self, ref_id: String) {
+        const MAX_RETIRED_EXACT_REFS: usize = 4096;
+        if self.retired_exact.insert(ref_id.clone()) {
+            self.retired_exact_order.push_back(ref_id);
+        }
+        while self.retired_exact_order.len() > MAX_RETIRED_EXACT_REFS {
+            if let Some(expired) = self.retired_exact_order.pop_front() {
+                self.retired_exact.remove(&expired);
+            }
+        }
+    }
+
+    fn missing_ref_error(&self, ref_id: &str) -> String {
+        if self.retired_exact.contains(ref_id) {
+            stale_ref_error(ref_id)
+        } else {
+            format!("Unknown ref: {}", ref_id)
+        }
     }
 
     pub fn begin_snapshot(&mut self) {
+        let exact = self
+            .map
+            .iter()
+            .filter(|(_, entry)| entry.is_exact())
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        for id in exact {
+            self.retire_exact(id);
+        }
         self.map.clear();
+    }
+
+    /// Trace snapshots may append exact identities but cannot retire or rebind
+    /// any existing handle, even when the caller timed out before completion.
+    pub fn merge_snapshot(&mut self, snapshot: RefMap) -> Result<(), String> {
+        for (id, entry) in &snapshot.map {
+            if self.map.get(id).is_some_and(|old| {
+                old.backend_node_id != entry.backend_node_id
+                    || old.frame_id != entry.frame_id
+                    || old.session_id != entry.session_id
+                    || old.is_exact() != entry.is_exact()
+                    || (old.is_exact() && old.context_id != entry.context_id)
+            }) {
+                return Err("Preserved snapshot attempted to rebind an exact reference".into());
+            }
+        }
+        self.map.extend(snapshot.map);
+        for id in snapshot.retired_exact_order {
+            if !self.map.contains_key(&id) {
+                self.retire_exact(id);
+            }
+        }
+        self.documents = snapshot.documents;
+        self.next_ref = self.next_ref.max(snapshot.next_ref);
+        Ok(())
     }
 
     /// Observe the document behind a page/frame pair. Unknown documents never
@@ -196,11 +307,12 @@ impl RefMap {
         page_session: &str,
         frame: Option<&str>,
         backend_node_id: i64,
+        exact: bool,
     ) -> Option<&str> {
         self.documents
             .get(&(page_session.to_string(), frame.map(str::to_string)))?
             .refs
-            .get(&backend_node_id)
+            .get(&(backend_node_id, exact))
             .map(String::as_str)
     }
 
@@ -210,25 +322,28 @@ impl RefMap {
         frame: Option<&str>,
         backend_node_id: i64,
         ref_id: &str,
+        exact: bool,
     ) {
         if let Some(document) = self
             .documents
             .get_mut(&(page_session.to_string(), frame.map(str::to_string)))
         {
-            document.refs.insert(backend_node_id, ref_id.to_string());
+            document
+                .refs
+                .insert((backend_node_id, exact), ref_id.to_string());
         }
     }
 
     pub fn invalidate_page(&mut self, page_session: &str) {
         self.documents
             .retain(|(entry_page, _), _| entry_page != page_session);
-        self.map.clear();
+        self.begin_snapshot();
     }
 
     /// Drop all document identities while preserving the monotonic ref counter.
     pub fn invalidate_all_documents(&mut self) {
         self.documents.clear();
-        self.map.clear();
+        self.begin_snapshot();
     }
 
     pub fn next_ref_num(&self) -> usize {
@@ -415,6 +530,9 @@ async fn resolve_object_in_same_process_frame(
         .ok_or_else(|| format!("Element not found in the selected frame: {}", selector))
 }
 
+/// Resolve and preflight a pointer target. CDP geometry/hit-testing and input
+/// dispatch are separate commands: page script can still mutate the DOM between
+/// them. An exact ref prevents semantic rebinding, not that pointer TOCTOU race.
 pub async fn resolve_element_center(
     client: &CdpClient,
     session_id: &str,
@@ -425,10 +543,34 @@ pub async fn resolve_element_center(
     if let Some(ref_id) = parse_ref(selector_or_ref) {
         let entry = ref_map
             .get(&ref_id)
-            .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+            .ok_or_else(|| ref_map.missing_ref_error(&ref_id))?;
+        // An AX-only ref remains observable, but has no exact DOM action target.
+        if entry.backend_node_id.is_none() && !entry.allow_role_fallback {
+            return Err(stale_ref_error(&ref_id));
+        }
+        if entry.is_exact() {
+            // Coordinate actions must use the same connected exact-ref gate as
+            // element actions before scrolling, hit-testing, or input dispatch.
+            let (checked_object, checked_session) = resolve_element_object_id(
+                client,
+                session_id,
+                ref_map,
+                selector_or_ref,
+                iframe_sessions,
+            )
+            .await?;
+            let _ = client
+                .send_command(
+                    "Runtime.releaseObject",
+                    Some(serde_json::json!({"objectId":checked_object})),
+                    Some(&checked_session),
+                )
+                .await;
+        }
 
-        let effective_session_id =
-            resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+        let effective_session_id = entry.session_id.as_deref().unwrap_or_else(|| {
+            resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions)
+        });
 
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {
@@ -459,7 +601,7 @@ pub async fn resolve_element_center(
                 return Ok((x, y, effective_session_id.to_string()));
             }
             if !entry.allow_role_fallback {
-                return Err(format!("Element ref {ref_id} is stale"));
+                return Err(stale_ref_error(&ref_id));
             }
             // backend_node_id is stale; re-query the accessibility tree below
         }
@@ -668,6 +810,13 @@ async fn scroll_node_into_view(client: &CdpClient, session_id: &str, backend_nod
         .await;
 }
 
+/// Closed marker generated only by exact-ref resolution before input dispatch.
+pub const STALE_REF_PREFIX: &str = "e2e_node_stale:";
+
+fn stale_ref_error(ref_id: &str) -> String {
+    format!("{STALE_REF_PREFIX}{ref_id}")
+}
+
 pub async fn resolve_element_object_id(
     client: &CdpClient,
     session_id: &str,
@@ -678,20 +827,21 @@ pub async fn resolve_element_object_id(
     if let Some(ref_id) = parse_ref(selector_or_ref) {
         let entry = ref_map
             .get(&ref_id)
-            .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+            .ok_or_else(|| ref_map.missing_ref_error(&ref_id))?;
 
-        let effective_session_id =
-            resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+        let effective_session_id = entry.session_id.as_deref().unwrap_or_else(|| {
+            resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions)
+        });
 
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {
             let result: Result<DomResolveNodeResult, String> = client
                 .send_command_typed(
                     "DOM.resolveNode",
-                    &DomResolveNodeParams {
-                        backend_node_id: Some(backend_node_id),
-                        node_id: None,
-                        object_group: Some("agent-browser".to_string()),
+                    &{
+                        let mut params=serde_json::json!({"backendNodeId":backend_node_id,"objectGroup":"agent-browser"});
+                        if let Some(context)=entry.context_id{params["executionContextId"]=serde_json::json!(context);}
+                        params
                     },
                     Some(effective_session_id),
                 )
@@ -699,15 +849,61 @@ pub async fn resolve_element_object_id(
 
             if let Ok(r) = result {
                 if let Some(object_id) = r.object.object_id {
+                    if entry.is_exact() {
+                        // Resolving a detached backend node can still succeed. Never
+                        // dispatch input to it, or rebind it to a same-name replacement.
+                        let connected: Result<EvaluateResult,String> = client
+                            .send_command_typed(
+                                "Runtime.callFunctionOn",
+                                &CallFunctionOnParams {
+                                    function_declaration: "function() { return this.isConnected === true && (this.nodeType === 9 || this.ownerDocument === document); }".to_string(),
+                                    object_id: Some(object_id.clone()),
+                                    arguments: None,
+                                    return_by_value: Some(true),
+                                    await_promise: Some(false),
+                                },
+                                Some(effective_session_id),
+                            )
+                            .await;
+                        let accepted = connected.as_ref().is_ok_and(|result| {
+                            result.exception_details.is_none()
+                                && result.result.value.as_ref().and_then(Value::as_bool)
+                                    == Some(true)
+                        });
+                        if !accepted {
+                            // The caller never receives a rejected handle, so this
+                            // gate owns cleanup even on protocol/evaluation failure.
+                            let mut objects = std::collections::HashSet::from([object_id]);
+                            if let Ok(result) = connected {
+                                objects.extend(result.result.object_id);
+                                objects.extend(
+                                    result
+                                        .exception_details
+                                        .and_then(|details| details.exception)
+                                        .and_then(|exception| exception.object_id),
+                                );
+                            }
+                            for object in objects {
+                                let _ = client
+                                    .send_command(
+                                        "Runtime.releaseObject",
+                                        Some(serde_json::json!({"objectId":object})),
+                                        Some(effective_session_id),
+                                    )
+                                    .await;
+                            }
+                            return Err(stale_ref_error(&ref_id));
+                        }
+                    }
                     return Ok((object_id, effective_session_id.to_string()));
                 }
             }
-            if !entry.allow_role_fallback {
-                return Err(format!("Element ref {ref_id} is stale"));
-            }
-            // backend_node_id is stale; re-query the accessibility tree below
+        }
+        if !entry.allow_role_fallback {
+            return Err(stale_ref_error(&ref_id));
         }
 
+        // Ordinary snapshot refs retain upstream role/name fallback; exact refs do not.
         // Fallback: re-query the accessibility tree to find a fresh node by role/name
         let fresh_id = find_node_id_by_role_name(
             client,
@@ -1354,7 +1550,11 @@ pub async fn get_element_input_value(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
                 function_declaration:
-                    "function() { return typeof this.value === 'string' ? this.value : ''; }"
+                    r#"function() {
+                        const autocomplete = (this.getAttribute?.('autocomplete') || '').toLowerCase().split(/\s+/);
+                        if (this.type === 'password' || autocomplete.includes('current-password') || autocomplete.includes('new-password')) return '';
+                        return typeof this.value === 'string' ? this.value : '';
+                    }"#
                         .to_string(),
                 object_id: Some(object_id),
                 arguments: None,
@@ -1538,6 +1738,272 @@ mod tests {
     use super::*;
 
     #[test]
+    fn retired_exact_refs_are_bounded_and_never_become_semantic_refs() {
+        let mut refs = RefMap::new();
+        refs.add("e0".into(), Some(1), "button", "ordinary", None);
+        refs.remove("e0");
+        assert_eq!(refs.missing_ref_error("e0"), "Unknown ref: e0");
+        for id in 1..=4097 {
+            let name = format!("e{id}");
+            refs.add_exact_backend_node(name.clone(), id);
+            refs.remove(&name);
+        }
+        assert_eq!(refs.retired_exact.len(), 4096);
+        assert_eq!(refs.missing_ref_error("e1"), "Unknown ref: e1");
+        assert_eq!(refs.missing_ref_error("e4097"), "e2e_node_stale:e4097");
+        refs.add_exact_backend_node("e4097".into(), 4097);
+        assert!(!refs.retired_exact.contains("e4097"));
+        refs.invalidate_all_documents();
+        assert_eq!(refs.missing_ref_error("e4097"), "e2e_node_stale:e4097");
+    }
+
+    #[test]
+    fn durable_refs_keep_exact_and_semantic_capabilities_separate() {
+        let mut refs = RefMap::new();
+        refs.observe_document("page", None, "page", Some("loader"));
+        refs.remember_durable_ref("page", None, 42, "e1", false);
+        refs.remember_durable_ref("page", None, 42, "e2", true);
+        assert_eq!(refs.durable_ref("page", None, 42, false), Some("e1"));
+        assert_eq!(refs.durable_ref("page", None, 42, true), Some("e2"));
+    }
+
+    #[tokio::test]
+    async fn ordinary_ref_retains_upstream_role_name_fallback() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for (step, method) in [
+                "DOM.resolveNode",
+                "Accessibility.getFullAXTree",
+                "DOM.resolveNode",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let request = ws.next().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], method);
+                let mut response = json!({"id":request["id"], "result":{}});
+                match step {
+                    0 => {
+                        assert_eq!(request["params"]["backendNodeId"], 42);
+                        response["error"] = json!({"code":-32000,"message":"Node removed"});
+                    }
+                    1 => {
+                        response["result"] = json!({"nodes":[{"nodeId":"replacement","role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"},"backendDOMNodeId":43}]})
+                    }
+                    _ => {
+                        assert_eq!(request["params"]["backendNodeId"], 43);
+                        response["result"] =
+                            json!({"object":{"type":"object","objectId":"replacement"}});
+                    }
+                }
+                ws.send(Message::Text(response.to_string())).await.unwrap();
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut refs = RefMap::new();
+        refs.add("e1".into(), Some(42), "button", "Save", None);
+        let (object, session) =
+            resolve_element_object_id(&client, "page", &refs, "@e1", &HashMap::new())
+                .await
+                .unwrap();
+        assert_eq!((object.as_str(), session.as_str()), ("replacement", "page"));
+        server.await.unwrap();
+    }
+
+    #[test]
+    fn ordinary_refs_allow_fallback_but_exact_refs_never_rebind() {
+        let mut map = RefMap::new();
+        map.add_with_frame("e1".into(), Some(42), "button", "Save", None, None);
+        map.add_exact_with_frame("e2".into(), 43, "button", "Save", None, None);
+        assert!(map.get("e1").unwrap().allow_role_fallback);
+        assert!(!map.get("e2").unwrap().allow_role_fallback);
+        assert_ne!(
+            map.get("e1").unwrap().backend_node_id,
+            map.get("e2").unwrap().backend_node_id
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_ref_rejects_both_resolvers_without_querying_same_name_node() {
+        use futures_util::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            if let Ok(Some(Ok(Message::Text(command)))) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await
+            {
+                panic!("AX-only ref must not query or dispatch: {command}");
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut map = RefMap::new();
+        // No exact ref is issued for an AX-only node without a backend identity.
+        map.add_with_frame("e2".into(), Some(43), "button", "Save", None, None);
+        let object = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            resolve_element_object_id(&client, "page-session", &map, "@e1", &HashMap::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(object.unwrap_err(), "Unknown ref: e1");
+        let center = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            resolve_element_center(&client, "page-session", &map, "@e1", &HashMap::new()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(center.unwrap_err(), "Unknown ref: e1");
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn coordinate_probe_releases_its_handle_before_geometry() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for method in [
+                "DOM.resolveNode",
+                "Runtime.callFunctionOn",
+                "Runtime.releaseObject",
+                "DOM.scrollIntoViewIfNeeded",
+                "DOM.getBoxModel",
+            ] {
+                let incoming = ws.next().await.unwrap().unwrap();
+                let request: Value = serde_json::from_str(incoming.to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], method);
+                let mut response = json!({"id":request["id"],"result":{}});
+                match method {
+                    "DOM.resolveNode" => {
+                        response["result"] = json!({"object":{"type":"object","objectId":"probe"}})
+                    }
+                    "Runtime.callFunctionOn" => {
+                        response["result"] = json!({"result":{"type":"boolean","value":true}})
+                    }
+                    "Runtime.releaseObject" => assert_eq!(request["params"]["objectId"], "probe"),
+                    "DOM.getBoxModel" => {
+                        response["error"] = json!({"code":-32000,"message":"No box"})
+                    }
+                    _ => {}
+                }
+                ws.send(Message::Text(response.to_string())).await.unwrap();
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let mut refs = RefMap::new();
+        refs.add_exact_with_frame("e1".into(), 42, "button", "Save", None, None);
+        assert!(
+            resolve_element_center(&client, "page", &refs, "@e1", &HashMap::new())
+                .await
+                .is_err()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_ref_rejects_without_querying_same_name_node() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        for (backend_missing, center) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let expected = if backend_missing { 1 } else { 2 };
+                for step in 0..expected {
+                    let incoming = ws.next().await.unwrap().unwrap();
+                    let request: Value = serde_json::from_str(incoming.to_text().unwrap()).unwrap();
+                    let mut response =
+                        json!({ "id": request["id"], "sessionId": request["sessionId"] });
+                    if step == 0 {
+                        assert_eq!(request["method"], "DOM.resolveNode");
+                        assert_eq!(request["params"]["backendNodeId"], 42);
+                        if backend_missing {
+                            response["error"] = json!({"code": -32000, "message": "Node removed"});
+                        } else {
+                            response["result"] =
+                                json!({"object":{"type":"object","objectId":"old-node"}});
+                        }
+                    } else {
+                        assert_eq!(request["method"], "Runtime.callFunctionOn");
+                        assert_eq!(request["params"]["objectId"], "old-node");
+                        response["result"] = json!({"result":{"type":"boolean","value":false}});
+                    }
+                    ws.send(Message::Text(response.to_string())).await.unwrap();
+                }
+                if !backend_missing {
+                    let incoming = ws.next().await.unwrap().unwrap();
+                    let request: Value = serde_json::from_str(incoming.to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], "Runtime.releaseObject");
+                    assert_eq!(request["params"]["objectId"], "old-node");
+                    ws.send(Message::Text(
+                        json!({"id":request["id"],"result":{}}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                }
+                // No Accessibility.getFullAXTree or input event may follow.
+                if let Ok(Some(Ok(Message::Text(next)))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), ws.next()).await
+                {
+                    panic!("Stale ref caused another command: {next}");
+                }
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let mut map = RefMap::new();
+            map.add_exact_with_frame("e1".into(), 42, "button", "Save", None, None);
+            map.add_with_frame("e2".into(), Some(43), "button", "Save", None, None);
+            let error = if center {
+                resolve_element_center(&client, "page-session", &map, "@e1", &HashMap::new())
+                    .await
+                    .unwrap_err()
+            } else {
+                resolve_element_object_id(&client, "page-session", &map, "@e1", &HashMap::new())
+                    .await
+                    .unwrap_err()
+            };
+            assert_eq!(error, "e2e_node_stale:e1");
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn preserved_snapshot_keeps_imported_identity_and_rejects_rebinding() {
+        let mut live = RefMap::new();
+        live.add_with_frame("e1".into(), Some(42), "button", "original", None, None);
+        live.set_next_ref_num(2);
+        let mut snapshot = live.clone();
+        snapshot.begin_snapshot();
+        snapshot.add_with_frame("e2".into(), Some(43), "button", "new", None, None);
+        snapshot.set_next_ref_num(3);
+        live.merge_snapshot(snapshot).unwrap();
+        assert_eq!(live.get("e1").unwrap().backend_node_id, Some(42));
+        assert_eq!(live.next_ref_num(), 3);
+        let mut bad = live.clone();
+        bad.add_with_frame("e1".into(), Some(99), "button", "replacement", None, None);
+        assert!(live.merge_snapshot(bad).is_err());
+        assert_eq!(live.get("e1").unwrap().backend_node_id, Some(42));
+    }
+
+    #[test]
     fn test_parse_ref_at_prefix() {
         assert_eq!(parse_ref("@e1"), Some("e1".to_string()));
         assert_eq!(parse_ref("@e123"), Some("e123".to_string()));
@@ -1593,14 +2059,17 @@ mod tests {
             "frame-session",
             Some("frame-loader")
         ));
-        map.remember_durable_ref("page-a", None, 42, "e1");
-        map.remember_durable_ref("page-a", Some("frame-a"), 42, "e2");
-        assert_eq!(map.durable_ref("page-a", None, 42), Some("e1"));
-        assert_eq!(map.durable_ref("page-a", Some("frame-a"), 42), Some("e2"));
-        assert_eq!(map.durable_ref("page-b", None, 42), None);
+        map.remember_durable_ref("page-a", None, 42, "e1", false);
+        map.remember_durable_ref("page-a", Some("frame-a"), 42, "e2", false);
+        assert_eq!(map.durable_ref("page-a", None, 42, false), Some("e1"));
+        assert_eq!(
+            map.durable_ref("page-a", Some("frame-a"), 42, false),
+            Some("e2")
+        );
+        assert_eq!(map.durable_ref("page-b", None, 42, false), None);
 
         map.invalidate_page("page-a");
-        assert_eq!(map.durable_ref("page-a", None, 42), None);
+        assert_eq!(map.durable_ref("page-a", None, 42, false), None);
         assert_eq!(map.next_ref_num(), 1);
     }
 
@@ -1608,14 +2077,14 @@ mod tests {
     fn invalidating_one_page_preserves_other_page_documents() {
         let mut map = RefMap::new();
         assert!(map.observe_document("page-a", None, "session-a", Some("loader-a")));
-        map.remember_durable_ref("page-a", None, 42, "e1");
+        map.remember_durable_ref("page-a", None, 42, "e1", false);
         assert!(map.observe_document("page-b", None, "session-b", Some("loader-b")));
-        map.remember_durable_ref("page-b", None, 42, "e2");
+        map.remember_durable_ref("page-b", None, 42, "e2", false);
 
         map.invalidate_page("page-b");
 
-        assert_eq!(map.durable_ref("page-a", None, 42), Some("e1"));
-        assert_eq!(map.durable_ref("page-b", None, 42), None);
+        assert_eq!(map.durable_ref("page-a", None, 42, false), Some("e1"));
+        assert_eq!(map.durable_ref("page-b", None, 42, false), None);
     }
 
     #[test]
