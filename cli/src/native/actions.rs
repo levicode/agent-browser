@@ -14131,10 +14131,21 @@ async fn move_mouse_interpolated(
             cursor.record(mouse_state.x, mouse_state.y, buttons);
         }
         if let Some((started, duration)) = schedule {
-            tokio::time::sleep_until(started + duration.mul_f64(i as f64 / steps as f64)).await;
+            wait_for_mouse_step_deadline(started, duration, i, steps).await;
         }
     }
     Ok(())
+}
+
+/// Each completed dispatch waits only until its slot on the original clock.
+/// A slow CDP reply can exhaust a slot, but must never start another full delay.
+async fn wait_for_mouse_step_deadline(
+    started: tokio::time::Instant,
+    duration: tokio::time::Duration,
+    step: usize,
+    steps: usize,
+) {
+    tokio::time::sleep_until(started + duration.mul_f64(step as f64 / steps as f64)).await;
 }
 
 fn interpolated_mouse_steps(
@@ -17438,10 +17449,39 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(interpolated_mouse_steps(10.0, 100, Some(3), true), 3);
     }
 
-    #[tokio::test]
+    /// Controlled in-memory replies advance only virtual time. Real socket
+    /// readiness and the host's parallel-test load cannot affect this schedule.
+    async fn assert_mouse_deadlines_with_mock_replies(reply_ms: u64, elapsed_ms: &[u64]) {
+        use tokio::time::{advance, Duration, Instant};
+
+        let started = Instant::now();
+        for (index, expected_ms) in elapsed_ms.iter().enumerate() {
+            // Stand in for the awaited CDP reply, not an additional pacing delay.
+            advance(Duration::from_millis(reply_ms)).await;
+            wait_for_mouse_step_deadline(
+                started,
+                Duration::from_millis(1000),
+                index + 1,
+                elapsed_ms.len(),
+            )
+            .await;
+            assert_eq!(started.elapsed(), Duration::from_millis(*expected_ms));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn mouse_move_duration_includes_cdp_response_latency() {
+        assert_mouse_deadlines_with_mock_replies(200, &[250, 500, 750, 1000]).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn mouse_move_overdue_replies_do_not_add_pacing_delay() {
+        assert_mouse_deadlines_with_mock_replies(400, &[400, 800, 1200, 1600]).await;
+    }
+
+    #[tokio::test]
+    async fn mouse_move_sends_ordered_button_events_and_exact_endpoint() {
         use futures_util::{SinkExt, StreamExt};
-        use std::time::Duration;
         use tokio_tungstenite::tungstenite::Message;
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -17459,7 +17499,6 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                     command["params"]["x"].as_f64().unwrap(),
                     command["params"]["y"].as_f64().unwrap(),
                 ));
-                tokio::time::sleep(Duration::from_millis(200)).await;
                 ws.send(Message::Text(
                     json!({ "id": command["id"], "result": {} }).to_string(),
                 ))
@@ -17473,16 +17512,15 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let history = Arc::new(std::sync::Mutex::new(
             recording::RecordingCursorHistory::default(),
         ));
-        let started = tokio::time::Instant::now();
         move_mouse_interpolated(
             &client,
             "page",
             &mut mouse,
             400.0,
             200.0,
-            1000,
+            0,
             Some(4),
-            true,
+            false,
             42,
             1,
             (0.0, 0.0),
@@ -17490,14 +17528,17 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         )
         .await
         .unwrap();
-        let elapsed = started.elapsed();
-        assert!(elapsed >= Duration::from_millis(1000));
-        assert!(
-            elapsed < Duration::from_millis(1600),
-            "response latency was added to the movement duration: {elapsed:?}"
-        );
         let positions = server.await.unwrap();
-        assert_eq!(positions.last(), Some(&(400.0, 200.0)));
+        assert_eq!(
+            positions,
+            vec![
+                (62.5, 31.25),
+                (200.0, 100.0),
+                (337.5, 168.75),
+                (400.0, 200.0)
+            ],
+            "the real transport must preserve every ordered eased step"
+        );
         assert_eq!((mouse.x, mouse.y), (400.0, 200.0));
     }
 
