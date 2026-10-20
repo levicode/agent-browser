@@ -13240,9 +13240,10 @@ async fn e2e_exact_snapshot_ref_never_rebinds_ordinary_ref_keeps_fallback() {
             )
             .await,
         );
-        assert_success(
-            &execute_command(&json!({"action":"snapshot","exactRefs":exact}), &mut state).await,
-        );
+        let snapshot =
+            execute_command(&json!({"action":"snapshot","exactRefs":exact}), &mut state).await;
+        assert_success(&snapshot);
+        assert_eq!(get_data(&snapshot)["exactRefs"], json!(exact));
         let (reference, entry) = state
             .ref_map
             .entries_sorted()

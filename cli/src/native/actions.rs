@@ -6504,7 +6504,7 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     if !cmd.get("delta").and_then(Value::as_bool).unwrap_or(false) {
         return Ok(
-            json!({ "snapshot": tree, "origin": url, "refs": refs, "removedRefs": removed_refs, "complete":!options.interactive && !options.compact && options.depth.is_none() && options.selector.is_none() }),
+            json!({ "snapshot": tree, "origin": url, "refs": refs, "removedRefs": removed_refs, "exactRefs": options.exact_refs, "complete":!options.interactive && !options.compact && options.depth.is_none() && options.selector.is_none() }),
         );
     }
 
@@ -6524,7 +6524,7 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         || previous
             .as_ref()
             .is_none_or(|entry| entry.url != url || entry.options != options_key);
-    let response = if force_full {
+    let mut response = if force_full {
         json!({
             "snapshot": { "kind": "full", "revision": revision, "tree": tree, "refs": refs },
             "origin": url,
@@ -6532,6 +6532,8 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     } else {
         snapshot_delta_response(previous.as_ref().unwrap(), revision, &tree, &refs, &url)
     };
+
+    response["exactRefs"] = json!(options.exact_refs);
 
     if state.snapshot_revisions.len() >= 32 && !state.snapshot_revisions.contains_key(&session_id) {
         if let Some(oldest_key) = state

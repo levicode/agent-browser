@@ -121,6 +121,7 @@ test('explicit select kinds are unique and exact; auto retains upstream direct-m
   assert.equal(node.options[1].selected, true);
   assert.deepEqual(selectOption.call(node, ['2'], 'index'), { matched: 1 });
   assert.equal(node.options[2].selected, true);
+  assert.deepEqual(node.events, ['change', 'input', 'change', 'input', 'change']);
 });
 
 test('missing, normalized-ambiguous and disabled exact options never partially mutate', () => {

@@ -627,6 +627,7 @@ const SELECT_OPTION_JS: &str = r#"function(vals, mode) {
     }
     if (wanted.size === 0) return { error: 'No option matched ' + JSON.stringify(vals), beforeInput: true };
     for (const option of options) option.selected = wanted.has(option);
+    if (exact) this.dispatchEvent(new Event('input', { bubbles: true }));
     this.dispatchEvent(new Event('change', { bubbles: true }));
     return { matched: wanted.size };
 }"#;
