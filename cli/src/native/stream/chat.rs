@@ -399,6 +399,7 @@ const ALLOWED_COMMANDS: &[&str] = &[
     "screenshot",
     "pdf",
     "snapshot",
+    "capabilities",
     "ref",
     "eval",
     "close",
