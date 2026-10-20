@@ -120,6 +120,24 @@ fn attach_allowed_domains_to_launch_command(launch_cmd: &mut serde_json::Value, 
     }
 }
 
+/// Send the compiled-contract expectation and immutable scope on launch and
+/// every subsequent request. "default" means an absent browserContextId in CDP;
+/// cdpDedicated is the caller's declaration, not a native isolation proof.
+fn attach_cdp_scope_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
+    if let Some(ref contract) = flags.expect_contract {
+        cmd["expectedContract"] = json!(contract);
+    }
+    if flags.cdp_dedicated {
+        cmd["cdpDedicated"] = json!(true);
+    }
+    if let Some(ref target) = flags.cdp_target {
+        cmd["cdpTarget"] = json!(target);
+    }
+    if let Some(ref context) = flags.cdp_context {
+        cmd["cdpContext"] = json!(context);
+    }
+}
+
 fn attach_pin_tab_to_command(cmd: &mut serde_json::Value, flags: &Flags) {
     if flags.pin_tab {
         cmd["pinTab"] = json!(true);
@@ -154,7 +172,7 @@ fn command_is_external_launch(cmd: &serde_json::Value) -> bool {
 /// as arguments counts when every command in it is one of these.
 fn command_is_browserless(cmd: &serde_json::Value) -> bool {
     match cmd.get("action").and_then(|value| value.as_str()) {
-        Some("read") => true,
+        Some("read" | "capabilities") => true,
         Some("batch") => {
             let first_words: Vec<Option<String>> =
                 if let Some(argv) = cmd.get("argv").and_then(|v| v.as_array()) {
@@ -189,6 +207,7 @@ fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::V
     attach_webmcp_launch_option(&mut launch_cmd, flags);
     attach_allowed_domains_to_launch_command(&mut launch_cmd, flags);
     attach_restore_config_to_command(&mut launch_cmd, flags);
+    attach_cdp_scope_to_command(&mut launch_cmd, flags);
     attach_ca_cert_to_launch_command(&mut launch_cmd, flags);
 
     if let Some(ref cs) = flags.color_scheme {
@@ -288,6 +307,19 @@ fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
     }
 
     None
+}
+
+/// Scoped shutdown must remain possible after its owned target or browser exits.
+/// The actual close command still carries the immutable target/context pair.
+fn cdp_connection_for_command<'a>(
+    flags: &'a Flags,
+    command: &serde_json::Value,
+) -> Option<&'a str> {
+    if flags.cdp_target.is_some() && command["action"] == "close" {
+        None
+    } else {
+        flags.cdp.as_deref()
+    }
 }
 
 fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -> bool {
@@ -442,7 +474,7 @@ fn run_interactive_confirmations(
             false
         };
 
-        let confirm_cmd = if approved {
+        let mut confirm_cmd = if approved {
             json!({
                 "id": gen_id(),
                 "action": "confirm",
@@ -456,6 +488,7 @@ fn run_interactive_confirmations(
             })
         };
 
+        attach_cdp_scope_to_command(&mut confirm_cmd, flags);
         match send_command(confirm_cmd, &flags.session) {
             Ok(next_resp) => {
                 if !approved {
@@ -707,19 +740,34 @@ fn run_session_id(args: &[String], json_mode: bool) {
     }
 }
 
-fn run_session_info(session: &str, json_mode: bool) {
+fn run_session_info(flags: &Flags) {
+    let session = flags.session.as_str();
+    let json_mode = flags.json;
     let inventory = walk_daemons();
     let active = inventory.sessions.iter().find(|s| s.name == session);
     let runtime = active.and_then(|_| {
-        send_command(
-            json!({
-                "id": gen_id(),
-                "action": "session_info"
-            }),
-            session,
-        )
-        .ok()
+        let mut command = json!({
+            "id": gen_id(),
+            "action": "session_info"
+        });
+        attach_cdp_scope_to_command(&mut command, flags);
+        send_command(command, session).ok()
     });
+
+    if flags.expect_contract.is_some() {
+        if let Some(response) = runtime.as_ref().filter(|response| !response.success) {
+            let error = response
+                .error
+                .as_deref()
+                .unwrap_or("Session contract verification failed");
+            if json_mode {
+                print_json_error_with_code(error, response.code.as_deref());
+            } else {
+                eprintln!("{} {}", color::error_indicator(), error);
+            }
+            exit(1);
+        }
+    }
 
     let runtime_data = runtime.as_ref().and_then(|resp| resp.data.clone());
     let runtime_error = runtime.as_ref().and_then(|resp| {
@@ -778,12 +826,14 @@ fn run_session_info(session: &str, json_mode: bool) {
     }
 }
 
-fn run_session(args: &[String], session: &str, json_mode: bool) {
+fn run_session(args: &[String], flags: &Flags) {
+    let session = flags.session.as_str();
+    let json_mode = flags.json;
     let subcommand = args.get(1).map(|s| s.as_str());
 
     match subcommand {
         Some("id") => run_session_id(args, json_mode),
-        Some("info") => run_session_info(session, json_mode),
+        Some("info") => run_session_info(flags),
         Some("list") => {
             let sessions: Vec<String> = walk_daemons()
                 .sessions
@@ -1295,7 +1345,25 @@ fn run_dashboard_stop(json_mode: bool) {
     }
 }
 
+fn close_all_scope_error(flags: &Flags) -> Option<&'static str> {
+    if flags.cdp_target.is_some() || flags.cdp_context.is_some() {
+        Some("Cannot use close --all with --cdp-target or --cdp-context")
+    } else {
+        None
+    }
+}
+
 fn run_close_all(flags: &Flags) {
+    // This cross-session operation can force-kill a daemon when transport
+    // fails. It cannot honor an immutable target/context scope safely.
+    if let Some(message) = close_all_scope_error(flags) {
+        if flags.json {
+            print_json_error_with_type(message, "invalid_value");
+        } else {
+            eprintln!("{} {}", color::error_indicator(), message);
+        }
+        exit(1);
+    }
     // walk_daemons auto-cleans stale .pid / .sock / .stream sidecar files and
     // separates out the standalone dashboard. We only want to send `close` to
     // real session daemons; the dashboard has its own `dashboard stop`.
@@ -1322,7 +1390,8 @@ fn run_close_all(flags: &Flags) {
     let mut failed: Vec<(String, String)> = Vec::new();
 
     for (session, pid) in &sessions {
-        let cmd = json!({ "id": gen_id(), "action": "close" });
+        let mut cmd = json!({ "id": gen_id(), "action": "close" });
+        attach_cdp_scope_to_command(&mut cmd, flags);
         // A close whose response was lost leaves the daemon in an unknown
         // state; force-kill it like an unreachable one.
         let result = send_command(cmd, session).and_then(|resp| {
@@ -1431,6 +1500,14 @@ fn main() {
 
     let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = parse_flags(&args);
+    if let Some(message) = flags::cdp_scope_error(&flags) {
+        if flags.json {
+            print_json_error_with_type(message, "invalid_value");
+        } else {
+            eprintln!("{} {}", color::error_indicator(), message);
+        }
+        exit(1);
+    }
     if flags.restore_uses_session {
         flags.restore = Some(flags.session.clone());
     }
@@ -1440,8 +1517,12 @@ fn main() {
     let clean = clean_args(&args);
     tls::configure_process(&flags);
 
-    let has_help = args.iter().any(|a| a == "--help" || a == "-h");
-    let has_version = args.iter().any(|a| a == "--version" || a == "-V");
+    let control_args = &args[..args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len())];
+    let has_help = control_args.iter().any(|a| a == "--help" || a == "-h");
+    let has_version = control_args.iter().any(|a| a == "--version" || a == "-V");
 
     if has_help {
         if let Some(cmd) = clean.first() {
@@ -1463,6 +1544,36 @@ fn main() {
         return;
     }
 
+    // A capability query is pure local metadata: no daemon, browser, network,
+    // restored session or profile is touched, even with launch flags present.
+    if let Some(ref expected) = flags.expect_contract {
+        if let Err(error) =
+            native::contract::validate_expected_contract(&json!({"expectedContract": expected}))
+        {
+            if flags.json {
+                print_json_error_with_code(error, Some("contract_mismatch"));
+            } else {
+                eprintln!("{} {}", color::error_indicator(), error);
+            }
+            exit(1);
+        }
+    }
+    if clean.first().map(String::as_str) == Some("capabilities") {
+        if clean.len() != 1 {
+            if flags.json {
+                print_json_error_with_type("capabilities takes no arguments", "invalid_value");
+            } else {
+                eprintln!(
+                    "{} capabilities takes no arguments",
+                    color::error_indicator()
+                );
+            }
+            exit(1);
+        }
+        print_json_value(json!({"success":true,"data":native::contract::capabilities()}));
+        return;
+    }
+
     // Handle install separately
     if clean.first().map(|s| s.as_str()) == Some("install") {
         let with_deps = args.iter().any(|a| a == "--with-deps" || a == "-d");
@@ -1470,8 +1581,18 @@ fn main() {
         return;
     }
 
-    // Handle upgrade separately
+    // The maintained fork is source-locked; upstream's package-manager upgrade
+    // would silently replace it with an incompatible official distribution.
     if clean.first().map(|s| s.as_str()) == Some("upgrade") {
+        if env!("CARGO_PKG_VERSION").contains("-e2e.") {
+            let message = "This maintained build is source-locked. Update the consumer source lock and rebuild the pinned fork; native self-upgrade must not install the official package.";
+            if flags.json {
+                print_json_error_with_code(message, Some("source_locked_distribution"));
+            } else {
+                eprintln!("{} {}", color::error_indicator(), message);
+            }
+            exit(1);
+        }
         run_upgrade();
         return;
     }
@@ -1575,7 +1696,7 @@ fn main() {
 
     // Handle session separately (doesn't need daemon)
     if clean.first().map(|s| s.as_str()) == Some("session") {
-        run_session(&clean, &flags.session, flags.json);
+        run_session(&clean, &flags);
         return;
     }
 
@@ -1668,6 +1789,7 @@ fn main() {
 
     attach_pin_tab_to_command(&mut cmd, &flags);
     attach_restore_config_to_command(&mut cmd, &flags);
+    attach_cdp_scope_to_command(&mut cmd, &flags);
 
     // Validate restore/session persistence name before starting daemon
     if let Some(name) = restore_key_from_flags(&flags) {
@@ -1809,13 +1931,17 @@ fn main() {
         cdp: flags.cdp.as_deref(),
         no_auto_dialog: flags.no_auto_dialog,
         plugins: Some(plugin_registry_json.as_str()),
+        expected_contract: flags.expect_contract.as_deref(),
     };
 
     let daemon_result = match ensure_daemon(&flags.session, &daemon_opts) {
         Ok(result) => result,
         Err(e) => {
             if flags.json {
-                print_json_error(e);
+                let code = e
+                    .starts_with(native::contract::CONTRACT_MISMATCH_PREFIX)
+                    .then_some("contract_mismatch");
+                print_json_error_with_code(e, code);
             } else {
                 eprintln!("{} {}", color::error_indicator(), e);
             }
@@ -1838,6 +1964,7 @@ fn main() {
         attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
         attach_pin_tab_to_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
+        attach_cdp_scope_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
@@ -1875,7 +2002,7 @@ fn main() {
 
     // Connect via CDP if --cdp flag is set
     // Accepts either a port number (e.g., "9222") or a full URL (e.g., "ws://..." or "wss://...")
-    if let Some(ref cdp_value) = flags.cdp {
+    if let Some(cdp_value) = cdp_connection_for_command(&flags, &cmd) {
         // Validate CDP value eagerly (even when daemon is already running) so
         // the user gets an immediate error for bad input instead of a silent no-op.
         let launch_cmd = if cdp_value.starts_with("ws://")
@@ -1940,6 +2067,7 @@ fn main() {
         attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
         attach_pin_tab_to_command(&mut launch_cmd, &flags);
         attach_restore_config_to_command(&mut launch_cmd, &flags);
+        attach_cdp_scope_to_command(&mut launch_cmd, &flags);
 
         if flags.ignore_https_errors {
             launch_cmd["ignoreHTTPSErrors"] = json!(true);
@@ -2016,6 +2144,7 @@ fn main() {
         }
         launch_cmd["plugins"] = json!(flags.plugins.clone());
         attach_restore_config_to_command(&mut launch_cmd, &flags);
+        attach_cdp_scope_to_command(&mut launch_cmd, &flags);
 
         let cmd_obj = launch_cmd
             .as_object_mut()
@@ -2193,7 +2322,10 @@ fn main() {
         }
         Err(e) => {
             if flags.json {
-                print_json_error(e);
+                let code = e
+                    .starts_with(native::contract::CONTRACT_MISMATCH_PREFIX)
+                    .then_some("contract_mismatch");
+                print_json_error_with_code(e, code);
             } else {
                 eprintln!("{} {}", color::error_indicator(), e);
             }
@@ -2320,6 +2452,7 @@ fn run_batch(
             .map(|s| s.to_string());
         attach_plugins_to_command(&mut parsed, &flags.plugins);
         attach_restore_config_to_command(&mut parsed, flags);
+        attach_cdp_scope_to_command(&mut parsed, flags);
 
         attach_pin_tab_to_command(&mut parsed, flags);
 
@@ -2396,6 +2529,92 @@ fn run_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn scoped_close_never_schedules_a_cdp_launch() {
+        for verb in ["close", "quit", "exit"] {
+            let input: Vec<String> = [
+                "--cdp",
+                "ws://closed.invalid/devtools/browser/closed",
+                "--cdp-dedicated",
+                "--cdp-target",
+                "closed-target",
+                "--cdp-context",
+                "owned-context",
+                verb,
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            let flags = parse_flags(&input);
+            let mut command = parse_command(&clean_args(&input), &flags).unwrap();
+            attach_cdp_scope_to_command(&mut command, &flags);
+            assert_eq!(command["action"], "close");
+            assert_eq!(cdp_connection_for_command(&flags, &command), None);
+            assert_eq!(command["cdpTarget"], "closed-target");
+            assert_eq!(command["cdpContext"], "owned-context");
+            assert_eq!(
+                cdp_connection_for_command(&flags, &json!({"action":"snapshot"})),
+                flags.cdp.as_deref()
+            );
+        }
+        let flags = parse_flags(&["--cdp".into(), "9222".into()]);
+        assert_eq!(
+            cdp_connection_for_command(&flags, &json!({"action":"close"})),
+            Some("9222"),
+            "legacy unscoped behavior is unchanged"
+        );
+    }
+
+    #[test]
+    fn scoped_close_all_rejects_before_cross_session_shutdown() {
+        let mut flags = parse_flags(&[]);
+        assert_eq!(close_all_scope_error(&flags), None);
+        flags.cdp_target = Some("target-1".into());
+        flags.cdp_context = Some("default".into());
+        assert_eq!(
+            close_all_scope_error(&flags),
+            Some("Cannot use close --all with --cdp-target or --cdp-context")
+        );
+    }
+
+    #[test]
+    fn cdp_scope_is_attached_to_launch_and_ordinary_command_json() {
+        for context in ["default", "opaque-context", "Default"] {
+            let input: Vec<String> = [
+                "--cdp",
+                "9222",
+                "--cdp-dedicated",
+                "--cdp-target",
+                "target-1",
+                "--cdp-context",
+                context,
+                "snapshot",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            let flags = parse_flags(&input);
+            assert_eq!(flags::cdp_scope_error(&flags), None);
+            let ordinary = parse_command(&clean_args(&input), &flags).unwrap();
+            for mut command in [
+                json!({"action":"launch","cdpPort":9222}),
+                ordinary,
+                json!({"action":"confirm"}),
+                json!({"action":"session_info"}),
+            ] {
+                attach_cdp_scope_to_command(&mut command, &flags);
+                assert_eq!(command["cdpTarget"], "target-1");
+                assert_eq!(command["cdpContext"], context);
+                assert!(command.get("browserContextId").is_none());
+            }
+        }
+        let flags = parse_flags(&[]);
+        let mut command = json!({"action":"snapshot"});
+        let unchanged = command.clone();
+        attach_cdp_scope_to_command(&mut command, &flags);
+        assert_eq!(command, unchanged);
+    }
+
     #[test]
     fn input_mode_session_setting_preserves_command_override() {
         let args: Vec<String> = ["--input-mode", "smooth", "click", "#button", "--human"]

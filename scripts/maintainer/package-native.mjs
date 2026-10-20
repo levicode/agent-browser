@@ -1,0 +1,41 @@
+import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { createHash } from 'node:crypto';
+import { copyFileSync, mkdirSync, readFileSync, writeFileSync, mkdtempSync, rmSync, chmodSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+const run = (command, args) => execFileSync(command, args, {encoding: 'utf8'}).trim();
+const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
+const metadata = JSON.parse(readFileSync('maintainer/upstream.json', 'utf8'));
+const commit = run('git', ['rev-parse', 'HEAD']);
+const tree = run('git', ['rev-parse', 'HEAD^{tree}']);
+assert.equal(commit, process.env.GITHUB_SHA, 'Only package this CI checkout');
+assert.equal(run('git', ['status', '--porcelain', '--untracked-files=no']), '', 'Tracked source must be clean');
+const binaryPath = path.resolve('cli/target/ci/agent-browser');
+assert.equal(run(binaryPath, ['--version']), `agent-browser ${metadata.nativeVersion}`);
+const capabilityEnvelope = JSON.parse(run(binaryPath, ['capabilities', '--json']));
+assert.equal(capabilityEnvelope.success, true);
+const capabilities = capabilityEnvelope.data;
+assert.equal(capabilities.contractVersion, metadata.adapterContract);
+assert.equal(capabilities.nativeVersion, metadata.nativeVersion);
+assert.deepEqual(capabilities.capabilities, ['exact-refs', 'passive-scoped-cdp', 'pre-dispatch-stale', 'outcome-unknown']);
+assert.equal(capabilities.passiveScope.requiresDedicatedEndpoint, true);
+assert.equal(capabilities.passiveScope.requiresTargetAndContext, true);
+assert.equal(capabilities.passiveScope.ownsDebuggerPause, false);
+assert.equal(capabilities.passiveScope.ownsFetch, false);
+
+const bytes = readFileSync(binaryPath);
+assert.ok(metadata.support.platforms.includes(`${process.platform}-${process.arch}`));
+const stage = mkdtempSync(path.join(tmpdir(), 'agent-browser-package-'));
+try {
+  mkdirSync('artifacts', {recursive: true});
+  copyFileSync(binaryPath, path.join(stage, 'agent-browser'));
+  chmodSync(path.join(stage, 'agent-browser'), 0o755);
+  copyFileSync('LICENSE', path.join(stage, 'LICENSE'));
+  writeFileSync(path.join(stage, 'NOTICE'), `Maintained agent-browser fork\nSource: ${metadata.forkRepository}/tree/${commit}\nTree: ${tree}\nUpstream: ${metadata.repository}/tree/${metadata.baseCommit}\nContract: ${metadata.adapterContract}\n`);
+  const archive = `agent-browser-${metadata.nativeVersion}-${process.platform}-${process.arch}.tar.gz`;
+  run('tar', ['-czf', `artifacts/${archive}`, '-C', stage, 'agent-browser', 'LICENSE', 'NOTICE']);
+  const digest = hash(readFileSync(`artifacts/${archive}`));
+  writeFileSync('artifacts/SHA256SUMS', `${digest}  ${archive}\n`);
+  writeFileSync('artifacts/manifest.json', JSON.stringify({schemaVersion:1, repository:metadata.forkRepository, sourceCommit:commit, sourceTree:tree, upstreamRepository:metadata.repository, upstreamCommit:metadata.baseCommit, nativeVersion:metadata.nativeVersion, adapterContract:metadata.adapterContract, capabilities, platform:process.platform, architecture:process.arch, rustVersion:run('rustc',['--version']), workflowRun:process.env.GITHUB_RUN_ID, binarySha256:hash(bytes), archive, archiveSha256:digest, verification:'Native suite only. Full browser/consumer acceptance is recorded separately in levicode/e2e.'}, null, 2)+'\n');
+} finally { rmSync(stage, {recursive:true, force:true}); }

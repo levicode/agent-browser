@@ -436,8 +436,319 @@ impl BrowserProcess {
     }
 }
 
+/// Browser-context boundary, immutable after initial discovery. The literal
+/// `default` remains an absent command context ID. A separately proven metadata
+/// ID can identify its targets without treating default-context commands as incognito.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CdpScope {
+    pub initial_target: String,
+    pub context_id: Option<String>,
+}
+
+impl CdpScope {
+    pub fn from_command(cmd: &Value) -> Result<Option<Self>, String> {
+        let target = cmd.get("cdpTarget");
+        let context = cmd.get("cdpContext");
+        if target.is_none() && context.is_none() {
+            if cmd.get("cdpDedicated").is_some() {
+                return Err("Dedicated CDP declaration requires target/context scope".to_string());
+            }
+            return Ok(None);
+        }
+        if cmd.get("cdpDedicated").and_then(Value::as_bool) != Some(true) {
+            return Err(
+                "Scoped CDP requires an explicit dedicated endpoint declaration".to_string(),
+            );
+        }
+        fn valid(v: &Value) -> Option<&str> {
+            v.as_str().filter(|id| {
+                !id.is_empty()
+                    && !id.starts_with("--")
+                    && !id.chars().any(|c| c.is_whitespace() || c.is_control())
+            })
+        }
+        let target = target
+            .and_then(valid)
+            .ok_or("Invalid CDP target/context scope")?;
+        let context = context
+            .and_then(valid)
+            .ok_or("Invalid CDP target/context scope")?;
+        Ok(Some(Self {
+            initial_target: target.to_string(),
+            context_id: (context != "default").then(|| context.to_string()),
+        }))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScopedSession {
+    target_id: String,
+    parent_session: Option<String>,
+}
+
+#[derive(Default)]
+struct ScopedSessions {
+    invalidated: bool,
+    live: HashMap<String, ScopedSession>,
+    revoked: HashSet<String>,
+    revoked_targets: HashSet<String>,
+}
+
+/// Shared by the synchronous drain and asynchronous interception subscriber.
+/// Unknown or replayed child attachments cannot obtain domain/input authority.
+#[derive(Clone)]
+pub(super) struct CdpScopeGuard {
+    scope: Option<CdpScope>,
+    resolved_default_context: Option<String>,
+    sessions: Arc<std::sync::Mutex<ScopedSessions>>,
+}
+
+impl CdpScopeGuard {
+    pub fn new(scope: Option<CdpScope>) -> Self {
+        Self {
+            scope,
+            resolved_default_context: None,
+            sessions: Arc::new(std::sync::Mutex::new(ScopedSessions::default())),
+        }
+    }
+
+    /// A scoped CDP client is a passive participant. The owning companion
+    /// alone pauses/resumes renderers while installing first-request controls.
+    pub fn owns_debugger_pause(&self) -> bool {
+        self.scope.is_none()
+    }
+
+    /// Background preparation is advisory and must not hold the daemon command
+    /// mutex after its exact target/session disappears. Listen independently:
+    /// both ordinary event consumers can themselves be awaiting preparation.
+    /// Dropping the future removes its pending CDP request via PendingGuard.
+    pub async fn run_background<T, F>(
+        &self,
+        client: &CdpClient,
+        target: Option<&str>,
+        session: Option<&str>,
+        work: std::pin::Pin<Box<F>>,
+    ) -> Result<Option<T>, String>
+    where
+        F: Future<Output = Result<T, String>>,
+    {
+        let mut events = client.subscribe();
+        self.run_background_events(&mut events, target, session, work)
+            .await
+    }
+
+    pub async fn run_background_events<T, F>(
+        &self,
+        events: &mut broadcast::Receiver<CdpEvent>,
+        target: Option<&str>,
+        session: Option<&str>,
+        work: std::pin::Pin<Box<F>>,
+    ) -> Result<Option<T>, String>
+    where
+        F: Future<Output = Result<T, String>>,
+    {
+        if self.scope.is_none() {
+            return work.await.map(Some);
+        }
+        let live = || {
+            self.sessions
+                .lock()
+                .map(|state| {
+                    !state.invalidated
+                        && target.is_none_or(|id| !state.revoked_targets.contains(id))
+                        && session.is_none_or(|id| state.live.contains_key(id))
+                })
+                .unwrap_or(false)
+        };
+        if !live() {
+            return Ok(None);
+        }
+        let mut work = work;
+        loop {
+            tokio::select! {
+                biased;
+                event = events.recv() => {
+                    match event {
+                        Ok(event) if event.method == "Target.targetDestroyed" => {
+                            if let Some(id) = event.params.get("targetId").and_then(Value::as_str) {
+                                self.revoke_target(id);
+                            }
+                        }
+                        Ok(event) if event.method == "Target.detachedFromTarget" => {
+                            if let Some(id) = event.params.get("sessionId").and_then(Value::as_str) {
+                                self.revoke_session(id);
+                            }
+                        }
+                        Ok(_) => {},
+                        Err(_) => {
+                            // Missing destruction events cannot grant continued authority.
+                            self.invalidate();
+                            return Err("Scoped background lifecycle stream was lost".to_string());
+                        }
+                    }
+                    if !live() { return Ok(None); }
+                }
+                result = &mut work => {
+                    return if live() { result.map(Some) } else { Ok(None) };
+                }
+            }
+        }
+    }
+
+    pub fn accepts_target(&self, target: &TargetInfo) -> bool {
+        self.scope.as_ref().is_none_or(|scope| {
+            should_track_target(target)
+                && target.browser_context_id.as_ref()
+                    == scope
+                        .context_id
+                        .as_ref()
+                        .or(self.resolved_default_context.as_ref())
+                && self
+                    .sessions
+                    .lock()
+                    .map(|state| {
+                        !state.invalidated && !state.revoked_targets.contains(&target.target_id)
+                    })
+                    .unwrap_or(false)
+        })
+    }
+
+    pub fn accepts_session(&self, session: Option<&str>) -> bool {
+        if self.scope.is_none() {
+            return true;
+        }
+        let Some(session) = session else {
+            return false;
+        };
+        self.sessions
+            .lock()
+            .map(|state| !state.invalidated && state.live.contains_key(session))
+            .unwrap_or(false)
+    }
+
+    /// Call only after validating target metadata or creating the target in
+    /// this manager's immutable context. It does not authorize arbitrary ids.
+    pub fn register_session(&self, session: &str, target: &str, parent: Option<&str>) -> bool {
+        if self.scope.is_none() {
+            return true;
+        }
+        let Ok(mut state) = self.sessions.lock() else {
+            return false;
+        };
+        if state.invalidated
+            || state.revoked.contains(session)
+            || state.revoked_targets.contains(target)
+            || session.is_empty()
+        {
+            return false;
+        }
+        if parent.is_some_and(|sid| !state.live.contains_key(sid)) {
+            return false;
+        }
+        let proof = ScopedSession {
+            target_id: target.to_string(),
+            parent_session: parent.map(str::to_string),
+        };
+        if let Some(previous) = state.live.get(session) {
+            return previous == &proof;
+        }
+        state.live.insert(session.to_string(), proof);
+        true
+    }
+
+    pub fn accept_attachment(
+        &self,
+        parent: Option<&str>,
+        target: Option<&TargetInfo>,
+        session: &str,
+    ) -> bool {
+        let Some(scope) = &self.scope else {
+            return true;
+        };
+        let Some(target) = target else {
+            return false;
+        };
+        match target.target_type.as_str() {
+            "page" | "webview" => {
+                if !self.accepts_target(target) {
+                    return false;
+                }
+            }
+            "iframe" | "worker" | "shared_worker" | "service_worker" => {
+                if parent.is_none()
+                    || !self.accepts_session(parent)
+                    || target.browser_context_id.as_ref().is_some_and(|id| {
+                        Some(id)
+                            != scope
+                                .context_id
+                                .as_ref()
+                                .or(self.resolved_default_context.as_ref())
+                    })
+                {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+        self.register_session(session, &target.target_id, parent)
+    }
+
+    pub fn invalidate(&self) {
+        if self.scope.is_none() {
+            return;
+        }
+        if let Ok(mut state) = self.sessions.lock() {
+            state.invalidated = true;
+            state.live.clear();
+        }
+    }
+
+    pub fn revoke_session(&self, session: &str) {
+        if self.scope.is_none() {
+            return;
+        }
+        let Ok(mut state) = self.sessions.lock() else {
+            return;
+        };
+        let mut pending = vec![session.to_string()];
+        while let Some(sid) = pending.pop() {
+            state.revoked.insert(sid.clone());
+            let children: Vec<String> = state
+                .live
+                .iter()
+                .filter(|(_, proof)| proof.parent_session.as_deref() == Some(sid.as_str()))
+                .map(|(child, _)| child.clone())
+                .collect();
+            state.live.remove(&sid);
+            pending.extend(children);
+        }
+    }
+
+    pub fn revoke_target(&self, target: &str) {
+        if self.scope.is_none() {
+            return;
+        }
+        let sessions: Vec<String> = match self.sessions.lock() {
+            Ok(mut state) => {
+                state.revoked_targets.insert(target.to_string());
+                state
+                    .live
+                    .iter()
+                    .filter(|(_, proof)| proof.target_id == target)
+                    .map(|(sid, _)| sid.clone())
+                    .collect()
+            }
+            Err(_) => return,
+        };
+        for sid in sessions {
+            self.revoke_session(&sid);
+        }
+    }
+}
+
 pub struct BrowserManager {
     pub client: Arc<CdpClient>,
+    scope_guard: CdpScopeGuard,
     browser_process: Option<BrowserProcess>,
     ws_url: String,
     pages: Vec<PageInfo>,
@@ -610,6 +921,7 @@ impl BrowserManager {
                 pin_tab: false,
                 bound_target_id: None,
                 bound_target_gone: None,
+                scope_guard: CdpScopeGuard::new(None),
                 headless,
             };
             if let Err(error) = manager.discover_and_attach_targets().await {
@@ -679,26 +991,34 @@ impl BrowserManager {
     }
 
     pub async fn connect_cdp(url: &str) -> Result<Self, String> {
-        Self::connect_cdp_inner(url, false, None).await
+        Self::connect_cdp_inner(url, false, None, None).await
     }
 
     /// Connect to a provider CDP proxy where the WebSocket IS the page session.
     /// Skips browser-level Target.* commands that most proxies don't support.
     pub async fn connect_cdp_direct(url: &str) -> Result<Self, String> {
-        Self::connect_cdp_inner(url, true, None).await
+        Self::connect_cdp_inner(url, true, None, None).await
     }
 
     pub async fn connect_cdp_with_headers(
         url: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Result<Self, String> {
-        Self::connect_cdp_inner(url, false, headers).await
+        Self::connect_cdp_inner(url, false, headers, None).await
+    }
+
+    pub(super) async fn connect_cdp_scoped(
+        url: &str,
+        scope: Option<CdpScope>,
+    ) -> Result<Self, String> {
+        Self::connect_cdp_inner(url, false, None, scope).await
     }
 
     async fn connect_cdp_inner(
         url: &str,
         direct_page: bool,
         headers: Option<Vec<(String, String)>>,
+        scope: Option<CdpScope>,
     ) -> Result<Self, String> {
         let ws_url = resolve_cdp_url(url).await?;
         let client = Arc::new(CdpClient::connect_with_headers(&ws_url, headers).await?);
@@ -717,9 +1037,11 @@ impl BrowserManager {
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            scope_guard: CdpScopeGuard::new(None),
             headless: true,
         };
 
+        manager.scope_guard = CdpScopeGuard::new(scope);
         let initialization = if direct_page {
             let tab_id = manager.assign_tab_id();
             manager.pages.push(PageInfo {
@@ -750,7 +1072,190 @@ impl BrowserManager {
         Self::connect_cdp(&ws_url).await
     }
 
+    pub(super) fn scope_guard(&self) -> CdpScopeGuard {
+        self.scope_guard.clone()
+    }
+
+    pub(super) fn is_scoped(&self) -> bool {
+        self.scope_guard.scope.is_some()
+    }
+
+    pub(super) fn target_parameters(&self, url: &str) -> Value {
+        let mut params = json!({"url": url});
+        if let Some(context) = self
+            .scope_guard
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.context_id.as_ref())
+        {
+            params["browserContextId"] = json!(context);
+        }
+        params
+    }
+
+    pub(super) async fn enable_active_scoped_domains(&self) -> Result<(), String> {
+        if self.is_scoped() {
+            self.client
+                .send_command_typed::<_, Value>(
+                    "Target.setDiscoverTargets",
+                    &SetDiscoverTargetsParams { discover: true },
+                    None,
+                )
+                .await?;
+            self.enable_domains(self.active_session_id()?).await?;
+        }
+        Ok(())
+    }
+
+    async fn discover_scoped_target(&mut self) -> Result<(), String> {
+        let scope = self
+            .scope_guard
+            .scope
+            .as_ref()
+            .ok_or("Missing CDP scope")?
+            .clone();
+        let contexts_before = if scope.context_id.is_none() {
+            Some(
+                self.client
+                    .send_command_no_params("Target.getBrowserContexts", None)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let result: GetTargetsResult = self
+            .client
+            .send_command_typed("Target.getTargets", &json!({}), None)
+            .await?;
+        if let Some(before) = contexts_before {
+            // Contexts can be created while targets are being enumerated. Only
+            // contexts outside BOTH incognito snapshots can prove a default ID.
+            let after = self
+                .client
+                .send_command_no_params("Target.getBrowserContexts", None)
+                .await?;
+            fn valid_id(id: &str) -> bool {
+                !id.is_empty()
+                    && !id.starts_with("--")
+                    && !id.chars().any(|c| c.is_whitespace() || c.is_control())
+            }
+            fn explicit_default(metadata: &Value) -> Result<Option<String>, String> {
+                match metadata.get("defaultBrowserContextId") {
+                    None | Some(Value::Null) => Ok(None),
+                    Some(Value::String(id)) if valid_id(id) => Ok(Some(id.clone())),
+                    _ => Err("Invalid default browser context metadata".to_string()),
+                }
+            }
+            fn incognito_ids(metadata: &Value) -> Option<HashSet<String>> {
+                metadata
+                    .get("browserContextIds")?
+                    .as_array()?
+                    .iter()
+                    .map(|value| value.as_str().filter(|id| valid_id(id)).map(str::to_string))
+                    .collect()
+            }
+            let explicit_before = explicit_default(&before)?;
+            let explicit_after = explicit_default(&after)?;
+            if explicit_before.is_some()
+                && explicit_after.is_some()
+                && explicit_before != explicit_after
+            {
+                return Err("Default browser context metadata changed during discovery".to_string());
+            }
+            let before_ids = incognito_ids(&before);
+            let after_ids = incognito_ids(&after);
+            let mut incognito = HashSet::new();
+            if let Some(ids) = &before_ids {
+                incognito.extend(ids.iter().cloned());
+            }
+            if let Some(ids) = &after_ids {
+                incognito.extend(ids.iter().cloned());
+            }
+            let resolved = if let Some(id) = explicit_before.or(explicit_after) {
+                if incognito.contains(&id) {
+                    return Err(
+                        "Default browser context conflicts with incognito metadata".to_string()
+                    );
+                }
+                Some(id)
+            } else {
+                let concrete: HashSet<String> = result
+                    .target_infos
+                    .iter()
+                    .filter_map(|target| target.browser_context_id.clone())
+                    .collect();
+                if concrete.iter().any(|id| !valid_id(id)) {
+                    return Err("Invalid target browser context metadata".to_string());
+                }
+                if !concrete.is_empty() && (before_ids.is_none() || after_ids.is_none()) {
+                    return Err(
+                        "Cannot prove the default browser context from incomplete metadata"
+                            .to_string(),
+                    );
+                }
+                let candidates: HashSet<String> =
+                    concrete.difference(&incognito).cloned().collect();
+                if candidates.len() > 1 {
+                    return Err("Default browser context is ambiguous".to_string());
+                }
+                // With no concrete candidate, only legacy targets whose context
+                // is absent can match. Never reinterpret an incognito ID as default.
+                candidates.into_iter().next()
+            };
+            self.scope_guard.resolved_default_context = resolved;
+        }
+        let target = result
+            .target_infos
+            .into_iter()
+            .find(|target| target.target_id == scope.initial_target)
+            .filter(|target| self.scope_guard.accepts_target(target))
+            .ok_or("Selected CDP target is absent or outside the requested browser context")?;
+        let attach: AttachToTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: target.target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+        if !self
+            .scope_guard
+            .register_session(&attach.session_id, &target.target_id, None)
+        {
+            return Err("Cannot establish scoped CDP session".to_string());
+        }
+        // Never probe, enable, revive, or fall back to any other target.
+        if !self
+            .renderer_responds(&attach.session_id, RENDERER_PROBE_TIMEOUT_MS)
+            .await
+        {
+            return Err("Selected CDP target is not responding".to_string());
+        }
+        let tab_id = self.assign_tab_id();
+        self.pages.push(PageInfo {
+            tab_id,
+            label: None,
+            target_id: target.target_id,
+            session_id: attach.session_id,
+            url: target.url,
+            title: target.title,
+            target_type: target.target_type,
+        });
+        self.active_page_index = 0;
+        self.pin_tab = true;
+        self.bind_active_target();
+        // Subscribers must exist before discovery/auto-attach is enabled.
+        // The daemon calls enable_active_scoped_domains after subscribing.
+        Ok(())
+    }
+
     async fn discover_and_attach_targets(&mut self) -> Result<(), String> {
+        if self.is_scoped() {
+            return self.discover_scoped_target().await;
+        }
         self.client
             .send_command_typed::<_, Value>(
                 "Target.setDiscoverTargets",
@@ -887,6 +1392,10 @@ impl BrowserManager {
     }
 
     pub async fn enable_browser_auto_attach_pub(&self) -> Result<(), String> {
+        // Browser-wide auto-attach can pause targets owned by other contexts.
+        if self.is_scoped() {
+            return Ok(());
+        }
         self.client
             .send_command(
                 "Target.setAutoAttach",
@@ -908,6 +1417,21 @@ impl BrowserManager {
     }
 
     async fn prepare_domains(&self, session_id: &str) -> Result<(), String> {
+        self.scope_guard
+            .run_background(
+                &self.client,
+                None,
+                Some(session_id),
+                Box::pin(self.prepare_live_domains(session_id)),
+            )
+            .await?
+            .ok_or_else(|| "Scoped preparation session detached".to_string())
+    }
+
+    async fn prepare_live_domains(&self, session_id: &str) -> Result<(), String> {
+        if !self.scope_guard.accepts_session(Some(session_id)) {
+            return Err("CDP session is outside the immutable scope".to_string());
+        }
         self.client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;
@@ -923,8 +1447,8 @@ impl BrowserManager {
             .await;
         // Enable auto-attach for cross-origin iframe support.
         // flatten: true gives each iframe its own session_id.
-        // waitForDebuggerOnStart keeps child targets paused until the daemon
-        // installs any required network controls and explicitly resumes them.
+        // Only legacy standalone sessions own the debugger pause. Scoped
+        // participants must never race the companion's network setup/resume.
         // Ignored on engines that don't support it (e.g. Lightpanda).
         let _ = self
             .client
@@ -932,7 +1456,7 @@ impl BrowserManager {
                 "Target.setAutoAttach",
                 Some(json!({
                     "autoAttach": true,
-                    "waitForDebuggerOnStart": true,
+                    "waitForDebuggerOnStart": self.scope_guard.owns_debugger_pause(),
                     "flatten": true
                 })),
                 Some(session_id),
@@ -979,6 +1503,11 @@ impl BrowserManager {
         // paused, so the probe times out without the tab being discarded.
         if dialog_session == Some(session_id) {
             return Ok(RendererState::DialogBlocked);
+        }
+        if self.is_scoped() {
+            return Err(
+                "Scoped CDP target is not responding; activation recovery is disabled".to_string(),
+            );
         }
         match tokio::time::timeout(
             Duration::from_millis(REVIVED_RENDERER_TIMEOUT_MS),
@@ -1048,6 +1577,16 @@ impl BrowserManager {
     }
 
     async fn resume_if_waiting(&self, session_id: &str) -> Result<(), String> {
+        if !self.scope_guard.accepts_session(Some(session_id)) {
+            return Err("CDP session is outside the immutable scope".to_string());
+        }
+        // A manual/non-waiting session (or duplicate resume) bypasses V8's
+        // shared debugger barrier and can release another client's page pause.
+        // Scoped sessions never own that pause, including selected pages,
+        // discovered popups, explicitly switched tabs, OOPIFs and workers.
+        if !self.scope_guard.owns_debugger_pause() {
+            return Ok(());
+        }
         // Needed for real browser sessions (Chrome 144+) where targets are
         // paused after attach until explicitly resumed. No-op otherwise.
         let _ = self
@@ -1065,10 +1604,14 @@ impl BrowserManager {
         self.client
             .send_command_no_params("Runtime.enable", None)
             .await?;
-        let _ = self
-            .client
-            .send_command_no_params("Runtime.runIfWaitingForDebugger", None)
-            .await;
+        // Direct provider connections currently have no scoped constructor;
+        // retain the ownership guard here so future callers cannot bypass it.
+        if self.scope_guard.owns_debugger_pause() {
+            let _ = self
+                .client
+                .send_command_no_params("Runtime.runIfWaitingForDebugger", None)
+                .await;
+        }
         self.client
             .send_command_no_params("Network.enable", None)
             .await?;
@@ -1084,7 +1627,14 @@ impl BrowserManager {
         self.pages
             .get(self.active_page_index)
             .map(|p| p.session_id.as_str())
-            .ok_or_else(|| "No active page".to_string())
+            .filter(|sid| self.scope_guard.accepts_session(Some(sid)))
+            .ok_or_else(|| {
+                if self.is_scoped() {
+                    "No active page or scoped session was detached".to_string()
+                } else {
+                    "No active page".to_string()
+                }
+            })
     }
 
     // -----------------------------------------------------------------------
@@ -1096,6 +1646,7 @@ impl BrowserManager {
     /// waiting for a restart to re-derive it. Disabling clears any pending
     /// `tab_gone` state so the session falls back to legacy selection.
     pub fn set_pin_tab(&mut self, pin: bool) {
+        let pin = pin || self.is_scoped();
         self.pin_tab = pin;
         if pin {
             self.bind_active_target();
@@ -1490,6 +2041,11 @@ impl BrowserManager {
     /// Ensures the browser has at least one page. If `pages` is empty, creates a new
     /// about:blank page and attaches to it.
     pub async fn ensure_page(&mut self) -> Result<(), String> {
+        if self.is_scoped() && self.pages.is_empty() {
+            return Err(
+                "Scoped CDP target is gone; explicit tab selection is required".to_string(),
+            );
+        }
         if !self.pages.is_empty() {
             return Ok(());
         }
@@ -1669,9 +2225,7 @@ impl BrowserManager {
             .client
             .send_command_typed(
                 "Target.createTarget",
-                &CreateTargetParams {
-                    url: target_url.to_string(),
-                },
+                &self.target_parameters(target_url),
                 None,
             )
             .await?;
@@ -1688,6 +2242,12 @@ impl BrowserManager {
             )
             .await?;
 
+        if !self
+            .scope_guard
+            .register_session(&attach.session_id, &result.target_id, None)
+        {
+            return Err("Cannot establish scoped CDP tab session".to_string());
+        }
         self.enable_domains(&attach.session_id).await?;
 
         let tab_id = self.next_tab_id;
@@ -1889,6 +2449,10 @@ impl BrowserManager {
             )
             .await?;
 
+        if self.is_scoped() {
+            return Ok(());
+        }
+
         // Screencast captures the actual content area, not the emulated CSS
         // viewport, so resize the content area to match.
         if let Ok(target_id) = self.active_target_id() {
@@ -2013,12 +2577,17 @@ impl BrowserManager {
     }
 
     pub async fn grant_permissions(&self, permissions: &[String]) -> Result<(), String> {
+        let mut params = json!({ "permissions": permissions });
+        if let Some(context) = self
+            .scope_guard
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.context_id.as_ref())
+        {
+            params["browserContextId"] = json!(context);
+        }
         self.client
-            .send_command(
-                "Browser.grantPermissions",
-                Some(json!({ "permissions": permissions })),
-                None,
-            )
+            .send_command("Browser.grantPermissions", Some(params), None)
             .await?;
         Ok(())
     }
@@ -2056,33 +2625,51 @@ impl BrowserManager {
             resolve_element_object_id(&self.client, session_id, ref_map, selector, iframe_sessions)
                 .await?;
 
-        let describe: Value = self
+        let result = async {
+            // Chromium deliberately treats DOM.setFileInputFiles([]) as a no-op.
+            // Clearing must bind to this exact input rather than keyboard focus.
+            if files.is_empty() {
+                return clear_exact_file_input(&self.client, &object_id, &effective_session_id)
+                    .await;
+            }
+            let describe: Value = self
+                .client
+                .send_command(
+                    "DOM.describeNode",
+                    Some(json!({ "objectId": object_id })),
+                    Some(&effective_session_id),
+                )
+                .await?;
+
+            let backend_node_id = describe
+                .get("node")
+                .and_then(|n| n.get("backendNodeId"))
+                .and_then(|v| v.as_i64())
+                .ok_or("Could not get backendNodeId for file input")?;
+
+            self.client
+                .send_command(
+                    "DOM.setFileInputFiles",
+                    Some(json!({
+                        "files": files,
+                        "backendNodeId": backend_node_id,
+                    })),
+                    Some(&effective_session_id),
+                )
+                .await?;
+
+            Ok(())
+        }
+        .await;
+        let _ = self
             .client
             .send_command(
-                "DOM.describeNode",
-                Some(json!({ "objectId": object_id })),
+                "Runtime.releaseObject",
+                Some(json!({"objectId": object_id})),
                 Some(&effective_session_id),
             )
-            .await?;
-
-        let backend_node_id = describe
-            .get("node")
-            .and_then(|n| n.get("backendNodeId"))
-            .and_then(|v| v.as_i64())
-            .ok_or("Could not get backendNodeId for file input")?;
-
-        self.client
-            .send_command(
-                "DOM.setFileInputFiles",
-                Some(json!({
-                    "files": files,
-                    "backendNodeId": backend_node_id,
-                })),
-                Some(&effective_session_id),
-            )
-            .await?;
-
-        Ok(())
+            .await;
+        result
     }
 
     pub async fn add_script_to_evaluate(&self, source: &str) -> Result<String, String> {
@@ -2112,6 +2699,28 @@ impl BrowserManager {
             )
             .await?;
         Ok(())
+    }
+
+    pub async fn tab_bind_by_id(&mut self, tab_id: u32) -> Result<Value, String> {
+        let index = self
+            .pages
+            .iter()
+            .position(|page| page.tab_id == tab_id)
+            .ok_or("Unknown tab id")?;
+        let session = self.pages[index].session_id.clone();
+        if !self
+            .renderer_responds(&session, RENDERER_PROBE_TIMEOUT_MS)
+            .await
+        {
+            return Err("Read-only tab binding requires a responsive renderer".into());
+        }
+        self.enable_domains(&session).await?;
+        self.active_page_index = index;
+        self.bind_active_target();
+        let page = &self.pages[index];
+        Ok(
+            json!({"tabId":format_tab_id(page.tab_id),"targetId":page.target_id,"url":page.url,"title":page.title}),
+        )
     }
 
     pub async fn tab_switch_by_id(
@@ -2165,6 +2774,9 @@ impl BrowserManager {
     }
 
     fn add_page_with_activation(&mut self, page: PageInfo, activate: bool) {
+        if !self.scope_guard.accepts_session(Some(&page.session_id)) {
+            return;
+        }
         let new_index = self.pages.len();
         // In the tab_gone state, adopting a discovered tab would clear it and
         // re-bind to a tab the session never opened. Recovery stays explicit
@@ -2197,10 +2809,14 @@ impl BrowserManager {
     }
 
     pub fn update_page_target_info(&mut self, target: &TargetInfo) -> bool {
+        if !self.scope_guard.accepts_target(target) {
+            return false;
+        }
         update_page_target_info_in_pages(&mut self.pages, target)
     }
 
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
+        self.scope_guard.revoke_target(target_id);
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             let page = self.pages.remove(pos);
             self.update_active_page_after_removal(pos);
@@ -2279,19 +2895,63 @@ impl BrowserManager {
 
     pub async fn set_download_behavior(&self, download_path: &str) -> Result<(), String> {
         let session_id = self.active_session_id()?;
+        let mut params =
+            json!({"behavior":"allowAndName", "downloadPath":download_path, "eventsEnabled":true});
+        if let Some(context) = self
+            .scope_guard
+            .scope
+            .as_ref()
+            .and_then(|scope| scope.context_id.as_ref())
+        {
+            params["browserContextId"] = json!(context);
+        }
         self.client
             .send_command(
                 "Browser.setDownloadBehavior",
-                Some(json!({
-                    "behavior": "allowAndName",
-                    "downloadPath": download_path,
-                    "eventsEnabled": true,
-                })),
+                Some(params),
                 Some(session_id),
             )
             .await?;
         Ok(())
     }
+}
+
+/// File paths cannot express an empty selection in Chromium's DOM domain.
+/// No rejection after the native setter is allowed to become a safe retry.
+async fn clear_exact_file_input(
+    client: &CdpClient,
+    object_id: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let result: EvaluateResult = client.send_command_typed("Runtime.callFunctionOn", &json!({
+        "objectId":object_id,
+        "functionDeclaration":r#"function() {
+            if (!this.isConnected || this.ownerDocument !== document || !(this instanceof HTMLInputElement) || this.type !== 'file') return {beforeInput:true};
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(this, '');
+            if (this.files.length !== 0) return false;
+            this.dispatchEvent(new Event('input', {bubbles:true, composed:true}));
+            this.dispatchEvent(new Event('change', {bubbles:true}));
+            return true;
+        }"#,
+        "returnByValue":true,
+    }), Some(session_id)).await?;
+    if result.exception_details.is_none()
+        && result
+            .result
+            .value
+            .as_ref()
+            .is_some_and(|value| value["beforeInput"].as_bool() == Some(true))
+    {
+        return Err("e2e_not_actionable".into());
+    }
+    if result.exception_details.is_some()
+        || result.result.value.as_ref().and_then(Value::as_bool) != Some(true)
+    {
+        return Err(
+            "File selection clearing did not complete after mutation may have committed".into(),
+        );
+    }
+    Ok(())
 }
 
 /// Core network-idle polling loop, extracted so it can be unit-tested without a
@@ -2429,6 +3089,7 @@ async fn initialize_lightpanda_manager(
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            scope_guard: CdpScopeGuard::new(None),
             headless: true,
         };
 
@@ -2538,6 +3199,7 @@ async fn initialize_obscura_manager(
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            scope_guard: CdpScopeGuard::new(None),
             headless: true,
         };
 
@@ -3333,7 +3995,78 @@ mod tests {
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            scope_guard: CdpScopeGuard::new(None),
             headless: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_upload_uses_one_exact_setter_and_never_retries_after_mutation() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        for outcome in ["cleared", "before-input", "after-mutation", "exception"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let Some(Ok(Message::Text(text))) = ws.next().await else {
+                    panic!("Missing exact input operation");
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(command["method"], "Runtime.callFunctionOn");
+                assert_eq!(command["sessionId"], "owned-frame");
+                assert_eq!(command["params"]["objectId"], "exact-file-input");
+                let source = command["params"]["functionDeclaration"].as_str().unwrap();
+                assert!(!source.contains("querySelector"));
+                assert_eq!(source.matches(".set.call(this, '')").count(), 1);
+                assert_eq!(source.matches("new Event('input'").count(), 1);
+                assert_eq!(source.matches("new Event('change'").count(), 1);
+                assert!(
+                    source.find("return {beforeInput:true}").unwrap()
+                        < source.find(".set.call").unwrap()
+                );
+                let result = match outcome {
+                    "cleared" => json!({"result":{"type":"boolean","value":true}}),
+                    "before-input" => {
+                        json!({"result":{"type":"object","value":{"beforeInput":true}}})
+                    }
+                    "after-mutation" => json!({"result":{"type":"boolean","value":false}}),
+                    _ => {
+                        json!({"result":{"type":"undefined"},"exceptionDetails":{"text":"synthetic exception","lineNumber":0,"columnNumber":0}})
+                    }
+                };
+                ws.send(Message::Text(
+                    json!({"id":command["id"],"result":result}).to_string(),
+                ))
+                .await
+                .unwrap();
+                while let Some(Ok(message)) = ws.next().await {
+                    match message {
+                        Message::Text(text) => {
+                            panic!("Empty upload dispatched another command: {text}")
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let result = clear_exact_file_input(&client, "exact-file-input", "owned-frame").await;
+            match outcome {
+                "cleared" => assert!(result.is_ok()),
+                "before-input" => assert_eq!(result.unwrap_err(), "e2e_not_actionable"),
+                _ => {
+                    let error = result.unwrap_err();
+                    assert!(!error.starts_with("e2e_"));
+                    assert!(error.contains("may have committed"));
+                }
+            }
+            client.close().await;
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
         }
     }
 
@@ -3393,6 +4126,7 @@ mod tests {
             pin_tab: false,
             bound_target_id: None,
             bound_target_gone: None,
+            scope_guard: CdpScopeGuard::new(None),
             headless: true,
         };
         manager.close().await.unwrap();
@@ -3488,14 +4222,14 @@ mod tests {
         existing: bool,
     ) {
         let (url, server) = initialization_server(fail_method, existing, 2, false).await;
-        let error = BrowserManager::connect_cdp_inner(&url, direct, None)
+        let error = BrowserManager::connect_cdp_inner(&url, direct, None, None)
             .await
             .err()
             .expect("initialization should fail");
         assert!(error.contains("injected initialization failure"), "{error}");
         let mut manager = tokio::time::timeout(
             Duration::from_secs(4),
-            BrowserManager::connect_cdp_inner(&url, direct, None),
+            BrowserManager::connect_cdp_inner(&url, direct, None, None),
         )
         .await
         .expect("retry should succeed after cleanup")
@@ -4451,6 +5185,12 @@ mod tests {
     /// never needlessly reactivated.
     async fn start_mock_cdp_browser_responsive(
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        start_mock_cdp_browser_responsive_counting_focus(false).await
+    }
+
+    async fn start_mock_cdp_browser_responsive_counting_focus(
+        include_front: bool,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use futures_util::{SinkExt, StreamExt};
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -4489,7 +5229,9 @@ mod tests {
                 let method = cmd["method"].as_str().unwrap_or("");
                 let respond = |result: Value| json!({ "id": id, "result": result }).to_string();
 
-                if method == "Target.activateTarget" {
+                if method == "Target.activateTarget"
+                    || (include_front && method == "Page.bringToFront")
+                {
                     activations_task.fetch_add(1, Ordering::SeqCst);
                 }
 
@@ -4523,6 +5265,22 @@ mod tests {
     /// A responsive tab must not be reactivated: recovery only runs when the
     /// liveness probe gets no answer, so a healthy tab keeps its state and is
     /// never touched by Target.activateTarget (#1528).
+    #[tokio::test]
+    async fn trace_binding_returns_exact_target_without_focus() {
+        let (url, activations) = start_mock_cdp_browser_responsive_counting_focus(true).await;
+        let mut manager = BrowserManager::connect_cdp(&url).await.unwrap();
+        let id = manager
+            .pages
+            .iter()
+            .find(|page| page.target_id == "T-TWO")
+            .unwrap()
+            .tab_id;
+        let result = manager.tab_bind_by_id(id).await.unwrap();
+        assert_eq!(result["targetId"], "T-TWO");
+        assert_eq!(manager.active_target_id().unwrap(), "T-TWO");
+        assert_eq!(activations.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
     #[tokio::test]
     async fn test_tab_switch_does_not_revive_responsive_tab() {
         let (url, activations) = start_mock_cdp_browser_responsive().await;
@@ -4994,6 +5752,643 @@ mod tests {
             mgr.client.pending_len().await,
             0,
             "cancelled connect-time probes left orphaned CDP requests in the pending map"
+        );
+    }
+
+    fn strict_scope(context_id: Option<&str>) -> CdpScope {
+        CdpScope {
+            initial_target: "T-SELECTED".to_string(),
+            context_id: context_id.map(str::to_string),
+        }
+    }
+
+    fn strict_scope_target(id: &str, kind: &str, context: Option<&str>) -> TargetInfo {
+        TargetInfo {
+            target_id: id.to_string(),
+            target_type: kind.to_string(),
+            title: id.to_string(),
+            url: "https://scope.test/".to_string(),
+            attached: Some(false),
+            browser_context_id: context.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn test_cdp_scope_guard_unscoped_preserves_legacy_acceptance() {
+        let guard = CdpScopeGuard::new(None);
+        assert!(guard.accepts_session(None));
+        assert!(guard.accepts_session(Some("S-UNTRACKED")));
+        let target = strict_scope_target("T-FOREIGN", "page", Some("C-FOREIGN"));
+        assert!(guard.accept_attachment(None, Some(&target), "S-FOREIGN"));
+    }
+
+    #[test]
+    fn test_cdp_scope_guard_page_context_is_exact_and_default_is_not_wildcard() {
+        let guard = CdpScopeGuard::new(Some(strict_scope(Some("C-APPROVED"))));
+        assert!(!guard.accepts_session(None));
+        assert!(!guard.accepts_session(Some("S-UNKNOWN")));
+        assert!(guard.register_session("S-SELECTED", "T-SELECTED", None));
+        let popup = strict_scope_target("T-POPUP", "page", Some("C-APPROVED"));
+        assert!(guard.accept_attachment(None, Some(&popup), "S-POPUP"));
+        assert!(guard.accepts_session(Some("S-POPUP")));
+        for (id, context) in [("T-FOREIGN", Some("C-FOREIGN")), ("T-DEFAULT", None)] {
+            let target = strict_scope_target(id, "page", context);
+            assert!(!guard.accept_attachment(None, Some(&target), id));
+            assert!(!guard.accepts_session(Some(id)));
+        }
+        let default_guard = CdpScopeGuard::new(Some(strict_scope(None)));
+        let default_page = strict_scope_target("T-DEFAULT", "page", None);
+        let isolated_page = strict_scope_target("T-ISOLATED", "page", Some("C-APPROVED"));
+        assert!(default_guard.accept_attachment(None, Some(&default_page), "S-DEFAULT"));
+        assert!(!default_guard.accept_attachment(None, Some(&isolated_page), "S-ISOLATED"));
+    }
+
+    #[test]
+    fn test_cdp_scope_guard_nested_parent_provenance() {
+        let guard = CdpScopeGuard::new(Some(strict_scope(Some("C-APPROVED"))));
+        assert!(guard.register_session("S-SELECTED", "T-SELECTED", None));
+        let frame = strict_scope_target("T-FRAME", "iframe", None);
+        assert!(guard.accept_attachment(Some("S-SELECTED"), Some(&frame), "S-FRAME"));
+        let nested = strict_scope_target("T-NESTED", "iframe", Some("C-APPROVED"));
+        assert!(guard.accept_attachment(Some("S-FRAME"), Some(&nested), "S-NESTED"));
+        for (id, kind) in [
+            ("S-WORKER", "worker"),
+            ("S-SHARED", "shared_worker"),
+            ("S-SERVICE", "service_worker"),
+        ] {
+            let worker = strict_scope_target(id, kind, None);
+            assert!(guard.accept_attachment(Some("S-NESTED"), Some(&worker), id));
+            assert!(guard.accepts_session(Some(id)));
+        }
+        let clone = guard.clone();
+        assert!(clone.accepts_session(Some("S-NESTED")));
+        assert!(!clone.accept_attachment(Some("S-UNAPPROVED"), Some(&frame), "S-STRANGER"));
+        assert!(!clone.accept_attachment(None, Some(&nested), "S-ROOT-IFRAME"));
+        let worker = strict_scope_target("T-WORKER", "worker", Some("C-APPROVED"));
+        assert!(!clone.accept_attachment(None, Some(&worker), "S-ROOT-WORKER"));
+        let foreign = strict_scope_target("T-FOREIGN", "iframe", Some("C-FOREIGN"));
+        assert!(!clone.accept_attachment(Some("S-SELECTED"), Some(&foreign), "S-FOREIGN"));
+        assert!(!clone.accept_attachment(Some("S-SELECTED"), None, "S-MALFORMED"));
+        let other = strict_scope_target("T-BROWSER", "browser", Some("C-APPROVED"));
+        assert!(!clone.accept_attachment(Some("S-SELECTED"), Some(&other), "S-BROWSER"));
+    }
+
+    #[test]
+    fn test_cdp_scope_guard_detach_revokes_descendants_and_blocks_stale_replay() {
+        let guard = CdpScopeGuard::new(Some(strict_scope(Some("C-APPROVED"))));
+        assert!(guard.register_session("S-SELECTED", "T-SELECTED", None));
+        let frame = strict_scope_target("T-FRAME", "iframe", None);
+        let worker = strict_scope_target("T-WORKER", "worker", None);
+        assert!(guard.accept_attachment(Some("S-SELECTED"), Some(&frame), "S-FRAME"));
+        assert!(guard.accept_attachment(Some("S-FRAME"), Some(&worker), "S-WORKER"));
+        let second_subscriber = guard.clone();
+        second_subscriber.revoke_session("S-FRAME");
+        assert!(guard.accepts_session(Some("S-SELECTED")));
+        assert!(!guard.accepts_session(Some("S-FRAME")));
+        assert!(!guard.accepts_session(Some("S-WORKER")));
+        // The slower event subscriber may now replay an earlier attachment.
+        assert!(!guard.accept_attachment(Some("S-SELECTED"), Some(&frame), "S-FRAME"));
+        assert!(!guard.register_session("S-FRAME", "T-FRAME", Some("S-SELECTED")));
+        assert!(!guard.accept_attachment(Some("S-FRAME"), Some(&worker), "S-LATE-WORKER"));
+        assert!(!guard.accepts_session(Some("S-LATE-WORKER")));
+        guard.revoke_session("S-NOT-YET-SEEN");
+        let popup = strict_scope_target("T-POPUP", "page", Some("C-APPROVED"));
+        assert!(!guard.accept_attachment(None, Some(&popup), "S-NOT-YET-SEEN"));
+    }
+
+    #[test]
+    fn test_cdp_scope_guard_destroy_revokes_all_target_sessions_and_descendants() {
+        let guard = CdpScopeGuard::new(Some(strict_scope(Some("C-APPROVED"))));
+        assert!(guard.register_session("S-SELECTED", "T-SELECTED", None));
+        assert!(guard.register_session("S-RECORDER", "T-SELECTED", None));
+        let frame = strict_scope_target("T-FRAME", "iframe", None);
+        assert!(guard.accept_attachment(Some("S-SELECTED"), Some(&frame), "S-FRAME"));
+        let popup = strict_scope_target("T-POPUP", "page", Some("C-APPROVED"));
+        assert!(guard.accept_attachment(None, Some(&popup), "S-POPUP"));
+        guard.revoke_target("T-SELECTED");
+        for sid in ["S-SELECTED", "S-RECORDER", "S-FRAME"] {
+            assert!(
+                !guard.accepts_session(Some(sid)),
+                "destroy left {sid} approved"
+            );
+        }
+        assert!(guard.accepts_session(Some("S-POPUP")));
+        let selected = strict_scope_target("T-SELECTED", "page", Some("C-APPROVED"));
+        assert!(!guard.accept_attachment(None, Some(&selected), "S-SELECTED"));
+        // A slower subscriber may replay the destroyed target with a session
+        // the faster subscriber never registered. Target tombstones cover it.
+        assert!(!guard.accept_attachment(None, Some(&selected), "S-UNSEEN-LATE"));
+        assert!(!guard.register_session("S-UNSEEN-LATE", "T-SELECTED", None));
+        assert!(!guard.accepts_target(&selected));
+    }
+
+    #[test]
+    fn test_cdp_scope_guard_lagged_stream_invalidation_is_permanent_and_shared() {
+        let guard = CdpScopeGuard::new(Some(strict_scope(Some("C-APPROVED"))));
+        assert!(guard.register_session("S-SELECTED", "T-SELECTED", None));
+        let second_subscriber = guard.clone();
+        guard.invalidate();
+        let target = strict_scope_target("T-POPUP", "page", Some("C-APPROVED"));
+        assert!(!second_subscriber.accepts_session(Some("S-SELECTED")));
+        assert!(!second_subscriber.accepts_target(&target));
+        assert!(!second_subscriber.register_session("S-NEW", "T-POPUP", None));
+        assert!(!second_subscriber.accept_attachment(None, Some(&target), "S-NEW"));
+        second_subscriber.revoke_session("S-SELECTED");
+        assert!(!guard.register_session("S-NEWER", "T-NEWER", None));
+        let legacy = CdpScopeGuard::new(None);
+        legacy.invalidate();
+        assert!(legacy.accepts_session(None));
+        assert!(legacy.accepts_target(&target));
+        assert!(legacy.accept_attachment(None, Some(&target), "S-LEGACY"));
+    }
+
+    #[derive(Clone, Copy)]
+    enum StrictScopeSentinelMode {
+        Matching,
+        Mismatched,
+        Missing,
+        Unresponsive,
+        DefaultMetadata,
+        DefaultForeign,
+        DefaultMetadataAbsent,
+        DefaultMetadataInvalid,
+        DefaultAbsentContext,
+        DefaultProvenUnique,
+        DefaultAmbiguous,
+        DefaultRacingIncognito,
+        DefaultLegacyConflict,
+    }
+
+    /// An ordinary websocket fixture, with no Chrome process. Foreign and
+    /// same-context sibling targets are deliberately listed before the selected
+    /// target so an unfiltered attach/probe fallback is visible on the wire.
+    async fn strict_scope_sentinel(
+        mode: StrictScopeSentinelMode,
+    ) -> (
+        String,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://{}/devtools/browser/scope-sentinel",
+            listener.local_addr().unwrap()
+        );
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let events = recorded.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut context_reads = 0;
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(15), ws.next())
+                    .await
+                    .expect("scope fixture connection did not close");
+                let text = match message {
+                    Some(Ok(Message::Text(text))) => text,
+                    Some(Ok(Message::Ping(payload))) => {
+                        let _ = ws.send(Message::Pong(payload)).await;
+                        continue;
+                    }
+                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                    _ => continue,
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                events.lock().unwrap().push(command.clone());
+                let method = command["method"].as_str().unwrap_or("");
+                let sid = command["sessionId"].as_str();
+                if matches!(mode, StrictScopeSentinelMode::Unresponsive)
+                    && sid == Some("S-T-SELECTED")
+                    && method == "Runtime.evaluate"
+                {
+                    continue;
+                }
+                let result = match method {
+                    "Target.getBrowserContexts" => {
+                        context_reads += 1;
+                        match mode {
+                            StrictScopeSentinelMode::DefaultMetadata
+                            | StrictScopeSentinelMode::DefaultForeign => {
+                                json!({"browserContextIds":["C-FOREIGN","C-APPROVED"],"defaultBrowserContextId":"C-DEFAULT"})
+                            }
+                            StrictScopeSentinelMode::DefaultMetadataInvalid => {
+                                json!({"browserContextIds":["C-FOREIGN","C-APPROVED"],"defaultBrowserContextId":" invalid context "})
+                            }
+                            StrictScopeSentinelMode::DefaultMetadataAbsent => {
+                                json!({"browserContextIds":["C-DEFAULT","C-FOREIGN","C-APPROVED"]})
+                            }
+                            StrictScopeSentinelMode::DefaultAmbiguous
+                            | StrictScopeSentinelMode::DefaultLegacyConflict => {
+                                json!({"browserContextIds":["C-FOREIGN"]})
+                            }
+                            StrictScopeSentinelMode::DefaultRacingIncognito
+                                if context_reads > 1 =>
+                            {
+                                json!({"browserContextIds":["C-DEFAULT","C-FOREIGN","C-APPROVED"]})
+                            }
+                            _ => json!({"browserContextIds":["C-FOREIGN","C-APPROVED"]}),
+                        }
+                    }
+                    "Target.getTargets" => {
+                        let mut targets = vec![
+                            json!({"targetId":"T-FOREIGN","type":"page","title":"foreign", "url":"https://foreign.test/","browserContextId":"C-FOREIGN"}),
+                            json!({"targetId":"T-SIBLING","type":"page","title":"sibling", "url":"https://sibling.test/","browserContextId":"C-APPROVED"}),
+                            json!({"targetId":"T-DEFAULT","type":"page","title":"default", "url":"https://default.test/"}),
+                        ];
+                        if !matches!(mode, StrictScopeSentinelMode::Missing) {
+                            let context = match mode {
+                                StrictScopeSentinelMode::Mismatched
+                                | StrictScopeSentinelMode::DefaultForeign => "C-FOREIGN",
+                                StrictScopeSentinelMode::DefaultMetadata
+                                | StrictScopeSentinelMode::DefaultMetadataAbsent
+                                | StrictScopeSentinelMode::DefaultMetadataInvalid
+                                | StrictScopeSentinelMode::DefaultProvenUnique
+                                | StrictScopeSentinelMode::DefaultAmbiguous
+                                | StrictScopeSentinelMode::DefaultRacingIncognito => "C-DEFAULT",
+                                _ => "C-APPROVED",
+                            };
+                            let mut selected = json!({"targetId":"T-SELECTED","type":"page", "title":"selected","url":"https://selected.test/","browserContextId":context});
+                            if matches!(
+                                mode,
+                                StrictScopeSentinelMode::DefaultAbsentContext
+                                    | StrictScopeSentinelMode::DefaultLegacyConflict
+                            ) {
+                                selected.as_object_mut().unwrap().remove("browserContextId");
+                            }
+                            targets.push(selected);
+                        }
+                        json!({"targetInfos": targets})
+                    }
+                    "Target.attachToTarget" => {
+                        let target = command["params"]["targetId"].as_str().unwrap_or("");
+                        json!({"sessionId":format!("S-{target}")})
+                    }
+                    "Runtime.evaluate" => json!({"result":{"type":"number","value":1}}),
+                    "Target.createTarget" => json!({"targetId":"T-UNEXPECTED-CREATED"}),
+                    _ => json!({}),
+                };
+                let response = json!({"id":command["id"],"result":result});
+                if ws.send(Message::Text(response.to_string())).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (url, recorded, server)
+    }
+
+    fn assert_strict_scope_wire_boundary(commands: &[Value]) {
+        for command in commands {
+            let method = command["method"].as_str().unwrap_or("");
+            assert!(
+                !matches!(
+                    method,
+                    "Target.createTarget"
+                        | "Target.createBrowserContext"
+                        | "Target.activateTarget"
+                        | "Browser.close"
+                ),
+                "scoped connect escaped through {command}"
+            );
+            if method == "Target.attachToTarget" {
+                assert_eq!(
+                    command["params"]["targetId"], "T-SELECTED",
+                    "foreign/sibling attachment: {command}"
+                );
+            }
+            if let Some(sid) = command["sessionId"].as_str() {
+                assert_eq!(
+                    sid, "S-T-SELECTED",
+                    "foreign/sibling session command: {command}"
+                );
+            }
+            assert_ne!(
+                method, "Runtime.runIfWaitingForDebugger",
+                "scoped client resumed a renderer it does not own: {command}"
+            );
+            if method == "Target.setAutoAttach" {
+                assert_eq!(
+                    command["sessionId"], "S-T-SELECTED",
+                    "browser-wide auto-attach: {command}"
+                );
+                assert_eq!(
+                    command["params"]["waitForDebuggerOnStart"], false,
+                    "scoped client requested a debugger pause: {command}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cdp_scope_connect_wire_sentinel_only_selected_target_and_deferred_domains() {
+        let (url, recorded, server) =
+            strict_scope_sentinel(StrictScopeSentinelMode::Matching).await;
+        let mut manager = tokio::time::timeout(
+            Duration::from_secs(10),
+            BrowserManager::connect_cdp_scoped(&url, Some(strict_scope(Some("C-APPROVED")))),
+        )
+        .await
+        .expect("scoped connect timed out")
+        .expect("selected target should connect");
+        assert_eq!(manager.pages.len(), 1);
+        assert_eq!(manager.active_target_id().unwrap(), "T-SELECTED");
+        assert!(manager.scope_guard().accepts_session(Some("S-T-SELECTED")));
+        {
+            let commands = recorded.lock().unwrap();
+            assert_strict_scope_wire_boundary(&commands);
+            assert!(commands
+                .iter()
+                .any(|c| c["method"] == "Target.attachToTarget"));
+            assert!(commands.iter().any(|c| c["method"] == "Runtime.evaluate"));
+            assert!(
+                !commands.iter().any(|c| matches!(
+                    c["method"].as_str(),
+                    Some(
+                        "Page.enable"
+                            | "Runtime.enable"
+                            | "Network.enable"
+                            | "Target.setAutoAttach"
+                    )
+                )),
+                "scoped domains must wait until event subscribers exist"
+            );
+        }
+        let _subscribed = manager.client.subscribe();
+        manager
+            .enable_active_scoped_domains()
+            .await
+            .expect("enable scoped domains");
+        manager
+            .enable_browser_auto_attach_pub()
+            .await
+            .expect("scoped browser auto-attach must be a no-op");
+        manager.remove_page_by_target_id("T-SELECTED");
+        let _ = manager.ensure_page().await;
+        assert!(
+            manager.pages.is_empty(),
+            "empty scope silently created a fallback page"
+        );
+        manager.close().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let commands = recorded.lock().unwrap();
+        assert_strict_scope_wire_boundary(&commands);
+        assert!(commands.iter().any(|c| c["method"] == "Page.enable"));
+    }
+
+    #[test]
+    fn scoped_lifecycle_wrapper_keeps_large_work_on_the_heap() {
+        let guard = CdpScopeGuard::new(Some(strict_scope(Some("C-APPROVED"))));
+        let (_sender, mut events) = broadcast::channel(1);
+        let payload = [0u8; 128 * 1024];
+        let work = Box::pin(async move {
+            std::future::pending::<()>().await;
+            std::hint::black_box(payload);
+            Ok::<(), String>(())
+        });
+        assert!(std::mem::size_of_val(work.as_ref().get_ref()) >= 128 * 1024);
+        let future = guard.run_background_events(&mut events, None, None, work);
+        let bytes = std::mem::size_of_val(&future);
+        assert!(
+            bytes < 16 * 1024,
+            "Lifecycle wrapper embedded {bytes} bytes of setup work instead of a heap pointer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_passive_scope_never_resumes_selected_or_child_sessions_and_legacy_still_does() {
+        for scoped in [false, true] {
+            let (url, recorded, server) =
+                strict_scope_sentinel(StrictScopeSentinelMode::Matching).await;
+            let scope = scoped.then(|| strict_scope(Some("C-APPROVED")));
+            let mut manager = BrowserManager::connect_cdp_scoped(&url, scope)
+                .await
+                .unwrap();
+            let active = manager.active_session_id().unwrap().to_string();
+            manager.enable_domains(&active).await.unwrap();
+            // Exercise the same centralized preparation/resume used by tab
+            // switching, explicit tab creation and synchronous event drains.
+            for (sid, target, parent) in [
+                ("S-POPUP", "T-POPUP", None),
+                ("S-FRAME", "T-FRAME", Some(active.as_str())),
+            ] {
+                assert!(manager.scope_guard.register_session(sid, target, parent));
+                manager.prepare_domains_pub(sid).await.unwrap();
+                manager.resume_if_waiting_pub(sid).await.unwrap();
+                manager.resume_if_waiting_pub(sid).await.unwrap();
+            }
+            manager.close().await.unwrap();
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let commands = recorded.lock().unwrap();
+            let resumes: Vec<_> = commands
+                .iter()
+                .filter(|c| c["method"] == "Runtime.runIfWaitingForDebugger")
+                .collect();
+            assert_eq!(resumes.is_empty(), scoped);
+            for command in commands
+                .iter()
+                .filter(|c| c["method"] == "Target.setAutoAttach")
+            {
+                assert_eq!(command["params"]["waitForDebuggerOnStart"], !scoped);
+            }
+            assert!(commands
+                .iter()
+                .any(|c| c["method"] == "Target.setAutoAttach" && c["sessionId"] == "S-FRAME"));
+            assert!(commands
+                .iter()
+                .any(|c| c["method"] == "Target.setAutoAttach" && c["sessionId"] == "S-POPUP"));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cdp_scope_default_sentinel_requires_explicit_or_unique_non_incognito_proof() {
+        for (mode, expected_success, resolved_context) in [
+            (
+                StrictScopeSentinelMode::DefaultMetadata,
+                true,
+                Some("C-DEFAULT"),
+            ),
+            (
+                StrictScopeSentinelMode::DefaultForeign,
+                false,
+                Some("C-DEFAULT"),
+            ),
+            (StrictScopeSentinelMode::DefaultMetadataAbsent, false, None),
+            (StrictScopeSentinelMode::DefaultMetadataInvalid, false, None),
+            (StrictScopeSentinelMode::DefaultAbsentContext, true, None),
+            (
+                StrictScopeSentinelMode::DefaultProvenUnique,
+                true,
+                Some("C-DEFAULT"),
+            ),
+            (StrictScopeSentinelMode::DefaultAmbiguous, false, None),
+            (StrictScopeSentinelMode::DefaultRacingIncognito, false, None),
+            (
+                StrictScopeSentinelMode::DefaultLegacyConflict,
+                false,
+                Some("C-APPROVED"),
+            ),
+        ] {
+            let (url, recorded, server) = strict_scope_sentinel(mode).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                BrowserManager::connect_cdp_scoped(&url, Some(strict_scope(None))),
+            )
+            .await
+            .expect("default-context resolution timed out");
+            if expected_success {
+                let mut manager = result.expect("verified default context should connect");
+                assert_eq!(manager.active_target_id().unwrap(), "T-SELECTED");
+                let guard = manager.scope_guard();
+                assert!(guard.accepts_target(&strict_scope_target(
+                    "T-DEFAULT-PAGE",
+                    "page",
+                    resolved_context
+                )));
+                assert!(!guard.accepts_target(&strict_scope_target(
+                    "T-FOREIGN-PAGE",
+                    "page",
+                    Some("C-FOREIGN")
+                )));
+                if resolved_context.is_some() {
+                    assert!(!guard.accepts_target(&strict_scope_target(
+                        "T-UNRESOLVED",
+                        "page",
+                        None
+                    )));
+                } else {
+                    assert!(!guard.accepts_target(&strict_scope_target(
+                        "T-UNVERIFIED",
+                        "page",
+                        Some("C-DEFAULT")
+                    )));
+                }
+                assert!(
+                    manager
+                        .scope_guard
+                        .scope
+                        .as_ref()
+                        .unwrap()
+                        .context_id
+                        .is_none(),
+                    "resolved metadata must not rewrite default-context command semantics"
+                );
+                assert_eq!(
+                    manager.scope_guard.resolved_default_context.as_deref(),
+                    resolved_context
+                );
+                assert!(
+                    manager
+                        .target_parameters("about:blank")
+                        .get("browserContextId")
+                        .is_none(),
+                    "default-context createTarget must omit the incognito context parameter"
+                );
+                manager.close().await.unwrap();
+            } else {
+                assert!(
+                    result.is_err(),
+                    "foreign or unverified concrete context must fail before attach"
+                );
+            }
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let commands = recorded.lock().unwrap();
+            assert_strict_scope_wire_boundary(&commands);
+            let context_reads: Vec<usize> = commands
+                .iter()
+                .enumerate()
+                .filter_map(|(index, command)| {
+                    (command["method"] == "Target.getBrowserContexts").then_some(index)
+                })
+                .collect();
+            let targets_at = commands
+                .iter()
+                .position(|c| c["method"] == "Target.getTargets")
+                .unwrap();
+            assert_eq!(
+                context_reads.len(),
+                2,
+                "default proof must bracket target enumeration"
+            );
+            assert!(context_reads[0] < targets_at && targets_at < context_reads[1]);
+            if !expected_success {
+                assert!(
+                    !commands
+                        .iter()
+                        .any(|c| c["method"] == "Target.attachToTarget"
+                            || c["sessionId"].is_string()),
+                    "unverified default selection caused attach/probe/domain work: {commands:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cdp_scope_connect_wire_sentinel_missing_or_mismatch_fail_before_attach() {
+        for mode in [
+            StrictScopeSentinelMode::Missing,
+            StrictScopeSentinelMode::Mismatched,
+        ] {
+            let (url, recorded, server) = strict_scope_sentinel(mode).await;
+            let result = tokio::time::timeout(
+                Duration::from_secs(10),
+                BrowserManager::connect_cdp_scoped(&url, Some(strict_scope(Some("C-APPROVED")))),
+            )
+            .await
+            .expect("scope validation timed out");
+            assert!(
+                result.is_err(),
+                "missing/mismatched initial target must fail closed"
+            );
+            tokio::time::timeout(Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let commands = recorded.lock().unwrap();
+            assert_strict_scope_wire_boundary(&commands);
+            assert!(
+                !commands
+                    .iter()
+                    .any(|c| c["method"] == "Target.attachToTarget" || c["sessionId"].is_string()),
+                "validation must precede every attach/probe/domain command: {commands:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cdp_scope_connect_wire_sentinel_unresponsive_never_revives_or_falls_back() {
+        let (url, recorded, server) =
+            strict_scope_sentinel(StrictScopeSentinelMode::Unresponsive).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            BrowserManager::connect_cdp_scoped(&url, Some(strict_scope(Some("C-APPROVED")))),
+        )
+        .await
+        .expect("unresponsive scoped connect must fail promptly");
+        assert!(
+            result.is_err(),
+            "an unresponsive selected target must fail closed"
+        );
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
+        let commands = recorded.lock().unwrap();
+        assert_strict_scope_wire_boundary(&commands);
+        assert!(commands.iter().any(|c| c["method"] == "Runtime.evaluate"));
+        assert!(
+            !commands.iter().any(|c| c["method"] == "Page.enable"),
+            "no domain setup after failed selected-target probe"
         );
     }
 }

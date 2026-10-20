@@ -1,0 +1,58 @@
+name: Maintained e2e native contract
+
+on:
+  push:
+    branches: [main, 'feat/e2e-exact-contract', 'upgrade/**']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: maintained-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native:
+    name: Native contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+          key: maintained-e2e
+      - name: Validate fork metadata and package versions
+        run: node scripts/maintainer/check-contract.mjs
+      - name: Test embedded element semantics
+        run: node --test test/element-semantics.test.mjs
+      - name: Format and lint native implementation
+        run: |
+          cargo fmt --manifest-path cli/Cargo.toml -- --check
+          cargo clippy --locked --manifest-path cli/Cargo.toml -- -D warnings
+      - name: Run launch-safety regression and complete native suite
+        run: |
+          cargo test --profile ci --locked --manifest-path cli/Cargo.toml --bin agent-browser native::e2e_tests::test_obscura_e2e_unlaunchable_binary_does_not_attach_to_inherited_cdp -- --exact --nocapture
+          cargo test --profile ci --locked --manifest-path cli/Cargo.toml --bin agent-browser
+      - name: Build locked native executable
+        run: cargo build --locked --profile ci --manifest-path cli/Cargo.toml
+      - name: Package native artifact with source provenance
+        run: node scripts/maintainer/package-native.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agent-browser-native-${{ matrix.os }}-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error

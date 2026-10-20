@@ -13,6 +13,8 @@ permissions:
 
 jobs:
   check-release:
+    # Forks build validation artifacts only; upstream publication is never inherited.
+    if: github.repository == 'vercel-labs/agent-browser'
     name: Check for new version
     runs-on: ubuntu-latest
     timeout-minutes: 5

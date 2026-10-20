@@ -1,0 +1,16 @@
+import assert from 'node:assert/strict';
+import { fileURLToPath } from 'node:url';
+import { readFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
+const read = (p) => readFileSync(new URL(`../../${p}`, import.meta.url), 'utf8');
+const metadata = JSON.parse(read('maintainer/upstream.json'));
+assert.equal(metadata.schemaVersion, 1);
+assert.equal(metadata.repository, 'https://github.com/vercel-labs/agent-browser');
+assert.equal(metadata.forkRepository, 'https://github.com/levicode/agent-browser');
+assert.match(metadata.baseCommit, /^[a-f0-9]{40}$/);
+assert.match(metadata.previousValidatedBase, /^[a-f0-9]{40}$/);
+assert.equal(metadata.adapterContract, 'e2e-exact-1');
+assert.equal(JSON.parse(read('package.json')).version, metadata.nativeVersion);
+assert.ok(read('.github/workflows/release.yml').includes("if: github.repository == 'vercel-labs/agent-browser'"), 'Inherited release must be guarded');
+execFileSync(process.execPath, [fileURLToPath(new URL('../check-version-sync.js', import.meta.url))], {stdio: 'inherit'});
+console.log(`Maintained contract ${metadata.adapterContract}, version ${metadata.nativeVersion}, upstream ${metadata.baseCommit}`);

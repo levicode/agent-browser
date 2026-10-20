@@ -30,6 +30,7 @@ pub struct PendingRelease {
     pub x: f64,
     pub y: f64,
     pub button: String,
+    pub modifiers: i32,
 }
 
 pub async fn click(
@@ -41,7 +42,31 @@ pub async fn click(
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<ClickResult, String> {
-    let (x, y, effective_session_id) = resolve_element_center(
+    click_with_modifiers(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        button,
+        click_count,
+        0,
+        iframe_sessions,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn click_with_modifiers(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    button: &str,
+    click_count: i32,
+    modifiers: i32,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<ClickResult, String> {
+    let (mut x, mut y, effective_session_id) = resolve_element_center(
         client,
         session_id,
         ref_map,
@@ -54,6 +79,40 @@ pub async fn click(
     // other session belongs to a background tab and must not abort this click.
     let offset =
         session_viewport_offset(client, session_id, &effective_session_id, iframe_sessions).await?;
+    if click_count == 2 {
+        let mut first = dispatch_click(
+            client,
+            &effective_session_id,
+            &[effective_session_id.as_str(), session_id],
+            x,
+            y,
+            button,
+            1,
+            modifiers,
+        )
+        .await?;
+        if first.dialog_opened {
+            first.position = (x + offset.0, y + offset.1);
+            (first.x, first.y) = first.position;
+            return Ok(first);
+        }
+        let (next_x, next_y, next_session) = resolve_element_center(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
+        )
+        .await
+        .map_err(|_| {
+            "Double click target unavailable after input may have committed".to_string()
+        })?;
+        if next_session != effective_session_id {
+            return Err("Double click frame changed after input may have committed".into());
+        }
+        x = next_x;
+        y = next_y;
+    }
     let mut result = dispatch_click(
         client,
         &effective_session_id,
@@ -62,8 +121,16 @@ pub async fn click(
         y,
         button,
         click_count,
+        modifiers,
     )
-    .await?;
+    .await
+    .map_err(|error| {
+        if click_count == 2 {
+            "Double click incomplete after input may have committed".to_string()
+        } else {
+            error
+        }
+    })?;
     // Compute before dispatch: a click may navigate or open a blocking dialog.
     result.position = (x + offset.0, y + offset.1);
     (result.x, result.y) = result.position;
@@ -126,6 +193,63 @@ pub async fn hover(
     Ok((x + offset.0, y + offset.1))
 }
 
+// One fill implementation: normal controls retain the upstream browser text
+// insertion path. Only controls without a reliable text insertion path use the
+// narrow native-value extension, after validating on a detached same-type input.
+const PREPARE_FILL_JS: &str = r#"function(value) {
+    const tag = this.localName;
+    const native = tag === 'input' || tag === 'textarea';
+    const textTypes = ['text', 'email', 'password', 'search', 'tel', 'url', 'number'];
+    const valueTypes = ['date', 'datetime-local', 'month', 'time', 'week'];
+    const usesValue = tag === 'input' && valueTypes.includes(this.type);
+    const editable = tag === 'textarea' || (tag === 'input' && (textTypes.includes(this.type) || usesValue)) || (!native && this.isContentEditable);
+    const blocked = () => !this.isConnected || this.matches(':disabled') || this.readOnly || this.getAttribute('aria-disabled') === 'true' || this.getAttribute('aria-readonly') === 'true';
+    if (!editable || blocked() || this.getClientRects().length === 0) return { beforeInput: true };
+
+    let valueSetter;
+    if (usesValue) {
+        const view = this.ownerDocument.defaultView;
+        valueSetter = Object.getOwnPropertyDescriptor(view.HTMLInputElement.prototype, 'value').set;
+        const probe = this.ownerDocument.createElement('input');
+        probe.type = this.type;
+        valueSetter.call(probe, value);
+        if (probe.value !== value) return { beforeInput: true };
+    }
+
+    this.focus();
+    const focused = () => {
+        let active = this.ownerDocument.activeElement;
+        while (active && active.shadowRoot?.activeElement) active = active.shadowRoot.activeElement;
+        return active === this || this.getRootNode().activeElement === this;
+    };
+    if (blocked() || !focused()) return false;
+
+    if (usesValue) {
+        valueSetter.call(this, value);
+        if (this.value !== value) return false;
+        this.dispatchEvent(new Event('input', { bubbles: true, composed: true }));
+        this.dispatchEvent(new Event('change', { bubbles: true }));
+        return { nativeValue: true };
+    }
+    if (native) {
+        this.select && this.select();
+        if (blocked() || !focused()) return false;
+        this.value = '';
+        this.dispatchEvent(new Event('input', { bubbles: true }));
+    } else {
+        // Let Input.insertText replace the selection using browser editing
+        // semantics. Never flatten a rich editor with textContent assignment.
+        const range = this.ownerDocument.createRange();
+        range.selectNodeContents(this);
+        const selection = this.ownerDocument.getSelection();
+        if (!selection) return false;
+        selection.removeAllRanges();
+        selection.addRange(range);
+    }
+    if (blocked() || !focused()) return false;
+    return !native && value === '' ? { deleteSelection: true } : { insertText: true };
+}"#;
+
 pub async fn fill(
     client: &CdpClient,
     session_id: &str,
@@ -143,42 +267,46 @@ pub async fn fill(
     )
     .await?;
 
-    // Focus the element
-    client
-        .send_command_typed::<_, Value>(
+    let result: EvaluateResult = client
+        .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: "function() { this.focus(); }".to_string(),
-                object_id: Some(object_id.clone()),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
-        )
-        .await?;
-
-    // Select all + delete to clear
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: r#"function() {
-                    this.select && this.select();
-                    this.value = '';
-                    this.dispatchEvent(new Event('input', { bubbles: true }));
-                }"#
-                .to_string(),
+                function_declaration: PREPARE_FILL_JS.to_string(),
                 object_id: Some(object_id),
-                arguments: None,
+                arguments: Some(vec![CallArgument {
+                    value: Some(serde_json::json!(value)),
+                    object_id: None,
+                }]),
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
             Some(&effective_session_id),
         )
         .await?;
+    if result.exception_details.is_some() {
+        return Err("Fill did not complete after page effects may have committed".into());
+    }
+    let result = result.result.value.unwrap_or(Value::Null);
+    if result["beforeInput"].as_bool() == Some(true) {
+        return Err("e2e_not_actionable".into());
+    }
+    if result["nativeValue"].as_bool() == Some(true) {
+        return Ok(());
+    }
+    if result["deleteSelection"].as_bool() == Some(true) {
+        // A complete browser editing key sequence reliably deletes the selected
+        // rich-editor contents even when empty insertText is a no-op.
+        return press_key(client, session_id, "Backspace")
+            .await
+            .map_err(|_| "Fill incomplete after input may have committed".to_string());
+    }
+    if result["insertText"].as_bool() != Some(true) {
+        return Err("Fill did not complete after page effects may have committed".into());
+    }
 
-    // Insert text (keyboard input dispatched at page level, use parent session_id)
+    // Like upstream, keyboard insertion uses the top-level page session after
+    // focusing the element in its frame. CDP cannot make focus and insertion
+    // atomic; never retry on an uncertain response from this command.
     client
         .send_command_typed::<_, Value>(
             "Input.insertText",
@@ -187,8 +315,8 @@ pub async fn fill(
             },
             Some(session_id),
         )
-        .await?;
-
+        .await
+        .map_err(|_| "Fill incomplete after input may have committed".to_string())?;
     Ok(())
 }
 
@@ -257,11 +385,40 @@ pub async fn type_text_into_active_context(
     text: &str,
     delay_ms: Option<u64>,
 ) -> Result<(), String> {
+    type_text_into_context(client, session_id, text, delay_ms, false).await
+}
+
+/// Explicit keyboard typing emits real key events for printable US-layout keys.
+/// Unmapped Unicode still uses the browser's trusted text insertion command.
+pub async fn type_keys_into_active_context(
+    client: &CdpClient,
+    session_id: &str,
+    text: &str,
+    delay_ms: Option<u64>,
+) -> Result<(), String> {
+    type_text_into_context(client, session_id, text, delay_ms, true).await
+}
+
+fn typing_key_info(ch: char) -> (String, String, i32) {
+    // Complete the shifted digit mapping for explicit physical-key dispatch.
+    if let Some(digit) = ")!@#$%^&*(".chars().position(|candidate| candidate == ch) {
+        return (ch.to_string(), format!("Digit{}", digit), 48 + digit as i32);
+    }
+    char_to_key_info(ch)
+}
+
+async fn type_text_into_context(
+    client: &CdpClient,
+    session_id: &str,
+    text: &str,
+    delay_ms: Option<u64>,
+    keyboard_events: bool,
+) -> Result<(), String> {
     let delay = delay_ms.unwrap_or(0);
 
     for ch in text.chars() {
-        if matches!(ch, '\n' | '\r' | '\t') {
-            let (key, code, key_code) = char_to_key_info(ch);
+        let (key, code, key_code) = typing_key_info(ch);
+        if matches!(ch, '\n' | '\r' | '\t') || (keyboard_events && key_code != 0) {
             let text_str = key_text(&key);
             client
                 .send_command_typed::<_, Value>(
@@ -297,9 +454,9 @@ pub async fn type_text_into_active_context(
                 )
                 .await?;
         } else {
-            // VS Code/Electron webviews reject repeated dispatchKeyEvent calls
-            // carrying printable `text`. Insert printable characters directly
-            // and reserve key events for controls like Enter and Tab.
+            // Element text typing retains upstream direct printable insertion.
+            // Explicit keyboard typing uses this only for unmapped characters;
+            // never synthesize a physical keyboard code for Unicode text.
             client
                 .send_command_typed::<_, Value>(
                     "Input.insertText",
@@ -436,12 +593,51 @@ pub async fn scroll(
     Ok(())
 }
 
+// Auto matching keeps upstream value/trimmed label/text matching and its
+// whitespace-normalized fallback. Explicit match kinds are exact selectors;
+// they must identify one enabled option before the shared mutation starts.
+const SELECT_OPTION_JS: &str = r#"function(vals, mode) {
+    const exact = mode !== 'auto';
+    if (!this.isConnected || this.localName !== 'select' || this.matches(':disabled')) return { error: 'e2e_not_actionable', beforeInput: true };
+    if (exact && !this.multiple && vals.length !== 1) return { error: 'e2e_unsupported_capability', beforeInput: true };
+    const normalize = (value) => String(value ?? '').replace(/[\u200B\u200C\u200D\u2060\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+    const options = Array.from(this.options);
+    const wanted = new Set();
+    for (const value of vals) {
+        let matches = options.filter((option, index) =>
+            mode === 'index' ? String(index) === value :
+            mode === 'value' ? option.value === value :
+            mode === 'label' ? option.label === value :
+            value === option.value || value === option.label.trim() || value === option.textContent.trim()
+        );
+        if (!exact && matches.length === 0) {
+            const normalizedValue = normalize(value);
+            matches = options.filter((option) => normalize(option.label) === normalizedValue);
+            if (matches.length > 1) return { error: 'Multiple options matched ' + JSON.stringify(value) + ' after whitespace normalization', beforeInput: true };
+        }
+        if (exact && matches.length !== 1) return { error: 'e2e_not_actionable', beforeInput: true };
+        if (matches.length === 0) {
+            const available = options.map(option => option.value + ' ("' + normalize(option.label) + '")').join(', ');
+            return { error: 'No option matched ' + JSON.stringify(vals) + '. Available options: ' + available, beforeInput: true };
+        }
+        for (const option of matches) {
+            if (exact && (option.disabled || option.parentElement?.matches('optgroup:disabled'))) return { error: 'e2e_not_actionable', beforeInput: true };
+            wanted.add(option);
+        }
+    }
+    if (wanted.size === 0) return { error: 'No option matched ' + JSON.stringify(vals), beforeInput: true };
+    for (const option of options) option.selected = wanted.has(option);
+    this.dispatchEvent(new Event('change', { bubbles: true }));
+    return { matched: wanted.size };
+}"#;
+
 pub async fn select_option(
     client: &CdpClient,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
     values: &[String],
+    mode: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
@@ -453,46 +649,10 @@ pub async fn select_option(
     )
     .await?;
 
-    // Matching nothing must be an error, not a silent success: an agent that
-    // selects a misspelled option otherwise sees "Done", and only discovers
-    // the page state is wrong after more commands. List what was available.
-    let js = r#"function(vals) {
-            const normalize = (value) => String(value ?? '')
-                .replace(/[\u200B\u200C\u200D\u2060\uFEFF]/g, '')
-                .replace(/\s+/g, ' ')
-                .trim();
-            const options = Array.from(this.options);
-            const wanted = new Set();
-            for (const value of vals) {
-                let matches = options.filter((opt) =>
-                    value === opt.value ||
-                    value === opt.label.trim() ||
-                    value === opt.textContent.trim()
-                );
-                if (matches.length === 0) {
-                    const normalizedValue = normalize(value);
-                    matches = options.filter((opt) =>
-                        normalize(opt.label) === normalizedValue
-                    );
-                    if (matches.length > 1) {
-                        return { error: 'Multiple options matched ' + JSON.stringify(value) + ' after whitespace normalization' };
-                    }
-                }
-                if (matches.length === 0) {
-                    const available = options.map(o => o.value + ' ("' + normalize(o.label) + '")').join(', ');
-                    return { error: 'No option matched ' + JSON.stringify(vals) + '. Available options: ' + available };
-                }
-                for (const opt of matches) wanted.add(opt);
-            }
-            if (wanted.size === 0) {
-                const available = options.map(o => o.value + ' ("' + normalize(o.label) + '")').join(', ');
-                return { error: 'No option matched ' + JSON.stringify(vals) + '. Available options: ' + available };
-            }
-            for (const opt of options) opt.selected = wanted.has(opt);
-            this.dispatchEvent(new Event('change', { bubbles: true }));
-            return { matched: wanted.size };
-        }"#
-    .to_string();
+    if !["auto", "value", "label", "index"].contains(&mode) {
+        return Err("e2e_unsupported_capability".into());
+    }
+    let js = SELECT_OPTION_JS.to_string();
 
     let result = client
         .send_command_typed::<_, Value>(
@@ -500,10 +660,16 @@ pub async fn select_option(
             &CallFunctionOnParams {
                 function_declaration: js,
                 object_id: Some(object_id),
-                arguments: Some(vec![CallArgument {
-                    value: Some(serde_json::json!(values)),
-                    object_id: None,
-                }]),
+                arguments: Some(vec![
+                    CallArgument {
+                        value: Some(serde_json::json!(values)),
+                        object_id: None,
+                    },
+                    CallArgument {
+                        value: Some(serde_json::json!(mode)),
+                        object_id: None,
+                    },
+                ]),
                 return_by_value: Some(true),
                 await_promise: Some(false),
             },
@@ -511,15 +677,27 @@ pub async fn select_option(
         )
         .await?;
 
+    if result.get("exceptionDetails").is_some() {
+        return Err("Select option did not complete".into());
+    }
     if let Some(error) = result
         .get("result")
         .and_then(|r| r.get("value"))
         .and_then(|v| v.get("error"))
         .and_then(|e| e.as_str())
     {
-        return Err(error.to_string());
+        if result["result"]["value"]["beforeInput"].as_bool() == Some(true) {
+            return Err(error.to_string());
+        }
+        return Err("Select did not complete".into());
     }
 
+    if result["result"]["value"]["matched"]
+        .as_u64()
+        .is_none_or(|count| count == 0)
+    {
+        return Err("Select did not complete after input may have committed".into());
+    }
     Ok(())
 }
 
@@ -531,11 +709,12 @@ pub async fn check(
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<Option<(f64, f64)>, String> {
     let mut position = None;
-    let is_checked = super::element::is_element_checked(
+    let is_checked = read_checkable_state(
         client,
         session_id,
         ref_map,
         selector_or_ref,
+        false,
         iframe_sessions,
     )
     .await?;
@@ -552,27 +731,15 @@ pub async fn check(
         .await?;
         position = Some(result.position);
 
-        // Verify the click changed the state (Playwright parity: _setChecked re-checks).
-        // If the coordinate-based click missed (e.g. hidden input, overlay), retry
-        // with a JS .click() on the element and its associated input.
-        if !super::element::is_element_checked(
+        wait_for_checkbox_after_input(
             client,
             session_id,
             ref_map,
             selector_or_ref,
+            true,
             iframe_sessions,
         )
-        .await?
-        {
-            js_click_checkbox(
-                client,
-                session_id,
-                ref_map,
-                selector_or_ref,
-                iframe_sessions,
-            )
-            .await?;
-        }
+        .await?;
     }
     Ok(position)
 }
@@ -585,11 +752,12 @@ pub async fn uncheck(
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<Option<(f64, f64)>, String> {
     let mut position = None;
-    let is_checked = super::element::is_element_checked(
+    let is_checked = read_checkable_state(
         client,
         session_id,
         ref_map,
         selector_or_ref,
+        true,
         iframe_sessions,
     )
     .await?;
@@ -606,45 +774,28 @@ pub async fn uncheck(
         .await?;
         position = Some(result.position);
 
-        // Same verify-and-retry as check().
-        if super::element::is_element_checked(
+        wait_for_checkbox_after_input(
             client,
             session_id,
             ref_map,
             selector_or_ref,
+            false,
             iframe_sessions,
         )
-        .await?
-        {
-            js_click_checkbox(
-                client,
-                session_id,
-                ref_map,
-                selector_or_ref,
-                iframe_sessions,
-            )
-            .await?;
-        }
+        .await?;
     }
     Ok(position)
 }
 
-/// Fallback for when the coordinate-based CDP click did not toggle the
-/// checkbox/radio state. This mirrors how Playwright dispatches clicks
-/// through the DOM rather than via raw Input.dispatchMouseEvent coordinates.
-///
-/// Uses the same follow-label resolution as `is_element_checked`:
-/// 1. If the element is a native input → `.click()` it directly.
-/// 2. If the element is inside a `<label>` → `.click()` the label's `.control`.
-/// 3. If the element has a nested `<input>` → `.click()` that input.
-/// 4. Otherwise → `.click()` the element itself (handles ARIA role controls).
-async fn js_click_checkbox(
+/// Reject unrelated controls and radio unchecking before dispatching any input.
+async fn read_checkable_state(
     client: &CdpClient,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
+    uncheck: bool,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
         session_id,
@@ -653,46 +804,61 @@ async fn js_click_checkbox(
         iframe_sessions,
     )
     .await?;
+    let result: EvaluateResult=client.send_command_typed("Runtime.callFunctionOn", &CallFunctionOnParams {
+        function_declaration:r#"function(uncheck){
+            let el=this;if(el.localName==='label')el=el.control;
+            if(!el||!el.isConnected||el.matches(':disabled')||el.getAttribute('aria-disabled')==='true')return null;
+            const native=el.localName==='input'&&['checkbox','radio'].includes(el.type);
+            const role=el.getAttribute('role');const radio=native?el.type==='radio':['radio','menuitemradio'].includes(role);
+            if(uncheck&&radio)return 'unsupported';
+            if(native)return el.checked;
+            if(!['checkbox','radio','switch','menuitemcheckbox','menuitemradio'].includes(role))return null;
+            const checked=el.getAttribute('aria-checked');return checked==='true'?true:checked==='false'?false:null;
+        }"#.to_string(),object_id:Some(object_id),arguments:Some(vec![CallArgument{value:Some(serde_json::json!(uncheck)),object_id:None}]),return_by_value:Some(true),await_promise:Some(false),
+    },Some(&effective_session_id)).await?;
+    if result.exception_details.is_some() {
+        return Err("Checkable target is unavailable".into());
+    }
+    if result.result.value.as_ref().and_then(Value::as_str) == Some("unsupported") {
+        return Err("e2e_unsupported_capability".into());
+    }
+    result
+        .result
+        .value
+        .as_ref()
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "e2e_not_actionable".to_string())
+}
 
-    let js = r#"function() {
-            var el = this;
-            var tag = el.tagName && el.tagName.toUpperCase();
-            // 1. Native input — click it directly
-            if (tag === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
-                el.click();
-                return;
-            }
-            // 2. Follow label → control association
-            var label = tag === 'LABEL' ? el : (el.closest && el.closest('label'));
-            if (label && label.tagName && label.tagName.toUpperCase() === 'LABEL' && label.control) {
-                label.control.click();
-                return;
-            }
-            // 3. Nested native input
-            var input = el.querySelector && el.querySelector('input[type="checkbox"], input[type="radio"]');
-            if (input) {
-                input.click();
-                return;
-            }
-            // 4. ARIA role control — click the element itself
-            el.click();
-        }"#;
-
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: js.to_string(),
-                object_id: Some(object_id),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
+/// After dispatch, only observe. A second click can undo a delayed controlled
+/// update. Any read failure after input is uncertain, never a retryable stale.
+async fn wait_for_checkbox_after_input(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    wanted: bool,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<(), String> {
+    let started = std::time::Instant::now();
+    loop {
+        let checked = super::element::is_element_checked(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
         )
-        .await?;
-
-    Ok(())
+        .await
+        .map_err(|_| "Checkbox state unavailable after input may have committed".to_string())?;
+        if checked == wanted {
+            return Ok(());
+        }
+        if started.elapsed() >= std::time::Duration::from_millis(1500) {
+            return Err("Checkbox state did not settle after input may have committed".to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 pub async fn focus(
@@ -735,36 +901,15 @@ pub async fn clear(
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
-    let (object_id, effective_session_id) = resolve_element_object_id(
+    fill(
         client,
         session_id,
         ref_map,
         selector_or_ref,
+        "",
         iframe_sessions,
     )
-    .await?;
-
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: r#"function() {
-                    this.focus();
-                    this.value = '';
-                    this.dispatchEvent(new Event('input', { bubbles: true }));
-                    this.dispatchEvent(new Event('change', { bubbles: true }));
-                }"#
-                .to_string(),
-                object_id: Some(object_id),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
-            },
-            Some(&effective_session_id),
-        )
-        .await?;
-
-    Ok(())
+    .await
 }
 
 pub async fn select_all(
@@ -1028,6 +1173,7 @@ async fn dispatch_mouse_or_dialog(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_click(
     client: &CdpClient,
     session_id: &str,
@@ -1036,6 +1182,7 @@ async fn dispatch_click(
     y: f64,
     button: &str,
     click_count: i32,
+    modifiers: i32,
 ) -> Result<ClickResult, String> {
     // Move
     if dispatch_mouse_or_dialog(
@@ -1051,7 +1198,7 @@ async fn dispatch_click(
             click_count: None,
             delta_x: None,
             delta_y: None,
-            modifiers: None,
+            modifiers: Some(modifiers),
         },
     )
     .await?
@@ -1087,7 +1234,7 @@ async fn dispatch_click(
             click_count: Some(click_count),
             delta_x: None,
             delta_y: None,
-            modifiers: None,
+            modifiers: Some(modifiers),
         },
     )
     .await?
@@ -1103,6 +1250,7 @@ async fn dispatch_click(
                 x,
                 y,
                 button: button.to_string(),
+                modifiers,
             }),
             x,
             y,
@@ -1125,7 +1273,7 @@ async fn dispatch_click(
             click_count: Some(click_count),
             delta_x: None,
             delta_y: None,
-            modifiers: None,
+            modifiers: Some(modifiers),
         },
     )
     .await?;
@@ -1157,7 +1305,7 @@ pub async fn dispatch_pending_release(
                 click_count: Some(1),
                 delta_x: None,
                 delta_y: None,
-                modifiers: None,
+                modifiers: Some(release.modifiers),
             },
             Some(&release.session_id),
         )
@@ -1274,7 +1422,364 @@ fn named_key_info(key: &str) -> (String, String, i32) {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn fill_uses_one_browser_insertion_and_never_retries_uncertain_input() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        for (exact, fail_insert, native_value) in [
+            (false, false, false),
+            (true, false, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let mut insertions = 0;
+                while let Ok(Some(Ok(Message::Text(text)))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await
+                {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let mut response = json!({"id":request["id"],"result":{}});
+                    match request["method"].as_str().unwrap() {
+                        "DOM.resolveNode" => {
+                            response["result"] =
+                                json!({"object":{"type":"object","objectId":"field"}})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            let source = request["params"]["functionDeclaration"].as_str().unwrap();
+                            if source == PREPARE_FILL_JS {
+                                response["result"] = json!({"result":{"type":"object","value":{"nativeValue":native_value,"insertText":!native_value}}});
+                            } else {
+                                assert!(exact);
+                                assert!(source.contains("return this.isConnected"));
+                                response["result"] =
+                                    json!({"result":{"type":"boolean","value":true}});
+                            }
+                        }
+                        "Input.insertText" => {
+                            insertions += 1;
+                            assert_eq!(request["sessionId"], "page");
+                            assert_eq!(request["params"]["text"], "replacement");
+                            if fail_insert {
+                                response["error"] =
+                                    json!({"code":-32000,"message":"Response lost"});
+                            }
+                        }
+                        method => panic!("Unexpected fill command: {method}"),
+                    }
+                    ws.send(Message::Text(response.to_string())).await.unwrap();
+                }
+                insertions
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let mut refs = RefMap::new();
+            if exact {
+                refs.add_exact_backend_node("e1".into(), 42);
+            } else {
+                refs.add("e1".into(), Some(42), "textbox", "Name", None);
+            }
+            let result = fill(
+                &client,
+                "page",
+                &refs,
+                "@e1",
+                "replacement",
+                &HashMap::new(),
+            )
+            .await;
+            if fail_insert {
+                let error = result.unwrap_err();
+                assert!(error.contains("after input may have committed"));
+                assert!(!error.starts_with(super::super::element::STALE_REF_PREFIX));
+            } else {
+                assert!(result.is_ok());
+            }
+            assert_eq!(server.await.unwrap(), usize::from(!native_value));
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_click_preserves_modifiers_on_move_press_and_release() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for event in ["mouseMoved", "mousePressed", "mouseReleased"] {
+                let Some(Ok(Message::Text(text))) = ws.next().await else {
+                    panic!("Missing pointer event")
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(request["method"], "Input.dispatchMouseEvent");
+                assert_eq!(request["params"]["modifiers"], 10);
+                assert_eq!(request["params"]["type"], event);
+                ws.send(Message::Text(
+                    json!({"id":request["id"],"sessionId":request["sessionId"],"result":{}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        dispatch_click(&client, "page", &["page"], 3.5, 7.25, "left", 1, 10)
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn noncheckable_targets_never_dispatch_a_click() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        for remove_check in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                while let Ok(Some(Ok(Message::Text(text)))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await
+                {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let response = match request["method"].as_str().unwrap() {
+                        "DOM.resolveNode" => json!({"object":{"type":"object","objectId":"node"}}),
+                        "Runtime.callFunctionOn" => {
+                            let source = request["params"]["functionDeclaration"].as_str().unwrap();
+                            if source.contains("return this.isConnected") {
+                                json!({"result":{"type":"boolean","value":true}})
+                            } else {
+                                json!({"result":{"type":"object","subtype":"null","value":null}})
+                            }
+                        }
+                        method => panic!("Uncheckable target dispatched {method}"),
+                    };
+                    ws.send(Message::Text(json!({"id":request["id"],"sessionId":request["sessionId"],"result":response}).to_string())).await.unwrap();
+                }
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let mut refs = RefMap::new();
+            refs.add_with_frame(
+                "e1".into(),
+                Some(42),
+                "button",
+                "Business action",
+                None,
+                None,
+            );
+            let result = if remove_check {
+                uncheck(&client, "page", &refs, "@e1", &HashMap::new()).await
+            } else {
+                check(&client, "page", &refs, "@e1", &HashMap::new()).await
+            };
+            assert!(result.is_err());
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn checkbox_delayed_state_and_replacement_never_dispatch_again() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        for detached in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let mut reads = 0;
+                while let Ok(Some(Ok(Message::Text(text)))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(100), ws.next()).await
+                {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "DOM.resolveNode" => {
+                            json!({"object":{"type":"object","objectId":"checked-node"}})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            let function =
+                                request["params"]["functionDeclaration"].as_str().unwrap();
+                            assert!(
+                                !function.contains(".click("),
+                                "A delayed state must never trigger another click"
+                            );
+                            if function.contains("isConnected") {
+                                json!({"result":{"type":"boolean","value":!detached}})
+                            } else {
+                                reads += 1;
+                                json!({"result":{"type":"boolean","value":reads >= 3}})
+                            }
+                        }
+                        "Runtime.releaseObject" => {
+                            assert_eq!(request["params"]["objectId"], "checked-node");
+                            json!({})
+                        }
+                        other => panic!("Post-click verification must be read-only, got {other}"),
+                    };
+                    let response = json!({"id":request["id"],"sessionId":request["sessionId"],"result":result});
+                    ws.send(Message::Text(response.to_string())).await.unwrap();
+                }
+                reads
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let mut map = RefMap::new();
+            map.add_exact_with_frame("e1".into(), 42, "checkbox", "Agree", None, None);
+            let result =
+                wait_for_checkbox_after_input(&client, "page", &map, "@e1", true, &HashMap::new())
+                    .await;
+            if detached {
+                let error = result.unwrap_err();
+                assert!(!error.starts_with(super::super::element::STALE_REF_PREFIX));
+                assert!(error.contains("after input may have committed"));
+            } else {
+                assert!(result.is_ok());
+            }
+            let reads = server.await.unwrap();
+            assert_eq!(reads, if detached { 0 } else { 3 });
+        }
+    }
+
     use super::*;
+
+    #[tokio::test]
+    async fn text_and_keyboard_operations_share_dispatch_and_unicode_insertion() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        for keyboard_events in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+                let mut commands = Vec::new();
+                while let Some(Ok(message)) = ws.next().await {
+                    match message {
+                        Message::Text(text) => {
+                            let command: Value = serde_json::from_str(&text).unwrap();
+                            assert_eq!(command["sessionId"], "owned-page");
+                            ws.send(Message::Text(
+                                json!({"id":command["id"],"result":{}}).to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                            commands.push(command);
+                        }
+                        Message::Close(_) => break,
+                        _ => {}
+                    }
+                }
+                commands
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let text = "--sessionA@! \n\t汉🙂";
+            if keyboard_events {
+                type_keys_into_active_context(&client, "owned-page", text, None)
+                    .await
+                    .unwrap();
+            } else {
+                type_text_into_active_context(&client, "owned-page", text, None)
+                    .await
+                    .unwrap();
+            }
+            client.close().await;
+            let commands = tokio::time::timeout(std::time::Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut commands = commands.iter();
+            for ch in text.chars() {
+                let (key, code, key_code) = typing_key_info(ch);
+                if matches!(ch, '\n' | '\r' | '\t') || (keyboard_events && key_code != 0) {
+                    let down = commands.next().unwrap();
+                    let up = commands.next().unwrap();
+                    for (command, event) in [(down, "keyDown"), (up, "keyUp")] {
+                        assert_eq!(command["method"], "Input.dispatchKeyEvent");
+                        assert_eq!(command["params"]["type"], event);
+                        assert_eq!(command["params"]["key"], key);
+                        assert_eq!(command["params"]["code"], code);
+                        assert_eq!(command["params"]["windowsVirtualKeyCode"], key_code);
+                    }
+                    assert_eq!(down["params"]["text"], json!(key_text(&key)));
+                    assert!(up["params"]["text"].is_null());
+                } else {
+                    let command = commands.next().unwrap();
+                    assert_eq!(command["method"], "Input.insertText");
+                    assert_eq!(command["params"]["text"], ch.to_string());
+                }
+            }
+            assert!(commands.next().is_none());
+        }
+        for (ch, code, key_code) in [
+            ('!', "Digit1", 49),
+            ('@', "Digit2", 50),
+            (')', "Digit0", 48),
+        ] {
+            assert_eq!(
+                typing_key_info(ch),
+                (ch.to_string(), code.to_string(), key_code)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn keyboard_type_stops_after_a_partial_key_pair_without_retry() {
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(socket).await.unwrap();
+            let mut count = 0;
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Text(text) => {
+                        count += 1;
+                        assert!(
+                            count <= 2,
+                            "Typing retried or continued after an uncertain key pair"
+                        );
+                        let command: Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(command["method"], "Input.dispatchKeyEvent");
+                        assert_eq!(command["params"]["key"], "a");
+                        let response = if count == 1 {
+                            json!({"id":command["id"],"result":{}})
+                        } else {
+                            json!({"id":command["id"],"error":{"code":-32000,"message":"synthetic keyup failure"}})
+                        };
+                        ws.send(Message::Text(response.to_string())).await.unwrap();
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            count
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let error = type_keys_into_active_context(&client, "owned-page", "abc", None)
+            .await
+            .unwrap_err();
+        assert!(!error.starts_with("e2e_"));
+        client.close().await;
+        assert_eq!(
+            tokio::time::timeout(std::time::Duration::from_secs(3), server)
+                .await
+                .unwrap()
+                .unwrap(),
+            2
+        );
+    }
 
     /// Verify that `char_to_key_info` returns the correct (key, code,
     /// windowsVirtualKeyCode) triple for every character in Playwright's

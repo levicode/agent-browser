@@ -2,6 +2,12 @@
 
 Browser automation CLI for AI agents. Fast native Rust CLI.
 
+## Maintained e2e adapter contract
+
+This fork retains upstream history and adds one versioned adapter contract with additive operation semantics. The maintained native binary is not an interchangeable official release. It is consumed through an exact source lock by `levicode/e2e`; do not install it over a global official installation. See [the contract and compatibility boundary](maintainer/CONTRACT.md) and [upgrade procedure](maintainer/UPSTREAM_SYNC.md). No automatic npm publication or GitHub release runs in this fork.
+
+The installation instructions below are inherited upstream documentation. The npm package and global upgrade command refer to the official distribution, not this source-pinned fork.
+
 <p>
   <a href="https://vercel.com/labs#labs-products"><img alt="Vercel Labs Product" src="https://img.shields.io/badge/LABS-PRODUCT-0a0a0a.svg?style=for-the-badge&amp;logo=Vercel&amp;labelColor=000000" height="28"></a>
   <a href="https://www.npmjs.com/package/agent-browser"><img alt="npm version: agent-browser" src="https://img.shields.io/npm/v/agent-browser.svg?style=for-the-badge&amp;labelColor=000000" height="28"></a>

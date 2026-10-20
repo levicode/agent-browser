@@ -92,7 +92,8 @@ fn normalize_navigation_url(url: &str) -> String {
 pub fn is_top_level_command(value: &str) -> bool {
     matches!(
         value,
-        "open"
+        "capabilities"
+            | "open"
             | "goto"
             | "navigate"
             | "back"
@@ -123,6 +124,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "screenshot"
             | "pdf"
             | "snapshot"
+            | "ref"
             | "eval"
             | "close"
             | "quit"
@@ -366,6 +368,65 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         });
     }
 
+    if let Some(boundary) = args.iter().position(|arg| arg == "--") {
+        const USAGE: &str = "fill|type|select|eval [options] -- <literal data>";
+        let before = &args[..boundary];
+        let values = &args[boundary + 1..];
+        let command = before.first().map(String::as_str).unwrap_or("");
+        if command == "keyboard"
+            && (before.len() == 2
+                || (before.len() == 3 && before[1] == "type" && before[2] == "--physical"))
+            && ["type", "inserttext", "insertText"].contains(&before[1].as_str())
+        {
+            let subaction = if before[1] == "type" {
+                "type"
+            } else {
+                "insertText"
+            };
+            let mut parsed = json!({"id":gen_id(),"action":"keyboard","subaction":subaction,"text":values.join(" ")});
+            if before.len() == 3 {
+                parsed["physical"] = json!(true);
+            }
+            return Ok(parsed);
+        }
+        if command == "eval" && before.len() == 1 {
+            return Ok(json!({"id":gen_id(),"action":"evaluate","script":values.join(" ")}));
+        }
+        if (command == "fill" && before.len() == 2)
+            || (command == "type" && before.len() >= 2)
+            || (command == "select" && before.len() >= 2 && !values.is_empty())
+        {
+            let mut control = before.to_vec();
+            // The parser sees only a harmless placeholder; values never become flags.
+            control.push(if command == "select" { "0" } else { "" }.to_string());
+            let mut parsed = parse_command_inner(&control, flags)?;
+            match command {
+                "fill" => parsed["value"] = json!(values.join(" ")),
+                "type" => parsed["text"] = json!(values.join(" ")),
+                "select" => {
+                    if parsed["mode"] == "index"
+                        && values.iter().any(|value| value.parse::<usize>().is_err())
+                    {
+                        return Err(ParseError::InvalidValue {
+                            message: "Invalid select index".into(),
+                            usage: USAGE,
+                        });
+                    }
+                    parsed["values"] = if values.len() == 1 {
+                        json!(values[0])
+                    } else {
+                        json!(values)
+                    };
+                }
+                _ => unreachable!(),
+            }
+            return Ok(parsed);
+        }
+        return Err(ParseError::InvalidValue {
+            message: "This command does not accept a literal-data boundary here".into(),
+            usage: USAGE,
+        });
+    }
     let cmd = args[0].as_str();
     let rest: Vec<&str> = args[1..].iter().map(|s| s.as_str()).collect();
     let id = gen_id();
@@ -386,10 +447,35 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             // scripts before the first real navigation (see `batch`).
             // `goto` and `navigate` still require a URL since those verbs
             // imply the navigation itself.
-            let first_url = rest.iter().find(|a| !a.starts_with("--"));
+            let mut first_url: Option<&str> = None;
+            let mut wait_until: Option<&str> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                if rest[i] == "--wait-until" {
+                    let value = *rest
+                        .get(i + 1)
+                        .ok_or_else(|| ParseError::MissingArguments {
+                            context: format!("{cmd} --wait-until"),
+                            usage: "open <url> --wait-until <load|domcontentloaded|networkidle>",
+                        })?;
+                    if !matches!(value, "load" | "domcontentloaded" | "networkidle") {
+                        return Err(ParseError::InvalidValue {
+                            message: "Invalid navigation wait strategy".into(),
+                            usage: "open <url> --wait-until <load|domcontentloaded|networkidle>",
+                        });
+                    }
+                    wait_until = Some(value);
+                    i += 2;
+                    continue;
+                }
+                if !rest[i].starts_with("--") && first_url.is_none() {
+                    first_url = Some(rest[i]);
+                }
+                i += 1;
+            }
             let url = match first_url {
-                Some(u) => *u,
-                None if cmd == "open" => {
+                Some(u) => u,
+                None if cmd == "open" && wait_until.is_none() => {
                     return Ok(json!({ "id": id, "action": "launch", "headless": !flags.headed }));
                 }
                 None => {
@@ -403,6 +489,9 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             let mut nav_cmd = json!({ "id": id, "action": "navigate", "url": url });
             if flags.provider.is_some() {
                 nav_cmd["waitUntil"] = json!("none");
+            }
+            if let Some(wait_until) = wait_until {
+                nav_cmd["waitUntil"] = json!(wait_until);
             }
             if let Some(ref headers_json) = flags.headers {
                 let headers =
@@ -429,31 +518,53 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
         "webmcp" => parse_webmcp(&rest, &id),
 
         // === Core Actions ===
-        "click" => {
-            let new_tab = rest.contains(&"--new-tab");
-            let human = rest.contains(&"--human");
-            let sel = rest
-                .iter()
-                .find(|arg| **arg != "--new-tab" && **arg != "--human")
-                .ok_or_else(|| ParseError::MissingArguments {
-                    context: "click".to_string(),
-                    usage: "click <selector> [--new-tab] [--human]",
-                })?;
-            let mut cmd = json!({ "id": id, "action": "click", "selector": sel });
+        "click" | "dblclick" => {
+            const USAGE: &str = "click|dblclick <selector> [--modifiers 0..15]";
+            let mut selector = None;
+            let mut modifiers = 0i32;
+            let mut new_tab = false;
+            let mut human = false;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--modifiers" => {
+                        modifiers = rest
+                            .get(i + 1)
+                            .and_then(|value| value.parse::<i32>().ok())
+                            .filter(|value| (0..=15).contains(value))
+                            .ok_or_else(|| ParseError::InvalidValue {
+                                message: "Invalid modifier mask".into(),
+                                usage: USAGE,
+                            })?;
+                        i += 1;
+                    }
+                    "--new-tab" if cmd == "click" => new_tab = true,
+                    "--human" if cmd == "click" => human = true,
+                    value if !value.starts_with("--") && selector.is_none() => {
+                        selector = Some(value)
+                    }
+                    _ => {
+                        return Err(ParseError::InvalidValue {
+                            message: "Invalid click arguments".into(),
+                            usage: USAGE,
+                        })
+                    }
+                }
+                i += 1;
+            }
+            let selector = selector.ok_or_else(|| ParseError::MissingArguments {
+                context: cmd.into(),
+                usage: USAGE,
+            })?;
+            let mut action =
+                json!({"id":id,"action":cmd,"selector":selector,"modifiers":modifiers});
             if new_tab {
-                cmd["newTab"] = json!(true);
+                action["newTab"] = json!(true);
             }
             if human {
-                cmd["inputMode"] = json!("human");
+                action["inputMode"] = json!("human");
             }
-            Ok(cmd)
-        }
-        "dblclick" => {
-            let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
-                context: "dblclick".to_string(),
-                usage: "dblclick <selector>",
-            })?;
-            Ok(json!({ "id": id, "action": "dblclick", "selector": sel }))
+            Ok(action)
         }
         "fill" => {
             let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -534,20 +645,39 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(json!({ "id": id, "action": "uncheck", "selector": sel }))
         }
         "select" => {
-            let sel = rest.first().ok_or_else(|| ParseError::MissingArguments {
-                context: "select".to_string(),
-                usage: "select <selector> <value...>",
+            const USAGE: &str = "select <selector> [--value|--label|--index] <values...>";
+            let selector = rest.first().ok_or_else(|| ParseError::MissingArguments {
+                context: "select".into(),
+                usage: USAGE,
             })?;
-            let _val = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
-                context: "select".to_string(),
-                usage: "select <selector> <value...>",
-            })?;
-            let values = &rest[1..];
-            if values.len() == 1 {
-                Ok(json!({ "id": id, "action": "select", "selector": sel, "values": values[0] }))
-            } else {
-                Ok(json!({ "id": id, "action": "select", "selector": sel, "values": values }))
+            let mut offset = 1;
+            let mode = match rest.get(1).copied() {
+                Some("--value") => {
+                    offset = 2;
+                    "value"
+                }
+                Some("--label") => {
+                    offset = 2;
+                    "label"
+                }
+                Some("--index") => {
+                    offset = 2;
+                    "index"
+                }
+                _ => "auto",
+            };
+            let values = &rest[offset..];
+            if values.is_empty()
+                || (mode == "index" && values.iter().any(|value| value.parse::<usize>().is_err()))
+            {
+                return Err(ParseError::InvalidValue {
+                    message: "Invalid select values".into(),
+                    usage: USAGE,
+                });
             }
+            Ok(
+                json!({"id":id,"action":"select","selector":selector,"values":if values.len()==1{json!(values[0])}else{json!(values)},"mode":mode}),
+            )
         }
         "drag" => {
             let src = rest.first().ok_or_else(|| ParseError::MissingArguments {
@@ -612,14 +742,19 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             })?;
             match *sub {
                 "type" => {
-                    let text: String = rest[1..].join(" ");
+                    let physical = rest.get(1) == Some(&"--physical");
+                    let text: String = rest[if physical { 2 } else { 1 }..].join(" ");
                     if text.is_empty() {
                         return Err(ParseError::MissingArguments {
                             context: "keyboard type".to_string(),
                             usage: "keyboard type <text>",
                         });
                     }
-                    Ok(json!({ "id": id, "action": "keyboard", "subaction": "type", "text": text }))
+                    let mut command = json!({ "id": id, "action": "keyboard", "subaction": "type", "text": text });
+                    if physical {
+                        command["physical"] = json!(true);
+                    }
+                    Ok(command)
                 }
                 "inserttext" | "insertText" => {
                     let text: String = rest[1..].join(" ");
@@ -910,6 +1045,40 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             Ok(json!({ "id": id, "action": "pdf", "path": path }))
         }
 
+        // Exact backend identities are accepted only from the active target.
+        "ref" => {
+            const USAGE: &str = "ref <backend-node-id> [--frame <frame-id>]";
+            let backend_id = rest
+                .first()
+                .and_then(|value| value.parse::<i64>().ok())
+                .filter(|value| *value > 0)
+                .ok_or_else(|| ParseError::InvalidValue {
+                    message: "Expected a positive backend node id".into(),
+                    usage: USAGE,
+                })?;
+            let frame = match rest.as_slice() {
+                [_] => None,
+                [_, "--frame", frame] if !frame.is_empty() => Some(*frame),
+                _ => {
+                    return Err(ParseError::InvalidValue {
+                        message: "Invalid exact ref arguments".into(),
+                        usage: USAGE,
+                    })
+                }
+            };
+            Ok(json!({ "id": id, "action": "ref", "backendNodeId": backend_id, "frameId": frame }))
+        }
+
+        "capabilities" => {
+            if !rest.is_empty() {
+                return Err(ParseError::InvalidValue {
+                    message: "capabilities takes no arguments".into(),
+                    usage: "capabilities",
+                });
+            }
+            Ok(json!({ "id": id, "action": "capabilities" }))
+        }
+
         // === Snapshot ===
         "snapshot" => {
             let mut cmd = json!({ "id": id, "action": "snapshot" });
@@ -917,6 +1086,35 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
             let mut i = 0;
             while i < rest.len() {
                 match rest[i] {
+                    "--exact-refs" => {
+                        obj.insert("exactRefs".into(), json!(true));
+                    }
+                    "--preserve-refs" => {
+                        obj.insert("preserveRefs".into(), json!(true));
+                    }
+                    "--allowed-frame-documents" => {
+                        const USAGE: &str =
+                            "snapshot --allowed-frame-documents <JSON frameId-to-loaderId map>";
+                        let value =
+                            rest.get(i + 1)
+                                .ok_or_else(|| ParseError::MissingArguments {
+                                    context: "snapshot".into(),
+                                    usage: USAGE,
+                                })?;
+                        let documents: std::collections::HashMap<String, String> =
+                            serde_json::from_str(value).map_err(|_| ParseError::InvalidValue {
+                                message: "Invalid frame document map".into(),
+                                usage: USAGE,
+                            })?;
+                        if documents.values().any(String::is_empty) {
+                            return Err(ParseError::InvalidValue {
+                                message: "Frame document ids cannot be empty".into(),
+                                usage: USAGE,
+                            });
+                        }
+                        obj.insert("allowedFrameDocuments".into(), json!(documents));
+                        i += 1;
+                    }
                     "-i" | "--interactive" => {
                         obj.insert("interactive".to_string(), json!(true));
                     }
@@ -1604,11 +1802,17 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                     }
                     Ok(cmd)
                 }
-                Some(tab_ref) => Ok(json!({
-                    "id": id,
-                    "action": "tab_switch",
-                    "tabId": tab_ref,
-                })),
+                Some(tab_ref) => {
+                    if rest.len() > 2 || (rest.len() == 2 && rest[1] != "--no-activate") {
+                        return Err(ParseError::InvalidValue {
+                            message: "Invalid tab binding arguments".into(),
+                            usage: "tab <id> [--no-activate]",
+                        });
+                    }
+                    Ok(
+                        json!({"id":id,"action":"tab_switch","tabId":tab_ref,"noActivate":rest.len()==2}),
+                    )
+                }
                 None => Ok(json!({ "id": id, "action": "tab_list" })),
             }
         }
@@ -3163,9 +3367,10 @@ fn parse_find(rest: &[&str], id: &str) -> Result<Value, ParseError> {
 }
 
 fn parse_mouse(rest: &[&str], id: &str) -> Result<Value, ParseError> {
-    const VALID: &[&str] = &["move", "down", "up", "wheel"];
+    const VALID: &[&str] = &["move", "down", "up", "wheel", "state"];
 
     match rest.first().copied() {
+        Some("state") if rest.len() == 1 => Ok(json!({"id":id,"action":"mousestate"})),
         Some("move") => {
             let x_str = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
                 context: "mouse move".to_string(),
@@ -3589,6 +3794,10 @@ mod tests {
             init_scripts: Vec::new(),
             enable: Vec::new(),
             cdp: None,
+            cdp_target: None,
+            cdp_context: None,
+            cdp_dedicated: false,
+            expect_contract: None,
             profile: None,
             state: None,
             proxy: None,
@@ -4169,6 +4378,27 @@ mod tests {
     // === Navigation Tests ===
 
     #[test]
+    fn open_honors_explicit_wait_strategy() {
+        for strategy in ["load", "domcontentloaded", "networkidle"] {
+            let command = format!("open --wait-until {strategy} https://example.com");
+            let parsed = parse_command(&args(&command), &default_flags()).unwrap();
+            assert_eq!(parsed["url"], "https://example.com");
+            assert_eq!(parsed["waitUntil"], strategy);
+        }
+        assert!(parse_command(
+            &args("open https://example.com --wait-until invented"),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(
+            &args("open https://example.com --wait-until"),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(&args("open --wait-until load"), &default_flags()).is_err());
+    }
+
+    #[test]
     fn test_open_without_url_launches() {
         let cmd = parse_command(&args("open"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "launch");
@@ -4451,6 +4681,78 @@ mod tests {
     }
 
     // === Core Actions ===
+
+    #[test]
+    fn explicit_click_modifiers_and_select_modes() {
+        for verb in ["click", "dblclick"] {
+            let value = parse_command(
+                &args(&format!("{verb} @e1 --modifiers 10")),
+                &default_flags(),
+            )
+            .unwrap();
+            assert_eq!(value["modifiers"], 10);
+            assert!(parse_command(
+                &args(&format!("{verb} @e1 --modifiers 16")),
+                &default_flags()
+            )
+            .is_err());
+        }
+        for mode in ["value", "label", "index"] {
+            let value =
+                parse_command(&args(&format!("select @e1 --{mode} 1")), &default_flags()).unwrap();
+            assert_eq!(value["mode"], mode);
+            assert_eq!(value["values"], "1");
+        }
+        assert!(parse_command(&args("select @e1 --index -1"), &default_flags()).is_err());
+        assert!(parse_command(&args("select @e1 --label"), &default_flags()).is_err());
+    }
+
+    #[test]
+    fn upload_without_paths_is_an_explicit_empty_file_selection() {
+        let value = parse_command(&args("upload @e7"), &default_flags()).unwrap();
+        assert_eq!(value["action"], "upload");
+        assert_eq!(value["selector"], "@e7");
+        assert_eq!(value["files"], json!([]));
+    }
+
+    #[test]
+    fn mouse_state_is_read_only() {
+        let value = parse_command(&args("mouse state"), &default_flags()).unwrap();
+        assert_eq!(value["action"], "mousestate");
+        assert!(parse_command(&args("mouse state unexpected"), &default_flags()).is_err());
+    }
+
+    #[test]
+    fn literal_data_never_changes_command_options() {
+        let input = args("fill @e1 -- --session --help --version");
+        let flags = crate::flags::parse_flags(&input);
+        let value = parse_command(&crate::flags::clean_args(&input), &flags).unwrap();
+        assert_eq!(value["value"], "--session --help --version");
+        let value = parse_command(
+            &args("type @e1 --delay 4 -- --clear --delay"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(value["text"], "--clear --delay");
+        assert_eq!(value["delay"], 4);
+        assert!(value.get("clear").is_none());
+        let value =
+            parse_command(&args("select @e1 --label -- --value"), &default_flags()).unwrap();
+        assert_eq!(value["mode"], "label");
+        assert_eq!(value["values"], "--value");
+        let value = parse_command(&args("eval -- --help"), &default_flags()).unwrap();
+        assert_eq!(value["script"], "--help");
+        let value = parse_command(&args("keyboard type -- --session"), &default_flags()).unwrap();
+        assert_eq!(value["text"], "--session");
+        assert_eq!(value["subaction"], "type");
+    }
+
+    #[test]
+    fn trace_tab_binding_never_requests_activation() {
+        let value = parse_command(&args("tab t1 --no-activate"), &default_flags()).unwrap();
+        assert_eq!(value["noActivate"], true);
+        assert!(parse_command(&args("tab t1 --unknown"), &default_flags()).is_err());
+    }
 
     #[test]
     fn test_click() {
@@ -4869,6 +5171,66 @@ mod tests {
     }
 
     // === Snapshot ===
+
+    #[test]
+    fn test_exact_ref_cli() {
+        let cmd = parse_command(&args("ref 42 --frame frame-1"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "ref");
+        assert_eq!(cmd["backendNodeId"], 42);
+        assert_eq!(cmd["frameId"], "frame-1");
+        assert!(parse_command(&args("ref -1"), &default_flags()).is_err());
+        assert!(parse_command(&args("ref 42 extra"), &default_flags()).is_err());
+    }
+
+    #[test]
+    fn snapshot_preserves_refs_and_validates_frame_document_map() {
+        let input = vec![
+            "snapshot".into(),
+            "--preserve-refs".into(),
+            "--allowed-frame-documents".into(),
+            r#"{"child":"loader"}"#.into(),
+        ];
+        let value = parse_command(&input, &default_flags()).unwrap();
+        assert_eq!(value["preserveRefs"], true);
+        assert_eq!(value["allowedFrameDocuments"]["child"], "loader");
+        assert!(parse_command(
+            &args("snapshot --allowed-frame-documents []"),
+            &default_flags()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn physical_keyboard_is_explicit_and_literal_data_cannot_select_it() {
+        let command =
+            parse_command(&args("keyboard type --physical -- hello"), &default_flags()).unwrap();
+        assert_eq!(command["physical"], true);
+        assert_eq!(command["text"], "hello");
+        let ordinary =
+            parse_command(&args("keyboard type -- --physical"), &default_flags()).unwrap();
+        assert!(ordinary.get("physical").is_none());
+        assert_eq!(ordinary["text"], "--physical");
+        let explicit =
+            parse_command(&args("keyboard type --physical hello"), &default_flags()).unwrap();
+        assert_eq!(explicit["physical"], true);
+        assert!(parse_command(
+            &args("keyboard inserttext --physical -- hello"),
+            &default_flags()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn capabilities_and_exact_refs_are_additive_commands() {
+        let caps = parse_command(&args("capabilities"), &default_flags()).unwrap();
+        assert_eq!(caps["action"], "capabilities");
+        assert!(is_top_level_command("capabilities"));
+        assert!(parse_command(&args("capabilities extra"), &default_flags()).is_err());
+        let exact = parse_command(&args("snapshot --exact-refs"), &default_flags()).unwrap();
+        assert_eq!(exact["exactRefs"], true);
+        let ordinary = parse_command(&args("snapshot"), &default_flags()).unwrap();
+        assert!(ordinary.get("exactRefs").is_none());
+    }
 
     #[test]
     fn test_snapshot() {
