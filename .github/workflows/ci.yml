@@ -101,7 +101,7 @@ jobs:
         run: cargo clippy --manifest-path cli/Cargo.toml -- -D warnings
 
       - name: Run Rust tests
-        run: cargo test --profile ci --manifest-path cli/Cargo.toml
+        run: cargo test --profile ci --manifest-path cli/Cargo.toml -- --test-threads=1
 
   dashboard:
     name: Dashboard
@@ -202,7 +202,7 @@ jobs:
           workspaces: cli
 
       - name: Run Rust tests
-        run: cargo test --profile ci --manifest-path cli/Cargo.toml --target ${{ matrix.target }}
+        run: cargo test --profile ci --manifest-path cli/Cargo.toml --target ${{ matrix.target }} -- --test-threads=1
 
   native-e2e:
     name: Native E2E Tests

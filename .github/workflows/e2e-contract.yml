@@ -43,10 +43,11 @@ jobs:
         run: |
           cargo fmt --manifest-path cli/Cargo.toml -- --check
           cargo clippy --locked --manifest-path cli/Cargo.toml -- -D warnings
+      # Upstream tests share process-global env; preserve concurrency inside each test.
       - name: Run launch-safety regression and complete native suite
         run: |
-          cargo test --profile ci --locked --manifest-path cli/Cargo.toml --bin agent-browser native::e2e_tests::test_obscura_e2e_unlaunchable_binary_does_not_attach_to_inherited_cdp -- --exact --nocapture
-          cargo test --profile ci --locked --manifest-path cli/Cargo.toml --bin agent-browser
+          cargo test --profile ci --locked --manifest-path cli/Cargo.toml --bin agent-browser native::e2e_tests::test_obscura_e2e_unlaunchable_binary_does_not_attach_to_inherited_cdp -- --exact --nocapture --test-threads=1
+          cargo test --profile ci --locked --manifest-path cli/Cargo.toml --bin agent-browser -- --test-threads=1
       - name: Build locked native executable
         run: cargo build --locked --profile ci --manifest-path cli/Cargo.toml
       - name: Package native artifact with source provenance
