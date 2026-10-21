@@ -449,6 +449,7 @@ impl ClientEnrollment {
         .await?;
         lease.permit.check()?;
         permit.complete()?;
+        self.network.configuration_committed(&entry.session, op)?;
         if let Some(current) = self
             .index
             .lock()
@@ -1305,6 +1306,19 @@ mod tests {
         tokio::sync::mpsc::Sender<Value>,
         JoinHandle<()>,
     ) {
+        let (owner, notices, log, emit, server, _broker) = fixture_with_broker(mode).await;
+        (owner, notices, log, emit, server)
+    }
+    async fn fixture_with_broker(
+        mode: &'static str,
+    ) -> (
+        Arc<ClientEnrollment>,
+        Notices,
+        Log,
+        tokio::sync::mpsc::Sender<Value>,
+        JoinHandle<()>,
+        Arc<ClientSession>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let log: Log = Arc::default();
@@ -1325,6 +1339,7 @@ mod tests {
                         let method=request["method"].as_str().unwrap();
                         if mode=="delayed-dispose" && method=="Target.disposeBrowserContext" {tokio::time::sleep(Duration::from_millis(40)).await;}
                         if method=="Target.detachFromTarget" {detach_count+=1;}
+                        if mode=="hold-timezone" && method=="Emulation.setTimezoneOverride" { continue; }
                         let settings_error = match (mode, method) {
                             ("locale-already", "Emulation.setLocaleOverride") => Some("Another locale override is already in effect"),
                             ("timezone-already", "Emulation.setTimezoneOverride") => Some("Timezone override is already in effect"),
@@ -1339,7 +1354,7 @@ mod tests {
                         if (mode=="fail-fetch" && method=="Fetch.enable") || (mode=="detach-fallback" && method=="Target.detachFromTarget" && detach_count==1) {
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic injected failure"}}).to_string())).await.unwrap();continue;
                         }
-                        if (mode=="first-request" || mode=="large-first-request") && method=="Fetch.enable" {
+                        if (mode=="first-request" || mode=="large-first-request" || mode=="hold-timezone") && method=="Fetch.enable" {
                             let body=if mode=="large-first-request" {"b".repeat(1536*1024)} else {String::new()};
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
                         }
@@ -1363,9 +1378,9 @@ mod tests {
             }
         });
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
-        let (owner, notices, _broker) =
+        let (owner, notices, broker) =
             coordinator(client, "owned-context", "owned-scope", "initial");
-        (owner, notices, log, emit, server)
+        (owner, notices, log, emit, server, broker)
     }
     fn attach(
         context: &str,
@@ -1378,6 +1393,117 @@ mod tests {
             method: "Target.attachedToTarget".into(),
             session_id: parent.map(str::to_owned),
             params: json!({"sessionId":session,"waitingForDebugger":true,"targetInfo":{"targetId":target,"type":kind,"browserContextId":context}}),
+        }
+    }
+    #[tokio::test]
+    async fn first_request_cannot_continue_before_complete_target_configuration() {
+        for fail in [false, true] {
+            for registered_route in [false, true] {
+                let (mut owner, mut notices, log, emit, server, broker) =
+                    fixture_with_broker("hold-timezone").await;
+                Arc::get_mut(&mut owner).unwrap().config.timezone_id = Some("UTC".into());
+                owner
+                    .network
+                    .replace_routes(
+                        1,
+                        if registered_route {
+                            vec!["route".into()]
+                        } else {
+                            vec![]
+                        },
+                    )
+                    .unwrap();
+                let callbacks = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let count = callbacks.clone();
+                let policy = tokio::spawn(async move {
+                    while let Some(ServerMessage::Event {
+                        decision: Some(decision),
+                        ..
+                    }) = notices.recv().await
+                    {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        let _ = broker.resolve(
+                            1,
+                            &decision.token,
+                            super::super::client_protocol::Decision::Continue {
+                                overrides: Default::default(),
+                            },
+                        );
+                    }
+                });
+                let child = owner.clone();
+                let enrollment = tokio::spawn(async move {
+                    child
+                        .enroll_existing("initial-target", "initial", "page", &child.operation())
+                        .await
+                });
+                let timezone_id = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if let Some(id) = log
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|v| v["method"] == "Emulation.setTimezoneOverride")
+                            .map(|v| v["id"].clone())
+                        {
+                            break id;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let premature_continue = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["method"] == "Fetch.continueRequest");
+                let premature_callback = callbacks.load(Ordering::SeqCst) > 0;
+                emit.send(if fail {json!({"id":timezone_id,"error":{"code":-32602,"message":"Synthetic timezone rejection"}})} else {json!({"id":timezone_id,"result":{}})}).await.unwrap();
+                let outcome = enrollment.await.unwrap();
+                assert_eq!(outcome.is_err(), fail);
+                if !fail {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            if log
+                                .lock()
+                                .unwrap()
+                                .iter()
+                                .any(|v| v["method"] == "Fetch.continueRequest")
+                            {
+                                break;
+                            }
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(callbacks.load(Ordering::SeqCst), 1);
+                }
+                let _ = owner.close().await;
+                let proof = owner.contain_owned_resources().await.unwrap();
+                owner.release_after_containment(proof).await.unwrap();
+                assert_eq!(owner.network.pending_callbacks().unwrap(), 0);
+                let escaped = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|v| v["method"] == "Fetch.continueRequest");
+                policy.abort();
+                server.abort();
+                assert!(
+                    !premature_continue,
+                    "Continue escaped before configuration commit"
+                );
+                assert!(
+                    !premature_callback,
+                    "JS callback escaped before configuration commit"
+                );
+                if fail {
+                    assert!(!escaped, "configuration failure released an owned request");
+                }
+            }
         }
     }
     #[tokio::test]
@@ -2327,15 +2453,73 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
+        let trace: Arc<Mutex<Vec<String>>> = Arc::default();
+        let trace_started = Instant::now();
+        let mut events = client
+            .subscribe_bounded_methods(
+                &[
+                    "Target.attachedToTarget",
+                    "Network.requestWillBeSent",
+                    "Fetch.requestPaused",
+                    "Network.loadingFailed",
+                ],
+                256,
+                65536,
+            )
+            .unwrap();
+        let event_trace = trace.clone();
+        let event_reader = tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                let url = event
+                    .params
+                    .pointer("/request/url")
+                    .or_else(|| event.params.pointer("/targetInfo/url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let mut trace = event_trace.lock().unwrap();
+                if trace.len() < 64 {
+                    trace.push(format!(
+                        "t={:?} cdp {} session={:?} waiting={:?} target_type={:?} resource_type={} url={url}",
+                        trace_started.elapsed(),
+                        event.method,
+                        event.session_id,
+                        event.params.get("waitingForDebugger"),
+                        event.params.pointer("/targetInfo/type"),
+                        event
+                            .params
+                            .get("type")
+                            .or_else(|| event.params.get("resourceType"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                    ));
+                }
+            }
+        });
         let (mut owner, mut notices, broker) =
             coordinator(client.clone(), &context, "hosted-failure-scope", "");
+        let policy_trace = trace.clone();
         let policy = tokio::spawn(async move {
             while let Some(message) = notices.recv().await {
                 if let ServerMessage::Event {
                     decision: Some(decision),
+                    event,
+                    payload,
                     ..
                 } = message
                 {
+                    {
+                        let mut trace = policy_trace.lock().unwrap();
+                        if trace.len() < 64 {
+                            trace.push(format!(
+                                "t={:?} decision Continue event={event} url={}",
+                                trace_started.elapsed(),
+                                payload
+                                    .pointer("/request/url")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or("")
+                            ));
+                        }
+                    }
                     let _ = broker.resolve(
                         1,
                         &decision.token,
@@ -2353,6 +2537,7 @@ mod tests {
         let url = format!("http://{}/must-not-start", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
         let count = requests.clone();
+        let http_trace = trace.clone();
         let http = tokio::spawn(async move {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             while let Ok((mut stream, _)) = listener.accept().await {
@@ -2360,6 +2545,18 @@ mod tests {
                 let read = stream.read(&mut bytes).await.unwrap_or(0);
                 if read > 0 {
                     count.fetch_add(1, Ordering::SeqCst);
+                    let line = String::from_utf8_lossy(&bytes[..read])
+                        .lines()
+                        .next()
+                        .unwrap_or("")
+                        .to_owned();
+                    let mut trace = http_trace.lock().unwrap();
+                    if trace.len() < 64 {
+                        trace.push(format!(
+                            "t={:?} http read={read} first_line={line:?}",
+                            trace_started.elapsed()
+                        ));
+                    }
                 }
                 let _ = stream
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -2381,6 +2578,23 @@ mod tests {
         owner.release_after_containment(proof).await.unwrap();
         let outcome = owner.cleanup_outcome().unwrap();
         assert!(outcome.isolated_context_disposed && outcome.autoattach_disabled);
+        eprintln!(
+            "first-request containment trace: {:#?}",
+            trace.lock().unwrap()
+        );
+        {
+            let index = owner.index.lock().unwrap();
+            eprintln!(
+                "first-request containment failure: {:?}; resumed entries: {:?}",
+                index.failure,
+                index
+                    .sessions
+                    .values()
+                    .map(|entry| (entry.kind.clone(), entry.application, entry.resumed))
+                    .collect::<Vec<_>>()
+            );
+        }
+        event_reader.abort();
         assert_eq!(requests.load(Ordering::SeqCst), 0);
         assert!(client
             .send_command("Browser.getVersion", Some(json!({})), None)

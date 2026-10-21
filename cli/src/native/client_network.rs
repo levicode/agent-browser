@@ -30,7 +30,7 @@ pub struct ClientNetwork {
     sealed: AtomicBool,
     ui_gate: Arc<super::client_ui::UiGate>,
     cancellation: tokio::sync::watch::Sender<CancelSignal>,
-    sessions: Mutex<HashMap<String, ApplicationSession>>,
+    sessions: Mutex<HashMap<String, EnrolledSession>>,
     tasks: Mutex<tokio::task::JoinSet<Result<(), ProtocolError>>>,
     blocking_reads: Mutex<tokio::task::JoinSet<()>>,
     dialog_enabled: AtomicBool,
@@ -111,7 +111,14 @@ impl ClientNetwork {
             if sessions.len() >= 128 || sessions.contains_key(&id) {
                 return Err(ProtocolError::CapacityExceeded);
             }
-            sessions.insert(id.clone(), session);
+            let (configuration_ready, _) = tokio::sync::watch::channel(false);
+            sessions.insert(
+                id.clone(),
+                EnrolledSession {
+                    application: session,
+                    configuration_ready,
+                },
+            );
         }
         let result = tokio::time::timeout_at(operation.deadline.into(), async {
             self.client.send_command("Network.enable", Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id)).await?;
@@ -126,6 +133,57 @@ impl ClientNetwork {
         self.check()
     }
 
+    /// Enrollment calls this only after exact-target settings, recursive
+    /// attachment, and resume authorization have all acknowledged completion.
+    /// Holding initial requests is failure containment, not a timing delay.
+    pub(crate) fn configuration_committed(
+        &self,
+        session: &str,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check()?;
+        if operation.generation != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.check()?;
+        let session = sessions.get(session).ok_or(ProtocolError::StaleScope)?;
+        session.configuration_ready.send_replace(true);
+        Ok(())
+    }
+    async fn wait_for_configuration(
+        &self,
+        mut ready: tokio::sync::watch::Receiver<bool>,
+        deadline: std::time::Instant,
+    ) -> Result<(), ProtocolError> {
+        let mut cancellation = self.cancellation.subscribe();
+        loop {
+            self.check()?;
+            if *cancellation.borrow() != CancelSignal::None {
+                return Err(ProtocolError::Cancelled);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if *ready.borrow() {
+                return Ok(());
+            }
+            tokio::select! {
+                changed=ready.changed()=>changed.map_err(|_|ProtocolError::StaleScope)?,
+                _=cancellation.changed()=>return Err(ProtocolError::Cancelled),
+                _=tokio::time::sleep_until(deadline.into())=>return Err(ProtocolError::DeadlineExceeded),
+            }
+        }
+    }
     /// Caller holds the enrollment configuration gate, so no new target can
     /// install an old policy between existing-session ACKs and this publication.
     pub async fn update_policy(
@@ -190,7 +248,7 @@ impl ClientNetwork {
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             .values_mut()
         {
-            session.active_page = session.root_page_session == root;
+            session.application.active_page = session.application.root_page_session == root;
         }
         Ok(())
     }
@@ -655,6 +713,8 @@ impl ClientNetwork {
         let Some(session) = session else {
             return Ok(());
         };
+        let configuration_ready = session.configuration_ready.subscribe();
+        let session = session.application;
         if matches!(
             event.method.as_str(),
             "Browser.downloadWillBegin" | "Page.downloadWillBegin"
@@ -824,6 +884,28 @@ impl ClientNetwork {
                 .as_ref()
                 .map(|lease| lease.deadline)
                 .unwrap_or_else(|| std::time::Instant::now() + std::time::Duration::from_secs(30));
+            let _pending_token_cleanup = captured.as_ref().map(|lease| TokenCleanup {
+                network: &this,
+                token: lease.token.clone(),
+            });
+            if callback_reservation.is_some() {
+                if let Err(error) = this
+                    .wait_for_configuration(configuration_ready, deadline)
+                    .await
+                {
+                    // No callback/default Continue is emitted before commit.
+                    // A timed-out admission can only abort the held request.
+                    if event.method == "Fetch.requestPaused" {
+                        let request_id = required_string(&event.params, "requestId")?;
+                        let _ = tokio::time::timeout(
+                            std::time::Duration::from_secs(2),
+                            this.abort_request(&session.session_id, request_id),
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
             let _callback_permit = if let Some(reservation) = callback_reservation {
                 match reservation
                     .enter(deadline, this.cancellation.subscribe())
@@ -1703,6 +1785,11 @@ impl Drop for AliasCleanup<'_> {
 }
 
 #[derive(Clone)]
+struct EnrolledSession {
+    application: ApplicationSession,
+    configuration_ready: tokio::sync::watch::Sender<bool>,
+}
+#[derive(Clone)]
 pub struct ApplicationSession {
     pub session_id: String,
     pub root_page_session: String,
@@ -1932,13 +2019,61 @@ mod bridge_tests {
         ));
         network.sessions.lock().unwrap().insert(
             "owned".into(),
-            ApplicationSession {
-                session_id: "owned".into(),
-                root_page_session: "owned".into(),
-                active_page: true,
+            EnrolledSession {
+                application: ApplicationSession {
+                    session_id: "owned".into(),
+                    root_page_session: "owned".into(),
+                    active_page: true,
+                },
+                configuration_ready: tokio::sync::watch::channel(true).0,
             },
         );
         (network, events, received, server)
+    }
+    #[tokio::test]
+    async fn uncommitted_session_hold_uses_original_deadline_and_scope_cancellation() {
+        let (network, _events, _commands, server) = fixture().await;
+        let (ready, receiver) = tokio::sync::watch::channel(false);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(10);
+        assert_eq!(
+            network.wait_for_configuration(receiver, deadline).await,
+            Err(ProtocolError::DeadlineExceeded)
+        );
+        let child = network.clone();
+        let receiver = ready.subscribe();
+        let waiting = tokio::spawn(async move {
+            child
+                .wait_for_configuration(
+                    receiver,
+                    std::time::Instant::now() + std::time::Duration::from_secs(30),
+                )
+                .await
+        });
+        network.revoke().unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn uncommitted_request_backpressure_never_emits_callbacks_or_leaks_tokens() {
+        let (network, mut events, mut commands, server) = fixture().await;
+        network.sessions.lock().unwrap()["owned"]
+            .configuration_ready
+            .send_replace(false);
+        for index in 0..64 {
+            network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":format!("held-{index}"),"request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}).unwrap();
+        }
+        assert_eq!(network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"overflow","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}),Err(ProtocolError::CapacityExceeded));
+        network.close().await.unwrap();
+        assert_eq!(network.pending_callbacks().unwrap(), 0);
+        assert!(events.try_recv().is_err());
+        assert!(commands.try_recv().is_err());
+        server.abort();
     }
     async fn next_event(
         events: &mut tokio::sync::mpsc::Receiver<ServerMessage>,
