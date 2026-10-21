@@ -550,6 +550,21 @@ impl BrowserManager {
     }
 
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
+        Self::launch_with_transport_limit(options, engine, None).await
+    }
+
+    pub(super) async fn launch_owned(
+        options: LaunchOptions,
+        engine: Option<&str>,
+    ) -> Result<Self, String> {
+        Self::launch_with_transport_limit(options, engine, Some(128 * 1024 * 1024)).await
+    }
+
+    async fn launch_with_transport_limit(
+        options: LaunchOptions,
+        engine: Option<&str>,
+        message_limit: Option<usize>,
+    ) -> Result<Self, String> {
         let engine = engine.unwrap_or("chrome");
 
         match engine {
@@ -625,7 +640,9 @@ impl BrowserManager {
         } else if engine == "obscura" {
             initialize_obscura_manager(ws_url, process).await?
         } else {
-            let client = Arc::new(CdpClient::connect(&ws_url).await?);
+            let client = Arc::new(
+                CdpClient::connect_with_headers_and_limit(&ws_url, None, message_limit).await?,
+            );
             let mut manager = Self {
                 client,
                 browser_process: Some(process),
@@ -742,7 +759,18 @@ impl BrowserManager {
         discover_pages: bool,
     ) -> Result<Self, String> {
         let ws_url = resolve_cdp_url(url).await?;
-        let client = Arc::new(CdpClient::connect_with_headers(&ws_url, headers).await?);
+        let client = Arc::new(
+            CdpClient::connect_with_headers_and_limit(
+                &ws_url,
+                headers,
+                if discover_pages {
+                    None
+                } else {
+                    Some(128 * 1024 * 1024)
+                },
+            )
+            .await?,
+        );
         let mut manager = Self {
             client,
             browser_process: None,
@@ -1662,6 +1690,23 @@ impl BrowserManager {
         self.pages.iter().any(|p| p.label.as_deref() == Some(label))
     }
 
+    /// Forget only handles belonging to a context whose disposal has already
+    /// been acknowledged. This never closes or adopts an unrelated target.
+    pub(super) fn forget_disposed_targets(&mut self, targets: &HashSet<String>) {
+        self.pages.retain(|page| !targets.contains(&page.target_id));
+        if self
+            .bound_target_id
+            .as_ref()
+            .is_some_and(|id| targets.contains(id))
+        {
+            self.bound_target_id = None;
+            self.bound_target_gone = None;
+        }
+        self.active_page_index = self
+            .active_page_index
+            .min(self.pages.len().saturating_sub(1));
+    }
+
     /// Create and bind a blank page only in an explicitly owned context.
     /// No real URL is loaded before the caller installs its policies/hooks.
     pub async fn owned_blank_page(&mut self, context_id: Option<&str>) -> Result<String, String> {
@@ -1730,6 +1775,84 @@ impl BrowserManager {
         self.active_page_index = self.pages.len() - 1;
         self.bind_active_target();
         Ok(target_id)
+    }
+
+    /// Bind only a target whose dedicated-context authority the caller has
+    /// already verified. Failure detaches our session, never closes host data.
+    pub async fn adopt_verified_page(
+        &mut self,
+        target_id: &str,
+        context_id: &str,
+    ) -> Result<(), String> {
+        if target_id.is_empty() || self.pages.iter().any(|page| page.target_id == target_id) {
+            return Err("Invalid verified target identity".into());
+        }
+        let attached = self
+            .client
+            .send_command(
+                "Target.attachToTarget",
+                Some(json!({"targetId": target_id, "flatten": true})),
+                None,
+            )
+            .await?;
+        let session_id = attached
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or("Missing verified page session")?
+            .to_owned();
+        let verified = self
+            .client
+            .send_command(
+                "Target.getTargetInfo",
+                Some(json!({"targetId": target_id})),
+                None,
+            )
+            .await;
+        let valid = verified
+            .as_ref()
+            .ok()
+            .and_then(|value| value.get("targetInfo"))
+            .is_some_and(|info| {
+                info.get("targetId").and_then(Value::as_str) == Some(target_id)
+                    && info.get("type").and_then(Value::as_str) == Some("page")
+                    && info
+                        .get("browserContextId")
+                        .is_none_or(|id| id.as_str() == Some(context_id))
+            });
+        if !valid {
+            self.client
+                .send_command(
+                    "Target.detachFromTarget",
+                    Some(json!({"sessionId": session_id})),
+                    None,
+                )
+                .await?;
+            return Err("Verified page identity changed".into());
+        }
+        if let Err(error) = self.enable_domains(&session_id).await {
+            self.client
+                .send_command(
+                    "Target.detachFromTarget",
+                    Some(json!({"sessionId": session_id})),
+                    None,
+                )
+                .await?;
+            return Err(error);
+        }
+        let tab_id = self.assign_tab_id();
+        self.pages.push(PageInfo {
+            tab_id,
+            label: None,
+            target_id: target_id.to_owned(),
+            session_id,
+            url: String::new(),
+            title: String::new(),
+            target_type: "page".into(),
+        });
+        self.active_page_index = self.pages.len() - 1;
+        self.bind_active_target();
+        Ok(())
     }
 
     pub async fn tab_new(

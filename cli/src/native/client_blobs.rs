@@ -1,0 +1,808 @@
+//! Bounded opaque byte storage shared by uploads, responses and native artifacts.
+//! No caller-controlled filesystem path is accepted. Memory reservations remain
+//! charged while a committed browser operation still holds its body lease.
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use base64::Engine;
+use serde::Serialize;
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
+
+pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobScope {
+    pub generation: u64,
+    pub identity_scope: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct BlobLimits {
+    pub max_blob_bytes: usize,
+    pub max_total_bytes: usize,
+    pub max_handles: usize,
+}
+impl Default for BlobLimits {
+    fn default() -> Self {
+        Self {
+            max_blob_bytes: 64 * 1024 * 1024,
+            max_total_bytes: 128 * 1024 * 1024,
+            max_handles: 128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlobError {
+    InvalidInput,
+    Missing,
+    StaleScope,
+    OffsetMismatch,
+    Unsealed,
+    IntegrityMismatch,
+    Reserved,
+    QuotaExceeded,
+    Closed,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobInfo {
+    pub handle: String,
+    pub size: usize,
+    pub sha256: String,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BlobChunk {
+    pub base64: String,
+    pub next_offset: usize,
+    pub eof: bool,
+}
+
+struct Budget {
+    bytes: usize,
+    handles: usize,
+}
+struct Charge {
+    size: usize,
+    budget: Arc<Mutex<Budget>>,
+}
+impl Drop for Charge {
+    fn drop(&mut self) {
+        if let Ok(mut budget) = self.budget.lock() {
+            budget.bytes -= self.size;
+            budget.handles -= 1;
+        }
+    }
+}
+struct Entry {
+    scope: BlobScope,
+    bytes: Arc<Vec<u8>>,
+    expected_sha256: String,
+    hasher: Sha256,
+    sealed: bool,
+    reserved_by: Option<String>,
+    charge: Arc<Charge>,
+}
+struct Inner {
+    closed: bool,
+    active_scope: Option<BlobScope>,
+    entries: HashMap<String, Entry>,
+}
+
+pub struct BlobStore {
+    limits: BlobLimits,
+    budget: Arc<Mutex<Budget>>,
+    inner: Mutex<Inner>,
+}
+
+/// Owns immutable bytes until native dispatch completes. Not Clone: a single
+/// accepted token commits one body lease, while its quota remains reserved.
+pub struct BlobLease {
+    bytes: Arc<Vec<u8>>,
+    _charge: Arc<Charge>,
+}
+impl BlobLease {
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+/// Reserves the maximum producer payload before collection. The charge survives
+/// the await and failed/stale producers release it on drop without publishing.
+pub struct BlobProducer {
+    scope: BlobScope,
+    charge: Charge,
+}
+
+impl BlobStore {
+    pub fn new(limits: BlobLimits) -> Result<Self, BlobError> {
+        if limits.max_blob_bytes == 0
+            || limits.max_blob_bytes > 512 * 1024 * 1024
+            || limits.max_total_bytes < limits.max_blob_bytes
+            || limits.max_total_bytes > 1024 * 1024 * 1024
+            || limits.max_handles == 0
+            || limits.max_handles > 1024
+        {
+            return Err(BlobError::InvalidInput);
+        }
+        Ok(Self {
+            limits,
+            budget: Arc::new(Mutex::new(Budget {
+                bytes: 0,
+                handles: 0,
+            })),
+            inner: Mutex::new(Inner {
+                closed: false,
+                active_scope: None,
+                entries: HashMap::new(),
+            }),
+        })
+    }
+
+    /// Lifecycle-only admission. Producers must never activate scopes: they
+    /// only insert into the currently admitted owner. No retired-scope history
+    /// grows unbounded, and revocation seals late producer insertion atomically.
+    pub fn activate_scope(&self, scope: BlobScope) -> Result<(), BlobError> {
+        if scope.generation == 0 || scope.identity_scope.is_empty() {
+            return Err(BlobError::InvalidInput);
+        }
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        if inner.active_scope.is_some() {
+            return Err(BlobError::InvalidInput);
+        }
+        inner.active_scope = Some(scope);
+        Ok(())
+    }
+
+    fn check_scope(entry: &Entry, scope: &BlobScope) -> Result<(), BlobError> {
+        if &entry.scope == scope {
+            Ok(())
+        } else {
+            Err(BlobError::StaleScope)
+        }
+    }
+    fn valid_hash(hash: &str) -> bool {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    }
+
+    pub fn create(
+        &self,
+        scope: BlobScope,
+        size: usize,
+        sha256: String,
+    ) -> Result<String, BlobError> {
+        if scope.generation == 0 || scope.identity_scope.is_empty() || !Self::valid_hash(&sha256) {
+            return Err(BlobError::InvalidInput);
+        }
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        if inner.active_scope.as_ref() != Some(&scope) {
+            return Err(BlobError::StaleScope);
+        }
+        let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        if size > self.limits.max_blob_bytes
+            || budget.handles >= self.limits.max_handles
+            || size > self.limits.max_total_bytes.saturating_sub(budget.bytes)
+        {
+            return Err(BlobError::QuotaExceeded);
+        }
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(size)
+            .map_err(|_| BlobError::QuotaExceeded)?;
+        budget.bytes += size;
+        budget.handles += 1;
+        drop(budget);
+        let handle = Uuid::new_v4().to_string();
+        inner.entries.insert(
+            handle.clone(),
+            Entry {
+                scope,
+                bytes: Arc::new(bytes),
+                expected_sha256: sha256,
+                hasher: Sha256::new(),
+                sealed: false,
+                reserved_by: None,
+                charge: Arc::new(Charge {
+                    size,
+                    budget: self.budget.clone(),
+                }),
+            },
+        );
+        Ok(handle)
+    }
+
+    pub fn write(
+        &self,
+        scope: &BlobScope,
+        handle: &str,
+        offset: usize,
+        encoded: &str,
+    ) -> Result<usize, BlobError> {
+        if encoded.len() > MAX_CHUNK_BYTES.div_ceil(3) * 4 {
+            return Err(BlobError::InvalidInput);
+        }
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|_| BlobError::InvalidInput)?;
+        if chunk.len() > MAX_CHUNK_BYTES || chunk.is_empty() {
+            return Err(BlobError::InvalidInput);
+        }
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        let entry = inner.entries.get_mut(handle).ok_or(BlobError::Missing)?;
+        Self::check_scope(entry, scope)?;
+        if entry.sealed || entry.reserved_by.is_some() {
+            return Err(BlobError::Reserved);
+        }
+        if offset != entry.bytes.len() {
+            return Err(BlobError::OffsetMismatch);
+        }
+        if chunk.len() > entry.charge.size.saturating_sub(offset) {
+            return Err(BlobError::QuotaExceeded);
+        }
+        Arc::get_mut(&mut entry.bytes)
+            .ok_or(BlobError::Reserved)?
+            .extend_from_slice(&chunk);
+        // Hash at bounded chunk admission, never scan a large body while the
+        // resource mutex blocks the independently serviced control lane.
+        entry.hasher.update(&chunk);
+        Ok(entry.bytes.len())
+    }
+
+    pub fn seal(&self, scope: &BlobScope, handle: &str) -> Result<BlobInfo, BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        let entry = inner.entries.get_mut(handle).ok_or(BlobError::Missing)?;
+        Self::check_scope(entry, scope)?;
+        if entry.reserved_by.is_some() {
+            return Err(BlobError::Reserved);
+        }
+        if entry.bytes.len() != entry.charge.size
+            || format!("{:x}", entry.hasher.clone().finalize()) != entry.expected_sha256
+        {
+            return Err(BlobError::IntegrityMismatch);
+        }
+        entry.sealed = true;
+        Ok(BlobInfo {
+            handle: handle.into(),
+            size: entry.charge.size,
+            sha256: entry.expected_sha256.clone(),
+        })
+    }
+
+    pub fn read(
+        &self,
+        scope: &BlobScope,
+        handle: &str,
+        offset: usize,
+        length: usize,
+    ) -> Result<Vec<u8>, BlobError> {
+        if length == 0 || length > MAX_CHUNK_BYTES {
+            return Err(BlobError::InvalidInput);
+        }
+        let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        let entry = inner.entries.get(handle).ok_or(BlobError::Missing)?;
+        Self::check_scope(entry, scope)?;
+        if !entry.sealed {
+            return Err(BlobError::Unsealed);
+        }
+        if offset > entry.bytes.len() {
+            return Err(BlobError::OffsetMismatch);
+        }
+        Ok(entry.bytes[offset..offset.saturating_add(length).min(entry.bytes.len())].to_vec())
+    }
+
+    pub fn read_chunk(
+        &self,
+        scope: &BlobScope,
+        handle: &str,
+        offset: usize,
+        max_bytes: usize,
+    ) -> Result<BlobChunk, BlobError> {
+        if max_bytes == 0 || max_bytes > MAX_CHUNK_BYTES {
+            return Err(BlobError::InvalidInput);
+        }
+        let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        let entry = inner.entries.get(handle).ok_or(BlobError::Missing)?;
+        Self::check_scope(entry, scope)?;
+        if !entry.sealed {
+            return Err(BlobError::Unsealed);
+        }
+        if offset > entry.bytes.len() {
+            return Err(BlobError::OffsetMismatch);
+        }
+        let next_offset = offset.saturating_add(max_bytes).min(entry.bytes.len());
+        Ok(BlobChunk {
+            base64: base64::engine::general_purpose::STANDARD
+                .encode(&entry.bytes[offset..next_offset]),
+            next_offset,
+            eof: next_offset == entry.bytes.len(),
+        })
+    }
+
+    pub fn reserve_producer(&self, scope: BlobScope) -> Result<BlobProducer, BlobError> {
+        let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        if inner.active_scope.as_ref() != Some(&scope) {
+            return Err(BlobError::StaleScope);
+        }
+        let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        let size = self.limits.max_blob_bytes;
+        if budget.handles >= self.limits.max_handles
+            || size > self.limits.max_total_bytes.saturating_sub(budget.bytes)
+        {
+            return Err(BlobError::QuotaExceeded);
+        }
+        budget.bytes += size;
+        budget.handles += 1;
+        Ok(BlobProducer {
+            scope,
+            charge: Charge {
+                size,
+                budget: self.budget.clone(),
+            },
+        })
+    }
+    pub fn producer_limit(&self) -> usize {
+        self.limits.max_blob_bytes
+    }
+    pub fn finish_producer(
+        &self,
+        mut producer: BlobProducer,
+        bytes: Vec<u8>,
+    ) -> Result<BlobInfo, BlobError> {
+        if bytes.len() > producer.charge.size {
+            return Err(BlobError::QuotaExceeded);
+        }
+        // Hash outside the store lock. Lifecycle is checked again at publication.
+        let sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        if inner.active_scope.as_ref() != Some(&producer.scope) {
+            return Err(BlobError::StaleScope);
+        }
+        {
+            let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+            budget.bytes -= producer.charge.size - bytes.len();
+            producer.charge.size = bytes.len();
+        }
+        let handle = Uuid::new_v4().to_string();
+        let info = BlobInfo {
+            handle: handle.clone(),
+            size: bytes.len(),
+            sha256: sha256.clone(),
+        };
+        inner.entries.insert(
+            handle,
+            Entry {
+                scope: producer.scope,
+                bytes: Arc::new(bytes),
+                expected_sha256: sha256,
+                hasher: Sha256::new(),
+                sealed: true,
+                reserved_by: None,
+                charge: Arc::new(producer.charge),
+            },
+        );
+        Ok(info)
+    }
+
+    /// Native producers pass already-protected bytes, never unmasked pixels.
+    /// Their pre-collected buffers are NOT charged here: callers must bound
+    /// producer admission/collection separately before invoking this helper.
+    pub fn insert_sealed(&self, scope: BlobScope, bytes: &[u8]) -> Result<BlobInfo, BlobError> {
+        let sha256 = format!("{:x}", Sha256::digest(bytes));
+        let handle = self.create(scope.clone(), bytes.len(), sha256)?;
+        let result = (|| {
+            for (index, chunk) in bytes.chunks(MAX_CHUNK_BYTES).enumerate() {
+                self.write(
+                    &scope,
+                    &handle,
+                    index * MAX_CHUNK_BYTES,
+                    &base64::engine::general_purpose::STANDARD.encode(chunk),
+                )?;
+            }
+            self.seal(&scope, &handle)
+        })();
+        if result.is_err() {
+            let _ = self.release(&scope, &handle);
+        }
+        result
+    }
+
+    /// Reserve before selecting a one-use protocol token. Roll back if token
+    /// validation/selection fails; never consume an invalid body after ack.
+    pub fn reserve(&self, scope: &BlobScope, handle: &str, token: &str) -> Result<(), BlobError> {
+        if token.is_empty() {
+            return Err(BlobError::InvalidInput);
+        }
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        // One reservation per token prevents a rejected replay using a second
+        // handle from rolling back the first accepted decision's reservation.
+        if inner
+            .entries
+            .values()
+            .any(|entry| entry.reserved_by.as_deref() == Some(token))
+        {
+            return Err(BlobError::Reserved);
+        }
+        let entry = inner.entries.get_mut(handle).ok_or(BlobError::Missing)?;
+        Self::check_scope(entry, scope)?;
+        if !entry.sealed {
+            return Err(BlobError::Unsealed);
+        }
+        if entry.reserved_by.is_some() || Arc::strong_count(&entry.bytes) > 1 {
+            return Err(BlobError::Reserved);
+        }
+        entry.reserved_by = Some(token.into());
+        Ok(())
+    }
+
+    /// Borrow immutable sealed bytes without transferring the handle. Both the
+    /// owner entry and command lease retain one shared quota charge; no copy.
+    pub fn borrow_sealed(&self, scope: &BlobScope, handle: &str) -> Result<BlobLease, BlobError> {
+        let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        let entry = inner.entries.get(handle).ok_or(BlobError::Missing)?;
+        Self::check_scope(entry, scope)?;
+        if !entry.sealed {
+            return Err(BlobError::Unsealed);
+        }
+        if entry.reserved_by.is_some() {
+            return Err(BlobError::Reserved);
+        }
+        Ok(BlobLease {
+            bytes: entry.bytes.clone(),
+            _charge: entry.charge.clone(),
+        })
+    }
+
+    pub fn commit(
+        &self,
+        scope: &BlobScope,
+        handle: &str,
+        token: &str,
+    ) -> Result<BlobLease, BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        let entry = inner.entries.get(handle).ok_or(BlobError::Missing)?;
+        Self::check_scope(entry, scope)?;
+        if entry.reserved_by.as_deref() != Some(token) {
+            return Err(BlobError::Reserved);
+        }
+        let entry = inner.entries.remove(handle).ok_or(BlobError::Missing)?;
+        Ok(BlobLease {
+            bytes: entry.bytes,
+            _charge: entry.charge,
+        })
+    }
+
+    pub fn rollback(&self, token: &str) -> Result<(), BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        for entry in inner.entries.values_mut() {
+            if entry.reserved_by.as_deref() == Some(token) {
+                entry.reserved_by = None;
+            }
+        }
+        Ok(())
+    }
+
+    /// After acceptance the upload belongs to native. Expiry/cancellation before
+    /// a Selected outcome must discard it, not restore caller ownership.
+    pub fn discard_reserved(&self, token: &str) -> Result<(), BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        inner
+            .entries
+            .retain(|_, entry| entry.reserved_by.as_deref() != Some(token));
+        Ok(())
+    }
+
+    pub fn release(&self, scope: &BlobScope, handle: &str) -> Result<(), BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        let entry = inner.entries.get(handle).ok_or(BlobError::Missing)?;
+        Self::check_scope(entry, scope)?;
+        if entry.reserved_by.is_some() {
+            return Err(BlobError::Reserved);
+        }
+        inner.entries.remove(handle);
+        Ok(())
+    }
+    pub fn revoke_scope(&self, scope: &BlobScope) -> Result<(), BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.active_scope.as_ref() == Some(scope) {
+            inner.active_scope = None;
+        }
+        inner.entries.retain(|_, entry| &entry.scope != scope);
+        Ok(())
+    }
+    pub fn close(&self) -> Result<(), BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        inner.closed = true;
+        inner.active_scope = None;
+        inner.entries.clear();
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn scope() -> BlobScope {
+        BlobScope {
+            generation: 1,
+            identity_scope: "context-one".into(),
+        }
+    }
+    fn digest(data: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(data))
+    }
+    fn store() -> BlobStore {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 8,
+            max_handles: 2,
+        })
+        .unwrap();
+        store.activate_scope(scope()).unwrap();
+        store
+    }
+    #[test]
+    fn retired_scope_cannot_repopulate_after_late_completion() {
+        let store = store();
+        let old = scope();
+        store.revoke_scope(&old).unwrap();
+        assert_eq!(
+            store.insert_sealed(old.clone(), b"late"),
+            Err(BlobError::StaleScope)
+        );
+        let next = BlobScope {
+            generation: 1,
+            identity_scope: "next-context".into(),
+        };
+        store.activate_scope(next.clone()).unwrap();
+        assert_eq!(
+            store.insert_sealed(old.clone(), b"late"),
+            Err(BlobError::StaleScope)
+        );
+        store.revoke_scope(&old).unwrap();
+        assert!(store.insert_sealed(next, b"new").is_ok());
+    }
+
+    #[test]
+    fn chunk_reads_have_exact_eof_and_reject_zero_length() {
+        let store = store();
+        let scope = scope();
+        let info = store.insert_sealed(scope.clone(), b"abc").unwrap();
+        assert_eq!(
+            store.read_chunk(&scope, &info.handle, 0, 2).unwrap(),
+            BlobChunk {
+                base64: "YWI=".into(),
+                next_offset: 2,
+                eof: false
+            }
+        );
+        assert_eq!(
+            store.read_chunk(&scope, &info.handle, 2, 2).unwrap(),
+            BlobChunk {
+                base64: "Yw==".into(),
+                next_offset: 3,
+                eof: true
+            }
+        );
+        assert_eq!(
+            store.read_chunk(&scope, &info.handle, 3, 2).unwrap(),
+            BlobChunk {
+                base64: "".into(),
+                next_offset: 3,
+                eof: true
+            }
+        );
+        assert_eq!(
+            store.read_chunk(&scope, &info.handle, 0, 0),
+            Err(BlobError::InvalidInput)
+        );
+        assert_eq!(
+            store.read_chunk(&scope, &info.handle, 4, 1),
+            Err(BlobError::OffsetMismatch)
+        );
+        store.release(&scope, &info.handle).unwrap();
+        let empty = store.insert_sealed(scope.clone(), b"").unwrap();
+        assert!(store.read_chunk(&scope, &empty.handle, 0, 1).unwrap().eof);
+    }
+
+    #[test]
+    fn sequential_upload_requires_exact_size_hash_and_scope() {
+        let store = store();
+        let scope = scope();
+        let handle = store.create(scope.clone(), 3, digest(b"abc")).unwrap();
+        assert_eq!(
+            store.write(&scope, &handle, 1, "YWJj"),
+            Err(BlobError::OffsetMismatch)
+        );
+        assert_eq!(
+            store.seal(&scope, &handle),
+            Err(BlobError::IntegrityMismatch)
+        );
+        store.write(&scope, &handle, 0, "YWJj").unwrap();
+        store.seal(&scope, &handle).unwrap();
+        assert_eq!(store.read(&scope, &handle, 0, 3).unwrap(), b"abc");
+        let other = BlobScope {
+            generation: 2,
+            ..scope.clone()
+        };
+        assert_eq!(
+            store.read(&other, &handle, 0, 3),
+            Err(BlobError::StaleScope)
+        );
+    }
+    #[test]
+    fn replay_cannot_reserve_another_handle_under_selected_token() {
+        let store = store();
+        let scope = scope();
+        let first = store.insert_sealed(scope.clone(), b"one").unwrap();
+        let second = store.insert_sealed(scope.clone(), b"two").unwrap();
+        store.reserve(&scope, &first.handle, "selected").unwrap();
+        assert_eq!(
+            store.reserve(&scope, &second.handle, "selected"),
+            Err(BlobError::Reserved)
+        );
+        assert!(store.release(&scope, &first.handle).is_err());
+        assert_eq!(
+            store
+                .commit(&scope, &first.handle, "selected")
+                .unwrap()
+                .bytes(),
+            b"one"
+        );
+        store.release(&scope, &second.handle).unwrap();
+    }
+
+    #[test]
+    fn decision_reservation_is_one_use_and_lease_keeps_quota_charged() {
+        let store = store();
+        let scope = scope();
+        let handle = store.create(scope.clone(), 8, digest(b"12345678")).unwrap();
+        store.write(&scope, &handle, 0, "MTIzNDU2Nzg=").unwrap();
+        store.seal(&scope, &handle).unwrap();
+        store.reserve(&scope, &handle, "token").unwrap();
+        assert_eq!(store.release(&scope, &handle), Err(BlobError::Reserved));
+        let lease = store.commit(&scope, &handle, "token").unwrap();
+        assert_eq!(lease.bytes(), b"12345678");
+        assert!(store.commit(&scope, &handle, "token").is_err());
+        assert_eq!(
+            store.create(scope.clone(), 1, digest(b"x")),
+            Err(BlobError::QuotaExceeded)
+        );
+        drop(lease);
+        assert!(store.create(scope, 1, digest(b"x")).is_ok());
+    }
+    #[test]
+    fn accepted_but_expired_decision_discards_upload_and_returns_quota() {
+        let store = store();
+        let scope = scope();
+        let body = store.insert_sealed(scope.clone(), b"12345678").unwrap();
+        store.reserve(&scope, &body.handle, "accepted").unwrap();
+        store.discard_reserved("accepted").unwrap();
+        assert!(store.commit(&scope, &body.handle, "accepted").is_err());
+        assert!(store.insert_sealed(scope.clone(), b"12345678").is_ok());
+        // Cleanup is idempotent even if a winning consumer already took bytes.
+        store.discard_reserved("accepted").unwrap();
+    }
+
+    #[test]
+    fn rejected_token_can_rollback_and_scope_revoke_clears_handles() {
+        let store = store();
+        let scope = scope();
+        let handle = store.create(scope.clone(), 0, digest(b"")).unwrap();
+        store.seal(&scope, &handle).unwrap();
+        store.reserve(&scope, &handle, "bad-token").unwrap();
+        store.rollback("bad-token").unwrap();
+        store.reserve(&scope, &handle, "valid-token").unwrap();
+        store.revoke_scope(&scope).unwrap();
+        assert!(store.commit(&scope, &handle, "valid-token").is_err());
+        store.close().unwrap();
+        assert_eq!(store.create(scope, 0, digest(b"")), Err(BlobError::Closed));
+    }
+}
+
+#[cfg(test)]
+mod producer_tests {
+    use super::*;
+    #[test]
+    fn borrowed_upload_retains_bytes_and_quota_after_handle_release() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 8,
+            max_handles: 2,
+        })
+        .unwrap();
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "borrow".into(),
+        };
+        store.activate_scope(scope.clone()).unwrap();
+        let info = store.insert_sealed(scope.clone(), b"12345678").unwrap();
+        let lease = store.borrow_sealed(&scope, &info.handle).unwrap();
+        assert_eq!(
+            store.reserve(&scope, &info.handle, "decision"),
+            Err(BlobError::Reserved)
+        );
+        store.release(&scope, &info.handle).unwrap();
+        assert_eq!(lease.bytes(), b"12345678");
+        assert!(matches!(
+            store.reserve_producer(scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        drop(lease);
+        assert!(store.reserve_producer(scope).is_ok());
+    }
+
+    #[test]
+    fn producer_reserves_before_collecting_and_rejects_late_scope() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 8,
+            max_handles: 2,
+        })
+        .unwrap();
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "first".into(),
+        };
+        store.activate_scope(scope.clone()).unwrap();
+        let producer = store.reserve_producer(scope.clone()).unwrap();
+        assert!(matches!(
+            store.reserve_producer(scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        let info = store.finish_producer(producer, b"abc".to_vec()).unwrap();
+        assert_eq!(info.size, 3);
+        store.release(&scope, &info.handle).unwrap();
+        let late = store.reserve_producer(scope.clone()).unwrap();
+        store.revoke_scope(&scope).unwrap();
+        assert_eq!(
+            store.finish_producer(late, b"late".to_vec()),
+            Err(BlobError::StaleScope)
+        );
+        store
+            .activate_scope(BlobScope {
+                generation: 1,
+                identity_scope: "next".into(),
+            })
+            .unwrap();
+    }
+}

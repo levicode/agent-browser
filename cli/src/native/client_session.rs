@@ -85,6 +85,7 @@ pub enum DecisionOwner {
 }
 
 struct PendingDecision {
+    resource_scope: Option<String>,
     selected: Option<Decision>,
     owner: DecisionOwner,
     kind: DecisionKind,
@@ -117,6 +118,7 @@ struct Inner {
     registries: HashMap<u64, Registry>,
     registry_high_water: u64,
     released_registries: Vec<u64>,
+    registry_scopes: HashMap<u64, String>,
 }
 
 /// One broker lives for the entire client session. Scope generations may change;
@@ -145,6 +147,7 @@ impl ClientSession {
                 registries: HashMap::new(),
                 registry_high_water: 0,
                 released_registries: Vec::new(),
+                registry_scopes: HashMap::new(),
             }),
         }
     }
@@ -333,6 +336,15 @@ impl ClientSession {
         version: u64,
         registrations: Vec<String>,
     ) -> Result<(), ProtocolError> {
+        self.register_routes_scoped(generation, version, registrations, None)
+    }
+    pub fn register_routes_scoped(
+        &self,
+        generation: u64,
+        version: u64,
+        registrations: Vec<String>,
+        identity_scope: Option<String>,
+    ) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
         Self::check(&inner, generation)?;
         if version == 0 || version > MAX_SAFE_SEQUENCE || version <= inner.registry_high_water {
@@ -350,6 +362,12 @@ impl ClientSession {
                 .any(|id| id.is_empty() || id.len() > 128 || id.chars().any(char::is_control))
         {
             return Err(ProtocolError::InvalidFrame);
+        }
+        if let Some(scope) = identity_scope {
+            if scope.is_empty() {
+                return Err(ProtocolError::InvalidArguments);
+            }
+            inner.registry_scopes.insert(version, scope);
         }
         inner.registry_high_water = version;
         inner.registries.insert(
@@ -373,6 +391,20 @@ impl ClientSession {
         timeout_ms: u64,
         registry: Option<u64>,
     ) -> Result<DecisionLease, ProtocolError> {
+        self.decision_scoped(generation, owner, kind, timeout_ms, registry, None)
+    }
+    pub fn decision_scoped(
+        &self,
+        generation: u64,
+        owner: DecisionOwner,
+        kind: DecisionKind,
+        timeout_ms: u64,
+        registry: Option<u64>,
+        resource_scope: Option<String>,
+    ) -> Result<DecisionLease, ProtocolError> {
+        if resource_scope.as_ref().is_some_and(String::is_empty) {
+            return Err(ProtocolError::InvalidArguments);
+        }
         let mut inner = self.lock()?;
         Self::check(&inner, generation)?;
         if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
@@ -416,6 +448,7 @@ impl ClientSession {
         inner.decisions.insert(
             token.clone(),
             PendingDecision {
+                resource_scope,
                 selected: None,
                 owner,
                 kind,
@@ -510,6 +543,7 @@ impl ClientSession {
             inner.decisions.insert(
                 next_token.clone(),
                 PendingDecision {
+                    resource_scope: pending.resource_scope,
                     selected: None,
                     owner: pending.owner,
                     kind: pending.kind,
@@ -589,6 +623,38 @@ impl ClientSession {
         }
     }
 
+    /// Revokes even a fallback token that has been created by control but not
+    /// yet observed by its asynchronous native resource task.
+    pub fn revoke_scope_decisions(&self, scope: &str) -> Result<(), ProtocolError> {
+        let mut inner = self.lock()?;
+        let tokens: Vec<_> = inner
+            .decisions
+            .iter()
+            .filter(|(_, pending)| pending.resource_scope.as_deref() == Some(scope))
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in tokens {
+            if let Some(pending) = inner.decisions.remove(&token) {
+                Self::cancel_token_children(&mut inner, &token);
+                Self::release_registry(&mut inner, pending.registry);
+                let _ = pending.sender.send(DecisionOutcome::Cancelled);
+            }
+        }
+        Ok(())
+    }
+
+    /// Scoped native resource owner revokes one callback before destroying its
+    /// context. Missing/settled tokens are harmless; sibling scopes are untouched.
+    pub fn revoke_decision(&self, token: &str) -> Result<(), ProtocolError> {
+        let mut inner = self.lock()?;
+        if let Some(pending) = inner.decisions.remove(token) {
+            Self::cancel_token_children(&mut inner, token);
+            Self::release_registry(&mut inner, pending.registry);
+            let _ = pending.sender.send(DecisionOutcome::Cancelled);
+        }
+        Ok(())
+    }
+
     /// Timer/connection owner calls this without any browser mutex.
     pub fn expire_decisions(&self) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
@@ -643,9 +709,23 @@ impl ClientSession {
     }
 
     pub fn take_released_registries(&self, limit: usize) -> Result<Vec<u64>, ProtocolError> {
+        Ok(self
+            .take_released_registry_events(limit)?
+            .into_iter()
+            .map(|(version, _)| version)
+            .collect())
+    }
+    pub fn take_released_registry_events(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<(u64, Option<String>)>, ProtocolError> {
         let mut inner = self.lock()?;
         let count = limit.min(inner.released_registries.len());
-        Ok(inner.released_registries.drain(..count).collect())
+        let versions: Vec<_> = inner.released_registries.drain(..count).collect();
+        Ok(versions
+            .into_iter()
+            .map(|version| (version, inner.registry_scopes.remove(&version)))
+            .collect())
     }
 
     fn seal(inner: &mut Inner, health: ScopeState) {
@@ -681,6 +761,75 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn scope_revoke_cancels_fallback_before_resource_task_observes_it() {
+        let broker = ClientSession::new();
+        let first = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                None,
+                Some("old".into()),
+            )
+            .unwrap();
+        broker
+            .resolve(
+                1,
+                &first.token,
+                Decision::Fallback {
+                    overrides: Default::default(),
+                },
+            )
+            .unwrap();
+        broker.revoke_scope_decisions("old").unwrap();
+        let DecisionOutcome::Fallback { next, .. } = first.outcome.await.unwrap() else {
+            panic!("expected fallback");
+        };
+        assert!(matches!(
+            next.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        assert!(matches!(
+            broker.resolve(1, &next.token, Decision::Abort {}),
+            Err(ProtocolError::DecisionMissing)
+        ));
+        assert_eq!(broker.health().unwrap().1, ScopeState::Usable);
+    }
+
+    #[tokio::test]
+    async fn revoked_callback_releases_original_scope_registry() {
+        let broker = ClientSession::new();
+        broker
+            .register_routes_scoped(1, 1, vec!["route".into()], Some("old-context".into()))
+            .unwrap();
+        let lease = broker
+            .decision(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(1),
+            )
+            .unwrap();
+        broker.retire_registry(1, 1).unwrap();
+        broker.revoke_decision(&lease.token).unwrap();
+        assert!(matches!(
+            lease.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(1, Some("old-context".into()))]
+        );
+        assert_eq!(broker.health().unwrap().1, ScopeState::Usable);
+        assert!(matches!(
+            broker.admit_callback(1, 1, 1000, Some(&lease.token)),
+            Err(ProtocolError::DecisionMissing)
+        ));
+    }
 
     #[test]
     fn settled_sequences_cannot_replay_after_record_removal() {
@@ -861,7 +1010,8 @@ mod tests {
                 Decision::Fulfill {
                     status: 999,
                     headers: vec![],
-                    body_base64: String::new()
+                    body_base64: Some(String::new()),
+                    body_handle: None
                 }
             ),
             Err(ProtocolError::InvalidFrame)

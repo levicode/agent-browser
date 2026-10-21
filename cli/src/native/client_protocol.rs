@@ -60,8 +60,18 @@ pub enum Decision {
     Fulfill {
         status: u16,
         headers: Vec<Header>,
-        #[serde(rename = "bodyBase64")]
-        body_base64: String,
+        #[serde(
+            rename = "bodyBase64",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        body_base64: Option<String>,
+        #[serde(
+            rename = "bodyHandle",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        body_handle: Option<String>,
     },
     Abort {},
     Fallback {
@@ -81,6 +91,15 @@ pub enum Decision {
 }
 
 impl Decision {
+    pub fn body_handle(&self) -> Option<&str> {
+        match self {
+            Self::Fulfill { body_handle, .. } => body_handle.as_deref(),
+            Self::Continue { overrides } | Self::Fallback { overrides } => {
+                overrides.body_handle.as_deref()
+            }
+            _ => None,
+        }
+    }
     /// Validate semantic payloads before consuming a one-use resource token.
     pub fn validate(&self) -> Result<(), ProtocolError> {
         use base64::Engine;
@@ -100,14 +119,33 @@ impl Decision {
                     .decode(body)
                     .is_ok()
         }
+        fn handle_valid(handle: &str) -> bool {
+            !handle.is_empty()
+                && handle.len() <= 128
+                && handle
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        }
         let valid = match self {
             Self::Fulfill {
                 status,
                 headers,
                 body_base64,
-            } => (100..=599).contains(status) && headers_valid(headers) && body_valid(body_base64),
+                body_handle,
+            } => {
+                (100..=599).contains(status)
+                    && headers_valid(headers)
+                    && (body_base64.is_some() ^ body_handle.is_some())
+                    && body_base64.as_ref().is_none_or(|b| body_valid(b))
+                    && body_handle.as_ref().is_none_or(|h| handle_valid(h))
+            }
             Self::Continue { overrides } | Self::Fallback { overrides } => {
-                overrides.headers.as_ref().is_none_or(|h| headers_valid(h))
+                !(overrides.body_base64.is_some() && overrides.body_handle.is_some())
+                    && overrides
+                        .body_handle
+                        .as_ref()
+                        .is_none_or(|h| handle_valid(h))
+                    && overrides.headers.as_ref().is_none_or(|h| headers_valid(h))
                     && overrides.body_base64.as_ref().is_none_or(|b| body_valid(b))
                     && overrides.method.as_ref().is_none_or(|m| {
                         !m.is_empty()
@@ -141,6 +179,7 @@ pub struct RequestOverrides {
     pub method: Option<String>,
     pub headers: Option<Vec<Header>>,
     pub body_base64: Option<String>,
+    pub body_handle: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -196,6 +235,8 @@ pub enum ProtocolError {
     PolicyDenied,
     NotActionable,
     LocatorNotFound,
+    ContentLengthMismatch,
+    RedirectBodyUnavailable,
 }
 
 /// Server envelopes are strict and correlated. A result terminates an RPC;
@@ -345,6 +386,21 @@ mod tests {
         }
         for value in vectors["invalidClient"].as_array().unwrap() {
             assert!(parse_frame(&serde_json::to_vec(value).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn shared_decision_vectors_enforce_exclusive_body_sources() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/client-protocol-v1.json"))
+                .unwrap();
+        for value in vectors["validDecision"].as_array().unwrap() {
+            let decision: Decision = serde_json::from_value(value.clone()).unwrap();
+            assert!(decision.validate().is_ok());
+        }
+        for value in vectors["invalidDecision"].as_array().unwrap() {
+            let decision: Decision = serde_json::from_value(value.clone()).unwrap();
+            assert!(decision.validate().is_err());
         }
     }
 

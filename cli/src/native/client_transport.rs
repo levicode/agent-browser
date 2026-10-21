@@ -1,5 +1,5 @@
-//! Bounded negotiated transport. Browser dispatch is deliberately unavailable
-//! until the owned-scope executor implements and advertises its contracts.
+//! Bounded negotiated transport with independently serviced native control.
+//! Only the owned executor advertises implemented browser capabilities.
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
@@ -16,6 +16,26 @@ pub struct NativeOutcome {
 pub trait ClientExecutor: Send + Sync + 'static {
     fn capabilities(&self) -> Vec<String>;
     fn set_event_sink(&self, _sink: ClientEventSink) -> Result<(), ProtocolError> {
+        Ok(())
+    }
+    /// Called on the independent control lane. Implementations may only take
+    /// short resource-store locks, never browser/action or lifecycle locks.
+    /// A failure must leave no reservation. Default refuses unwired blob bodies.
+    fn prepare_decision(
+        &self,
+        _generation: u64,
+        _token: &str,
+        decision: &Decision,
+    ) -> Result<(), ProtocolError> {
+        if decision.body_handle().is_some() {
+            Err(ProtocolError::UnsupportedCapability)
+        } else {
+            Ok(())
+        }
+    }
+    /// Rejected selection rolls back its reservation. Accepted selection already
+    /// woke the native consumer, which atomically claims the reserved byte lease.
+    fn finish_decision(&self, _token: &str, _accepted: bool) -> Result<(), ProtocolError> {
         Ok(())
     }
     fn execute(
@@ -38,6 +58,21 @@ pub struct ClientEventSink {
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl ClientEventSink {
+    #[cfg(test)]
+    pub(crate) fn test_channel(
+        broker: std::sync::Arc<ClientSession>,
+    ) -> (Self, mpsc::Receiver<ServerMessage>) {
+        let (sender, receiver) = mpsc::channel(64);
+        (
+            Self {
+                sender,
+                broker,
+                sequence: std::sync::Arc::new(std::sync::Mutex::new(0)),
+                open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            },
+            receiver,
+        )
+    }
     pub fn emit(
         &self,
         event: String,
@@ -298,8 +333,10 @@ where
                 _ = timer.tick() => {
                     let _ = broker.expire_decisions();
                     if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { break; }
-                    for version in broker.take_released_registries(16).unwrap_or_default() {
-                        if sink.emit("registry-released".into(), serde_json::json!({ "registryVersion": version }), None).is_err() { break; }
+                    for (version,identity_scope) in broker.take_released_registry_events(16).unwrap_or_default() {
+                        let mut payload=serde_json::json!({ "registryVersion": version });
+                        if let Some(scope)=identity_scope { payload["identityScope"]=serde_json::json!(scope); }
+                        if sink.emit("registry-released".into(), payload, None).is_err() { break; }
                     }
                     if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { break; }
                     continue;
@@ -429,7 +466,7 @@ where
                     break;
                 }
                 other => {
-                    let (response, close) = respond(&broker, other);
+                    let (response, close) = respond(&broker, other, executor.as_ref());
                     if !enqueue(&sender, response, &broker) || close {
                         break;
                     }
@@ -579,7 +616,11 @@ async fn execute_bounded<E: ClientExecutor>(
     }
 }
 
-fn respond(broker: &ClientSession, message: ClientMessage) -> (ServerMessage, bool) {
+fn respond<E: ClientExecutor>(
+    broker: &ClientSession,
+    message: ClientMessage,
+    executor: &E,
+) -> (ServerMessage, bool) {
     let (generation, scope_state) = broker.health().unwrap_or((1, ScopeState::Quarantined));
     match message {
         ClientMessage::Request {
@@ -640,7 +681,25 @@ fn respond(broker: &ClientSession, message: ClientMessage) -> (ServerMessage, bo
             token,
             decision,
         } => {
-            let result = broker.resolve(requested_generation, &token, decision);
+            let prepared = decision
+                .validate()
+                .and_then(|()| executor.prepare_decision(requested_generation, &token, &decision));
+            let result = match prepared {
+                Err(error) => Err(error),
+                Ok(()) => {
+                    let result = broker.resolve(requested_generation, &token, decision);
+                    if executor.finish_decision(&token, result.is_ok()).is_err() {
+                        // A selected decision cannot be undone or reported as
+                        // unselected. Preserve acceptance and quarantine scope.
+                        let _ = broker.quarantine();
+                    }
+                    result
+                }
+            };
+            let scope_state = broker
+                .health()
+                .map(|(_, state)| state)
+                .unwrap_or(ScopeState::Quarantined);
             (
                 ServerMessage::ControlResult {
                     id,
@@ -851,6 +910,187 @@ mod tests {
         assert!(parse_frame(&[0xff]).is_err());
         assert!(read_frame(&mut &b"partial"[..]).await.is_err());
     }
+    struct BlobExecutor {
+        store: super::super::client_blobs::BlobStore,
+        scope: super::super::client_blobs::BlobScope,
+    }
+    impl ClientExecutor for BlobExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        fn prepare_decision(
+            &self,
+            generation: u64,
+            token: &str,
+            decision: &Decision,
+        ) -> Result<(), ProtocolError> {
+            if generation != self.scope.generation {
+                return Err(ProtocolError::StaleGeneration);
+            }
+            if let Some(handle) = decision.body_handle() {
+                self.store
+                    .reserve(&self.scope, handle, token)
+                    .map_err(|_| ProtocolError::InvalidArguments)?;
+            }
+            Ok(())
+        }
+        fn finish_decision(&self, token: &str, accepted: bool) -> Result<(), ProtocolError> {
+            if !accepted {
+                self.store
+                    .rollback(token)
+                    .map_err(|_| ProtocolError::CleanupFailed)?;
+            }
+            Ok(())
+        }
+        async fn execute(
+            &self,
+            _: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            _: OperationLease,
+        ) -> NativeOutcome {
+            NativeOutcome {
+                result: Err(ProtocolError::UnsupportedCommand),
+                effects: Effects::NotDispatched,
+            }
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn body_reservation_precedes_selection_and_rejection_restores_handle() {
+        use super::super::client_blobs::{BlobLimits, BlobScope, BlobStore};
+        use super::super::client_session::{DecisionKind, DecisionOutcome, DecisionOwner};
+        let broker = ClientSession::new();
+        let executor = BlobExecutor {
+            store: BlobStore::new(BlobLimits::default()).unwrap(),
+            scope: BlobScope {
+                generation: 1,
+                identity_scope: "owned".into(),
+            },
+        };
+        executor
+            .store
+            .activate_scope(executor.scope.clone())
+            .unwrap();
+        let body = executor
+            .store
+            .insert_sealed(executor.scope.clone(), b"synthetic")
+            .unwrap();
+        let decision = || Decision::Fulfill {
+            status: 200,
+            headers: vec![],
+            body_base64: None,
+            body_handle: Some(body.handle.clone()),
+        };
+        let message = |token: String| ClientMessage::Decision {
+            id: "control".into(),
+            generation: 1,
+            token,
+            decision: decision(),
+        };
+        let (rejected, _) = respond(&broker, message("missing".into()), &executor);
+        assert!(matches!(
+            rejected,
+            ServerMessage::ControlResult {
+                accepted: false,
+                ..
+            }
+        ));
+        // Rollback after rejected token leaves the same sealed handle usable.
+        let lease = broker
+            .decision(1, DecisionOwner::Scope, DecisionKind::Request, 1000, None)
+            .unwrap();
+        let (selected, _) = respond(&broker, message(lease.token.clone()), &executor);
+        assert!(matches!(
+            selected,
+            ServerMessage::ControlResult { accepted: true, .. }
+        ));
+        assert!(matches!(
+            lease.outcome.await.unwrap(),
+            DecisionOutcome::Selected(_)
+        ));
+        let other = executor
+            .store
+            .insert_sealed(executor.scope.clone(), b"other")
+            .unwrap();
+        let replay = ClientMessage::Decision {
+            id: "replay".into(),
+            generation: 1,
+            token: lease.token.clone(),
+            decision: Decision::Fulfill {
+                status: 200,
+                headers: vec![],
+                body_base64: None,
+                body_handle: Some(other.handle.clone()),
+            },
+        };
+        let (rejected, _) = respond(&broker, replay, &executor);
+        assert!(matches!(
+            rejected,
+            ServerMessage::ControlResult {
+                accepted: false,
+                ..
+            }
+        ));
+        executor
+            .store
+            .release(&executor.scope, &other.handle)
+            .unwrap();
+        // Selection wakes consumers before finish returns; reservation already
+        // blocks release and native consumer alone can atomically claim bytes.
+        assert!(executor
+            .store
+            .release(&executor.scope, &body.handle)
+            .is_err());
+        let bytes = executor
+            .store
+            .commit(&executor.scope, &body.handle, &lease.token)
+            .unwrap();
+        assert_eq!(bytes.bytes(), b"synthetic");
+        assert!(executor
+            .store
+            .commit(&executor.scope, &body.handle, &lease.token)
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn unwired_blob_body_does_not_consume_decision_token() {
+        use super::super::client_session::{DecisionKind, DecisionOwner};
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let executor = StalledExecutor {
+            broker: broker.clone(),
+            cleanup_succeeds: true,
+        };
+        let lease = broker
+            .decision(1, DecisionOwner::Scope, DecisionKind::Request, 1000, None)
+            .unwrap();
+        let message = ClientMessage::Decision {
+            id: "control".into(),
+            generation: 1,
+            token: lease.token.clone(),
+            decision: Decision::Fulfill {
+                status: 200,
+                headers: vec![],
+                body_base64: None,
+                body_handle: Some("sealed-body".into()),
+            },
+        };
+        let (rejected, _) = respond(&broker, message, &executor);
+        assert!(matches!(
+            rejected,
+            ServerMessage::ControlResult {
+                accepted: false,
+                error: Some(WireError {
+                    code: ProtocolError::UnsupportedCapability
+                }),
+                ..
+            }
+        ));
+        broker.resolve(1, &lease.token, Decision::Abort {}).unwrap();
+    }
+
     #[test]
     fn unavailable_browser_commands_never_claim_execution() {
         let broker = ClientSession::new();
@@ -863,7 +1103,11 @@ mod tests {
             callback_token: None,
             args: Default::default(),
         };
-        let (reply, _) = respond(&broker, message);
+        let executor = StalledExecutor {
+            broker: std::sync::Arc::new(ClientSession::new()),
+            cleanup_succeeds: true,
+        };
+        let (reply, _) = respond(&broker, message, &executor);
         assert!(matches!(
             reply,
             ServerMessage::Result {

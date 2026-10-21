@@ -1,6 +1,212 @@
 //! Shared protected-read stabilization. Browser conformance is an explicit gate;
 //! the existence of this module does not advertise a protected capability.
 
+use super::client_browser::BrowserExecutionLease;
+use super::client_session::{CancelSignal, OperationLease};
+use super::client_targets::{ProtectedTargetBarrier, TargetPurpose};
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectedReadReason {
+    Cancelled,
+    Deadline,
+    StaleScope,
+    IncompleteInventory,
+    BrowserFailure,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtectedReadFailure {
+    pub reason: ProtectedReadReason,
+    pub identity_scope: String,
+    pub cleanup_integrity_lost: bool,
+}
+
+/// One stabilization journal shared by semantic and pixel reads. Its enclosing
+/// task must be retained by the native owner through restore, even if the RPC
+/// receiver is dropped. Admission must already exclude all UI mutations.
+/// This does not advertise a capability: target event enrollment and Chromium
+/// freeze/read conformance remain separately required deployment gates.
+pub struct ProtectedReadJournal<'a> {
+    page: &'a BrowserExecutionLease,
+    operation: &'a OperationLease,
+    barrier: ProtectedTargetBarrier,
+    sessions: Vec<String>,
+    touched: Vec<(String, f64)>,
+    restored: bool,
+    started: bool,
+}
+impl<'a> ProtectedReadJournal<'a> {
+    pub fn begin(
+        page: &'a BrowserExecutionLease,
+        operation: &'a OperationLease,
+        lifecycle_known_active: bool,
+    ) -> Result<Self, ProtectedReadFailure> {
+        let failure = |reason| ProtectedReadFailure {
+            reason,
+            identity_scope: page.identity_scope.clone(),
+            cleanup_integrity_lost: false,
+        };
+        if !lifecycle_known_active {
+            return Err(failure(ProtectedReadReason::IncompleteInventory));
+        }
+        let barrier = page
+            .targets
+            .protected_read_barrier()
+            .map_err(|_| failure(ProtectedReadReason::IncompleteInventory))?;
+        if barrier.stamp.identity_scope != page.identity_scope {
+            return Err(failure(ProtectedReadReason::StaleScope));
+        }
+        let mut sessions = Vec::new();
+        let mut main = false;
+        for target in &barrier.stamp.targets {
+            if target.purpose != Some(TargetPurpose::Application) {
+                return Err(failure(ProtectedReadReason::IncompleteInventory));
+            }
+            if matches!(target.kind.as_str(), "page" | "iframe") {
+                main |=
+                    target.session_id == page.page_session_id && target.target_id == page.target_id;
+                sessions.push(target.session_id.clone());
+            }
+        }
+        if !main {
+            return Err(failure(ProtectedReadReason::IncompleteInventory));
+        }
+        sessions.sort();
+        sessions.dedup();
+        let journal = Self {
+            page,
+            operation,
+            barrier,
+            sessions,
+            touched: Vec::new(),
+            restored: false,
+            started: false,
+        };
+        journal.check().map_err(failure)?;
+        Ok(journal)
+    }
+    pub fn check(&self) -> Result<(), ProtectedReadReason> {
+        self.page
+            .permit
+            .check()
+            .map_err(|_| ProtectedReadReason::StaleScope)?;
+        self.barrier
+            .check()
+            .map_err(|_| ProtectedReadReason::StaleScope)?;
+        if *self.operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtectedReadReason::Cancelled);
+        }
+        if Instant::now() >= self.operation.deadline {
+            return Err(ProtectedReadReason::Deadline);
+        }
+        Ok(())
+    }
+    pub fn contains_session(&self, session: &str) -> bool {
+        self.sessions.iter().any(|value| value == session)
+    }
+    pub async fn command(
+        &self,
+        session: &str,
+        method: &str,
+        args: Value,
+    ) -> Result<Value, ProtectedReadReason> {
+        if self.restored {
+            return Err(ProtectedReadReason::StaleScope);
+        }
+        self.check()?;
+        if !self.contains_session(session) {
+            return Err(ProtectedReadReason::IncompleteInventory);
+        }
+        let mut cancellation = self.operation.cancellation.clone();
+        tokio::select! {
+            result=self.page.client.send_command(method,Some(args),Some(session))=>{self.check()?;result.map_err(|_|ProtectedReadReason::BrowserFailure)},
+            _=cancellation.changed()=>Err(ProtectedReadReason::Cancelled),
+            _=tokio::time::sleep_until(self.operation.deadline.into())=>Err(ProtectedReadReason::Deadline),
+        }
+    }
+    pub async fn freeze(&mut self) -> Result<(), ProtectedReadReason> {
+        if self.started || self.restored {
+            return Err(ProtectedReadReason::StaleScope);
+        }
+        self.started = true;
+        for session in self.sessions.clone() {
+            self.command(&session, "Animation.enable", json!({}))
+                .await?;
+            let rate = self
+                .command(&session, "Animation.getPlaybackRate", json!({}))
+                .await?["playbackRate"]
+                .as_f64()
+                .filter(|rate| rate.is_finite())
+                .ok_or(ProtectedReadReason::BrowserFailure)?;
+            // Journal before delivery: lost acknowledgements may still mutate.
+            self.touched.push((session.clone(), rate));
+            self.command(
+                &session,
+                "Animation.setPlaybackRate",
+                json!({"playbackRate":0}),
+            )
+            .await?;
+            self.command(
+                &session,
+                "Page.setWebLifecycleState",
+                json!({"state":"frozen"}),
+            )
+            .await?;
+        }
+        self.check()
+    }
+    /// Always call after freeze, including a failed/cancelled freeze. Cleanup
+    /// ignores the expired operation budget but has one total three-second cap.
+    /// No staged value may escape until both restore and final check succeed.
+    pub async fn restore(&mut self) -> Result<(), ProtectedReadFailure> {
+        if self.restored {
+            return Ok(());
+        }
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut complete = true;
+        for (session, rate) in self.touched.iter().rev() {
+            for (method, args) in [
+                ("Page.setWebLifecycleState", json!({"state":"active"})),
+                ("Animation.setPlaybackRate", json!({"playbackRate":rate})),
+            ] {
+                let command_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+                if Instant::now() >= deadline {
+                    complete = false;
+                    break;
+                }
+                complete &= matches!(
+                    tokio::time::timeout_at(
+                        command_deadline.into(),
+                        self.page
+                            .client
+                            .send_command(method, Some(args), Some(session))
+                    )
+                    .await,
+                    Ok(Ok(_))
+                );
+            }
+        }
+        if !complete {
+            self.barrier.quarantine();
+            return Err(ProtectedReadFailure {
+                reason: ProtectedReadReason::BrowserFailure,
+                identity_scope: self.page.identity_scope.clone(),
+                cleanup_integrity_lost: true,
+            });
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+impl Drop for ProtectedReadJournal<'_> {
+    fn drop(&mut self) {
+        if !self.restored && !self.touched.is_empty() {
+            self.barrier.quarantine();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::cdp::client::CdpClient;
@@ -9,6 +215,128 @@ mod tests {
     use serde_json::{json, Value};
     use std::sync::Arc;
     use std::time::Duration;
+
+    async fn journal_fixture(
+        fail_restore: bool,
+        stale_during_restore: bool,
+    ) -> (
+        super::super::client_browser::BrowserExecutionLease,
+        super::super::client_session::OperationLease,
+        tokio::sync::watch::Sender<super::super::client_session::CancelSignal>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use super::super::client_session::{CancelSignal, OperationLease};
+        use super::super::client_targets::ClientTargets;
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        targets
+            .attached("context", "target".into(), "session".into(), "page".into())
+            .unwrap();
+        targets.configured("target").unwrap();
+        targets
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        targets.acknowledge_enrollment().unwrap(); // Synthetic fixture only.
+        let server_targets = targets.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                let mut response = json!({"id":request["id"],"sessionId":request["sessionId"],"result":if request["method"]=="Animation.getPlaybackRate" {json!({"playbackRate":1})} else {json!({})}});
+                if stale_during_restore
+                    && request["method"] == "Page.setWebLifecycleState"
+                    && request["params"]["state"] == "active"
+                {
+                    server_targets.invalidate_inventory().unwrap();
+                }
+                if fail_restore
+                    && request["method"] == "Page.setWebLifecycleState"
+                    && request["params"]["state"] == "active"
+                {
+                    response.as_object_mut().unwrap().remove("result");
+                    response["error"] =
+                        json!({"code":-32000,"message":"synthetic cleanup failure"});
+                }
+                if ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        response.to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let gate = Arc::new(ExecutionGate::default());
+        let page = super::super::client_browser::BrowserExecutionLease {
+            client,
+            page_session_id: "session".into(),
+            target_id: "target".into(),
+            identity_scope: "scope".into(),
+            permit: gate.enter(false).unwrap(),
+            targets,
+        };
+        let (sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 1,
+            deadline: std::time::Instant::now() + Duration::from_secs(5),
+            cancellation,
+        };
+        (page, operation, sender, server)
+    }
+    #[tokio::test]
+    async fn protected_journal_restores_before_releasing_barrier() {
+        let (page, operation, _sender, server) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation, true).unwrap();
+        journal.freeze().await.unwrap();
+        assert!(page.targets.protected_read_barrier().is_err());
+        journal.restore().await.unwrap();
+        journal.check().unwrap();
+        drop(journal);
+        assert!(page.targets.protected_read_barrier().is_ok());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn protected_journal_abandonment_and_cleanup_failure_seal_original_scope() {
+        for cleanup in [false, true] {
+            let (page, operation, _sender, server) = journal_fixture(cleanup, false).await;
+            let mut journal = super::ProtectedReadJournal::begin(&page, &operation, true).unwrap();
+            journal.freeze().await.unwrap();
+            if cleanup {
+                let error = journal.restore().await.unwrap_err();
+                assert!(error.cleanup_integrity_lost);
+                assert_eq!(error.identity_scope, "scope");
+            }
+            drop(journal);
+            assert!(page.targets.inventory().is_err());
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn protected_journal_clean_restore_does_not_authorize_stale_publish() {
+        let (page, operation, _sender, server) = journal_fixture(false, true).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation, true).unwrap();
+        journal.freeze().await.unwrap();
+        journal.check().unwrap();
+        journal.restore().await.unwrap();
+        assert_eq!(journal.check(), Err(super::ProtectedReadReason::StaleScope));
+        drop(journal);
+        server.abort();
+    }
 
     async fn bounded(
         client: &CdpClient,

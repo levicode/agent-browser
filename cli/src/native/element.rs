@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc,
+    Arc, OnceLock,
 };
 
 use serde_json::Value;
@@ -38,11 +38,17 @@ struct DocumentRefs {
     refs: HashMap<i64, String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefAllocationError {
+    Exhausted,
+}
+
 #[derive(Clone)]
 pub struct RefMap {
     map: HashMap<String, RefEntry>,
     documents: HashMap<(String, Option<String>), DocumentRefs>,
     next_ref: Arc<AtomicUsize>,
+    viewport_ref: Arc<OnceLock<Result<String, RefAllocationError>>>,
 }
 
 impl RefMap {
@@ -51,6 +57,7 @@ impl RefMap {
             map: HashMap::new(),
             documents: HashMap::new(),
             next_ref: Arc::new(AtomicUsize::new(1)),
+            viewport_ref: Arc::new(OnceLock::new()),
         }
     }
 
@@ -115,6 +122,17 @@ impl RefMap {
         name: &str,
         binding: ExactBinding,
     ) -> String {
+        self.try_bind_exact(backend_node_id, role, name, binding)
+            .expect("native reference space exhausted")
+    }
+
+    pub fn try_bind_exact(
+        &mut self,
+        backend_node_id: i64,
+        role: &str,
+        name: &str,
+        binding: ExactBinding,
+    ) -> Result<String, RefAllocationError> {
         self.observe_document(
             &binding.page_session,
             Some(&binding.frame),
@@ -124,7 +142,8 @@ impl RefMap {
         let id = self
             .durable_ref(&binding.page_session, Some(&binding.frame), backend_node_id)
             .map(str::to_owned)
-            .unwrap_or_else(|| self.allocate_ref());
+            .map(Ok)
+            .unwrap_or_else(|| self.try_allocate_ref())?;
         self.remember_durable_ref(
             &binding.page_session,
             Some(&binding.frame),
@@ -144,7 +163,7 @@ impl RefMap {
                 exact_binding: Some(binding),
             },
         );
-        id
+        Ok(id)
     }
 
     pub fn add_selector(
@@ -291,12 +310,35 @@ impl RefMap {
     /// Reserve a globally unique ref in this client's lifetime. Cloned staging
     /// maps share the allocator: abandoning a snapshot never recycles IDs.
     pub fn allocate_ref(&self) -> String {
+        self.try_allocate_ref()
+            .expect("native reference space exhausted")
+    }
+
+    pub fn try_allocate_ref(&self) -> Result<String, RefAllocationError> {
         #[allow(deprecated)] // Keep compatibility with older stable toolchains.
         let n = self
             .next_ref
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
-            .expect("native reference space exhausted");
-        format!("e{n}")
+            .map_err(|_| RefAllocationError::Exhausted)?;
+        Ok(format!("e{n}"))
+    }
+
+    /// A client-lifetime viewport capability, not a DOM identity. It is allocated
+    /// lazily from the same counter, never enters the DOM registry, and survives
+    /// document invalidation. Only an explicit native viewport operation may use it.
+    pub fn try_viewport_ref(&self) -> Result<&str, RefAllocationError> {
+        self.viewport_ref
+            .get_or_init(|| self.try_allocate_ref())
+            .as_ref()
+            .map(String::as_str)
+            .map_err(|error| *error)
+    }
+
+    pub fn is_viewport_ref(&self, reference: &str) -> bool {
+        let Some(Ok(viewport)) = self.viewport_ref.get() else {
+            return false;
+        };
+        parse_ref(reference).as_deref() == Some(viewport.as_str())
     }
 
     pub fn next_ref_num(&self) -> usize {
@@ -1881,6 +1923,40 @@ pub async fn get_element_styles(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn viewport_capability_is_shared_stable_and_never_a_dom_identity() {
+        let mut refs = RefMap::new();
+        assert_eq!(refs.allocate_ref(), "e1", "legacy allocation is unchanged");
+        let clones: Vec<_> = (0..8)
+            .map(|_| {
+                let refs = refs.clone();
+                std::thread::spawn(move || refs.try_viewport_ref().unwrap().to_string())
+            })
+            .collect();
+        let ids: Vec<_> = clones
+            .into_iter()
+            .map(|thread| thread.join().unwrap())
+            .collect();
+        assert!(ids.iter().all(|id| id == "e2"));
+        assert_eq!(refs.next_ref_num(), 3);
+        assert!(refs.is_viewport_ref("@e2"));
+        assert!(refs.get("e2").is_none());
+        refs.add_exact_backend_node("e1".into(), 42);
+        refs.invalidate_all_documents();
+        assert!(refs.get("e1").is_none());
+        assert_eq!(refs.try_viewport_ref().unwrap(), "e2");
+        assert_eq!(refs.allocate_ref(), "e3");
+    }
+
+    #[test]
+    fn viewport_allocation_exhaustion_is_typed_without_recycling() {
+        let mut refs = RefMap::new();
+        refs.set_next_ref_num(usize::MAX);
+        assert_eq!(refs.try_viewport_ref(), Err(RefAllocationError::Exhausted));
+        assert!(!refs.is_viewport_ref("@e1"));
+        assert_eq!(refs.next_ref_num(), usize::MAX);
+    }
+
     #[tokio::test]
     async fn exact_connectivity_releases_owned_and_auxiliary_handles_on_every_failure() {
         use futures_util::{SinkExt, StreamExt};

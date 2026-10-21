@@ -761,6 +761,8 @@ fn tool_profile_summaries() -> Vec<Value> {
 // Intentionally no session-connect MCP tool: a one-shot tool result cannot
 // proxy a persistent bidirectional JSON-line connection. Existing MCP tools
 // retain canonical one-shot command behavior; session clients use the CLI.
+// Scoped blob handles/decision tokens belong to that negotiated connection and
+// are intentionally not exposed as separate stateless MCP tools.
 fn tools() -> Vec<Value> {
     let mut tools = vec![
         tool(

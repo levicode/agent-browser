@@ -659,6 +659,24 @@ impl EventTracker {
     }
 }
 
+/// Shared native dialog terminal primitive. Both legacy commands and negotiated
+/// callback sessions choose policy above this one browser operation.
+pub async fn handle_dialog(
+    client: &CdpClient,
+    session: &str,
+    accept: bool,
+    prompt: Option<&str>,
+) -> Result<(), String> {
+    let mut params = json!({"accept":accept});
+    if let Some(prompt) = prompt {
+        params["promptText"] = json!(prompt);
+    }
+    client
+        .send_command("Page.handleJavaScriptDialog", Some(params), Some(session))
+        .await
+        .map(|_| ())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

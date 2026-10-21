@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::Shutdown;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +44,129 @@ const PRIVATE_SESSION_BUFFER: usize = 16;
 /// broadcast, a tap never drops an event when its reader falls behind.
 type MethodTaps =
     Arc<std::sync::Mutex<Vec<(&'static [&'static str], mpsc::UnboundedSender<CdpEvent>)>>>;
+
+/// Bounded control-event subscriptions fail closed rather than silently losing a
+/// paused request. The consumer must quarantine its owned scope on overflow.
+type BoundedMethodTaps = Arc<std::sync::Mutex<HashMap<u64, BoundedMethodRoute>>>;
+struct BoundedMethodRoute {
+    methods: &'static [&'static str],
+    sender: mpsc::Sender<BoundedCdpEvent>,
+    budget: Arc<EventBudget>,
+    failed: Arc<AtomicBool>,
+    max_event_bytes: usize,
+}
+#[derive(Debug)]
+struct EventBudget {
+    used: AtomicUsize,
+    maximum: usize,
+}
+#[derive(Debug)]
+struct EventCharge {
+    budget: Arc<EventBudget>,
+    bytes: usize,
+}
+impl Drop for EventCharge {
+    fn drop(&mut self) {
+        self.budget.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+/// Retain this lease whenever processing copies event data beyond recv().
+/// It accounts encoded bytes, not exact allocator overhead; event count and
+/// transport frame limits independently bound object/parse overhead.
+#[derive(Clone, Debug)]
+pub struct EventBudgetLease {
+    _charge: Arc<EventCharge>,
+}
+#[derive(Debug)]
+pub struct BoundedCdpEvent {
+    event: CdpEvent,
+    charge: EventBudgetLease,
+}
+impl BoundedCdpEvent {
+    pub fn budget_lease(&self) -> EventBudgetLease {
+        self.charge.clone()
+    }
+}
+impl std::ops::Deref for BoundedCdpEvent {
+    type Target = CdpEvent;
+    fn deref(&self) -> &CdpEvent {
+        &self.event
+    }
+}
+impl EventBudget {
+    fn reserve(self: &Arc<Self>, bytes: usize) -> Option<EventBudgetLease> {
+        #[allow(deprecated)]
+        self.used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes).filter(|next| *next <= self.maximum)
+            })
+            .ok()?;
+        Some(EventBudgetLease {
+            _charge: Arc::new(EventCharge {
+                budget: self.clone(),
+                bytes,
+            }),
+        })
+    }
+}
+pub struct BoundedMethodEvents {
+    receiver: mpsc::Receiver<BoundedCdpEvent>,
+    failed: Arc<AtomicBool>,
+    routes: BoundedMethodTaps,
+    id: u64,
+}
+impl BoundedMethodEvents {
+    pub async fn recv(&mut self) -> Result<BoundedCdpEvent, &'static str> {
+        if self.failed.load(Ordering::SeqCst) {
+            return Err("control event overflow");
+        }
+        let event = self
+            .receiver
+            .recv()
+            .await
+            .ok_or("control event stream closed")?;
+        if self.failed.load(Ordering::SeqCst) {
+            return Err("control event overflow");
+        }
+        Ok(event)
+    }
+}
+impl Drop for BoundedMethodEvents {
+    fn drop(&mut self) {
+        self.routes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
+fn publish_bounded(taps: &BoundedMethodTaps, event: &CdpEvent, bytes: usize) {
+    taps.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|_, route| {
+            if !route.methods.contains(&event.method.as_str()) {
+                return true;
+            }
+            if bytes > route.max_event_bytes {
+                route.failed.store(true, Ordering::SeqCst);
+                return false;
+            }
+            let Some(charge) = route.budget.reserve(bytes) else {
+                route.failed.store(true, Ordering::SeqCst);
+                return false;
+            };
+            match route.sender.try_send(BoundedCdpEvent {
+                event: event.clone(),
+                charge,
+            }) {
+                Ok(()) => true,
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    route.failed.store(true, Ordering::SeqCst);
+                    false
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => false,
+            }
+        });
+}
 
 /// Interval between WebSocket ping frames sent to keep the connection alive
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
@@ -170,6 +293,8 @@ pub struct CdpClient {
     keepalive_handle: Mutex<Option<JoinHandle<()>>>,
     private_sessions: PrivateSessions,
     method_taps: MethodTaps,
+    bounded_method_taps: BoundedMethodTaps,
+    next_tap_id: AtomicU64,
 }
 
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
@@ -206,6 +331,19 @@ impl CdpClient {
         url: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Result<Self, String> {
+        Self::connect_with_headers_and_limit(url, headers, None).await
+    }
+
+    /// Negotiated owners bound transport allocation before JSON parsing. Legacy
+    /// connections retain their existing unlimited-message behavior.
+    pub async fn connect_with_headers_and_limit(
+        url: &str,
+        headers: Option<Vec<(String, String)>>,
+        message_limit: Option<usize>,
+    ) -> Result<Self, String> {
+        if message_limit.is_some_and(|limit| !(1024..=512 * 1024 * 1024).contains(&limit)) {
+            return Err("Invalid native transport limit".into());
+        }
         let normalized_url = normalize_websocket_root_path(url);
         let mut request = normalized_url
             .as_str()
@@ -225,8 +363,8 @@ impl CdpClient {
         }
 
         let ws_config = WebSocketConfig {
-            max_message_size: None,
-            max_frame_size: None,
+            max_message_size: message_limit,
+            max_frame_size: message_limit,
             ..Default::default()
         };
 
@@ -264,6 +402,10 @@ impl CdpClient {
 
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let method_taps: MethodTaps = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let bounded_method_taps: BoundedMethodTaps =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let bounded_taps_clone = bounded_method_taps.clone();
 
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
@@ -379,6 +521,7 @@ impl CdpClient {
                             None => false,
                         }
                     });
+                    publish_bounded(&bounded_taps_clone, &event, msg.len());
                     if !routed {
                         let mut taps = taps_clone.lock().unwrap_or_else(|e| e.into_inner());
                         taps.retain(|(methods, tx)| {
@@ -394,6 +537,10 @@ impl CdpClient {
             // Reader loop exited (connection closed or error). Drop all pending
             // command senders so callers get an immediate channel-closed error
             // instead of waiting for the 30-second timeout.
+            bounded_taps_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clear();
             closed_reader.store(true, Ordering::SeqCst);
             pending_clone.lock().await.clear();
 
@@ -439,6 +586,8 @@ impl CdpClient {
             keepalive_handle: Mutex::new(Some(keepalive_handle)),
             private_sessions,
             method_taps,
+            bounded_method_taps,
+            next_tap_id: AtomicU64::new(1),
         })
     }
 
@@ -560,6 +709,74 @@ impl CdpClient {
             .unwrap_or_else(|e| e.into_inner())
             .push((methods, tx));
         rx
+    }
+
+    /// A bounded, independently observed control lane. Unlike the legacy
+    /// lossless tap, exhaustion is explicit and requires scope teardown.
+    pub fn subscribe_bounded_methods(
+        &self,
+        methods: &'static [&'static str],
+        capacity: usize,
+        max_event_bytes: usize,
+    ) -> Result<BoundedMethodEvents, &'static str> {
+        self.subscribe_bounded_methods_with_budget(
+            methods,
+            capacity,
+            max_event_bytes,
+            capacity
+                .saturating_mul(max_event_bytes)
+                .min(256 * 1024 * 1024),
+        )
+    }
+
+    /// Encoded-byte budget covers queued AND leased in-flight events. Overflow
+    /// is terminal: no consumer may continue after losing a required event.
+    pub fn subscribe_bounded_methods_with_budget(
+        &self,
+        methods: &'static [&'static str],
+        capacity: usize,
+        max_event_bytes: usize,
+        max_in_flight_bytes: usize,
+    ) -> Result<BoundedMethodEvents, &'static str> {
+        if methods.is_empty()
+            || capacity == 0
+            || capacity > 256
+            || max_event_bytes == 0
+            || max_event_bytes > 128 * 1024 * 1024
+            || max_in_flight_bytes < max_event_bytes
+            || max_in_flight_bytes > 256 * 1024 * 1024
+        {
+            return Err("invalid control event bounds");
+        }
+        #[allow(deprecated)] // Keep compatibility with older stable toolchains.
+        let id = self
+            .next_tap_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .map_err(|_| "control subscription ids exhausted")?;
+        let (sender, receiver) = mpsc::channel(capacity);
+        let failed = Arc::new(AtomicBool::new(false));
+        self.bounded_method_taps
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                id,
+                BoundedMethodRoute {
+                    methods,
+                    sender,
+                    failed: failed.clone(),
+                    max_event_bytes,
+                    budget: Arc::new(EventBudget {
+                        used: AtomicUsize::new(0),
+                        maximum: max_in_flight_bytes,
+                    }),
+                },
+            );
+        Ok(BoundedMethodEvents {
+            receiver,
+            failed,
+            routes: self.bounded_method_taps.clone(),
+            id,
+        })
     }
 
     /// Deliver every event carrying `session_id` to the returned receiver
@@ -739,6 +956,147 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn negotiated_receive_limit_closes_oversized_response_without_reuse() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request = ws.next().await.unwrap().unwrap().into_text().unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            ws.send(Message::Text(
+                json!({"id":request["id"],"result":{"data":"x".repeat(4096)}}).to_string(),
+            ))
+            .await
+            .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(2), ws.next()).await;
+        });
+        let client = CdpClient::connect_with_headers_and_limit(&url, None, Some(1024))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.send_command_no_params("Browser.getVersion", None),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert_eq!(client.pending_len().await, 0);
+        assert_eq!(
+            client
+                .send_command_no_params("Browser.getVersion", None)
+                .await
+                .unwrap_err(),
+            CONNECTION_CLOSED_ERROR
+        );
+        client.close().await;
+        server.await.unwrap();
+    }
+
+    fn bounded_fixture(
+        capacity: usize,
+        max_event_bytes: usize,
+    ) -> (BoundedMethodTaps, BoundedMethodEvents) {
+        let routes = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let (sender, receiver) = mpsc::channel(capacity);
+        let failed = Arc::new(AtomicBool::new(false));
+        routes.lock().unwrap().insert(
+            1,
+            BoundedMethodRoute {
+                methods: &["Fetch.requestPaused"],
+                sender,
+                failed: failed.clone(),
+                max_event_bytes,
+                budget: Arc::new(EventBudget {
+                    used: AtomicUsize::new(0),
+                    maximum: capacity * max_event_bytes,
+                }),
+            },
+        );
+        let events = BoundedMethodEvents {
+            receiver,
+            failed,
+            routes: routes.clone(),
+            id: 1,
+        };
+        (routes, events)
+    }
+    fn paused_event() -> CdpEvent {
+        CdpEvent {
+            method: "Fetch.requestPaused".into(),
+            params: json!({"requestId":"synthetic"}),
+            session_id: Some("owned".into()),
+        }
+    }
+    #[tokio::test]
+    async fn bounded_control_overflow_never_delivers_partial_history_as_complete() {
+        let (routes, mut events) = bounded_fixture(1, 100);
+        publish_bounded(&routes, &paused_event(), 50);
+        publish_bounded(&routes, &paused_event(), 50);
+        assert_eq!(events.recv().await.unwrap_err(), "control event overflow");
+        assert!(routes.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn bounded_control_size_limit_and_subscription_drop_are_explicit() {
+        let (routes, mut events) = bounded_fixture(1, 100);
+        publish_bounded(&routes, &paused_event(), 101);
+        assert_eq!(events.recv().await.unwrap_err(), "control event overflow");
+        let (routes, events) = bounded_fixture(1, 100);
+        drop(events);
+        assert!(routes.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn bounded_control_filters_unrelated_events_without_consuming_capacity() {
+        let (routes, mut events) = bounded_fixture(1, 100);
+        let mut unrelated = paused_event();
+        unrelated.method = "Page.frameNavigated".into();
+        publish_bounded(&routes, &unrelated, 1000);
+        publish_bounded(&routes, &paused_event(), 50);
+        assert_eq!(events.recv().await.unwrap().method, "Fetch.requestPaused");
+    }
+
+    #[tokio::test]
+    async fn bounded_event_budget_remains_charged_after_receive_and_lease_clone() {
+        let (routes, mut events) = bounded_fixture(4, 100);
+        let budget = Arc::new(EventBudget {
+            used: AtomicUsize::new(0),
+            maximum: 100,
+        });
+        routes.lock().unwrap().get_mut(&1).unwrap().budget = budget.clone();
+        publish_bounded(&routes, &paused_event(), 60);
+        let event = events.recv().await.unwrap();
+        let lease = event.budget_lease();
+        drop(event);
+        assert_eq!(budget.used.load(Ordering::Acquire), 60);
+        publish_bounded(&routes, &paused_event(), 60);
+        assert_eq!(events.recv().await.unwrap_err(), "control event overflow");
+        drop(lease);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+    #[tokio::test]
+    async fn bounded_event_budget_reclaims_released_events_and_accepts_large_original_body() {
+        let (routes, mut events) = bounded_fixture(4, 2 * 1024 * 1024);
+        let budget = Arc::new(EventBudget {
+            used: AtomicUsize::new(0),
+            maximum: 2 * 1024 * 1024,
+        });
+        routes.lock().unwrap().get_mut(&1).unwrap().budget = budget.clone();
+        let mut original = paused_event();
+        original.params["request"] = json!({"postData":"x".repeat(1536*1024)});
+        for _ in 0..3 {
+            publish_bounded(&routes, &original, 1600 * 1024);
+            let event = events.recv().await.unwrap();
+            assert_eq!(
+                event.params["request"]["postData"].as_str().unwrap().len(),
+                1536 * 1024
+            );
+            assert_eq!(budget.used.load(Ordering::Acquire), 1600 * 1024);
+            drop(event);
+            assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        }
+    }
 
     const TEST_CERT_DER: &str = "MIIBPDCB46ADAgECAgkA9xwXmIhbzQIwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MB4XDTI2MDgzMDA1NTU0NFoXDTM2MDgyNzA1NTU0NFowFDESMBAGA1UEAwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEQdmPO0sXXFRmVn7+8MViXGom2rYy8aV3Oc0pNZhUmFGaPl4MRFzc1G0yaV/WRBPF/BUh2LGsXCvUsn7NqaYkFaMeMBwwGgYDVR0RBBMwEYIJbG9jYWxob3N0hwR/AAABMAoGCCqGSM49BAMCA0gAMEUCIQC32oureGNAupABEmonQPAQBD7OdJjXmUxoVQNr0UB+6AIgb23GMwxTjwHyLG4tZcJST7r3cCW8K/Y+1h618j2f+Uw=";
     const TEST_KEY_DER: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgIVZST8Vhc5f3OW+4kF78f8o1nQCRwjW/Yo8CXQ35Y9uhRANCAARB2Y87SxdcVGZWfv7wxWJcaibatjLxpXc5zSk1mFSYUZo+XgxEXNzUbTJpX9ZEE8X8FSHYsaxcK9Syfs2ppiQV";

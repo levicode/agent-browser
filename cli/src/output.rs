@@ -3145,6 +3145,9 @@ Operations:
   list                 List all active sessions
   connect --json       Persistent protocol; explicit one-use --session <dedicated-name>
 
+Protocol payloads:
+  Body handles require negotiated native support; inline bytes and handles are exclusive.
+
 Environment:
   AGENT_BROWSER_SESSION    Default session name
   AGENT_BROWSER_NAMESPACE  Namespace for daemon sockets and restore state

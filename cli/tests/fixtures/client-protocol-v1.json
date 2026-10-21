@@ -175,6 +175,59 @@
     "stale-reference",
     "policy-denied",
     "not-actionable",
-    "locator-not-found"
+    "locator-not-found",
+    "content-length-mismatch",
+    "redirect-body-unavailable"
+  ],
+  "validDecision": [
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": [],
+      "bodyBase64": ""
+    },
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": [],
+      "bodyHandle": "blob-opaque"
+    },
+    {
+      "kind": "continue",
+      "overrides": {
+        "bodyHandle": "blob-opaque"
+      }
+    },
+    {
+      "kind": "fallback",
+      "overrides": {}
+    }
+  ],
+  "invalidDecision": [
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": []
+    },
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": [],
+      "bodyBase64": "",
+      "bodyHandle": "blob-opaque"
+    },
+    {
+      "kind": "continue",
+      "overrides": {
+        "bodyBase64": "",
+        "bodyHandle": "blob-opaque"
+      }
+    },
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": [],
+      "bodyHandle": ""
+    }
   ]
 }

@@ -9,13 +9,19 @@ pub mod browser;
 #[allow(dead_code)]
 pub mod cdp;
 #[allow(dead_code)]
+pub mod client_blobs;
+#[allow(dead_code)]
 pub mod client_browser;
 #[allow(dead_code)]
 pub mod client_capture;
 #[allow(dead_code)]
+pub mod client_enrollment;
+#[allow(dead_code)]
 pub mod client_network;
 #[allow(dead_code)]
 pub mod client_observation;
+#[allow(dead_code)]
+pub mod client_page;
 #[allow(dead_code)]
 pub mod client_protected_read;
 #[allow(dead_code)]
@@ -25,7 +31,9 @@ pub mod client_session;
 #[allow(dead_code)]
 pub mod client_state;
 #[allow(dead_code)]
+pub mod client_targets;
 pub mod client_transport;
+pub mod client_ui;
 #[allow(dead_code)]
 pub mod cookies;
 #[allow(dead_code)]

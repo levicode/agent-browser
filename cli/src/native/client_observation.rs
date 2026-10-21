@@ -97,9 +97,30 @@ pub struct SemanticNode {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Observation {
     pub identity_scope: String,
+    #[serde(with = "revision_wire")]
     pub revision: u64,
     pub roots: Vec<SemanticNode>,
+    pub viewport_ref: NodeReference,
     pub truncated: bool,
+}
+// Keep native counters numeric, but never expose a u64 as a JavaScript number.
+mod revision_wire {
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(revision: &u64, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&revision.to_string())
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.is_empty()
+            || !text.bytes().all(|byte| byte.is_ascii_digit())
+            || (text.len() > 1 && text.starts_with('0'))
+        {
+            return Err(serde::de::Error::custom(
+                "revision must be a canonical decimal string",
+            ));
+        }
+        text.parse().map_err(serde::de::Error::custom)
+    }
 }
 /// Explicit browser-owned frame input; policy selects frames before this layer.
 #[derive(Clone, Debug)]
@@ -158,12 +179,14 @@ async fn command(
 ) -> Result<Value, ObservationError> {
     check(lease)?;
     let mut cancellation = lease.cancellation.clone();
+    #[cfg(test)]
+    let diagnostic_site = diagnostic_site(&args);
     tokio::select! {
         result = client.send_command(method, Some(args), Some(session)) => {
             check(lease)?;
             #[cfg(test)]
             match &result {
-                Ok(value) => diagnostic_exception(method, value),
+                Ok(value) => diagnostic_exception(method, diagnostic_site, value),
                 Err(_) => eprintln!("native observation protocol failure at {method}; details omitted"),
             }
             result.map_err(|_|ObservationError::BackendFailure)
@@ -173,7 +196,19 @@ async fn command(
     }
 }
 #[cfg(test)]
-fn diagnostic_exception(method: &str, value: &Value) {
+fn diagnostic_site(args: &Value) -> &'static str {
+    match args["functionDeclaration"].as_str() {
+        Some(value) if value.starts_with("function(testId,secureSelector,...nodes)") => {
+            "metadata-batch"
+        }
+        Some(value) if value == METADATA => "metadata-single",
+        Some(value) if value.starts_with("function(selector,...roots)") => "security-inventory",
+        Some(value) if value == MATCH_QUERY => "query-match",
+        _ => "other-native-command",
+    }
+}
+#[cfg(test)]
+fn diagnostic_exception(method: &str, site: &str, value: &Value) {
     let Some(details) = value.get("exceptionDetails") else {
         return;
     };
@@ -186,7 +221,15 @@ fn diagnostic_exception(method: &str, value: &Value) {
             )
         })
         .unwrap_or("unclassified");
-    eprintln!("native observation renderer failure at {method}: class={class}, line={:?}, column={:?}; details omitted",details["lineNumber"].as_u64(),details["columnNumber"].as_u64());
+    let category = if details["exception"]["description"]
+        .as_str()
+        .is_some_and(|v| v.starts_with("TypeError: Illegal invocation"))
+    {
+        "illegal-invocation"
+    } else {
+        "unclassified"
+    };
+    eprintln!("native observation renderer failure at {method}/{site}: class={class}, category={category}, line={:?}, column={:?}; details omitted",details["lineNumber"].as_u64(),details["columnNumber"].as_u64());
 }
 
 async fn validate_frame(
@@ -342,7 +385,9 @@ fn project_node(
     });
     let mut binding = frame.binding.clone();
     binding.actionable = !matches!(role.as_deref(), Some("document" | "text" | "InlineTextBox"));
-    let id = refs.bind_exact(backend, role.as_deref().unwrap_or(""), "", binding);
+    let id = refs
+        .try_bind_exact(backend, role.as_deref().unwrap_or(""), "", binding)
+        .map_err(|_| ObservationError::BackendFailure)?;
     let mut node = SemanticNode {
         reference: NodeReference {
             id: format!("@{id}"),
@@ -394,6 +439,12 @@ fn project_node(
         node.attributes.remove("value");
     }
     if bounded {
+        node.attributes.retain(|name, _| {
+            matches!(
+                name.as_str(),
+                "type" | "autocomplete" | "href" | "role" | "placeholder"
+            ) || name.starts_with("aria-")
+        });
         if let Some(href) = node.attributes.get_mut("href") {
             *href = href.split(['?', '#']).next().unwrap_or("").to_string();
         }
@@ -527,12 +578,22 @@ pub async fn observe(
     for root in &mut roots {
         scrub_sensitive_ancestors(root);
     }
+    let viewport_ref = NodeReference {
+        id: format!(
+            "@{}",
+            staged
+                .try_viewport_ref()
+                .map_err(|_| ObservationError::BackendFailure)?
+        ),
+        revision: revision.to_string(),
+    };
     check(lease)?;
     *refs = staged;
     Ok(Observation {
         identity_scope: identity_scope.into(),
         revision,
         roots,
+        viewport_ref,
         truncated,
     })
 }
@@ -628,6 +689,7 @@ pub struct QueryOptions {
 #[serde(rename_all = "camelCase")]
 pub struct QueryResult {
     pub identity_scope: String,
+    #[serde(with = "revision_wire")]
     pub revision: u64,
     pub nodes: Vec<SemanticNode>,
 }
@@ -669,6 +731,9 @@ pub async fn read(
     options: &ReadOptions,
     lease: &OperationLease,
 ) -> Result<Value, ObservationError> {
+    if refs.is_viewport_ref(&options.reference) {
+        return Err(ObservationError::InvalidArguments);
+    }
     let id =
         super::element::parse_ref(&options.reference).ok_or(ObservationError::InvalidArguments)?;
     let entry = refs
@@ -726,12 +791,28 @@ pub async fn read(
     .await?;
     validate_frame(client, frame, lease).await?;
     check(lease)?;
+    let result = project_read_fields(node, options.fields.as_deref())?;
+    *refs = staged;
+    Ok(result)
+}
+
+fn project_read_fields(
+    mut node: SemanticNode,
+    fields: Option<&[ReadField]>,
+) -> Result<Value, ObservationError> {
+    let secure = node.states.get("secure") == Some(&true);
+    if secure {
+        node.value = None;
+        node.text = None;
+        node.selection = None;
+        node.attributes.remove("value");
+    }
     let mut result = serde_json::to_value(node).map_err(|_| ObservationError::BackendFailure)?;
-    if let Some(fields) = &options.fields {
+    if let Some(fields) = fields {
         let names: Vec<String> = fields
             .iter()
-            .map(|f| {
-                serde_json::to_value(f)
+            .map(|field| {
+                serde_json::to_value(field)
                     .unwrap()
                     .as_str()
                     .unwrap()
@@ -741,9 +822,13 @@ pub async fn read(
         result
             .as_object_mut()
             .unwrap()
-            .retain(|k, _| k == "ref" || names.contains(k));
+            .retain(|key, _| key == "ref" || names.contains(key) || (secure && key == "states"));
+        // Mandatory policy metadata survives even a value-only projection. The
+        // fixture guard must deny a secure read, not mistake omission for empty.
+        if secure && !names.iter().any(|name| name == "states") {
+            result["states"] = json!({"secure":true});
+        }
     }
-    *refs = staged;
     Ok(result)
 }
 
@@ -843,26 +928,7 @@ pub async fn query(
     // DOM.getDocument includes shadow roots. Query candidates are real elements,
     // including those omitted from the AX tree; semantic role comes from AX.
     let dom = frame_dom(client, frame, lease).await?;
-    fn collect(node: &Value, ids: &mut Vec<i64>) {
-        if node["nodeType"] == 1 {
-            if let Some(id) = node["backendNodeId"].as_i64() {
-                ids.push(id);
-            }
-        }
-        for key in ["children", "shadowRoots"] {
-            if let Some(children) = node[key].as_array() {
-                for child in children {
-                    collect(child, ids);
-                }
-            }
-        }
-        // contentDocument is deliberately not crossed: frame scoping is explicit.
-    }
-    let mut ids = Vec::new();
-    collect(&dom["root"], &mut ids);
-    if ids.len() > 100000 {
-        return Err("Query candidate limit exceeded".into());
-    }
+    let ids = bounded_dom_ids(&dom["root"], &[1], 100_000)?;
     let mut staged = refs.clone();
     let mut nodes = Vec::new();
     let metadata_options = ObservationOptions {
@@ -944,6 +1010,8 @@ async fn read_batch(
             let group=&group;
             async move {
                 let value=command(client,session,"DOM.resolveNode",json!({"backendNodeId":ax.backend_d_o_m_node_id,"executionContextId":context,"objectGroup":group}),lease).await?;
+                #[cfg(test)]
+                if value["object"]["subtype"] != "node" { eprintln!("native observation resolved metadata receiver has non-node subtype; details omitted"); }
                 value["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference)
             }
         })).buffered(16).try_collect().await?;
@@ -951,7 +1019,11 @@ async fn read_batch(
         arguments.extend(objects.iter().map(|o|json!({"objectId":o})));
         let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; return nodes.map(node=>read.call(node,testId,secureSelector)); }}");
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true}),lease).await?;
-        if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
+        if result.get("exceptionDetails").is_some(){
+            #[cfg(test)]
+            diagnostic_receivers(client,session,&objects,lease).await;
+            return Err(ObservationError::BackendFailure);
+        }
         let values=result["result"]["value"].as_array().ok_or("Missing metadata batch")?;
         if values.len()!=nodes.len(){return Err("Incomplete metadata batch".into());}
         nodes.iter().zip(values).map(|(ax,data)|project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,data,bounded)).collect()
@@ -966,6 +1038,36 @@ async fn read_batch(
     )
     .await;
     result
+}
+
+/// Failure-only test diagnostics. Only fixed booleans and bounded ordinals leave
+/// the renderer; never print remote values, descriptions, identities, or text.
+#[cfg(test)]
+async fn diagnostic_receivers(
+    client: &CdpClient,
+    session: &str,
+    objects: &[String],
+    lease: &OperationLease,
+) {
+    let Some(first) = objects.first() else {
+        return;
+    };
+    let result=command(client,session,"Runtime.callFunctionOn",json!({
+        "objectId":first,"arguments":objects.iter().map(|id|json!({"objectId":id})).collect::<Vec<_>>(),"returnByValue":true,
+        "functionDeclaration":r#"function(...nodes){return nodes.map(node=>{
+          const descriptor=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected');
+          let getterOk=false,connected=false;
+          try{connected=descriptor.get.call(node);getterOk=true;}catch{}
+          return {isNode:node instanceof Node,isDocument:node===document,isGlobal:node===globalThis,isObject:typeof node==='object',hasGetter:typeof descriptor?.get==='function',getterOk,connected:connected===true};
+        });}"#
+    }),lease).await;
+    if let Ok(value) = result {
+        if let Some(rows) = value["result"]["value"].as_array() {
+            for (index, row) in rows.iter().take(64).enumerate() {
+                eprintln!("native metadata receiver index={index}: isNode={:?}, isDocument={:?}, isGlobal={:?}, isObject={:?}, hasGetter={:?}, getterOk={:?}, connected={:?}",row["isNode"].as_bool(),row["isDocument"].as_bool(),row["isGlobal"].as_bool(),row["isObject"].as_bool(),row["hasGetter"].as_bool(),row["getterOk"].as_bool(),row["connected"].as_bool());
+            }
+        }
+    }
 }
 
 async fn frame_dom(
@@ -1434,9 +1536,58 @@ fn apply_security(node: &mut SemanticNode, backend: i64, security: &SecurityInve
         ids.split_whitespace()
             .any(|id| security.label_ids.contains(id))
     });
-    if security.ancestors.contains(&backend) || labelled {
+    // Secure nodes already have their content projected safely. Retain their
+    // public labels so a password control remains discoverable by label.
+    let sensitive_ancestor =
+        security.ancestors.contains(&backend) && node.states.get("secure") != Some(&true);
+    if sensitive_ancestor || labelled {
         scrub_content(node);
     }
+}
+/// Bounded, iterative traversal avoids native stack exhaustion on hostile DOMs.
+fn security_root_ids(root: &Value) -> Result<Vec<i64>, ObservationError> {
+    let ids = bounded_dom_ids(root, &[9, 11], 10_000)?;
+    if ids.is_empty() {
+        return Err(ObservationError::BackendFailure);
+    }
+    Ok(ids)
+}
+fn bounded_dom_ids(
+    root: &Value,
+    node_types: &[i64],
+    limit: usize,
+) -> Result<Vec<i64>, ObservationError> {
+    let mut pending = vec![(root, 0usize)];
+    let mut roots = Vec::new();
+    let mut visited = 0usize;
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if depth > 256 || visited > 100_000 {
+            return Err(ObservationError::BackendFailure);
+        }
+        if node["nodeType"]
+            .as_i64()
+            .is_some_and(|kind| node_types.contains(&kind))
+        {
+            roots.push(
+                node["backendNodeId"]
+                    .as_i64()
+                    .ok_or(ObservationError::BackendFailure)?,
+            );
+            if roots.len() > limit {
+                return Err(ObservationError::BackendFailure);
+            }
+        }
+        for key in ["children", "shadowRoots"] {
+            if let Some(children) = node[key].as_array() {
+                if pending.len().saturating_add(children.len()) > 100_000 {
+                    return Err(ObservationError::BackendFailure);
+                }
+                pending.extend(children.iter().rev().map(|child| (child, depth + 1)));
+            }
+        }
+    }
+    Ok(roots)
 }
 /// Enumerate native shadow-root handles, not every element. CSS matching stays
 /// in Chromium, including closed roots supplied by DOM.getDocument(pierce).
@@ -1449,25 +1600,7 @@ async fn security_inventory(
 ) -> Result<SecurityInventory, ObservationError> {
     use futures_util::{stream, StreamExt, TryStreamExt};
     let dom = frame_dom(client, frame, lease).await?;
-    fn roots(node: &Value, out: &mut Vec<i64>) {
-        if matches!(node["nodeType"].as_i64(), Some(9 | 11)) {
-            if let Some(id) = node["backendNodeId"].as_i64() {
-                out.push(id);
-            }
-        }
-        for key in ["children", "shadowRoots"] {
-            if let Some(children) = node[key].as_array() {
-                for child in children {
-                    roots(child, out);
-                }
-            }
-        }
-    }
-    let mut ids = Vec::new();
-    roots(&dom["root"], &mut ids);
-    if ids.is_empty() || ids.len() > 10000 {
-        return Err(ObservationError::BackendFailure);
-    }
+    let ids = security_root_ids(&dom["root"])?;
     let session = &frame.binding.session;
     let group = format!("native-security-{}", lease.sequence);
     let result=async{
@@ -1481,7 +1614,7 @@ async fn security_inventory(
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"arguments":args,"objectGroup":group,"functionDeclaration":r#"function(selector,...roots){
             const result=new Set();const all='input[type="password" i],'+selector;
             for(const root of roots){if(root!==document&&root.ownerDocument!==document)throw new Error('stale root');
-                for(const secure of root.querySelectorAll(all)){const seen=new Set();for(let p=secure.parentElement||(secure.getRootNode&&secure.getRootNode().host);p&&!seen.has(p);p=p.parentElement||(p.getRootNode&&p.getRootNode().host)){seen.add(p);result.add(p);}}
+                for(const secure of root.querySelectorAll(all)){const seen=new Set();for(let p=secure;p&&!seen.has(p);p=p.parentElement||(p.getRootNode&&p.getRootNode().host)){seen.add(p);result.add(p);}}
             }return Array.from(result);
         }"#,"returnByValue":false}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
@@ -1719,10 +1852,10 @@ mod tests {
             let adopted=result.nodes[0].reference.id.clone();
             mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelector('iframe').contentDocument.body.appendChild(document.querySelector('li button')); true","returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_4".to_string())?;
             if super::super::element::resolve_element_object_id(&mgr.client,session,&refs,&adopted,&HashMap::new()).await.is_ok(){return Err("Cross-document adopted node retained old exact authority".into());}
-            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"for(const mode of ['open','closed']){const h=document.createElement('div');h.id=mode+'-secure-host';h.className='secure';document.body.appendChild(h);h.attachShadow({mode}).innerHTML='<span>synthetic-shadow-secret</span><input value="synthetic-shadow-secret">';}const h=document.createElement('div');h.id='unmarked-host';document.body.appendChild(h);h.attachShadow({mode:'closed'}).innerHTML='<span class="secure">synthetic-closed-child</span>';const b=document.createElement('button');b.setAttribute('aria-labelledby','unmarked-host');document.body.appendChild(b);true"#,"returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_5".to_string())?;
+            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"for(const mode of ['open','closed']){const h=document.createElement('div');h.id=mode+'-secure-host';h.className='secure';document.body.appendChild(h);h.attachShadow({mode}).innerHTML='<span>synthetic-shadow-secret</span><input value="synthetic-shadow-secret">';}const h=document.createElement('div');h.id='unmarked-host';document.body.appendChild(h);h.attachShadow({mode:'closed'}).innerHTML='<span class="secure">synthetic-closed-child</span><span class="secure" id="root-local-secret">synthetic-root-local-secret</span><button aria-labelledby="root-local-secret">Public</button>';const b=document.createElement('button');b.setAttribute('aria-labelledby','unmarked-host');document.body.appendChild(b);true"#,"returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_5".to_string())?;
             let policy=ObservationOptions{secure_field_selector:".secure".into(),..Default::default()};
             let secret_tree=observe(&mgr.client,&frames,&mut refs,"fixture",3,&policy,&lease).await.map_err(|_| "native observation stage: observe_3".to_string())?;
-            let serialized=serde_json::to_string(&secret_tree).unwrap();if serialized.contains("synthetic-shadow-secret")||serialized.contains("synthetic-closed-child"){return Err("Shadow secure subtree leaked in observation".into());}
+            let serialized=serde_json::to_string(&secret_tree).unwrap();if serialized.contains("synthetic-shadow-secret")||serialized.contains("synthetic-closed-child")||serialized.contains("synthetic-root-local-secret"){return Err("Shadow secure subtree leaked in observation".into());}
             let unmarked:QueryOptions=serde_json::from_value(json!({"secureFieldSelector":".secure","expression":{"kind":"selector","selector":"#unmarked-host"}})).unwrap();
             let found=query(&mgr.client,&frames,&mut refs,"fixture",3,&unmarked,&lease).await.map_err(|_| "native observation stage: query_7".to_string())?;
             let read_options:ReadOptions=serde_json::from_value(json!({"ref":found.nodes[0].reference.id,"secureFieldSelector":".secure"})).unwrap();
@@ -1736,6 +1869,56 @@ mod tests {
         .await;
         assert_eq!(close["success"], true, "{close}");
         run.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires real Chromium; coordinate convention probe, not full geometry acceptance"]
+    async fn chromium_native_same_process_frame_coordinate_convention() {
+        use super::super::actions::{execute_command, DaemonState};
+        let mut state = DaemonState::new();
+        let launch = execute_command(
+            &json!({"id":"geometry-launch","action":"launch","headless":true}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(launch["success"], true, "{launch}");
+        let result = async {
+            let mgr = state.browser.as_ref().ok_or("Missing browser")?;
+            let session = mgr.active_session_id()?;
+            let setup = mgr.client.send_command("Runtime.evaluate", Some(json!({
+                "expression": r#"new Promise(resolve=>{document.body.style.cssText='margin:0;height:3000px';const f=document.createElement('iframe');f.id='geometry-frame';f.style.cssText='position:absolute;left:100px;top:150px;width:200px;height:150px;border:10px solid black;transform:scale(2);transform-origin:0 0';f.onload=()=>resolve(true);f.srcdoc='<body style="margin:0;height:2000px"><button id="target" style="position:absolute;left:20px;top:30px;width:40px;height:25px;border:0;padding:0">Probe</button>';document.body.appendChild(f);})"#,
+                "awaitPromise":true,"returnByValue":true
+            })), Some(session)).await?;
+            if setup.get("exceptionDetails").is_some() { return Err("Coordinate fixture failed".to_string()); }
+            let resolved = mgr.client.send_command("Runtime.evaluate", Some(json!({
+                "expression":"document.querySelector('#geometry-frame').contentDocument.querySelector('#target')",
+                "returnByValue":false,"objectGroup":"native-coordinate-probe"
+            })), Some(session)).await?;
+            let object = resolved["result"]["objectId"].as_str().ok_or("No fixture node")?;
+            for (scrolled, expected_y) in [(false,230.0),(true,130.0)] {
+                if scrolled {
+                    let scroll = mgr.client.send_command("Runtime.evaluate", Some(json!({
+                        "expression":"window.scrollTo(0,80);document.querySelector('#geometry-frame').contentWindow.scrollTo(0,10);[scrollY,document.querySelector('#geometry-frame').contentWindow.scrollY]",
+                        "returnByValue":true
+                    })),Some(session)).await?;
+                    if scroll["result"]["value"] != json!([80,10]) { return Err("Synthetic scroll did not settle".into()); }
+                }
+                let box_model=mgr.client.send_command("DOM.getBoxModel",Some(json!({"objectId":object})),Some(session)).await?;
+                let quads=mgr.client.send_command("DOM.getContentQuads",Some(json!({"objectId":object})),Some(session)).await?;
+                let expected=[160.0,expected_y,240.0,expected_y,240.0,expected_y+50.0,160.0,expected_y+50.0];
+                for quad in [&box_model["model"]["border"],&quads["quads"][0]] {
+                    let points=quad.as_array().ok_or("Native quad unavailable")?;
+                    if points.len()!=8 || points.iter().zip(expected).any(|(actual,want)|actual.as_f64().is_none_or(|value|(value-want).abs()>0.5)) {
+                        return Err(format!("Native quad convention differs: {quad}; expected {expected:?}"));
+                    }
+                }
+            }
+            mgr.client.send_command("Runtime.releaseObjectGroup",Some(json!({"objectGroup":"native-coordinate-probe"})),Some(session)).await?;
+            Ok::<(),String>(())
+        }.await;
+        let close =
+            execute_command(&json!({"id":"geometry-close","action":"close"}), &mut state).await;
+        assert_eq!(close["success"], true, "{close}");
+        result.unwrap();
     }
     #[test]
     fn sibling_order_follows_child_ids_not_ax_array_order() {
@@ -1774,6 +1957,96 @@ mod tests {
         let bad:LocatorExpression=serde_json::from_value(json!({"kind":"query","query":{"kind":"role","value":{"kind":"regexp","source":".*","flags":""}}})).unwrap();
         assert!(validate_expression(&bad, 0).is_err());
         assert!(serde_json::from_value::<QueryOptions>(json!({"expression":{"kind":"query","query":{"kind":"role","states":{"script":true},"value":{"kind":"string","value":"button","exact":true}}}})).is_err());
+    }
+    #[test]
+    fn diagnostic_labels_never_echo_renderer_source() {
+        assert_eq!(
+            diagnostic_site(&json!({"functionDeclaration": METADATA})),
+            "metadata-single"
+        );
+        assert_eq!(
+            diagnostic_site(
+                &json!({"functionDeclaration": format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; return nodes.map(node=>read.call(node,testId,secureSelector)); }}")})
+            ),
+            "metadata-batch"
+        );
+        assert_eq!(
+            diagnostic_site(
+                &json!({"functionDeclaration":"function(selector,...roots){ synthetic-private-data }"})
+            ),
+            "security-inventory"
+        );
+        assert_eq!(
+            diagnostic_site(&json!({"functionDeclaration":"synthetic-private-data"})),
+            "other-native-command"
+        );
+    }
+    #[tokio::test]
+    async fn metadata_batch_keeps_remote_arguments_in_native_candidate_order() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.createIsolatedWorld" => json!({"executionContextId":17}),
+                    "DOM.resolveNode" => {
+                        assert_eq!(request["params"]["executionContextId"], 17);
+                        let backend = request["params"]["backendNodeId"].as_i64().unwrap();
+                        json!({"object":{"type":"object","subtype":"node","objectId":format!("native-{backend}")}})
+                    }
+                    "Runtime.callFunctionOn" => {
+                        assert_eq!(request["params"]["objectId"], "native-42");
+                        assert_eq!(
+                            request["params"]["arguments"],
+                            json!([
+                                {"value":"data-testid"},{"value":"input[type=\"password\" i]"},
+                                {"objectId":"native-42"},{"objectId":"native-43"}
+                            ])
+                        );
+                        assert_eq!(diagnostic_site(&request["params"]), "metadata-batch");
+                        json!({"result":{"type":"object","value":[metadata(),metadata()]}})
+                    }
+                    "Runtime.releaseObjectGroup" => json!({}),
+                    _ => panic!("unexpected metadata command"),
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if request["method"] == "Runtime.releaseObjectGroup" {
+                    break;
+                }
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let (lease, _sender) = lease();
+        let mut refs = RefMap::new();
+        let one = ax("first", 42, &[]);
+        let two = ax("second", 43, &[]);
+        let nodes = read_batch(
+            &client,
+            &frame(),
+            &[&one, &two],
+            &mut refs,
+            1,
+            &ObservationOptions::default(),
+            &lease,
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_ne!(nodes[0].reference.id, nodes[1].reference.id);
+        server.await.unwrap();
     }
     #[test]
     fn observation_href_omits_tokens_but_full_read_preserves_requested_attribute() {
@@ -1818,6 +2091,138 @@ mod tests {
         };
         apply_security(&mut labelled, 9, &security);
         assert!(labelled.name.is_none());
+    }
+    #[test]
+    fn security_inventory_bounds_dom_depth_and_root_count() {
+        let mut deep = json!({"nodeType":1,"backendNodeId":9});
+        for _ in 0..257 {
+            deep = json!({"nodeType":1,"children":[deep]});
+        }
+        let deep = json!({"nodeType":9,"backendNodeId":1,"children":[deep]});
+        assert!(security_root_ids(&deep).is_err());
+        assert!(bounded_dom_ids(&deep, &[1], 100_000).is_err());
+        let wide = json!({"nodeType":9,"backendNodeId":1,"shadowRoots":
+            (0..10_000).map(|i|json!({"nodeType":11,"backendNodeId":i+2})).collect::<Vec<_>>()});
+        assert!(security_root_ids(&wide).is_err());
+        let valid = json!({"nodeType":9,"backendNodeId":1,"children":[
+            {"nodeType":1,"shadowRoots":[{"nodeType":11,"backendNodeId":2}]}]});
+        assert_eq!(security_root_ids(&valid).unwrap(), vec![1, 2]);
+    }
+    #[test]
+    fn secure_inventory_keeps_public_password_labels_without_value() {
+        let mut data = metadata();
+        data["states"]["secure"] = json!(true);
+        data["labels"] = json!(["Password"]);
+        data["value"] = json!("synthetic-secret");
+        let mut refs = RefMap::new();
+        let mut node = project_node(
+            &frame(),
+            2,
+            &ax("password", 2, &[]),
+            &mut refs,
+            1,
+            &data,
+            false,
+        )
+        .unwrap();
+        apply_security(
+            &mut node,
+            2,
+            &SecurityInventory {
+                ancestors: std::collections::HashSet::from([2]),
+                label_ids: Default::default(),
+            },
+        );
+        assert_eq!(node.labels, vec!["Password"]);
+        assert!(node.value.is_none());
+    }
+    #[test]
+    fn observation_attributes_are_bounded_but_explicit_read_preserves_them() {
+        let mut data = metadata();
+        data["attributes"] =
+            json!({"data-private":"synthetic-secret","aria-label":"Public","placeholder":"Public"});
+        let mut refs = RefMap::new();
+        let observed =
+            project_node(&frame(), 2, &ax("a", 2, &[]), &mut refs, 1, &data, true).unwrap();
+        assert!(!observed.attributes.contains_key("data-private"));
+        assert_eq!(observed.attributes["aria-label"], "Public");
+        let read = project_node(&frame(), 2, &ax("a", 2, &[]), &mut refs, 1, &data, false).unwrap();
+        assert_eq!(read.attributes["data-private"], "synthetic-secret");
+    }
+    #[test]
+    fn exact_reference_exhaustion_returns_error_without_publishing() {
+        let mut refs = RefMap::new();
+        refs.set_next_ref_num(usize::MAX);
+        assert!(project_node(
+            &frame(),
+            2,
+            &ax("a", 2, &[]),
+            &mut refs,
+            1,
+            &metadata(),
+            true
+        )
+        .is_err());
+        assert_eq!(refs.next_ref_num(), usize::MAX);
+        assert!(refs
+            .durable_ref(
+                &frame().binding.page_session,
+                Some(&frame().binding.frame),
+                2
+            )
+            .is_none());
+    }
+    #[test]
+    fn revision_wire_preserves_full_native_integer_precision() {
+        let observation = Observation {
+            identity_scope: "scope".into(),
+            revision: u64::MAX,
+            roots: vec![],
+            viewport_ref: NodeReference {
+                id: "@e1".into(),
+                revision: u64::MAX.to_string(),
+            },
+            truncated: false,
+        };
+        let encoded = serde_json::to_value(&observation).unwrap();
+        assert_eq!(encoded["revision"], u64::MAX.to_string());
+        assert_eq!(
+            serde_json::from_value::<Observation>(encoded.clone())
+                .unwrap()
+                .revision,
+            u64::MAX
+        );
+        let mut numeric = encoded.clone();
+        numeric["revision"] = json!(42);
+        assert!(serde_json::from_value::<Observation>(numeric).is_err());
+        let mut noncanonical = encoded;
+        noncanonical["revision"] = json!("042");
+        assert!(serde_json::from_value::<Observation>(noncanonical).is_err());
+        let query = QueryResult {
+            identity_scope: "scope".into(),
+            revision: u64::MAX,
+            nodes: vec![],
+        };
+        assert_eq!(
+            serde_json::to_value(query).unwrap()["revision"],
+            u64::MAX.to_string()
+        );
+    }
+    #[test]
+    fn selected_secure_read_retains_policy_metadata_not_an_empty_value() {
+        let node = SemanticNode {
+            reference: NodeReference {
+                id: "@e1".into(),
+                revision: "1".into(),
+            },
+            value: Some("synthetic-secret".into()),
+            states: BTreeMap::from([("secure".into(), true), ("focused".into(), true)]),
+            ..Default::default()
+        };
+        let value = project_read_fields(node, Some(&[ReadField::Value])).unwrap();
+        assert_eq!(value["states"], json!({"secure":true}));
+        assert!(value.get("value").is_none());
+        assert!(value.get("ref").is_some());
     }
     #[test]
     fn schema_rejects_unknown_nested_query_fields() {

@@ -1,8 +1,8 @@
 //! Native-only protected pixel transaction. Raw pixels stay inside this module;
 //! cleanup integrity is part of the outcome, even for optional screenshots.
-use super::cdp::client::CdpClient;
 use super::client_browser::BrowserExecutionLease;
 use super::client_observation::ObservationFrame;
+use super::client_protected_read::{ProtectedReadJournal, ProtectedReadReason};
 use super::client_session::{CancelSignal, OperationLease};
 use base64::Engine;
 use futures_util::{StreamExt, TryStreamExt};
@@ -106,16 +106,6 @@ async fn command(
         _ = tokio::time::sleep_until(operation.deadline.into()) => Err(CaptureReason::Deadline),
     }
 }
-async fn cleanup_command(client: &CdpClient, session: &str, method: &str, args: Value) -> bool {
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            client.send_command(method, Some(args), Some(session))
-        )
-        .await,
-        Ok(Ok(_))
-    )
-}
 /// Spawn supervision before the first page mutation. Dropping the RPC receiver
 /// does not drop this task; the owner joins it before releasing its scope.
 pub fn start_capture(
@@ -131,22 +121,20 @@ async fn capture_transaction(
     request: CaptureRequest,
     operation: OperationLease,
 ) -> Result<MaskedCapture, CaptureFailure> {
-    let mut touched = Vec::<(String, f64)>::new();
+    let mut journal =
+        ProtectedReadJournal::begin(&context.page, &operation, context.lifecycle_known_active)
+            .map_err(|failure| CaptureFailure {
+                reason: protected_reason(failure.reason),
+                identity_scope: failure.identity_scope,
+                cleanup_integrity_lost: failure.cleanup_integrity_lost,
+            })?;
     let result = async {
         if !context.inventory_complete || !context.lifecycle_known_active || context.frames.is_empty() { return Err(CaptureReason::IncompleteFrames); }
         if request.secure_field_selector.is_empty() || request.secure_field_selector.len() > 8192 { return Err(CaptureReason::MaskingUnproven); }
-        let mut sessions = HashSet::new();
         for frame in &context.frames {
-            if frame.binding.page_session != context.page.page_session_id { return Err(CaptureReason::IncompleteFrames); }
-            if !sessions.insert(frame.binding.session.clone()) { continue; }
-            command(&context, &operation, &frame.binding.session, "Animation.enable", json!({})).await?;
-            let rate = command(&context, &operation, &frame.binding.session, "Animation.getPlaybackRate", json!({})).await?["playbackRate"].as_f64().ok_or(CaptureReason::MaskingUnproven)?;
-            if !rate.is_finite() { return Err(CaptureReason::MaskingUnproven); }
-            // Journal BEFORE delivery: a timeout may still have changed state.
-            touched.push((frame.binding.session.clone(), rate));
-            command(&context, &operation, &frame.binding.session, "Animation.setPlaybackRate", json!({"playbackRate":0})).await?;
-            command(&context, &operation, &frame.binding.session, "Page.setWebLifecycleState", json!({"state":"frozen"})).await?;
+            if frame.binding.page_session != context.page.page_session_id || !journal.contains_session(&frame.binding.session) {return Err(CaptureReason::IncompleteFrames);}
         }
+        journal.freeze().await.map_err(protected_reason)?;
         validate_frames(&context, &operation).await?;
         let viewport_size = viewport(&context, &operation).await?;
         let before = masks(&context, &request, &operation).await?;
@@ -168,41 +156,37 @@ async fn capture_transaction(
         check(&context, &operation)?;
         raster_mask(&bytes, viewport_size, &before, &context.page.identity_scope)
     }.await;
-    let mut cleanup_ok = true;
-    for (session, rate) in touched.iter().rev() {
-        // Both restores are attempted even if the first fails. These handles
-        // belong to this captured scope, never a new attempt's current page.
-        let active = cleanup_command(
-            &context.page.client,
-            session,
-            "Page.setWebLifecycleState",
-            json!({"state":"active"}),
-        )
-        .await;
-        let animation = cleanup_command(
-            &context.page.client,
-            session,
-            "Animation.setPlaybackRate",
-            json!({"playbackRate":rate}),
-        )
-        .await;
-        cleanup_ok &= active && animation;
-    }
-    if !cleanup_ok {
+    let integrity = journal.check().map_err(protected_reason);
+    if let Err(failure) = journal.restore().await {
         return Err(CaptureFailure {
-            reason: result.err().unwrap_or(CaptureReason::BrowserFailure),
-            identity_scope: context.page.identity_scope,
-            cleanup_integrity_lost: true,
+            reason: result
+                .as_ref()
+                .err()
+                .copied()
+                .unwrap_or_else(|| protected_reason(failure.reason)),
+            identity_scope: failure.identity_scope,
+            cleanup_integrity_lost: failure.cleanup_integrity_lost,
         });
     }
-    check(&context, &operation)
+    integrity
+        .and_then(|_| journal.check().map_err(protected_reason))
         .and(result)
         .map_err(|reason| CaptureFailure {
             reason,
-            identity_scope: context.page.identity_scope,
+            identity_scope: context.page.identity_scope.clone(),
             cleanup_integrity_lost: false,
         })
 }
+fn protected_reason(reason: ProtectedReadReason) -> CaptureReason {
+    match reason {
+        ProtectedReadReason::Cancelled => CaptureReason::Cancelled,
+        ProtectedReadReason::Deadline => CaptureReason::Deadline,
+        ProtectedReadReason::StaleScope => CaptureReason::StaleScope,
+        ProtectedReadReason::IncompleteInventory => CaptureReason::IncompleteFrames,
+        ProtectedReadReason::BrowserFailure => CaptureReason::BrowserFailure,
+    }
+}
+
 async fn viewport(
     context: &CaptureContext,
     operation: &OperationLease,
@@ -361,19 +345,23 @@ async fn masks(
                     if result.unsafe_geometry { return Err(CaptureReason::UnsafeGeometry); }
                     proof.count += result.count;
                     if owned.parent_frame_id.is_some() && !result.masks.is_empty() {
-                        let (width,height)=viewport(context,operation).await?;
-                        proof.masks.push(MaskRect{x:0.0,y:0.0,width,height});
-                    } else { proof.masks.extend(result.masks); }
+                        // No all-black success: renderer/frame projection needs
+                        // its own verified geometry before pixels are usable.
+                        return Err(CaptureReason::UnsafeGeometry);
+                    }
+                    proof.masks.extend(result.masks);
                 }
                 Ok(())
             }.await;
             // Object handles are private and best-effort released; cancelled
             // remote resolution can finish late, so scope disposal is final GC.
-            let _ = cleanup_command(
-                &context.page.client,
-                &owned.binding.session,
-                "Runtime.releaseObjectGroup",
-                json!({"objectGroup":group}),
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                context.page.client.send_command(
+                    "Runtime.releaseObjectGroup",
+                    Some(json!({"objectGroup":group})),
+                    Some(&owned.binding.session),
+                ),
             )
             .await;
             gathered?;
@@ -396,13 +384,15 @@ const MASK_READER: &str = r#"function(selector,...nodes){
   let secure=false;for(let p=node;p;){if(p.matches('input[type="password" i]')||p.matches(selector)){secure=true;break;}p=p.parentElement||(p.getRootNode().host||null);}
   if(!secure)continue;
   count++;
-  if(!visible){if(style.display==='contents')masks.push({x:0,y:0,width:innerWidth,height:innerHeight});continue;}
+  if(!visible){if(style.display==='contents')unsafeGeometry=true;continue;}
   if(![rect.x,rect.y,rect.width,rect.height].every(Number.isFinite))throw Error('geometry');
-  // Filters and shadows can carry text pixels outside the border box. Cover
-  // the viewport rather than returning an unproven narrow mask.
-  let bleed=!(node.localName==='input'||node.localName==='textarea');
-  for(let p=node;p;){const s=getComputedStyle(p);if(s.filter!=='none'||s.textShadow!=='none'||s.boxShadow!=='none')bleed=true;p=p.parentElement||(p.getRootNode().host||null);}
-  masks.push(bleed?{x:0,y:0,width:innerWidth,height:innerHeight}:{x:rect.x,y:rect.y,width:rect.width,height:rect.height});
+  // A clean refusal is not an all-black success. Required password-input
+  // geometry is distinct from optional arbitrary secure-container policies.
+  // Decorative box shadows do not carry the input's protected glyph pixels.
+  let bleed=!(node.localName==='input'||node.localName==='textarea')||style.textShadow!=='none';
+  for(let p=node;p;){const s=getComputedStyle(p);if(s.filter!=='none')bleed=true;p=p.parentElement||(p.getRootNode().host||null);}
+  if(bleed){unsafeGeometry=true;continue;}
+  masks.push({x:rect.x,y:rect.y,width:rect.width,height:rect.height});
  }
  return {count,masks,opaque,unsafeGeometry};
 }"#;
@@ -523,5 +513,70 @@ mod tests {
             "old"
         )
         .is_err());
+    }
+    /// Static one-page masking and cleanup proof only. This does not establish
+    /// recursive target enrollment, OOPIF projection, or dynamic paint fidelity.
+    #[tokio::test]
+    #[ignore = "requires real Chromium; required static masked-pixel fidelity gate"]
+    async fn chromium_static_mask_preserves_public_pixels_and_restores_state() {
+        use super::super::client_browser::{ExecutionGate, OwnedBrowser};
+        use super::super::element::ExactBinding;
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        for closed_shadow in [false, true] {
+            let mut owner = OwnedBrowser::launch(Default::default(), None)
+                .await
+                .unwrap();
+            let gate = Arc::new(ExecutionGate::default());
+            let page = owner.lease(gate.enter(false).unwrap()).unwrap();
+            let client = page.client.clone();
+            let session = page.page_session_id.clone();
+            let (sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: Instant::now() + Duration::from_secs(30),
+                cancellation,
+            };
+            let result:Result<(),String>=async {
+                client.send_command("Emulation.setDeviceMetricsOverride",Some(json!({"width":400,"height":300,"deviceScaleFactor":1,"mobile":false})),Some(&session)).await?;
+                let fixture=format!(r#"(()=>{{document.body.style.cssText='margin:0;background:rgb(25,75,125)';const host=document.createElement('div');host.style.cssText='position:absolute;left:20px;top:20px;width:120px;height:40px;background:red;box-shadow:0 0 4px white';document.body.appendChild(host);const root={closed_shadow}?host.attachShadow({{mode:'closed'}}):host;const input=document.createElement('input');input.type='password';input.value='synthetic-mask-only';input.style.cssText='position:absolute;left:0;top:0;width:100px;height:30px;border:0;padding:0;box-shadow:none;text-shadow:none;background:red';root.appendChild(input);window.__maskFixture={{host,input,style:input.getAttribute('style')}};document.body.dataset.tick='0';setInterval(()=>document.body.dataset.tick=String(Number(document.body.dataset.tick)+1),10);return true}})()"#);
+                let setup=client.send_command("Runtime.evaluate",Some(json!({"expression":fixture,"returnByValue":true})),Some(&session)).await?;
+                if setup["result"]["value"]!=true{return Err("Static masking fixture setup failed".into());}
+                client.send_command("Animation.enable",Some(json!({})),Some(&session)).await?;
+                client.send_command("Animation.setPlaybackRate",Some(json!({"playbackRate":0.75})),Some(&session)).await?;
+                let tree=client.send_command("Page.getFrameTree",Some(json!({})),Some(&session)).await?;
+                let frame=&tree["frameTree"]["frame"];
+                let binding=ExactBinding{page_session:session.clone(),session:session.clone(),frame:frame["id"].as_str().ok_or("Missing static frame")?.into(),loader:frame["loaderId"].as_str().ok_or("Missing static loader")?.into(),actionable:false};
+                let frames=vec![ObservationFrame{binding,offset_x:0.0,offset_y:0.0,frame_path:vec![],parent_frame_id:None,owner_backend_id:None,url:"about:blank".into()}];
+                // Only this synthetic fixture is a known one-page inventory.
+                // Production callers cannot use this acknowledgement as a substitute
+                // for the native owner's recursive enrollment barrier.
+                page.targets.acknowledge_enrollment().map_err(|_|"Static inventory acknowledgement failed")?;
+                let captured=start_capture(CaptureContext{page,frames,inventory_complete:true,lifecycle_known_active:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await.map_err(|_|"Capture task failed")?.map_err(|_|"Static protected capture failed")?;
+                let rate=client.send_command("Animation.getPlaybackRate",Some(json!({})),Some(&session)).await?;
+                if rate["playbackRate"].as_f64()!=Some(0.75){return Err("Animation playback was not restored".into());}
+                let controls=client.send_command("Runtime.evaluate",Some(json!({"expression":"window.__maskFixture.input.value==='synthetic-mask-only' && window.__maskFixture.input.getAttribute('style')===window.__maskFixture.style","returnByValue":true})),Some(&session)).await?;
+                if controls["result"]["value"]!=true{return Err("Capture changed the synthetic control".into());}
+                let before=client.send_command("Runtime.evaluate",Some(json!({"expression":"Number(document.body.dataset.tick)","returnByValue":true})),Some(&session)).await?["result"]["value"].as_u64().ok_or("Missing synthetic timer")?;
+                tokio::time::timeout(Duration::from_secs(3),async {
+                    loop {
+                        let value=client.send_command("Runtime.evaluate",Some(json!({"expression":"Number(document.body.dataset.tick)","returnByValue":true})),Some(&session)).await?;
+                        if value["result"]["value"].as_u64().is_some_and(|tick|tick>before){return Ok::<(),String>(());}
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }).await.map_err(|_|"Synthetic timer did not resume")??;
+                let pixels=image::load_from_memory(&captured.png).map_err(|_|"Masked PNG invalid")?.to_rgba8();
+                if pixels.dimensions()!=(400,300){return Err("Unexpected static screenshot dimensions".into());}
+                if pixels.get_pixel(25,25).0 != [0,0,0,255]{return Err("Protected pixels were not black".into());}
+                if pixels.get_pixel(300,200).0 != [25,75,125,255]{return Err(if closed_shadow {"Closed-shadow masking erased public background"}else{"Password masking erased public background"}.into());}
+                Ok(())
+            }.await;
+            drop(sender);
+            let cleanup = owner.close().await;
+            assert!(cleanup.is_ok(), "Static fixture context cleanup failed");
+            result.unwrap();
+        }
     }
 }
