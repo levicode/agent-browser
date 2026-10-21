@@ -279,9 +279,7 @@ async fn run_socket_server(
                 }
             }
             _ = drain_interval.tick() => {
-                if let Ok(guard) = client_gate.clone().try_read_owned() {
-                    spawn_background_tick_guarded(state.clone(), autosave_interval_ms, Some(guard));
-                }
+                spawn_legacy_background_tick(state.clone(), autosave_interval_ms, client_gate.clone());
             }
             _ = async {
                 match idle_sleep_pin {
@@ -435,9 +433,7 @@ async fn run_socket_server(
                 }
             }
             _ = drain_interval.tick() => {
-                if let Ok(guard) = client_gate.clone().try_read_owned() {
-                    spawn_background_tick_guarded(state.clone(), autosave_interval_ms, Some(guard));
-                }
+                spawn_legacy_background_tick(state.clone(), autosave_interval_ms, client_gate.clone());
             }
             _ = async {
                 match idle_sleep_pin {
@@ -523,6 +519,23 @@ fn spawn_background_tick_if_idle(
     autosave_interval_ms: u64,
 ) -> bool {
     spawn_background_tick_guarded(state, autosave_interval_ms, None)
+}
+
+/// Native-only sessions own their event pumps and resources in ClientBrowser;
+/// their empty legacy manager must not reserve admission even for a no-op tick.
+/// Legacy maintenance keeps its original non-blocking admission guard.
+fn spawn_legacy_background_tick(
+    state: Arc<tokio::sync::Mutex<DaemonState>>,
+    autosave_interval_ms: u64,
+    client_gate: Arc<RwLock<()>>,
+) -> bool {
+    if env::var_os("AGENT_BROWSER_CLIENT_ONLY").is_some() {
+        return false;
+    }
+    let Ok(guard) = client_gate.try_read_owned() else {
+        return false;
+    };
+    spawn_background_tick_guarded(state, autosave_interval_ms, Some(guard))
 }
 
 fn spawn_background_tick_guarded(
@@ -834,6 +847,73 @@ mod tests {
     #[allow(unused_imports)]
     use super::*;
 
+    /// A scheduled legacy tick has not run yet when a buffered native hello
+    /// arrives. The native-only daemon has no legacy browser to maintain and
+    /// must admit the hello without weakening exclusive session ownership.
+    #[tokio::test]
+    async fn client_only_hello_survives_scheduled_legacy_background_tick() {
+        let environment = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_CLIENT_ONLY"]);
+        environment.set("AGENT_BROWSER_CLIENT_ONLY", "1");
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let activity = Arc::new(IdleActivity::new());
+        let gate = Arc::new(RwLock::new(()));
+        let (client, server) = tokio::io::duplex(8192);
+        let mut client = BufReader::new(client);
+        client
+            .get_mut()
+            .write_all(super::super::client_protocol::SOCKET_PREFACE)
+            .await
+            .unwrap();
+        client.get_mut().write_all(b"{\"type\":\"hello\",\"id\":\"h\",\"protocol\":\"agent-browser-session/1\",\"requiredCapabilities\":[]}\n{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n").await.unwrap();
+
+        // Scheduling captures the real production locks synchronously. Poll
+        // the buffered connection once before the current-thread runtime can
+        // run the spawned tick: this forces the admission race without sleeps.
+        spawn_legacy_background_tick(state.clone(), 30_000, gate.clone());
+        let mut connection = Box::pin(handle_connection(
+            server,
+            state.clone(),
+            activity,
+            None,
+            Arc::new(Notify::new()),
+            gate.clone(),
+        ));
+        let first_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(connection.as_mut(), context))
+        })
+        .await;
+        let task = first_poll.is_pending().then(|| tokio::spawn(connection));
+
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::client_transport::read_frame(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let ready: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            ready["type"], "ready",
+            "cold native hello was refused: {ready}"
+        );
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::client_transport::read_frame(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let closed: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(closed["type"], "closed");
+        task.expect("native transport serves the accepted session")
+            .await
+            .unwrap();
+        assert!(state.lock().await.browser.is_none());
+        assert!(gate.try_read().is_ok());
+    }
+
     #[tokio::test]
     async fn client_session_negotiation_preserves_legacy_and_excludes_mutation() {
         let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
@@ -1074,6 +1154,35 @@ mod tests {
             &direct
         ));
         assert!(close_completed_response("confirm", &confirmed));
+    }
+
+    #[tokio::test]
+    async fn legacy_background_tick_keeps_its_original_admission_guard() {
+        let environment = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_CLIENT_ONLY"]);
+        environment.remove("AGENT_BROWSER_CLIENT_ONLY");
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let gate = Arc::new(RwLock::new(()));
+
+        let exclusive = gate.clone().write_owned().await;
+        assert!(!spawn_legacy_background_tick(
+            state.clone(),
+            30_000,
+            gate.clone()
+        ));
+        assert_eq!(Arc::strong_count(&state), 1);
+        drop(exclusive);
+
+        assert!(spawn_legacy_background_tick(
+            state.clone(),
+            30_000,
+            gate.clone()
+        ));
+        assert!(state.try_lock().is_err());
+        assert!(gate.try_write().is_err());
+        let _ = tokio::time::timeout(Duration::from_secs(1), gate.write())
+            .await
+            .expect("legacy maintenance should release its admission guard");
+        assert!(state.try_lock().is_ok());
     }
 
     #[tokio::test]

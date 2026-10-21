@@ -1034,8 +1034,9 @@ impl ClientEnrollment {
         }) {
             #[cfg(test)]
             eprintln!(
-                "state.capture refusal=missing-target error={:?}",
-                ProtocolError::StaleScope
+                "state.capture refusal=missing-target error={:?} inventory={:?}",
+                ProtocolError::StaleScope,
+                capture_inventory_diagnostic(&entries, infos, &self.targets.context_id),
             );
             return Err(ProtocolError::StaleScope);
         }
@@ -3787,6 +3788,70 @@ fn capture_frame_fingerprint(
     }
     Ok(())
 }
+/// Closed, count-only diagnostics. Never print target/session/context IDs, URLs,
+/// titles, or browser-provided type strings when capture refuses inventory.
+#[cfg(test)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CaptureInventoryDiagnostic {
+    entries: usize,
+    inventory: usize,
+    missing: usize,
+    absent_target: usize,
+    missing_context: usize,
+    foreign_context: usize,
+    application: usize,
+    observation_only: usize,
+    page: usize,
+    iframe: usize,
+    worker: usize,
+    other: usize,
+    parent: usize,
+}
+#[cfg(test)]
+fn capture_inventory_diagnostic(
+    entries: &[Attribution],
+    infos: &[Value],
+    context: &str,
+) -> CaptureInventoryDiagnostic {
+    let mut result = CaptureInventoryDiagnostic {
+        entries: entries.len(),
+        inventory: infos.len(),
+        ..Default::default()
+    };
+    for entry in entries {
+        let matches = infos.iter().filter(|info| {
+            info.get("targetId").and_then(Value::as_str) == Some(entry.target.as_str())
+        });
+        if matches
+            .clone()
+            .any(|info| info.get("browserContextId").and_then(Value::as_str) == Some(context))
+        {
+            continue;
+        }
+        result.missing += 1;
+        if matches.clone().next().is_none() {
+            result.absent_target += 1;
+        } else if matches.clone().any(|info| {
+            info.get("browserContextId")
+                .and_then(Value::as_str)
+                .is_none()
+        }) {
+            result.missing_context += 1;
+        } else {
+            result.foreign_context += 1;
+        }
+        result.application += usize::from(entry.application);
+        result.observation_only += usize::from(entry.observation_only);
+        result.parent += usize::from(entry.parent.is_some());
+        match entry.kind.as_str() {
+            "page" => result.page += 1,
+            "iframe" => result.iframe += 1,
+            "worker" | "service_worker" | "shared_worker" => result.worker += 1,
+            _ => result.other += 1,
+        }
+    }
+    result
+}
 fn autoattach(enabled: bool) -> Value {
     let mut params = json!({"autoAttach":enabled,"waitForDebuggerOnStart":enabled,"flatten":true});
     if enabled {
@@ -3947,6 +4012,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut detach_count = 0;
+            let mut inventory_reads = 0;
             let mut realm_loader = "synthetic-loader".to_owned();
             let mut whitespace = HashMap::<String, bool>::new();
             let mut closed_targets = std::collections::HashSet::<String>::new();
@@ -3964,6 +4030,7 @@ mod tests {
                         let request:Value=serde_json::from_str(&text).unwrap();
                         recorded.lock().unwrap().push(request.clone());
                         let method=request["method"].as_str().unwrap();
+                        if method=="Target.getTargets" { inventory_reads += 1; }
                         if matches!(mode,"observer-close"|"observer-unknown-error"|"observer-detached-live") && method=="Page.enable" && request["sessionId"]=="observer" {
                             if mode!="observer-unknown-error" { socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"observer","targetId":"other-host"}}).to_string())).await.unwrap(); }
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"target closed"}}).to_string())).await.unwrap();continue;
@@ -4028,7 +4095,10 @@ mod tests {
                                 {"targetId":"foreign","browserContextId":"other-context","type":"page"}]}),
                             "Target.getTargets" if mode=="observer-detached-live"=>json!({"targetInfos":[{"targetId":"other-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="borrowed-capture"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"},{"targetId":"unadopted-host","type":"page","browserContextId":"owned-context"}]}),
-                            "Target.getTargets" if mode=="attestation"=>json!({"targetInfos":[{"targetId":"target","type":"page","browserContextId":"owned-context"}]}),
+                            "Target.getTargets" if mode=="attestation-missing-target" && inventory_reads>1=>json!({"targetInfos":[]}),
+                            "Target.getTargets" if mode=="attestation-missing-context" && inventory_reads>1=>json!({"targetInfos":[{"targetId":"target","type":"page"}]}),
+                            "Target.getTargets" if mode=="attestation-foreign-context" && inventory_reads>1=>json!({"targetInfos":[{"targetId":"target","type":"page","browserContextId":"foreign-context"}]}),
+                            "Target.getTargets" if mode=="attestation" || mode.starts_with("attestation-")=>json!({"targetInfos":[{"targetId":"target","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets"=>json!({"targetInfos":[]}),
                             "Target.closeTarget"=>json!({"success":true}),
                             "Browser.getVersion"=>json!({"userAgent":"Synthetic Chromium"}),
@@ -4514,6 +4584,132 @@ mod tests {
             .is_err());
         server.abort();
         other_server.abort();
+    }
+    #[tokio::test]
+    async fn capture_attestation_rejects_each_missing_target_inventory_category() {
+        for (mode, absent_target, missing_context, foreign_context) in [
+            ("attestation-missing-target", 1, 0, 0),
+            ("attestation-missing-context", 0, 1, 0),
+            ("attestation-foreign-context", 0, 0, 1),
+        ] {
+            let (owner, _notices, log, _emit, server) = fixture(mode).await;
+            owner
+                .enroll_existing("target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let frames_before = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Page.getFrameTree")
+                .count();
+            assert!(
+                matches!(
+                    owner.attest_capture(&owner.operation()).await,
+                    Err(ProtocolError::StaleScope)
+                ),
+                "accepted {mode}"
+            );
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == "Page.getFrameTree")
+                    .count(),
+                frames_before,
+                "{mode} reached renderer capture before inventory proof"
+            );
+            let inventory = owner
+                .command(&owner.operation(), None, "Target.getTargets", json!({}))
+                .await
+                .unwrap();
+            let entries = owner
+                .index
+                .lock()
+                .unwrap()
+                .sessions
+                .values()
+                .cloned()
+                .collect::<Vec<_>>();
+            let diagnostic = capture_inventory_diagnostic(
+                &entries,
+                inventory["targetInfos"].as_array().unwrap(),
+                "owned-context",
+            );
+            assert_eq!(
+                diagnostic,
+                CaptureInventoryDiagnostic {
+                    entries: 1,
+                    inventory: usize::from(absent_target == 0),
+                    missing: 1,
+                    absent_target,
+                    missing_context,
+                    foreign_context,
+                    application: 1,
+                    page: 1,
+                    ..Default::default()
+                }
+            );
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[test]
+    fn capture_inventory_diagnostic_uses_only_closed_roles_and_counts() {
+        let mut entry = Attribution {
+            target: "private-target".into(),
+            session: "private-session".into(),
+            parent: Some("private-parent".into()),
+            root: "private-root".into(),
+            kind: "private-browser-provided-type".into(),
+            application: false,
+            observation_only: true,
+            observer_paused: false,
+            resumed: true,
+        };
+        let diagnostic = capture_inventory_diagnostic(&[entry.clone()], &[], "private-context");
+        assert_eq!(
+            diagnostic,
+            CaptureInventoryDiagnostic {
+                entries: 1,
+                missing: 1,
+                absent_target: 1,
+                observation_only: 1,
+                other: 1,
+                parent: 1,
+                ..Default::default()
+            }
+        );
+        assert!(!format!("{diagnostic:?}").contains("private"));
+        for (kind, page, iframe, worker) in [
+            ("page", 1, 0, 0),
+            ("iframe", 0, 1, 0),
+            ("worker", 0, 0, 1),
+            ("service_worker", 0, 0, 1),
+            ("shared_worker", 0, 0, 1),
+        ] {
+            entry.kind = kind.into();
+            let diagnostic = capture_inventory_diagnostic(&[entry.clone()], &[], "private-context");
+            assert_eq!(
+                (
+                    diagnostic.page,
+                    diagnostic.iframe,
+                    diagnostic.worker,
+                    diagnostic.other
+                ),
+                (page, iframe, worker, 0)
+            );
+        }
+        let exact = json!({"targetId":"private-target","browserContextId":"private-context"});
+        assert_eq!(
+            capture_inventory_diagnostic(&[entry], &[exact], "private-context"),
+            CaptureInventoryDiagnostic {
+                entries: 1,
+                inventory: 1,
+                ..Default::default()
+            }
+        );
     }
     #[tokio::test]
     async fn dequeued_attach_is_pending_before_async_target_registration() {

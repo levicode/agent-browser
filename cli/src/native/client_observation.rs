@@ -531,6 +531,53 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    }
    return normalize(text);
  }
+ // A closed, small content-name proof for native buttons, not a general
+ // accname implementation. Null means unavailable; an empty string is a
+ // complete anonymous result. Native inventory excludes author shadow roots.
+ function completeButtonName(root){
+   let count=0;
+   function token(n,depth){
+     if(++count>512||depth>64)return null;
+     if(n.nodeType===3){const value=n.nodeValue||'';return value.length<=512?value:null;}
+     if(n.nodeType!==1||composedSecure(n)||n.shadowRoot||n.isContentEditable)return null;
+     const css=doc.defaultView.getComputedStyle(n);
+     if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')return '';
+     if(['aria-label','aria-labelledby','alt','contenteditable'].some(a=>n.hasAttribute(a))||
+       n.hasAttribute('role')&&(n!==root||n.getAttribute('role')!=='button'))return null;
+     for(const pseudo of ['::before','::after']){
+       const content=doc.defaultView.getComputedStyle(n,pseudo).content;
+       if(content!=='none'&&content!=='normal'&&content!=='')return null;
+     }
+     if(n!==root){
+       if(n instanceof SVGSVGElement){
+         // AX omission alone proves nothing: only a genuinely empty SVG with
+         // geometry/presentation attributes is an empty contribution here.
+         if(n.childNodes.length||Array.from(n.attributes).some(a=>!['id','class','style','width','height','viewBox','x','y','xmlns'].includes(a.name)))return null;
+         return '';
+       }
+       if(!(n instanceof HTMLElement)||!['span','div','p','abbr','b','strong','em','i','small','br'].includes(n.localName))return null;
+     }
+     if(n.childNodes.length>512-count)return null;
+     let out='';
+     for(const child of n.childNodes){
+       const value=token(child,depth+1);if(value===null)return null;
+       const block=child.nodeType===1&&(child.localName==='br'||doc.defaultView.getComputedStyle(child).display!=='inline');
+       if(out.length+value.length+(block?2:0)>512)return null;
+       out+=block?' '+value+' ':value;
+     }
+     // Preserve raw whitespace: even a block boundary suppresses a
+     // descendant's title. Inert does not suppress name-from-content.
+     if(n===root||out!=='')return out;
+     const title=n.getAttribute('title')||'';
+     return title.length<=512?title.trim():null;
+   }
+   const content=token(root,0);if(content===null)return null;
+   const name=normalize(content);if(name)return name;
+   // Unlike a descendant title, the button's own title follows normalized
+   // content and preserves internal whitespace, as the original reader does.
+   const title=root.getAttribute('title')||'';
+   return title.length<=512?title.trim():null;
+ }
  function safeText(node){
    if(!node)return null;if(node.nodeType===3)return composedSecure(node.parentElement||node.getRootNode()?.host)?null:node.textContent;
    return secureDescendants?safeLabelText(node):node.innerText;
@@ -584,6 +631,10 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const labelNodes=[...referenced,...associated];
  const labelTexts=[...referenced.map(node=>safeLabelText(node)),...associated.map(node=>safeLabelText(node,true))];
  const labels=e?[e.getAttribute('aria-label'),...labelTexts].filter(s=>s!=null&&s!=='').map(normalize):[];
+ let completeButtonContentName=null;
+ if(simpleNameInventory&&e instanceof HTMLButtonElement&&e.localName==='button'&&!secure&&!secureDescendants&&!protectedEditor&&
+   associated.length===0&&!e.hasAttribute('aria-label')&&!e.hasAttribute('aria-labelledby')&&
+   (!e.hasAttribute('role')||e.getAttribute('role')==='button'))completeButtonContentName=completeButtonName(e);
  let simpleAssociatedName=null;
  if(simpleNameInventory&&e&&!secure&&!protectedEditor&&associated.length>0&&associated.length<=32&&
    !(e.getAttribute('aria-label')||'').trim()&&!(e.getAttribute('aria-labelledby')||'').trim()){
@@ -681,9 +732,18 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      space=whitespace;
    }
  }
+ // Exact renderer control state, unlike AX, keeps disabled option selection and
+ // ignores stale ARIA on native controls. These remain untrusted semantic facts.
+ const checkable=!!e&&tag==='input'&&e instanceof HTMLInputElement&&(e.type==='checkbox'||e.type==='radio');
+ const nativeOption=!!e&&tag==='option'&&e instanceof HTMLOptionElement;
+ const controlStates={};
+ if(checkable)controlStates.checked=e.checked;
+ else if(e&&e.hasAttribute('aria-checked'))controlStates.checked=e.getAttribute('aria-checked')==='true';
+ if(nativeOption)controlStates.selected=e.selected;
+ else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
  const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
- return {author,pageLevelLandmark,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
- value:secure?null:editingHost?editorValue:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
+ return {author,controlStates,pageLevelLandmark,completeButtonContentName,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
+ value:secure||(boundedObservation&&checkable)?null:editingHost?editorValue:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
 }"#;
@@ -865,6 +925,35 @@ fn project_node(
             .filter(|name| !name.is_empty())
             .map(str::to_owned);
     }
+    // Complete content evidence can correct an incomplete AX name, including
+    // a proven empty name. Apply before all existing security selection and
+    // normalization; query, exact read, and observation share this projection.
+    if let Some(value) = data
+        .get("completeButtonContentName")
+        .filter(|v| !v.is_null())
+    {
+        let name = value.as_str().ok_or("Invalid complete button name")?;
+        if name.chars().count() > 512 {
+            return Err(ObservationError::BackendFailure);
+        }
+        if node.role.as_deref() == Some("button")
+            && node
+                .author
+                .as_ref()
+                .is_some_and(|facts| facts.tag == "button")
+            && data["__nativeReadonlyPseudo"] != true
+            && data["states"]["secure"] != true
+            && data["secureDescendants"] != true
+            && data["redactName"] != true
+            && data["attributes"]["aria-label"].is_null()
+            && data["attributes"]["aria-labelledby"].is_null()
+            && data["attributes"]["role"]
+                .as_str()
+                .is_none_or(|role| role == "button")
+        {
+            node.name = (!name.is_empty()).then(|| name.to_owned());
+        }
+    }
     node.safe_public_name = data["safePublicName"]
         .as_str()
         .filter(|v| !v.is_empty())
@@ -920,6 +1009,20 @@ fn project_node(
         }
         if p.name == "level" {
             node.level = p.value.value.as_ref().and_then(Value::as_i64);
+        }
+    }
+    if data["__nativeReadonlyPseudo"] != true {
+        if let Some(states) = data.get("controlStates") {
+            let states = states.as_object().ok_or("Invalid control states")?;
+            for (name, value) in states {
+                if !matches!(name.as_str(), "checked" | "selected") {
+                    return Err(ObservationError::BackendFailure);
+                }
+                node.states.insert(
+                    name.clone(),
+                    value.as_bool().ok_or("Invalid control state")?,
+                );
+            }
         }
     }
     node.selector = data["selector"].as_str().map(str::to_owned);
@@ -3080,6 +3183,90 @@ mod tests {
     }
 
     #[test]
+    fn complete_button_names_correct_ax_and_distinguish_empty_from_unavailable() {
+        for bounded in [false, true] {
+            for (ax_name, complete, expected) in [
+                ("Save ", Some("Save draft"), Some("Save draft")),
+                ("", Some("Child tooltip"), Some("Child tooltip")),
+                ("AX fallback", Some(""), None),
+                ("AX fallback", None, Some("AX fallback")),
+            ] {
+                let mut native = ax("button", 42, &[]);
+                native.name.as_mut().unwrap().value = Some(json!(ax_name));
+                let mut data = metadata();
+                data["completeButtonContentName"] = json!(complete);
+                data["attributes"]["title"] = json!("Must not restore");
+                data["simpleAssociatedName"] = json!("Must not restore");
+                let node =
+                    project_node(&frame(), 42, &native, &mut RefMap::new(), 1, &data, bounded)
+                        .unwrap();
+                assert_eq!(node.name.as_deref(), expected);
+            }
+        }
+        for invalid in [json!(true), json!({}), json!("x".repeat(513))] {
+            let mut data = metadata();
+            data["completeButtonContentName"] = invalid;
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &ax("button", 42, &[]),
+                    &mut RefMap::new(),
+                    1,
+                    &data,
+                    true
+                )
+                .unwrap_err(),
+                ObservationError::BackendFailure
+            );
+        }
+    }
+
+    #[test]
+    fn complete_button_names_preserve_role_priority_and_security_selection() {
+        let native = ax("button", 42, &[]);
+        let mut data = metadata();
+        data["completeButtonContentName"] = json!("Proof name");
+        let project = |native: &AXNode, data: &Value| {
+            project_node(&frame(), 42, native, &mut RefMap::new(), 1, data, false)
+                .unwrap()
+                .name
+        };
+        assert_eq!(project(&native, &data).as_deref(), Some("Proof name"));
+        for attr in ["aria-label", "aria-labelledby"] {
+            data["attributes"][attr] = json!("");
+            assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+            data["attributes"] = json!({});
+        }
+        for role in ["link", "none", "unknown button"] {
+            data["attributes"]["role"] = json!(role);
+            assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        }
+        data["attributes"] = json!({});
+        for role in ["link", "none", "generic"] {
+            let mut other = native.clone();
+            other.role.as_mut().unwrap().value = Some(json!(role));
+            assert_eq!(project(&other, &data).as_deref(), Some("Save"));
+        }
+        data["author"]["tag"] = json!("div");
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        data["author"]["tag"] = json!("button");
+        data["__nativeReadonlyPseudo"] = json!(true);
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        data["__nativeReadonlyPseudo"] = json!(false);
+        data["states"]["secure"] = json!(true);
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        data["states"]["secure"] = json!(false);
+        for flag in ["secureDescendants", "redactName", "completeEmptyReference"] {
+            data[flag] = json!(true);
+            assert_eq!(project(&native, &data), None);
+            data[flag] = json!(false);
+        }
+        data["safePublicName"] = json!("Safe public name");
+        assert_eq!(project(&native, &data).as_deref(), Some("Safe public name"));
+    }
+
+    #[test]
     fn inherited_ax_disabled_is_projected_without_overriding_native_disabled() {
         let mut ax = ax("control", 42, &[]);
         ax.properties = serde_json::from_value(
@@ -3249,6 +3436,53 @@ mod tests {
         assert!(observation_frame_order(&[child.clone()]).is_err());
         child.parent_frame_id = Some("child".into());
         assert!(observation_frame_order(&[child]).is_err());
+    }
+
+    #[test]
+    fn exact_control_metadata_precedes_native_ax_state() {
+        for name in ["checked", "selected"] {
+            for expected in [true, false] {
+                let mut native = ax("control", 42, &[]);
+                native.properties = Some(
+                    serde_json::from_value(json!([
+                        {"name":name,"value":{"type":"boolean","value":!expected}}
+                    ]))
+                    .unwrap(),
+                );
+                let mut data = metadata();
+                data["controlStates"] = json!({name:expected});
+                let node = project_node(&frame(), 42, &native, &mut RefMap::new(), 1, &data, true)
+                    .unwrap();
+                assert_eq!(node.states.get(name), Some(&expected));
+                data["__nativeReadonlyPseudo"] = json!(true);
+                let pseudo =
+                    project_node(&frame(), 42, &native, &mut RefMap::new(), 1, &data, true)
+                        .unwrap();
+                assert_eq!(pseudo.states.get(name), Some(&!expected));
+            }
+        }
+        for invalid in [
+            json!({"checked":null}),
+            json!({"checked":"true"}),
+            json!({"hidden":true}),
+            json!([]),
+        ] {
+            let mut data = metadata();
+            data["controlStates"] = invalid;
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &ax("control", 42, &[]),
+                    &mut RefMap::new(),
+                    1,
+                    &data,
+                    true
+                )
+                .unwrap_err(),
+                ObservationError::BackendFailure
+            );
+        }
     }
 
     #[test]

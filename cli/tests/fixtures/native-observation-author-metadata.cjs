@@ -22,6 +22,12 @@ class Element extends Node {
   getBoundingClientRect() { return { x: 0, y: 0, width: 10, height: 10 }; }
   checkVisibility() { return true; }
 }
+class InputControl extends Element { constructor(type, checked) { super(); this.localName='input'; this.type=type; this.checked=checked; this.value='on'; } }
+class OptionControl extends Element { constructor(selected) { super(); this.localName='option'; this.selected=selected; this.value='Poland'; } }
+global.HTMLInputElement=InputControl; global.HTMLOptionElement=OptionControl;
+class ButtonControl extends Element { constructor() { super(); this.localName='button'; } }
+class EmptySvg extends Element { constructor() { super(); this.localName='svg'; } }
+global.HTMLButtonElement=ButtonControl; global.SVGSVGElement=EmptySvg;
 class Text extends Node {
   constructor(value, host) { super(); this.nodeType = 3; this.nodeValue = value; this.textContent = value; this.parentElement = null; this.host = host; }
   getRootNode() { return { host: this.host }; }
@@ -297,3 +303,109 @@ document.defaultView.getComputedStyle = () => ({ display: 'block', visibility: '
 assert.equal(read.call(skippingBox, 'data-testid', '.secure', true).author.skipsContent, false);
 document.defaultView.getComputedStyle = simpleStyle;
 console.log('PASS: content-skipping metadata preserves owner box and direct-read rendering contract');
+
+// Native control properties precede stale ARIA and native AX projection.
+
+for (const type of ['checkbox','radio']) {
+  for (const checked of [true,false]) {
+    const input=new InputControl(type,checked);
+    input.getAttribute=name=>name==='aria-checked'?String(!checked):null;
+    assert.deepEqual(read.call(input,'data-testid','.secure',true).controlStates,{checked});
+    assert.equal(read.call(input,'data-testid','.secure',true).value,null);
+    assert.equal(read.call(input,'data-testid','.secure',false).value,'on');
+  }
+}
+for (const selected of [true,false]) {
+  const option=new OptionControl(selected);
+  option.getAttribute=name=>name==='aria-selected'?String(!selected):null;
+  assert.deepEqual(read.call(option,'data-testid','.secure',true).controlStates,{selected});
+}
+for (const [value,selected] of [['TRUE',true],['TrUe',true],['FALSE',false]]) {
+  const tab=new Element();tab.getAttribute=name=>name==='aria-selected'?value:null;
+  assert.deepEqual(read.call(tab,'data-testid','.secure',true).controlStates,{selected});
+}
+console.log('PASS: exact native control properties override ARIA, with checkable tokens only in direct reads');
+
+// Complete native-button content names correct specific AX omissions without
+// growing into another accessible-name reader. Unsupported is not empty.
+const nameStyle = document.defaultView.getComputedStyle;
+document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+function attributes(node, values) {
+  node.attributes = Object.entries(values).map(([name, value]) => ({ name, value }));
+  node.getAttribute = name => values[name] ?? null;
+  node.hasAttribute = name => Object.hasOwn(values, name);
+  return node;
+}
+function wrapper(children = [], attrs = {}) {
+  const node = attributes(new Element(), attrs); node.localName = 'span'; node.childNodes = children; return node;
+}
+const button = new ButtonControl();
+const buttonName = (bounded = false, protectedEditor = false, inventory = true) => read.call(button, 'data-testid', '.secure', bounded, protectedEditor, inventory).completeButtonContentName;
+button.childNodes = [new Text('Save ', button), wrapper([new Text('draft', button)], { inert: '' })];
+assert.equal(buttonName(), 'Save draft');
+assert.equal(buttonName(true), 'Save draft');
+assert.equal(buttonName(false, false, false), null);
+assert.equal(buttonName(false, true), null);
+const svg = attributes(new EmptySvg(), { width: '10', height: '10' });
+const titled = wrapper([svg], { title: 'Child tooltip' });
+button.childNodes = [titled];
+assert.equal(buttonName(), 'Child tooltip');
+// Flex blockifies its SVG; raw boundary spaces prevent the wrapper title.
+titled.nameDisplay = 'flex'; svg.nameDisplay = 'block';
+assert.equal(buttonName(), '');
+attributes(button, { title: ' Own  tooltip ' });
+assert.equal(buttonName(), 'Own  tooltip');
+attributes(button, {}); delete titled.nameDisplay; delete svg.nameDisplay;
+titled.childNodes = [new Text(' \t', titled)];
+assert.equal(buttonName(), '');
+titled.childNodes = [];
+assert.equal(buttonName(), 'Child tooltip');
+titled.childNodes = [new Text('Actual', titled)];
+assert.equal(buttonName(), 'Actual');
+for (const display of ['block', 'inline-block', 'inline-flex', 'inline-grid', 'contents']) {
+  const child = wrapper([new Text('B', button)]); child.nameDisplay = display;
+  button.childNodes = [new Text('A', button), child]; assert.equal(buttonName(), 'A B');
+}
+const br = wrapper(); br.localName = 'br';
+button.childNodes = [new Text('A', button), br, new Text('B', button)];
+assert.equal(buttonName(), 'A B');
+for (const hidden of ['aria', 'display', 'visibility']) {
+  const child = wrapper([new Text('Hidden', button)]);
+  if (hidden === 'aria') attributes(child, { 'aria-hidden': 'TrUe' });
+  if (hidden === 'display') child.nameDisplay = 'none';
+  if (hidden === 'visibility') child.nameVisibility = 'hidden';
+  button.childNodes = [child, new Text(' Visible', button)]; assert.equal(buttonName(), 'Visible');
+}
+button.childNodes = [new Text('Child', button)];
+for (const attrs of [{ role: 'link' }, { role: 'none' }, { 'aria-label': '' }, { 'aria-labelledby': 'name' }, { alt: '' }, { contenteditable: 'false' }]) {
+  attributes(button, attrs); assert.equal(buttonName(), null);
+}
+attributes(button, { role: 'button' }); assert.equal(buttonName(), 'Child');
+attributes(button, {});
+button.labels = [wrapper()]; assert.equal(buttonName(), null); button.labels = [];
+button.secure = true; assert.equal(buttonName(), null); button.secure = false;
+button.shadowRoot = {}; assert.equal(buttonName(), null); delete button.shadowRoot;
+button.generated = '"before"'; assert.equal(buttonName(), null); delete button.generated;
+button.isContentEditable = true; assert.equal(buttonName(), null); button.isContentEditable = false;
+const fakeButton = new Element(); fakeButton.localName = 'button'; fakeButton.childNodes = button.childNodes;
+assert.equal(read.call(fakeButton, 'data-testid', '.secure', false, false, true).completeButtonContentName, null);
+for (const tag of ['img', 'input', 'textarea', 'select', 'button', 'slot', 'canvas', 'math', 'custom-icon']) {
+  const rich = wrapper(); rich.localName = tag; button.childNodes = [rich]; assert.equal(buttonName(), null);
+}
+for (const attrs of [{ title: 'SVG title' }, { alt: '' }, { 'aria-label': '' }, { 'aria-labelledby': '' }, { 'aria-describedby': 'desc' }, { role: 'img' }, { tabindex: '0' }]) {
+  attributes(svg, attrs); button.childNodes = [wrapper([svg], { title: 'Must not guess' })]; assert.equal(buttonName(), null);
+}
+attributes(svg, { width: '10', height: '10' });
+svg.childNodes = [new Text('', svg)]; assert.equal(buttonName(), null); svg.childNodes = [];
+svg.generated = '"icon"'; assert.equal(buttonName(), null); delete svg.generated;
+const sensitive = wrapper(); sensitive.secure = true;
+Object.defineProperty(sensitive, 'childNodes', { get() { throw Error('Secure name content acquired'); } });
+button.childNodes = [sensitive]; assert.equal(buttonName(), null);
+for (const chars of [513, 100000]) {
+  button.childNodes = [new Text('x'.repeat(chars), button)]; assert.equal(buttonName(), null);
+}
+button.childNodes = Array.from({ length: 513 }, () => new Text('', button)); assert.equal(buttonName(), null);
+let nested = wrapper(); for (let i = 0; i < 65; i++) nested = wrapper([nested]);
+button.childNodes = [nested]; assert.equal(buttonName(), null);
+document.defaultView.getComputedStyle = nameStyle;
+console.log('PASS: native button name proofs preserve inert/title/raw-space precedence and reject unsupported, secure, shadow, and oversized content');

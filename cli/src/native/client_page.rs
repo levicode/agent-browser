@@ -951,6 +951,7 @@ impl ClientPageState {
         if method != "Page.navigate" || loader.is_some() {
             let mut cancel = op.cancellation.clone();
             let mut reached = BTreeSet::new();
+            let mut restored_milestones_requested = false;
             loop {
                 check(page, op)?;
                 let event = tokio::select! {
@@ -983,6 +984,27 @@ impl ClientPageState {
                         .and_then(Value::as_str);
                     if candidate.is_some() && candidate != previous_loader.as_deref() {
                         loader = candidate.map(str::to_owned);
+                        if method == "Page.navigateToHistoryEntry"
+                            && event.params.get("type").and_then(Value::as_str)
+                                == Some("BackForwardCacheRestore")
+                            && candidate.is_some_and(|id| !id.is_empty())
+                            && !restored_milestones_requested
+                        {
+                            // BFCache restores do not dispatch new document load
+                            // events. Chromium replays the current document's real
+                            // recorded lifecycle milestones when enabled again.
+                            // Keep the original lease and exact frame/loader proof;
+                            // the restore notification alone is not completion.
+                            restored_milestones_requested = true;
+                            command(
+                                page,
+                                op,
+                                session,
+                                "Page.setLifecycleEventsEnabled",
+                                json!({"enabled":true}),
+                            )
+                            .await?;
+                        }
                     }
                 }
                 if event.method == "Page.lifecycleEvent"
@@ -1972,6 +1994,7 @@ mod tests {
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut history_restored = false;
             while let Some(Ok(message)) = ws.next().await {
                 let Ok(text) = message.to_text() else {
                     continue;
@@ -1993,8 +2016,66 @@ mod tests {
                     "Page.getFrameTree" => {
                         json!({"frameTree":{"frame":{"id":"main","loaderId":"old"}}})
                     }
+                    "Page.setLifecycleEventsEnabled"
+                        if mode.starts_with("restore-") && history_restored =>
+                    {
+                        // Chromium 156 replays the current document's recorded
+                        // lifecycle timestamps when this command enables events.
+                        // A BFCache restore itself emits frameNavigated only.
+                        if mode == "restore-held-replay" {
+                            continue;
+                        }
+                        if mode != "restore-missing-milestone" {
+                            let session = if mode == "restore-milestone-wrong-session" {
+                                "other"
+                            } else {
+                                "page"
+                            };
+                            let frame = if mode == "restore-milestone-wrong-frame" {
+                                "child"
+                            } else {
+                                "main"
+                            };
+                            let loader = if mode == "restore-milestone-wrong-loader" {
+                                "old"
+                            } else {
+                                "restored"
+                            };
+                            ws.send(Message::Text(json!({"method":"Page.lifecycleEvent","sessionId":session,"params":{"frameId":frame,"loaderId":loader,"name":"load"}}).to_string())).await.unwrap();
+                        }
+                        json!({})
+                    }
                     "Page.navigate" | "Page.reload" | "Page.navigateToHistoryEntry" => {
-                        if mode != "same-document" {
+                        if mode.starts_with("restore-") {
+                            history_restored = true;
+                            if mode == "restore-same-document" {
+                                ws.send(Message::Text(json!({"method":"Page.navigatedWithinDocument","sessionId":"page","params":{"frameId":"main","url":"https://fixture.invalid/#restored"}}).to_string())).await.unwrap();
+                            } else {
+                                let session = if mode == "restore-wrong-session" {
+                                    "other"
+                                } else {
+                                    "page"
+                                };
+                                let frame = if mode == "restore-wrong-frame" {
+                                    "child"
+                                } else {
+                                    "main"
+                                };
+                                let loader = if mode == "restore-old-loader" {
+                                    "old"
+                                } else if mode == "restore-empty-loader" {
+                                    ""
+                                } else {
+                                    "restored"
+                                };
+                                let kind = if mode == "restore-normal-navigation" {
+                                    "Navigation"
+                                } else {
+                                    "BackForwardCacheRestore"
+                                };
+                                ws.send(Message::Text(json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":{"id":frame,"loaderId":loader},"type":kind}}).to_string())).await.unwrap();
+                            }
+                        } else if mode != "same-document" {
                             for (session, loader, name) in [
                                 ("other", "new", "load"),
                                 ("page", "old", "load"),
@@ -2010,14 +2091,16 @@ mod tests {
                         } else if method != "Page.navigate" {
                             ws.send(Message::Text(json!({"method":"Page.navigatedWithinDocument","sessionId":"page","params":{"frameId":"main","url":"https://fixture.invalid/#two"}}).to_string())).await.unwrap();
                         }
-                        if method == "Page.navigate" && mode != "same-document" {
+                        if method == "Page.navigate" && mode.starts_with("restore-") {
+                            json!({"frameId":"main","loaderId":"restored"})
+                        } else if method == "Page.navigate" && mode != "same-document" {
                             json!({"frameId":"main","loaderId":"new"})
                         } else {
                             json!({})
                         }
                     }
                     "Page.getNavigationHistory" => {
-                        json!({"currentIndex":0,"entries":[{"id":1},{"id":2}]})
+                        json!({"currentIndex":if mode == "restore-back" { 1 } else { 0 },"entries":[{"id":1},{"id":2}]})
                     }
                     "Runtime.evaluate"
                         if request["params"]["expression"]
@@ -2586,6 +2669,142 @@ mod tests {
         );
         task.abort();
     }
+    // Pinned Chromium 156.0.8078.47: InspectorPageAgent::
+    // DidRestoreFromBackForwardCache emits frameNavigated, while
+    // setLifecycleEventsEnabled replays stored milestones for the live loader.
+    // https://raw.githubusercontent.com/chromium/chromium/1d17a2e2ee147bb7d6ae2ab6abdb3a2510c17775/third_party/blink/renderer/core/inspector/inspector_page_agent.cc
+    #[tokio::test]
+    async fn history_restore_uses_current_native_lifecycle_milestones() {
+        for (mode, name) in [
+            ("restore-back", "page.back"),
+            ("restore-forward", "page.forward"),
+        ] {
+            let (page, log, task) = mock(mode).await;
+            let (mut op, _sender) = operation();
+            op.deadline = Instant::now() + Duration::from_millis(250);
+            let state = ClientPageState::new("scope".into(), "context".into());
+            let result = state.execute(&page, &[], &op, name, &json!({})).await;
+            task.abort();
+            assert_eq!(
+                result,
+                Ok(Value::Null),
+                "{mode}: restore must prove its recorded load"
+            );
+            let requests = log.lock().unwrap();
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "Page.setLifecycleEventsEnabled")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request["method"] == "Page.navigateToHistoryEntry")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_restore_does_not_invent_or_borrow_completion() {
+        for (mode, replays) in [
+            ("restore-wrong-session", 0),
+            ("restore-wrong-frame", 0),
+            ("restore-old-loader", 0),
+            ("restore-empty-loader", 0),
+            ("restore-normal-navigation", 0),
+            ("restore-missing-milestone", 1),
+            ("restore-milestone-wrong-session", 1),
+            ("restore-milestone-wrong-frame", 1),
+            ("restore-milestone-wrong-loader", 1),
+        ] {
+            let (page, log, task) = mock(mode).await;
+            let (mut op, _sender) = operation();
+            op.deadline = Instant::now() + Duration::from_millis(100);
+            let state = ClientPageState::new("scope".into(), "context".into());
+            let result = state
+                .execute(&page, &[], &op, "page.forward", &json!({}))
+                .await;
+            task.abort();
+            assert_eq!(result, Err(ProtocolError::DeadlineExceeded), "{mode}");
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == "Page.setLifecycleEventsEnabled")
+                    .count(),
+                1 + replays,
+                "{mode}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_restore_replay_is_not_a_navigation_or_same_document_fallback() {
+        for (mode, name, args, success) in [
+            (
+                "restore-forward",
+                "page.navigate",
+                json!({"url":"https://fixture.invalid/", "waitUntil":"load"}),
+                false,
+            ),
+            ("restore-forward", "page.reload", json!({}), false),
+            ("restore-same-document", "page.forward", json!({}), true),
+        ] {
+            let (page, log, task) = mock(mode).await;
+            let (mut op, _sender) = operation();
+            op.deadline = Instant::now() + Duration::from_millis(100);
+            let state = ClientPageState::new("scope".into(), "context".into());
+            let result = state.execute(&page, &[], &op, name, &args).await;
+            task.abort();
+            if success {
+                assert_eq!(result, Ok(Value::Null));
+            } else {
+                assert_eq!(result, Err(ProtocolError::DeadlineExceeded));
+            }
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == "Page.setLifecycleEventsEnabled")
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn history_restore_replay_preserves_the_original_cancellation_budget() {
+        let (page, log, task) = mock("restore-held-replay").await;
+        let (op, sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        let cancel = async {
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == "Page.setLifecycleEventsEnabled")
+                    .count()
+                    < 2
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("history restore should request recorded milestones");
+            sender.send_replace(CancelSignal::Requested);
+        };
+        let args = json!({});
+        let navigation = state.execute(&page, &[], &op, "page.forward", &args);
+        let (result, ()) = tokio::join!(navigation, cancel);
+        task.abort();
+        assert_eq!(result, Err(ProtocolError::Cancelled));
+    }
+
     #[tokio::test]
     async fn same_document_and_history_boundary_do_not_wait_for_nonexistent_load() {
         let (page, log, task) = mock("same-document").await;
