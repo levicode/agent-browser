@@ -2699,6 +2699,7 @@ mod tests {
                     .await;
             }
         });
+        let mut opener_evaluation = None;
         match mode {
             "raw-direct-url" => {
                 let _ = client
@@ -2750,11 +2751,38 @@ mod tests {
                     "(() => {{ const popup=window.open({}); return popup !== null; }})()",
                     serde_json::to_string(&url).unwrap()
                 );
-                let result=client.send_command("Runtime.evaluate",Some(json!({"expression":expression,"userGesture":true,"returnByValue":true})),popup_parent.as_ref().map(|(_,session)|session.as_str())).await.unwrap();
-                assert_eq!(
-                    result["result"]["value"], true,
-                    "window.open was blocked before a popup was created"
-                );
+                let opener_client = client.clone();
+                let opener_owner = owner.clone();
+                let opener_session = popup_parent.as_ref().unwrap().1.clone();
+                opener_evaluation = Some(tokio::spawn(async move {
+                    // window.open may remain blocked while its child is paused.
+                    // Failed child configuration can dispose this opener before
+                    // its evaluate reply. Retain the command concurrently rather
+                    // than making that reply a prerequisite for containment.
+                    let result = opener_client.send_command("Runtime.evaluate",
+                        Some(json!({"expression":expression,"userGesture":true,"returnByValue":true})),
+                        Some(&opener_session)).await;
+                    let disposed_at_reply = opener_owner
+                        .cleanup_outcome()
+                        .is_ok_and(|outcome| outcome.isolated_context_disposed);
+                    (result, disposed_at_reply)
+                }));
+                let parent = &popup_parent.as_ref().unwrap().0;
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    loop {
+                        if popup_links
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|(target, opener)| target != parent && opener == parent)
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("window.open produced no distinct popup with exact opener attribution");
             }
             _ => unreachable!(),
         }
@@ -2794,6 +2822,43 @@ mod tests {
         owner.release_after_containment(proof).await.unwrap();
         let outcome = owner.cleanup_outcome().unwrap();
         assert!(outcome.isolated_context_disposed && outcome.autoattach_disabled);
+        if let Some(evaluation) = opener_evaluation {
+            let (result, disposed_at_reply) = evaluation
+                .await
+                .expect("retained opener evaluation task failed");
+            match result {
+                Ok(value) => {
+                    assert!(
+                        value.get("exceptionDetails").is_none(),
+                        "unexpected opener JavaScript exception"
+                    );
+                    assert_eq!(
+                        value["result"]["value"], true,
+                        "window.open returned no popup handle"
+                    );
+                    eprintln!("popup opener evaluation: successful non-null handle");
+                }
+                Err(error) => {
+                    // Do not accept timeout alone as creation evidence: exact
+                    // popup/opener attribution and failed unresumed enrollment
+                    // were independently required above. Unexpected failures
+                    // before acknowledged containment still fail this fixture.
+                    assert!(
+                        disposed_at_reply,
+                        "opener evaluation failed before acknowledged context containment: {error}"
+                    );
+                    let expected = error.contains("timed out")
+                        || error.contains("closed")
+                        || error.contains("Session with given id not found")
+                        || error.contains("Cannot find context with specified id");
+                    assert!(
+                        expected,
+                        "unexpected post-containment opener failure: {error}"
+                    );
+                    eprintln!("popup opener evaluation: expected closed/timeout outcome after acknowledged context disposal");
+                }
+            }
+        }
         eprintln!(
             "first-request containment trace: {:#?}",
             trace.lock().unwrap()
