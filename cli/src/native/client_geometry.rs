@@ -3,7 +3,7 @@
 //! renderer-root (OOPIF) boundaries compose another transform. No DOM engine,
 //! selector fallback, raw pixels, or wire-visible renderer identifiers live here.
 use super::cdp::client::CdpClient;
-use super::client_observation::ObservationFrame;
+use super::client_observation::{HiddenFrameProof, ObservationError, ObservationFrame};
 use super::client_session::{CancelSignal, OperationLease};
 use super::element;
 use serde::{Deserialize, Serialize};
@@ -628,7 +628,8 @@ impl Polygon {
 #[derive(Debug, Clone, PartialEq)]
 struct SessionProof {
     root: String,
-    viewport: Viewport,
+    // Excluded renderer roots retain identity, never fabricated geometry.
+    viewport: Option<Viewport>,
 }
 #[derive(Debug, Clone, PartialEq)]
 struct FrameProof {
@@ -648,6 +649,7 @@ pub struct GeometrySnapshot {
     transforms: HashMap<String, Matrix>,
     clips: HashMap<String, Vec<Polygon>>,
     pub viewport: Viewport,
+    hidden_frames: Option<HiddenFrameProof>,
 }
 #[derive(Debug, Clone)]
 struct FrameInput {
@@ -780,6 +782,7 @@ async fn read_proofs(
     client: &CdpClient,
     page_session: &str,
     inputs: &[FrameInput],
+    excluded: &HashSet<String>,
     operation: &OperationLease,
 ) -> Result<(HashMap<String, FrameProof>, HashMap<String, SessionProof>), GeometryError> {
     if inputs.is_empty() || inputs.len() > MAX_FRAMES {
@@ -823,16 +826,22 @@ async fn read_proofs(
                 .ok_or(GeometryError::IncompleteInventory)?
                 .to_owned();
             trees.insert(binding.session.clone(), tree_frames(&tree["frameTree"])?);
-            let viewport = metrics(
-                &command(
-                    client,
-                    &binding.session,
-                    "Page.getLayoutMetrics",
-                    json!({}),
-                    operation,
-                )
-                .await?,
-            )?;
+            let viewport = if inputs.iter().any(|input| {
+                input.binding.session == binding.session && !excluded.contains(&input.binding.frame)
+            }) {
+                Some(metrics(
+                    &command(
+                        client,
+                        &binding.session,
+                        "Page.getLayoutMetrics",
+                        json!({}),
+                        operation,
+                    )
+                    .await?,
+                )?)
+            } else {
+                None
+            };
             sessions.insert(binding.session.clone(), SessionProof { root, viewport });
         }
     }
@@ -892,6 +901,9 @@ async fn read_proofs(
             if Some(backend) != input.owner {
                 return Err(GeometryError::StaleIdentity);
             }
+            if excluded.contains(&binding.frame) {
+                continue;
+            }
             let parent_binding = element::ExactBinding {
                 page_session: page_session.to_owned(),
                 session: parent.session.clone(),
@@ -948,7 +960,7 @@ fn session_transform(
         }
         let parent_matrix =
             session_transform(&parent.session, page, frames, sessions, built, visiting)?;
-        let viewport = proof.viewport;
+        let viewport = proof.viewport.ok_or(GeometryError::IncompleteInventory)?;
         // Native quads use renderer-root visual CSS coordinates. Offset moves
         // that origin back to the child layout viewport before embedding it in
         // the exact native content quad (border and padding are not viewport).
@@ -967,6 +979,20 @@ fn session_transform(
     built.insert(session.to_owned(), matrix);
     Ok(matrix)
 }
+fn hidden_proof_error(error: ObservationError) -> GeometryError {
+    match error {
+        ObservationError::StaleReference => GeometryError::StaleIdentity,
+        ObservationError::Cancelled => GeometryError::Cancelled,
+        ObservationError::DeadlineExceeded => GeometryError::DeadlineExceeded,
+        ObservationError::CleanupFailed { primary } => GeometryError::CleanupFailed {
+            primary: primary.map(|error| Box::new(hidden_proof_error(*error))),
+        },
+        ObservationError::BackendFailure => GeometryError::BackendFailure,
+        ObservationError::InvalidArguments
+        | ObservationError::PolicyDenied
+        | ObservationError::ResourceLimit => GeometryError::IncompleteInventory,
+    }
+}
 impl GeometrySnapshot {
     pub async fn capture(
         client: &CdpClient,
@@ -974,6 +1000,44 @@ impl GeometrySnapshot {
         frames: &[ObservationFrame],
         operation: &OperationLease,
     ) -> Result<Self, GeometryError> {
+        Self::capture_impl(client, page_session, frames, None, operation).await
+    }
+    /// Semantic-only omission requires native positive hidden-owner evidence.
+    /// The full topology remains verified; this never relaxes pixel/action quads.
+    pub(crate) async fn capture_semantic(
+        client: &CdpClient,
+        page_session: &str,
+        frames: &[ObservationFrame],
+        hidden: &HiddenFrameProof,
+        operation: &OperationLease,
+    ) -> Result<Self, GeometryError> {
+        hidden
+            .validate_inventory(frames)
+            .map_err(hidden_proof_error)?;
+        hidden
+            .revalidate(client, operation)
+            .await
+            .map_err(hidden_proof_error)?;
+        Self::capture_impl(
+            client,
+            page_session,
+            frames,
+            Some(hidden.clone()),
+            operation,
+        )
+        .await
+    }
+    async fn capture_impl(
+        client: &CdpClient,
+        page_session: &str,
+        frames: &[ObservationFrame],
+        hidden_frames: Option<HiddenFrameProof>,
+        operation: &OperationLease,
+    ) -> Result<Self, GeometryError> {
+        let empty = HashSet::new();
+        let excluded = hidden_frames
+            .as_ref()
+            .map_or(&empty, HiddenFrameProof::excluded_frames);
         let inputs = frames
             .iter()
             .map(|f| FrameInput {
@@ -982,9 +1046,13 @@ impl GeometrySnapshot {
                 owner: f.owner_backend_id,
             })
             .collect::<Vec<_>>();
-        let (frames, sessions) = read_proofs(client, page_session, &inputs, operation).await?;
+        let (frames, sessions) =
+            read_proofs(client, page_session, &inputs, excluded, operation).await?;
         let mut transforms = HashMap::new();
-        for session in sessions.keys() {
+        for (session, proof) in &sessions {
+            if proof.viewport.is_none() {
+                continue;
+            }
             session_transform(
                 session,
                 page_session,
@@ -996,6 +1064,9 @@ impl GeometrySnapshot {
         }
         let mut clips = HashMap::new();
         for frame in frames.values() {
+            if excluded.contains(&frame.id) {
+                continue;
+            }
             let mut current = frame;
             let mut ancestors = Vec::new();
             let mut seen = HashSet::new();
@@ -1025,7 +1096,8 @@ impl GeometrySnapshot {
         let viewport = sessions
             .get(page_session)
             .ok_or(GeometryError::IncompleteInventory)?
-            .viewport;
+            .viewport
+            .ok_or(GeometryError::IncompleteInventory)?;
         Ok(Self {
             page_session: page_session.to_owned(),
             frames,
@@ -1033,6 +1105,7 @@ impl GeometrySnapshot {
             transforms,
             clips,
             viewport,
+            hidden_frames,
         })
     }
     pub async fn revalidate(
@@ -1055,8 +1128,19 @@ impl GeometrySnapshot {
                 owner: f.owner,
             })
             .collect::<Vec<_>>();
+        if let Some(hidden) = &self.hidden_frames {
+            hidden
+                .revalidate(client, operation)
+                .await
+                .map_err(hidden_proof_error)?;
+        }
+        let empty = HashSet::new();
+        let excluded = self
+            .hidden_frames
+            .as_ref()
+            .map_or(&empty, HiddenFrameProof::excluded_frames);
         let (frames, sessions) =
-            read_proofs(client, &self.page_session, &inputs, operation).await?;
+            read_proofs(client, &self.page_session, &inputs, excluded, operation).await?;
         if frames != self.frames || sessions != self.sessions {
             return Err(GeometryError::StaleIdentity);
         }
@@ -1069,6 +1153,9 @@ impl GeometrySnapshot {
         client: &CdpClient,
         operation: &OperationLease,
     ) -> Result<Self, GeometryError> {
+        if self.hidden_frames.is_some() {
+            return Err(GeometryError::IncompleteInventory);
+        }
         let inputs = self
             .frames
             .values()
@@ -1148,9 +1235,29 @@ impl GeometrySnapshot {
         transform.enclose(point)?;
         transform.apply(point)
     }
+    fn require_strict(&self) -> Result<(), GeometryError> {
+        if self.hidden_frames.is_some() {
+            return Err(GeometryError::IncompleteInventory);
+        }
+        Ok(())
+    }
+    fn require_included(&self, frame: &str) -> Result<(), GeometryError> {
+        if self
+            .hidden_frames
+            .as_ref()
+            .is_some_and(|proof| proof.excluded_frames().contains(frame))
+        {
+            return Err(GeometryError::IncompleteInventory);
+        }
+        Ok(())
+    }
     fn check_input_viewports(&self) -> Result<(), GeometryError> {
+        if self.hidden_frames.is_some() {
+            return Err(GeometryError::IncompleteInventory);
+        }
         if self.sessions.values().any(|s| {
-            s.viewport.scale != 1. || s.viewport.offset_x != 0. || s.viewport.offset_y != 0.
+            s.viewport
+                .is_none_or(|v| v.scale != 1. || v.offset_x != 0. || v.offset_y != 0.)
         }) {
             return Err(GeometryError::InvalidGeometry);
         }
@@ -1194,6 +1301,8 @@ impl GeometrySnapshot {
         &self,
         frame_id: &str,
     ) -> Result<Vec<(element::ExactBinding, i64)>, GeometryError> {
+        self.require_strict()?;
+        self.require_included(frame_id)?;
         let mut frame = self
             .frames
             .get(frame_id)
@@ -1228,6 +1337,8 @@ impl GeometrySnapshot {
         frame_id: &str,
         polygon: &Polygon,
     ) -> Result<Polygon, GeometryError> {
+        self.require_strict()?;
+        self.require_included(frame_id)?;
         let mut polygon = polygon.clone();
         for clip in self
             .clips
@@ -1251,6 +1362,8 @@ impl GeometrySnapshot {
         frame_id: &str,
         points: [Point; 4],
     ) -> Result<Polygon, GeometryError> {
+        self.require_strict()?;
+        self.require_included(frame_id)?;
         validate_convex(&points)?;
         let frame = self
             .frames
@@ -1271,6 +1384,7 @@ impl GeometrySnapshot {
         frame_id: &str,
         points: [Point; 4],
     ) -> Result<SemanticBounds, GeometryError> {
+        self.require_included(frame_id)?;
         // Accept only the exact duplicate-edge form of a collapsed native
         // rectangle. Arbitrary collinear/bow-tie quads remain invalid.
         let collapsed = (points[0] == points[1] && points[2] == points[3])
@@ -1307,6 +1421,7 @@ impl GeometrySnapshot {
         backend: i64,
         operation: &OperationLease,
     ) -> Result<SemanticBounds, GeometryError> {
+        self.require_included(&frame.binding.frame)?;
         let proof = self
             .frames
             .get(&frame.binding.frame)
@@ -1331,6 +1446,8 @@ impl GeometrySnapshot {
         backend: i64,
         operation: &OperationLease,
     ) -> Result<Vec<Polygon>, GeometryError> {
+        self.require_strict()?;
+        self.require_included(&frame.binding.frame)?;
         let proof = self
             .frames
             .get(&frame.binding.frame)
@@ -1593,12 +1710,13 @@ mod tests {
                 "page".into(),
                 SessionProof {
                     root: "main".into(),
-                    viewport: viewport(),
+                    viewport: Some(viewport()),
                 },
             )]),
             transforms: HashMap::from([("page".into(), Matrix::IDENTITY)]),
             clips: HashMap::new(),
             viewport: viewport(),
+            hidden_frames: None,
         };
         let root = proof
             .frame_to_root_point("leaf", Point { x: 5., y: 7. })
@@ -1613,7 +1731,14 @@ mod tests {
             Point { x: 12.5, y: 18.5 }
         );
         assert_eq!(proof.project_native_point("leaf", root).unwrap(), root);
-        proof.sessions.get_mut("page").unwrap().viewport.scale = 2.;
+        proof
+            .sessions
+            .get_mut("page")
+            .unwrap()
+            .viewport
+            .as_mut()
+            .unwrap()
+            .scale = 2.;
         assert_eq!(
             proof.project_native_point("leaf", root),
             Err(GeometryError::InvalidGeometry)
@@ -1882,20 +2007,20 @@ mod tests {
                 "page".into(),
                 SessionProof {
                     root: "root".into(),
-                    viewport: viewport(),
+                    viewport: Some(viewport()),
                 },
             ),
             (
                 "child-session".into(),
                 SessionProof {
                     root: "child".into(),
-                    viewport: Viewport {
+                    viewport: Some(Viewport {
                         width: 85.,
                         height: 40.,
                         layout_width: 85.,
                         layout_height: 40.,
                         ..viewport()
-                    },
+                    }),
                 },
             ),
         ]);
@@ -2045,6 +2170,176 @@ mod tests {
             },
             sender,
         )
+    }
+    #[tokio::test]
+    async fn semantic_exclusion_preserves_full_native_ownership_without_spatial_reads() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        for child_session in ["page", "remote"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+            let requests = log.clone();
+            let hidden = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let reported_hidden = hidden.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    requests.lock().unwrap().push(request.clone());
+                    let result = match request["method"].as_str().unwrap() {
+                        "Page.getFrameTree" if request["sessionId"] == "remote" => {
+                            json!({"frameTree":{"frame":{"id":"child","loaderId":"child-doc","parentId":"root"}}})
+                        }
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"root","loaderId":"doc"},"childFrames":[{"frame":{"id":"child","loaderId":"child-doc"}}]}})
+                        }
+                        "Page.getLayoutMetrics" => {
+                            json!({"cssVisualViewport":{"clientWidth":100,"clientHeight":80,"offsetX":0,"offsetY":0,"scale":1},"cssLayoutViewport":{"clientWidth":100,"clientHeight":80}})
+                        }
+                        "DOM.getFrameOwner" => json!({"backendNodeId":7}),
+                        "Page.createIsolatedWorld" => json!({"executionContextId":3}),
+                        "DOM.resolveNode" => {
+                            json!({"object":{"objectId":"owner","subtype":"node"}})
+                        }
+                        "Runtime.callFunctionOn"
+                            if request["params"]["functionDeclaration"]
+                                .as_str()
+                                .is_some_and(|function| {
+                                    function.starts_with("function(testId,secureSelector)")
+                                }) =>
+                        {
+                            json!({"result":{"value":{"nodeType":1,"tag":"iframe","hidden":reported_hidden.load(std::sync::atomic::Ordering::SeqCst)}}})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            json!({"result":{"value":{"connected":true,"frameOwner":true,"width":0,"height":0}}})
+                        }
+                        "DOM.getBoxModel" => json!({"model":{"content":[0,0,0,0,0,0,0,0]}}),
+                        _ => json!({}),
+                    };
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":result}).to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let (operation, _cancel) = mock_operation();
+            let main = mock_frame();
+            let mut child = main.clone();
+            child.parent_frame_id = Some("root".into());
+            child.owner_backend_id = Some(7);
+            child.binding.frame = "child".into();
+            child.binding.loader = "child-doc".into();
+            child.binding.session = child_session.into();
+            let inputs = [main.clone(), child.clone()].map(|frame| FrameInput {
+                binding: frame.binding,
+                parent: frame.parent_frame_id,
+                owner: frame.owner_backend_id,
+            });
+            let excluded = HashSet::from(["child".into()]);
+            let (frames, sessions) = read_proofs(&client, "page", &inputs, &excluded, &operation)
+                .await
+                .unwrap();
+            assert_eq!(frames.len(), 2);
+            assert_eq!(frames["child"].owner, Some(7));
+            assert_eq!(frames["child"].owner_quad, None);
+            if child_session == "remote" {
+                assert_eq!(sessions["remote"].viewport, None);
+            }
+            let requests = log.lock().unwrap().clone();
+            assert!(requests.iter().any(|r| r["method"] == "DOM.getFrameOwner"));
+            assert!(!requests
+                .iter()
+                .any(|r| r["method"] == "DOM.getBoxModel" || r["method"] == "DOM.resolveNode"));
+            assert!(!requests
+                .iter()
+                .any(|r| r["method"] == "Page.getLayoutMetrics" && r["sessionId"] == "remote"));
+            let full = [main.clone(), child.clone()];
+            let hidden_proof = HiddenFrameProof::for_test(&full, &["child"]);
+            let semantic = GeometrySnapshot::capture_semantic(
+                &client,
+                "page",
+                &full,
+                &hidden_proof,
+                &operation,
+            )
+            .await
+            .unwrap();
+            semantic.revalidate(&client, &operation).await.unwrap();
+            assert!(semantic
+                .project_semantic_quad("root", rect(1., 2., 3., 4.))
+                .is_ok());
+            assert_eq!(
+                semantic.project_semantic_quad("child", rect(1., 2., 3., 4.)),
+                Err(GeometryError::IncompleteInventory)
+            );
+            assert_eq!(
+                semantic.project_native_quad("root", rect(1., 2., 3., 4.)),
+                Err(GeometryError::IncompleteInventory)
+            );
+            assert_eq!(
+                semantic.owner_chain("child"),
+                Err(GeometryError::IncompleteInventory)
+            );
+            assert_eq!(
+                semantic
+                    .node_semantic_bounds(&client, &child, 9, &operation)
+                    .await,
+                Err(GeometryError::IncompleteInventory)
+            );
+            hidden.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                semantic.revalidate(&client, &operation).await,
+                Err(GeometryError::StaleIdentity)
+            );
+            let mut wrong = inputs.clone();
+            wrong[1].owner = Some(8);
+            assert_eq!(
+                read_proofs(&client, "page", &wrong, &excluded, &operation)
+                    .await
+                    .unwrap_err(),
+                GeometryError::StaleIdentity
+            );
+            let mut replaced = inputs.clone();
+            replaced[1].binding.loader = "replacement".into();
+            assert_eq!(
+                read_proofs(&client, "page", &replaced, &excluded, &operation)
+                    .await
+                    .unwrap_err(),
+                GeometryError::StaleIdentity
+            );
+            assert_eq!(
+                read_proofs(&client, "page", &inputs[..1], &excluded, &operation)
+                    .await
+                    .unwrap_err(),
+                GeometryError::IncompleteInventory
+            );
+            assert!(
+                GeometrySnapshot::capture(&client, "page", &[main, child], &operation)
+                    .await
+                    .is_err(),
+                "strict geometry must still refuse collapsed owner"
+            );
+            server.abort();
+        }
+    }
+    #[test]
+    fn hidden_proof_cleanup_keeps_original_failure() {
+        assert_eq!(
+            hidden_proof_error(ObservationError::CleanupFailed {
+                primary: Some(Box::new(ObservationError::Cancelled))
+            }),
+            GeometryError::CleanupFailed {
+                primary: Some(Box::new(GeometryError::Cancelled))
+            }
+        );
     }
     #[tokio::test]
     async fn semantic_projection_keeps_zero_area_bounds_without_granting_paint_authority() {

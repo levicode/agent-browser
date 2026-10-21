@@ -2314,7 +2314,6 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     blobs: runtime.blobs.clone(),
                     scope: runtime.scope.clone(),
                     policy,
-                    lifecycle_known_active: true,
                     #[cfg(feature = "acceptance-faults")]
                     faults: self.faults.clone(),
                 })

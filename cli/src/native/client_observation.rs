@@ -106,6 +106,8 @@ pub struct SemanticNode {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Observation {
+    #[serde(skip)]
+    pub(crate) hidden_frame_proof: HiddenFrameProof,
     pub identity_scope: String,
     #[serde(with = "revision_wire")]
     pub revision: u64,
@@ -470,7 +472,7 @@ fn ax_string(value: &Option<super::cdp::types::AXValue>) -> Option<String> {
 // Targeted metadata on an already-resolved native DOM handle. It neither walks
 // the DOM nor creates identities. Password text/value/selection/attribute values
 // are excluded in the renderer before any data is transferred to the client.
-const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=false,protectedEditor=false) {
+const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=false,protectedEditor=false,simpleNameInventory=false) {
  const nodeProto=Node.prototype;
  if (!Object.getOwnPropertyDescriptor(nodeProto,'isConnected').get.call(this) || (this!==document && Object.getOwnPropertyDescriptor(nodeProto,'ownerDocument').get.call(this)!==document)) return {__nativeStatus:'stale-reference'};
  const e=this.nodeType===1?this:null, doc=this.ownerDocument||this;
@@ -483,13 +485,17 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const secure=composedSecure(secureElement);
  const secureDescendants=!!e&&!!Element.prototype.querySelector.call(e,secureSelectorAll);
  const normalize=s=>String(s??'').replace(/\s+/g,' ').trim();
- function safeLabelText(node){
+ function safeLabelText(node,excludeAriaHidden=false){
    if(!node||composedSecure(node.nodeType===1?node:node.parentElement||node.getRootNode()?.host))return '';
    const pending=[node],parts=[];let count=0;
    while(pending.length){const n=pending.pop();if(++count>10000)return null;if(n===' '){parts.push(' ');continue;}
      if(n.nodeType===3){if(!composedSecure(n.parentElement||n.getRootNode()?.host))parts.push(n.textContent);continue;}
      if(n.nodeType!==1&&n.nodeType!==9&&n.nodeType!==11)continue;
      if(n.nodeType===1){
+       // Associated label queries use accessible=false name text: decorative
+       // aria-hidden descendants contribute nothing. IDREF roots retain their
+       // separate policy; this flag never changes security exclusion.
+       if(excludeAriaHidden&&(n.getAttribute('aria-hidden')||'').toLowerCase()==='true')continue;
        if(composedSecure(n)||Element.prototype.matches.call(n,'input,textarea,select,script,style'))continue;
        // Text is not an adequate replacement for icon/alternative naming.
        if(n.shadowRoot||Element.prototype.matches.call(n,'img,svg,canvas,slot')||n.hasAttribute('aria-label')||n.hasAttribute('aria-labelledby'))return null;
@@ -499,6 +505,31 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      for(let i=n.childNodes.length-1;i>=0;i--)pending.push(n.childNodes[i]);
    }
    return normalize(parts.join(''));
+ }
+ // A deliberately incomplete naming proof, not an alternate accname reader.
+ // Native inventory must first rule out author shadow roots, including closed.
+ function completeSimpleLabel(root,named){
+   const pending=[root];let text='',count=0;
+   while(pending.length){
+     const n=pending.pop();if(++count>512)return null;
+     if(n===' '){text+=' ';if(text.length>512)return null;continue;}
+     if(n===named)continue;
+     if(n.nodeType===3){const value=n.nodeValue||'';if(value.length>512-text.length)return null;text+=value;continue;}
+     if(n.nodeType!==1)return null;
+     if(composedSecure(n))return null;
+     const css=doc.defaultView.getComputedStyle(n);
+     if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')continue;
+     if(n.shadowRoot||Element.prototype.matches.call(n,'input,textarea,select,button,meter,progress,output,img,svg,math,canvas,video,audio,iframe,slot,script,style')||
+       ['aria-label','aria-labelledby','title','alt','role','contenteditable'].some(a=>n.hasAttribute(a)))return null;
+     for(const pseudo of ['::before','::after']){
+       const content=doc.defaultView.getComputedStyle(n,pseudo).content;
+       if(content!=='none'&&content!=='normal'&&content!=='')return null;
+     }
+     if(n!==root&&(n.localName==='br'||css.display!=='inline')){text+=' ';pending.push(' ');}
+     if(text.length>512||n.childNodes.length>512-count||pending.length+n.childNodes.length>512)return null;
+     for(let i=n.childNodes.length-1;i>=0;i--)pending.push(n.childNodes[i]);
+   }
+   return normalize(text);
  }
  function safeText(node){
    if(!node)return null;if(node.nodeType===3)return composedSecure(node.parentElement||node.getRootNode()?.host)?null:node.textContent;
@@ -551,12 +582,51 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const associated=e&&e.labels?Array.from(e.labels):[];
  const referenced=e?(e.getAttribute('aria-labelledby')||'').split(/\s+/).filter(Boolean).map(id=>e.getRootNode().getElementById?.(id)||doc.getElementById(id)).filter(Boolean):[];
  const labelNodes=[...referenced,...associated];
- const labelTexts=labelNodes.map(safeLabelText);
+ const labelTexts=[...referenced.map(node=>safeLabelText(node)),...associated.map(node=>safeLabelText(node,true))];
  const labels=e?[e.getAttribute('aria-label'),...labelTexts].filter(s=>s!=null&&s!=='').map(normalize):[];
+ let simpleAssociatedName=null;
+ if(simpleNameInventory&&e&&!secure&&!protectedEditor&&associated.length>0&&associated.length<=32&&
+   !(e.getAttribute('aria-label')||'').trim()&&!(e.getAttribute('aria-labelledby')||'').trim()){
+   const names=associated.map(label=>completeSimpleLabel(label,e));
+   if(names.every(name=>name!==null)&&names.reduce((sum,name)=>sum+name.length+1,0)<=512)simpleAssociatedName=normalize(names.join(' '))||null;
+ }
+ // Complete-empty is distinct from unavailable: a whitespace contribution
+ // suppresses title/own-content fallback in the original IDREF computation.
+ let completeEmptyReference=false;
+ const referenceAttribute=e?(e.getAttribute('aria-labelledby')||''):'';
+ if(simpleNameInventory&&e&&!secure&&!protectedEditor&&referenceAttribute.length<=4096&&referenceAttribute.trim()){
+   const root=Node.prototype.getRootNode.call(e),ids=referenceAttribute.trim().split(/\s+/);
+   if(root===doc&&ids.length<=32){
+     let complete=true,targets=0,scanned=0;
+     for(const id of ids){
+       const target=root.getElementById(id);
+       if(!target)continue;
+       targets++;
+       if(!(target instanceof HTMLElement)||!['span','div','p','label','abbr','b','strong','em','i','small'].includes(target.localName)||
+         target.hasAttribute('role')||target.hasAttribute('contenteditable')||target.hasAttribute('aria-labelledby')||composedSecure(target)||target.shadowRoot||
+         (target.getAttribute('aria-label')||'').trim()||target.hasAttribute('alt')||
+         target.childNodes.length===0||target.childNodes.length>512){complete=false;break;}
+       for(const pseudo of ['::before','::after']){
+         const content=doc.defaultView.getComputedStyle(target,pseudo).content;
+         if(content!=='none'&&content!=='normal'&&content!==''){complete=false;break;}
+       }
+       if(!complete)break;
+       let chars=0;
+       for(const child of target.childNodes){
+         if(++scanned>512||child.nodeType!==3){complete=false;break;}
+         const value=child.nodeValue||'';
+         if(value.length>512-chars||!/^\s*$/.test(value)){complete=false;break;}
+         chars+=value.length;
+       }
+       if(!complete||chars===0){complete=false;break;}
+     }
+     completeEmptyReference=complete&&targets>0;
+   }
+ }
  const labelledSecure=labelNodes.some(n=>Element.prototype.querySelector.call(n,secureSelectorAll));
  let safePublicName=null;
  if(e&&!secure&&(secureDescendants||labelledSecure)){
-   if(referenced.length){const values=referenced.map(safeLabelText);if(values.every(s=>s!==null))safePublicName=normalize(values.join(' '));}
+   if(referenced.length){const values=referenced.map(node=>safeLabelText(node));if(values.every(s=>s!==null))safePublicName=normalize(values.join(' '));}
    else if(e.hasAttribute('aria-label'))safePublicName=normalize(e.getAttribute('aria-label'));
    else if(labelNodes.length&&labelTexts.every(s=>s!==null))safePublicName=normalize(labelTexts.join(' '));
    else if(secureDescendants)safePublicName=safeLabelText(e);
@@ -565,6 +635,19 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const secureText=secure&&(!e||!Element.prototype.matches.call(e,'input,textarea,select'));
  const unsafeLabel=!!e&&(e.getAttribute('aria-labelledby')||'').split(/\s+/).some(id=>composedSecure(doc.getElementById(id)));
  const tag=e?e.localName:'';
+ let pageLevelLandmark=null;
+ if(tag==='header'||tag==='footer'){
+   pageLevelLandmark=true;
+   // Public landmark scope includes authored sections across shadow hosts.
+   // This fact changes role projection only, never native ownership.
+   const scope='article,aside,main,nav,section,[role~="article"],[role~="complementary"],[role~="main"],[role~="navigation"],[role~="region"]';
+   let depth=0;
+   for(let p=e;p;p=p.parentElement||Node.prototype.getRootNode.call(p)?.host||null){
+     if(++depth>256)return {__nativeStatus:'resource-limit'};
+     if(Element.prototype.matches.call(p,scope)){pageLevelLandmark=false;break;}
+   }
+ }
+
  const editingHost=!!e&&e instanceof HTMLElement&&e.isContentEditable&&
    !['svg','math','canvas','video','audio','iframe','img','hr','br','wbr','area','a','button','input','textarea','select'].includes(tag)&&
    !(e.parentElement instanceof HTMLElement&&e.parentElement.isContentEditable);
@@ -598,8 +681,8 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
      space=whitespace;
    }
  }
- const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
- return {author,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
+ const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
+ return {author,pageLevelLandmark,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure?null:editingHost?editorValue:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
@@ -724,6 +807,14 @@ fn project_node(
     if author.as_ref().is_some_and(|facts| facts.tag == "iframe") && role.is_none() {
         role = Some("iframe".into());
     }
+    if data["pageLevelLandmark"] == false
+        && author
+            .as_ref()
+            .is_some_and(|facts| matches!(facts.tag.as_str(), "header" | "footer"))
+        && authored_role(&data["attributes"]).is_none()
+    {
+        role = None;
+    }
     if data["editingHost"] == true {
         role = Some(
             match authored_role(&data["attributes"]) {
@@ -756,6 +847,24 @@ fn project_node(
         frame_path: frame.frame_path.clone(),
         ..Default::default()
     };
+    // Only a complete native-gated simple label can fill absent AX naming.
+    // Apply before security selection, so security can still clear the name.
+    if node.name.is_none()
+        && data["states"]["secure"] != true
+        && data["secureDescendants"] != true
+        && data["redactName"] != true
+        && data["attributes"]["aria-label"]
+            .as_str()
+            .is_none_or(|s| s.trim_matches(ecmascript_whitespace).is_empty())
+        && data["attributes"]["aria-labelledby"]
+            .as_str()
+            .is_none_or(|s| s.trim_matches(ecmascript_whitespace).is_empty())
+    {
+        node.name = data["simpleAssociatedName"]
+            .as_str()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
+    }
     node.safe_public_name = data["safePublicName"]
         .as_str()
         .filter(|v| !v.is_empty())
@@ -765,6 +874,11 @@ fn project_node(
         || node.safe_public_name.is_some()
     {
         node.name = node.safe_public_name.clone();
+    }
+    if data["completeEmptyReference"] == true {
+        // Empty referenced content is positive provenance, not permission to
+        // restore a title or fall back to the element's own AX content.
+        node.name = None;
     }
     // Normalize the selected, security-approved name once for every consumer.
     // A title cannot resurrect a name removed by the secure-content policy.
@@ -884,6 +998,184 @@ fn observation_frame_order(
     }
     ordered.sort_by_key(|(depth, _)| *depth);
     Ok(ordered.into_iter().map(|(_, frame)| frame).collect())
+}
+
+/// Private positive exclusion evidence. Public serialization never carries it;
+/// omitted/truncated semantic nodes are not evidence of hidden frame content.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HiddenFrameProof {
+    inventory: Vec<ObservationFrame>,
+    owners: Vec<(ObservationFrame, ObservationFrame)>,
+    excluded: std::collections::HashSet<String>,
+    test_id_attribute: String,
+    secure_field_selector: String,
+}
+impl HiddenFrameProof {
+    #[cfg(test)]
+    pub(crate) fn for_test(frames: &[ObservationFrame], direct_hidden_children: &[&str]) -> Self {
+        let direct: std::collections::HashSet<_> = direct_hidden_children.iter().copied().collect();
+        let hidden = frames
+            .iter()
+            .filter(|frame| direct.contains(frame.binding.frame.as_str()))
+            .map(|frame| {
+                (
+                    frame.parent_frame_id.clone().expect("hidden child parent"),
+                    frame.owner_backend_id.expect("hidden child owner"),
+                )
+            })
+            .collect();
+        let mut excluded = std::collections::HashSet::new();
+        for frame in observation_frame_order(frames).unwrap() {
+            if direct.contains(frame.binding.frame.as_str())
+                || frame
+                    .parent_frame_id
+                    .as_ref()
+                    .is_some_and(|parent| excluded.contains(parent))
+            {
+                excluded.insert(frame.binding.frame.clone());
+            }
+        }
+        Self::new(frames, &hidden, excluded, &ObservationOptions::default()).unwrap()
+    }
+    fn new(
+        frames: &[ObservationFrame],
+        hidden: &std::collections::HashSet<(String, i64)>,
+        excluded: std::collections::HashSet<String>,
+        options: &ObservationOptions,
+    ) -> Result<Self, ObservationError> {
+        let mut owners = Vec::new();
+        for child in frames {
+            let Some(parent_id) = &child.parent_frame_id else {
+                continue;
+            };
+            if excluded.contains(parent_id) {
+                continue;
+            }
+            let backend = child
+                .owner_backend_id
+                .ok_or(ObservationError::BackendFailure)?;
+            if hidden.contains(&(parent_id.clone(), backend)) {
+                let parent = frames
+                    .iter()
+                    .find(|frame| &frame.binding.frame == parent_id)
+                    .ok_or(ObservationError::BackendFailure)?;
+                owners.push((parent.clone(), child.clone()));
+            }
+        }
+        let proof = Self {
+            inventory: frames.to_vec(),
+            owners,
+            excluded,
+            test_id_attribute: options.test_id_attribute.clone(),
+            secure_field_selector: options.secure_field_selector.clone(),
+        };
+        proof.validate_inventory(frames)?;
+        Ok(proof)
+    }
+    pub(crate) fn excluded_frames(&self) -> &std::collections::HashSet<String> {
+        &self.excluded
+    }
+
+    pub(crate) fn validate_inventory(
+        &self,
+        frames: &[ObservationFrame],
+    ) -> Result<(), ObservationError> {
+        let ordered = observation_frame_order(frames)?;
+        if frames.len() != self.inventory.len() {
+            return Err(ObservationError::StaleReference);
+        }
+        for expected in &self.inventory {
+            let actual = frames
+                .iter()
+                .find(|frame| frame.binding.frame == expected.binding.frame)
+                .ok_or(ObservationError::StaleReference)?;
+            if actual.binding != expected.binding
+                || actual.parent_frame_id != expected.parent_frame_id
+                || actual.owner_backend_id != expected.owner_backend_id
+            {
+                return Err(ObservationError::StaleReference);
+            }
+        }
+        let mut direct = std::collections::HashSet::new();
+        for (parent, child) in &self.owners {
+            let actual = frames
+                .iter()
+                .find(|frame| frame.binding.frame == child.binding.frame)
+                .ok_or(ObservationError::StaleReference)?;
+            let actual_parent = frames
+                .iter()
+                .find(|frame| frame.binding.frame == parent.binding.frame)
+                .ok_or(ObservationError::StaleReference)?;
+            if actual.binding != child.binding
+                || actual.parent_frame_id.as_ref() != Some(&parent.binding.frame)
+                || actual.owner_backend_id != child.owner_backend_id
+                || child.owner_backend_id.is_none_or(|id| id <= 0)
+                || actual_parent.binding != parent.binding
+                || !direct.insert(child.binding.frame.clone())
+            {
+                return Err(ObservationError::StaleReference);
+            }
+        }
+        let mut closure = std::collections::HashSet::new();
+        for frame in ordered {
+            if direct.contains(&frame.binding.frame)
+                || frame
+                    .parent_frame_id
+                    .as_ref()
+                    .is_some_and(|parent| closure.contains(parent))
+            {
+                closure.insert(frame.binding.frame.clone());
+            }
+        }
+        if closure != self.excluded {
+            return Err(ObservationError::BackendFailure);
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn revalidate(
+        &self,
+        client: &CdpClient,
+        lease: &OperationLease,
+    ) -> Result<(), ObservationError> {
+        check(lease)?;
+        self.validate_inventory(&self.inventory)?;
+        for (index, (parent, child)) in self.owners.iter().enumerate() {
+            check(lease)?;
+            let session = &parent.binding.session;
+            let group = format!("native-hidden-proof-{}-{index}", lease.sequence);
+            let result = async {
+                validate_frame(client, parent, lease).await?;
+                validate_frame(client, child, lease).await?;
+                let backend = child.owner_backend_id.ok_or(ObservationError::BackendFailure)?;
+                let owner = command(client, session, "DOM.getFrameOwner", json!({"frameId":child.binding.frame}), lease).await?;
+                if owner["backendNodeId"].as_i64().ok_or(ObservationError::BackendFailure)? != backend { return Err(ObservationError::StaleReference); }
+                let world = command(client, session, "Page.createIsolatedWorld", json!({"frameId":parent.binding.frame,"worldName":"agent-browser-native-observation"}), lease).await?;
+                let context = world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?;
+                let remote = command(client, session, "DOM.resolveNode", json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}), lease).await?;
+                if remote["object"]["subtype"] != "node" { return Err(ObservationError::BackendFailure); }
+                let object = remote["object"]["objectId"].as_str().ok_or(ObservationError::BackendFailure)?;
+                // The same metadata reader validates the native receiver/document.
+                // Bounded + protected-editor modes prevent raw text/value reads;
+                // only the fixed identity/hidden facts leave this call.
+                let function = format!("function(testId,secureSelector){{const read={METADATA};const data=read.call(this,testId,secureSelector,true,true,false);return {{status:data.__nativeStatus,nodeType:data.author?.nodeType,tag:data.author?.tag,hidden:data.states?.hidden}};}}");
+                let reply = command(client, session, "Runtime.callFunctionOn", json!({"objectId":object,"objectGroup":group,"functionDeclaration":function,"arguments":[{"value":self.test_id_attribute},{"value":self.secure_field_selector}],"returnByValue":true}), lease).await?;
+                if reply.get("exceptionDetails").is_some() { return Err(ObservationError::BackendFailure); }
+                let facts = &reply["result"]["value"];
+                if facts["status"] == "stale-reference" { return Err(ObservationError::StaleReference); }
+                if !facts["status"].is_null() || facts["nodeType"] != 1 || facts["tag"] != "iframe" { return Err(ObservationError::BackendFailure); }
+                match facts["hidden"].as_bool() {
+                    Some(true) => {},
+                    Some(false) => return Err(ObservationError::StaleReference),
+                    None => return Err(ObservationError::BackendFailure),
+                }
+                validate_frame(client, parent, lease).await?;
+                validate_frame(client, child, lease).await
+            }.await;
+            settle_object_group(client, session, &group, result).await?;
+        }
+        Ok(())
+    }
 }
 
 fn proven_hidden_iframe(node: &SemanticNode) -> bool {
@@ -1093,9 +1385,12 @@ pub async fn observe(
         pending.extend(node.children.iter());
     }
     staged.retain_query_additions(refs, &published);
+    let hidden_frame_proof =
+        HiddenFrameProof::new(frames, &hidden_owners, skipped_frames, options)?;
     check(lease)?;
     *refs = staged;
     Ok(Observation {
+        hidden_frame_proof,
         identity_scope: identity_scope.into(),
         revision,
         roots,
@@ -1804,7 +2099,8 @@ async fn read_batch(
         arguments.extend(objects.iter().map(|o|json!({"objectId":o})));
         let protected_editors = metadata_receiver_protection(nodes, &pseudo, acquisition_policy)?;
         let protected_editors = serde_json::to_string(&protected_editors).map_err(|_| ObservationError::BackendFailure)?;
-        let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index])); }}");
+        let simple_name_inventory=acquisition_policy.simple_name_inventory;
+        let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory})); }}");
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true}),lease).await?;
         if result.get("exceptionDetails").is_some(){
             #[cfg(test)]
@@ -2403,6 +2699,9 @@ struct SecurityInventory {
     browser_internal: std::collections::HashSet<i64>,
     ancestors: std::collections::HashSet<i64>,
     label_ids: std::collections::HashSet<String>,
+    // Conservative: simple-name completion is declined for an entire frame
+    // containing any author shadow root, even when this receiver is unrelated.
+    simple_name_inventory: bool,
 }
 /// Browser implementation shadow trees are not author controls. Keep their
 /// native identities out of the author observation without rebinding them to
@@ -2508,6 +2807,14 @@ fn bounded_dom_ids(
 /// Enumerate native shadow-root handles, not every element. CSS matching stays
 /// in Chromium, including closed roots supplied by DOM.getDocument(pierce).
 /// Only sensitive ancestors' identities are returned; no field values are read.
+fn simple_name_inventory(
+    root: &Value,
+    roots: &[i64],
+    internal: &std::collections::HashSet<i64>,
+) -> bool {
+    root["nodeType"] == 9 && roots.iter().filter(|id| !internal.contains(id)).count() == 1
+}
+
 async fn security_inventory(
     client: &CdpClient,
     frame: &ObservationFrame,
@@ -2517,6 +2824,8 @@ async fn security_inventory(
     use futures_util::{stream, StreamExt, TryStreamExt};
     let dom = frame_dom(client, frame, lease).await?;
     let ids = security_root_ids(&dom["root"])?;
+    let browser_internal = browser_internal_ids(&dom["root"])?;
+    let simple_name_inventory = simple_name_inventory(&dom["root"], &ids, &browser_internal);
     let session = &frame.binding.session;
     let group = format!("native-security-{}", lease.sequence);
     let result=async{
@@ -2538,7 +2847,7 @@ async fn security_inventory(
         let properties=command(client,session,"Runtime.getProperties",json!({"objectId":array,"ownProperties":true}),lease).await?;
         let handles:Vec<String>=properties["result"].as_array().ok_or(ObservationError::BackendFailure)?.iter().filter(|p|p["name"].as_str().is_some_and(|s|s.parse::<usize>().is_ok())).map(|p|p["value"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::BackendFailure)).collect::<Result<_,_>>()?;
         let descriptions:Vec<Value>=stream::iter(handles.into_iter().map(|object|async move{command(client,session,"DOM.describeNode",json!({"objectId":object}),lease).await})).buffered(16).try_collect().await?;
-        let mut security=SecurityInventory { browser_internal: browser_internal_ids(&dom["root"] )?, ..Default::default() };
+        let mut security=SecurityInventory { browser_internal, simple_name_inventory, ..Default::default() };
         for description in descriptions{
             let node=&description["node"];security.ancestors.insert(node["backendNodeId"].as_i64().ok_or(ObservationError::BackendFailure)?);
             if let Some(attributes)=node["attributes"].as_array(){for pair in attributes.as_chunks::<2>().0{if pair[0]=="id"{if let Some(id)=pair[1].as_str(){security.label_ids.insert(id.to_string());}}}}
@@ -2673,6 +2982,103 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn implicit_landmarks_obey_author_section_scope_without_changing_explicit_roles() {
+        for (tag, native) in [("header", "banner"), ("footer", "contentinfo")] {
+            let mut node = ax("landmark", 42, &[]);
+            node.role.as_mut().unwrap().value = Some(json!(native));
+            let mut data = metadata();
+            data["author"]["tag"] = json!(tag);
+            data["pageLevelLandmark"] = json!(false);
+            let projected =
+                project_node(&frame(), 42, &node, &mut RefMap::new(), 1, &data, true).unwrap();
+            assert_eq!(projected.role, None);
+            data["attributes"]["role"] = json!(native);
+            assert_eq!(
+                project_node(&frame(), 42, &node, &mut RefMap::new(), 1, &data, true)
+                    .unwrap()
+                    .role
+                    .as_deref(),
+                Some(native)
+            );
+            data["attributes"] = json!({});
+            data["pageLevelLandmark"] = json!(true);
+            assert_eq!(
+                project_node(&frame(), 42, &node, &mut RefMap::new(), 1, &data, true)
+                    .unwrap()
+                    .role
+                    .as_deref(),
+                Some(native)
+            );
+        }
+    }
+
+    #[test]
+    fn simple_name_inventory_declines_author_shadow_but_not_browser_internals() {
+        for (kind, expected) in [("open", false), ("closed", false), ("user-agent", true)] {
+            let root = json!({"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"backendNodeId":2,"shadowRoots":[{"nodeType":11,"backendNodeId":3,"shadowRootType":kind}]}]});
+            assert_eq!(
+                simple_name_inventory(
+                    &root,
+                    &security_root_ids(&root).unwrap(),
+                    &browser_internal_ids(&root).unwrap()
+                ),
+                expected
+            );
+        }
+        assert!(!simple_name_inventory(
+            &json!({}),
+            &[1],
+            &Default::default()
+        ));
+    }
+
+    #[test]
+    fn complete_empty_reference_clears_ax_without_title_or_label_fallback() {
+        let native = ax("reference", 42, &[]);
+        let mut data = metadata();
+        data["completeEmptyReference"] = json!(true);
+        data["attributes"]["title"] = json!("Must not restore");
+        data["simpleAssociatedName"] = json!("Must not restore");
+        let project = |data: &Value| {
+            project_node(&frame(), 42, &native, &mut RefMap::new(), 1, data, false)
+                .unwrap()
+                .name
+        };
+        assert_eq!(project(&data), None);
+        data["redactName"] = json!(true);
+        assert_eq!(project(&data), None);
+        data["redactName"] = json!(false);
+        data["completeEmptyReference"] = json!(false);
+        assert_eq!(project(&data).as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn complete_associated_label_only_fills_missing_unprotected_ax_name() {
+        let mut native = ax("control", 42, &[]);
+        native.name = None;
+        let mut data = metadata();
+        data["simpleAssociatedName"] = json!("Name");
+        let project = |native: &AXNode, data: &Value| {
+            project_node(&frame(), 42, native, &mut RefMap::new(), 1, data, false)
+                .unwrap()
+                .name
+        };
+        assert_eq!(project(&native, &data).as_deref(), Some("Name"));
+        for attribute in ["aria-label", "aria-labelledby"] {
+            data["attributes"][attribute] = json!("Higher priority");
+            assert_eq!(project(&native, &data), None);
+            data["attributes"] = json!({});
+        }
+        for flag in ["redactName", "secureDescendants"] {
+            data[flag] = json!(true);
+            assert_eq!(project(&native, &data), None);
+            data[flag] = json!(false);
+        }
+        native.name = ax("named", 42, &[]).name;
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+    }
+
     #[test]
     fn inherited_ax_disabled_is_projected_without_overriding_native_disabled() {
         let mut ax = ax("control", 42, &[]);
@@ -3924,6 +4330,7 @@ mod tests {
         };
         let security = SecurityInventory {
             browser_internal: Default::default(),
+            simple_name_inventory: false,
             ancestors: Default::default(),
             label_ids: std::collections::HashSet::from(["closed-host".into()]),
         };
@@ -3968,6 +4375,7 @@ mod tests {
             2,
             &SecurityInventory {
                 browser_internal: Default::default(),
+                simple_name_inventory: false,
                 ancestors: std::collections::HashSet::from([2]),
                 label_ids: Default::default(),
             },
@@ -4009,6 +4417,7 @@ mod tests {
             2,
             &SecurityInventory {
                 browser_internal: Default::default(),
+                simple_name_inventory: false,
                 ancestors: std::collections::HashSet::from([2]),
                 label_ids: Default::default(),
             },
@@ -4052,9 +4461,153 @@ mod tests {
             )
             .is_none());
     }
+    fn hidden_proof_frames() -> Vec<ObservationFrame> {
+        let parent = frame();
+        let mut child = parent.clone();
+        child.binding.frame = "child".into();
+        child.binding.loader = "child-doc".into();
+        child.parent_frame_id = Some("main".into());
+        child.owner_backend_id = Some(42);
+        let mut nested = child.clone();
+        nested.binding.frame = "nested".into();
+        nested.binding.loader = "nested-doc".into();
+        nested.parent_frame_id = Some("child".into());
+        nested.owner_backend_id = Some(43);
+        vec![parent, child, nested]
+    }
+    #[test]
+    fn hidden_frame_proof_requires_exact_inventory_and_positive_descendant_closure() {
+        let frames = hidden_proof_frames();
+        let mut proof = HiddenFrameProof::for_test(&frames, &["child"]);
+        assert_eq!(
+            proof.excluded_frames(),
+            &std::collections::HashSet::from(["child".into(), "nested".into()])
+        );
+        proof.validate_inventory(&frames).unwrap();
+        for field in ["loader", "owner", "parent"] {
+            let mut changed = frames.clone();
+            match field {
+                "loader" => changed[1].binding.loader = "replaced".into(),
+                "owner" => changed[1].owner_backend_id = Some(44),
+                _ => changed[2].parent_frame_id = Some("main".into()),
+            }
+            assert!(proof.validate_inventory(&changed).is_err());
+        }
+        assert!(proof.validate_inventory(&frames[..2]).is_err());
+        proof.excluded.remove("nested");
+        assert!(proof.validate_inventory(&frames).is_err());
+        assert!(HiddenFrameProof::for_test(&frames, &[])
+            .excluded_frames()
+            .is_empty());
+    }
+    #[tokio::test]
+    async fn hidden_frame_proof_rechecks_owner_visibility_and_always_settles_group() {
+        use futures_util::{SinkExt, StreamExt};
+        for mode in [
+            "hidden",
+            "visible",
+            "owner",
+            "loader",
+            "malformed",
+            "exception",
+            "cleanup",
+            "cleanup-primary",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut metadata = false;
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(text).unwrap();
+                    assert_eq!(request["sessionId"], "renderer");
+                    let method = request["method"].as_str().unwrap();
+                    let result = match method {
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"},"childFrames":[{"frame":{"id":"child","loaderId":if mode=="loader"{"changed"}else{"child-doc"}}}]}})
+                        }
+                        "DOM.getFrameOwner" => {
+                            assert_eq!(request["params"]["frameId"], "child");
+                            json!({"backendNodeId":if mode=="owner"{44}else{42}})
+                        }
+                        "Page.createIsolatedWorld" => {
+                            assert_eq!(request["params"]["frameId"], "main");
+                            json!({"executionContextId":17})
+                        }
+                        "DOM.resolveNode" => {
+                            assert_eq!(request["params"]["backendNodeId"], 42);
+                            assert_eq!(request["params"]["executionContextId"], 17);
+                            json!({"object":{"type":"object","subtype":"node","objectId":"exact-owner"}})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            metadata = true;
+                            assert_eq!(request["params"]["objectId"], "exact-owner");
+                            assert_eq!(request["params"]["returnByValue"], true);
+                            let function =
+                                request["params"]["functionDeclaration"].as_str().unwrap();
+                            assert!(function.contains(METADATA));
+                            assert!(function.contains("true,true,false"));
+                            if mode == "exception" {
+                                json!({"exceptionDetails":{"exception":{"objectId":"owned-exception"}}})
+                            } else {
+                                json!({"result":{"type":"object","value":{"nodeType":1,"tag":"iframe","hidden":if mode=="malformed"{json!("true")}else{json!(!matches!(mode,"visible"|"cleanup-primary"))}}}})
+                            }
+                        }
+                        "Runtime.releaseObjectGroup" => json!({}),
+                        _ => panic!("unexpected hidden proof command {method}"),
+                    };
+                    let response = if method == "Runtime.releaseObjectGroup"
+                        && matches!(mode, "cleanup" | "cleanup-primary")
+                    {
+                        json!({"id":request["id"],"error":{"code":-32000,"message":"cleanup refused"}})
+                    } else {
+                        json!({"id":request["id"],"result":result})
+                    };
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            response.to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    if method == "Runtime.releaseObjectGroup" {
+                        break;
+                    }
+                }
+                assert_eq!(metadata, !matches!(mode, "owner" | "loader"));
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let (lease, _sender) = lease();
+            let proof = HiddenFrameProof::for_test(&hidden_proof_frames(), &["child"]);
+            let result = proof.revalidate(&client, &lease).await;
+            match mode {
+                "hidden" => assert_eq!(result, Ok(())),
+                "visible" | "owner" | "loader" => {
+                    assert_eq!(result, Err(ObservationError::StaleReference))
+                }
+                "cleanup" => assert_eq!(
+                    result,
+                    Err(ObservationError::CleanupFailed { primary: None })
+                ),
+                "cleanup-primary" => assert_eq!(
+                    result,
+                    Err(ObservationError::CleanupFailed {
+                        primary: Some(Box::new(ObservationError::StaleReference))
+                    })
+                ),
+                _ => assert_eq!(result, Err(ObservationError::BackendFailure)),
+            }
+            server.await.unwrap();
+        }
+    }
+
     #[test]
     fn revision_wire_preserves_full_native_integer_precision() {
         let observation = Observation {
+            hidden_frame_proof: HiddenFrameProof::default(),
             identity_scope: "scope".into(),
             revision: u64::MAX,
             roots: vec![],
@@ -4066,6 +4619,7 @@ mod tests {
         };
         let encoded = serde_json::to_value(&observation).unwrap();
         assert_eq!(encoded["revision"], u64::MAX.to_string());
+        assert!(encoded.get("hiddenFrameProof").is_none());
         assert_eq!(
             serde_json::from_value::<Observation>(encoded.clone())
                 .unwrap()

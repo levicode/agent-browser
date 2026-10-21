@@ -158,3 +158,142 @@ assert.equal(hint.call({ onclick: null }), false);
 assert.equal(hint.call({ onclick() { throw Error('Handler invoked'); } }), true);
 assert.equal(hint.call({ addEventListener() {} }), false);
 console.log('PASS: isolated metadata gates main-world handler hint without invoking handler getters');
+
+// A landmark's author section scope crosses the exact receiver's shadow root.
+Node.prototype.getRootNode = function() { return this.nativeRoot || document; };
+const baseMatches = Element.prototype.matches;
+Element.prototype.matches = function(selector) {
+  if (selector.startsWith('article,aside,')) return this.sectionScope === true;
+  return baseMatches.call(this, selector);
+};
+for (const tag of ['header', 'footer']) {
+  const landmark = new Element(); landmark.localName = tag;
+  assert.equal(read.call(landmark, 'data-testid', '.secure', true).pageLevelLandmark, true);
+  const sectionHost = new Element(); sectionHost.sectionScope = true;
+  landmark.nativeRoot = { host: sectionHost };
+  assert.equal(read.call(landmark, 'data-testid', '.secure', true).pageLevelLandmark, false);
+  sectionHost.sectionScope = false;
+  assert.equal(read.call(landmark, 'data-testid', '.secure', true).pageLevelLandmark, true);
+  landmark.parentElement = landmark;
+  assert.equal(read.call(landmark, 'data-testid', '.secure', true).__nativeStatus, 'resource-limit');
+}
+Element.prototype.matches = baseMatches;
+console.log('PASS: author landmark scope crosses shadow hosts with a bounded walk');
+
+// Associated labels exclude decorative aria-hidden content. This is not the
+// IDREF-root hidden policy, which intentionally remains a separate code path.
+const associatedLabel = new Element(); associatedLabel.localName = 'label';
+const marker = new Element(); marker.localName = 'span';
+marker.getAttribute = name => name === 'aria-hidden' ? 'TrUe' : null;
+marker.childNodes = [new Text('*', marker)];
+associatedLabel.childNodes = [new Text('Name', associatedLabel), marker];
+const labelledControl = new Element(); labelledControl.labels = [associatedLabel];
+assert.deepEqual(read.call(labelledControl, 'data-testid', '.secure', false).labels, ['Name']);
+associatedLabel.getAttribute = name => name === 'aria-hidden' ? 'true' : null;
+assert.deepEqual(read.call(labelledControl, 'data-testid', '.secure', false).labels, []);
+associatedLabel.getAttribute = () => null;
+marker.secure = true;
+marker.getAttribute = () => null;
+assert.deepEqual(read.call(labelledControl, 'data-testid', '.secure', false).labels, ['Name']);
+console.log('PASS: associated-label text drops aria-hidden markers without weakening secure exclusion');
+
+const simpleStyle = document.defaultView.getComputedStyle;
+document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+const simpleLabel = new Element(); simpleLabel.localName = 'label';
+const unnamedControl = new Element(); unnamedControl.localName = 'input'; unnamedControl.labels = [simpleLabel];
+simpleLabel.childNodes = [new Text('Name', simpleLabel), unnamedControl];
+const completeName = () => read.call(unnamedControl, 'data-testid', '.secure', false, false, true).simpleAssociatedName;
+assert.equal(completeName(), 'Name');
+assert.equal(read.call(unnamedControl, 'data-testid', '.secure', false).simpleAssociatedName, null);
+assert.equal(read.call(unnamedControl, 'data-testid', '.secure', false, true, true).simpleAssociatedName, null);
+unnamedControl.getAttribute = name => name === 'aria-labelledby' ? 'other' : null;
+assert.equal(completeName(), null); unnamedControl.getAttribute = () => null;
+for (const tag of ['input', 'svg', 'slot']) {
+  const rich = new Element(); rich.localName = tag;
+  const old = Element.prototype.matches;
+  Element.prototype.matches = function(selector) { return this === rich && selector.includes(tag) || old.call(this, selector); };
+  simpleLabel.childNodes.push(rich); assert.equal(completeName(), null); simpleLabel.childNodes.pop();
+  Element.prototype.matches = old;
+}
+const authored = new Element(); authored.hasAttribute = name => name === 'title';
+simpleLabel.childNodes.push(authored); assert.equal(completeName(), null); simpleLabel.childNodes.pop();
+document.defaultView.getComputedStyle = (_node, pseudo) => ({ display: 'inline', visibility: 'visible', content: pseudo ? '"icon"' : 'none' });
+assert.equal(completeName(), null);
+document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+simpleLabel.childNodes = [new Text('x'.repeat(513), simpleLabel)]; assert.equal(completeName(), null);
+simpleLabel.childNodes = [new Text('Name', simpleLabel)]; simpleLabel.secure = true; assert.equal(completeName(), null);
+document.defaultView.getComputedStyle = simpleStyle;
+console.log('PASS: complete simple label facts require native inventory and reject rich/secure/overflow content');
+
+// Accessible-name boundaries are not line-text inline-flow boundaries.
+simpleLabel.secure = false;
+document.defaultView.getComputedStyle = node => ({ display: node.nameDisplay || 'inline', visibility: 'visible', content: 'none' });
+for (const display of ['inline-block', 'inline-flex', 'inline-grid', 'contents']) {
+  const child = new Element(); child.localName = 'span'; child.nameDisplay = display;
+  child.childNodes = [new Text('B', child)];
+  simpleLabel.childNodes = [new Text('A', simpleLabel), child];
+  assert.equal(completeName(), 'A B');
+}
+const lineBreak = new Element(); lineBreak.localName = 'br';
+simpleLabel.childNodes = [new Text('A', simpleLabel), lineBreak, new Text('B', simpleLabel)];
+assert.equal(completeName(), 'A B');
+document.defaultView.getComputedStyle = simpleStyle;
+console.log('PASS: simple associated names preserve BR and non-inline child boundaries');
+
+const referenceTarget = new Element(); referenceTarget.localName = 'span';
+referenceTarget.getAttribute = name => name === 'title' ? 'Spaced reference' : null;
+referenceTarget.childNodes = [new Text(' \t', referenceTarget)];
+const referenceControl = new Element(); referenceControl.getAttribute = name => name === 'aria-labelledby' ? 'reference' : null;
+const savedLookup = document.getElementById;
+document.getElementById = id => id === 'reference' ? referenceTarget : null;
+document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+const emptyReference = () => read.call(referenceControl, 'data-testid', '.secure', false, false, true).completeEmptyReference;
+assert.equal(emptyReference(), true);
+assert.equal(read.call(referenceControl, 'data-testid', '.secure', false).completeEmptyReference, false);
+referenceTarget.childNodes = [new Text('\uFEFF', referenceTarget)]; assert.equal(emptyReference(), true);
+for (const text of ['', '\u0085', 'named', ' '.repeat(513)]) {
+  referenceTarget.childNodes = [new Text(text, referenceTarget)]; assert.equal(emptyReference(), false);
+}
+referenceTarget.childNodes = [new Text(' ', referenceTarget), new Element()]; assert.equal(emptyReference(), false);
+referenceTarget.childNodes = [new Text(' ', referenceTarget)];
+referenceTarget.getAttribute = name => name === 'aria-label' ? 'Named target' : null; assert.equal(emptyReference(), false);
+referenceTarget.getAttribute = () => null;
+referenceTarget.secure = true; assert.equal(emptyReference(), false); referenceTarget.secure = false;
+document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: '"generated"' });
+assert.equal(emptyReference(), false);
+document.defaultView.getComputedStyle = simpleStyle;
+document.getElementById = savedLookup;
+console.log('PASS: complete-empty IDREF facts require exact native-gated whitespace-only complete targets');
+
+// A document ID with the same spelling cannot complete another tree's IDREF.
+document.getElementById = id => id === 'reference' ? referenceTarget : null;
+document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+referenceControl.nativeRoot = { host: new Element(), getElementById: () => referenceTarget };
+assert.equal(emptyReference(), false); delete referenceControl.nativeRoot;
+referenceTarget.hasAttribute = name => name === 'role'; assert.equal(emptyReference(), false);
+referenceTarget.hasAttribute = () => false;
+referenceTarget.localName = 'textarea'; assert.equal(emptyReference(), false); referenceTarget.localName = 'span';
+document.defaultView.getComputedStyle = simpleStyle;
+document.getElementById = savedLookup;
+
+// Chained authored references remain outside this intentionally simple proof.
+document.getElementById = id => id === 'reference' ? referenceTarget : null;
+document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+referenceTarget.hasAttribute = name => name === 'aria-labelledby';
+referenceTarget.getAttribute = name => name === 'aria-labelledby' ? 'another-name' : null;
+assert.equal(emptyReference(), false);
+referenceTarget.hasAttribute = () => false; referenceTarget.getAttribute = () => null;
+document.defaultView.getComputedStyle = simpleStyle;
+document.getElementById = savedLookup;
+
+const skippingBox = new Element(); skippingBox.innerText = '';
+document.defaultView.getComputedStyle = () => ({ display: 'block', visibility: 'visible', contentVisibility: 'hidden', content: 'none' });
+const skippingFacts = read.call(skippingBox, 'data-testid', '.secure', true);
+assert.equal(skippingFacts.author.skipsContent, true);
+assert.equal(skippingFacts.states.hidden, false);
+assert.deepEqual(skippingFacts.rect, { x: 0, y: 0, width: 10, height: 10 });
+assert.equal(read.call(skippingBox, 'data-testid', '.secure', false).text, '');
+document.defaultView.getComputedStyle = () => ({ display: 'block', visibility: 'hidden', contentVisibility: 'visible', content: 'none' });
+assert.equal(read.call(skippingBox, 'data-testid', '.secure', true).author.skipsContent, false);
+document.defaultView.getComputedStyle = simpleStyle;
+console.log('PASS: content-skipping metadata preserves owner box and direct-read rendering contract');

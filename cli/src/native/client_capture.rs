@@ -48,7 +48,6 @@ pub struct CaptureContext {
     pub page: BrowserExecutionLease,
     pub frames: Vec<ObservationFrame>,
     pub inventory_complete: bool,
-    pub lifecycle_known_active: bool,
 }
 pub struct MaskedCapture {
     pub png: Vec<u8>,
@@ -62,6 +61,7 @@ pub struct MaskedCapture {
 #[serde(rename_all = "camelCase")]
 struct FrameMasks {
     count: usize,
+    secure: Vec<usize>,
     masks: Vec<usize>,
     opaque: bool,
     unsafe_geometry: bool,
@@ -69,6 +69,7 @@ struct FrameMasks {
 #[derive(Clone, PartialEq)]
 struct MaskProof {
     count: usize,
+    secure_nodes: Vec<(String, i64)>,
     masks: Vec<Polygon>,
 }
 
@@ -117,15 +118,19 @@ async fn capture_transaction(
     operation: OperationLease,
 ) -> Result<MaskedCapture, CaptureFailure> {
     let mut journal =
-        ProtectedReadJournal::begin(&context.page, &operation, context.lifecycle_known_active)
-            .map_err(|failure| CaptureFailure {
+        ProtectedReadJournal::begin(&context.page, &operation).map_err(|failure| {
+            CaptureFailure {
                 reason: protected_reason(failure.reason),
                 identity_scope: failure.identity_scope,
                 cleanup_integrity_lost: failure.cleanup_integrity_lost,
-            })?;
+            }
+        })?;
     let mut geometry = None;
     let result = async {
-        journal.freeze().await.map_err(protected_reason)?;
+        journal
+            .stabilize_animations()
+            .await
+            .map_err(protected_reason)?;
         geometry = Some(
             GeometrySnapshot::capture(
                 &context.page.client,
@@ -140,7 +145,7 @@ async fn capture_transaction(
             &context,
             &request,
             &operation,
-            &journal,
+            &mut journal,
             geometry.as_ref().ok_or(CaptureReason::UnsafeGeometry)?,
         )
         .await
@@ -183,19 +188,19 @@ async fn capture_transaction(
             cleanup_integrity_lost,
         })
 }
-/// Capture within the caller's already frozen transaction. The caller must
+/// Capture within the caller's animation-stabilized protected transaction. The caller must
 /// retain the journal, restore it, and revalidate before publishing these bytes.
-/// This helper neither freezes twice nor emits an artifact handle.
+/// This helper owns source masks through the same journal; no lifecycle mutation.
 pub async fn capture_under_journal(
     context: &CaptureContext,
     request: &CaptureRequest,
     operation: &OperationLease,
-    journal: &ProtectedReadJournal<'_>,
+    journal: &mut ProtectedReadJournal<'_>,
     geometry: &GeometrySnapshot,
 ) -> Result<MaskedCapture, CaptureReason> {
-    journal.require_frozen().map_err(protected_reason)?;
+    journal.require_stabilized().map_err(protected_reason)?;
 
-    if !context.inventory_complete || !context.lifecycle_known_active || context.frames.is_empty() {
+    if !context.inventory_complete || context.frames.is_empty() {
         return Err(CaptureReason::IncompleteFrames);
     }
     if request.secure_field_selector.is_empty() || request.secure_field_selector.len() > 8192 {
@@ -211,6 +216,11 @@ pub async fn capture_under_journal(
     validate_frames(context, operation).await?;
     let viewport_size = viewport(context, operation).await?;
     let before = masks(context, request, operation, geometry).await?;
+    install_source_masks(context, request, operation, journal).await?;
+    journal
+        .verify_source_masks()
+        .await
+        .map_err(source_mask_reason)?;
     // Reuse canonical native screenshot capture, without annotations or IO.
     let options = super::screenshot::ScreenshotOptions::default();
     let refs = super::element::RefMap::new();
@@ -237,6 +247,17 @@ pub async fn capture_under_journal(
     #[cfg(test)]
     equivalence_tests::after_raw_capture(context, operation).await?;
     validate_frames(context, operation).await?;
+    journal
+        .verify_source_masks()
+        .await
+        .map_err(source_mask_reason)?;
+    // Compare ordinary visible geometry only after our source rules are gone.
+    // Errors above still leave ownership in the outer retained cleanup journal.
+    journal
+        .remove_source_masks()
+        .await
+        .map_err(|_| CaptureReason::CleanupFailed)?;
+    validate_frames(context, operation).await?;
     if viewport(context, operation).await? != viewport_size
         || masks(context, request, operation, geometry).await? != before
     {
@@ -253,6 +274,247 @@ pub async fn capture_under_journal(
         &before,
         &context.page.identity_scope,
     )
+}
+/// Source masks track the controls rather than an earlier raster rectangle.
+/// The retained holder is created and journaled before installing any rule.
+/// Native snapshot enumeration supplies elements in closed shadow roots too.
+async fn install_source_masks(
+    context: &CaptureContext,
+    request: &CaptureRequest,
+    operation: &OperationLease,
+    journal: &mut ProtectedReadJournal<'_>,
+) -> Result<(), CaptureReason> {
+    let mut sessions = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut total = 0usize;
+    for frame in &context.frames {
+        if !sessions.insert(frame.binding.session.clone()) {
+            continue;
+        }
+        let snapshot = command(
+            context,
+            operation,
+            &frame.binding.session,
+            "DOMSnapshot.captureSnapshot",
+            json!({"computedStyles":[]}),
+        )
+        .await?;
+        let strings = snapshot["strings"]
+            .as_array()
+            .ok_or(CaptureReason::MaskingUnproven)?;
+        for document in snapshot["documents"]
+            .as_array()
+            .ok_or(CaptureReason::IncompleteFrames)?
+        {
+            let index = document["frameId"]
+                .as_u64()
+                .ok_or(CaptureReason::IncompleteFrames)? as usize;
+            let id = strings
+                .get(index)
+                .and_then(Value::as_str)
+                .ok_or(CaptureReason::IncompleteFrames)?;
+            let owned = context
+                .frames
+                .iter()
+                .find(|f| f.binding.frame == id && f.binding.session == frame.binding.session)
+                .ok_or(CaptureReason::IncompleteFrames)?;
+            if !seen.insert(id.to_owned()) {
+                return Err(CaptureReason::IncompleteFrames);
+            }
+            let types = document["nodes"]["nodeType"]
+                .as_array()
+                .ok_or(CaptureReason::MaskingUnproven)?;
+            let backends = document["nodes"]["backendNodeId"]
+                .as_array()
+                .ok_or(CaptureReason::MaskingUnproven)?;
+            if types.len() != backends.len() {
+                return Err(CaptureReason::MaskingUnproven);
+            }
+            total = total
+                .checked_add(types.len())
+                .ok_or(CaptureReason::BoundsExceeded)?;
+            if total > MAX_DOM_NODES {
+                return Err(CaptureReason::BoundsExceeded);
+            }
+            let world = command(
+                context,
+                operation,
+                &owned.binding.session,
+                "Page.createIsolatedWorld",
+                json!({"frameId":id,"worldName":"agent-browser-protected-capture"}),
+            )
+            .await?;
+            let realm = world["executionContextId"]
+                .as_i64()
+                .ok_or(CaptureReason::MaskingUnproven)?;
+            let group = format!("capture-source-{}-{}", operation.sequence, id);
+            journal
+                .reserve_source_group(owned.binding.session.clone(), group.clone())
+                .map_err(protected_reason)?;
+            let response = command(
+                context,
+                operation,
+                &owned.binding.session,
+                "Runtime.evaluate",
+                json!({"contextId":realm,"expression":SOURCE_MASK_HOLDER,"objectGroup":group}),
+            )
+            .await?;
+            if response.get("exceptionDetails").is_some() {
+                return Err(CaptureReason::MaskingUnproven);
+            }
+            let object = response["result"]["objectId"]
+                .as_str()
+                .ok_or(CaptureReason::MaskingUnproven)?
+                .to_owned();
+            journal
+                .bind_source_holder(&owned.binding.session, &group, object.clone())
+                .map_err(protected_reason)?;
+            let ids = source_mask_backend_ids(document, strings)?;
+            for batch in ids.chunks(64) {
+                let mut args = vec![json!({"value":request.secure_field_selector})];
+                let resolved:Vec<Result<Value,CaptureReason>>=futures_util::stream::iter(batch.iter().copied().map(|backend|{let group=&group;async move {
+                    let value=command(context,operation,&owned.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":realm,"objectGroup":group})).await?;
+                    let handle=value["object"]["objectId"].as_str().ok_or(CaptureReason::MaskingUnproven)?;
+                    Ok(json!({"objectId":handle}))
+                }})).buffered(16).collect().await;
+                for value in resolved {
+                    args.push(value?);
+                }
+                let installed=command(context,operation,&owned.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":"function(selector,...nodes){return this.install(selector,nodes)}","arguments":args,"returnByValue":true,"objectGroup":group})).await?;
+                if installed.get("exceptionDetails").is_some()
+                    || installed["result"]["value"] != true
+                {
+                    return Err(CaptureReason::MaskingUnproven);
+                }
+            }
+        }
+    }
+    if seen.len() != context.frames.len() {
+        return Err(CaptureReason::IncompleteFrames);
+    }
+    Ok(())
+}
+
+fn source_mask_backend_ids(document: &Value, strings: &[Value]) -> Result<Vec<i64>, CaptureReason> {
+    let nodes = &document["nodes"];
+    let types = nodes["nodeType"]
+        .as_array()
+        .ok_or(CaptureReason::MaskingUnproven)?;
+    let backends = nodes["backendNodeId"]
+        .as_array()
+        .ok_or(CaptureReason::MaskingUnproven)?;
+    if types.len() != backends.len() {
+        return Err(CaptureReason::MaskingUnproven);
+    }
+    let mut internal = HashSet::new();
+    if let Some(rare) = nodes.get("shadowRootType") {
+        let indices = rare["index"]
+            .as_array()
+            .ok_or(CaptureReason::MaskingUnproven)?;
+        let values = rare["value"]
+            .as_array()
+            .ok_or(CaptureReason::MaskingUnproven)?;
+        if indices.len() != values.len() {
+            return Err(CaptureReason::MaskingUnproven);
+        }
+        let mut seen = HashSet::new();
+        for (index, value) in indices.iter().zip(values) {
+            let index = index
+                .as_u64()
+                .filter(|i| *i < types.len() as u64)
+                .ok_or(CaptureReason::MaskingUnproven)? as usize;
+            if !seen.insert(index) {
+                return Err(CaptureReason::MaskingUnproven);
+            }
+            let kind = value
+                .as_u64()
+                .and_then(|i| strings.get(i as usize))
+                .and_then(Value::as_str)
+                .ok_or(CaptureReason::MaskingUnproven)?;
+            match kind {
+                "user-agent" => {
+                    internal.insert(index);
+                }
+                "open" | "closed" => {}
+                _ => return Err(CaptureReason::MaskingUnproven),
+            }
+        }
+    }
+    types
+        .iter()
+        .zip(backends)
+        .enumerate()
+        .filter(|(i, (kind, _))| !internal.contains(i) && matches!(kind.as_u64(), Some(1 | 9 | 11)))
+        .map(|(_, (_, id))| {
+            id.as_i64()
+                .filter(|id| *id > 0)
+                .ok_or(CaptureReason::MaskingUnproven)
+        })
+        .collect()
+}
+
+// These are temporary owned stylesheet nodes, not author inline-style edits.
+// Opacity preserves layout and suppresses the entire control's composited
+// subtree. The raster pass still returns the original black mask rectangles.
+// This is bounded source-mask parity, not a promise against hostile transient
+// tampering that leaves no observable evidence between checks.
+const SOURCE_MASK_HOLDER: &str = r#"(()=>{
+ const connected=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected').get;
+ const owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
+ const getRoot=Node.prototype.getRootNode,append=Node.prototype.appendChild,remove=Node.prototype.removeChild;
+ const matches=Element.prototype.matches,queryDocument=Document.prototype.querySelectorAll,queryShadow=DocumentFragment.prototype.querySelectorAll;
+ const create=Document.prototype.createElement,text=Object.getOwnPropertyDescriptor(Node.prototype,'textContent').set;
+ const roots=new Map(),tracked=new Set();let selector=null,removed=false;
+ const rootOf=node=>getRoot.call(node);
+ const ours=node=>node===document||owner.call(node)===document;
+ const selected=node=>node.nodeType===1&&matches.call(node,'input[type="password" i],'+selector);
+ return {
+ install(request,nodes){
+  if(removed||typeof request!=='string'||!request.length||request.length>8192)return false;
+  if(selector!==null&&selector!==request)return false;selector=request;
+  // Parse the exact selector before adding a stylesheet.
+  queryDocument.call(document,'input[type="password" i],'+selector);
+  for(const node of nodes){
+   if(!connected.call(node)||!ours(node))return false;
+   const root=rootOf(node);if(root!==document&&!(root instanceof ShadowRoot))return false;
+   if(!roots.has(root)){
+    const style=create.call(document,'style');
+    const rule='input[type="password" i],'+selector+'{opacity:0!important}';
+    text.call(style,rule);
+    // Journal ownership before append; insertion failure is still removable.
+    roots.set(root,{style,rule,parent:root===document?document.documentElement:root});
+    append.call(roots.get(root).parent,style);
+    const sheet=style.sheet;if(!sheet||sheet.cssRules.length!==1)return false;roots.get(root).cssText=sheet.cssRules[0].cssText;
+   }
+   if(node.nodeType===1)tracked.add(node);
+  }
+  return true;
+ },
+ verify(){
+  if(removed||selector===null||!roots.has(document))return false;
+  for(const [root,entry]of roots){
+   if(!connected.call(root)||!connected.call(entry.style)||entry.style.parentNode!==entry.parent||rootOf(entry.style)!==root||entry.style.textContent!==entry.rule)return false;
+   const sheet=entry.style.sheet;if(!sheet||sheet.disabled||sheet.cssRules.length!==1)return false;
+   const rule=sheet.cssRules[0];if(rule.cssText!==entry.cssText)return false;if(rule.style.getPropertyValue('opacity')!=='0'||rule.style.getPropertyPriority('opacity')!=='important')return false;
+   const nodes=root===document?queryDocument.call(root,'input[type="password" i],'+selector):queryShadow.call(root,'input[type="password" i],'+selector);
+   for(const node of nodes)if(Number(getComputedStyle(node).opacity)!==0)return false;
+  }
+  for(const node of tracked)if(connected.call(node)&&selected(node)&&(!roots.has(rootOf(node))||Number(getComputedStyle(node).opacity)!==0))return false;
+  return true;
+ },
+ remove(){
+  let complete=true;
+  for(const {style}of roots.values()){try{if(style.parentNode)remove.call(style.parentNode,style);}catch{complete=false;}}
+  if(complete){removed=true;roots.clear();tracked.clear();}return complete;
+ }
+ };
+})()"#;
+
+fn source_mask_reason(reason: ProtectedReadReason) -> CaptureReason {
+    match reason {
+        ProtectedReadReason::BrowserFailure => CaptureReason::MaskingUnproven,
+        other => protected_reason(other),
+    }
 }
 pub(crate) fn geometry_reason(reason: GeometryError) -> CaptureReason {
     match reason {
@@ -348,6 +610,7 @@ async fn masks(
 ) -> Result<MaskProof, CaptureReason> {
     let mut proof = MaskProof {
         count: 0,
+        secure_nodes: Vec::new(),
         masks: Vec::new(),
     };
     let mut sessions = HashSet::new();
@@ -434,6 +697,8 @@ async fn masks(
                     if result.opaque { return Err(CaptureReason::UninspectableContent); }
                     if result.unsafe_geometry { return Err(CaptureReason::UnsafeGeometry); }
                     proof.count += result.count;
+                    if result.secure.len()!=result.count {return Err(CaptureReason::MaskingUnproven);}
+                    for index in result.secure {proof.secure_nodes.push((id.to_owned(),*batch.get(index).ok_or(CaptureReason::MaskingUnproven)?));}
                     if !result.masks.is_empty() && !owner_paint_checked { verify_owner_paint(context, operation, geometry, id).await?; owner_paint_checked = true; }
                     let secure_backends = result.masks.into_iter().map(|index| batch.get(index).copied().ok_or(CaptureReason::MaskingUnproven)).collect::<Result<Vec<_>, _>>()?;
                     let polygons: Vec<Result<Vec<Polygon>, CaptureReason>> = futures_util::stream::iter(secure_backends.into_iter().map(|backend| async move {
@@ -513,7 +778,7 @@ const OWNER_PAINT_READER: &str = r#"function(){
 const MASK_READER: &str = r#"function(selector,...nodes){
  const connected=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected').get;
  const owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
- let count=0,masks=[],opaque=false,unsafeGeometry=false;
+ let count=0,masks=[],secureIds=[],opaque=false,unsafeGeometry=false;
  for(const [index,node] of nodes.entries()){
   if(!connected.call(node)||owner.call(node)!==document)throw Error('stale');
   const rect=node.getBoundingClientRect(),style=getComputedStyle(node);
@@ -521,7 +786,7 @@ const MASK_READER: &str = r#"function(selector,...nodes){
   if(visible&&(node.localName==='object'||node.localName==='embed'))opaque=true;
   let secure=false;for(let p=node;p;){if(p.matches('input[type="password" i]')||p.matches(selector)){secure=true;break;}p=p.parentElement||(p.getRootNode().host||null);}
   if(!secure)continue;
-  count++;
+  count++;secureIds.push(index);
   if(!visible){if(style.display==='contents')unsafeGeometry=true;continue;}
   if(![rect.x,rect.y,rect.width,rect.height].every(Number.isFinite))throw Error('geometry');
   // A clean refusal is not an all-black success. Required password-input
@@ -532,7 +797,7 @@ const MASK_READER: &str = r#"function(selector,...nodes){
   if(bleed){unsafeGeometry=true;continue;}
   masks.push(index);
  }
- return {count,masks,opaque,unsafeGeometry};
+ return {count,masks,secure:secureIds,opaque,unsafeGeometry};
 }"#;
 
 fn raster_mask(
@@ -618,6 +883,49 @@ mod tests {
         }
     }
     #[test]
+    fn source_mask_native_roots_exclude_user_agent_and_retain_closed_author_nodes() {
+        let strings = vec![json!("user-agent"), json!("closed")];
+        let mut doc = json!({"nodes":{"nodeType":[9,1,11,1,11,1],"backendNodeId":[1,2,3,4,5,6],"shadowRootType":{"index":[2,3,4,5],"value":[0,0,1,1]}}});
+        assert_eq!(
+            source_mask_backend_ids(&doc, &strings).unwrap(),
+            vec![1, 2, 5, 6]
+        );
+        doc["nodes"]["shadowRootType"]["value"][0] = json!(99);
+        assert_eq!(
+            source_mask_backend_ids(&doc, &strings),
+            Err(CaptureReason::MaskingUnproven)
+        );
+    }
+    #[test]
+    fn source_mask_rejections_preserve_deadline_cancel_and_scope() {
+        assert_eq!(
+            source_mask_reason(ProtectedReadReason::Cancelled),
+            CaptureReason::Cancelled
+        );
+        assert_eq!(
+            source_mask_reason(ProtectedReadReason::Deadline),
+            CaptureReason::Deadline
+        );
+        assert_eq!(
+            source_mask_reason(ProtectedReadReason::StaleScope),
+            CaptureReason::StaleScope
+        );
+        let a = MaskProof {
+            count: 1,
+            secure_nodes: vec![("frame".into(), 1)],
+            masks: vec![],
+        };
+        let b = MaskProof {
+            count: 1,
+            secure_nodes: vec![("frame".into(), 2)],
+            masks: vec![],
+        };
+        assert!(
+            a != b,
+            "replacement secure node cannot reuse the earlier coverage proof"
+        );
+    }
+    #[test]
     fn geometry_proof_errors_never_become_optional_screenshot_failures() {
         assert_eq!(
             geometry_reason(GeometryError::BackendFailure),
@@ -645,6 +953,7 @@ mod tests {
             bytes.get_ref(),
             test_viewport(4.0, 4.0),
             &MaskProof {
+                secure_nodes: Vec::new(),
                 count: 1,
                 masks: vec![Polygon::rectangle_for_test(0.75, 0.75, 0.5, 0.5)],
             },
@@ -662,6 +971,7 @@ mod tests {
             b"not png",
             test_viewport(10.0, 10.0),
             &MaskProof {
+                secure_nodes: Vec::new(),
                 count: 0,
                 masks: vec![]
             },
@@ -671,6 +981,77 @@ mod tests {
     }
     /// Static one-page masking and cleanup proof only. This does not establish
     /// recursive target enrollment, OOPIF projection, or dynamic paint fidelity.
+    #[tokio::test]
+    #[ignore = "hosted Chromium: exact source-mask cleanup, dynamic closed roots and background visibility"]
+    async fn chromium_source_masks_cover_dynamic_fields_without_activating_background_page() {
+        use super::super::client_browser::{ExecutionGate, OwnedBrowser};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let mut owner = OwnedBrowser::launch(Default::default(), None)
+            .await
+            .unwrap();
+        let gate = Arc::new(ExecutionGate::default());
+        let page = owner.lease(gate.enter(false).unwrap()).unwrap();
+        let client = page.client.clone();
+        let session = page.page_session_id.clone();
+        let target = page.target_id.clone();
+        let (_tx, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 3100001,
+            deadline: Instant::now() + Duration::from_secs(30),
+            cancellation,
+        };
+        let result:Result<(),String>=async {
+            client.send_command("Runtime.evaluate",Some(json!({"expression":r#"(()=>{document.body.style.cssText='margin:0;background:white';const h=document.createElement('div');document.body.append(h);const root=h.attachShadow({mode:'closed'});const input=document.createElement('input');input.type='password';input.value='synthetic-only';input.style.cssText='position:absolute;left:10px;top:10px;width:80px;height:25px;background:red';root.append(input);window.__sourceMaskFixture={root,input,style:input.getAttribute('style')};return true})()"#,"returnByValue":true})),Some(&session)).await?;
+            // Independently activate another exact host page BEFORE the capture.
+            // The capture must preserve this state, never activate its own page.
+            let peer=client.send_command("Target.createTarget",Some(json!({"url":"about:blank","browserContextId":owner.context_id,"background":false})),None).await?["targetId"].as_str().ok_or("Missing peer target")?.to_owned();
+            let peer_session=client.send_command("Target.attachToTarget",Some(json!({"targetId":peer,"flatten":true})),None).await?["sessionId"].as_str().ok_or("Missing peer session")?.to_owned();
+            client.send_command("Target.activateTarget",Some(json!({"targetId":peer})),None).await?;
+            let read=json!({"expression":"({visibility:document.visibilityState,focus:document.hasFocus()})","returnByValue":true});
+            let before=client.send_command("Runtime.evaluate",Some(read.clone()),Some(&session)).await?["result"]["value"].clone();
+            let peer_before=client.send_command("Runtime.evaluate",Some(read.clone()),Some(&peer_session)).await?["result"]["value"].clone();
+            if before["visibility"]!="hidden"||peer_before["visibility"]!="visible"{return Err("Fixture did not establish exact background and foreground pages".into());}
+            let frames=super::super::client_observation::enumerate_frames(&client,&session,&HashMap::new(),&operation).await.map_err(|e|format!("Frame inventory: {e:?}"))?;
+            page.targets.acknowledge_enrollment().map_err(|e|format!("Primitive fixture inventory: {e:?}"))?;
+            let context=CaptureContext{page,frames,inventory_complete:true};
+            let mut journal=ProtectedReadJournal::begin(&context.page,&operation).map_err(|e|format!("Journal: {e:?}"))?;
+            let masked:Result<(),String>=async {
+                journal.stabilize_animations().await.map_err(|e|format!("Stabilization: {e:?}"))?;
+                install_source_masks(&context,&CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},&operation,&mut journal).await.map_err(|e|format!("Install: {e:?}"))?;
+                let changed=client.send_command("Runtime.evaluate",Some(json!({"expression":r#"(()=>{const f=window.__sourceMaskFixture;f.input.style.left='100px';const n=document.createElement('input');n.type='password';n.value='new-synthetic-only';n.style.cssText='position:absolute;left:10px;top:10px;width:80px;height:25px;background:red';f.root.append(n);f.newInput=n;return getComputedStyle(f.input).opacity==='0'&&getComputedStyle(n).opacity==='0'})()"#,"returnByValue":true})),Some(&session)).await?;
+                if changed["result"]["value"]!=true{return Err("Moved or new matching closed-root field was not masked at source".into());}
+                journal.verify_source_masks().await.map_err(|e|format!("Source proof: {e:?}"))?;
+                // Raw source screenshot must already suppress the red controls;
+                // the production raster pass adds the required black regions.
+                let shot=client.send_command("Page.captureScreenshot",Some(json!({"format":"png","fromSurface":true})),Some(&session)).await?;
+                let bytes=base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str().ok_or("No source pixels")?).map_err(|_|"Invalid source pixels")?;
+                let image=image::load_from_memory(&bytes).map_err(|_|"Invalid source PNG")?.to_rgba8();
+                if image.width()<185||image.height()<40{return Err("Unexpected source viewport".into());}
+                for x in [20,110]{if image.get_pixel(x,20).0!=[255,255,255,255]{return Err("Source mask did not suppress control pixels".into());}}
+                Ok(())
+            }.await;
+            let restore=journal.restore().await;
+            drop(journal);
+            restore.map_err(|e|format!("Source cleanup: {e:?}"))?;masked?;
+            let after=client.send_command("Runtime.evaluate",Some(read.clone()),Some(&session)).await?["result"]["value"].clone();
+            let peer_after=client.send_command("Runtime.evaluate",Some(read),Some(&peer_session)).await?["result"]["value"].clone();
+            if after!=before||peer_after!=peer_before{return Err("Source capture changed host visibility/focus".into());}
+            let clean=client.send_command("Runtime.evaluate",Some(json!({"expression":"(()=>{const f=window.__sourceMaskFixture;return f.root.querySelectorAll('style').length===0&&document.querySelectorAll('style').length===0&&getComputedStyle(f.input).opacity==='1'&&getComputedStyle(f.newInput).opacity==='1'&&f.input.style.left==='100px'&&f.input.value==='synthetic-only'})()","returnByValue":true})),Some(&session)).await?;
+            if clean["result"]["value"]!=true{return Err("Source cleanup left a rule or overwrote concurrent author state".into());}
+            for id in [&target,&peer]{let info=client.send_command("Target.getTargetInfo",Some(json!({"targetId":id})),None).await?;if info["targetInfo"]["targetId"]!=*id{return Err("Capture closed a host page".into());}}
+            client.send_command("Target.detachFromTarget",Some(json!({"sessionId":peer_session})),None).await?;
+            Ok(())
+        }.await;
+        let cleanup = owner.close().await;
+        assert!(
+            cleanup.is_ok(),
+            "Owned test context cleanup failed: {cleanup:?}"
+        );
+        assert!(result.is_ok(), "Source mask/background gate: {result:?}");
+    }
     #[tokio::test]
     #[ignore = "requires real Chromium; required static masked-pixel fidelity gate"]
     async fn chromium_static_mask_preserves_public_pixels_and_restores_state() {
@@ -718,7 +1099,7 @@ mod tests {
                 // Production callers cannot use this acknowledgement as a substitute
                 // for the native owner's recursive enrollment barrier.
                 page.targets.acknowledge_enrollment().map_err(|_|"Static inventory acknowledgement failed")?;
-                let captured=start_capture(CaptureContext{page,frames,inventory_complete:true,lifecycle_known_active:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await.map_err(|_|"Capture task failed")?.map_err(|_|"Static protected capture failed")?;
+                let captured=start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await.map_err(|_|"Capture task failed")?.map_err(|_|"Static protected capture failed")?;
                 let rate=client.send_command("Animation.getPlaybackRate",Some(json!({})),Some(&session)).await?;
                 if rate["playbackRate"].as_f64()!=Some(0.75){return Err("Animation playback was not restored".into());}
                 let controls=client.send_command("Runtime.evaluate",Some(json!({"expression":"window.__maskFixture.input.value==='synthetic-mask-only' && window.__maskFixture.input.getAttribute('style')===window.__maskFixture.style","returnByValue":true})),Some(&session)).await?;

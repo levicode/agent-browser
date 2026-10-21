@@ -111,7 +111,7 @@ async fn chromium_capture_retirement_races_publish_no_pixels_and_keep_typed_reas
             let frames=super::super::client_observation::enumerate_frames(&page.client,&page.page_session_id,&HashMap::new(),&operation).await.map_err(|_|"Frame enumeration failed")?;assert_eq!(frames.len(),2);
             page.targets.acknowledge_enrollment().map_err(|_|"Fixture enrollment failed")?;
             let identity=page.identity_scope.clone();
-            let outcome=start_capture(CaptureContext{page,frames,inventory_complete:true,lifecycle_known_active:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await.map_err(|_|"Retained capture task failed")?;
+            let outcome=start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await.map_err(|_|"Retained capture task failed")?;
             let failure=match outcome{Err(error)=>error,Ok(_)=>panic!("Retired capture returned pixels")};
             assert!(hook.reached.load(Ordering::SeqCst),"Race must occur after actual screenshot, not preflight");
             assert_eq!(failure.reason,if matches!(mode,Mode::Deadline){CaptureReason::Deadline}else{CaptureReason::StaleScope});assert_eq!(failure.identity_scope,identity);Ok::<(),String>(())
@@ -140,6 +140,7 @@ fn raster_png_dimensions_and_truncated_or_invalid_header_contract() {
         layout_height: 2.,
     };
     let proof = MaskProof {
+        secure_nodes: Vec::new(),
         count: 0,
         masks: Vec::new(),
     };

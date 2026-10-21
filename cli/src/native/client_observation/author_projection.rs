@@ -24,6 +24,8 @@ pub(super) struct Facts {
     #[serde(default)]
     pub suppress: bool,
     #[serde(default)]
+    pub skips_content: bool,
+    #[serde(default)]
     pub visible: bool,
     #[serde(default)]
     pub line_visible: Option<bool>,
@@ -227,6 +229,66 @@ pub(super) fn compact(
     mut nodes: HashMap<i64, SemanticNode>,
     limit: usize,
 ) -> Result<(Vec<SemanticNode>, bool), ObservationError> {
+    let mut rendered_parent = HashMap::new();
+    // Slot assignment takes precedence over the light-DOM parent. Unassigned
+    // light nodes have no rendered parent and cannot claim coverage by the host.
+    for entry in graph.entries.values() {
+        for child in &entry.rendered {
+            if rendered_parent.insert(*child, entry.id).is_some() {
+                return Err(ObservationError::BackendFailure);
+            }
+        }
+    }
+    // Content visibility suppresses descendants, not the owner's painted box.
+    // Follow proven native rendered edges, including closed-root slot ownership,
+    // rather than guessing a flat-tree parent from renderer-visible properties.
+    fn skipped_content(
+        id: i64,
+        nodes: &HashMap<i64, SemanticNode>,
+        parents: &HashMap<i64, i64>,
+        cache: &mut HashMap<i64, bool>,
+        depth: usize,
+    ) -> Result<bool, ObservationError> {
+        if let Some(value) = cache.get(&id) {
+            return Ok(*value);
+        }
+        if depth > 256 {
+            return Err(ObservationError::BackendFailure);
+        }
+        let skipped = if let Some(parent) = parents.get(&id) {
+            facts(nodes.get(parent).ok_or(ObservationError::BackendFailure)?)?.skips_content
+                || skipped_content(*parent, nodes, parents, cache, depth + 1)?
+        } else {
+            false
+        };
+        cache.insert(id, skipped);
+        Ok(skipped)
+    }
+    // Pseudos have native owner edges but are intentionally absent from line
+    // flow. They still inherit content skipping from that exact owner.
+    let mut content_parent = rendered_parent.clone();
+    for entry in graph.entries.values() {
+        for child in &entry.children {
+            if graph.entries.get(child).is_some_and(|node| node.pseudo)
+                && content_parent.insert(*child, entry.id).is_some()
+            {
+                return Err(ObservationError::BackendFailure);
+            }
+        }
+    }
+    let mut skipped = HashMap::new();
+    for id in &graph.ids {
+        skipped_content(*id, &nodes, &content_parent, &mut skipped, 0)?;
+    }
+    for (id, suppressed) in skipped {
+        if suppressed {
+            nodes
+                .get_mut(&id)
+                .and_then(|node| node.author.as_mut())
+                .ok_or(ObservationError::BackendFailure)?
+                .suppress = true;
+        }
+    }
     let mut runs: HashMap<i64, String> = HashMap::new();
     let mut direct = HashSet::new();
     let mut visiting = HashSet::new();
@@ -295,16 +357,6 @@ pub(super) fn compact(
     }
     for id in &graph.ids {
         run(*id, graph, &nodes, &mut runs, &mut direct, &mut visiting, 0)?;
-    }
-    let mut rendered_parent = HashMap::new();
-    // Slot assignment takes precedence over the light-DOM parent. Unassigned
-    // light nodes have no rendered parent and cannot claim coverage by the host.
-    for entry in graph.entries.values() {
-        for child in &entry.rendered {
-            if rendered_parent.insert(*child, entry.id).is_some() {
-                return Err(ObservationError::BackendFailure);
-            }
-        }
     }
     let mut coverage = HashMap::new();
     fn covered(
@@ -376,6 +428,9 @@ pub(super) fn compact(
             node.states.insert("hidden".into(), false);
             node.value = None;
         }
+        if f.suppress {
+            continue;
+        }
         if entry.kind == 3 {
             continue;
         }
@@ -395,7 +450,7 @@ pub(super) fn compact(
         } else {
             String::new()
         };
-        node.text = (!text.is_empty()).then_some(text);
+        node.text = (!text.is_empty() || f.skips_content).then_some(text);
         let independent = node.role.is_some()
             || node.test_id.is_some()
             || node.name.is_some()
@@ -715,6 +770,59 @@ mod tests {
         let p = f.el("p", None, vec![before, host, end]);
         assert_eq!(texts(&f.run(vec![p])), vec![Some("Hello dear Ada!")]);
     }
+    #[test]
+    fn skipped_content_keeps_owner_but_drops_descendant_lines_and_controls() {
+        let mut f = Fixture::default();
+        let text = f.text("Skipped text");
+        let button_text = f.text("Skipped");
+        let button = f.el("button", Some("button"), vec![button_text]);
+        let owner = f.el("div", Some("group"), vec![text, button]);
+        f.facts_mut(&owner).skips_content = true;
+        let owner_ref = reference(&owner);
+        let nodes = f.run(vec![owner]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].reference.id, owner_ref);
+        assert_eq!(nodes[0].text.as_deref(), Some(""));
+        assert!(nodes[0].children.is_empty());
+        assert_ne!(nodes[0].states.get("hidden"), Some(&true));
+    }
+    #[test]
+    fn skipped_content_excludes_pseudo_without_rebinding_unsuppressed_identity() {
+        for skips in [false, true] {
+            let mut f = Fixture::default();
+            let mut pseudo = f.el("", Some("text"), vec![]);
+            pseudo["pseudoType"] = json!("before");
+            let pseudo_ref = reference(&pseudo);
+            let mut owner = f.el("div", Some("group"), vec![]);
+            owner["pseudoElements"] = json!([pseudo]);
+            f.facts_mut(&owner).skips_content = skips;
+            let nodes = f.run(vec![owner]);
+            if skips {
+                assert_eq!(flat(&nodes).len(), 1);
+            } else {
+                assert!(flat(&nodes)
+                    .iter()
+                    .any(|node| node.reference.id == pseudo_ref));
+            }
+        }
+    }
+
+    #[test]
+    fn skipped_closed_slot_uses_native_distributed_parent_not_light_parent() {
+        let mut f = Fixture::default();
+        let text = f.text("Skipped slotted text");
+        let span = f.el("span", Some("button"), vec![text]);
+        let mut slot = f.el("slot", None, vec![]);
+        f.facts_mut(&slot).skips_content = true;
+        slot["distributedNodes"] = json!([{"backendNodeId":span["backendNodeId"]}]);
+        let mut host = f.el("host", Some("group"), vec![span]);
+        host["shadowRoots"] = json!([{"nodeType":11,"backendNodeId":999,"shadowRootType":"closed","children":[slot]}]);
+        let nodes = f.run(vec![host]);
+        assert_eq!(flat(&nodes).len(), 1);
+        assert!(nodes[0].children.is_empty());
+        assert_eq!(nodes[0].text, None);
+    }
+
     #[test]
     fn hidden_slot_breaks_coverage_but_visible_assigned_endpoint_survives() {
         let mut f = Fixture::default();

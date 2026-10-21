@@ -26,31 +26,28 @@ pub struct ProtectedReadFailure {
 /// task must be retained by the native owner through restore, even if the RPC
 /// receiver is dropped. Admission must already exclude all UI mutations.
 /// This does not advertise a capability: target event enrollment and Chromium
-/// freeze/read conformance remain separately required deployment gates.
+/// source-mask/read conformance remain separately required deployment gates.
 pub struct ProtectedReadJournal<'a> {
     page: &'a BrowserExecutionLease,
     operation: &'a OperationLease,
     barrier: ProtectedTargetBarrier,
     sessions: Vec<String>,
     touched: Vec<(String, f64)>,
+    source_masks: Vec<(String, Option<String>, String)>,
     restored: bool,
     started: bool,
-    freeze_completed: bool,
+    stabilization_completed: bool,
 }
 impl<'a> ProtectedReadJournal<'a> {
     pub fn begin(
         page: &'a BrowserExecutionLease,
         operation: &'a OperationLease,
-        lifecycle_known_active: bool,
     ) -> Result<Self, ProtectedReadFailure> {
         let failure = |reason| ProtectedReadFailure {
             reason,
             identity_scope: page.identity_scope.clone(),
             cleanup_integrity_lost: false,
         };
-        if !lifecycle_known_active {
-            return Err(failure(ProtectedReadReason::IncompleteInventory));
-        }
         let barrier = page
             .targets
             .protected_read_barrier()
@@ -81,9 +78,10 @@ impl<'a> ProtectedReadJournal<'a> {
             barrier,
             sessions,
             touched: Vec::new(),
+            source_masks: Vec::new(),
             restored: false,
             started: false,
-            freeze_completed: false,
+            stabilization_completed: false,
         };
         journal.check().map_err(failure)?;
         Ok(journal)
@@ -104,10 +102,10 @@ impl<'a> ProtectedReadJournal<'a> {
         }
         Ok(())
     }
-    /// A successful begin is not evidence that browser execution was frozen.
+    /// A successful begin is not evidence that animation stabilization completed.
     /// Pixel and semantic consumers use this before reading protected content.
-    pub fn require_frozen(&self) -> Result<(), ProtectedReadReason> {
-        if !self.freeze_completed || self.restored {
+    pub fn require_stabilized(&self) -> Result<(), ProtectedReadReason> {
+        if !self.stabilization_completed || self.restored {
             return Err(ProtectedReadReason::IncompleteInventory);
         }
         self.check()
@@ -135,7 +133,7 @@ impl<'a> ProtectedReadJournal<'a> {
             _=tokio::time::sleep_until(self.operation.deadline.into())=>Err(ProtectedReadReason::Deadline),
         }
     }
-    pub async fn freeze(&mut self) -> Result<(), ProtectedReadReason> {
+    pub async fn stabilize_animations(&mut self) -> Result<(), ProtectedReadReason> {
         if self.started || self.restored {
             return Err(ProtectedReadReason::StaleScope);
         }
@@ -157,48 +155,139 @@ impl<'a> ProtectedReadJournal<'a> {
                 json!({"playbackRate":0}),
             )
             .await?;
-            self.command(
-                &session,
-                "Page.setWebLifecycleState",
-                json!({"state":"frozen"}),
-            )
-            .await?;
         }
         self.check()?;
-        self.freeze_completed = true;
+        self.stabilization_completed = true;
         Ok(())
     }
-    /// Always call after freeze, including a failed/cancelled freeze. Cleanup
+    /// Ownership is recorded before any source stylesheet is inserted. The
+    /// object retains exact nodes and native removal methods in an isolated world.
+    pub(crate) fn reserve_source_group(
+        &mut self,
+        session: String,
+        group: String,
+    ) -> Result<(), ProtectedReadReason> {
+        self.require_stabilized()?;
+        if !self.contains_session(&session)
+            || self.source_masks.len() >= 4096
+            || self
+                .source_masks
+                .iter()
+                .any(|(s, _, g)| s == &session && g == &group)
+        {
+            return Err(ProtectedReadReason::IncompleteInventory);
+        }
+        self.source_masks.push((session, None, group));
+        Ok(())
+    }
+    pub(crate) fn bind_source_holder(
+        &mut self,
+        session: &str,
+        group: &str,
+        object: String,
+    ) -> Result<(), ProtectedReadReason> {
+        // Cleanup ownership accepts a known ACK even after cancellation; the
+        // next mutating command independently checks the original operation.
+        let entry = self
+            .source_masks
+            .iter_mut()
+            .find(|(s, _, g)| s == session && g == group)
+            .ok_or(ProtectedReadReason::IncompleteInventory)?;
+        if entry.1.is_some() {
+            return Err(ProtectedReadReason::IncompleteInventory);
+        }
+        entry.1 = Some(object);
+        Ok(())
+    }
+    pub(crate) async fn verify_source_masks(&self) -> Result<(), ProtectedReadReason> {
+        for (session, object, group) in &self.source_masks {
+            let object = object
+                .as_ref()
+                .ok_or(ProtectedReadReason::IncompleteInventory)?;
+            let response=self.command(session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":"function(){return this.verify()}","returnByValue":true,"objectGroup":group})).await?;
+            if response.get("exceptionDetails").is_some() || response["result"]["value"] != true {
+                return Err(ProtectedReadReason::BrowserFailure);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) async fn remove_source_masks(&mut self) -> Result<(), ProtectedReadReason> {
+        self.remove_source_masks_until(Instant::now() + Duration::from_secs(3))
+            .await
+    }
+    async fn remove_source_masks_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<(), ProtectedReadReason> {
+        // Keep every ownership record in self across await/caller cancellation.
+        // Remove only after exact node removal and group-release ACKs.
+        let attempts = self.source_masks.clone();
+        for (session, object, group) in attempts.into_iter().rev() {
+            if let Some(handle) = &object {
+                let result=tokio::time::timeout_at(deadline.into(),self.page.client.send_command("Runtime.callFunctionOn",Some(json!({"objectId":handle,"functionDeclaration":"function(){return this.remove()}","returnByValue":true,"objectGroup":group})),Some(&session))).await;
+                let removed = matches!(&result,Ok(Ok(value)) if value.get("exceptionDetails").is_none() && value["result"]["value"]==true);
+                if !removed {
+                    continue;
+                }
+            }
+            let released = tokio::time::timeout_at(
+                deadline.into(),
+                self.page.client.send_command(
+                    "Runtime.releaseObjectGroup",
+                    Some(json!({"objectGroup":group})),
+                    Some(&session),
+                ),
+            )
+            .await;
+            if matches!(released, Ok(Ok(_))) {
+                self.source_masks
+                    .retain(|(s, _, g)| s != &session || g != &group);
+            }
+        }
+        if !self.source_masks.is_empty() {
+            self.barrier.quarantine();
+            return Err(ProtectedReadReason::BrowserFailure);
+        }
+        Ok(())
+    }
+    /// Always call after stabilization, including failure/cancellation. Cleanup
     /// ignores the expired operation budget but has one total three-second cap.
     /// No staged value may escape until both restore and final check succeed.
     pub async fn restore(&mut self) -> Result<(), ProtectedReadFailure> {
         if self.restored {
             return Ok(());
         }
+        #[cfg(feature = "acceptance-faults")]
+        eprintln!(
+            "native-settlement sequence={} phase=ProtectedRestoreBegin",
+            self.operation.sequence
+        );
         let deadline = Instant::now() + Duration::from_secs(3);
-        let mut complete = true;
+        let mut complete = self.remove_source_masks_until(deadline).await.is_ok();
         for (session, rate) in self.touched.iter().rev() {
-            for (method, args) in [
-                ("Page.setWebLifecycleState", json!({"state":"active"})),
-                ("Animation.setPlaybackRate", json!({"playbackRate":rate})),
-            ] {
-                let command_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
-                if Instant::now() >= deadline {
-                    complete = false;
-                    break;
-                }
-                complete &= matches!(
-                    tokio::time::timeout_at(
-                        command_deadline.into(),
-                        self.page
-                            .client
-                            .send_command(method, Some(args), Some(session))
-                    )
-                    .await,
-                    Ok(Ok(_))
-                );
+            let command_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+            if Instant::now() >= deadline {
+                complete = false;
+                break;
             }
+            complete &= matches!(
+                tokio::time::timeout_at(
+                    command_deadline.into(),
+                    self.page.client.send_command(
+                        "Animation.setPlaybackRate",
+                        Some(json!({"playbackRate":rate})),
+                        Some(session)
+                    )
+                )
+                .await,
+                Ok(Ok(_))
+            );
         }
+        #[cfg(feature = "acceptance-faults")]
+        eprintln!(
+            "native-settlement sequence={} phase=ProtectedRestoreEnd integrity={}",
+            self.operation.sequence, complete
+        );
         if !complete {
             self.barrier.quarantine();
             return Err(ProtectedReadFailure {
@@ -213,7 +302,7 @@ impl<'a> ProtectedReadJournal<'a> {
 }
 impl Drop for ProtectedReadJournal<'_> {
     fn drop(&mut self) {
-        if !self.restored && !self.touched.is_empty() {
+        if !self.restored && (!self.touched.is_empty() || !self.source_masks.is_empty()) {
             self.barrier.quarantine();
         }
     }
@@ -236,6 +325,7 @@ mod tests {
         super::super::client_session::OperationLease,
         tokio::sync::watch::Sender<super::super::client_session::CancelSignal>,
         tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<Value>>>,
     ) {
         use super::super::client_session::{CancelSignal, OperationLease};
         use super::super::client_targets::ClientTargets;
@@ -255,6 +345,8 @@ mod tests {
             .unwrap();
         targets.acknowledge_enrollment().unwrap(); // Synthetic fixture only.
         let server_targets = targets.clone();
+        let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = records.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -263,16 +355,28 @@ mod tests {
                     continue;
                 };
                 let request: Value = serde_json::from_str(text).unwrap();
+                recorded.lock().unwrap().push(request.clone());
                 let mut response = json!({"id":request["id"],"sessionId":request["sessionId"],"result":if request["method"]=="Animation.getPlaybackRate" {json!({"playbackRate":1})} else {json!({})}});
+                if request["method"] == "Runtime.callFunctionOn" {
+                    response["result"] = json!({"result":{"value":true}});
+                    if request["params"]["objectId"] == "fail-remove"
+                        && request["params"]["functionDeclaration"]
+                            == "function(){return this.remove()}"
+                    {
+                        response.as_object_mut().unwrap().remove("result");
+                        response["error"] =
+                            json!({"code":-32000,"message":"synthetic source cleanup failure"});
+                    }
+                }
                 if stale_during_restore
-                    && request["method"] == "Page.setWebLifecycleState"
-                    && request["params"]["state"] == "active"
+                    && request["method"] == "Animation.setPlaybackRate"
+                    && request["params"]["playbackRate"].as_f64() == Some(1.0)
                 {
                     server_targets.invalidate_inventory().unwrap();
                 }
                 if fail_restore
-                    && request["method"] == "Page.setWebLifecycleState"
-                    && request["params"]["state"] == "active"
+                    && request["method"] == "Animation.setPlaybackRate"
+                    && request["params"]["playbackRate"].as_f64() == Some(1.0)
                 {
                     response.as_object_mut().unwrap().remove("result");
                     response["error"] =
@@ -307,18 +411,18 @@ mod tests {
             deadline: std::time::Instant::now() + Duration::from_secs(5),
             cancellation,
         };
-        (page, operation, sender, server)
+        (page, operation, sender, server, records)
     }
     #[tokio::test]
     async fn protected_journal_restores_before_releasing_barrier() {
-        let (page, operation, _sender, server) = journal_fixture(false, false).await;
-        let mut journal = super::ProtectedReadJournal::begin(&page, &operation, true).unwrap();
-        assert!(journal.require_frozen().is_err());
-        journal.freeze().await.unwrap();
-        journal.require_frozen().unwrap();
+        let (page, operation, _sender, server, _records) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        assert!(journal.require_stabilized().is_err());
+        journal.stabilize_animations().await.unwrap();
+        journal.require_stabilized().unwrap();
         assert!(page.targets.protected_read_barrier().is_err());
         journal.restore().await.unwrap();
-        assert!(journal.require_frozen().is_err());
+        assert!(journal.require_stabilized().is_err());
         journal.check().unwrap();
         drop(journal);
         assert!(page.targets.protected_read_barrier().is_ok());
@@ -327,9 +431,10 @@ mod tests {
     #[tokio::test]
     async fn protected_journal_abandonment_and_cleanup_failure_seal_original_scope() {
         for cleanup in [false, true] {
-            let (page, operation, _sender, server) = journal_fixture(cleanup, false).await;
-            let mut journal = super::ProtectedReadJournal::begin(&page, &operation, true).unwrap();
-            journal.freeze().await.unwrap();
+            let (page, operation, _sender, server, _records) =
+                journal_fixture(cleanup, false).await;
+            let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+            journal.stabilize_animations().await.unwrap();
             if cleanup {
                 let error = journal.restore().await.unwrap_err();
                 assert!(error.cleanup_integrity_lost);
@@ -343,12 +448,92 @@ mod tests {
 
     #[tokio::test]
     async fn protected_journal_clean_restore_does_not_authorize_stale_publish() {
-        let (page, operation, _sender, server) = journal_fixture(false, true).await;
-        let mut journal = super::ProtectedReadJournal::begin(&page, &operation, true).unwrap();
-        journal.freeze().await.unwrap();
+        let (page, operation, _sender, server, _records) = journal_fixture(false, true).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
         journal.check().unwrap();
         journal.restore().await.unwrap();
         assert_eq!(journal.check(), Err(super::ProtectedReadReason::StaleScope));
+        drop(journal);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn source_mask_cleanup_drains_all_owned_holders_even_after_cancel_or_failure() {
+        for fail in [false, true] {
+            let (page, operation, sender, server, records) = journal_fixture(false, false).await;
+            let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+            journal.stabilize_animations().await.unwrap();
+            journal
+                .reserve_source_group("session".into(), "clean-group".into())
+                .unwrap();
+            journal
+                .bind_source_holder("session", "clean-group", "clean".into())
+                .unwrap();
+            journal
+                .reserve_source_group("session".into(), "second-group".into())
+                .unwrap();
+            journal
+                .bind_source_holder(
+                    "session",
+                    "second-group",
+                    if fail { "fail-remove" } else { "second" }.into(),
+                )
+                .unwrap();
+            journal.verify_source_masks().await.unwrap();
+            sender
+                .send(super::super::client_session::CancelSignal::Requested)
+                .unwrap();
+            let result = journal.restore().await;
+            assert_eq!(result.is_err(), fail);
+            if let Err(error) = result {
+                assert!(error.cleanup_integrity_lost);
+            }
+            let commands = records.lock().unwrap();
+            assert!(commands
+                .iter()
+                .any(|r| r["method"] == "Runtime.callFunctionOn"
+                    && r["params"]["objectId"] == "clean"
+                    && r["params"]["functionDeclaration"] == "function(){return this.remove()}"));
+            assert!(commands
+                .iter()
+                .any(|r| r["method"] == "Runtime.releaseObjectGroup"
+                    && r["params"]["objectGroup"] == "clean-group"));
+            assert!(commands
+                .iter()
+                .any(|r| r["method"] == "Animation.setPlaybackRate"
+                    && r["params"]["playbackRate"].as_f64() == Some(1.0)));
+            assert!(!commands
+                .iter()
+                .any(|r| r["method"] == "Page.setWebLifecycleState"
+                    || r["method"] == "Page.bringToFront"));
+            drop(commands);
+            drop(journal);
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_source_group_is_released_without_fabricated_holder_after_cancel() {
+        let (page, operation, sender, server, records) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
+        journal
+            .reserve_source_group("session".into(), "unacknowledged-group".into())
+            .unwrap();
+        sender
+            .send(super::super::client_session::CancelSignal::Requested)
+            .unwrap();
+        journal.restore().await.unwrap();
+        let commands = records.lock().unwrap();
+        assert!(commands
+            .iter()
+            .any(|r| r["method"] == "Runtime.releaseObjectGroup"
+                && r["params"]["objectGroup"] == "unacknowledged-group"));
+        assert!(!commands
+            .iter()
+            .any(|r| r["method"] == "Runtime.callFunctionOn"));
+        drop(commands);
         drop(journal);
         server.abort();
     }
@@ -393,7 +578,7 @@ mod tests {
     /// Run explicitly with --ignored; all data are synthetic and no network is used.
     #[tokio::test]
     #[ignore = "requires real Chromium; required protected-read browser CI gate"]
-    async fn chromium_frozen_page_keeps_native_read_lane_and_restores() {
+    async fn chromium_animation_stabilization_preserves_visibility_and_native_reads() {
         let mut owner = OwnedBrowser::launch(Default::default(), None)
             .await
             .unwrap();
@@ -423,13 +608,7 @@ mod tests {
                 json!({"playbackRate":0}),
             )
             .await?;
-            bounded(
-                client,
-                session,
-                "Page.setWebLifecycleState",
-                json!({"state":"frozen"}),
-            )
-            .await?;
+            let visibility=bounded(client,session,"Runtime.evaluate",json!({"expression":"({visibility:document.visibilityState,focus:document.hasFocus()})","returnByValue":true})).await?["result"]["value"].clone();
             let tree = bounded(client, session, "Page.getFrameTree", json!({})).await?;
             let frame = tree["frameTree"]["frame"]["id"]
                 .as_str()
@@ -445,11 +624,10 @@ mod tests {
                 .as_i64()
                 .ok_or("missing world")?;
             let before = counter(client, session, Some(world)).await?;
-            // This delay measures scheduler suspension, never readiness/state restoration.
-            tokio::time::sleep(Duration::from_millis(80)).await;
-            if counter(client, session, Some(world)).await? != before {
-                return Err("page timer advanced while frozen".into());
-            }
+            // Animations may pause, but normal JS scheduling must remain live.
+            advances(client,session,before).await?;
+            let after_visibility=bounded(client,session,"Runtime.evaluate",json!({"expression":"({visibility:document.visibilityState,focus:document.hasFocus()})","returnByValue":true})).await?["result"]["value"].clone();
+            if after_visibility!=visibility{return Err("animation stabilization changed visibility/focus".into());}
             let ax = bounded(
                 client,
                 session,
@@ -461,7 +639,7 @@ mod tests {
                 .as_array()
                 .is_some_and(|nodes| nodes.iter().any(|n| n["role"]["value"] == "button"))
             {
-                return Err("frozen AX read lost button".into());
+                return Err("stabilized AX read lost button".into());
             }
             let dom = bounded(
                 client,
@@ -490,20 +668,13 @@ mod tests {
                 .map_err(|_| "undecodable synthetic image")?;
             let after = bounded(client, session, "Page.getFrameTree", json!({})).await?;
             if after["frameTree"]["frame"]["loaderId"] != loader {
-                return Err("document changed during frozen read".into());
+                return Err("document changed during stabilized read".into());
             }
             Ok(())
         }
         .await;
         let cleanup: Result<(), String> = async {
             if touched {
-                let active = bounded(
-                    client,
-                    session,
-                    "Page.setWebLifecycleState",
-                    json!({"state":"active"}),
-                )
-                .await;
                 let rate = bounded(
                     client,
                     session,
@@ -511,7 +682,6 @@ mod tests {
                     json!({"playbackRate":original_rate.unwrap_or(1.0)}),
                 )
                 .await;
-                active?;
                 rate?;
                 if bounded(client, session, "Animation.getPlaybackRate", json!({})).await?
                     ["playbackRate"]
@@ -530,6 +700,9 @@ mod tests {
         let closed = owner.close().await;
         assert!(closed.is_ok(), "owned synthetic context cleanup failed");
         assert!(cleanup.is_ok(), "restoration proof failed: {cleanup:?}");
-        assert!(result.is_ok(), "frozen read conformance failed: {result:?}");
+        assert!(
+            result.is_ok(),
+            "animation stabilization conformance failed: {result:?}"
+        );
     }
 }

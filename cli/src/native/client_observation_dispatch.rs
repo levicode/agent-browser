@@ -73,8 +73,6 @@ pub struct DispatchContext {
     pub blobs: Arc<BlobStore>,
     pub scope: BlobScope,
     pub policy: ReadPolicy,
-    /// Supplied only by the lifecycle owner, never a wire flag.
-    pub lifecycle_known_active: bool,
 }
 pub struct DispatchTask {
     /// Must be retained and joined by lifecycle shutdown, never aborted merely
@@ -233,6 +231,7 @@ impl ObservationDispatch {
         let identity = context.page.identity_scope.clone();
         let observation_cleanup = AtomicBool::new(false);
         let map_observation = |error| observation_error_with_cleanup(error, &observation_cleanup);
+        let map_geometry = |error| geometry_error_with_cleanup(error, &observation_cleanup);
         let failure = |error: ProtocolError| DispatchFailure {
             error: error.clone(),
             identity_scope: identity.clone(),
@@ -248,6 +247,11 @@ impl ObservationDispatch {
         validate_policy(&context.policy, &request).map_err(failure)?;
         let protected =
             !matches!(&request, DispatchRequest::Query(q) if q.purpose == QueryPurpose::Fixture);
+        // Semantic-only reads need exclusive admission and exact target/frame
+        // fences, not a browser lifecycle mutation. Chromium's frozen state
+        // also hides the page; setting active does not undo that visibility.
+        let stabilize_pixels = matches!(&request, DispatchRequest::Screenshot(_))
+            || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
         let _ui = context
             .ui
             .enter(
@@ -307,7 +311,6 @@ impl ObservationDispatch {
             page: context.page,
             frames,
             inventory_complete: true,
-            lifecycle_known_active: context.lifecycle_known_active,
         };
         let is_observe = matches!(&request, DispatchRequest::Observe(_));
         let outcome = async {
@@ -316,7 +319,6 @@ impl ObservationDispatch {
                 ProtectedReadJournal::begin(
                     &capture_context.page,
                     &operation,
-                    context.lifecycle_known_active,
                 )
                 .map_err(|e| DispatchFailure {
                     error: protected_error(e.reason),
@@ -329,19 +331,25 @@ impl ObservationDispatch {
         };
         let mut geometry = None;
         let result = async {
-            if let Some(journal) = &mut journal { journal.freeze().await.map_err(protected_error)?; }
+            if stabilize_pixels { journal.as_mut().ok_or(ProtocolError::PolicyDenied)?.stabilize_animations().await.map_err(protected_error)?; }
             let frozen = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
             same_frames(&capture_context.frames, &frozen)?;
-            geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(geometry_error)?);
-            let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
+            // A semantic tree may prove an iframe owner non-rendering. Acquire
+            // that exact proof before spatial validation, never infer it from
+            // omitted/truncated output. Pixel and query paths remain strict.
+            if !matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels) {
+                geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(map_geometry)?);
+            }
             match request {
                 DispatchRequest::Query(query) => {
+                    let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     let mut output = observation::query(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &query.options, &operation).await.map_err(map_observation)?;
-                    observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut output.nodes, &operation).await.map_err(geometry_error)?;
+                    observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut output.nodes, &operation).await.map_err(map_geometry)?;
                     Ok((serde_json::to_value(output).map_err(|_| ProtocolError::BrowserFailure)?, None, false))
                 }
                 DispatchRequest::Screenshot(request) => {
-                    let pixels = client_capture::capture_under_journal(&capture_context, &request, &operation, journal.as_ref().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(capture_error)?;
+                    let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
+                    let pixels = client_capture::capture_under_journal(&capture_context, &request, &operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(capture_error)?;
                     Ok((Value::Null, Some(pixels), false))
                 }
                 DispatchRequest::Observe(request) => {
@@ -364,14 +372,18 @@ impl ObservationDispatch {
                     }.await;
                     let (mut value, fallback) = match tree {
                         Ok(mut tree) => {
-                            observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut tree.roots, &operation).await.map_err(geometry_error)?;
+                            if geometry.is_none() {
+                                geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.hidden_frame_proof, &operation).await.map_err(map_geometry)?);
+                            }
+                            let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
+                            observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut tree.roots, &operation).await.map_err(map_geometry)?;
                             let root = exact_root(tree.roots, &staged, &frozen)?;
                             verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
                             (json!({"identityScope":identity,"revision":revision.to_string(),"root":root,"viewportRef":tree.viewport_ref,"truncated":tree.truncated}), false)
                         }
                         Err(ObservationError::DeadlineExceeded) if request.options.pixel_fallback => {
                             check(&capture_context.page, &operation)?;
-                            // The old frozen transaction must restore before fresh
+                            // Any previous pixel stabilization must restore before fresh
                             // fallback pixels can observe current application state.
                             return Ok((Value::Null, None, true));
                         }
@@ -382,8 +394,9 @@ impl ObservationDispatch {
                     let main = main_frame(&frozen)?;
                     value["location"] = Value::String(main.url.clone());
                     let pixels = if request.options.pixels || fallback {
+                        let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                         let pixel_operation = pixel_lease(&operation);
-                        let result = client_capture::capture_under_journal(&capture_context, &CaptureRequest { secure_field_selector: request.secure_field_selector }, &pixel_operation, journal.as_ref().ok_or(ProtocolError::PolicyDenied)?, geometry).await;
+                        let result = client_capture::capture_under_journal(&capture_context, &CaptureRequest { secure_field_selector: request.secure_field_selector }, &pixel_operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await;
                         match result {
                             Ok(pixels) => {
                                 if viewport(&capture_context.page, &operation).await? != value["viewport"] { return Err(ProtocolError::StaleScope); }
@@ -424,7 +437,7 @@ impl ObservationDispatch {
                 geometry
                     .revalidate(&capture_context.page.client, &operation)
                     .await
-                    .map_err(geometry_error)
+                    .map_err(map_geometry)
                     .map_err(failure)?;
             }
         }
@@ -618,15 +631,14 @@ async fn fresh_fallback<'a>(
         identity_scope: context.page.identity_scope.clone(),
     };
     let mut journal =
-        ProtectedReadJournal::begin(&context.page, operation, context.lifecycle_known_active)
-            .map_err(|error| DispatchFailure {
-                error: protected_error(error.reason),
-                identity_scope: error.identity_scope,
-                cleanup_integrity_lost: error.cleanup_integrity_lost,
-            })?;
+        ProtectedReadJournal::begin(&context.page, operation).map_err(|error| DispatchFailure {
+            error: protected_error(error.reason),
+            identity_scope: error.identity_scope,
+            cleanup_integrity_lost: error.cleanup_integrity_lost,
+        })?;
     let mut geometry = None;
     let result = async {
-        journal.freeze().await.map_err(protected_error)?;
+        journal.stabilize_animations().await.map_err(protected_error)?;
         let frozen = verified_frames_with_cleanup(&context.page, operation, Some(&observation_cleanup)).await?;
         same_frames(&context.frames, &frozen)?;
         geometry = Some(GeometrySnapshot::capture(&context.page.client, &context.page.page_session_id, &frozen, operation).await.map_err(geometry_error)?);
@@ -634,7 +646,7 @@ async fn fresh_fallback<'a>(
         let root = minimal_document(&context.page, &frozen, refs, revision, operation).await?;
         let viewport_ref = refs.try_viewport_ref().map_err(|_| ProtocolError::IdentifierExhausted)?;
         let viewport = viewport(&context.page, operation).await?;
-        let pixels = client_capture::capture_under_journal(context, &CaptureRequest { secure_field_selector: selector.to_owned() }, &pixel_lease(operation), &journal, geometry).await.map_err(capture_error)?;
+        let pixels = client_capture::capture_under_journal(context, &CaptureRequest { secure_field_selector: selector.to_owned() }, &pixel_lease(operation), &mut journal, geometry).await.map_err(capture_error)?;
         let value = json!({"identityScope":context.page.identity_scope,"revision":revision.to_string(),"root":{"ref":root},
             "viewportRef":{"id":format!("@{viewport_ref}"),"revision":revision.to_string()},"truncated":true,"treeUnavailable":true,
             "viewport":viewport,"location":main_frame(&frozen)?.url});
@@ -1190,6 +1202,20 @@ fn protected_error(error: ProtectedReadReason) -> ProtocolError {
         ProtectedReadReason::BrowserFailure => ProtocolError::BrowserFailure,
     }
 }
+fn geometry_error_with_cleanup(
+    error: super::client_geometry::GeometryError,
+    cleanup: &AtomicBool,
+) -> ProtocolError {
+    match error {
+        super::client_geometry::GeometryError::CleanupFailed { primary } => {
+            cleanup.store(true, Ordering::SeqCst);
+            primary
+                .map(|error| geometry_error_with_cleanup(*error, cleanup))
+                .unwrap_or(ProtocolError::CleanupFailed)
+        }
+        error => geometry_error(error),
+    }
+}
 fn geometry_error(error: super::client_geometry::GeometryError) -> ProtocolError {
     capture_error(client_capture::geometry_reason(error))
 }
@@ -1403,8 +1429,11 @@ mod tests {
                         _ => json!({}),
                     };
                     let mut response = json!({"id":request["id"],"sessionId":request["sessionId"],"result":result});
-                    if request["method"] == "Page.setWebLifecycleState"
-                        && request["params"]["state"] == "active"
+                    assert_ne!(request["method"], "Page.setWebLifecycleState");
+                    // Hold the exact saved-rate restoration ACK, not the removed
+                    // lifecycle activation command. JSON encodes this f64 as 1.0.
+                    if request["method"] == "Animation.setPlaybackRate"
+                        && request["params"]["playbackRate"].as_f64() == Some(1.0)
                     {
                         if let Some(send) = restoring_send.take() {
                             let _ = send.send(());
@@ -1479,7 +1508,6 @@ mod tests {
                         test_id_attribute: "data-testid".into(),
                         secure_field_selector: "input[type=password]".into(),
                     },
-                    lifecycle_known_active: true,
                 },
                 DispatchRequest::Screenshot(CaptureRequest {
                     secure_field_selector: "input[type=password]".into(),
@@ -1525,138 +1553,200 @@ mod tests {
     }
     #[cfg(feature = "acceptance-faults")]
     #[tokio::test]
-    async fn semantic_timeout_restores_then_freezes_a_distinct_pixel_transaction() {
-        use super::super::cdp::client::CdpClient;
-        use super::super::client_browser::ExecutionGate;
-        use super::super::client_targets::ClientTargets;
-        use super::super::client_test_faults::{FaultController, Phase, State};
-        use base64::Engine;
-        use futures_util::{SinkExt, StreamExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}", listener.local_addr().unwrap());
-        let lifecycle = Arc::new(Mutex::new(Vec::<String>::new()));
-        let log = lifecycle.clone();
-        let mut bytes = std::io::Cursor::new(Vec::new());
-        image::DynamicImage::new_rgba8(10, 10)
-            .write_to(&mut bytes, image::ImageFormat::Png)
-            .unwrap();
-        let png = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            while let Some(Ok(message)) = socket.next().await {
-                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
-                if request["method"] == "Page.setWebLifecycleState" {
-                    log.lock()
-                        .unwrap()
-                        .push(request["params"]["state"].as_str().unwrap().into());
+    async fn semantic_only_timeout_never_mutates_lifecycle_and_fallback_stabilizes_separately() {
+        for (pixels, fallback) in [(false, false), (false, true), (true, true)] {
+            use super::super::cdp::client::CdpClient;
+            use super::super::client_browser::ExecutionGate;
+            use super::super::client_targets::ClientTargets;
+            use super::super::client_test_faults::{FaultController, Phase, State};
+            use base64::Engine;
+            use futures_util::{SinkExt, StreamExt};
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let lifecycle = Arc::new(Mutex::new(Vec::<String>::new()));
+            let log = lifecycle.clone();
+            let animation_commands = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let animation_log = animation_commands.clone();
+            let source_commands = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+            let source_log = source_commands.clone();
+            let mut bytes = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(10, 10)
+                .write_to(&mut bytes, image::ImageFormat::Png)
+                .unwrap();
+            let png = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    if request["method"]
+                        .as_str()
+                        .is_some_and(|method| method.starts_with("Animation."))
+                    {
+                        animation_log.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if request["method"] == "Page.setWebLifecycleState" {
+                        log.lock()
+                            .unwrap()
+                            .push(request["params"]["state"].as_str().unwrap().into());
+                    }
+                    let result = match request["method"].as_str().unwrap() {
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"}}})
+                        }
+                        "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                        "Animation.getPlaybackRate" => json!({"playbackRate":1}),
+                        "Page.getLayoutMetrics" => {
+                            json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}})
+                        }
+                        "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":1}}),
+                        "DOMSnapshot.captureSnapshot" => {
+                            json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[],"backendNodeId":[]}}]})
+                        }
+                        "Runtime.evaluate" => {
+                            // This peer has an empty DOM inventory. Its only evaluate is
+                            // the source-mask holder factory, never an arbitrary script.
+                            assert_eq!(request["params"]["contextId"], 1);
+                            assert!(request["params"]["objectGroup"]
+                                .as_str()
+                                .unwrap()
+                                .starts_with("capture-source-"));
+                            source_log.lock().unwrap().push("holder");
+                            json!({"result":{"type":"object","objectId":"source-holder"}})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            assert_eq!(request["params"]["objectId"], "source-holder");
+                            let phase =
+                                match request["params"]["functionDeclaration"].as_str().unwrap() {
+                                    "function(){return this.verify()}" => "verify",
+                                    "function(){return this.remove()}" => "remove",
+                                    other => panic!("unexpected source holder method: {other}"),
+                                };
+                            assert_eq!(request["params"]["returnByValue"], true);
+                            assert!(request["params"]["objectGroup"]
+                                .as_str()
+                                .unwrap()
+                                .starts_with("capture-source-"));
+                            source_log.lock().unwrap().push(phase);
+                            json!({"result":{"type":"boolean","value":true}})
+                        }
+                        "Runtime.releaseObjectGroup"
+                            if request["params"]["objectGroup"]
+                                .as_str()
+                                .is_some_and(|group| group.starts_with("capture-source-")) =>
+                        {
+                            source_log.lock().unwrap().push("release");
+                            json!({})
+                        }
+                        "Page.captureScreenshot" => json!({"data":png}),
+                        _ => json!({}),
+                    };
+                    if socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"sessionId":request["sessionId"],"result":result}).to_string())).await.is_err() { break; }
                 }
-                let result = match request["method"].as_str().unwrap() {
-                    "Page.getFrameTree" => {
-                        json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"}}})
-                    }
-                    "Page.createIsolatedWorld" => json!({"executionContextId":1}),
-                    "Animation.getPlaybackRate" => json!({"playbackRate":1}),
-                    "Page.getLayoutMetrics" => {
-                        json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}})
-                    }
-                    "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":1}}),
-                    "DOMSnapshot.captureSnapshot" => {
-                        json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[],"backendNodeId":[]}}]})
-                    }
-                    "Page.captureScreenshot" => json!({"data":png}),
-                    _ => json!({}),
-                };
-                if socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"sessionId":request["sessionId"],"result":result}).to_string())).await.is_err() { break; }
-            }
-        });
-        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
-        let targets = ClientTargets::new("context".into(), "scope".into());
-        targets
-            .attached("context", "target".into(), "session".into(), "page".into())
-            .unwrap();
-        targets.configured("target").unwrap();
-        targets
-            .resume_permit("target")
-            .await
-            .unwrap()
-            .complete()
-            .unwrap();
-        targets.acknowledge_enrollment().unwrap(); // Synthetic complete single-page inventory only.
-        let gate = Arc::new(ExecutionGate::default());
-        let page = BrowserExecutionLease {
-            client,
-            page_session_id: "session".into(),
-            target_id: "target".into(),
-            identity_scope: "scope".into(),
-            permit: gate.enter(false).unwrap(),
-            targets,
-        };
-        let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
-        let scope = BlobScope {
-            generation: 1,
-            identity_scope: "scope".into(),
-        };
-        blobs.activate_scope(scope.clone()).unwrap();
-        let faults = Arc::new(FaultController::default());
-        let token = faults.arm("scope", Phase::SemanticAcquire).unwrap();
-        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
-        let operation = OperationLease {
-            is_callback: false,
-            generation: 1,
-            sequence: 1,
-            deadline: Instant::now() + Duration::from_millis(2000),
-            cancellation,
-        };
-        let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
-        let task = dispatch.start(
-            DispatchContext {
-                faults: faults.clone(),
-                page,
-                ui: Arc::new(UiGate::default()),
-                blobs: blobs.clone(),
-                scope: scope.clone(),
-                policy: ReadPolicy {
+            });
+            let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+            let targets = ClientTargets::new("context".into(), "scope".into());
+            targets
+                .attached("context", "target".into(), "session".into(), "page".into())
+                .unwrap();
+            targets.configured("target").unwrap();
+            targets
+                .resume_permit("target")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            targets.acknowledge_enrollment().unwrap(); // Synthetic complete single-page inventory only.
+            let gate = Arc::new(ExecutionGate::default());
+            let page = BrowserExecutionLease {
+                client,
+                page_session_id: "session".into(),
+                target_id: "target".into(),
+                identity_scope: "scope".into(),
+                permit: gate.enter(false).unwrap(),
+                targets,
+            };
+            let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
+            let scope = BlobScope {
+                generation: 1,
+                identity_scope: "scope".into(),
+            };
+            blobs.activate_scope(scope.clone()).unwrap();
+            let faults = Arc::new(FaultController::default());
+            let token = faults.arm("scope", Phase::SemanticAcquire).unwrap();
+            let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: Instant::now() + Duration::from_millis(2000),
+                cancellation,
+            };
+            let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+            let task = dispatch.start(
+                DispatchContext {
+                    faults: faults.clone(),
+                    page,
+                    ui: Arc::new(UiGate::default()),
+                    blobs: blobs.clone(),
+                    scope: scope.clone(),
+                    policy: ReadPolicy {
+                        test_id_attribute: "data-testid".into(),
+                        secure_field_selector: "input[type=password]".into(),
+                    },
+                },
+                DispatchRequest::Observe(ObserveRequest {
+                    options: ObserveFlags {
+                        pixels,
+                        pixel_fallback: fallback,
+                        comparable: false,
+                    },
                     test_id_attribute: "data-testid".into(),
                     secure_field_selector: "input[type=password]".into(),
-                },
-                lifecycle_known_active: true,
-            },
-            DispatchRequest::Observe(ObserveRequest {
-                options: ObserveFlags {
-                    pixels: false,
-                    pixel_fallback: true,
-                    comparable: false,
-                },
-                test_id_attribute: "data-testid".into(),
-                secure_field_selector: "input[type=password]".into(),
-            }),
-            operation,
-        );
-        let output = task.result.await.unwrap().unwrap();
-        task.join.await.unwrap().unwrap();
-        assert_eq!(output["treeUnavailable"], true);
-        let root = output["root"].as_object().expect("fallback root object");
-        assert_eq!(
-            root.len(),
-            1,
-            "unavailable tree must serialize only the exact root reference"
-        );
-        assert!(root.contains_key("ref"));
-        assert!(root["ref"]["id"].as_str().unwrap().starts_with("@e"));
-        assert_eq!(output["truncated"], true);
-        assert_eq!(
-            faults.status("scope", &token).unwrap().state,
-            State::Expired
-        );
-        assert_eq!(
-            *lifecycle.lock().unwrap(),
-            vec!["frozen", "active", "frozen", "active"]
-        );
-        blobs
-            .release(&scope, output["pixels"]["handle"].as_str().unwrap())
-            .unwrap();
-        server.abort();
+                }),
+                operation,
+            );
+            let output = task.result.await.unwrap();
+            task.join.await.unwrap().unwrap();
+            if !fallback {
+                assert_eq!(output.unwrap_err().error, ProtocolError::DeadlineExceeded);
+                assert!(lifecycle.lock().unwrap().is_empty());
+                assert_eq!(animation_commands.load(Ordering::SeqCst), 0);
+                assert!(source_commands.lock().unwrap().is_empty());
+                server.abort();
+                continue;
+            }
+            let output = output.unwrap();
+            assert_eq!(output["treeUnavailable"], true);
+            let root = output["root"].as_object().expect("fallback root object");
+            assert_eq!(
+                root.len(),
+                1,
+                "unavailable tree must serialize only the exact root reference"
+            );
+            assert!(root.contains_key("ref"));
+            assert!(root["ref"]["id"].as_str().unwrap().starts_with("@e"));
+            assert_eq!(output["truncated"], true);
+            assert_eq!(
+                faults.status("scope", &token).unwrap().state,
+                State::Expired
+            );
+            assert!(lifecycle.lock().unwrap().is_empty());
+            assert_eq!(
+                animation_commands.load(Ordering::SeqCst),
+                if pixels { 8 } else { 4 }
+            );
+            let expected_source_cycle = ["holder", "verify", "verify", "remove", "release"];
+            assert_eq!(
+                *source_commands.lock().unwrap(),
+                expected_source_cycle,
+                "the timed-out semantic phase never captures; fresh fallback owns one settled source holder"
+            );
+            blobs
+                .release(&scope, output["pixels"]["handle"].as_str().unwrap())
+                .unwrap();
+            server.abort();
+        }
     }
     #[tokio::test]
     async fn action_snapshot_uses_committed_revision_not_failed_staging_counter() {
@@ -1814,6 +1904,23 @@ mod tests {
         );
         assert_eq!(publication.published_revision, 0);
     }
+    #[test]
+    fn semantic_geometry_cleanup_preserves_nested_primary_and_integrity() {
+        use super::super::client_geometry::GeometryError;
+        let cleanup = AtomicBool::new(false);
+        assert_eq!(
+            geometry_error_with_cleanup(
+                GeometryError::CleanupFailed {
+                    primary: Some(Box::new(GeometryError::CleanupFailed {
+                        primary: Some(Box::new(GeometryError::Cancelled))
+                    }))
+                },
+                &cleanup
+            ),
+            ProtocolError::Cancelled
+        );
+        assert!(cleanup.load(Ordering::SeqCst));
+    }
     #[tokio::test]
     async fn fixture_query_publishes_zero_area_semantics_through_dispatch() {
         use super::super::cdp::client::CdpClient;
@@ -1916,7 +2023,6 @@ mod tests {
             faults:Arc::new(super::super::client_test_faults::FaultController::default()),
             page, ui:Arc::new(UiGate::default()), blobs, scope,
             policy:ReadPolicy { test_id_attribute:"data-testid".into(), secure_field_selector:"input[type=password]".into() },
-            lifecycle_known_active:true,
         }, DispatchRequest::Query(QueryRequest {
             purpose:QueryPurpose::Fixture,
             options:serde_json::from_value(json!({"expression":{"kind":"selector","selector":"#zero"},"secureFieldSelector":"input[type=password]"})).unwrap(),
@@ -1936,6 +2042,170 @@ mod tests {
                 .unwrap()
                 .backend_node_id,
             Some(7)
+        );
+        server.abort();
+        let _ = server.await;
+    }
+    #[tokio::test]
+    async fn tree_observe_skips_positive_hidden_iframe_before_spatial_proof() {
+        use super::super::cdp::client::CdpClient;
+        use super::super::client_browser::ExecutionGate;
+        use super::super::client_targets::ClientTargets;
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.getFrameTree" => {
+                        json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"},"childFrames":[{"frame":{"id":"child","parentId":"frame","loaderId":"child-loader","url":"about:blank"}}]}})
+                    }
+                    "Page.getLayoutMetrics" => {
+                        json!({"cssVisualViewport":{"clientWidth":100,"clientHeight":80,"offsetX":0,"offsetY":0,"scale":1},"cssLayoutViewport":{"clientWidth":100,"clientHeight":80}})
+                    }
+                    "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                    "DOM.getDocument" => {
+                        json!({"root":{"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"nodeName":"IFRAME","localName":"iframe","backendNodeId":7}]}})
+                    }
+                    "Accessibility.getFullAXTree" => {
+                        assert_eq!(
+                            request["params"]["frameId"], "frame",
+                            "hidden child AX must not be acquired"
+                        );
+                        json!({"nodes":[{"nodeId":"document","backendDOMNodeId":1,"role":{"type":"role","value":"RootWebArea"}},{"nodeId":"owner","backendDOMNodeId":7,"role":{"type":"role","value":"Iframe"}}]})
+                    }
+                    "DOM.resolveNode" => {
+                        json!({"object":{"objectId":format!("node-{}", request["params"]["backendNodeId"]),"subtype":"node"}})
+                    }
+                    "DOM.getFrameOwner" => json!({"backendNodeId":7}),
+                    "DOM.getBoxModel" => panic!("hidden frame spatial proof must not run"),
+                    "Runtime.getProperties" => json!({"result":[]}),
+                    "Runtime.callFunctionOn" => {
+                        let declaration =
+                            request["params"]["functionDeclaration"].as_str().unwrap();
+                        if declaration.contains("Array.from(result)") {
+                            json!({"result":{"objectId":"security"}})
+                        } else if declaration.contains("selector:parts.join") {
+                            json!({"result":{"value":{"x":0,"y":0,"selector":"iframe"}}})
+                        } else if declaration.starts_with("function(expression") {
+                            json!({"result":{"value":{"indices":[0],"redacted":[]}}})
+                        } else if declaration.contains("return {status:data.__nativeStatus") {
+                            json!({"result":{"value":{"nodeType":1,"tag":"iframe","hidden":true}}})
+                        } else if declaration.contains("const read=") {
+                            let values = request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|argument| {
+                                match argument["objectId"].as_str().unwrap() {
+                                    "node-1" => json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}}),
+                                    "node-7" => json!({"attributes":{},"labels":[],"states":{"hidden":true},"rect":null,"author":{"nodeType":1,"tag":"iframe","visible":false}}),
+                                    _ => panic!("unknown exact metadata receiver"),
+                                }
+                            }).collect::<Vec<_>>();
+                            json!({"result":{"value":values}})
+                        } else if declaration
+                            .starts_with("function(testId,secureSelector,boundedObservation")
+                        {
+                            json!({"result":{"value":{"attributes":{},"labels":[],"states":{"hidden":true},"rect":null,"author":{"nodeType":1,"tag":"iframe","visible":false}}}})
+                        } else if declaration.contains("frameOwner") {
+                            json!({"result":{"value":{"connected":true,"frameOwner":false}}})
+                        } else {
+                            json!({"result":{"value":true}})
+                        }
+                    }
+                    "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => json!({}),
+                    method => panic!("unexpected zero-area dispatch command: {method}"),
+                };
+                if ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        targets
+            .attached("context", "target".into(), "session".into(), "page".into())
+            .unwrap();
+        targets.configured("target").unwrap();
+        targets
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        targets.acknowledge_enrollment().unwrap(); // Synthetic complete inventory only.
+        let gate = Arc::new(ExecutionGate::default());
+        let page = BrowserExecutionLease {
+            client,
+            page_session_id: "session".into(),
+            target_id: "target".into(),
+            identity_scope: "scope".into(),
+            permit: gate.enter(false).unwrap(),
+            targets,
+        };
+        let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "scope".into(),
+        };
+        blobs.activate_scope(scope.clone()).unwrap();
+        let refs = Arc::new(Mutex::new(RefMap::new()));
+        let dispatch = ObservationDispatch::new(refs.clone());
+        let (_sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            generation: 1,
+            sequence: 1,
+            is_callback: false,
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation,
+        };
+        let task = dispatch.clone().start(
+            DispatchContext {
+                #[cfg(feature = "acceptance-faults")]
+                faults: Arc::new(super::super::client_test_faults::FaultController::default()),
+                page,
+                ui: Arc::new(UiGate::default()),
+                blobs,
+                scope,
+                policy: ReadPolicy {
+                    test_id_attribute: "data-testid".into(),
+                    secure_field_selector: "input[type=password]".into(),
+                },
+            },
+            DispatchRequest::Observe(ObserveRequest {
+                options: serde_json::from_value(json!({})).unwrap(),
+                test_id_attribute: "data-testid".into(),
+                secure_field_selector: "input[type=password]".into(),
+            }),
+            operation,
+        );
+        let result = task.result.await.unwrap().unwrap();
+        task.join.await.unwrap().unwrap();
+        assert_eq!(result["root"]["role"], "document");
+        assert!(result["root"]["children"]
+            .as_array()
+            .is_none_or(Vec::is_empty));
+        assert!(result.get("hidden_frame_proof").is_none());
+        assert!(result.get("hiddenFrameProof").is_none());
+        assert_eq!(
+            dispatch
+                .snapshot_for_action(&OperationLease {
+                    generation: 1,
+                    sequence: 2,
+                    is_callback: false,
+                    deadline: Instant::now() + Duration::from_secs(1),
+                    cancellation: _sender.subscribe(),
+                })
+                .await
+                .unwrap()
+                .0,
+            1
         );
         server.abort();
         let _ = server.await;

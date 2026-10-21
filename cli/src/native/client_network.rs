@@ -6,7 +6,7 @@ use super::client_app_events::{
     AppEventContext, AppEventProjector, AppNavigationContext, OwnNavigationGuard,
 };
 use super::client_blobs::{
-    BlobChunk, BlobLease, BlobProducer, BlobScope, BlobStore, MAX_CHUNK_BYTES,
+    BlobChunk, BlobError, BlobLease, BlobProducer, BlobScope, BlobStore, MAX_CHUNK_BYTES,
 };
 use super::client_browser::BrowserExecutionLease;
 use super::client_protocol::{Decision, DecisionNotice, ProtocolError, RequestOverrides};
@@ -953,7 +953,7 @@ impl ClientNetwork {
         let reservation = self
             .blobs
             .reserve_producer(self.scope.clone())
-            .map_err(|_| ProtocolError::CapacityExceeded)?;
+            .map_err(producer_error)?;
         let (handle, resource) = self.new_resource()?;
         downloads.insert(
             guid.into(),
@@ -1073,7 +1073,7 @@ impl ClientNetwork {
                     self.blobs
                         .finish_producer(producer, bytes)
                         .map(|blob| blob.handle)
-                        .map_err(|_| ProtocolError::CapacityExceeded)
+                        .map_err(producer_error)
                 }
                 .await;
                 self.finish_download(&handle, result)
@@ -1165,7 +1165,16 @@ impl ClientNetwork {
         budget: Option<super::cdp::client::EventBudgetLease>,
     ) -> Result<(), ProtocolError> {
         self.check()?;
-        if event.method == "Browser.downloadProgress" || event.method == "Page.downloadProgress" {
+        // configure_downloads requires Browser.setDownloadBehavior with eventsEnabled
+        // before subscription. The deprecated Page stream reports the same GUID
+        // and must not create or complete a second resource, even after release.
+        if matches!(
+            event.method.as_str(),
+            "Page.downloadWillBegin" | "Page.downloadProgress"
+        ) {
+            return Ok(());
+        }
+        if event.method == "Browser.downloadProgress" {
             let guid = required_string(&event.params, "guid")?;
             let terminal = matches!(
                 event.params.get("state").and_then(Value::as_str),
@@ -1232,10 +1241,7 @@ impl ClientNetwork {
         let configuration_ready = session.configuration_ready.subscribe();
         let session_tenure = configuration_ready.clone();
         let session = session.application;
-        if matches!(
-            event.method.as_str(),
-            "Browser.downloadWillBegin" | "Page.downloadWillBegin"
-        ) {
+        if event.method == "Browser.downloadWillBegin" {
             return self.download_started(&session, &event.params, &sink);
         }
         let supported = matches!(
@@ -1521,7 +1527,10 @@ impl ClientNetwork {
                 "Page.javascriptDialogOpening" => {
                     this.dialog(&session.session_id, event.params, &sink).await
                 }
-                "Network.loadingFinished" => this.response_finished(&session, event.params).await,
+                "Network.loadingFinished" => {
+                    this.response_finished(&session, event.params, deadline, &session_tenure)
+                        .await
+                }
                 _ => Ok(()),
             };
             if result.is_ok() {
@@ -2225,10 +2234,59 @@ impl ClientNetwork {
         downloads.retain(|_, entry| entry.handle != handle);
         Ok(())
     }
+    async fn reserve_response_producer(
+        &self,
+        deadline: std::time::Instant,
+        session_id: &str,
+        captured_tenure: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<BlobProducer, ProtocolError> {
+        // Subscribe before the first check: finish/release between check and await
+        // cannot be lost. Wait itself owns no quota, UI permit or store lock.
+        let mut tenure = captured_tenure.clone();
+        let mut changes = self.blobs.budget_changes().map_err(producer_error)?;
+        let mut cancellation = self.cancellation.subscribe();
+        loop {
+            changes.borrow_and_update();
+            self.check()?;
+            if !self.session_tenure_live(session_id, &tenure)? {
+                return Err(ProtocolError::StaleScope);
+            }
+            if *cancellation.borrow() != CancelSignal::None {
+                return Err(ProtocolError::Cancelled);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if let Some(producer) = self
+                .blobs
+                .try_reserve_producer(self.scope.clone())
+                .map_err(producer_error)?
+            {
+                self.check()?;
+                if *cancellation.borrow() != CancelSignal::None {
+                    return Err(ProtocolError::Cancelled);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(ProtocolError::DeadlineExceeded);
+                }
+                return Ok(producer);
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.changed() => {},
+                _ = tenure.changed() => {},
+                _ = tokio::time::sleep_until(deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                result = changes.changed() => { result.map_err(|_| ProtocolError::ScopeUnavailable)?; },
+            }
+        }
+    }
+
     async fn response_finished(
         &self,
         session: &ApplicationSession,
         params: Value,
+        deadline: std::time::Instant,
+        session_tenure: &tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), ProtocolError> {
         let id = required_string(&params, "requestId")?;
         let handle = self
@@ -2241,18 +2299,35 @@ impl ClientNetwork {
         };
         let result = async {
             let producer = self
-                .blobs
-                .reserve_producer(self.scope.clone())
-                .map_err(|_| ProtocolError::CapacityExceeded)?;
-            let result = self
-                .client
-                .send_command(
-                    "Network.getResponseBody",
-                    Some(json!({"requestId":id})),
-                    Some(&session.session_id),
-                )
-                .await
-                .map_err(|_| ProtocolError::BrowserFailure)?;
+                .reserve_response_producer(deadline, &session.session_id, session_tenure)
+                .await?;
+            if !self.session_tenure_live(&session.session_id, session_tenure)? {
+                return Err(ProtocolError::StaleScope);
+            }
+            let mut cancellation = self.cancellation.subscribe();
+            let mut tenure = session_tenure.clone();
+            if *cancellation.borrow() != CancelSignal::None { return Err(ProtocolError::Cancelled); }
+            if std::time::Instant::now() >= deadline { return Err(ProtocolError::DeadlineExceeded); }
+            // Admission does not replenish collection's budget. This is a read;
+            // CdpClient's PendingGuard owns cancelled pending-response removal.
+            let body_read = self.client.send_command("Network.getResponseBody",
+                Some(json!({"requestId":id})), Some(&session.session_id));
+            tokio::pin!(body_read);
+            let result = loop {
+                tokio::select! {
+                    biased;
+                    _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                    _ = tenure.changed() => {
+                        if !self.session_tenure_live(&session.session_id, &tenure)? {
+                            return Err(ProtocolError::StaleScope);
+                        }
+                        // Configuration false→true is not retirement. Keep the
+                        // same pending read and original deadline; never replay.
+                    },
+                    _ = tokio::time::sleep_until(deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                    result = &mut body_read => break result.map_err(|_| ProtocolError::BrowserFailure)?,
+                }
+            };
             let body = required_string(&result, "body")?;
             if body.len() > self.blobs.producer_limit().div_ceil(3) * 4 {
                 return Err(ProtocolError::CapacityExceeded);
@@ -2265,12 +2340,20 @@ impl ClientNetwork {
                 body.as_bytes().to_vec()
             };
             self.check()?;
+            if !self.session_tenure_live(&session.session_id, session_tenure)? { return Err(ProtocolError::StaleScope); }
+            if *cancellation.borrow() != CancelSignal::None { return Err(ProtocolError::Cancelled); }
+            if std::time::Instant::now() >= deadline { return Err(ProtocolError::DeadlineExceeded); }
             self.blobs
                 .finish_producer(producer, bytes)
                 .map(|blob| blob.handle)
-                .map_err(|_| ProtocolError::CapacityExceeded)
+                .map_err(producer_error)
         }
         .await;
+        // Accounting corruption is not an expected capacity/cancellation refusal.
+        // Leave quarantine to the retained event task rather than certifying reuse.
+        self.blobs
+            .check_budget_integrity()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
         // A missing/failed response body is a resource error, not evidence that
         // the browser context itself has unknown mutation effects.
         self.finish_resource(&handle, result)
@@ -2802,9 +2885,93 @@ fn update_request(request: &mut Value, overrides: &RequestOverrides) {
     }
 }
 
+// Preserve store authority failures: only genuine reservation pressure is capacity.
+// This deliberately does not change full-size producer reservation accounting.
+fn producer_error(error: BlobError) -> ProtocolError {
+    match error {
+        BlobError::StaleScope => ProtocolError::StaleScope,
+        BlobError::QuotaExceeded => ProtocolError::CapacityExceeded,
+        BlobError::Closed => ProtocolError::ScopeUnavailable,
+        BlobError::Reserved => ProtocolError::PolicyDenied,
+        BlobError::InvalidInput
+        | BlobError::Missing
+        | BlobError::OffsetMismatch
+        | BlobError::Unsealed
+        | BlobError::IntegrityMismatch => ProtocolError::InvalidArguments,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn producer_errors_do_not_hide_scope_or_integrity_as_capacity() {
+        for (error, expected) in [
+            (BlobError::StaleScope, ProtocolError::StaleScope),
+            (BlobError::QuotaExceeded, ProtocolError::CapacityExceeded),
+            (BlobError::Closed, ProtocolError::ScopeUnavailable),
+            (BlobError::Reserved, ProtocolError::PolicyDenied),
+            (BlobError::InvalidInput, ProtocolError::InvalidArguments),
+            (BlobError::Missing, ProtocolError::InvalidArguments),
+            (BlobError::OffsetMismatch, ProtocolError::InvalidArguments),
+            (BlobError::Unsealed, ProtocolError::InvalidArguments),
+            (
+                BlobError::IntegrityMismatch,
+                ProtocolError::InvalidArguments,
+            ),
+        ] {
+            assert_eq!(producer_error(error), expected);
+        }
+    }
+
+    #[test]
+    fn small_retained_body_causes_real_full_producer_reservation_pressure() {
+        let store = BlobStore::new(super::super::client_blobs::BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 8,
+        })
+        .unwrap();
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "body-pressure".into(),
+        };
+        store.activate_scope(scope.clone()).unwrap();
+        let small = store.insert_sealed(scope.clone(), b"x").unwrap();
+        let collecting = store.reserve_producer(scope.clone()).unwrap();
+        // 1 retained byte + 8 reserved bytes leaves 7, even for a future tiny body.
+        assert!(matches!(
+            store
+                .reserve_producer(scope.clone())
+                .map_err(producer_error),
+            Err(ProtocolError::CapacityExceeded)
+        ));
+        let wrong = BlobScope {
+            generation: 1,
+            identity_scope: "retired".into(),
+        };
+        assert!(matches!(
+            store.reserve_producer(wrong).map_err(producer_error),
+            Err(ProtocolError::StaleScope)
+        ));
+        let finished = store.finish_producer(collecting, b"y".to_vec()).unwrap();
+        // Finishing shrinks the reservation, and releasing both retains no hidden charge.
+        let next = store.reserve_producer(scope.clone()).unwrap();
+        drop(next);
+        store.release(&scope, &small.handle).unwrap();
+        store.release(&scope, &finished.handle).unwrap();
+        let first = store.reserve_producer(scope.clone()).unwrap();
+        let second = store.reserve_producer(scope.clone()).unwrap();
+        store.revoke_scope(&scope).unwrap();
+        assert_eq!(
+            store
+                .finish_producer(first, b"late".to_vec())
+                .map_err(producer_error),
+            Err(ProtocolError::StaleScope)
+        );
+        drop(second);
+    }
+
     #[test]
     fn fallback_overrides_accumulate_without_erasing_previous_fields() {
         let mut current = RequestOverrides {
@@ -3109,6 +3276,233 @@ mod bridge_tests {
         );
         (network, events, received, server)
     }
+    async fn pressure_fixture() -> (
+        Arc<ClientNetwork>,
+        tokio::sync::mpsc::Receiver<ServerMessage>,
+        tokio::sync::mpsc::Receiver<Value>,
+        tokio::task::JoinHandle<()>,
+        super::super::client_blobs::BlobInfo,
+        BlobProducer,
+    ) {
+        let (mut network, events, commands, server) = fixture().await;
+        let blobs = Arc::new(
+            BlobStore::new(super::super::client_blobs::BlobLimits {
+                max_blob_bytes: 32,
+                max_total_bytes: 64,
+                max_handles: 8,
+            })
+            .unwrap(),
+        );
+        blobs.activate_scope(network.scope.clone()).unwrap();
+        let small = blobs.insert_sealed(network.scope.clone(), b"x").unwrap();
+        let producer = blobs.reserve_producer(network.scope.clone()).unwrap();
+        Arc::get_mut(&mut network).unwrap().blobs = blobs;
+        (network, events, commands, server, small, producer)
+    }
+
+    #[tokio::test]
+    async fn response_collection_waits_for_transient_bytes_without_dispatch_or_ui_lock() {
+        let (network, _events, mut commands, server, small, held) = pressure_fixture().await;
+        let session = ApplicationSession {
+            session_id: "owned".into(),
+            root_page_session: "owned".into(),
+            active_page: true,
+        };
+        network
+            .sessions
+            .lock()
+            .unwrap()
+            .get("owned")
+            .unwrap()
+            .configuration_ready
+            .send_replace(false);
+        let tenure = network
+            .sessions
+            .lock()
+            .unwrap()
+            .get("owned")
+            .unwrap()
+            .configuration_ready
+            .subscribe();
+        // Capture predates the legitimate ready notification. This notification
+        // must not be mistaken for session retirement or replay the body read.
+        network
+            .sessions
+            .lock()
+            .unwrap()
+            .get("owned")
+            .unwrap()
+            .configuration_ready
+            .send_replace(true);
+        let (handle, resource) = network.new_resource().unwrap();
+        network
+            .responses
+            .lock()
+            .unwrap()
+            .insert(("owned".into(), "response".into()), handle.clone());
+        let collect = network.response_finished(
+            &session,
+            json!({"requestId":"response"}),
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            &tenure,
+        );
+        tokio::pin!(collect);
+        assert!(futures_util::poll!(&mut collect).is_pending());
+        assert!(commands.try_recv().is_err());
+        let ui = network
+            .ui_gate
+            .enter(
+                true,
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                network.cancellation.subscribe(),
+            )
+            .await
+            .unwrap();
+        drop(ui);
+        let finished = network.blobs.finish_producer(held, b"y".to_vec()).unwrap();
+        collect.await.unwrap();
+        assert_eq!(
+            commands.recv().await.unwrap()["method"],
+            "Network.getResponseBody"
+        );
+        assert!(commands.try_recv().is_err());
+        let blob = resource.completed.borrow().clone().unwrap().unwrap();
+        let bytes = network.blobs.read(&network.scope, &blob, 0, 32).unwrap();
+        assert_eq!(bytes, b"synthetic-response");
+        network.release_body(&handle).unwrap();
+        network
+            .blobs
+            .release(&network.scope, &small.handle)
+            .unwrap();
+        network
+            .blobs
+            .release(&network.scope, &finished.handle)
+            .unwrap();
+        assert!(network.check().is_ok());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_admission_cancel_and_deadline_settle_only_resource_with_zero_cdp() {
+        for cancel in [false, true] {
+            let (network, _events, mut commands, server, small, held) = pressure_fixture().await;
+            let session = ApplicationSession {
+                session_id: "owned".into(),
+                root_page_session: "owned".into(),
+                active_page: true,
+            };
+            let tenure = network
+                .sessions
+                .lock()
+                .unwrap()
+                .get("owned")
+                .unwrap()
+                .configuration_ready
+                .subscribe();
+            let (handle, resource) = network.new_resource().unwrap();
+            network
+                .responses
+                .lock()
+                .unwrap()
+                .insert(("owned".into(), "response".into()), handle.clone());
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(if cancel { 2000 } else { 10 });
+            let collect = network.response_finished(
+                &session,
+                json!({"requestId":"response"}),
+                deadline,
+                &tenure,
+            );
+            tokio::pin!(collect);
+            assert!(futures_util::poll!(&mut collect).is_pending());
+            if cancel {
+                network
+                    .cancellation
+                    .send_replace(CancelSignal::SessionClosed);
+            }
+            collect.await.unwrap();
+            assert_eq!(
+                resource.completed.borrow().clone().unwrap(),
+                Err(if cancel {
+                    ProtocolError::Cancelled
+                } else {
+                    ProtocolError::DeadlineExceeded
+                })
+            );
+            assert!(commands.try_recv().is_err());
+            assert!(network.check().is_ok()); // No broker quarantine for expected refusal.
+            network.release_body(&handle).unwrap();
+            drop(held);
+            network
+                .blobs
+                .release(&network.scope, &small.handle)
+                .unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn response_wait_revoke_cannot_collect_into_replacement_scope() {
+        let (network, _events, mut commands, server, _small, held) = pressure_fixture().await;
+        let tenure = network
+            .sessions
+            .lock()
+            .unwrap()
+            .get("owned")
+            .unwrap()
+            .configuration_ready
+            .subscribe();
+        let wait = network.reserve_response_producer(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            "owned",
+            &tenure,
+        );
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        network.blobs.revoke_scope(&network.scope).unwrap();
+        network
+            .blobs
+            .activate_scope(BlobScope {
+                generation: 1,
+                identity_scope: "replacement".into(),
+            })
+            .unwrap();
+        assert!(matches!(wait.await, Err(ProtocolError::StaleScope)));
+        assert!(commands.try_recv().is_err());
+        drop(held);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn response_wait_retired_session_wakes_without_capacity_change() {
+        let (network, _events, mut commands, server, small, held) = pressure_fixture().await;
+        let tenure = network
+            .sessions
+            .lock()
+            .unwrap()
+            .get("owned")
+            .unwrap()
+            .configuration_ready
+            .subscribe();
+        let wait = network.reserve_response_producer(
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+            "owned",
+            &tenure,
+        );
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        network.sessions.lock().unwrap().remove("owned");
+        assert!(matches!(wait.await, Err(ProtocolError::StaleScope)));
+        assert!(commands.try_recv().is_err());
+        drop(held);
+        network
+            .blobs
+            .release(&network.scope, &small.handle)
+            .unwrap();
+        server.abort();
+    }
+
     fn route_replacement(source: &Arc<ClientNetwork>, identity: &str) -> Arc<ClientNetwork> {
         Arc::new(ClientNetwork::new(
             source.client.clone(),
@@ -4771,6 +5165,108 @@ mod bridge_tests {
         );
         assert!(!canonical.join("synthetic-guid").exists());
         network.release_body(handle).unwrap();
+        network.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn canonical_browser_download_ignores_legacy_stream_before_and_after_release() {
+        let (network, mut events, _, server) = fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(directory.path()).unwrap();
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Local(canonical.clone()));
+        *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
+        network.subscribe_downloads().unwrap();
+        let params = json!({"guid":"duplicate-guid","frameId":"owned-frame","url":"https://synthetic.test/file","suggestedFilename":"example.txt"});
+        network
+            .event(&CdpEvent {
+                method: "Page.downloadWillBegin".into(),
+                session_id: Some("owned".into()),
+                params: params.clone(),
+            })
+            .unwrap();
+        assert!(network.resources.lock().unwrap().is_empty());
+        assert!(events.try_recv().is_err());
+        for method in ["Browser.downloadWillBegin", "Page.downloadWillBegin"] {
+            network
+                .event(&CdpEvent {
+                    method: method.into(),
+                    session_id: Some("owned".into()),
+                    params: params.clone(),
+                })
+                .unwrap();
+        }
+        let (_, event, _) = next_event(&mut events).await;
+        let handle = event["handle"].as_str().unwrap();
+        assert!(events.try_recv().is_err());
+        assert_eq!(network.downloads.lock().unwrap().len(), 1);
+        assert_eq!(network.resources.lock().unwrap().len(), 1);
+        // A second maximum producer still fits the default two-producer quota:
+        // the duplicate did not reserve another hidden producer.
+        drop(
+            network
+                .blobs
+                .reserve_producer(network.scope.clone())
+                .unwrap(),
+        );
+        network
+            .event(&CdpEvent {
+                method: "Page.downloadProgress".into(),
+                session_id: Some("owned".into()),
+                params: json!({"guid":"duplicate-guid","state":"canceled"}),
+            })
+            .unwrap();
+        assert!(
+            !network
+                .downloads
+                .lock()
+                .unwrap()
+                .get("duplicate-guid")
+                .unwrap()
+                .terminal_started
+        );
+        std::fs::write(canonical.join("duplicate-guid"), b"downloaded").unwrap();
+        network
+            .event(&CdpEvent {
+                method: "Browser.downloadProgress".into(),
+                session_id: None,
+                params: json!({"guid":"duplicate-guid","state":"completed","receivedBytes":10}),
+            })
+            .unwrap();
+        let operation = network.broker.admit(1, 1, 2000).unwrap();
+        let bytes = network
+            .read_resource(handle, 0, 32, &operation)
+            .await
+            .unwrap();
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(bytes.base64)
+                .unwrap(),
+            b"downloaded"
+        );
+        network.release_body(handle).unwrap();
+        for method in ["Page.downloadWillBegin", "Page.downloadProgress"] {
+            network
+                .event(&CdpEvent {
+                    method: method.into(),
+                    session_id: Some("owned".into()),
+                    params: params.clone(),
+                })
+                .unwrap();
+        }
+        assert!(events.try_recv().is_err());
+        assert!(network.downloads.lock().unwrap().is_empty());
+        assert!(network.resources.lock().unwrap().is_empty());
+        let one = network
+            .blobs
+            .reserve_producer(network.scope.clone())
+            .unwrap();
+        let two = network
+            .blobs
+            .reserve_producer(network.scope.clone())
+            .unwrap();
+        drop((one, two));
+
         network.close().await.unwrap();
         server.abort();
     }

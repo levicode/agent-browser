@@ -6,6 +6,51 @@ use tokio::sync::mpsc;
 use super::client_protocol::*;
 use super::client_session::{ClientSession, OperationLease};
 
+// Acceptance-only diagnostics: closed phases and native operation sequence only.
+// Never serialize requests, IDs, browser values, or error descriptions.
+#[cfg(feature = "acceptance-faults")]
+#[derive(Debug)]
+enum SettlementPhase {
+    ExecuteStarted,
+    ExecuteReturned,
+    CancelObserved,
+    DeadlineObserved,
+    GraceReturned,
+    GraceExpired,
+    CompletionJoined,
+    ResultQueued,
+    ResultFlushed,
+    ControlFlushed,
+    CancelReceived,
+    CancelAccepted,
+    CancelRejected,
+    CancelQueued,
+    ReaderEnded,
+    ReaderRefused,
+    WriterFailed,
+    PublicationExpired,
+    HealthFailed,
+    CompletionLost,
+    ResultQueueFailed,
+    UnknownOutcome,
+    CloseReceived,
+    ControlQueueFailed,
+    ShutdownStarted,
+    ShutdownProven,
+    ShutdownUnproven,
+    PendingResultQueued,
+}
+macro_rules! settlement_trace {
+    ($sequence:expr, $phase:ident) => {
+        #[cfg(feature = "acceptance-faults")]
+        eprintln!(
+            "native-settlement sequence={} phase={:?}",
+            $sequence,
+            SettlementPhase::$phase
+        );
+    };
+}
+
 /// Browser mechanics stay native. The reader only admits work and forwards
 /// control; executors never own its lock or the output transport.
 pub struct NativeOutcome {
@@ -725,6 +770,16 @@ where
             ) {
                 break;
             }
+            #[cfg(feature = "acceptance-faults")]
+            match &message {
+                ServerMessage::Result { operation_seq, .. } => {
+                    settlement_trace!(*operation_seq, ResultFlushed);
+                }
+                ServerMessage::ControlResult { .. } => {
+                    settlement_trace!(0, ControlFlushed);
+                }
+                _ => {}
+            }
             if writer_sink.result_written(&message).is_err() {
                 let _ = writer_sink.broker.quarantine();
                 break;
@@ -798,36 +853,43 @@ where
         loop {
             let frame = tokio::select! {
                 frame = read_frame_retained(&mut reader, &mut incoming_frame) => frame,
-                _ = &mut failure => break,
+                _ = &mut failure => { settlement_trace!(0, WriterFailed); break; },
                 _ = timer.tick() => {
                     let _ = broker.expire_decisions();
-                    if sink.expire_publications().is_err() { let _ = broker.quarantine(); break; }
-                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { break; }
+                    if sink.expire_publications().is_err() { settlement_trace!(0, PublicationExpired); let _ = broker.quarantine(); break; }
+                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { settlement_trace!(0, HealthFailed); break; }
                     for (version,identity_scope) in broker.take_released_registry_events(16).unwrap_or_default() {
                         let mut payload=serde_json::json!({ "registryVersion": version });
                         if let Some(scope)=identity_scope { payload["identityScope"]=serde_json::json!(scope); }
                         if sink.emit("registry-released".into(), payload, None).is_err() { break; }
                     }
-                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { break; }
+                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { settlement_trace!(0, HealthFailed); break; }
                     continue;
                 },
                 completion = operations.join_next(), if !operations.is_empty() => {
-                    let Some(Ok((sequence, outcome))) = completion else { break; };
-                    let Some((id, generation)) = pending.remove(&sequence) else { break; };
+                    let Some(Ok((sequence, outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
+                    settlement_trace!(sequence, CompletionJoined);
+                    let Some((id, generation)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
                     let state = broker.settle(generation, sequence, outcome.effects).unwrap_or(ScopeState::Quarantined);
                     let unknown = outcome.effects == Effects::Unknown;
-                    if !enqueue(&sender, result_message(id, generation, sequence, outcome, state), &broker) || unknown { break; }
+                    if !enqueue(&sender, result_message(id, generation, sequence, outcome, state), &broker) { settlement_trace!(sequence, ResultQueueFailed); break; }
+                    settlement_trace!(sequence, ResultQueued);
+                    if unknown { settlement_trace!(sequence, UnknownOutcome); break; }
                     continue;
                 },
             };
             let message = match frame {
                 Ok(Some(bytes)) => parse_frame(&bytes),
-                Ok(None) => break,
+                Ok(None) => {
+                    settlement_trace!(0, ReaderEnded);
+                    break;
+                }
                 Err(error) => Err(error),
             };
             let message = match message {
                 Ok(message) => message,
                 Err(code) => {
+                    settlement_trace!(0, ReaderRefused);
                     let _ = broker.quarantine();
                     enqueue(
                         &sender,
@@ -932,18 +994,30 @@ where
                         .health()
                         .is_ok_and(|(current, _)| current == generation) =>
                 {
+                    settlement_trace!(0, CloseReceived);
                     closing_id = Some(id);
                     break;
                 }
                 other => {
+                    #[cfg(feature = "acceptance-faults")]
+                    let cancel_sequence = match &other {
+                        ClientMessage::Cancel { operation_seq, .. } => Some(*operation_seq),
+                        _ => None,
+                    };
                     let (response, close) = respond(&broker, other, executor.as_ref());
                     if !enqueue(&sender, response, &broker) || close {
+                        settlement_trace!(0, ControlQueueFailed);
                         break;
+                    }
+                    #[cfg(feature = "acceptance-faults")]
+                    if let Some(sequence) = cancel_sequence {
+                        settlement_trace!(sequence, CancelQueued);
                     }
                 }
             }
         }
     }
+    settlement_trace!(0, ShutdownStarted);
     // Seal before cancelling native work. EOF never proves resource teardown.
     sink.close_publications();
     let _ = broker.quarantine();
@@ -962,6 +1036,12 @@ where
     } else {
         false
     };
+    #[cfg(feature = "acceptance-faults")]
+    if teardown_proven {
+        settlement_trace!(0, ShutdownProven);
+    } else {
+        settlement_trace!(0, ShutdownUnproven);
+    }
     for (sequence, (id, generation)) in pending {
         let effects = if broker.has_started(sequence) {
             Effects::Unknown
@@ -969,7 +1049,7 @@ where
             Effects::NotDispatched
         };
         let _ = broker.settle(generation, sequence, effects);
-        enqueue(
+        let _queued = enqueue(
             &sender,
             result_message(
                 id,
@@ -983,6 +1063,12 @@ where
             ),
             &broker,
         );
+        #[cfg(feature = "acceptance-faults")]
+        if _queued {
+            settlement_trace!(sequence, PendingResultQueued);
+        } else {
+            settlement_trace!(sequence, ResultQueueFailed);
+        }
     }
     if teardown_proven {
         let _ = broker.mark_closed();
@@ -1064,20 +1150,23 @@ async fn execute_bounded<E: ClientExecutor>(
     let generation = lease.generation;
     let deadline = tokio::time::Instant::from_std(lease.deadline);
     let mut cancellation = lease.cancellation.clone();
+    settlement_trace!(sequence, ExecuteStarted);
     let execution = executor.execute(command, args, lease);
     tokio::pin!(execution);
     let reason = tokio::select! {
         biased;
-        outcome = &mut execution => return outcome,
-        _ = cancellation.changed() => ProtocolError::Cancelled,
-        _ = tokio::time::sleep_until(deadline) => ProtocolError::DeadlineExceeded,
+        outcome = &mut execution => { settlement_trace!(sequence, ExecuteReturned); return outcome; },
+        _ = cancellation.changed() => { settlement_trace!(sequence, CancelObserved); ProtocolError::Cancelled },
+        _ = tokio::time::sleep_until(deadline) => { settlement_trace!(sequence, DeadlineObserved); ProtocolError::DeadlineExceeded },
     };
     let _ = broker.cancel(generation, sequence);
     if let Ok(outcome) =
         tokio::time::timeout(std::time::Duration::from_millis(250), &mut execution).await
     {
+        settlement_trace!(sequence, GraceReturned);
         return outcome;
     }
+    settlement_trace!(sequence, GraceExpired);
     NativeOutcome {
         result: Err(reason),
         effects: if broker.has_started(sequence) {
@@ -1135,7 +1224,14 @@ fn respond<E: ClientExecutor>(
             generation: requested_generation,
             operation_seq,
         } => {
+            settlement_trace!(operation_seq, CancelReceived);
             let result = broker.cancel(requested_generation, operation_seq);
+            #[cfg(feature = "acceptance-faults")]
+            if result.is_ok() {
+                settlement_trace!(operation_seq, CancelAccepted);
+            } else {
+                settlement_trace!(operation_seq, CancelRejected);
+            }
             (
                 ServerMessage::ControlResult {
                     id,

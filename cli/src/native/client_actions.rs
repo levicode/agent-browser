@@ -4459,6 +4459,11 @@ mod tests {
         chromium_checked_action_acquisition("protected").await;
     }
     #[tokio::test]
+    #[ignore = "requires hosted Chromium: protected pixels preserve visibility and exact input ACK"]
+    async fn chromium_protected_pixels_then_exact_check_uses_committed_snapshot() {
+        chromium_checked_action_acquisition("pixels").await;
+    }
+    #[tokio::test]
     #[ignore = "requires hosted Chromium: production query then checked action baseline"]
     async fn chromium_fixture_query_then_exact_check_without_observation() {
         chromium_checked_action_acquisition("fixture").await;
@@ -4524,8 +4529,17 @@ mod tests {
             let query = run(&browser, &mut operations, &sink, "fixture.query", json!({"identityScope":scope,"expression":expression}), 2).await?;
             let nodes = query["nodes"].as_array().ok_or("missing query nodes")?;
             if nodes.len() != 1 { return Err("query did not locate one synthetic checkbox".into()); }
-            let reference=if acquisition=="protected" {
-                let snapshot = run(&browser, &mut operations, &sink, "browser.observe", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{}}), 2).await?;
+            let reference=if matches!(acquisition,"protected"|"pixels") {
+                // Read-only diagnostics on the same active page; never activate
+                // a background target to make the subsequent input succeed.
+                let visibility_source = "()=>({visibility:document.visibilityState,focused:document.hasFocus(),activeTag:document.activeElement?.tagName??null,activeId:document.activeElement?.id??null,version:navigator.userAgent})";
+                let before=run(&browser,&mut operations,&sink,"page.evaluate",json!({"identityScope":scope,"source":visibility_source,"argument":null}),2).await?;
+                eprintln!("native-observe-visibility before={}",before["value"]);
+                let snapshot = run(&browser, &mut operations, &sink, "browser.observe", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{"pixels":acquisition=="pixels"}}), 2).await?;
+                if acquisition=="pixels" && (snapshot["pixels"]["handle"].as_str().is_none() || snapshot["pixels"]["size"].as_u64().is_none_or(|size|size==0)) {return Err("protected pixels were not produced before exact action".into());}
+                let after=run(&browser,&mut operations,&sink,"page.evaluate",json!({"identityScope":scope,"source":visibility_source,"argument":null}),2).await?;
+                eprintln!("native-observe-visibility after={}",after["value"]);
+                if before["value"]!=after["value"] {return Err("protected observation changed visibility, focus, active element or browser identity".into());}
                 find(&snapshot["root"], &nodes[0]["ref"]["id"]).ok_or("query identity missing from committed observation")?
             } else {nodes[0]["ref"].clone()};
             // Actual central dispatch acquires snapshot_for_action; no supplied
@@ -4537,7 +4551,7 @@ mod tests {
             if acquisition!="protected" {return Ok(());}
             run(&browser, &mut operations, &sink, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=radio type=radio>Navigate</label>';document.querySelector('#radio').addEventListener('click',()=>location.replace('about:blank?native-checked-navigation'));return true}","argument":null}), 2).await?;
             let query=run(&browser,&mut operations,&sink,"fixture.query",json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#radio"}}),2).await?;
-            let snapshot=run(&browser,&mut operations,&sink,"browser.observe",json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{}}),2).await?;
+            let snapshot=run(&browser,&mut operations,&sink,"browser.observe",json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{"pixels":acquisition=="pixels"}}),2).await?;
             let reference=find(&snapshot["root"],&query["nodes"][0]["ref"]["id"]).ok_or("radio missing from committed snapshot")?;
             run(&browser,&mut operations,&sink,"browser.perform",json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}),2).await?;
             let location=run(&browser,&mut operations,&sink,"page.evaluate",json!({"identityScope":scope,"source":"()=>location.href","argument":null}),2).await?;

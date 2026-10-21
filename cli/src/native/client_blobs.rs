@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 pub const MAX_CHUNK_BYTES: usize = 256 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct BlobScope {
     pub generation: u64,
     pub identity_scope: String,
@@ -65,16 +65,50 @@ pub struct BlobChunk {
 struct Budget {
     bytes: usize,
     handles: usize,
+    producers: HashMap<BlobScope, usize>,
+    changed: tokio::sync::watch::Sender<()>,
+    corrupt: bool,
+}
+impl Budget {
+    fn remove_producer(&mut self, scope: &BlobScope, size: usize) -> Result<(), BlobError> {
+        let remaining = self
+            .producers
+            .get(scope)
+            .copied()
+            .and_then(|bytes| bytes.checked_sub(size))
+            .ok_or(BlobError::Closed)?;
+        if remaining == 0 {
+            self.producers.remove(scope);
+        } else {
+            self.producers.insert(scope.clone(), remaining);
+        }
+        Ok(())
+    }
 }
 struct Charge {
     size: usize,
     budget: Arc<Mutex<Budget>>,
+    producer_scope: Option<BlobScope>,
 }
 impl Drop for Charge {
     fn drop(&mut self) {
         if let Ok(mut budget) = self.budget.lock() {
-            budget.bytes -= self.size;
-            budget.handles -= 1;
+            if let Some(scope) = &self.producer_scope {
+                if budget.remove_producer(scope, self.size).is_err() {
+                    budget.corrupt = true;
+                }
+            }
+            match (
+                budget.bytes.checked_sub(self.size),
+                budget.handles.checked_sub(1),
+            ) {
+                (Some(bytes), Some(handles)) => {
+                    budget.bytes = bytes;
+                    budget.handles = handles;
+                }
+                _ => budget.corrupt = true,
+            }
+            budget.changed.send_replace(());
         }
     }
 }
@@ -165,6 +199,9 @@ impl BlobStore {
             budget: Arc::new(Mutex::new(Budget {
                 bytes: 0,
                 handles: 0,
+                producers: HashMap::new(),
+                changed: tokio::sync::watch::channel(()).0,
+                corrupt: false,
             })),
             inner: Mutex::new(Inner {
                 closed: false,
@@ -223,6 +260,9 @@ impl BlobStore {
             return Err(BlobError::StaleScope);
         }
         let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        if budget.corrupt {
+            return Err(BlobError::Closed);
+        }
         if size > self.limits.max_blob_bytes
             || budget.handles >= self.limits.max_handles
             || size > self.limits.max_total_bytes.saturating_sub(budget.bytes)
@@ -249,6 +289,7 @@ impl BlobStore {
                 charge: Arc::new(Charge {
                     size,
                     budget: self.budget.clone(),
+                    producer_scope: None,
                 }),
             },
         );
@@ -375,6 +416,16 @@ impl BlobStore {
     }
 
     pub fn reserve_producer(&self, scope: BlobScope) -> Result<BlobProducer, BlobError> {
+        self.try_reserve_producer(scope)?
+            .ok_or(BlobError::QuotaExceeded)
+    }
+
+    /// None means only same-scope in-flight byte reservations may shrink enough.
+    /// It grants no capacity or authority; callers must retry after a notification.
+    pub fn try_reserve_producer(
+        &self,
+        scope: BlobScope,
+    ) -> Result<Option<BlobProducer>, BlobError> {
         let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
         if inner.closed {
             return Err(BlobError::Closed);
@@ -383,21 +434,59 @@ impl BlobStore {
             return Err(BlobError::StaleScope);
         }
         let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        if budget.corrupt {
+            return Err(BlobError::Closed);
+        }
         let size = self.limits.max_blob_bytes;
-        if budget.handles >= self.limits.max_handles
-            || size > self.limits.max_total_bytes.saturating_sub(budget.bytes)
-        {
+        if budget.handles >= self.limits.max_handles {
             return Err(BlobError::QuotaExceeded);
         }
+        if size > self.limits.max_total_bytes.saturating_sub(budget.bytes) {
+            let transient = budget.producers.get(&scope).copied().unwrap_or(0);
+            let fixed = budget
+                .bytes
+                .checked_sub(transient)
+                .ok_or(BlobError::Closed)?;
+            if transient > 0 && fixed <= self.limits.max_total_bytes - size {
+                return Ok(None);
+            }
+            return Err(BlobError::QuotaExceeded);
+        }
+        let reserved = budget
+            .producers
+            .get(&scope)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(size)
+            .ok_or(BlobError::Closed)?;
         budget.bytes += size;
         budget.handles += 1;
-        Ok(BlobProducer {
-            scope,
+        budget.producers.insert(scope.clone(), reserved);
+        Ok(Some(BlobProducer {
+            scope: scope.clone(),
             charge: Charge {
                 size,
                 budget: self.budget.clone(),
+                producer_scope: Some(scope),
             },
-        })
+        }))
+    }
+
+    /// Internal integrity proof, distinct from an ordinary closed/retired scope.
+    pub fn check_budget_integrity(&self) -> Result<(), BlobError> {
+        let budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        if budget.corrupt {
+            return Err(BlobError::Closed);
+        }
+        Ok(())
+    }
+
+    pub fn budget_changes(&self) -> Result<tokio::sync::watch::Receiver<()>, BlobError> {
+        let budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        if budget.corrupt {
+            return Err(BlobError::Closed);
+        }
+        Ok(budget.changed.subscribe())
     }
     pub fn begin_artifact_attempt(&self, scope: &BlobScope) -> Result<AttemptArtifacts, BlobError> {
         let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
@@ -431,7 +520,18 @@ impl BlobStore {
         {
             return Err(BlobError::StaleScope);
         }
-        let producer = self.reserve_producer(scope.clone())?;
+        let mut producer = self.reserve_producer(scope.clone())?;
+        // Attempt artifacts can survive scope rotation and are not response-wait
+        // progress authority. Convert their charge to fixed ownership immediately.
+        {
+            let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+            if budget.corrupt {
+                return Err(BlobError::Closed);
+            }
+            budget.remove_producer(scope, producer.charge.size)?;
+            producer.charge.producer_scope = None;
+            budget.changed.send_replace(());
+        }
         Ok(ArtifactReservation {
             authority: authority.state.clone(),
             charge: producer.charge,
@@ -454,8 +554,12 @@ impl BlobStore {
             return Err(BlobError::QuotaExceeded);
         }
         let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        if budget.corrupt {
+            return Err(BlobError::Closed);
+        }
         budget.bytes -= reservation.charge.size - size;
         reservation.charge.size = size;
+        budget.changed.send_replace(());
         Ok(())
     }
     pub fn finish_artifact(
@@ -516,6 +620,9 @@ impl BlobStore {
             Ok(v) => v,
             Err(_) => return Err((BlobError::Closed, items)),
         };
+        if budget.corrupt {
+            return Err((BlobError::Closed, items));
+        }
         let mut infos = Vec::with_capacity(items.len());
         for ((mut reservation, bytes), sha256) in items.into_iter().zip(hashes) {
             budget.bytes -= reservation.charge.size - bytes.len();
@@ -539,6 +646,7 @@ impl BlobStore {
                 },
             );
         }
+        budget.changed.send_replace(());
         Ok(infos)
     }
 
@@ -564,8 +672,14 @@ impl BlobStore {
         }
         {
             let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+            if budget.corrupt {
+                return Err(BlobError::Closed);
+            }
+            budget.remove_producer(&producer.scope, producer.charge.size)?;
+            producer.charge.producer_scope = None;
             budget.bytes -= producer.charge.size - bytes.len();
             producer.charge.size = bytes.len();
+            budget.changed.send_replace(());
         }
         let handle = Uuid::new_v4().to_string();
         let info = BlobInfo {
@@ -721,6 +835,11 @@ impl BlobStore {
             inner.active_scope = None;
         }
         inner.entries.retain(|_, entry| &entry.scope != scope);
+        self.budget
+            .lock()
+            .map_err(|_| BlobError::Closed)?
+            .changed
+            .send_replace(());
         Ok(())
     }
     pub fn close(&self) -> Result<(), BlobError> {
@@ -728,6 +847,11 @@ impl BlobStore {
         inner.closed = true;
         inner.active_scope = None;
         inner.entries.clear();
+        self.budget
+            .lock()
+            .map_err(|_| BlobError::Closed)?
+            .changed
+            .send_replace(());
         Ok(())
     }
 }
@@ -735,6 +859,156 @@ impl BlobStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn budget_integrity_is_not_ordinary_scope_closure() {
+        let store = store();
+        store.close().unwrap();
+        assert!(store.check_budget_integrity().is_ok());
+        store.budget.lock().unwrap().corrupt = true;
+        assert_eq!(store.check_budget_integrity(), Err(BlobError::Closed));
+    }
+
+    #[test]
+    fn transient_admission_wakes_without_lost_finish_and_competitors_recheck() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 8,
+        })
+        .unwrap();
+        let scope = scope();
+        store.activate_scope(scope.clone()).unwrap();
+        let retained = store.insert_sealed(scope.clone(), b"x").unwrap();
+        let producing = store.reserve_producer(scope.clone()).unwrap();
+        let mut changes = store.budget_changes().unwrap();
+        changes.borrow_and_update();
+        assert!(store.try_reserve_producer(scope.clone()).unwrap().is_none());
+        let finished = store.finish_producer(producing, b"y".to_vec()).unwrap();
+        assert!(changes.has_changed().unwrap()); // Finish before changed().await is retained.
+        let winner = store.try_reserve_producer(scope.clone()).unwrap().unwrap();
+        assert!(store.try_reserve_producer(scope.clone()).unwrap().is_none());
+        drop(winner);
+        store.release(&scope, &retained.handle).unwrap();
+        store.release(&scope, &finished.handle).unwrap();
+        assert_eq!(store.budget.lock().unwrap().bytes, 0);
+        assert!(store.budget.lock().unwrap().producers.is_empty());
+    }
+
+    #[test]
+    fn fixed_and_handle_pressure_refuse_without_waiting() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 8,
+        })
+        .unwrap();
+        let scope = scope();
+        store.activate_scope(scope.clone()).unwrap();
+        store.insert_sealed(scope.clone(), b"12345678").unwrap();
+        store.insert_sealed(scope.clone(), b"x").unwrap();
+        assert!(matches!(
+            store.try_reserve_producer(scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        let handles = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 1,
+        })
+        .unwrap();
+        handles.activate_scope(scope.clone()).unwrap();
+        let producer = handles.reserve_producer(scope.clone()).unwrap();
+        assert!(matches!(
+            handles.try_reserve_producer(scope),
+            Err(BlobError::QuotaExceeded)
+        ));
+        drop(producer);
+    }
+
+    #[test]
+    fn failed_finish_releases_once_and_retired_producers_are_not_progress_authority() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 8,
+        })
+        .unwrap();
+        let old = scope();
+        store.activate_scope(old.clone()).unwrap();
+        let bad = store.reserve_producer(old.clone()).unwrap();
+        assert_eq!(
+            store.finish_producer(bad, vec![0; 9]),
+            Err(BlobError::QuotaExceeded)
+        );
+        assert_eq!(store.budget.lock().unwrap().bytes, 0);
+        assert!(store.budget.lock().unwrap().producers.is_empty());
+        let first = store.reserve_producer(old.clone()).unwrap();
+        let second = store.reserve_producer(old.clone()).unwrap();
+        let mut changes = store.budget_changes().unwrap();
+        changes.borrow_and_update();
+        store.revoke_scope(&old).unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert!(matches!(
+            store.try_reserve_producer(old.clone()),
+            Err(BlobError::StaleScope)
+        ));
+        let next = BlobScope {
+            generation: old.generation,
+            identity_scope: "replacement".into(),
+        };
+        store.activate_scope(next.clone()).unwrap();
+        assert!(matches!(
+            store.try_reserve_producer(next.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        drop(first);
+        let admitted = store.try_reserve_producer(next.clone()).unwrap().unwrap();
+        store.revoke_scope(&next).unwrap(); // Successful reserve is not publication authority.
+        assert_eq!(
+            store.finish_producer(admitted, b"late".to_vec()),
+            Err(BlobError::StaleScope)
+        );
+        drop(second);
+        assert_eq!(store.budget.lock().unwrap().bytes, 0);
+    }
+
+    #[test]
+    fn artifact_conversion_is_fixed_and_last_lease_release_wakes() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 8,
+        })
+        .unwrap();
+        let scope = scope();
+        store.activate_scope(scope.clone()).unwrap();
+        let authority = store.begin_artifact_attempt(&scope).unwrap();
+        let artifact = store.reserve_artifact(&authority, &scope).unwrap();
+        assert!(store.budget.lock().unwrap().producers.is_empty());
+        let sealed = store.insert_sealed(scope.clone(), b"x").unwrap();
+        assert!(matches!(
+            store.try_reserve_producer(scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        let mut changes = store.budget_changes().unwrap();
+        changes.borrow_and_update();
+        drop(artifact);
+        assert!(changes.has_changed().unwrap());
+        let lease = store.borrow_sealed(&scope, &sealed.handle).unwrap();
+        changes.borrow_and_update();
+        store.release(&scope, &sealed.handle).unwrap();
+        assert!(!changes.has_changed().unwrap()); // Borrowed bytes remain charged.
+        drop(lease);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+        store.close().unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert!(matches!(
+            store.try_reserve_producer(scope),
+            Err(BlobError::Closed)
+        ));
+    }
+
     fn scope() -> BlobScope {
         BlobScope {
             generation: 1,
