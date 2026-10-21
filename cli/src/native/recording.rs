@@ -695,7 +695,53 @@ pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
     Ok(result)
 }
 
+/// Optional negotiated recording projection. Ordinary CLI defaults remain PNG
+/// at the browser viewport size; negotiated Web recording uses JPEG frames.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CaptureOptions {
+    pub size: Option<(u32, u32)>,
+    pub jpeg: bool,
+    pub quality: Option<u8>,
+}
+impl CaptureOptions {
+    pub fn validate(self) -> Result<Self, String> {
+        if self.quality.is_some_and(|v| v > 100)
+            || (!self.jpeg && self.quality.is_some())
+            || self.size.is_some_and(|(w, h)| {
+                w == 0
+                    || h == 0
+                    || w > 16384
+                    || h > 16384
+                    || u64::from(w) * u64::from(h) > 64_000_000
+            })
+        {
+            return Err("Invalid native recording capture options".into());
+        }
+        Ok(self)
+    }
+    fn screencast(self) -> Value {
+        let mut value = json!({"format":if self.jpeg{"jpeg"}else{"png"},"everyNthFrame":1});
+        if let Some(quality) = self.quality {
+            value["quality"] = json!(quality);
+        }
+        if let Some((width, height)) = self.size {
+            value["maxWidth"] = json!(width);
+            value["maxHeight"] = json!(height);
+        }
+        value
+    }
+}
+
+#[cfg(test)]
 fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::process::Command {
+    build_ffmpeg_command_with_options(output_path, fps, cursor, CaptureOptions::default())
+}
+fn build_ffmpeg_command_with_options(
+    output_path: &str,
+    fps: u32,
+    cursor: bool,
+    options: CaptureOptions,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("ffmpeg");
     let high_fps = fps > HIGH_FPS_THRESHOLD;
 
@@ -714,13 +760,13 @@ fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::pro
             "-f",
             "image2pipe",
             "-c:v",
-            if cursor { "ppm" } else { "png" },
+            if cursor { "ppm" } else if options.jpeg { "mjpeg" } else { "png" },
             "-framerate",
             &fps.to_string(),
             "-i",
             "pipe:0",
         ])
-        .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
+        .args(["-vf", &options.size.map(|(width,height)|format!("scale={width}:{height}:force_original_aspect_ratio=decrease,pad=ceil({width}/2)*2:ceil({height}/2)*2:0:0")).unwrap_or_else(||"pad=ceil(iw/2)*2:ceil(ih/2)*2".into())])
         .args(["-fps_mode", "vfr"]);
 
     if output_extension(output_path).as_deref() == Some("webm") {
@@ -1445,8 +1491,50 @@ pub fn spawn_recording_task(
     shared_contact_sheet_count: Arc<AtomicU64>,
     cancel_rx: oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
+    spawn_recording_task_with_options(
+        client,
+        capture_session,
+        initial_frame,
+        output_path,
+        fps,
+        shared_count,
+        shared_captured,
+        cursor,
+        shared_cursor,
+        cursor_overlays,
+        iframe_sessions,
+        contact_sheet_path,
+        contact_sheet_threshold,
+        shared_contact_sheet_count,
+        cancel_rx,
+        CaptureOptions::default(),
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_recording_task_with_options(
+    client: Arc<CdpClient>,
+    capture_session: String,
+    initial_frame: InitialRecordingFrame,
+    output_path: String,
+    fps: u32,
+    shared_count: Arc<AtomicU64>,
+    shared_captured: Arc<AtomicU64>,
+    cursor: bool,
+    shared_cursor: SharedRecordingCursor,
+    cursor_overlays: SharedCursorOverlays,
+    iframe_sessions: Vec<String>,
+    contact_sheet_path: Option<String>,
+    contact_sheet_threshold: f64,
+    shared_contact_sheet_count: Arc<AtomicU64>,
+    cancel_rx: oneshot::Receiver<()>,
+    options: CaptureOptions,
+    ready: Option<oneshot::Sender<Result<(), String>>>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         let fps = validate_fps(fps)?;
+        let options = options.validate()?;
         if cursor {
             let mut sessions = iframe_sessions;
             sessions.push(capture_session.clone());
@@ -1475,12 +1563,13 @@ pub fn spawn_recording_task(
             }
             (None, None)
         };
-        let encoder = tokio::spawn(encode_stream(
+        let encoder = tokio::spawn(encode_stream_with_options(
             output_path,
             fps,
             false,
             shared_cursor.clone(),
             frame_rx,
+            options,
         ));
 
         // Chrome does not reliably emit an initial PNG screencast frame for a
@@ -1501,10 +1590,7 @@ pub fn spawn_recording_task(
             Ok(()) => client
                 .send_command(
                     "Page.startScreencast",
-                    Some(json!({
-                        "format": "png",
-                        "everyNthFrame": 1,
-                    })),
+                    Some(options.screencast()),
                     Some(&capture_session),
                 )
                 .await
@@ -1512,6 +1598,14 @@ pub fn spawn_recording_task(
             Err(error) => Err(error),
         };
 
+        if let Some(ready) = ready {
+            let _ = ready.send(
+                started
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|_| "Native recording startup failed".to_string()),
+            );
+        }
         let captured = match started {
             Ok(_) => {
                 collect_frames(
@@ -1591,6 +1685,14 @@ pub async fn capture_initial_image(
     client: &CdpClient,
     session_id: &str,
 ) -> Result<InitialRecordingFrame, String> {
+    capture_initial_image_with_options(client, session_id, CaptureOptions::default()).await
+}
+pub async fn capture_initial_image_with_options(
+    client: &CdpClient,
+    session_id: &str,
+    options: CaptureOptions,
+) -> Result<InitialRecordingFrame, String> {
+    let options = options.validate()?;
     let viewport = client
         .send_command(
             "Runtime.evaluate",
@@ -1614,7 +1716,14 @@ pub async fn capture_initial_image(
     let result = client
         .send_command(
             "Page.captureScreenshot",
-            Some(json!({"format": "png", "fromSurface": true})),
+            Some({
+                let mut params =
+                    json!({"format":if options.jpeg{"jpeg"}else{"png"},"fromSurface":true});
+                if let Some(quality) = options.quality {
+                    params["quality"] = json!(quality);
+                }
+                params
+            }),
             Some(session_id),
         )
         .await
@@ -1806,14 +1915,33 @@ fn render_cursor_frame(
     Ok(bytes)
 }
 
+#[cfg(test)]
 async fn encode_stream(
     output_path: String,
     fps: u32,
     cursor: bool,
     shared_cursor: SharedRecordingCursor,
-    mut frames: mpsc::Receiver<CapturedVideoFrame>,
+    frames: mpsc::Receiver<CapturedVideoFrame>,
 ) -> Result<u64, String> {
-    let mut command = build_ffmpeg_command(&output_path, fps, cursor);
+    encode_stream_with_options(
+        output_path,
+        fps,
+        cursor,
+        shared_cursor,
+        frames,
+        CaptureOptions::default(),
+    )
+    .await
+}
+async fn encode_stream_with_options(
+    output_path: String,
+    fps: u32,
+    cursor: bool,
+    shared_cursor: SharedRecordingCursor,
+    mut frames: mpsc::Receiver<CapturedVideoFrame>,
+    options: CaptureOptions,
+) -> Result<u64, String> {
+    let mut command = build_ffmpeg_command_with_options(&output_path, fps, cursor, options);
     let mut ffmpeg = spawn_ffmpeg_command(&mut command)?;
     let mut stdin = ffmpeg
         .stdin
@@ -1954,20 +2082,21 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
         cursor.enabled = false;
     }
 
-    let counter = state.shared_frame_count.take();
-    let captured = state.shared_captured_count.take();
-    let contact_sheet = state.shared_contact_sheet_count.take();
-    let handle = state.capture_task.take();
-
-    let result = if let Some(h) = handle {
-        match h.await {
+    // Borrow rather than take the join handle across await. If a caller is
+    // cancelled, the scope owner still owns the task and can finish cleanup.
+    let result = if let Some(handle) = state.capture_task.as_mut() {
+        match handle.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(format!("Recording task panicked: {}", e)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("Recording task failed".to_string()),
         }
     } else {
         Ok(())
     };
+    state.capture_task.take();
+    let counter = state.shared_frame_count.take();
+    let captured = state.shared_captured_count.take();
+    let contact_sheet = state.shared_contact_sheet_count.take();
 
     if let Some(c) = counter {
         state.frame_count = c.load(Ordering::Relaxed);
@@ -1990,6 +2119,77 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_options_preserve_cli_defaults_and_apply_jpeg_size() {
+        assert_eq!(
+            CaptureOptions::default().screencast(),
+            json!({"format":"png","everyNthFrame":1})
+        );
+        let options = CaptureOptions {
+            size: Some((801, 601)),
+            jpeg: true,
+            quality: Some(72),
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(
+            options.screencast(),
+            json!({"format":"jpeg","everyNthFrame":1,"quality":72,"maxWidth":801,"maxHeight":601})
+        );
+        let command = build_ffmpeg_command_with_options("fixture.webm", 24, false, options);
+        let arguments: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(arguments.iter().any(|value| value == "mjpeg"));
+        assert!(arguments.iter().any(|value| value == "libvpx"));
+        assert!(arguments
+            .iter()
+            .any(|value| value.contains("scale=801:601") && value.contains("pad=ceil(801/2)*2")));
+        for invalid in [
+            CaptureOptions {
+                size: Some((0, 10)),
+                ..Default::default()
+            },
+            CaptureOptions {
+                size: Some((16384, 16384)),
+                ..Default::default()
+            },
+            CaptureOptions {
+                quality: Some(10),
+                ..Default::default()
+            },
+            CaptureOptions {
+                jpeg: true,
+                quality: Some(101),
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_retains_encoder_join_until_scope_cleanup() {
+        let mut state = RecordingState::new();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        state.capture_task = Some(tokio::spawn(async move {
+            let _ = wait.await;
+            Ok(())
+        }));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            stop_recording_task(&mut state)
+        )
+        .await
+        .is_err());
+        assert!(state.capture_task.is_some());
+        release.send(()).unwrap();
+        stop_recording_task(&mut state).await.unwrap();
+        assert!(state.capture_task.is_none());
+    }
 
     #[test]
     fn cursor_history_only_collects_during_cursor_recordings() {

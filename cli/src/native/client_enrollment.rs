@@ -3,7 +3,7 @@
 //! The authoritative identity/purpose registry remains ClientTargets.
 use super::cdp::client::{BoundedMethodEvents, CdpClient};
 use super::cdp::types::CdpEvent;
-use super::client_browser::{BrowserExecutionLease, ExecutionGate};
+use super::client_browser::{BrowserExecutionLease, ExecutionGate, InitializationAccess};
 use super::client_network::{ApplicationSession, ClientNetwork};
 use super::client_page::ClientPageState;
 use super::client_protocol::ProtocolError;
@@ -100,6 +100,7 @@ pub struct ClientEnrollment {
     page: Arc<ClientPageState>,
     network: Arc<ClientNetwork>,
     gate: Arc<ExecutionGate>,
+    initialization: Option<InitializationAccess>,
     generation: u64,
     active_root: Mutex<String>,
     config: ScopeConfig,
@@ -127,6 +128,7 @@ impl ClientEnrollment {
         active_root: String,
         config: ScopeConfig,
         ownership: ScopeOwnership,
+        initialization: Option<InitializationAccess>,
     ) -> Arc<Self> {
         let (stop, _) = watch::channel(CancelSignal::None);
         Arc::new(Self {
@@ -135,6 +137,7 @@ impl ClientEnrollment {
             page,
             network,
             gate,
+            initialization,
             generation,
             active_root: Mutex::new(active_root),
             config,
@@ -202,15 +205,43 @@ impl ClientEnrollment {
         self.changed.notify_waiters();
     }
     fn lease(&self, entry: &Attribution) -> Result<BrowserExecutionLease, ProtocolError> {
-        self.check()?;
+        let permit = self
+            .check()
+            .and_then(|()| {
+                // Retain exact registry/epoch authority through publication. Never
+                // fall back to a later scope after this access has been retired.
+                match &self.initialization {
+                    Some(access) => access.enter(&self.targets),
+                    None => self.gate.enter(false),
+                }
+            })
+            .map_err(|error| self.admission_error(error))?;
         Ok(BrowserExecutionLease {
             client: self.client.clone(),
             page_session_id: entry.session.clone(),
             target_id: entry.target.clone(),
             identity_scope: self.targets.identity_scope.clone(),
             targets: self.targets.clone(),
-            permit: self.gate.enter(false)?,
+            permit,
         })
+    }
+    /// Only failed admission may become retirement cancellation. Once a permit
+    /// exists, browser/cleanup failures keep their original classification.
+    fn admission_error(&self, error: ProtocolError) -> ProtocolError {
+        if matches!(
+            error,
+            ProtocolError::StaleScope | ProtocolError::ScopeUnavailable
+        ) {
+            if let Ok(index) = self.index.lock() {
+                if let Some(failure) = &index.failure {
+                    return failure.clone();
+                }
+                if self.sealed.load(Ordering::Acquire) {
+                    return ProtocolError::Cancelled;
+                }
+            }
+        }
+        error
     }
     pub fn set_active_root(&self, session: &str) -> Result<(), ProtocolError> {
         self.check()?;
@@ -264,7 +295,9 @@ impl ClientEnrollment {
         if context != self.targets.context_id {
             return Ok(None);
         }
-        self.check()?;
+        // This admission check precedes all owned registration and CDP work.
+        // Explicit retirement cancels new owned work, not foreign detach cleanup.
+        self.check().map_err(|error| self.admission_error(error))?;
         for value in [target, session, kind] {
             valid_id(value)?;
         }
@@ -457,20 +490,22 @@ impl ClientEnrollment {
             .await?;
         }
         if let Some(locale) = &self.config.locale {
-            self.command(
+            self.emulation_override(
                 op,
-                Some(&entry.session),
+                &entry.session,
                 "Emulation.setLocaleOverride",
                 json!({"locale":locale}),
+                "Another locale override is already in effect",
             )
             .await?;
         }
         if let Some(timezone) = &self.config.timezone_id {
-            self.command(
+            self.emulation_override(
                 op,
-                Some(&entry.session),
+                &entry.session,
                 "Emulation.setTimezoneOverride",
                 json!({"timezoneId":timezone}),
+                "Timezone override is already in effect",
             )
             .await?;
         }
@@ -496,6 +531,30 @@ impl ClientEnrollment {
             }
         }
         Ok(())
+    }
+    /// Chromium can share an emulation agent across a page and its popup.
+    /// Match Playwright's narrow idempotent exception; all other failures,
+    /// especially invalid timezone identifiers, remain fatal before resume.
+    async fn emulation_override(
+        &self,
+        op: &OperationLease,
+        session: &str,
+        method: &str,
+        params: Value,
+        already_applied: &str,
+    ) -> Result<(), ProtocolError> {
+        bounded(op, async {
+            match self
+                .client
+                .send_command(method, Some(params), Some(session))
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(error) if error.contains(already_applied) => Ok(()),
+                Err(_) => Err(ProtocolError::BrowserFailure),
+            }
+        })
+        .await
     }
     async fn command(
         &self,
@@ -1146,7 +1205,12 @@ impl ClientEnrollment {
     }
 }
 fn autoattach(enabled: bool) -> Value {
-    json!({"autoAttach":enabled,"waitForDebuggerOnStart":enabled,"flatten":true,"filter":[{"type":"browser","exclude":true},{"type":"tab","exclude":true},{}]})
+    let mut params = json!({"autoAttach":enabled,"waitForDebuggerOnStart":enabled,"flatten":true});
+    if enabled {
+        params["filter"] =
+            json!([{"type":"browser","exclude":true},{"type":"tab","exclude":true},{}]);
+    }
+    params
 }
 fn valid_id(value: &str) -> Result<(), ProtocolError> {
     if value.is_empty() || value.len() > 1024 {
@@ -1226,6 +1290,7 @@ mod tests {
                     ..Default::default()
                 },
                 ScopeOwnership::IsolatedContext,
+                None,
             ),
             notices,
             broker,
@@ -1260,6 +1325,16 @@ mod tests {
                         let method=request["method"].as_str().unwrap();
                         if mode=="delayed-dispose" && method=="Target.disposeBrowserContext" {tokio::time::sleep(Duration::from_millis(40)).await;}
                         if method=="Target.detachFromTarget" {detach_count+=1;}
+                        let settings_error = match (mode, method) {
+                            ("locale-already", "Emulation.setLocaleOverride") => Some("Another locale override is already in effect"),
+                            ("timezone-already", "Emulation.setTimezoneOverride") => Some("Timezone override is already in effect"),
+                            ("invalid-timezone", "Emulation.setTimezoneOverride") => Some("Invalid timezone"),
+                            (_, "Target.setAutoAttach") if request["params"]["autoAttach"]==false && request["params"].get("filter").and_then(Value::as_array).is_some_and(|v|!v.is_empty()) => Some("Target filter should be empty when disabling auto-attach"),
+                            _=>None,
+                        };
+                        if let Some(error)=settings_error {
+                            socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32602,"message":error}}).to_string())).await.unwrap();continue;
+                        }
                         if method=="Target.closeTarget" {closed_targets.insert(request["params"]["targetId"].as_str().unwrap().to_owned());}
                         if (mode=="fail-fetch" && method=="Fetch.enable") || (mode=="detach-fallback" && method=="Target.detachFromTarget" && detach_count==1) {
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic injected failure"}}).to_string())).await.unwrap();continue;
@@ -1304,6 +1379,179 @@ mod tests {
             session_id: parent.map(str::to_owned),
             params: json!({"sessionId":session,"waitingForDebugger":true,"targetInfo":{"targetId":target,"type":kind,"browserContextId":context}}),
         }
+    }
+    #[tokio::test]
+    async fn retirement_before_registration_preserves_failure_and_foreign_cleanup() {
+        let (owner, _notices, log, _emit, server) = fixture("normal").await;
+        owner.seal();
+        assert_eq!(
+            owner
+                .attached(attach(
+                    "owned-context",
+                    "late-owned",
+                    "late-session",
+                    "page",
+                    None
+                ))
+                .await,
+            Err(ProtocolError::Cancelled)
+        );
+        assert!(owner.index.lock().unwrap().sessions.is_empty());
+        assert!(log.lock().unwrap().is_empty());
+        owner
+            .attached(attach(
+                "foreign-context",
+                "foreign-target",
+                "foreign-session",
+                "page",
+                None,
+            ))
+            .await
+            .unwrap();
+        let requests = log.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "Target.detachFromTarget");
+        owner.poison(ProtocolError::StaleScope);
+        assert_eq!(
+            owner
+                .attached(attach(
+                    "owned-context",
+                    "late-owned",
+                    "late-session",
+                    "page",
+                    None
+                ))
+                .await,
+            Err(ProtocolError::StaleScope)
+        );
+        assert!(owner.index.lock().unwrap().sessions.is_empty());
+        assert_eq!(log.lock().unwrap().len(), 1);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn explicit_retirement_only_cancels_unissued_admission_and_preserves_failure() {
+        let (owner, _notices, _log, _emit, server) = fixture("normal").await;
+        owner.seal();
+        owner.gate.seal();
+        assert_eq!(
+            owner.admission_error(ProtocolError::StaleScope),
+            ProtocolError::Cancelled
+        );
+        assert_eq!(
+            owner.admission_error(ProtocolError::BrowserFailure),
+            ProtocolError::BrowserFailure
+        );
+        owner.poison(ProtocolError::StaleScope);
+        assert_eq!(
+            owner.admission_error(ProtocolError::StaleScope),
+            ProtocolError::StaleScope
+        );
+        server.abort();
+    }
+    #[test]
+    fn disable_autoattach_omits_chromium_forbidden_filter() {
+        assert!(autoattach(true).get("filter").is_some());
+        assert!(autoattach(false).get("filter").is_none());
+    }
+    #[tokio::test]
+    async fn shared_renderer_emulation_is_idempotent_but_invalid_timezone_never_resumes() {
+        for mode in ["locale-already", "timezone-already", "invalid-timezone"] {
+            let (mut owner, _notices, log, _emit, server) = fixture(mode).await;
+            Arc::get_mut(&mut owner).unwrap().config.timezone_id = Some("Europe/Paris".into());
+            let result = owner
+                .attached(attach(
+                    "owned-context",
+                    "initial-target",
+                    "initial-session",
+                    "page",
+                    None,
+                ))
+                .await;
+            if mode == "invalid-timezone" {
+                assert_eq!(result, Err(ProtocolError::BrowserFailure));
+                assert!(!log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["method"] == "Runtime.runIfWaitingForDebugger"));
+            } else {
+                result.unwrap();
+                assert!(log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["method"] == "Runtime.runIfWaitingForDebugger"));
+            }
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn owned_target_configures_before_publication_with_private_authority() {
+        let (mut owner, _notices, log, _emit, server) = fixture("normal").await;
+        owner.gate.begin_transition().unwrap();
+        let authority = owner.gate.initialization(owner.targets.clone()).unwrap();
+        Arc::get_mut(&mut owner).unwrap().initialization = Some(authority.access());
+        assert!(owner.gate.enter(false).is_err());
+        owner
+            .attached(attach(
+                "owned-context",
+                "initial-target",
+                "initial-session",
+                "page",
+                None,
+            ))
+            .await
+            .unwrap();
+        let methods = log
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r["method"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        let configured = methods.iter().position(|m| m == "Fetch.enable").unwrap();
+        let resumed = methods
+            .iter()
+            .position(|m| m == "Runtime.runIfWaitingForDebugger")
+            .unwrap();
+        assert!(configured < resumed);
+        authority.publish().unwrap();
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn lifecycle_authority_survives_publication_but_never_next_scope() {
+        let (mut owner, _notices, log, _emit, server) = fixture("normal").await;
+        owner.gate.begin_transition().unwrap();
+        let authority = owner.gate.initialization(owner.targets.clone()).unwrap();
+        Arc::get_mut(&mut owner).unwrap().initialization = Some(authority.access());
+        let entry = Attribution {
+            target: "initial-target".into(),
+            session: "initial-session".into(),
+            parent: None,
+            root: "initial-session".into(),
+            kind: "page".into(),
+            application: true,
+            resumed: false,
+        };
+        let lease = owner.lease(&entry).unwrap();
+        assert!(authority.publish().is_err());
+        drop(lease);
+        authority.publish().unwrap();
+        drop(owner.lease(&entry).unwrap());
+        owner.gate.begin_transition().unwrap();
+        assert!(owner.lease(&entry).is_err());
+        let replacement = owner
+            .gate
+            .initialization(ClientTargets::new(
+                "next-context".into(),
+                "next-scope".into(),
+            ))
+            .unwrap();
+        replacement.publish().unwrap();
+        assert!(owner.lease(&entry).is_err());
+        assert!(log.lock().unwrap().is_empty());
+        server.abort();
     }
     #[tokio::test]
     async fn foreign_context_only_detaches_without_domains_or_resume() {

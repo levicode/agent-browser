@@ -283,6 +283,7 @@ pub struct CdpClient {
     socket: socket2::Socket,
     closed: Arc<AtomicBool>,
     close_complete: AtomicBool,
+    remote_closed: watch::Receiver<bool>,
     close_lock: Mutex<()>,
     cancel_tx: watch::Sender<bool>,
     next_id: AtomicU64,
@@ -399,6 +400,7 @@ impl CdpClient {
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
         let closed = Arc::new(AtomicBool::new(false));
+        let (remote_closed_tx, remote_closed) = watch::channel(false);
 
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let method_taps: MethodTaps = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -541,7 +543,11 @@ impl CdpClient {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
-            closed_reader.store(true, Ordering::SeqCst);
+            // Local teardown sets closed before stopping the reader. Only an
+            // independently ended browser connection authorizes replacement.
+            if !closed_reader.swap(true, Ordering::SeqCst) {
+                remote_closed_tx.send_replace(true);
+            }
             pending_clone.lock().await.clear();
 
             // Stop the keepalive task because the connection is gone.
@@ -576,6 +582,7 @@ impl CdpClient {
             socket,
             closed,
             close_complete: AtomicBool::new(false),
+            remote_closed,
             close_lock: Mutex::new(()),
             cancel_tx,
             next_id: AtomicU64::new(1),
@@ -589,6 +596,11 @@ impl CdpClient {
             bounded_method_taps,
             next_tap_id: AtomicU64::new(1),
         })
+    }
+
+    /// Evidence of underlying CDP connection loss, never local close or RPC EOF.
+    pub fn remote_connection_closed(&self) -> watch::Receiver<bool> {
+        self.remote_closed.clone()
     }
 
     fn ensure_open(&self) -> Result<(), String> {
@@ -956,6 +968,49 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn remote_connection_loss_is_distinct_from_local_close() {
+        for remote in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (release, released) = tokio::sync::oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                if remote {
+                    released.await.unwrap();
+                    socket.close(None).await.unwrap();
+                } else {
+                    while let Some(message) = socket.next().await {
+                        if matches!(message, Ok(Message::Close(_)) | Err(_)) {
+                            break;
+                        }
+                    }
+                }
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let mut loss = client.remote_connection_closed();
+            assert!(!*loss.borrow());
+            if remote {
+                release.send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(2), loss.wait_for(|value| *value))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            } else {
+                drop(release);
+                client.close().await;
+                assert!(
+                    !*loss.borrow(),
+                    "local teardown is not replacement authority"
+                );
+            }
+            client.close().await;
+            server.await.unwrap();
+            assert_eq!(*loss.borrow(), remote);
+        }
+    }
 
     #[tokio::test]
     async fn negotiated_receive_limit_closes_oversized_response_without_reuse() {

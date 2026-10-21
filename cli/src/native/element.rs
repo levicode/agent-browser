@@ -19,8 +19,15 @@ pub struct ExactBinding {
     pub actionable: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NativeReferenceKind {
+    Dom,
+    ReadOnlyCssPseudo,
+}
+
 #[derive(Debug, Clone)]
 pub struct RefEntry {
+    pub kind: NativeReferenceKind,
     pub backend_node_id: Option<i64>,
     pub role: String,
     pub name: String,
@@ -84,6 +91,7 @@ impl RefMap {
         self.map.insert(
             ref_id,
             RefEntry {
+                kind: NativeReferenceKind::Dom,
                 backend_node_id,
                 role: role.to_string(),
                 name: name.to_string(),
@@ -103,6 +111,7 @@ impl RefMap {
         self.map.insert(
             ref_id,
             RefEntry {
+                kind: NativeReferenceKind::Dom,
                 backend_node_id: Some(backend_node_id),
                 role: String::new(),
                 name: String::new(),
@@ -153,6 +162,7 @@ impl RefMap {
         self.map.insert(
             id.clone(),
             RefEntry {
+                kind: NativeReferenceKind::Dom,
                 backend_node_id: Some(backend_node_id),
                 role: role.into(),
                 name: name.into(),
@@ -163,6 +173,22 @@ impl RefMap {
                 exact_binding: Some(binding),
             },
         );
+        Ok(id)
+    }
+
+    pub fn try_bind_readonly_pseudo(
+        &mut self,
+        backend: i64,
+        role: &str,
+        binding: ExactBinding,
+    ) -> Result<String, RefAllocationError> {
+        let mut binding = binding;
+        binding.actionable = false;
+        let id = self.try_bind_exact(backend, role, "", binding)?;
+        self.map
+            .get_mut(&id)
+            .expect("just inserted native ref")
+            .kind = NativeReferenceKind::ReadOnlyCssPseudo;
         Ok(id)
     }
 
@@ -177,6 +203,7 @@ impl RefMap {
         self.map.insert(
             ref_id,
             RefEntry {
+                kind: NativeReferenceKind::Dom,
                 backend_node_id: None,
                 role: role.to_string(),
                 name: name.to_string(),
@@ -545,6 +572,9 @@ pub async fn resolve_element_center(
             .get(&ref_id)
             .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
 
+        if entry.kind == NativeReferenceKind::ReadOnlyCssPseudo {
+            return Err("Native reference is read-only and not actionable".into());
+        }
         if let Some(binding) = &entry.exact_binding {
             validate_exact_binding(client, session_id, binding).await?;
         }
@@ -1283,7 +1313,7 @@ fn build_count_elements_js(selector: &str) -> String {
 /// on el": shadow-including ancestors/descendants in either direction, and
 /// label/control association (custom checkboxes hide the input under a styled
 /// sibling inside the same label).
-const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
+pub(crate) const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
     // Descend from the given document through same-origin iframes so a point
     // over a frame resolves to the element inside it, in that frame's space.
     let d = doc, lx = x, ly = y;
@@ -1317,7 +1347,7 @@ const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
 
 /// Returns why a click at (x, y) cannot reach `el`, or null when it can.
 /// It fails open when the engine lacks an API it needs.
-const ACTIONABILITY_JS: &str = r#"(doc, el, x, y) => {
+pub(crate) const ACTIONABILITY_JS: &str = r#"(doc, el, x, y) => {
     try {
         const rect = el.getBoundingClientRect();
         if ((rect.width <= 0 && rect.height <= 0) || ['hidden', 'collapse'].includes(el.ownerDocument.defaultView.getComputedStyle(el).visibility)) return 'not visible';

@@ -9,6 +9,8 @@ pub mod browser;
 #[allow(dead_code)]
 pub mod cdp;
 #[allow(dead_code)]
+pub mod client_actions;
+#[allow(dead_code)]
 pub mod client_blobs;
 #[allow(dead_code)]
 pub mod client_browser;

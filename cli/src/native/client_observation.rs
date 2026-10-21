@@ -321,43 +321,23 @@ async fn read_backend(
     lease: &OperationLease,
     bounded: bool,
 ) -> Result<SemanticNode, ObservationError> {
-    let session = &frame.binding.session;
-    let world = command(
+    if ax.backend_d_o_m_node_id != Some(backend) {
+        return Err(ObservationError::StaleReference);
+    }
+    let mut node = read_batch(
         client,
-        session,
-        "Page.createIsolatedWorld",
-        json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),
+        frame,
+        &[ax],
+        refs,
+        revision,
+        options,
         lease,
+        bounded,
     )
-    .await?;
-    let context = world["executionContextId"]
-        .as_i64()
-        .ok_or("Missing isolated realm")?;
-    let resolved=command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":"native-observation"}),lease).await?;
-    let object = resolved["object"]["objectId"]
-        .as_str()
-        .ok_or("Native node resolution failed")?;
-    let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":METADATA,
-        "arguments":[{"value":options.test_id_attribute},{"value":options.secure_field_selector}],"returnByValue":true}),lease).await;
-    // Release is best-effort even after cancellation; it cannot publish data or IDs.
-    let _ = tokio::time::timeout(
-        std::time::Duration::from_millis(250),
-        client.send_command(
-            "Runtime.releaseObject",
-            Some(json!({"objectId":object})),
-            Some(session),
-        ),
-    )
-    .await;
-    let result = result?;
-    if result.get("exceptionDetails").is_some() {
-        return Err(ObservationError::BackendFailure);
-    }
-    let data = &result["result"]["value"];
-    if !data.is_object() {
-        return Err("Native metadata read returned no data".into());
-    }
-    let mut node = project_node(frame, backend, ax, refs, revision, data, bounded)?;
+    .await?
+    .into_iter()
+    .next()
+    .ok_or(ObservationError::BackendFailure)?;
     let security = security_inventory(client, frame, options, lease).await?;
     apply_security(&mut node, backend, &security);
     Ok(node)
@@ -385,9 +365,12 @@ fn project_node(
     });
     let mut binding = frame.binding.clone();
     binding.actionable = !matches!(role.as_deref(), Some("document" | "text" | "InlineTextBox"));
-    let id = refs
-        .try_bind_exact(backend, role.as_deref().unwrap_or(""), "", binding)
-        .map_err(|_| ObservationError::BackendFailure)?;
+    let id = if data["__nativeReadonlyPseudo"] == true {
+        refs.try_bind_readonly_pseudo(backend, role.as_deref().unwrap_or(""), binding)
+    } else {
+        refs.try_bind_exact(backend, role.as_deref().unwrap_or(""), "", binding)
+    }
+    .map_err(|_| ObservationError::BackendFailure)?;
     let mut node = SemanticNode {
         reference: NodeReference {
             id: format!("@{id}"),
@@ -986,6 +969,88 @@ pub async fn query(
     })
 }
 
+#[derive(Debug, Clone)]
+struct PseudoOrigin {
+    backend: i64,
+    pseudo_type: String,
+}
+fn pseudo_origins(root: &Value) -> Result<HashMap<i64, PseudoOrigin>, ObservationError> {
+    let mut result = HashMap::new();
+    let mut pending = vec![(root, None, 0usize)];
+    let mut visited = 0usize;
+    while let Some((node, origin, depth)) = pending.pop() {
+        visited += 1;
+        if visited > 100_000 || depth > 256 {
+            return Err(ObservationError::BackendFailure);
+        }
+        let backend = node["backendNodeId"].as_i64();
+        let pseudo = node["pseudoType"].as_str();
+        let current = if let Some(kind) = pseudo {
+            let origin = origin.ok_or(ObservationError::BackendFailure)?;
+            let backend = backend.ok_or(ObservationError::BackendFailure)?;
+            if result
+                .insert(
+                    backend,
+                    PseudoOrigin {
+                        backend: origin,
+                        pseudo_type: kind.into(),
+                    },
+                )
+                .is_some()
+            {
+                return Err(ObservationError::BackendFailure);
+            }
+            Some(origin)
+        } else if node["nodeType"] == 1 {
+            backend
+        } else {
+            origin
+        };
+        for key in ["children", "shadowRoots", "pseudoElements"] {
+            if let Some(children) = node[key].as_array() {
+                pending.extend(children.iter().rev().map(|n| (n, current, depth + 1)));
+            }
+        }
+    }
+    Ok(result)
+}
+fn verified_pseudo_origin(
+    remote: &Value,
+    described: &Value,
+    backend: i64,
+    origins: &HashMap<i64, PseudoOrigin>,
+) -> Result<i64, ObservationError> {
+    if remote["className"] != "CSSPseudoElement" || remote["type"] != "object" {
+        return Err(ObservationError::BackendFailure);
+    }
+    let origin = origins
+        .get(&backend)
+        .ok_or(ObservationError::StaleReference)?;
+    let node = &described["node"];
+    if node["backendNodeId"].as_i64() != Some(backend)
+        || node["nodeType"] != 1
+        || node["pseudoType"].as_str() != Some(origin.pseudo_type.as_str())
+    {
+        return Err(ObservationError::StaleReference);
+    }
+    Ok(origin.backend)
+}
+fn readonly_pseudo_metadata(data: &Value, ax: &AXNode) -> Value {
+    if data.get("__nativeStatus").is_some() {
+        return data.clone();
+    }
+    if !data.is_object()
+        || !data["states"]["secure"].is_boolean()
+        || !data["states"]["hidden"].is_boolean()
+    {
+        return json!({"__nativeStatus":"invalid-native-metadata"});
+    }
+    let protected = data["states"]["secure"] == true
+        || data["secureDescendants"] == true
+        || data["redactName"] == true;
+    json!({"__nativeReadonlyPseudo":true,"redactName":protected,"secureDescendants":data["secureDescendants"],"labels":[],"attributes":{},"states":{"secure":data["states"]["secure"]==true,"hidden":data["states"]["hidden"]==true,"disabled":true},"text":if protected{None}else{ax_string(&ax.name)},"rect":null})
+}
+
 #[allow(clippy::too_many_arguments)] // Same explicit ownership contract as the single-node reader.
 async fn read_batch(
     client: &CdpClient,
@@ -1006,15 +1071,27 @@ async fn read_batch(
     let result=async {
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing isolated realm")?;
-        let objects:Vec<String>=stream::iter(nodes.iter().map(|ax| {
+        let resolved:Vec<Value>=stream::iter(nodes.iter().map(|ax| {
             let group=&group;
             async move {
-                let value=command(client,session,"DOM.resolveNode",json!({"backendNodeId":ax.backend_d_o_m_node_id,"executionContextId":context,"objectGroup":group}),lease).await?;
-                #[cfg(test)]
-                if value["object"]["subtype"] != "node" { eprintln!("native observation resolved metadata receiver has non-node subtype; details omitted"); }
-                value["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference)
+                command(client,session,"DOM.resolveNode",json!({"backendNodeId":ax.backend_d_o_m_node_id,"executionContextId":context,"objectGroup":group}),lease).await
             }
         })).buffered(16).try_collect().await?;
+        let has_pseudo=resolved.iter().any(|value|value["object"]["subtype"]!="node");
+        let origins=if has_pseudo{pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?}else{HashMap::new()};
+        let mut objects=Vec::with_capacity(nodes.len());let mut pseudo=Vec::with_capacity(nodes.len());
+        for (ax,value) in nodes.iter().zip(&resolved){
+            let remote=&value["object"];
+            if remote["subtype"]=="node" { objects.push(remote["objectId"].as_str().ok_or(ObservationError::StaleReference)?.to_owned());pseudo.push(None);continue; }
+            let backend=ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
+            let described=command(client,session,"DOM.describeNode",json!({"backendNodeId":backend,"depth":0}),lease).await?;
+            #[cfg(test)]
+            eprintln!("native non-node classification: cssPseudo={}, nativePseudo={}, markerRole={}",remote["className"]=="CSSPseudoElement",described["node"]["pseudoType"].is_string(),ax_string(&ax.role).as_deref()==Some("ListMarker"));
+            let origin=verified_pseudo_origin(remote,&described,backend,&origins)?;
+            let owner=command(client,session,"DOM.resolveNode",json!({"backendNodeId":origin,"executionContextId":context,"objectGroup":group}),lease).await?;
+            if owner["object"]["subtype"]!="node"{return Err(ObservationError::StaleReference);}
+            objects.push(owner["object"]["objectId"].as_str().ok_or(ObservationError::StaleReference)?.to_owned());pseudo.push(Some(origin));
+        }
         let mut arguments=vec![json!({"value":options.test_id_attribute}),json!({"value":options.secure_field_selector})];
         arguments.extend(objects.iter().map(|o|json!({"objectId":o})));
         let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; return nodes.map(node=>read.call(node,testId,secureSelector)); }}");
@@ -1026,7 +1103,25 @@ async fn read_batch(
         }
         let values=result["result"]["value"].as_array().ok_or("Missing metadata batch")?;
         if values.len()!=nodes.len(){return Err("Incomplete metadata batch".into());}
-        nodes.iter().zip(values).map(|(ax,data)|project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,data,bounded)).collect()
+        let policy=if has_pseudo{Some(security_inventory(client,frame,options,lease).await?)}else{None};
+        if has_pseudo {
+            let current=pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?;
+            for ((ax,remote),origin) in nodes.iter().zip(&resolved).zip(&pseudo) {
+                if let Some(origin)=origin {
+                    let backend=ax.backend_d_o_m_node_id.ok_or(ObservationError::BackendFailure)?;
+                    let described=command(client,session,"DOM.describeNode",json!({"backendNodeId":backend,"depth":0}),lease).await?;
+                    if verified_pseudo_origin(&remote["object"],&described,backend,&current)?!=*origin{return Err(ObservationError::StaleReference);}
+                }
+            }
+        }
+        // The originating element supplies security policy only. Identity stays
+        // the native pseudo backend, never the origin's DOM reference.
+        nodes.iter().zip(values).zip(pseudo).map(|((ax,data),origin)|{
+            let readonly=if origin.is_some(){readonly_pseudo_metadata(data,ax)}else{data.clone()};
+            let mut node=project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,&readonly,bounded)?;
+            if let (Some(origin),Some(policy))=(origin,&policy){apply_security(&mut node,origin,policy);if node.states.get("secure")==Some(&true){scrub_content(&mut node);}}
+            Ok(node)
+        }).collect()
     }.await;
     let _ = tokio::time::timeout(
         std::time::Duration::from_millis(250),
@@ -1565,6 +1660,11 @@ fn bounded_dom_ids(
         if depth > 256 || visited > 100_000 {
             return Err(ObservationError::BackendFailure);
         }
+        // CSS pseudo trees are not DOM locator candidates. Their read-only AX
+        // identities are projected separately and never fed to MATCH_QUERY.
+        if node.get("pseudoType").is_some() {
+            continue;
+        }
         if node["nodeType"]
             .as_i64()
             .is_some_and(|kind| node_types.contains(&kind))
@@ -1692,7 +1792,7 @@ mod tests {
                     }
                     "Runtime.getProperties" => json!({"result":[]}),
                     "Page.createIsolatedWorld" => json!({"executionContextId":1}),
-                    "DOM.resolveNode" => json!({"object":{"objectId":"node-42"}}),
+                    "DOM.resolveNode" => json!({"object":{"objectId":"node-42","subtype":"node"}}),
                     "Runtime.callFunctionOn" => {
                         if request["params"]["functionDeclaration"]
                             .as_str()
@@ -1824,6 +1924,9 @@ mod tests {
             let (mut lease,_sender)=lease();lease.deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);let mut refs=RefMap::new();
             let frames=enumerate_frames(&mgr.client,session,&HashMap::new(),&lease).await.map_err(|_| "native observation stage: enumerate_frames_1".to_string())?;
             let observation=observe(&mgr.client,&frames,&mut refs,"fixture",1,&ObservationOptions::default(),&lease).await.map_err(|_| "native observation stage: observe_1".to_string())?;
+            let pseudo_refs:Vec<_>=refs.entries_sorted().into_iter().filter(|(_,entry)|entry.kind==super::super::element::NativeReferenceKind::ReadOnlyCssPseudo).collect();
+            if pseudo_refs.len()<2{return Err("Native list-marker readonly identities were lost".into());}
+            for (id,_) in pseudo_refs { if super::super::element::resolve_element_object_id(&mgr.client,session,&refs,&format!("@{id}"),&HashMap::new()).await.is_ok(){return Err("Readonly pseudo became actionable".into());} }
             let serialized=serde_json::to_string(&observation).unwrap();
             if serialized.contains("synthetic-password"){return Err("Password leaked in observation".to_string());}
             let options:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"index","source":{"kind":"query","query":{"kind":"role","value":{"kind":"string","value":"button","exact":true},"name":{"kind":"string","value":"Save","exact":true}}},"index":"last"}})).unwrap();
@@ -1853,9 +1956,10 @@ mod tests {
             mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelector('iframe').contentDocument.body.appendChild(document.querySelector('li button')); true","returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_4".to_string())?;
             if super::super::element::resolve_element_object_id(&mgr.client,session,&refs,&adopted,&HashMap::new()).await.is_ok(){return Err("Cross-document adopted node retained old exact authority".into());}
             mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"for(const mode of ['open','closed']){const h=document.createElement('div');h.id=mode+'-secure-host';h.className='secure';document.body.appendChild(h);h.attachShadow({mode}).innerHTML='<span>synthetic-shadow-secret</span><input value="synthetic-shadow-secret">';}const h=document.createElement('div');h.id='unmarked-host';document.body.appendChild(h);h.attachShadow({mode:'closed'}).innerHTML='<span class="secure">synthetic-closed-child</span><span class="secure" id="root-local-secret">synthetic-root-local-secret</span><button aria-labelledby="root-local-secret">Public</button>';const b=document.createElement('button');b.setAttribute('aria-labelledby','unmarked-host');document.body.appendChild(b);true"#,"returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_5".to_string())?;
+            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":"const generated=document.createElement('div');generated.className='secure generated';document.body.appendChild(generated);const style=document.createElement('style');style.textContent='.generated::before{content:\"synthetic-generated-secret\"}';document.head.appendChild(style);true","returnByValue":true})),Some(session)).await?;
             let policy=ObservationOptions{secure_field_selector:".secure".into(),..Default::default()};
             let secret_tree=observe(&mgr.client,&frames,&mut refs,"fixture",3,&policy,&lease).await.map_err(|_| "native observation stage: observe_3".to_string())?;
-            let serialized=serde_json::to_string(&secret_tree).unwrap();if serialized.contains("synthetic-shadow-secret")||serialized.contains("synthetic-closed-child")||serialized.contains("synthetic-root-local-secret"){return Err("Shadow secure subtree leaked in observation".into());}
+            let serialized=serde_json::to_string(&secret_tree).unwrap();if serialized.contains("synthetic-generated-secret")||serialized.contains("synthetic-shadow-secret")||serialized.contains("synthetic-closed-child")||serialized.contains("synthetic-root-local-secret"){return Err("Shadow secure subtree leaked in observation".into());}
             let unmarked:QueryOptions=serde_json::from_value(json!({"secureFieldSelector":".secure","expression":{"kind":"selector","selector":"#unmarked-host"}})).unwrap();
             let found=query(&mgr.client,&frames,&mut refs,"fixture",3,&unmarked,&lease).await.map_err(|_| "native observation stage: query_7".to_string())?;
             let read_options:ReadOptions=serde_json::from_value(json!({"ref":found.nodes[0].reference.id,"secureFieldSelector":".secure"})).unwrap();
@@ -2330,5 +2434,190 @@ mod tests {
                 .unwrap()
                 .actionable
         );
+    }
+    #[test]
+    fn native_pseudo_classification_requires_owned_inventory_and_exact_descriptor() {
+        let dom = json!({"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"backendNodeId":2,"pseudoElements":[{"nodeType":1,"backendNodeId":3,"pseudoType":"marker"}]}]});
+        let inventory = pseudo_origins(&dom).unwrap();
+        let remote = json!({"type":"object","className":"CSSPseudoElement","objectId":"opaque"});
+        let described = json!({"node":{"nodeType":1,"backendNodeId":3,"pseudoType":"marker"}});
+        assert_eq!(
+            verified_pseudo_origin(&remote, &described, 3, &inventory).unwrap(),
+            2
+        );
+        for invalid in [
+            json!({"type":"object","className":"Object"}),
+            json!({"type":"object","className":"Window"}),
+        ] {
+            assert!(verified_pseudo_origin(&invalid, &described, 3, &inventory).is_err());
+        }
+        assert!(verified_pseudo_origin(&remote, &described, 3, &HashMap::new()).is_err());
+        assert!(verified_pseudo_origin(
+            &remote,
+            &json!({"node":{"nodeType":1,"backendNodeId":4,"pseudoType":"marker"}}),
+            3,
+            &inventory
+        )
+        .is_err());
+        assert!(verified_pseudo_origin(
+            &remote,
+            &json!({"node":{"nodeType":1,"backendNodeId":3,"pseudoType":"before"}}),
+            3,
+            &inventory
+        )
+        .is_err());
+    }
+    #[test]
+    fn pseudo_projection_keeps_own_readonly_identity_and_redacts_origin_secrets() {
+        use super::super::element::NativeReferenceKind;
+        let mut node = ax("marker", 3, &[]);
+        node.role.as_mut().unwrap().value = Some(json!("ListMarker"));
+        node.name.as_mut().unwrap().value = Some(json!("synthetic-marker"));
+        let mut refs = RefMap::new();
+        let owner = refs.bind_exact(2, "listitem", "", frame().binding);
+        let data = readonly_pseudo_metadata(&metadata(), &node);
+        let projected = project_node(&frame(), 3, &node, &mut refs, 1, &data, true).unwrap();
+        assert_ne!(projected.reference.id, format!("@{owner}"));
+        let entry = refs
+            .get(projected.reference.id.trim_start_matches('@'))
+            .unwrap();
+        assert_eq!(entry.backend_node_id, Some(3));
+        assert_eq!(entry.kind, NativeReferenceKind::ReadOnlyCssPseudo);
+        assert!(!entry.exact_binding.as_ref().unwrap().actionable);
+        assert_eq!(projected.text.as_deref(), Some("synthetic-marker"));
+        assert!(projected.selector.is_none());
+        assert!(projected.value.is_none());
+        let mut secure = metadata();
+        secure["states"]["secure"] = json!(true);
+        let protected = project_node(
+            &frame(),
+            3,
+            &node,
+            &mut refs,
+            1,
+            &readonly_pseudo_metadata(&secure, &node),
+            true,
+        )
+        .unwrap();
+        assert!(!serde_json::to_string(&protected)
+            .unwrap()
+            .contains("synthetic-marker"));
+        let stale = readonly_pseudo_metadata(&json!({"__nativeStatus":"stale-reference"}), &node);
+        assert!(matches!(
+            project_node(&frame(), 3, &node, &mut refs, 1, &stale, true),
+            Err(ObservationError::StaleReference)
+        ));
+    }
+    #[tokio::test]
+    async fn pseudo_metadata_uses_verified_origin_without_rebinding_and_rejects_late_change() {
+        use futures_util::{SinkExt, StreamExt};
+        for mode in [
+            "valid",
+            "secure",
+            "unknown",
+            "wrong-realm",
+            "changed-origin",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut metadata_done = false;
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(text).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "Page.createIsolatedWorld" => json!({"executionContextId":17}),
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}})
+                        }
+                        "DOM.getDocument" => {
+                            json!({"root":{"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"backendNodeId":if mode=="changed-origin"&&metadata_done{4}else{2},"pseudoElements":[{"nodeType":1,"backendNodeId":3,"pseudoType":"marker"}]}]}})
+                        }
+                        "DOM.describeNode" => {
+                            json!({"node":{"nodeType":1,"backendNodeId":3,"pseudoType":"marker"}})
+                        }
+                        "DOM.resolveNode" => {
+                            let backend = request["params"]["backendNodeId"].as_i64().unwrap();
+                            if backend == 3 {
+                                json!({"object":{"type":"object","className":if mode=="unknown"{"Object"}else{"CSSPseudoElement"},"objectId":"pseudo"}})
+                            } else {
+                                json!({"object":{"type":"object","subtype":"node","objectId":format!("node-{backend}")}})
+                            }
+                        }
+                        "Runtime.callFunctionOn" => {
+                            let source = request["params"]["functionDeclaration"].as_str().unwrap();
+                            if source.contains("Array.from(result)") {
+                                json!({"result":{"objectId":"security-array"}})
+                            } else {
+                                assert_eq!(request["params"]["objectId"], "node-2");
+                                assert_eq!(request["params"]["arguments"][2]["objectId"], "node-2");
+                                metadata_done = true;
+                                let mut data = metadata();
+                                if mode == "secure" {
+                                    data["states"]["secure"] = json!(true);
+                                }
+                                if mode == "wrong-realm" {
+                                    data = json!({"__nativeStatus":"stale-reference"});
+                                }
+                                json!({"result":{"value":[data]}})
+                            }
+                        }
+                        "Runtime.getProperties" => json!({"result":[]}),
+                        "Runtime.releaseObjectGroup" => json!({}),
+                        _ => panic!("unexpected native pseudo command"),
+                    };
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":result}).to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let client = CdpClient::connect(&endpoint).await.unwrap();
+            let (op, _sender) = lease();
+            let mut refs = RefMap::new();
+            let node = ax("marker", 3, &[]);
+            let result = read_batch(
+                &client,
+                &frame(),
+                &[&node],
+                &mut refs,
+                1,
+                &ObservationOptions::default(),
+                &op,
+                true,
+            )
+            .await;
+            if mode == "valid" || mode == "secure" {
+                let projected = result.unwrap().remove(0);
+                let entry = refs
+                    .get(projected.reference.id.trim_start_matches('@'))
+                    .unwrap();
+                assert_eq!(entry.backend_node_id, Some(3));
+                assert_eq!(
+                    entry.kind,
+                    super::super::element::NativeReferenceKind::ReadOnlyCssPseudo
+                );
+                if mode == "secure" {
+                    assert!(projected.name.is_none());
+                    assert!(projected.text.is_none());
+                }
+            } else {
+                assert!(result.is_err(), "{mode}");
+                assert!(
+                    refs.entries_sorted().is_empty(),
+                    "failed proof allocated identity"
+                );
+            }
+            server.abort();
+        }
     }
 }

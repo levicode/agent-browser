@@ -30,6 +30,14 @@ struct InputState {
     mouse: MouseState,
     session: Option<String>,
 }
+/// A non-cloneable receipt for the exact temporary modifier transaction.
+/// The caller serializes input actions and retains cleanup on cancellation.
+pub(crate) struct ModifierReceipt {
+    identity_scope: String,
+    session: String,
+    keys: Vec<Key>,
+    released: Vec<Key>,
+}
 #[derive(Clone)]
 struct Key {
     key: String,
@@ -929,12 +937,30 @@ impl ClientPageState {
         .await?;
         Ok(())
     }
+    /// Pure API preflight, shared with locator actions before focus or selection.
+    pub(crate) fn validate_keyboard_command(
+        action: &str,
+        value: &str,
+    ) -> Result<(), ProtocolError> {
+        match action {
+            "type" => Ok(()),
+            "down" | "up" => key_descriptor(value).map(|_| ()),
+            "press" => {
+                for part in split_chord(value)? {
+                    key_descriptor(&part)?;
+                }
+                Ok(())
+            }
+            _ => invalid(),
+        }
+    }
     async fn keyboard(
         &self,
         page: &BrowserExecutionLease,
         op: &OperationLease,
         a: &Keyboard,
     ) -> Result<(), ProtocolError> {
+        Self::validate_keyboard_command(&a.action, &a.value)?;
         match a.action.as_str() {
             "down" | "up" => {
                 self.key_event(
@@ -986,6 +1012,149 @@ impl ClientPageState {
             _ => invalid(),
         }
     }
+    pub(crate) async fn acquire_modifiers(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        requested: &[String],
+    ) -> Result<ModifierReceipt, ProtocolError> {
+        self.validate(page, op)?;
+        if requested.len() > 8 {
+            return invalid();
+        }
+        // Validate the complete set before changing any held key.
+        let keys = requested
+            .iter()
+            .map(|name| {
+                let key = key_descriptor(name)?;
+                if key.modifier == 0 {
+                    return invalid();
+                }
+                Ok(key)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut receipt = ModifierReceipt {
+            identity_scope: page.identity_scope.clone(),
+            session: page.page_session_id.clone(),
+            keys: Vec::new(),
+            released: Vec::new(),
+        };
+        let requested_bits = keys.iter().fold(0, |bits, key| bits | key.modifier);
+        let previous = {
+            let mut state = self.state()?;
+            bind_input_session(&mut state.input, &page.page_session_id)?;
+            state
+                .input
+                .keys
+                .values()
+                .filter(|key| key.modifier != 0 && requested_bits & key.modifier == 0)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for key in previous {
+            self.key_event(page, op, key.clone(), false, false).await?;
+            receipt.released.push(key);
+        }
+        for key in keys {
+            let held = {
+                let mut state = self.state()?;
+                bind_input_session(&mut state.input, &page.page_session_id)?;
+                modifiers(&state.input)
+            };
+            // A held right-side key already satisfies the corresponding modifier.
+            if held & key.modifier != 0 {
+                continue;
+            }
+            self.key_event(page, op, key.clone(), true, false).await?;
+            receipt.keys.push(key);
+        }
+        Ok(receipt)
+    }
+
+    pub(crate) async fn restore_modifiers(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        receipt: ModifierReceipt,
+    ) -> Result<(), ProtocolError> {
+        self.validate(page, op)?;
+        if receipt.identity_scope != page.identity_scope || receipt.session != page.page_session_id
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        for key in receipt.keys.into_iter().rev() {
+            self.key_event(page, op, key, false, false).await?;
+        }
+        for key in receipt.released {
+            self.key_event(page, op, key, true, false).await?;
+        }
+        Ok(())
+    }
+
+    /// Shared primitive for locator actions and public mouse commands. Input
+    /// state is updated before dispatch so uncertain effects remain cleanable.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn pointer_event(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        kind: &str,
+        point: Option<(f64, f64)>,
+        button: Option<&str>,
+        click_count: Option<i32>,
+        delta: Option<(f64, f64)>,
+    ) -> Result<(), ProtocolError> {
+        self.validate(page, op)?;
+        if point.is_some_and(|(x, y)| !x.is_finite() || !y.is_finite())
+            || delta.is_some_and(|(x, y)| !x.is_finite() || !y.is_finite())
+        {
+            return invalid();
+        }
+        match kind {
+            "mousePressed" | "mouseReleased"
+                if matches!(
+                    button,
+                    Some("left" | "right" | "middle" | "back" | "forward")
+                ) && click_count.is_none_or(|n| n > 0)
+                    && delta.is_none() => {}
+            "mouseMoved" if button.is_none() && click_count.is_none() && delta.is_none() => {}
+            "mouseWheel" if button.is_none() && click_count.is_none() && delta.is_some() => {}
+            _ => return invalid(),
+        }
+        let params = {
+            let mut state = self.state()?;
+            bind_input_session(&mut state.input, &page.page_session_id)?;
+            let mods = modifiers(&state.input);
+            build_mouse_event_params(
+                &mut state.input.mouse,
+                kind,
+                point.map(|p| p.0),
+                point.map(|p| p.1),
+                button,
+                None,
+                button.map(|_| click_count.unwrap_or(1)),
+                delta.map(|p| p.0),
+                delta.map(|p| p.1),
+                Some(mods),
+            )
+        };
+        let mut params = serde_json::to_value(params).map_err(|_| ProtocolError::BrowserFailure)?;
+        if kind == "mouseWheel" {
+            for field in ["button", "buttons", "clickCount"] {
+                params.as_object_mut().unwrap().remove(field);
+            }
+        }
+        command(
+            page,
+            op,
+            Some(&page.page_session_id),
+            "Input.dispatchMouseEvent",
+            params,
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn mouse(
         &self,
         page: &BrowserExecutionLease,
@@ -1003,40 +1172,16 @@ impl ClientPageState {
             Mouse::Up => ("mouseReleased", None, None, Some("left"), None, None),
             _ => return invalid(),
         };
-        let params = {
-            let mut s = self.state()?;
-            bind_input_session(&mut s.input, &page.page_session_id)?;
-            let mods = modifiers(&s.input);
-            build_mouse_event_params(
-                &mut s.input.mouse,
-                kind,
-                x,
-                y,
-                button,
-                None,
-                button.map(|_| 1),
-                dx,
-                dy,
-                Some(mods),
-            )
-        };
-        let mut params = serde_json::to_value(params).map_err(|_| ProtocolError::BrowserFailure)?;
-        // Chromium's public wheel primitive carries deltas and modifiers, not
-        // a new button transition. Keep held buttons in native state only.
-        if kind == "mouseWheel" {
-            for field in ["button", "buttons", "clickCount"] {
-                params.as_object_mut().unwrap().remove(field);
-            }
-        }
-        command(
+        self.pointer_event(
             page,
             op,
-            Some(&page.page_session_id),
-            "Input.dispatchMouseEvent",
-            params,
+            kind,
+            x.zip(y),
+            button,
+            button.map(|_| 1),
+            dx.zip(dy),
         )
-        .await?;
-        Ok(())
+        .await
     }
     /// Cleanup runs outside the cancelled operation budget. Caller must retain
     /// this future until it settles and quarantine this scope on any failure.
@@ -1063,14 +1208,23 @@ impl ClientPageState {
                     )
                     .await?;
             }
-            if input.mouse.buttons != 0 {
+            for (button, mask) in [
+                ("left", 1),
+                ("right", 2),
+                ("middle", 4),
+                ("back", 8),
+                ("forward", 16),
+            ] {
+                if input.mouse.buttons & mask == 0 {
+                    continue;
+                }
                 let params = build_mouse_event_params(
                     &mut input.mouse,
                     "mouseReleased",
                     None,
                     None,
-                    Some("left"),
-                    Some(0),
+                    Some(button),
+                    None,
                     Some(1),
                     None,
                     None,
@@ -1657,6 +1811,211 @@ mod tests {
             log,
             task,
         )
+    }
+    #[tokio::test]
+    async fn shared_pointer_secondary_double_click_and_cleanup_preserve_state() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        state
+            .pointer_event(
+                &page,
+                &op,
+                "mouseMoved",
+                Some((12.5, 20.0)),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .pointer_event(
+                &page,
+                &op,
+                "mousePressed",
+                None,
+                Some("right"),
+                Some(2),
+                None,
+            )
+            .await
+            .unwrap();
+        state
+            .pointer_event(
+                &page,
+                &op,
+                "mousePressed",
+                None,
+                Some("left"),
+                Some(1),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.mouse_state().unwrap().buttons, 3);
+        state.release_input(&page).await.unwrap();
+        assert_eq!(state.mouse_state().unwrap().buttons, 0);
+        let requests = log.lock().unwrap();
+        let events = requests
+            .iter()
+            .filter(|r| r["method"] == "Input.dispatchMouseEvent")
+            .map(|r| &r["params"])
+            .collect::<Vec<_>>();
+        assert_eq!(events[1]["button"], "right");
+        assert_eq!(events[1]["clickCount"], 2);
+        assert_eq!(events[1]["x"], 12.5);
+        assert_eq!(events[3]["button"], "left");
+        assert_eq!(events[3]["buttons"], 2);
+        assert_eq!(events[4]["button"], "right");
+        assert_eq!(events[4]["buttons"], 0);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn shared_pointer_invalid_and_cancelled_commands_have_no_effects() {
+        let (page, log, task) = mock("normal").await;
+        let (op, sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        for (kind, point, button, count, delta) in [
+            ("bogus", None, None, None, None),
+            ("mousePressed", None, Some("bogus"), Some(1), None),
+            ("mousePressed", None, Some("left"), Some(0), None),
+            ("mouseMoved", Some((f64::NAN, 0.0)), None, None, None),
+            ("mouseWheel", None, None, None, Some((f64::INFINITY, 0.0))),
+            ("mouseMoved", None, Some("left"), None, None),
+        ] {
+            assert_eq!(
+                state
+                    .pointer_event(&page, &op, kind, point, button, count, delta)
+                    .await,
+                Err(ProtocolError::InvalidArguments)
+            );
+        }
+        sender.send(CancelSignal::Requested).unwrap();
+        assert!(state
+            .pointer_event(
+                &page,
+                &op,
+                "mousePressed",
+                None,
+                Some("right"),
+                Some(2),
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(state.mouse_state().unwrap().buttons, 0);
+        assert!(log.lock().unwrap().is_empty());
+        task.abort();
+    }
+    #[tokio::test]
+    async fn temporary_modifier_exact_set_restores_preheld_right_key() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        state
+            .keyboard(
+                &page,
+                &op,
+                &Keyboard {
+                    action: "down".into(),
+                    value: "ShiftRight".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let receipt = state
+            .acquire_modifiers(&page, &op, &["Control".into()])
+            .await
+            .unwrap();
+        assert_eq!(state.held_modifiers().unwrap(), 2);
+        state.restore_modifiers(&page, &op, receipt).await.unwrap();
+        assert_eq!(state.held_modifiers().unwrap(), 8);
+        assert!(state.state().unwrap().input.keys.contains_key("ShiftRight"));
+        let receipt = state.acquire_modifiers(&page, &op, &[]).await.unwrap();
+        assert_eq!(state.held_modifiers().unwrap(), 0);
+        state.restore_modifiers(&page, &op, receipt).await.unwrap();
+        assert_eq!(state.held_modifiers().unwrap(), 8);
+        let requests = log.lock().unwrap().clone();
+        let events = requests
+            .iter()
+            .filter(|r| r["method"] == "Input.dispatchKeyEvent")
+            .collect::<Vec<_>>();
+        assert_eq!(events[1]["params"]["type"], "keyUp");
+        assert_eq!(events[1]["params"]["code"], "ShiftRight");
+        assert_eq!(events[4]["params"]["code"], "ShiftRight");
+        drop(requests);
+        state.release_input(&page).await.unwrap();
+        task.abort();
+    }
+    #[tokio::test]
+    async fn temporary_modifiers_preserve_preheld_right_keys_and_reject_invalid_sets() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        state
+            .keyboard(
+                &page,
+                &op,
+                &Keyboard {
+                    action: "down".into(),
+                    value: "ShiftRight".into(),
+                },
+            )
+            .await
+            .unwrap();
+        let count = log.lock().unwrap().len();
+        assert!(state
+            .acquire_modifiers(&page, &op, &["Control".into(), "a".into()])
+            .await
+            .is_err());
+        assert_eq!(log.lock().unwrap().len(), count);
+        let receipt = state
+            .acquire_modifiers(
+                &page,
+                &op,
+                &["Shift".into(), "Control".into(), "Control".into()],
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.held_modifiers().unwrap(), 10);
+        state.restore_modifiers(&page, &op, receipt).await.unwrap();
+        assert_eq!(state.held_modifiers().unwrap(), 8);
+        assert!(state.state().unwrap().input.keys.contains_key("ShiftRight"));
+        let requests = log.lock().unwrap().clone();
+        let events = requests
+            .iter()
+            .filter(|r| r["method"] == "Input.dispatchKeyEvent")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[1]["params"]["code"], "ControlLeft");
+        assert_eq!(events[2]["params"]["type"], "keyUp");
+        drop(requests);
+        state.release_input(&page).await.unwrap();
+        task.abort();
+    }
+    #[test]
+    fn pure_keyboard_preflight_reuses_full_key_grammar_without_effects() {
+        for (action, value) in [
+            ("press", "Control++"),
+            ("press", "Shift+ArrowLeft"),
+            ("down", "ShiftRight"),
+            ("up", "ControlOrMeta"),
+            ("type", "中+literal"),
+        ] {
+            ClientPageState::validate_keyboard_command(action, value).unwrap();
+        }
+        for (action, value) in [
+            ("unknown", "a"),
+            ("press", "Shift+NotAKey"),
+            ("down", "Control+a"),
+            ("press", ""),
+        ] {
+            assert_eq!(
+                ClientPageState::validate_keyboard_command(action, value),
+                Err(ProtocolError::InvalidArguments)
+            );
+        }
     }
     #[test]
     fn pure_chord_literal_plus_and_modifier_aliases() {
