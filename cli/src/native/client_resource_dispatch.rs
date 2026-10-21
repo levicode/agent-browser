@@ -380,6 +380,26 @@ mod tests {
         }
     }
     #[test]
+    fn shared_fixture_routes_obey_actual_strict_resource_schema() {
+        let mut args = super::super::client_actions::fixture_routes("synthetic-scope");
+        args.as_object_mut().unwrap().remove("identityScope");
+        assert!(matches!(
+            parse("network.routes.replace", &args),
+            Ok(Command::Routes(_))
+        ));
+        let mut invalid = args.clone();
+        invalid["unexpected"] = json!(true);
+        assert!(matches!(
+            parse("network.routes.replace", &invalid),
+            Err(ProtocolError::InvalidArguments)
+        ));
+        args["version"] = json!(0);
+        assert!(matches!(
+            parse("network.routes.replace", &args),
+            Err(ProtocolError::InvalidArguments)
+        ));
+    }
+    #[test]
     fn strict_preflight_rejects_unknown_fields_noncanonical_bodies_and_bad_ranges() {
         for (name, args) in [
             ("dialog.register", json!({"enabled":true,"unexpected":1})),

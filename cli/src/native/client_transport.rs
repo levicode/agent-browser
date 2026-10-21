@@ -573,7 +573,16 @@ impl ClientEventSink {
 pub async fn read_frame<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Vec<u8>>, ProtocolError> {
-    let mut frame = Vec::new();
+    read_frame_retained(reader, &mut Vec::new()).await
+}
+
+// The transport select loop owns this buffer across timer/control/completion
+// branches. fill_buf is cancellation-safe; consumed bytes must also survive
+// cancellation of the future which is waiting for the remaining frame.
+async fn read_frame_retained<R: AsyncBufRead + Unpin>(
+    reader: &mut R,
+    frame: &mut Vec<u8>,
+) -> Result<Option<Vec<u8>>, ProtocolError> {
     loop {
         let available = reader
             .fill_buf()
@@ -594,7 +603,7 @@ pub async fn read_frame<R: AsyncBufRead + Unpin>(
         frame.extend_from_slice(&available[..length]);
         reader.consume(length + usize::from(newline.is_some()));
         if newline.is_some() {
-            return Ok(Some(frame));
+            return Ok(Some(std::mem::take(frame)));
         }
     }
 }
@@ -785,9 +794,10 @@ where
     let mut closing_id = None;
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(25));
     if valid && ready_queued {
+        let mut incoming_frame = Vec::new();
         loop {
             let frame = tokio::select! {
-                frame = read_frame(&mut reader) => frame,
+                frame = read_frame_retained(&mut reader, &mut incoming_frame) => frame,
                 _ = &mut failure => break,
                 _ = timer.tick() => {
                     let _ = broker.expire_decisions();
@@ -2066,6 +2076,153 @@ mod tests {
         assert_eq!(terminal["error"]["code"], "cleanup-failed");
         assert_eq!(terminal["scopeState"], "quarantined");
         assert!(!task.await.unwrap());
+    }
+
+    // Report bytes actually consumed, not merely written to the peer. This lets
+    // completion deterministically cancel a read after its prefix is consumed.
+    struct CountedReader<R> {
+        inner: R,
+        consumed: tokio::sync::watch::Sender<usize>,
+    }
+    impl<R: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for CountedReader<R> {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+    impl<R: AsyncBufRead + Unpin> AsyncBufRead for CountedReader<R> {
+        fn poll_fill_buf(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<&[u8]>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_fill_buf(cx)
+        }
+        fn consume(mut self: std::pin::Pin<&mut Self>, amount: usize) {
+            std::pin::Pin::new(&mut self.inner).consume(amount);
+            self.consumed.send_modify(|count| *count += amount);
+        }
+    }
+    struct GatedReadExecutor {
+        broker: std::sync::Arc<ClientSession>,
+        finish: tokio::sync::Notify,
+    }
+    impl ClientExecutor for GatedReadExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        async fn execute(
+            &self,
+            _: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            lease: OperationLease,
+        ) -> NativeOutcome {
+            self.broker.start(lease.generation, lease.sequence).unwrap();
+            self.finish.notified().await;
+            NativeOutcome {
+                result: Ok(serde_json::Value::Null),
+                effects: Effects::NotDispatched,
+            }
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn operation_completion_preserves_consumed_partial_control_frame() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let executor = std::sync::Arc::new(GatedReadExecutor {
+            broker: broker.clone(),
+            finish: tokio::sync::Notify::new(),
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let (count, mut consumed) = tokio::sync::watch::channel(0usize);
+        let serving = tokio::spawn(serve_with_executor(
+            CountedReader {
+                inner: tokio::io::BufReader::new(reader),
+                consumed: count,
+            },
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker,
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        read_frame(&mut peer).await.unwrap().unwrap();
+        let request = b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":1,\"timeoutMs\":5000,\"command\":\"test\",\"args\":{}}\n";
+        let prefix = b"{\"type\":\"cancel\",\"id\":\"c\",";
+        peer.get_mut().write_all(request).await.unwrap();
+        peer.get_mut().write_all(prefix).await.unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            consumed.wait_for(|count| *count >= request.len() + prefix.len()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        executor.finish.notify_one();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut peer))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let first: serde_json::Value = serde_json::from_slice(&first).unwrap();
+        assert_eq!(first["type"], "result");
+        assert_eq!(first["id"], "r");
+        // Receiving the result proves the competing completion branch ran.
+        peer.get_mut()
+            .write_all(b"\"generation\":1,\"operationSeq\":1}\n")
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut peer))
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let reply: serde_json::Value = serde_json::from_slice(&reply).unwrap();
+        peer.get_mut().shutdown().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), serving)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reply["type"], "control-result");
+        assert_eq!(reply["id"], "c");
+        assert_eq!(reply["accepted"], false);
+        assert_eq!(reply["error"]["code"], "operation-missing");
+    }
+
+    #[tokio::test]
+    async fn retained_frame_state_preserves_bounds_and_resets_only_at_newline() {
+        let mut frame = b"prefix".to_vec();
+        let mut bytes = &b"-suffix\nnext\n"[..];
+        assert_eq!(
+            read_frame_retained(&mut bytes, &mut frame).await.unwrap(),
+            Some(b"prefix-suffix".to_vec())
+        );
+        assert!(frame.is_empty());
+        assert_eq!(
+            read_frame_retained(&mut bytes, &mut frame).await.unwrap(),
+            Some(b"next".to_vec())
+        );
+        assert_eq!(
+            read_frame_retained(&mut bytes, &mut frame).await.unwrap(),
+            None
+        );
+        frame = vec![b'a'; MAX_FRAME_BYTES];
+        assert!(read_frame_retained(&mut &b"b\n"[..], &mut frame)
+            .await
+            .is_err());
+        frame = b"incomplete".to_vec();
+        assert!(read_frame_retained(&mut &b""[..], &mut frame)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

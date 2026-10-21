@@ -2500,6 +2500,7 @@ async fn require_editable_focus(
                 binding: frame.binding.clone(),
             };
             let result=resolved.call(ctx,d,false,r#"function(){
+              if(this===document)return false;
               if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};
               if(this===document.body||this===document.documentElement)return false;
               if(this instanceof HTMLInputElement)return !this.disabled&&!this.readOnly&&!['button','submit','reset','checkbox','radio','file','image','range','color'].includes(this.type);
@@ -2631,6 +2632,35 @@ fn read_recording(
     Ok(bytes)
 }
 
+#[cfg(test)]
+pub(crate) const FIXTURE_SECURE_SELECTOR: &str = "input[type=\"password\" i]";
+#[cfg(test)]
+pub(crate) fn fixture_configuration(scope: &str, site: Option<&str>) -> Value {
+    json!({"identityScope":scope,"testIdAttribute":"data-testid",
+        "secureFieldSelector":FIXTURE_SECURE_SELECTOR,
+        "requestPolicy":{"site":site},"downloads":{"source":"local"}})
+}
+
+#[cfg(test)]
+pub(crate) fn fixture_scope_open(source: &str, endpoint: Option<&str>) -> Value {
+    let mut value = json!({"source":source,"context":"isolated"});
+    if let Some(endpoint) = endpoint {
+        value["endpoint"] = json!(endpoint);
+    }
+    if source == "launch" {
+        value["headless"] = json!(true);
+        value["blockServiceWorkers"] = json!(false);
+        value["viewport"] = json!({"width":800,"height":600});
+        value["media"] = json!({});
+        value["initScripts"] = json!([]);
+    }
+    value
+}
+#[cfg(test)]
+pub(crate) fn fixture_routes(scope: &str) -> Value {
+    json!({"identityScope":scope,"version":1,"registrationIds":[]})
+}
+
 /// Direct-executor fixtures must reproduce the real reader's broker admission
 /// and settlement. ClientBrowser itself owns start(); never pre-start its lease.
 #[cfg(test)]
@@ -2671,6 +2701,35 @@ impl FixtureOperations {
         self.broker.validate_reconnect_operation(&lease)?;
         let outcome = executor.execute(command.into(), args, lease).await;
         self.broker.settle(1, self.sequence, outcome.effects)?;
+        Ok(outcome)
+    }
+    /// Also reproduce the real writer's post-settlement result ACK. This opens
+    /// only the exact operation's staged sink, never target/enrollment readiness.
+    pub(crate) async fn execute_written(
+        &mut self,
+        executor: &impl super::client_transport::ClientExecutor,
+        sink: &super::client_transport::ClientEventSink,
+        command: &str,
+        args: Value,
+        seconds: u64,
+    ) -> Result<super::client_transport::NativeOutcome, ProtocolError> {
+        use super::client_protocol::{ServerMessage, WireError};
+        let outcome = self.execute(executor, command, args, seconds).await?;
+        let (_, scope_state) = self.broker.health()?;
+        let (ok, data, error) = match &outcome.result {
+            Ok(data) => (true, Some(data.clone()), None),
+            Err(code) => (false, None, Some(WireError { code: code.clone() })),
+        };
+        sink.acknowledge_result_for_test(&ServerMessage::Result {
+            id: "synthetic-fixture-result".into(),
+            generation: 1,
+            operation_seq: self.sequence,
+            ok,
+            data,
+            error,
+            effects: outcome.effects,
+            scope_state,
+        })?;
         Ok(outcome)
     }
 }
@@ -2755,7 +2814,10 @@ mod tests {
                     .as_str()
                     .unwrap_or("");
                 if source.contains("return this.nodeType===1") {
-                    if mode == "focus-cancel" {
+                    if mode == "focus-cancel"
+                        || (mode == "focus-root-cancel"
+                            && request["params"]["objectId"] == "focused-document")
+                    {
                         server_cancel.send_replace(CancelSignal::Requested);
                     }
                     if mode == "focus-reset" {
@@ -2779,7 +2841,14 @@ mod tests {
                             server_cancel.send_replace(CancelSignal::Requested);
                             tokio::time::sleep(Duration::from_millis(30)).await;
                         }
-                        json!({"object":{"objectId":"exact-node","subtype":"node"}})
+                        let object = if mode.starts_with("focus-root")
+                            && request["params"]["backendNodeId"] == 1
+                        {
+                            "focused-document"
+                        } else {
+                            "exact-node"
+                        };
+                        json!({"object":{"objectId":object,"subtype":"node"}})
                     }
                     "DOM.getBoxModel" => json!({"model":{"border":[0,0,100,0,100,50,0,50]}}),
                     "Page.getLayoutMetrics" => {
@@ -2787,10 +2856,44 @@ mod tests {
                     }
                     "Browser.getVersion" => json!({"userAgent":"Synthetic Linux"}),
                     "Accessibility.getFullAXTree" => {
-                        json!({"nodes":[{"backendDOMNodeId":42,"properties":[{"name":"focused","value":{"value":true}}]}]})
+                        if mode.starts_with("focus-root") {
+                            let mut nodes = vec![
+                                json!({"backendDOMNodeId":1,"role":{"value":"RootWebArea"},"properties":[{"name":"focused","value":{"value":true}}]}),
+                            ];
+                            if mode != "focus-root-only" {
+                                nodes.push(json!({"backendDOMNodeId":42,"role":{"value":"textbox"},"properties":[{"name":"focused","value":{"value":true}}]}));
+                            }
+                            json!({"nodes":nodes})
+                        } else {
+                            json!({"nodes":[{"backendDOMNodeId":42,"properties":[{"name":"focused","value":{"value":true}}]}]})
+                        }
                     }
                     "Runtime.callFunctionOn" => {
-                        if source.contains("const blocker=") {
+                        if mode.starts_with("focus-root")
+                            && source.contains("return this.nodeType===1")
+                        {
+                            if request["params"]["objectId"] == "focused-document" {
+                                // Emulate the native document's null ownerDocument:
+                                // only the exact document identity guard avoids stale.
+                                let identity = source.find("if(this===document)return false;");
+                                let stale = source.find("if(!this.isConnected");
+                                if identity
+                                    .zip(stale)
+                                    .is_some_and(|(identity, stale)| identity < stale)
+                                {
+                                    json!({"result":{"value":false}})
+                                } else {
+                                    json!({"result":{"value":{"status":"stale"}}})
+                                }
+                            } else if matches!(
+                                mode,
+                                "focus-root-foreign" | "focus-root-disconnected"
+                            ) {
+                                json!({"result":{"value":{"status":"stale"}}})
+                            } else {
+                                json!({"result":{"value":true}})
+                            }
+                        } else if source.contains("const blocker=") {
                             if mode == "intercepted" {
                                 json!({"result":{"value":{"status":"intercepted-pointer"}}})
                             } else {
@@ -2837,6 +2940,8 @@ mod tests {
                 };
                 let reply = if ((mode == "exact-cleanup-failed"
                     || mode == "check-aux-cleanup-failed"
+                    || (mode == "focus-root-cleanup-failed"
+                        && request["params"]["objectId"] == "focused-document")
                     || (mode == "exact-aux-cleanup-failed"
                         && request["params"]["objectId"] == "result-handle"))
                     && method == "Runtime.releaseObject")
@@ -3065,6 +3170,80 @@ mod tests {
             d.failure(ProtocolError::StaleReference).effects,
             Effects::Unknown
         );
+    }
+    #[tokio::test]
+    async fn focused_document_is_released_before_editable_leaf_and_keyboard_dispatch() {
+        let f = fixture("focus-root-leaf").await;
+        ClientActions::default()
+            .execute(
+                f.context(),
+                "browser.keyboard.type",
+                &json!({"identityScope":"scope","text":"ok","replace":false}),
+            )
+            .await
+            .unwrap();
+        let log = f.log.lock().unwrap();
+        let document_release = log
+            .iter()
+            .position(|r| {
+                r["method"] == "Runtime.releaseObject"
+                    && r["params"]["objectId"] == "focused-document"
+            })
+            .unwrap();
+        let leaf = log
+            .iter()
+            .position(|r| r["method"] == "DOM.resolveNode" && r["params"]["backendNodeId"] == 42)
+            .unwrap();
+        let input = log
+            .iter()
+            .position(|r| {
+                r["method"]
+                    .as_str()
+                    .is_some_and(|m| m.starts_with("Input."))
+            })
+            .unwrap();
+        assert!(document_release < leaf && leaf < input);
+    }
+    #[tokio::test]
+    async fn focused_document_does_not_hide_missing_leaf_stale_cleanup_or_cancel() {
+        for (mode, error, cleanup) in [
+            ("focus-root-only", ProtocolError::NotActionable, false),
+            ("focus-root-foreign", ProtocolError::StaleReference, false),
+            (
+                "focus-root-disconnected",
+                ProtocolError::StaleReference,
+                false,
+            ),
+            (
+                "focus-root-cleanup-failed",
+                ProtocolError::CleanupFailed,
+                true,
+            ),
+            ("focus-root-cancel", ProtocolError::Cancelled, false),
+        ] {
+            let f = fixture(mode).await;
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.keyboard.type",
+                    &json!({"identityScope":"scope","text":"private synthetic","replace":true}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, error, "{mode}");
+            assert_eq!(failure.effects, Effects::NotDispatched, "{mode}");
+            assert_eq!(failure.cleanup_failed, cleanup, "{mode}");
+            assert!(f.inputs().is_empty(), "{mode}");
+            assert!(
+                f.log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["method"] == "Runtime.releaseObject"
+                        && r["params"]["objectId"] == "focused-document"),
+                "{mode}"
+            );
+        }
     }
     #[tokio::test]
     async fn cancelled_exact_resolution_drains_and_releases_late_remote_handle() {
@@ -4298,13 +4477,14 @@ mod tests {
         async fn run(
             browser: &ClientBrowser,
             operations: &mut FixtureOperations,
+            sink: &ClientEventSink,
             command: &str,
             args: Value,
             seconds: u64,
         ) -> Result<Value, String> {
             eprintln!("native-observe-action-stage command.start {command}");
             let outcome = operations
-                .execute(browser, command, args, seconds)
+                .execute_written(browser, sink, command, args, seconds)
                 .await
                 .map_err(|error| format!("fixture admission/settlement: {error:?}"))?;
             eprintln!(
@@ -4327,48 +4507,45 @@ mod tests {
         let broker = Arc::new(ClientSession::new());
         let browser = ClientBrowser::new(broker.clone());
         let (sink, _events) = ClientEventSink::test_channel(broker.clone());
-        browser.set_event_sink(sink).unwrap();
+        browser.set_event_sink(sink.clone()).unwrap();
         let mut operations = FixtureOperations::new(broker);
         let result: Result<(), String> = async {
-            let opened = run(&browser, &mut operations, "scope.open", json!({
-                "source":"launch", "context":"isolated", "headless":true,
-                "blockServiceWorkers":false,"viewport":{"width":800,"height":600},"media":{},"initScripts":[]
-            }), 30).await?;
+            let opened = run(&browser, &mut operations, &sink, "scope.open", fixture_scope_open("launch",None), 30).await?;
             let scope = opened["identityScope"].as_str().ok_or("missing scope")?;
-            run(&browser, &mut operations, "scope.configure", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","requestPolicy":{},"downloads":{"source":"local"}}), 30).await?;
-            run(&browser, &mut operations, "page.activate", json!({"identityScope":scope}), 30).await?;
-            run(&browser, &mut operations, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}), 2).await?;
+            run(&browser, &mut operations, &sink, "scope.configure", fixture_configuration(scope,None), 30).await?;
+            run(&browser, &mut operations, &sink, "page.activate", json!({"identityScope":scope}), 30).await?;
+            run(&browser, &mut operations, &sink, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}), 2).await?;
             if acquisition=="iframe" {
                 // Install a same-origin frame synchronously, without timer sleeps.
-                run(&browser,&mut operations,"page.evaluate",json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<iframe id=child></iframe>';document.querySelector('#child').contentDocument.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}),2).await?;
+                run(&browser,&mut operations,&sink,"page.evaluate",json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<iframe id=child></iframe>';document.querySelector('#child').contentDocument.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}),2).await?;
             }
             eprintln!("native-observe-action-stage acquisition {acquisition}");
             let expression=if acquisition=="iframe" {json!({"kind":"frame","selector":"#child","source":{"kind":"selector","selector":"#box"}})} else {json!({"kind":"selector","selector":"#box"})};
-            let query = run(&browser, &mut operations, "fixture.query", json!({"identityScope":scope,"expression":expression}), 2).await?;
+            let query = run(&browser, &mut operations, &sink, "fixture.query", json!({"identityScope":scope,"expression":expression}), 2).await?;
             let nodes = query["nodes"].as_array().ok_or("missing query nodes")?;
             if nodes.len() != 1 { return Err("query did not locate one synthetic checkbox".into()); }
             let reference=if acquisition=="protected" {
-                let snapshot = run(&browser, &mut operations, "browser.observe", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","options":{}}), 2).await?;
+                let snapshot = run(&browser, &mut operations, &sink, "browser.observe", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{}}), 2).await?;
                 find(&snapshot["root"], &nodes[0]["ref"]["id"]).ok_or("query identity missing from committed observation")?
             } else {nodes[0]["ref"].clone()};
             // Actual central dispatch acquires snapshot_for_action; no supplied
             // ref map, synthetic readiness ACK or protected-read bypass.
-            run(&browser, &mut operations, "browser.perform", json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}), 2).await?;
+            run(&browser, &mut operations, &sink, "browser.perform", json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}), 2).await?;
             let source=if acquisition=="iframe" {"()=>document.querySelector('#child').contentDocument.querySelector('#box').checked"} else {"()=>document.querySelector('#box').checked"};
-            let state = run(&browser, &mut operations, "page.evaluate", json!({"identityScope":scope,"source":source,"argument":null}), 2).await?;
+            let state = run(&browser, &mut operations, &sink, "page.evaluate", json!({"identityScope":scope,"source":source,"argument":null}), 2).await?;
             if state["value"] != true { return Err("observed checkbox did not become checked".into()); }
             if acquisition!="protected" {return Ok(());}
-            run(&browser, &mut operations, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=radio type=radio>Navigate</label>';document.querySelector('#radio').addEventListener('click',()=>location.replace('about:blank?native-checked-navigation'));return true}","argument":null}), 2).await?;
-            let query=run(&browser,&mut operations,"fixture.query",json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#radio"}}),2).await?;
-            let snapshot=run(&browser,&mut operations,"browser.observe",json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","options":{}}),2).await?;
+            run(&browser, &mut operations, &sink, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=radio type=radio>Navigate</label>';document.querySelector('#radio').addEventListener('click',()=>location.replace('about:blank?native-checked-navigation'));return true}","argument":null}), 2).await?;
+            let query=run(&browser,&mut operations,&sink,"fixture.query",json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#radio"}}),2).await?;
+            let snapshot=run(&browser,&mut operations,&sink,"browser.observe",json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{}}),2).await?;
             let reference=find(&snapshot["root"],&query["nodes"][0]["ref"]["id"]).ok_or("radio missing from committed snapshot")?;
-            run(&browser,&mut operations,"browser.perform",json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}),2).await?;
-            let location=run(&browser,&mut operations,"page.evaluate",json!({"identityScope":scope,"source":"()=>location.href","argument":null}),2).await?;
+            run(&browser,&mut operations,&sink,"browser.perform",json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}),2).await?;
+            let location=run(&browser,&mut operations,&sink,"page.evaluate",json!({"identityScope":scope,"source":"()=>location.href","argument":null}),2).await?;
             if location["value"]!="about:blank?native-checked-navigation" {return Err("checked radio did not navigate".into());}
             Ok(())
         }.await;
-        // Blank synthetic DOM avoids callback publication while this direct
-        // lifecycle fixture has no transport writer. This is not an ACK test.
+        // The direct fixture uses the exact synthetic writer-ACK hook after
+        // broker settlement, not a target/readiness bypass or real I/O claim.
         let cleanup = browser.shutdown().await;
         assert!(cleanup.is_ok(), "production scope cleanup: {cleanup:?}");
         assert!(result.is_ok(), "observe/action boundary: {result:?}");

@@ -26,7 +26,15 @@ pub(super) struct Facts {
     #[serde(default)]
     pub visible: bool,
     #[serde(default)]
+    pub line_visible: Option<bool>,
+    #[serde(default)]
     pub text: String,
+}
+
+impl Facts {
+    fn line_visible(&self) -> bool {
+        self.line_visible.unwrap_or(self.visible)
+    }
 }
 
 #[derive(Debug)]
@@ -261,9 +269,15 @@ pub(super) fn compact(
                             direct.insert(id);
                         }
                         text.push_str(&value);
-                    } else if child_facts.inline && child_facts.visible && !child_facts.breaking {
+                    } else if child_facts.inline
+                        && child_facts.line_visible()
+                        && !child_facts.breaking
+                    {
                         text.push_str(&value);
-                    } else if child_facts.breaking || !child_facts.inline || child_facts.visible {
+                    } else if child_facts.breaking
+                        || !child_facts.inline
+                        || child_facts.line_visible()
+                    {
                         text.push(' ');
                     }
                     // Bound intermediate concatenation too, not only the wire.
@@ -309,11 +323,11 @@ pub(super) fn compact(
             return Err(ObservationError::BackendFailure);
         }
         let f = facts(&nodes[&id])?;
-        let value = if !f.inline || !f.visible || f.breaking {
+        let value = if !f.inline || !f.line_visible() || f.breaking {
             false
         } else if let Some(parent) = parents.get(&id) {
             let p = facts(&nodes[parent])?;
-            if p.suppress || !p.visible {
+            if p.suppress || !p.line_visible() {
                 false
             } else if direct.contains(parent)
                 || (p.action && covered(*parent, nodes, parents, direct, runs, cache, depth + 1)?)
@@ -690,6 +704,10 @@ mod tests {
         let ada = f.text("Ada");
         let dear = f.text("dear ");
         let mut slot = f.el("slot", None, vec![]);
+        // Empty fallback has no raw box, but the visible slot renders its
+        // native assigned text into the surrounding line.
+        f.facts_mut(&slot).visible = false;
+        f.facts_mut(&slot).line_visible = Some(true);
         slot["distributedNodes"] = json!([{"backendNodeId":ada["backendNodeId"]}]);
         let mut host = f.el("host", None, vec![ada]);
         host["shadowRoots"] = json!([{"nodeType":11,"backendNodeId":999,"shadowRootType":"closed","children":[dear,slot]}]);
@@ -706,6 +724,7 @@ mod tests {
         let span_ref = reference(&span);
         let mut slot = f.el("slot", None, vec![]);
         f.facts_mut(&slot).visible = false;
+        f.facts_mut(&slot).line_visible = Some(false);
         slot["distributedNodes"] = json!([{"backendNodeId":span["backendNodeId"]}]);
         let mut host = f.el("host", None, vec![span]);
         host["shadowRoots"] =

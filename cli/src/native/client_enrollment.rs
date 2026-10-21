@@ -1005,10 +1005,20 @@ impl ClientEnrollment {
                 }
                 continue;
             }
-            let owned = self.targets.owned_target(target)?;
+            let owned = self.targets.owned_target(target);
+            #[cfg(test)]
+            if let Err(error) = &owned {
+                eprintln!("state.capture refusal=inventory-unowned error={error:?}");
+            }
+            let owned = owned?;
             if owned.purpose == Some(TargetPurpose::Application)
                 && !entries.iter().any(|entry| entry.target == owned.target_id)
             {
+                #[cfg(test)]
+                eprintln!(
+                    "state.capture refusal=inventory-entry error={:?}",
+                    ProtocolError::StaleScope
+                );
                 return Err(ProtocolError::StaleScope);
             }
             if owned.purpose.is_none() {
@@ -1022,6 +1032,11 @@ impl ClientEnrollment {
                         == Some(self.targets.context_id.as_str())
             })
         }) {
+            #[cfg(test)]
+            eprintln!(
+                "state.capture refusal=missing-target error={:?}",
+                ProtocolError::StaleScope
+            );
             return Err(ProtocolError::StaleScope);
         }
         let mut frames = Vec::new();
@@ -1054,6 +1069,16 @@ impl ClientEnrollment {
                 .values()
                 .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
         {
+            #[cfg(test)]
+            eprintln!(
+                "state.capture refusal={} error={:?}",
+                if index.application_epoch != epoch {
+                    "epoch-during-read"
+                } else {
+                    "admission-during-read"
+                },
+                ProtocolError::StaleScope
+            );
             return Err(ProtocolError::StaleScope);
         }
         drop(index);
@@ -1080,6 +1105,11 @@ impl ClientEnrollment {
                 .upgrade()
                 .is_some_and(|owner| Arc::ptr_eq(&owner, self))
         {
+            #[cfg(test)]
+            eprintln!(
+                "state.capture refusal=tenure-binding error={:?}",
+                ProtocolError::StaleScope
+            );
             return Err(ProtocolError::StaleScope);
         }
         previous
@@ -1090,6 +1120,16 @@ impl ClientEnrollment {
         if current.application_epoch != previous.application_epoch
             || current.frames != previous.frames
         {
+            #[cfg(test)]
+            eprintln!(
+                "state.capture refusal={} error={:?}",
+                if current.application_epoch != previous.application_epoch {
+                    "epoch-after-export"
+                } else {
+                    "frame-after-export"
+                },
+                ProtocolError::StaleScope
+            );
             return Err(ProtocolError::StaleScope);
         }
         Ok(())

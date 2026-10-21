@@ -2563,13 +2563,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let (ui_permit, attestation, origins) = match admission {
                             Ok(value) => value,
                             Err(error) => {
+                                #[cfg(test)]
+                                eprintln!("state.capture phase=pre-attestation error={error:?}");
                                 return (
                                     NativeOutcome {
                                         result: Err(error),
                                         effects: Effects::NotDispatched,
                                     },
                                     false,
-                                )
+                                );
                             }
                         };
                         let context = match CapturedStateContext::new(
@@ -2596,11 +2598,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                 )
                             }
                         };
-                        match super::client_state_dispatch::capture_state(
+                        let exported = super::client_state_dispatch::capture_state(
                             &context, &blobs, &scope, &lease,
                         )
-                        .await
-                        {
+                        .await;
+                        #[cfg(test)]
+                        if let Err(failure) = &exported {
+                            eprintln!("state.capture phase=export error={:?}", failure.error);
+                        }
+                        match exported {
                             Err(failure) => (
                                 NativeOutcome {
                                     result: Err(failure.error),
@@ -2610,9 +2616,16 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             ),
                             Ok(captured) => {
                                 let checked = async {
-                                    enrollment
+                                    let verified = enrollment
                                         .verify_capture_attestation(&attestation, &lease)
-                                        .await?;
+                                        .await;
+                                    #[cfg(test)]
+                                    if let Err(error) = &verified {
+                                        eprintln!(
+                                            "state.capture phase=post-attestation error={error:?}"
+                                        );
+                                    }
+                                    verified?;
                                     if page_state.visited_origins()? != origins {
                                         return Err(ProtocolError::ScopeUnavailable);
                                     }
@@ -4593,3 +4606,7 @@ mod tests {
 #[cfg(test)]
 #[path = "client_browser_reference_tests.rs"]
 mod reference_lifetime_tests;
+
+#[cfg(test)]
+#[path = "client_browser_state_tests.rs"]
+mod state_lifecycle_tests;
