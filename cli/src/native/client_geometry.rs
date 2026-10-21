@@ -33,6 +33,15 @@ pub struct Polygon {
     pub points: Vec<Point>,
     enclosure: Option<[Interval; 2]>,
 }
+/// Semantic layout bounds may be a line or a point. This type cannot be used
+/// as a masking polygon or an action hit region.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SemanticBounds(Bounds);
+impl SemanticBounds {
+    pub fn bounds(self) -> Bounds {
+        self.0
+    }
+}
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Bounds {
     pub x: f64,
@@ -670,7 +679,7 @@ async fn command(
         _=tokio::time::sleep_until(operation.deadline.into())=>Err(GeometryError::DeadlineExceeded),
     }
 }
-fn quad(value: &Value) -> Result<[Point; 4], GeometryError> {
+fn quad_points(value: &Value) -> Result<[Point; 4], GeometryError> {
     let values = value
         .as_array()
         .filter(|v| v.len() == 8)
@@ -684,6 +693,13 @@ fn quad(value: &Value) -> Result<[Point; 4], GeometryError> {
             .as_f64()
             .ok_or(GeometryError::InvalidGeometry)?;
     }
+    if points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+        return Err(GeometryError::InvalidGeometry);
+    }
+    Ok(points)
+}
+fn quad(value: &Value) -> Result<[Point; 4], GeometryError> {
+    let points = quad_points(value)?;
     validate_convex(&points)?;
     Ok(points)
 }
@@ -1250,6 +1266,64 @@ impl GeometrySnapshot {
         }
         .transform(matrix)
     }
+    fn project_semantic_quad(
+        &self,
+        frame_id: &str,
+        points: [Point; 4],
+    ) -> Result<SemanticBounds, GeometryError> {
+        // Accept only the exact duplicate-edge form of a collapsed native
+        // rectangle. Arbitrary collinear/bow-tie quads remain invalid.
+        let collapsed = (points[0] == points[1] && points[2] == points[3])
+            || (points[0] == points[3] && points[1] == points[2]);
+        if !collapsed {
+            validate_convex(&points)?;
+        }
+        if points.iter().any(|p| !p.x.is_finite() || !p.y.is_finite()) {
+            return Err(GeometryError::InvalidGeometry);
+        }
+        let frame = self
+            .frames
+            .get(frame_id)
+            .ok_or(GeometryError::IncompleteInventory)?;
+        let matrix = *self
+            .transforms
+            .get(&frame.session)
+            .ok_or(GeometryError::IncompleteInventory)?;
+        // Reuse the same interval-checked transform/horizon proof, but expose
+        // bounds only. Capture/action still require project_native_quad.
+        let projected = Polygon {
+            enclosure: None,
+            points: points.to_vec(),
+        }
+        .transform(matrix)?;
+        Ok(SemanticBounds(
+            projected.bounds().ok_or(GeometryError::InvalidGeometry)?,
+        ))
+    }
+    pub async fn node_semantic_bounds(
+        &self,
+        client: &CdpClient,
+        frame: &ObservationFrame,
+        backend: i64,
+        operation: &OperationLease,
+    ) -> Result<SemanticBounds, GeometryError> {
+        let proof = self
+            .frames
+            .get(&frame.binding.frame)
+            .ok_or(GeometryError::IncompleteInventory)?;
+        if proof.session != frame.binding.session
+            || proof.loader != frame.binding.loader
+            || frame.binding.page_session != self.page_session
+        {
+            return Err(GeometryError::StaleIdentity);
+        }
+        let (model, _) =
+            read_exact_box_impl(client, &frame.binding, backend, operation, false).await?;
+        self.project_semantic_quad(
+            &frame.binding.frame,
+            quad_points(&model["model"]["border"])?,
+        )
+    }
     pub async fn node_border_polygons(
         &self,
         client: &CdpClient,
@@ -1292,6 +1366,15 @@ async fn read_exact_box(
     binding: &element::ExactBinding,
     backend: i64,
     operation: &OperationLease,
+) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
+    read_exact_box_impl(client, binding, backend, operation, true).await
+}
+async fn read_exact_box_impl(
+    client: &CdpClient,
+    binding: &element::ExactBinding,
+    backend: i64,
+    operation: &OperationLease,
+    require_owner_size: bool,
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
     check(operation)?;
     let mut cancel = operation.cancellation.clone();
@@ -1371,7 +1454,7 @@ async fn read_exact_box(
             return Err(GeometryError::StaleIdentity);
         }
         let value = &proof["result"]["value"];
-        let size = if value["frameOwner"] == true {
+        let size = if require_owner_size && value["frameOwner"] == true {
             let w = number(value, "width")?;
             let h = number(value, "height")?;
             if w <= 0. || h <= 0. {
@@ -1866,6 +1949,17 @@ mod tests {
         std::sync::Arc<std::sync::atomic::AtomicBool>,
         MockLog,
     ) {
+        mock_geometry_with_border(fail_post_proof, json!([10, 20, 30, 20, 30, 40, 10, 40])).await
+    }
+    async fn mock_geometry_with_border(
+        fail_post_proof: bool,
+        border: Value,
+    ) -> (
+        CdpClient,
+        tokio::task::JoinHandle<()>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        MockLog,
+    ) {
         use futures_util::{SinkExt, StreamExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -1894,13 +1988,13 @@ mod tests {
                     "DOM.resolveNode" => {
                         json!({"object":{"objectId":"owned-node","subtype":"node"}})
                     }
-                    "DOM.getBoxModel" => json!({"model":{"border":[10,20,30,20,30,40,10,40]}}),
+                    "DOM.getBoxModel" => json!({"model":{"border":border}}),
                     "Runtime.callFunctionOn" => {
                         calls += 1;
                         if fail_post_proof && calls == 2 {
                             json!({"result":{"objectId":"result-owned"},"exceptionDetails":{"exception":{"objectId":"exception-owned"}}})
                         } else {
-                            if calls == 1 {
+                            if request["params"]["functionDeclaration"] != BOX_PROOF {
                                 json!({"result":{"value":true}})
                             } else {
                                 json!({"result":{"value":{"connected":true,"frameOwner":false}}})
@@ -1951,6 +2045,125 @@ mod tests {
             },
             sender,
         )
+    }
+    #[tokio::test]
+    async fn semantic_projection_keeps_zero_area_bounds_without_granting_paint_authority() {
+        for (border, width, height) in [
+            (json!([10, 20, 10, 20, 10, 20, 10, 20]), 0., 0.),
+            (json!([10, 20, 10, 20, 10, 40, 10, 40]), 0., 20.),
+            (json!([10, 20, 30, 20, 30, 20, 10, 20]), 20., 0.),
+        ] {
+            let (client, server, _, _) = mock_geometry_with_border(false, border.clone()).await;
+            let (operation, _sender) = mock_operation();
+            let frame = mock_frame();
+            let geometry = GeometrySnapshot::capture(
+                &client,
+                "page",
+                std::slice::from_ref(&frame),
+                &operation,
+            )
+            .await
+            .unwrap();
+            let mut refs = element::RefMap::new();
+            let id = refs
+                .try_bind_exact(7, "generic", "", frame.binding.clone())
+                .unwrap();
+            let mut node = super::super::client_observation::SemanticNode::default();
+            node.reference.id = format!("@{id}");
+            node.reference.revision = "1".into();
+            node.rect = Some(super::super::client_observation::Rect {
+                x: 999.,
+                y: 999.,
+                width,
+                height,
+            });
+            let mut nodes = vec![node];
+            // This is the exact post-read projection used by dispatch, not a
+            // metadata-only assertion that bypasses native geometry.
+            super::super::client_observation::project_geometry(
+                &client,
+                std::slice::from_ref(&frame),
+                &refs,
+                &geometry,
+                &mut nodes,
+                &operation,
+            )
+            .await
+            .unwrap();
+            let rect = nodes[0].rect.as_ref().unwrap();
+            assert_eq!(
+                (rect.x, rect.y, rect.width, rect.height),
+                (10., 20., width, height)
+            );
+            assert_eq!(
+                geometry.project_native_quad("root", quad_points(&border).unwrap()),
+                Err(GeometryError::InvalidGeometry)
+            );
+            geometry.revalidate(&client, &operation).await.unwrap();
+            server.abort();
+            let _ = server.await;
+        }
+    }
+    #[tokio::test]
+    async fn semantic_degenerate_bounds_retain_transform_and_reject_nonrectangular_collapse() {
+        let (client, server, _, _) = mock_geometry(false).await;
+        let (operation, _sender) = mock_operation();
+        let frame = mock_frame();
+        let mut geometry =
+            GeometrySnapshot::capture(&client, "page", std::slice::from_ref(&frame), &operation)
+                .await
+                .unwrap();
+        geometry.transforms.insert(
+            "page".into(),
+            Matrix::rectangle_to_quad(
+                Bounds {
+                    x: 0.,
+                    y: 0.,
+                    width: 100.,
+                    height: 100.,
+                },
+                &[
+                    Point { x: 20., y: 30. },
+                    Point { x: 220., y: 30. },
+                    Point { x: 220., y: 230. },
+                    Point { x: 20., y: 230. },
+                ],
+            )
+            .unwrap(),
+        );
+        let line = [
+            Point { x: 10., y: 20. },
+            Point { x: 10., y: 20. },
+            Point { x: 10., y: 40. },
+            Point { x: 10., y: 40. },
+        ];
+        let bounds = geometry
+            .project_semantic_quad("root", line)
+            .unwrap()
+            .bounds();
+        assert_eq!(
+            bounds,
+            Bounds {
+                x: 40.,
+                y: 70.,
+                width: 0.,
+                height: 40.
+            }
+        );
+        assert_eq!(
+            geometry.project_semantic_quad(
+                "root",
+                [
+                    Point { x: 0., y: 0. },
+                    Point { x: 1., y: 0. },
+                    Point { x: 2., y: 0. },
+                    Point { x: 3., y: 0. }
+                ]
+            ),
+            Err(GeometryError::InvalidGeometry)
+        );
+        server.abort();
+        let _ = server.await;
     }
     #[tokio::test]
     async fn native_geometry_ignores_legacy_additive_offsets_and_revalidates_viewport() {

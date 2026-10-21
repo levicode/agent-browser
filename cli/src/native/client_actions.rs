@@ -26,7 +26,6 @@ pub enum ActionReason {
     InterceptedPointer,
     CheckedStateUnchanged,
     ControlReplacedAfterClick,
-    RecordingSegmentMissing { ordinal: u64 },
 }
 #[derive(Debug)]
 pub struct ActionFailure {
@@ -42,7 +41,6 @@ struct Dispatch {
     intercepted: AtomicBool,
     checked_unchanged: AtomicBool,
     checked_replaced: AtomicBool,
-    recording_missing: std::sync::atomic::AtomicU64,
     acknowledged_postcondition: AtomicBool,
 }
 impl Dispatch {
@@ -59,10 +57,6 @@ impl Dispatch {
                 Some(ActionReason::ControlReplacedAfterClick)
             } else if self.checked_unchanged.load(Ordering::SeqCst) {
                 Some(ActionReason::CheckedStateUnchanged)
-            } else if self.recording_missing.load(Ordering::SeqCst) > 0 {
-                Some(ActionReason::RecordingSegmentMissing {
-                    ordinal: self.recording_missing.load(Ordering::SeqCst),
-                })
             } else {
                 None
             },
@@ -78,7 +72,22 @@ impl Dispatch {
         }
     }
 }
+fn finish_dispatch(
+    d: &Dispatch,
+    result: Result<Value, ProtocolError>,
+) -> Result<Value, ActionFailure> {
+    match result {
+        Ok(_) if d.cleanup.load(Ordering::SeqCst) => Err(d.failure(ProtocolError::CleanupFailed)),
+        result => result.map_err(|error| d.failure(error)),
+    }
+}
+pub enum ActionRealmAuthority<'a> {
+    Enrolled(&'a Arc<super::client_enrollment::ClientEnrollment>),
+    #[cfg(test)]
+    UntrackedFixture,
+}
 pub struct ActionContext<'a> {
+    pub realm_authority: ActionRealmAuthority<'a>,
     pub page: &'a BrowserExecutionLease,
     pub operation: &'a OperationLease,
     pub page_state: &'a ClientPageState,
@@ -356,13 +365,21 @@ fn reference<'a>(
     Ok((entry, binding))
 }
 struct Resolved {
+    realm: Option<super::client_enrollment::ExactRealmTicket>,
     object: String,
     session: String,
     binding: ExactBinding,
 }
 impl Resolved {
     async fn release(&self, ctx: &ActionContext<'_>) -> Result<(), ProtocolError> {
-        tokio::time::timeout(
+        if self
+            .realm
+            .as_ref()
+            .is_some_and(|realm| realm.destroyed() == Ok(true))
+        {
+            return Ok(());
+        }
+        let released = tokio::time::timeout(
             Duration::from_millis(250),
             ctx.page.client.send_command(
                 "Runtime.releaseObject",
@@ -370,10 +387,20 @@ impl Resolved {
                 Some(&self.session),
             ),
         )
-        .await
-        .map_err(|_| ProtocolError::CleanupFailed)?
-        .map_err(|_| ProtocolError::CleanupFailed)?;
-        Ok(())
+        .await;
+        if matches!(released, Ok(Ok(_))) {
+            return Ok(());
+        }
+        // Failed release is not evidence. Only the captured native realm's
+        // authoritative destruction can settle its now-invalid handles.
+        if self
+            .realm
+            .as_ref()
+            .is_some_and(|realm| realm.destroyed() == Ok(true))
+        {
+            return Ok(());
+        }
+        Err(ProtocolError::CleanupFailed)
     }
     async fn call(
         &self,
@@ -442,14 +469,48 @@ async fn release_call_handles(
         Ok(())
     }
 }
+fn exact_resolution_error(d: &Dispatch, error: element::ExactResolutionError) -> ProtocolError {
+    match error {
+        element::ExactResolutionError::StaleReference => ProtocolError::StaleReference,
+        element::ExactResolutionError::BackendFailure => ProtocolError::BrowserFailure,
+        element::ExactResolutionError::CleanupFailed { primary } => {
+            d.cleanup.store(true, Ordering::SeqCst);
+            primary.map_or(ProtocolError::CleanupFailed, |error| {
+                exact_resolution_error(d, *error)
+            })
+        }
+    }
+}
 async fn resolve_action_object(
     ctx: &ActionContext<'_>,
     d: &Dispatch,
     binding: &ExactBinding,
     backend: i64,
 ) -> Result<String, ProtocolError> {
+    resolve_action_object_in_realm(ctx, d, binding, backend, None).await
+}
+async fn resolve_action_object_in_realm(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    binding: &ExactBinding,
+    backend: i64,
+    context: Option<i64>,
+) -> Result<String, ProtocolError> {
     ctx.check()?;
-    let future = element::resolve_exact_object(&ctx.page.client, binding, backend);
+    let future = async {
+        match context {
+            Some(context) => {
+                element::resolve_exact_object_in_realm_typed(
+                    &ctx.page.client,
+                    binding,
+                    backend,
+                    context,
+                )
+                .await
+            }
+            None => element::resolve_exact_object_typed(&ctx.page.client, binding, backend).await,
+        }
+    };
     tokio::pin!(future);
     let mut cancellation = ctx.operation.cancellation.clone();
     let outcome = tokio::select! {
@@ -469,11 +530,12 @@ async fn resolve_action_object(
     };
     let object = match result {
         Ok(object) => object,
-        Err(_) => {
+        Err(error) => {
             if interrupted.is_some() {
                 d.cleanup.store(true, Ordering::SeqCst);
             }
-            return Err(interrupted.unwrap_or(ProtocolError::BrowserFailure));
+            let primary = exact_resolution_error(d, error);
+            return Err(interrupted.unwrap_or(primary));
         }
     };
     if let Some(primary) = interrupted.or_else(|| ctx.check().err()) {
@@ -500,14 +562,57 @@ async fn resolve(
 ) -> Result<Resolved, ProtocolError> {
     let (entry, binding) = reference(ctx, r)?;
     let backend = entry.backend_node_id.ok_or(ProtocolError::StaleReference)?;
-    ctx.bounded(element::validate_exact_binding(
-        &ctx.page.client,
-        &ctx.page.page_session_id,
-        &binding,
-    ))
-    .await?;
-    let object = resolve_action_object(ctx, d, &binding, backend).await?;
+    ctx.bounded(async {
+        Ok(element::validate_exact_binding_typed(
+            &ctx.page.client,
+            &ctx.page.page_session_id,
+            &binding,
+        )
+        .await)
+    })
+    .await?
+    .map_err(|error| exact_resolution_error(d, error))?;
+    let (context, realm) = match &ctx.realm_authority {
+        ActionRealmAuthority::Enrolled(enrollment) => {
+            let capture = enrollment.reserve_exact_realm(ctx.page, &binding, ctx.operation)?;
+            let context = ctx
+                .bounded(async {
+                    Ok(element::create_exact_realm(&ctx.page.client, &binding).await)
+                })
+                .await?
+                .map_err(|error| exact_resolution_error(d, error))?;
+            let realm = capture.bind(context, ctx.operation).await?;
+            ctx.check()?;
+            if realm.destroyed()? {
+                return Err(ProtocolError::StaleReference);
+            }
+            (Some(context), Some(realm))
+        }
+        #[cfg(test)]
+        ActionRealmAuthority::UntrackedFixture => (None, None),
+    };
+    let object = resolve_action_object_in_realm(ctx, d, &binding, backend, context).await?;
+    if let Some(ticket) = &realm {
+        if let Err(primary) = ticket.verify_resolution_owner(ctx.operation).await {
+            // Numeric context-ID reuse makes this handle's realm uncertain.
+            // Do not attach the old ticket or waive release using its destruction.
+            let released = tokio::time::timeout(
+                Duration::from_millis(250),
+                ctx.page.client.send_command(
+                    "Runtime.releaseObject",
+                    Some(json!({"objectId":object})),
+                    Some(&binding.session),
+                ),
+            )
+            .await;
+            if !matches!(released, Ok(Ok(_))) {
+                d.cleanup.store(true, Ordering::SeqCst);
+            }
+            return Err(primary);
+        }
+    }
     Ok(Resolved {
+        realm,
         object,
         session: binding.session.clone(),
         binding,
@@ -548,7 +653,7 @@ impl ClientActions {
     ) -> Result<Value, ActionFailure> {
         let d = Dispatch::default();
         let result = self.execute_inner(&ctx, &d, name, args).await;
-        result.map_err(|error| d.failure(error))
+        finish_dispatch(&d, result)
     }
     async fn execute_inner(
         &self,
@@ -739,8 +844,15 @@ async fn pointer_event(
 ) -> Result<(), ProtocolError> {
     ctx.check()?;
     d.mark();
+    // Static stage labels only: no node IDs, text, URL, keys or coordinates.
+    action_stage(match kind {
+        "mousePressed" => "input.press.dispatch",
+        "mouseReleased" => "input.release.dispatch",
+        _ => "input.move.dispatch",
+    });
     // Shared page input state is the single owner of held keys/buttons.
-    ctx.page_state
+    let result = ctx
+        .page_state
         .pointer_event(
             ctx.page,
             ctx.operation,
@@ -750,7 +862,15 @@ async fn pointer_event(
             count,
             delta,
         )
-        .await
+        .await;
+    if result.is_ok() {
+        action_stage(match kind {
+            "mousePressed" => "input.press.ack",
+            "mouseReleased" => "input.release.ack",
+            _ => "input.move.ack",
+        });
+    }
+    result
 }
 async fn viewport(ctx: &ActionContext<'_>, d: &Dispatch) -> Result<(f64, f64), ProtocolError> {
     let result = ctx
@@ -912,6 +1032,7 @@ async fn action_target(
     let object = candidate.unwrap().to_owned();
     release_call_handles(ctx, d, &resolved.session, &value, Some(&object)).await?;
     Ok(Resolved {
+        realm: resolved.realm,
         object,
         session: resolved.session,
         binding: resolved.binding,
@@ -965,6 +1086,12 @@ fn geometry_failure(d: &Dispatch, error: GeometryError) -> ProtocolError {
         GeometryError::BackendFailure => ProtocolError::BrowserFailure,
     }
 }
+fn action_stage(stage: &'static str) {
+    #[cfg(test)]
+    eprintln!("native-action-stage {stage}");
+    #[cfg(not(test))]
+    let _ = stage;
+}
 async fn center_once(
     ctx: &ActionContext<'_>,
     d: &Dispatch,
@@ -972,6 +1099,7 @@ async fn center_once(
     enabled: bool,
 ) -> Result<(Point, (f64, f64)), ProtocolError> {
     node.call(ctx,d,false,r#"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};const rect=this.getBoundingClientRect();const style=getComputedStyle(this);if(rect.width<=0||rect.height<=0||style.visibility==='hidden'||style.visibility==='collapse')return {status:'not-actionable'};return true;}"#,vec![]).await?;
+    action_stage("scroll.dispatch");
     ctx.command(
         d,
         true,
@@ -980,11 +1108,14 @@ async fn center_once(
         json!({"objectId":node.object}),
     )
     .await?;
+    action_stage("scroll.ack");
+    action_stage("geometry.refresh.dispatch");
     let geometry = ctx
         .geometry
         .refresh_after_scroll(&ctx.page.client, ctx.operation)
         .await
         .map_err(|e| geometry_failure(d, e))?;
+    action_stage("geometry.refresh.ack");
     let bounds = ctx
         .command(
             d,
@@ -1070,6 +1201,7 @@ async fn center_once(
             .map_err(|e| geometry_failure(d, e))?;
         let object = resolve_action_object(ctx, d, &binding, backend).await?;
         let owner = Resolved {
+            realm: None,
             object,
             session: binding.session.clone(),
             binding,
@@ -1185,7 +1317,9 @@ impl ClientActions {
         if let LocatorAction::LongPress { duration_ms } = &request.action {
             duration(*duration_ms, 500)?;
         }
+        action_stage("exact.resolve.dispatch");
         let node = action_target(ctx, d, &request.reference).await?;
+        action_stage("exact.resolve.ack");
         let result = self.perform_node(ctx, d, &node, request.action).await;
         let released = node.release(ctx).await;
         if released.is_err() {
@@ -1487,7 +1621,9 @@ async fn set_checked(
     node: &Resolved,
     wanted: bool,
 ) -> Result<(), ProtocolError> {
+    action_stage("checked.before.dispatch");
     let before = node.call(ctx, d, false, CHECKED_STATE, vec![]).await?;
+    action_stage("checked.before.ack");
     if before["checked"] == wanted {
         return Ok(());
     }
@@ -1525,7 +1661,29 @@ async fn set_checked(
                 d.acknowledged_postcondition.store(true, Ordering::SeqCst);
                 return Err(ProtocolError::NotActionable);
             }
-            Err(error) => return Err(error),
+            Err(error) => {
+                let retired = if matches!(
+                    error,
+                    ProtocolError::BrowserFailure | ProtocolError::StaleReference
+                ) {
+                    match &node.realm {
+                        Some(realm) => realm.document_retired(ctx.operation).await == Ok(true),
+                        None => false,
+                    }
+                } else {
+                    false
+                };
+                if checked_navigation_recovery_allowed(d, retired) {
+                    ctx.check()?;
+                    if first {
+                        return Ok(());
+                    }
+                    d.checked_replaced.store(true, Ordering::SeqCst);
+                    d.acknowledged_postcondition.store(true, Ordering::SeqCst);
+                    return Err(ProtocolError::NotActionable);
+                }
+                return Err(error);
+            }
             _ => {}
         }
         largest_read = largest_read.max(read_started.elapsed());
@@ -1551,6 +1709,11 @@ async fn set_checked(
             Err(error) => return Err(error),
         }
     }
+}
+// A realm ticket covers the owned node, not arbitrary auxiliary handles whose
+// release already failed. Never erase an independently recorded integrity loss.
+fn checked_navigation_recovery_allowed(d: &Dispatch, retired: bool) -> bool {
+    retired && !d.cleanup.load(Ordering::SeqCst)
 }
 fn checked_poll_fits(
     now: Instant,
@@ -2197,8 +2360,10 @@ impl ClientActions {
             return Err(ProtocolError::CleanupFailed);
         }
         if let Some(ordinal) = ledger.lost.take() {
-            d.recording_missing.store(ordinal, Ordering::SeqCst);
-            return Err(ProtocolError::BrowserFailure);
+            // Finalization and cleanup are acknowledged, but the recording is
+            // incomplete. Report this once without publishing retained blobs;
+            // the public adapter raises the artifact error and may retry stop.
+            return Ok(json!({"identityScope":ctx.page.identity_scope,"missingSegment":ordinal}));
         }
         if ledger
             .finished
@@ -2249,6 +2414,27 @@ impl ClientActions {
 
 /// Focus is discovered by the native AX tree, including closed shadow roots.
 /// No synthetic locator/ref or injected shadow-root registry is introduced.
+fn observation_action_error(
+    error: super::client_observation::ObservationError,
+    dispatch: &Dispatch,
+) -> ProtocolError {
+    use super::client_observation::ObservationError;
+    match error {
+        ObservationError::CleanupFailed { primary } => {
+            dispatch.cleanup.store(true, Ordering::SeqCst);
+            primary
+                .map(|error| observation_action_error(*error, dispatch))
+                .unwrap_or(ProtocolError::CleanupFailed)
+        }
+        ObservationError::Cancelled => ProtocolError::Cancelled,
+        ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
+        ObservationError::StaleReference => ProtocolError::StaleReference,
+        ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
+        ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::PolicyDenied => ProtocolError::PolicyDenied,
+        ObservationError::BackendFailure => ProtocolError::BrowserFailure,
+    }
+}
 async fn require_editable_focus(
     ctx: &ActionContext<'_>,
     d: &Dispatch,
@@ -2263,16 +2449,7 @@ async fn require_editable_focus(
         ctx.operation,
     )
     .await
-    .map_err(|error| match error {
-        super::client_observation::ObservationError::Cancelled => ProtocolError::Cancelled,
-        super::client_observation::ObservationError::DeadlineExceeded => {
-            ProtocolError::DeadlineExceeded
-        }
-        super::client_observation::ObservationError::StaleReference => {
-            ProtocolError::StaleReference
-        }
-        _ => ProtocolError::BrowserFailure,
-    })?;
+    .map_err(|error| observation_action_error(error, d))?;
     ctx.check()?;
     for frame in frames {
         let tree = ctx
@@ -2306,6 +2483,7 @@ async fn require_editable_focus(
                 ))
                 .await?;
             let resolved = Resolved {
+                realm: None,
                 object,
                 session: frame.binding.session.clone(),
                 binding: frame.binding.clone(),
@@ -2466,6 +2644,7 @@ mod tests {
     impl Fixture {
         fn context(&self) -> ActionContext<'_> {
             ActionContext {
+                realm_authority: ActionRealmAuthority::UntrackedFixture,
                 page: &self.page,
                 operation: &self.op,
                 page_state: &self.state,
@@ -2560,12 +2739,30 @@ mod tests {
                             } else {
                                 json!({"result":{"value":{"width":100,"height":50}}})
                             }
+                        } else if source.contains("const p=Node.prototype")
+                            && mode.starts_with("exact-")
+                        {
+                            match mode {
+                                "exact-disconnected" | "exact-cleanup-failed" => {
+                                    json!({"result":{"value":false}})
+                                }
+                                "exact-aux-cleanup-failed" => {
+                                    json!({"result":{"objectId":"result-handle"},"exceptionDetails":{"exception":{"objectId":"exception-handle"}}})
+                                }
+                                "exact-exception" => {
+                                    json!({"exceptionDetails":{"text":"synthetic"},"result":{}})
+                                }
+                                "exact-malformed" => json!({"result":{"value":null}}),
+                                _ => json!({"result":{"value":true}}),
+                            }
                         } else if source == CHECKED_STATE {
                             checked_reads += 1;
                             if mode == "check-read-stalled" && checked_reads == 2 {
                                 tokio::time::sleep(Duration::from_secs(2)).await;
                             }
-                            if (mode == "check-replaced" && checked_reads > 2)
+                            if mode == "check-aux-cleanup-failed" {
+                                json!({"result":{},"exceptionDetails":{"exception":{"objectId":"exception-handle"}}})
+                            } else if (mode == "check-replaced" && checked_reads > 2)
                                 || (mode == "check-immediate-replacement" && checked_reads > 1)
                             {
                                 json!({"result":{"value":{"status":"stale"}}})
@@ -2581,9 +2778,20 @@ mod tests {
                     "Runtime.evaluate" => json!({"result":{"value":true}}),
                     _ => json!({}),
                 };
+                let reply = if ((mode == "exact-cleanup-failed"
+                    || mode == "check-aux-cleanup-failed"
+                    || (mode == "exact-aux-cleanup-failed"
+                        && request["params"]["objectId"] == "result-handle"))
+                    && method == "Runtime.releaseObject")
+                    || (mode == "exact-protocol-error" && method == "DOM.resolveNode")
+                {
+                    json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic cleanup failure"}})
+                } else {
+                    json!({"id":request["id"],"result":result})
+                };
                 if socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
-                        json!({"id":request["id"],"result":result}).to_string(),
+                        reply.to_string(),
                     ))
                     .await
                     .is_err()
@@ -2659,6 +2867,86 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn exact_resolution_negative_proof_is_stale_but_unknown_is_not() {
+        for (mode, expected, cleanup_failed) in [
+            ("exact-disconnected", ProtocolError::StaleReference, false),
+            ("exact-exception", ProtocolError::BrowserFailure, false),
+            ("exact-protocol-error", ProtocolError::BrowserFailure, false),
+            ("exact-malformed", ProtocolError::BrowserFailure, false),
+            ("exact-cleanup-failed", ProtocolError::StaleReference, true),
+            (
+                "exact-aux-cleanup-failed",
+                ProtocolError::BrowserFailure,
+                true,
+            ),
+        ] {
+            let f = fixture(mode).await;
+            let failure = ClientActions::default().execute(f.context(), "browser.perform", &json!({
+                "identityScope":"scope", "ref":{"id":"@e1","revision":"1"}, "action":{"kind":"check"}
+            })).await.unwrap_err();
+            assert_eq!(failure.error, expected, "{mode}");
+            assert_eq!(failure.effects, Effects::NotDispatched, "{mode}");
+            assert_eq!(failure.cleanup_failed, cleanup_failed, "{mode}");
+            if mode == "exact-aux-cleanup-failed" {
+                let log = f.log.lock().unwrap();
+                for handle in ["result-handle", "exception-handle", "exact-node"] {
+                    assert!(log.iter().any(|r| r["method"] == "Runtime.releaseObject"
+                        && r["params"]["objectId"] == handle));
+                }
+            }
+            assert!(f.inputs().is_empty());
+            assert!(!f
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["method"] == "DOM.scrollIntoViewIfNeeded"));
+        }
+    }
+    #[tokio::test]
+    async fn exact_loader_mismatch_is_stale_before_dispatch() {
+        let mut f = fixture("normal").await;
+        let mut binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
+        binding.loader = "retired-document".into();
+        let id = f.refs.bind_exact(42, "checkbox", "", binding);
+        let failure = ClientActions::default().execute(f.context(), "browser.perform", &json!({
+            "identityScope":"scope", "ref":{"id":format!("@{id}"),"revision":"1"}, "action":{"kind":"check"}
+        })).await.unwrap_err();
+        assert_eq!(failure.error, ProtocolError::StaleReference);
+        assert_eq!(failure.effects, Effects::NotDispatched);
+        assert!(!failure.cleanup_failed);
+        assert!(f.inputs().is_empty());
+        assert!(!f
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "DOM.resolveNode"));
+    }
+    #[test]
+    fn action_success_cannot_hide_cleanup_integrity_and_primary_error_survives() {
+        let d = Dispatch::default();
+        d.cleanup.store(true, Ordering::SeqCst);
+        let result = finish_dispatch(&d, Ok(Value::Null)).unwrap_err();
+        assert_eq!(result.error, ProtocolError::CleanupFailed);
+        assert!(result.cleanup_failed);
+        assert_eq!(
+            finish_dispatch(&d, Err(ProtocolError::BrowserFailure))
+                .unwrap_err()
+                .error,
+            ProtocolError::BrowserFailure
+        );
+    }
+    #[test]
+    fn stale_does_not_erase_unknown_effects_after_dispatch() {
+        let d = Dispatch::default();
+        d.mark();
+        assert_eq!(
+            d.failure(ProtocolError::StaleReference).effects,
+            Effects::Unknown
+        );
+    }
+    #[tokio::test]
     async fn cancelled_exact_resolution_drains_and_releases_late_remote_handle() {
         let f = fixture("resolve-cancel").await;
         let d = Dispatch::default();
@@ -2674,6 +2962,22 @@ mod tests {
             .iter()
             .any(|v| v["method"] == "Runtime.releaseObject"
                 && v["params"]["objectId"] == "exact-node"));
+    }
+    #[test]
+    fn observation_cleanup_preserves_primary_and_sets_action_integrity_flag() {
+        let dispatch = Dispatch::default();
+        let error = observation_action_error(
+            super::super::client_observation::ObservationError::CleanupFailed {
+                primary: Some(Box::new(
+                    super::super::client_observation::ObservationError::Cancelled,
+                )),
+            },
+            &dispatch,
+        );
+        let failure = dispatch.failure(error);
+        assert_eq!(failure.error, ProtocolError::Cancelled);
+        assert!(failure.cleanup_failed);
+        assert_eq!(failure.effects, Effects::NotDispatched);
     }
     #[test]
     fn upload_paths_refuse_escapes_and_preserve_nested_directory_paths() {
@@ -3007,11 +3311,17 @@ mod tests {
             .await
             .unwrap();
         seed_recording(&actions, &f, 2, None, true).await;
-        assert_eq!(
-            collect_recording(&actions, &f).await.unwrap_err().error,
-            ProtocolError::BrowserFailure
-        );
-        assert!(!actions.recording.lock().await.armed);
+        let missing = collect_recording(&actions, &f).await.unwrap();
+        assert_eq!(missing, json!({"identityScope":"scope","missingSegment":2}));
+        {
+            let ledger = actions.recording.lock().await;
+            assert!(!ledger.armed);
+            assert!(ledger.current.is_none());
+            assert!(!ledger.cleanup_failed);
+            assert_eq!(ledger.finished.len(), 1);
+            assert!(ledger.finished[0].reservation.is_some());
+            assert_eq!(ledger.finished[0].bytes.as_deref(), Some(bytes.as_slice()));
+        }
         let result = collect_recording(&actions, &f).await.unwrap();
         assert_eq!(result["segments"].as_array().unwrap().len(), 1);
         assert_eq!(
@@ -3579,9 +3889,30 @@ mod tests {
         actions.abandon_recording().await.unwrap();
     }
     #[tokio::test]
+    async fn retired_realm_does_not_erase_failed_exception_handle_cleanup() {
+        let f = fixture("check-aux-cleanup-failed").await;
+        let node = Resolved {
+            realm: None,
+            object: "exact-node".into(),
+            session: "page".into(),
+            binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
+        };
+        let d = Dispatch::default();
+        let primary = node
+            .call(&f.context(), &d, false, CHECKED_STATE, vec![])
+            .await;
+        assert_eq!(primary, Err(ProtocolError::BrowserFailure));
+        assert!(d.cleanup.load(Ordering::SeqCst));
+        // Even a subsequently established retirement proof cannot settle this
+        // independently failed auxiliary handle by implication.
+        assert!(!checked_navigation_recovery_allowed(&d, true));
+        assert!(d.failure(ProtocolError::BrowserFailure).cleanup_failed);
+    }
+    #[tokio::test]
     async fn immediate_click_replacement_preserves_original_success_semantics() {
         let f = fixture("check-immediate-replacement").await;
         let node = Resolved {
+            realm: None,
             object: "exact-node".into(),
             session: "page".into(),
             binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
@@ -3633,6 +3964,7 @@ mod tests {
             let mut f = fixture(mode).await;
             f.op.deadline = Instant::now() + Duration::from_millis(350);
             let node = Resolved {
+                realm: None,
                 object: "exact-node".into(),
                 session: "page".into(),
                 binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
@@ -3664,6 +3996,7 @@ mod tests {
         let mut f = fixture("check-read-stalled").await;
         f.op.deadline = Instant::now() + Duration::from_millis(350);
         let node = Resolved {
+            realm: None,
             object: "exact-node".into(),
             session: "page".into(),
             binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
@@ -3767,6 +4100,94 @@ mod tests {
         assert!(actions.uploads.lock().await.is_empty());
     }
     #[tokio::test]
+    #[ignore = "requires hosted Chromium: production protected observe then exact checked action with bounded stage evidence"]
+    async fn chromium_protected_observe_then_exact_check_uses_committed_snapshot() {
+        use super::super::{
+            client_browser::ClientBrowser,
+            client_session::ClientSession,
+            client_transport::{ClientEventSink, ClientExecutor},
+        };
+        async fn run(
+            browser: &ClientBrowser,
+            sequence: &mut u64,
+            cancellation: &tokio::sync::watch::Receiver<CancelSignal>,
+            command: &str,
+            args: Value,
+            seconds: u64,
+        ) -> Result<Value, String> {
+            *sequence += 1;
+            eprintln!("native-observe-action-stage command.start {command}");
+            let outcome = browser
+                .execute(
+                    command.into(),
+                    args.as_object().ok_or("fixture shape")?.clone(),
+                    OperationLease {
+                        generation: 1,
+                        sequence: *sequence,
+                        is_callback: false,
+                        deadline: Instant::now() + Duration::from_secs(seconds),
+                        cancellation: cancellation.clone(),
+                    },
+                )
+                .await;
+            eprintln!(
+                "native-observe-action-stage command.settled {command} effects={:?}",
+                outcome.effects
+            );
+            outcome
+                .result
+                .map_err(|error| format!("{command}: {error:?}"))
+        }
+        fn find(node: &Value, id: &Value) -> Option<Value> {
+            if node["ref"]["id"] == *id {
+                return Some(node["ref"].clone());
+            }
+            node["children"]
+                .as_array()?
+                .iter()
+                .find_map(|child| find(child, id))
+        }
+        let broker = Arc::new(ClientSession::new());
+        let browser = ClientBrowser::new(broker.clone());
+        let (sink, _events) = ClientEventSink::test_channel(broker);
+        browser.set_event_sink(sink).unwrap();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let mut sequence = 0;
+        let result: Result<(), String> = async {
+            let opened = run(&browser, &mut sequence, &cancellation, "scope.open", json!({
+                "source":"launch", "context":"isolated", "headless":true,
+                "blockServiceWorkers":false,"viewport":{"width":800,"height":600},"media":{},"initScripts":[]
+            }), 30).await?;
+            let scope = opened["identityScope"].as_str().ok_or("missing scope")?;
+            run(&browser, &mut sequence, &cancellation, "scope.configure", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","requestPolicy":{},"downloads":{"source":"local"}}), 30).await?;
+            run(&browser, &mut sequence, &cancellation, "page.activate", json!({"identityScope":scope}), 30).await?;
+            run(&browser, &mut sequence, &cancellation, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}), 2).await?;
+            let query = run(&browser, &mut sequence, &cancellation, "fixture.query", json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#box"}}), 2).await?;
+            let nodes = query["nodes"].as_array().ok_or("missing query nodes")?;
+            if nodes.len() != 1 { return Err("query did not locate one synthetic checkbox".into()); }
+            let snapshot = run(&browser, &mut sequence, &cancellation, "browser.observe", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","options":{}}), 2).await?;
+            let reference = find(&snapshot["root"], &nodes[0]["ref"]["id"]).ok_or("query identity missing from committed observation")?;
+            // Actual central dispatch acquires snapshot_for_action; no supplied
+            // ref map, synthetic readiness ACK or protected-read bypass.
+            run(&browser, &mut sequence, &cancellation, "browser.perform", json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}), 2).await?;
+            let state = run(&browser, &mut sequence, &cancellation, "page.evaluate", json!({"identityScope":scope,"source":"()=>document.querySelector('#box').checked","argument":null}), 2).await?;
+            if state["value"] != true { return Err("observed checkbox did not become checked".into()); }
+            run(&browser, &mut sequence, &cancellation, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=radio type=radio>Navigate</label>';document.querySelector('#radio').addEventListener('click',()=>location.replace('about:blank?native-checked-navigation'));return true}","argument":null}), 2).await?;
+            let query=run(&browser,&mut sequence,&cancellation,"fixture.query",json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#radio"}}),2).await?;
+            let snapshot=run(&browser,&mut sequence,&cancellation,"browser.observe",json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","options":{}}),2).await?;
+            let reference=find(&snapshot["root"],&query["nodes"][0]["ref"]["id"]).ok_or("radio missing from committed snapshot")?;
+            run(&browser,&mut sequence,&cancellation,"browser.perform",json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}),2).await?;
+            let location=run(&browser,&mut sequence,&cancellation,"page.evaluate",json!({"identityScope":scope,"source":"()=>location.href","argument":null}),2).await?;
+            if location["value"]!="about:blank?native-checked-navigation" {return Err("checked radio did not navigate".into());}
+            Ok(())
+        }.await;
+        // Blank synthetic DOM avoids callback publication while this direct
+        // lifecycle fixture has no transport writer. This is not an ACK test.
+        let cleanup = browser.shutdown().await;
+        assert!(cleanup.is_ok(), "production scope cleanup: {cleanup:?}");
+        assert!(result.is_ok(), "observe/action boundary: {result:?}");
+    }
+    #[tokio::test]
     #[ignore = "requires real Chromium in hosted CI; native actions, not protocol mocks"]
     async fn chromium_exact_actions_fill_select_check_document_and_stale_ref() {
         use super::super::browser::{evaluate_on, BrowserManager};
@@ -3808,13 +4229,13 @@ mod tests {
                 ("#check", json!({"kind":"check"})),
                 ("#button", json!({"kind":"doubleTap"})),
             ] {
-                actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
+                actions.execute(ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
             }
             let value = evaluate_on(&browser.client,&session,"[document.querySelector('#text').value,document.querySelector('#pick').value,document.querySelector('#check').checked,document.querySelector('#button').dataset.clicked]").await?;
             assert_eq!(value,json!(["native synthetic","b",true,"2"]));
-            actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
+            actions.execute(ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
             evaluate_on(&browser.client,&session,"document.querySelector('#button').remove(); true").await?;
-            assert!(actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
+            assert!(actions.execute(ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
             actions.cleanup().await.map_err(|_|"cleanup failed")?;
             Ok::<(),String>(())
         }.await;
@@ -3858,11 +4279,11 @@ mod tests {
             blobs.activate_scope(BlobScope{generation:1,identity_scope:page.identity_scope.clone()}).unwrap();
             let sessions=HashMap::new();let actions=ClientActions::default();
             let args=json!({"identityScope":page.identity_scope,"ref":{"id":id,"revision":"1"},"action":{"kind":"tap"}});
-            actions.execute(ActionContext{page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.map_err(|e|format!("Nested action failed: {:?}",e.error))?;
+            actions.execute(ActionContext{realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.map_err(|e|format!("Nested action failed: {:?}",e.error))?;
             assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
             evaluate_on(&page.client,&session,"const cover=document.createElement('div');cover.style.cssText='position:fixed;inset:0;z-index:999;background:red';document.body.append(cover);true").await?;
             operation.deadline=Instant::now()+Duration::from_secs(2);
-            let error=actions.execute(ActionContext{page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.unwrap_err();
+            let error=actions.execute(ActionContext{realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.unwrap_err();
             assert_eq!(error.error,ProtocolError::NotActionable);assert_eq!(error.reason,Some(ActionReason::InterceptedPointer));
             assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
             actions.cleanup().await.map_err(|_|"Action cleanup failed")?;Ok::<(),String>(())
@@ -3927,12 +4348,12 @@ mod tests {
             blobs.activate_scope(first_scope.clone()).unwrap();
             let first_geometry=action_fixture_geometry(&first_page,&operation).await?;
             let second_geometry=action_fixture_geometry(&second_page,&operation).await?;
-            let first_context = || ActionContext {page:&first_page,operation:&operation,page_state:&first_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&first_geometry};
+            let first_context = || ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&first_page,operation:&operation,page_state:&first_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&first_geometry};
             actions.execute(first_context(), "recording.start", &json!({"identityScope":first_page.identity_scope,"size":{"width":320,"height":200},"quality":70})).await.map_err(|e|format!("record start {:?}",e.error))?;
             actions.recording_page_closing(&first_page.identity_scope, &blobs).await.map_err(|e|format!("record close {e:?}"))?;
             blobs.revoke_scope(&first_scope).unwrap();
             blobs.activate_scope(second_scope.clone()).unwrap();
-            let second_context = || ActionContext {page:&second_page,operation:&operation,page_state:&second_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&second_geometry};
+            let second_context = || ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&second_page,operation:&operation,page_state:&second_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&second_geometry};
             actions.recording_page_opened(second_context()).await.map_err(|e|format!("record reopen {:?}",e.error))?;
             let output = actions.execute(second_context(), "recording.stop", &json!({"identityScope":second_page.identity_scope})).await.map_err(|e|format!("record stop {:?}",e.error))?;
             let segments = output["segments"].as_array().ok_or("missing segments")?;

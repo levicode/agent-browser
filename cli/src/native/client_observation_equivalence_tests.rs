@@ -337,3 +337,43 @@ fn metadata_lifetime_hook_is_exact_operation_scoped() {
             .contains("new WeakRef")
     );
 }
+
+#[tokio::test]
+#[ignore = "hosted Chromium: same-document additive query quota and exact identity lifetime"]
+async fn chromium_query_churn_bounds_durable_metadata_without_evicting_authority() {
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result=async {
+        let session=browser.active_session_id()?;let(op,_tx)=operation();
+        evaluate_on(&browser.client,session,"document.body.innerHTML='<button id=current>Current</button>';true").await?;
+        let inventory=frames(&browser,&op).await;let mut refs=RefMap::new();refs.set_exact_limit_for_test(16);
+        let options:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"selector","selector":"#current"}})).unwrap();
+        let first=query(&browser.client,&inventory,&mut refs,"churn",1,&options,&op).await?;
+        assert_eq!(first.nodes.len(),1);let old=first.nodes[0].reference.id.clone();let mut current=old.clone();
+        assert_eq!(refs.retained_identity_counts(),(1,1),"Unmatched candidate identities must not become durable");
+        let mut ids=std::collections::HashSet::from([old.clone()]);let mut rejected=false;
+        for revision in 2..32 {
+            evaluate_on(&browser.client,session,"window.previous=document.querySelector('#current');window.previous.replaceWith(Object.assign(document.createElement('button'),{id:'current',textContent:'Current'}));true").await?;
+            let before=(refs.ref_ids(),refs.retained_identity_counts());
+            match query(&browser.client,&inventory,&mut refs,"churn",revision,&options,&op).await {
+                Ok(found)=>{assert_eq!(found.nodes.len(),1);current=found.nodes[0].reference.id.clone();assert!(ids.insert(current.clone()),"A retired DOM identity must never be rebound");let(map,durable)=refs.retained_identity_counts();assert_eq!(map,ids.len());assert_eq!(durable,ids.len());assert!(map<=16&&durable<=16);},
+                Err(ObservationError::ResourceLimit)=>{assert_eq!((refs.ref_ids(),refs.retained_identity_counts()),before);rejected=true;evaluate_on(&browser.client,session,"document.querySelector('#current').replaceWith(window.previous);true").await?;break;},
+                Err(error)=>return Err(format!("Unexpected churn failure: {error:?}")),
+            }
+        }
+        assert!(rejected,"Bounded query admission must eventually reject churn");
+        let retained=query(&browser.client,&inventory,&mut refs,"churn",100,&options,&op).await?;
+        assert_eq!(retained.nodes[0].reference.id,current);
+        let old_read:ReadOptions=serde_json::from_value(json!({"ref":old})).unwrap();
+        assert_eq!(read(&browser.client,&inventory,&mut refs,101,&old_read,&op).await.unwrap_err(),ObservationError::StaleReference);
+        evaluate_on(&browser.client,session,"document.querySelector('#current').onclick=()=>document.querySelector('#current').textContent='Clicked';true").await?;
+        let(x,y,effective)=super::super::element::resolve_element_center(&browser.client,session,&refs,&current,&HashMap::new(),true).await?;
+        for kind in ["mousePressed","mouseReleased"]{browser.client.send_command("Input.dispatchMouseEvent",Some(json!({"type":kind,"x":x,"y":y,"button":"left","clickCount":1})),Some(&effective)).await?;}
+        let text=browser.client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelector('#current').textContent","returnByValue":true})),Some(session)).await?;
+        assert_eq!(text["result"]["value"],"Clicked");
+        Ok::<(),String>(())
+    }.await;
+    browser.close().await.unwrap();
+    result.unwrap();
+}

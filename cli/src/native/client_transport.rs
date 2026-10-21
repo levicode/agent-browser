@@ -991,17 +991,22 @@ where
             );
         }
     } else {
-        enqueue(
-            &sender,
-            ServerMessage::Error {
+        // This terminal refusal follows every correlated outcome already
+        // queued above. The priority control lane must not overtake an Unknown
+        // result and erase its effects classification at the client.
+        if sender
+            .results
+            .try_send(ServerMessage::Error {
                 id: closing_id,
                 error: WireError {
                     code: ProtocolError::CleanupFailed,
                 },
                 scope_state: ScopeState::Quarantined,
-            },
-            &broker,
-        );
+            })
+            .is_err()
+        {
+            let _ = broker.quarantine();
+        }
     }
     drop(sender);
     let _ = drain.send(());
@@ -1715,6 +1720,7 @@ mod tests {
     struct GatedWriter<W> {
         inner: W,
         gate: std::sync::Arc<FlushGate>,
+        gated_type: &'static [u8],
     }
     impl<W: AsyncWrite + Unpin> AsyncWrite for GatedWriter<W> {
         fn poll_write(
@@ -1725,8 +1731,8 @@ mod tests {
             let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes);
             if let std::task::Poll::Ready(Ok(count)) = result {
                 if bytes[..count]
-                    .windows(b"\"type\":\"result\"".len())
-                    .any(|part| part == b"\"type\":\"result\"")
+                    .windows(self.gated_type.len())
+                    .any(|part| part == self.gated_type)
                 {
                     self.gate
                         .result_seen
@@ -1773,6 +1779,7 @@ mod tests {
             GatedWriter {
                 inner: writer,
                 gate: gate.clone(),
+                gated_type: b"\"type\":\"result\"",
             },
             ClientMessage::Hello {
                 id: "h".into(),
@@ -1818,6 +1825,96 @@ mod tests {
         drop(client);
         assert!(task.await.unwrap());
     }
+    struct UnknownCleanupExecutor {
+        shutdown_reached: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+    impl ClientExecutor for UnknownCleanupExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        async fn execute(
+            &self,
+            _: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            _: OperationLease,
+        ) -> NativeOutcome {
+            NativeOutcome {
+                result: Err(ProtocolError::BrowserFailure),
+                effects: Effects::Unknown,
+            }
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            if let Some(sender) = self.shutdown_reached.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+            Err(ProtocolError::CleanupFailed)
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminal_cleanup_refusal_cannot_overtake_correlated_unknown_result() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let (shutdown_send, shutdown_receive) = tokio::sync::oneshot::channel();
+        let executor = std::sync::Arc::new(UnknownCleanupExecutor {
+            shutdown_reached: std::sync::Mutex::new(Some(shutdown_send)),
+        });
+        let (client, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let gate = std::sync::Arc::new(FlushGate::default());
+        let task = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            GatedWriter {
+                inner: writer,
+                gate: gate.clone(),
+                gated_type: b"\"type\":\"ready\"",
+            },
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker,
+            executor,
+        ));
+        let mut client = tokio::io::BufReader::new(client);
+        read_frame(&mut client).await.unwrap().unwrap();
+        // Hold the writer on Ready's flush so both terminal messages queue
+        // before it can choose a lane. Reader/control processing stays live.
+        client.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":7,\"timeoutMs\":5000,\"command\":\"test\",\"args\":{}}\n").await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), shutdown_receive)
+            .await
+            .unwrap()
+            .unwrap();
+        // On this current-thread runtime shutdown returns and the serve task
+        // synchronously queues its refusal before yielding to this receiver.
+        {
+            let mut waker = gate.waker.lock().unwrap();
+            gate.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(waker) = waker.take() {
+                waker.wake();
+            }
+        }
+        let mut messages = Vec::new();
+        for _ in 0..2 {
+            let bytes =
+                tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(&mut client))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            messages.push(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+        }
+        assert_eq!(messages[0]["type"], "result");
+        assert_eq!(messages[0]["id"], "r");
+        assert_eq!(messages[0]["operationSeq"], 7);
+        assert_eq!(messages[0]["effects"], "unknown");
+        assert_eq!(messages[0]["error"]["code"], "browser-failure");
+        assert_eq!(messages[0]["scopeState"], "quarantined");
+        assert_eq!(messages[1]["type"], "error");
+        assert_eq!(messages[1]["error"]["code"], "cleanup-failed");
+        assert!(!task.await.unwrap(), "terminal cleanup is still unproven");
+    }
+
     struct StalledExecutor {
         broker: std::sync::Arc<ClientSession>,
         cleanup_succeeds: bool,

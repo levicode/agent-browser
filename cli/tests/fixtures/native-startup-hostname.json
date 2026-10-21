@@ -1,0 +1,7 @@
+{
+  "identityScope": "scope-1",
+  "testIdAttribute": "data-testid",
+  "secureFieldSelector": "input[type=\"password\" i]",
+  "requestPolicy": { "site": "127.0.0.1" },
+  "downloads": { "source": "local" }
+}

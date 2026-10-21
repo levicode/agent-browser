@@ -18,6 +18,7 @@ use super::element::{parse_ref, RefMap};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
@@ -214,10 +215,13 @@ impl ObservationDispatch {
         operation: OperationLease,
     ) -> Result<Output, DispatchFailure> {
         let identity = context.page.identity_scope.clone();
+        let observation_cleanup = AtomicBool::new(false);
+        let map_observation = |error| observation_error_with_cleanup(error, &observation_cleanup);
         let failure = |error: ProtocolError| DispatchFailure {
             error: error.clone(),
             identity_scope: identity.clone(),
-            cleanup_integrity_lost: error == ProtocolError::CleanupFailed,
+            cleanup_integrity_lost: error == ProtocolError::CleanupFailed
+                || observation_cleanup.load(Ordering::SeqCst),
         };
         if context.scope.identity_scope != identity
             || context.scope.generation != operation.generation
@@ -273,9 +277,10 @@ impl ObservationDispatch {
         } else {
             None
         };
-        let frames = verified_frames(&context.page, &operation)
-            .await
-            .map_err(failure)?;
+        let frames =
+            verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
+                .await
+                .map_err(failure)?;
         let fallback_selector = match &request {
             DispatchRequest::Observe(request) if request.options.pixel_fallback => {
                 Some(request.secure_field_selector.clone())
@@ -309,13 +314,13 @@ impl ObservationDispatch {
         let mut geometry = None;
         let result = async {
             if let Some(journal) = &mut journal { journal.freeze().await.map_err(protected_error)?; }
-            let frozen = verified_frames(&capture_context.page, &operation).await?;
+            let frozen = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
             same_frames(&capture_context.frames, &frozen)?;
             geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(geometry_error)?);
             let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
             match request {
                 DispatchRequest::Query(query) => {
-                    let mut output = observation::query(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &query.options, &operation).await.map_err(observation_error)?;
+                    let mut output = observation::query(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &query.options, &operation).await.map_err(map_observation)?;
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut output.nodes, &operation).await.map_err(geometry_error)?;
                     Ok((serde_json::to_value(output).map_err(|_| ProtocolError::BrowserFailure)?, None, false))
                 }
@@ -354,7 +359,7 @@ impl ObservationDispatch {
                             // fallback pixels can observe current application state.
                             return Ok((Value::Null, None, true));
                         }
-                        Err(error) => return Err(observation_error(error)),
+                        Err(error) => return Err(map_observation(error)),
                     };
                     if viewport(&capture_context.page, &operation).await? != observed_viewport { return Err(ProtocolError::StaleScope); }
                     value["viewport"] = observed_viewport;
@@ -391,7 +396,8 @@ impl ObservationDispatch {
                     .cloned()
                     .unwrap_or_else(|| protected_error(error.reason)),
                 identity_scope: identity.clone(),
-                cleanup_integrity_lost: error.cleanup_integrity_lost,
+                cleanup_integrity_lost: error.cleanup_integrity_lost
+                    || observation_cleanup.load(Ordering::SeqCst),
             });
         }
         // A clean restore must not turn a policy failure into a timeout and
@@ -414,7 +420,7 @@ impl ObservationDispatch {
             // The UI owner and original operation budget remain unchanged.
             drop(journal);
             check(&capture_context.page, &operation).map_err(failure)?;
-            capture_context.frames = verified_frames(&capture_context.page, &operation)
+            capture_context.frames = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup))
                 .await
                 .map_err(failure)?;
             staged = self
@@ -442,7 +448,7 @@ impl ObservationDispatch {
             journal.check().map_err(|e| failure(protected_error(e)))?;
         }
         check(&capture_context.page, &operation).map_err(failure)?;
-        let final_frames = verified_frames(&capture_context.page, &operation)
+        let final_frames = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup))
             .await
             .map_err(failure)?;
         same_frames(&capture_context.frames, &final_frames).map_err(failure)?;
@@ -505,8 +511,10 @@ impl ObservationDispatch {
                     && !failure.cleanup_integrity_lost
                     && failure.error == ProtocolError::StaleScope =>
             {
-                if document_retirement_proven(&capture_context, &operation).await {
-                    failure.error = ProtocolError::StaleReference;
+                match document_retirement_proven(&capture_context, &operation).await {
+                    Ok(true) => failure.error = ProtocolError::StaleReference,
+                    Err(ProtocolError::CleanupFailed) => failure.cleanup_integrity_lost = true,
+                    _ => {}
                 }
                 Err(failure)
             }
@@ -518,12 +526,15 @@ impl ObservationDispatch {
 /// Classify only an observe failure after its cleanup has finished. A stale
 /// capture can also mean layout movement, a retired attempt, or lost inventory
 /// authority; none of those is evidence of document replacement.
-async fn document_retirement_proven(context: &CaptureContext, operation: &OperationLease) -> bool {
+async fn document_retirement_proven(
+    context: &CaptureContext,
+    operation: &OperationLease,
+) -> Result<bool, ProtocolError> {
     if check(&context.page, operation).is_err() {
-        return false;
+        return Ok(false);
     }
     let Ok((revision, targets)) = context.page.targets.inventory() else {
-        return false;
+        return Ok(false);
     };
     let page_present = targets.iter().any(|target| {
         target.target_id == context.page.target_id
@@ -539,12 +550,13 @@ async fn document_retirement_proven(context: &CaptureContext, operation: &Operat
         // reason to convert cancellation or a backend error into NODE_STALE.
         match verified_frames(&context.page, operation).await {
             Ok(current) => retired_document(&context.frames, &current),
+            Err(ProtocolError::CleanupFailed) => return Err(ProtocolError::CleanupFailed),
             Err(_) => false,
         }
     };
-    replaced
+    Ok(replaced
         && context.page.targets.check_revision(revision).is_ok()
-        && check(&context.page, operation).is_ok()
+        && check(&context.page, operation).is_ok())
 }
 fn retired_document(before: &[ObservationFrame], after: &[ObservationFrame]) -> bool {
     before.iter().any(|old| {
@@ -582,8 +594,10 @@ async fn fresh_fallback<'a>(
     ),
     DispatchFailure,
 > {
+    let observation_cleanup = AtomicBool::new(false);
     let failure = |error: ProtocolError| DispatchFailure {
-        cleanup_integrity_lost: error == ProtocolError::CleanupFailed,
+        cleanup_integrity_lost: error == ProtocolError::CleanupFailed
+            || observation_cleanup.load(Ordering::SeqCst),
         error,
         identity_scope: context.page.identity_scope.clone(),
     };
@@ -597,7 +611,7 @@ async fn fresh_fallback<'a>(
     let mut geometry = None;
     let result = async {
         journal.freeze().await.map_err(protected_error)?;
-        let frozen = verified_frames(&context.page, operation).await?;
+        let frozen = verified_frames_with_cleanup(&context.page, operation, Some(&observation_cleanup)).await?;
         same_frames(&context.frames, &frozen)?;
         geometry = Some(GeometrySnapshot::capture(&context.page.client, &context.page.page_session_id, &frozen, operation).await.map_err(geometry_error)?);
         let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
@@ -618,7 +632,8 @@ async fn fresh_fallback<'a>(
                 .cloned()
                 .unwrap_or_else(|| protected_error(error.reason)),
             identity_scope: error.identity_scope,
-            cleanup_integrity_lost: error.cleanup_integrity_lost,
+            cleanup_integrity_lost: error.cleanup_integrity_lost
+                || observation_cleanup.load(Ordering::SeqCst),
         });
     }
     let (value, pixels) = result.map_err(failure)?;
@@ -635,7 +650,7 @@ async fn fresh_fallback<'a>(
     check(&context.page, operation).map_err(failure)?;
     same_frames(
         &context.frames,
-        &verified_frames(&context.page, operation)
+        &verified_frames_with_cleanup(&context.page, operation, Some(&observation_cleanup))
             .await
             .map_err(failure)?,
     )
@@ -739,6 +754,13 @@ pub async fn verified_frames(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+    verified_frames_with_cleanup(page, operation, None).await
+}
+async fn verified_frames_with_cleanup(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+) -> Result<Vec<ObservationFrame>, ProtocolError> {
     check(page, operation)?;
     let (revision, targets) = page.targets.inventory()?;
     let main = targets
@@ -785,7 +807,10 @@ pub async fn verified_frames(
     let frames =
         observation::enumerate_frames(&page.client, &page.page_session_id, &mapping, operation)
             .await
-            .map_err(observation_error)?;
+            .map_err(|error| match cleanup {
+                Some(cleanup) => observation_error_with_cleanup(error, cleanup),
+                None => observation_error(error),
+            })?;
     let root = main_frame(&frames)?;
     if root.binding.session != page.page_session_id {
         return Err(ProtocolError::StaleScope);
@@ -1098,10 +1123,14 @@ fn pixel_lease(operation: &OperationLease) -> OperationLease {
     }
 }
 fn semantic_lease(operation: &OperationLease, fallback: bool) -> OperationLease {
-    let now = Instant::now();
+    semantic_lease_at(operation, fallback, Instant::now())
+}
+fn semantic_lease_at(operation: &OperationLease, fallback: bool, now: Instant) -> OperationLease {
     let remaining = operation.deadline.saturating_duration_since(now);
     let reserve = if fallback {
-        (remaining / 2).min(Duration::from_secs(2))
+        // Preserve the original reader budget: reserve one quarter, capped at
+        // two seconds, for a fresh masked capture after semantic timeout.
+        (remaining / 4).min(Duration::from_secs(2))
     } else {
         Duration::ZERO
     };
@@ -1113,8 +1142,21 @@ fn semantic_lease(operation: &OperationLease, fallback: bool) -> OperationLease 
         cancellation: operation.cancellation.clone(),
     }
 }
+fn observation_error_with_cleanup(error: ObservationError, cleanup: &AtomicBool) -> ProtocolError {
+    match error {
+        ObservationError::CleanupFailed { primary } => {
+            cleanup.store(true, Ordering::SeqCst);
+            primary
+                .map(|error| observation_error_with_cleanup(*error, cleanup))
+                .unwrap_or(ProtocolError::CleanupFailed)
+        }
+        error => observation_error(error),
+    }
+}
 fn observation_error(error: ObservationError) -> ProtocolError {
     match error {
+        ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
+        ObservationError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
         ObservationError::StaleReference => ProtocolError::StaleReference,
         ObservationError::Cancelled => ProtocolError::Cancelled,
@@ -1154,6 +1196,27 @@ fn capture_error(error: CaptureReason) -> ProtocolError {
 mod tests {
     use super::super::element::ExactBinding;
     use super::*;
+    #[test]
+    fn observation_cleanup_preserves_primary_without_authorizing_fallback() {
+        let cleanup = AtomicBool::new(false);
+        let error = observation_error_with_cleanup(
+            ObservationError::CleanupFailed {
+                primary: Some(Box::new(ObservationError::DeadlineExceeded)),
+            },
+            &cleanup,
+        );
+        assert_eq!(error, ProtocolError::DeadlineExceeded);
+        assert!(cleanup.load(Ordering::SeqCst));
+        // Fallback matches the original observation variant, never this mapped error.
+        assert_eq!(
+            observation_error(ObservationError::ResourceLimit),
+            ProtocolError::CapacityExceeded
+        );
+        assert_eq!(
+            observation_error(ObservationError::CleanupFailed { primary: None }),
+            ProtocolError::CleanupFailed
+        );
+    }
     fn lineage_tree(id: &str, parent: Option<&str>, children: Vec<Value>) -> Value {
         let mut frame = json!({"id":id});
         if let Some(parent) = parent {
@@ -1700,10 +1763,137 @@ mod tests {
         );
         assert_eq!(publication.published_revision, 0);
     }
+    #[tokio::test]
+    async fn fixture_query_publishes_zero_area_semantics_through_dispatch() {
+        use super::super::cdp::client::CdpClient;
+        use super::super::client_browser::ExecutionGate;
+        use super::super::client_targets::ClientTargets;
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.getFrameTree" => {
+                        json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"}}})
+                    }
+                    "Page.getLayoutMetrics" => {
+                        json!({"cssVisualViewport":{"clientWidth":100,"clientHeight":80,"offsetX":0,"offsetY":0,"scale":1},"cssLayoutViewport":{"clientWidth":100,"clientHeight":80}})
+                    }
+                    "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                    "DOM.getDocument" => {
+                        json!({"root":{"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"backendNodeId":7}]}})
+                    }
+                    "Accessibility.getFullAXTree" => {
+                        json!({"nodes":[{"nodeId":"zero","backendDOMNodeId":7,"role":{"type":"role","value":"generic"}}]})
+                    }
+                    "DOM.resolveNode" => json!({"object":{"objectId":"owner","subtype":"node"}}),
+                    "DOM.getBoxModel" => json!({"model":{"border":[10,20,10,20,10,20,10,20]}}),
+                    "Runtime.getProperties" => json!({"result":[]}),
+                    "Runtime.callFunctionOn" => {
+                        let declaration =
+                            request["params"]["functionDeclaration"].as_str().unwrap();
+                        if declaration.contains("Array.from(result)") {
+                            json!({"result":{"objectId":"security"}})
+                        } else if declaration.starts_with("function(expression") {
+                            json!({"result":{"value":{"indices":[0],"redacted":[]}}})
+                        } else if declaration.contains("const read=") {
+                            json!({"result":{"value":[{"attributes":{},"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]}})
+                        } else if declaration.contains("frameOwner") {
+                            json!({"result":{"value":{"connected":true,"frameOwner":false}}})
+                        } else {
+                            json!({"result":{"value":true}})
+                        }
+                    }
+                    "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => json!({}),
+                    method => panic!("unexpected zero-area dispatch command: {method}"),
+                };
+                if ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        targets
+            .attached("context", "target".into(), "session".into(), "page".into())
+            .unwrap();
+        targets.configured("target").unwrap();
+        targets
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        targets.acknowledge_enrollment().unwrap(); // Synthetic complete inventory only.
+        let gate = Arc::new(ExecutionGate::default());
+        let page = BrowserExecutionLease {
+            client,
+            page_session_id: "session".into(),
+            target_id: "target".into(),
+            identity_scope: "scope".into(),
+            permit: gate.enter(false).unwrap(),
+            targets,
+        };
+        let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "scope".into(),
+        };
+        blobs.activate_scope(scope.clone()).unwrap();
+        let refs = Arc::new(Mutex::new(RefMap::new()));
+        let dispatch = ObservationDispatch::new(refs.clone());
+        let (_sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            generation: 1,
+            sequence: 1,
+            is_callback: false,
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation,
+        };
+        let task = dispatch.start(DispatchContext {
+            #[cfg(feature="acceptance-faults")]
+            faults:Arc::new(super::super::client_test_faults::FaultController::default()),
+            page, ui:Arc::new(UiGate::default()), blobs, scope,
+            policy:ReadPolicy { test_id_attribute:"data-testid".into(), secure_field_selector:"input[type=password]".into() },
+            lifecycle_known_active:true,
+        }, DispatchRequest::Query(QueryRequest {
+            purpose:QueryPurpose::Fixture,
+            options:serde_json::from_value(json!({"expression":{"kind":"selector","selector":"#zero"},"secureFieldSelector":"input[type=password]"})).unwrap(),
+        }), operation);
+        let result = task.result.await.unwrap().unwrap();
+        task.join.await.unwrap().unwrap();
+        assert_eq!(
+            result["nodes"][0]["rect"],
+            json!({"x":10.0,"y":20.0,"width":0.0,"height":0.0})
+        );
+        assert_eq!(result["nodes"][0]["states"]["hidden"], true);
+        let id = result["nodes"][0]["ref"]["id"].as_str().unwrap();
+        assert_eq!(
+            refs.lock()
+                .unwrap()
+                .get(id.trim_start_matches('@'))
+                .unwrap()
+                .backend_node_id,
+            Some(7)
+        );
+        server.abort();
+        let _ = server.await;
+    }
     #[test]
     fn fallback_reserves_bounded_time_without_resetting_parent_deadline() {
         let parent = operation();
-        let semantic = semantic_lease(&parent, true);
+        let now = parent.deadline - Duration::from_secs(8);
+        let semantic = semantic_lease_at(&parent, true, now);
         assert_eq!(parent.deadline - semantic.deadline, Duration::from_secs(2));
         assert_eq!(semantic.sequence, parent.sequence);
         assert_eq!(semantic_lease(&parent, false).deadline, parent.deadline);
@@ -1711,6 +1901,46 @@ mod tests {
         assert_eq!(
             parent.deadline - pixels.deadline,
             Duration::from_millis(500)
+        );
+    }
+    #[test]
+    fn fallback_semantic_budget_matches_quarter_reserve_and_cap_boundaries() {
+        let now = Instant::now();
+        for (remaining, reserve) in [
+            (Duration::ZERO, Duration::ZERO),
+            (Duration::from_millis(4), Duration::from_millis(1)),
+            (Duration::from_secs(2), Duration::from_millis(500)),
+            (Duration::from_secs(8), Duration::from_secs(2)),
+            (Duration::from_secs(12), Duration::from_secs(2)),
+        ] {
+            let mut parent = operation();
+            parent.deadline = now + remaining;
+            let semantic = semantic_lease_at(&parent, true, now);
+            assert_eq!(semantic.deadline, parent.deadline - reserve);
+            assert_eq!(
+                semantic_lease_at(&parent, false, now).deadline,
+                parent.deadline
+            );
+            assert_eq!(semantic.sequence, parent.sequence);
+            assert_eq!(semantic.generation, parent.generation);
+            assert_eq!(semantic.is_callback, parent.is_callback);
+        }
+        // A two-second stalled reader expires at 1500ms, not the former
+        // 1000ms half-budget cut that violated the original >1250ms fixture.
+        let mut parent = operation();
+        parent.deadline = now + Duration::from_secs(2);
+        assert_eq!(
+            semantic_lease_at(&parent, true, now).deadline - now,
+            Duration::from_millis(1500)
+        );
+        // Setup already spent from the same parent deadline, not a fresh budget.
+        assert_eq!(
+            semantic_lease_at(&parent, true, now + Duration::from_secs(1)).deadline,
+            parent.deadline - Duration::from_millis(250)
+        );
+        assert_eq!(
+            semantic_lease_at(&parent, true, now + Duration::from_secs(3)).deadline,
+            parent.deadline
         );
     }
     #[test]
@@ -1735,27 +1965,18 @@ mod tests {
         let id = refs
             .try_bind_exact(10, "document", "", frames[0].binding.clone())
             .unwrap();
-        let root = SemanticNode {
-            reference: observation::NodeReference {
-                id: format!("@{id}"),
-                revision: "1".into(),
-            },
-            role: Some("document".into()),
-            ..SemanticNode::default()
-        };
+        let mut root = SemanticNode::default();
+        root.reference.id = format!("@{id}");
+        root.reference.revision = "1".into();
+        root.role = Some("document".into());
         assert!(exact_root(vec![root.clone()], &refs, &frames).is_ok());
         assert!(exact_root(vec![root.clone(), root.clone()], &refs, &frames).is_err());
         let mut foreign = frames.clone();
         foreign[0].binding.loader = "new".into();
         assert!(exact_root(vec![root.clone()], &refs, &foreign).is_err());
         let viewport = refs.try_viewport_ref().unwrap();
-        let fake = SemanticNode {
-            reference: observation::NodeReference {
-                id: format!("@{viewport}"),
-                revision: "1".into(),
-            },
-            ..root
-        };
+        let mut fake = root;
+        fake.reference.id = format!("@{viewport}");
         assert!(exact_root(vec![fake], &refs, &frames).is_err());
     }
     #[test]

@@ -465,7 +465,9 @@ impl ConfigureRequest {
                 .request_policy
                 .site
                 .as_ref()
-                .is_some_and(|site| url::Url::parse(site).is_err())
+                // EngineAppInfo.site is siteOf(hostname), not an absolute URL.
+                // Matching remains in the existing callback-side sameSite policy.
+                .is_some_and(|site| site.len() > 16 * 1024 || site.chars().any(char::is_control))
             || self.request_policy.headers.as_ref().is_some_and(|headers| {
                 headers.iter().any(|(key, value)| {
                     key.is_empty()
@@ -2408,19 +2410,29 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     runtime.blobs.clone(),
                     runtime.page_active.clone(),
                     runtime.activation.clone(),
+                    runtime.enrollment.clone(),
                 ))
             }
             .await;
-            let (page, page_state, ui, actions, input_gate, blobs, page_active, activation) =
-                match captured {
-                    Ok(value) => value,
-                    Err(error) => {
-                        return NativeOutcome {
-                            result: Err(error),
-                            effects: Effects::NotDispatched,
-                        }
+            let (
+                page,
+                page_state,
+                ui,
+                actions,
+                input_gate,
+                blobs,
+                page_active,
+                activation,
+                enrollment,
+            ) = match captured {
+                Ok(value) => value,
+                Err(error) => {
+                    return NativeOutcome {
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
                     }
-                };
+                }
+            };
             // The action helper validates an internal captured identity, not a
             // purpose or authority chosen in the command payload.
             args.insert("identityScope".into(), page.identity_scope.clone().into());
@@ -2463,7 +2475,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     Ok(value) => value,
                     Err(error) => { let cleanup_failed = error == ProtocolError::CleanupFailed; return (NativeOutcome { result: Err(error), effects: if activation_dispatched { Effects::Unknown } else { Effects::NotDispatched } }, cleanup_failed); },
                 };
-                match actions.execute(super::client_actions::ActionContext { page:&page, operation:&lease, page_state:&page_state, refs:&refs, revision, iframe_sessions:&sessions, blobs:&blobs, geometry:&geometry }, &command, &serde_json::Value::Object(args)).await {
+                match actions.execute(super::client_actions::ActionContext { page:&page, operation:&lease, page_state:&page_state, refs:&refs, revision, iframe_sessions:&sessions, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }, &command, &serde_json::Value::Object(args)).await {
                     Ok(value) => {
                         if command == "recording.start" { page_active.store(true, std::sync::atomic::Ordering::SeqCst); }
                         (NativeOutcome { result: Ok(value), effects: Effects::Completed }, false)
@@ -3166,7 +3178,7 @@ impl ClientBrowser {
                     let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
                     let sessions = frames.into_iter().filter(|frame| frame.parent_frame_id.is_some()).map(|frame| (frame.binding.frame, frame.binding.session)).collect();
-                    actions.recording_page_opened(super::client_actions::ActionContext { page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, blobs:&blobs, geometry:&geometry }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
+                    actions.recording_page_opened(super::client_actions::ActionContext { page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
                 }
                 if *operation.cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
                 if std::time::Instant::now() >= operation.deadline { return Err(ProtocolError::DeadlineExceeded); }
@@ -3443,6 +3455,14 @@ impl ClientBrowser {
                                 iframe_sessions: &sessions,
                                 blobs: &blobs,
                                 geometry: &geometry,
+                                realm_authority:
+                                    super::client_actions::ActionRealmAuthority::Enrolled(
+                                        &resource
+                                            .runtime
+                                            .as_ref()
+                                            .ok_or(ProtocolError::ScopeUnavailable)?
+                                            .enrollment,
+                                    ),
                             })
                             .await
                             .map_err(|failure| failure.error)?;
@@ -3742,6 +3762,9 @@ impl ClientBrowser {
                             iframe_sessions: &sessions,
                             blobs: &blobs,
                             geometry: &geometry,
+                            realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(
+                                &runtime.enrollment,
+                            ),
                         })
                         .await
                         .map_err(|failure| failure.error)?;
@@ -3821,6 +3844,41 @@ impl ClientBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_public_startup_hostname_payload_is_valid_native_configuration() {
+        // Exact fixture captured by the real NativeSurface.startAttempt framed-client test.
+        let mut value: serde_json::Value = serde_json::from_str(include_str!(
+            "../../tests/fixtures/native-startup-hostname.json"
+        ))
+        .unwrap();
+        value.as_object_mut().unwrap().remove("identityScope");
+        let request: ConfigureRequest = serde_json::from_value(value.clone()).unwrap();
+        request.validate(false).unwrap();
+        assert_eq!(request.validate(true), Err(ProtocolError::InvalidArguments));
+        for site in ["localhost", "[::1]", "example.com", "example.co.uk"] {
+            value["requestPolicy"]["site"] = site.into();
+            serde_json::from_value::<ConfigureRequest>(value.clone())
+                .unwrap()
+                .validate(false)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn hostname_configuration_rejects_control_data_without_changing_header_authority() {
+        for site in ["example.com\nforeign", "example.com\0"] {
+            let request: ConfigureRequest = serde_json::from_value(serde_json::json!({
+                "testIdAttribute":"data-testid", "secureFieldSelector":"input[type=\"password\" i]",
+                "requestPolicy":{"site":site}, "downloads":{"source":"local"}
+            }))
+            .unwrap();
+            assert_eq!(
+                request.validate(false),
+                Err(ProtocolError::InvalidArguments)
+            );
+        }
+    }
 
     #[test]
     fn configuration_pins_original_password_policy_and_creation_service_worker_mode() {
@@ -4515,3 +4573,7 @@ mod tests {
         host.close().await.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "client_browser_reference_tests.rs"]
+mod reference_lifetime_tests;

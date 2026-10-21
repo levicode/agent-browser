@@ -26,6 +26,9 @@ const EVENTS: &[&str] = &[
     "Target.targetInfoChanged",
     "Runtime.consoleAPICalled",
     "Runtime.exceptionThrown",
+    "Runtime.executionContextCreated",
+    "Runtime.executionContextDestroyed",
+    "Runtime.executionContextsCleared",
     "Page.frameNavigated",
     "Page.frameAttached",
     "Page.navigatedWithinDocument",
@@ -169,6 +172,11 @@ struct FrameOwner {
 }
 #[derive(Default)]
 struct Index {
+    realm_serial: u64,
+    realm_sessions: HashMap<String, u64>,
+    realms: HashMap<(String, i64), Arc<RealmFact>>,
+    realm_pending: HashMap<u64, RealmPending>,
+    realm_tickets: usize,
     borrowed_restart: Option<u64>,
     borrowed_restart_sequence: u64,
     borrowed_retired_targets: HashSet<String>,
@@ -185,6 +193,168 @@ struct Index {
     retired_page_sessions: HashSet<String>,
     retired_observer_sessions: HashSet<String>,
     retired_observer_targets: HashSet<String>,
+}
+
+const MAX_REALM_HOLDS: usize = 64;
+#[derive(Debug)]
+struct RealmFact {
+    session: String,
+    tenure: u64,
+    frame: String,
+    id: i64,
+    unique: String,
+    destroyed: AtomicBool,
+}
+struct RealmPending {
+    binding: super::element::ExactBinding,
+    tenure: u64,
+    records: Vec<Arc<RealmFact>>,
+}
+pub(crate) struct RealmCaptureGuard {
+    owner: Arc<ClientEnrollment>,
+    nonce: u64,
+    operation: u64,
+}
+pub(crate) struct ExactRealmTicket {
+    owner: Arc<ClientEnrollment>,
+    binding: super::element::ExactBinding,
+    fact: Arc<RealmFact>,
+}
+impl Drop for RealmCaptureGuard {
+    fn drop(&mut self) {
+        if let Ok(mut index) = self.owner.index.lock() {
+            index.realm_pending.remove(&self.nonce);
+        }
+    }
+}
+impl Drop for ExactRealmTicket {
+    fn drop(&mut self) {
+        if let Ok(mut index) = self.owner.index.lock() {
+            index.realm_tickets = index.realm_tickets.saturating_sub(1);
+        }
+    }
+}
+impl RealmCaptureGuard {
+    pub(crate) async fn bind(
+        self,
+        context: i64,
+        op: &OperationLease,
+    ) -> Result<ExactRealmTicket, ProtocolError> {
+        if self.operation != op.sequence {
+            return Err(ProtocolError::StaleScope);
+        }
+        loop {
+            self.owner.check_restart_operation(op)?;
+            let watermark = self.owner.realm_watermark()?;
+            self.owner.drain_capture_watermark(&watermark, op).await?;
+            {
+                let mut index = self
+                    .owner
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                self.owner.realm_snapshot_healthy(&index, &watermark)?;
+                let pending = index
+                    .realm_pending
+                    .get(&self.nonce)
+                    .ok_or(ProtocolError::StaleScope)?;
+                let mut matches = pending.records.iter().filter(|fact| fact.id == context);
+                if let Some(fact) = matches.next() {
+                    if matches.next().is_some() {
+                        return Err(ProtocolError::StaleReference);
+                    }
+                    if index.realm_tickets >= MAX_REALM_HOLDS {
+                        return Err(ProtocolError::CapacityExceeded);
+                    }
+                    if index.realm_sessions.get(&pending.binding.session) != Some(&pending.tenure) {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    let ticket = ExactRealmTicket {
+                        owner: self.owner.clone(),
+                        binding: pending.binding.clone(),
+                        fact: fact.clone(),
+                    };
+                    index.realm_tickets += 1;
+                    return Ok(ticket);
+                }
+            }
+            bounded(op, async {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok(())
+            })
+            .await?;
+        }
+    }
+}
+impl ExactRealmTicket {
+    /// Cleanup identity only. Native realm destruction, not loader change or a
+    /// CDP error, invalidates the object handles allocated in this exact realm.
+    pub(crate) fn destroyed(&self) -> Result<bool, ProtocolError> {
+        self.owner.check()?;
+        let watermark = self.owner.realm_watermark()?;
+        let index = self
+            .owner
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.owner.realm_snapshot_healthy(&index, &watermark)?;
+        if index.realm_sessions.get(&self.fact.session) != Some(&self.fact.tenure)
+            || !index
+                .sessions
+                .get(&self.fact.session)
+                .is_some_and(|entry| entry.application && !entry.observation_only)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(self.fact.destroyed.load(Ordering::SeqCst))
+    }
+    /// ResolveNode accepts a numeric ID. Reconcile the original stream after
+    /// its ACK before granting the returned object this ticket's cleanup proof.
+    pub(crate) async fn verify_resolution_owner(
+        &self,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.owner.check_restart_operation(op)?;
+        let watermark = self.owner.realm_watermark()?;
+        self.owner.drain_capture_watermark(&watermark, op).await?;
+        let index = self
+            .owner
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.owner.realm_snapshot_healthy(&index, &watermark)?;
+        if self.fact.destroyed.load(Ordering::SeqCst)
+            || index.realm_sessions.get(&self.fact.session) != Some(&self.fact.tenure)
+            || !index
+                .realms
+                .get(&(self.fact.session.clone(), self.fact.id))
+                .is_some_and(|fact| Arc::ptr_eq(fact, &self.fact))
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        Ok(())
+    }
+    pub(crate) async fn document_retired(
+        &self,
+        op: &OperationLease,
+    ) -> Result<bool, ProtocolError> {
+        self.owner.check_restart_operation(op)?;
+        let watermark = self.owner.realm_watermark()?;
+        self.owner.drain_capture_watermark(&watermark, op).await?;
+        if !self.destroyed()? {
+            return Ok(false);
+        }
+        let evidence = bounded(op, async {
+            Ok(super::element::exact_document_replaced(&self.owner.client, &self.binding).await)
+        })
+        .await?;
+        self.owner.drain_capture_watermark(&watermark, op).await?;
+        self.owner.check_restart_operation(op)?;
+        if !self.destroyed()? {
+            return Ok(false);
+        }
+        evidence.map_err(|_| ProtocolError::BrowserFailure)
+    }
 }
 
 /// Explicit restart authority, not ordinary borrowed-resource ownership.
@@ -1322,6 +1492,199 @@ impl ClientEnrollment {
             return Err(ProtocolError::ScopeUnavailable);
         }
         self.targets.publish_initialization(authority)
+    }
+    fn realm_watermark(&self) -> Result<BoundedEventWatermark, ProtocolError> {
+        self.event_watermark
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .clone()
+            .ok_or(ProtocolError::ScopeUnavailable)
+    }
+    fn realm_snapshot_healthy(
+        &self,
+        index: &Index,
+        watermark: &BoundedEventWatermark,
+    ) -> Result<(), ProtocolError> {
+        if let Some(error) = &index.failure {
+            return Err(error.clone());
+        }
+        if self.sealed.load(Ordering::SeqCst) || !index.reconciled {
+            return Err(ProtocolError::StaleScope);
+        }
+        let received = watermark
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if index.applied_watermark < received {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        self.targets.inventory()?;
+        Ok(())
+    }
+    pub(crate) fn reserve_exact_realm(
+        self: &Arc<Self>,
+        page: &BrowserExecutionLease,
+        binding: &super::element::ExactBinding,
+        op: &OperationLease,
+    ) -> Result<RealmCaptureGuard, ProtocolError> {
+        self.check_restart_operation(op)?;
+        page.permit.check()?;
+        if !Arc::ptr_eq(&page.client, &self.client)
+            || !Arc::ptr_eq(&page.targets, &self.targets)
+            || page.identity_scope != self.targets.identity_scope
+            || binding.page_session != page.page_session_id
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(error) = &index.failure {
+            return Err(error.clone());
+        }
+        if self.sealed.load(Ordering::SeqCst) || !index.reconciled {
+            return Err(ProtocolError::StaleScope);
+        }
+        if !index.sessions.get(&binding.session).is_some_and(|entry| {
+            entry.application && !entry.observation_only && entry.root == page.page_session_id
+        }) || !index
+            .frames
+            .get(&binding.frame)
+            .is_some_and(|frame| frame.session == binding.session)
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        if index.realm_pending.len() >= MAX_REALM_HOLDS {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        index.realm_serial = index
+            .realm_serial
+            .checked_add(1)
+            .ok_or(ProtocolError::IdentifierExhausted)?;
+        let nonce = index.realm_serial;
+        let tenure = *index
+            .realm_sessions
+            .entry(binding.session.clone())
+            .or_insert(nonce);
+        let records = index
+            .realms
+            .values()
+            .filter(|fact| {
+                fact.session == binding.session
+                    && fact.frame == binding.frame
+                    && fact.tenure == tenure
+            })
+            .cloned()
+            .collect();
+        index.realm_pending.insert(
+            nonce,
+            RealmPending {
+                binding: binding.clone(),
+                tenure,
+                records,
+            },
+        );
+        Ok(RealmCaptureGuard {
+            owner: self.clone(),
+            nonce,
+            operation: op.sequence,
+        })
+    }
+    fn realm_event(&self, entry: &Attribution, event: &CdpEvent) -> Result<(), ProtocolError> {
+        if !entry.application
+            || entry.observation_only
+            || !matches!(entry.kind.as_str(), "page" | "iframe")
+        {
+            return Ok(());
+        }
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        match event.method.as_str() {
+            "Runtime.executionContextCreated" => {
+                let context = event
+                    .params
+                    .get("context")
+                    .ok_or(ProtocolError::InvalidFrame)?;
+                // Only the native resolver's isolated world grants these tickets.
+                if context["name"] != "agent-browser-native-observation" {
+                    return Ok(());
+                }
+                let id = context["id"]
+                    .as_i64()
+                    .filter(|id| *id > 0)
+                    .ok_or(ProtocolError::InvalidFrame)?;
+                let unique = field(context, "uniqueId")?.to_owned();
+                let frame = field(&context["auxData"], "frameId")?.to_owned();
+                let key = (entry.session.clone(), id);
+                if index
+                    .realms
+                    .get(&key)
+                    .is_some_and(|fact| fact.unique == unique && fact.frame == frame)
+                {
+                    return Ok(());
+                }
+                if index.realms.len() >= MAX_FRAMES {
+                    return Err(ProtocolError::CapacityExceeded);
+                }
+                index.realm_serial = index
+                    .realm_serial
+                    .checked_add(1)
+                    .ok_or(ProtocolError::IdentifierExhausted)?;
+                let serial = index.realm_serial;
+                let tenure = *index
+                    .realm_sessions
+                    .entry(entry.session.clone())
+                    .or_insert(serial);
+                let fact = Arc::new(RealmFact {
+                    session: entry.session.clone(),
+                    tenure,
+                    frame,
+                    id,
+                    unique,
+                    destroyed: AtomicBool::new(false),
+                });
+                for pending in index.realm_pending.values_mut().filter(|pending| {
+                    pending.binding.session == fact.session
+                        && pending.binding.frame == fact.frame
+                        && pending.tenure == tenure
+                }) {
+                    if pending.records.len() >= MAX_FRAMES {
+                        return Err(ProtocolError::CapacityExceeded);
+                    }
+                    pending.records.push(fact.clone());
+                }
+                index.realms.insert(key, fact);
+            }
+            "Runtime.executionContextDestroyed" => {
+                let id = event.params["executionContextId"]
+                    .as_i64()
+                    .ok_or(ProtocolError::InvalidFrame)?;
+                let key = (entry.session.clone(), id);
+                if let Some(fact) = index.realms.get(&key) {
+                    if event.params["executionContextUniqueId"].as_str()
+                        != Some(fact.unique.as_str())
+                    {
+                        return Err(ProtocolError::InvalidFrame);
+                    }
+                    fact.destroyed.store(true, Ordering::SeqCst);
+                    index.realms.remove(&key);
+                }
+            }
+            "Runtime.executionContextsCleared" => {
+                index.realms.retain(|(session, _), fact| {
+                    if session == &entry.session {
+                        fact.destroyed.store(true, Ordering::SeqCst);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+            _ => {}
+        }
+        Ok(())
     }
     pub(crate) async fn flush_app_events(
         &self,
@@ -3030,6 +3393,8 @@ impl ClientEnrollment {
                             .map(|entry| entry.session.clone()),
                     );
                     if let Some(entry) = index.sessions.remove(&id) {
+                        index.realm_sessions.remove(&id);
+                        index.realms.retain(|(session, _), _| session != &id);
                         index.popup_opened.remove(&entry.session);
                         removed.push(entry);
                     }
@@ -3191,6 +3556,14 @@ impl ClientEnrollment {
         }
         if !entry.application {
             return Ok(());
+        }
+        if matches!(
+            event.method.as_str(),
+            "Runtime.executionContextCreated"
+                | "Runtime.executionContextDestroyed"
+                | "Runtime.executionContextsCleared"
+        ) {
+            return self.realm_event(&entry, event);
         }
         match event.method.as_str() {
             "Page.frameAttached" => {
@@ -3523,10 +3896,17 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut detach_count = 0;
+            let mut realm_loader = "synthetic-loader".to_owned();
             let mut closed_targets = std::collections::HashSet::<String>::new();
             loop {
                 tokio::select! {
-                    event=emitted.recv()=> { let Some(event)=event else {break}; if socket.send(Message::Text(event.to_string())).await.is_err(){break;} },
+                    event=emitted.recv()=> {
+                        let Some(event)=event else {break};
+                        if event["method"]=="Page.frameNavigated" {
+                            if let Some(loader)=event["params"]["frame"]["loaderId"].as_str() { realm_loader=loader.to_owned(); }
+                        }
+                        if socket.send(Message::Text(event.to_string())).await.is_err(){break;}
+                    },
                     message=socket.next()=> {
                         let Some(Ok(Message::Text(text)))=message else {break};
                         let request:Value=serde_json::from_str(&text).unwrap();
@@ -3560,9 +3940,27 @@ mod tests {
                             let body=if mode=="large-first-request" {"b".repeat(1536*1024)} else {String::new()};
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
                         }
+                        if mode.starts_with("realm-resolve-reuse") {
+                            if method=="Page.createIsolatedWorld" {
+                                socket.send(Message::Text(realm_created(7,"before-resolve").to_string())).await.unwrap();
+                            }
+                            if method=="DOM.resolveNode" {
+                                // Hold the successful resolver ACK until native lifecycle
+                                // events establish destruction and numeric-ID reuse.
+                                socket.send(Message::Text(json!({"method":"Runtime.executionContextDestroyed","sessionId":"initial","params":{"executionContextId":7,"executionContextUniqueId":"before-resolve"}}).to_string())).await.unwrap();
+                                socket.send(Message::Text(realm_created(7,"after-resolve").to_string())).await.unwrap();
+                            }
+                            if mode=="realm-resolve-reuse-release-fails" && method=="Runtime.releaseObject" {
+                                socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic release failure"}}).to_string())).await.unwrap();continue;
+                            }
+                        }
                         let mut result=match method {
+                            "Page.createIsolatedWorld" if mode.starts_with("realm-resolve-reuse")=>json!({"executionContextId":7}),
+                            "DOM.resolveNode" if mode.starts_with("realm-resolve-reuse")=>json!({"object":{"objectId":"replacement-handle","subtype":"node"}}),
+                            "Runtime.callFunctionOn" if mode.starts_with("realm-resolve-reuse")=>json!({"result":{"value":true}}),
+                            "Page.getLayoutMetrics"=>json!({"cssVisualViewport":{"clientWidth":800.,"clientHeight":600.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":800.,"clientHeight":600.}}),
                             "Target.getTargetInfo" if mode=="observer-context" => json!({"targetInfo":{"targetId":request["params"]["targetId"],"type":"iframe","browserContextId":"owned-context"}}),
-                            "Page.getFrameTree"=>json!({"frameTree":{"frame":{"id":format!("frame-{}",request["sessionId"].as_str().unwrap()),"loaderId":"synthetic-loader","url":if mode=="borrowed-capture" {"https://initial.test/"} else {"about:blank"}}}}),
+                            "Page.getFrameTree"=>json!({"frameTree":{"frame":{"id":format!("frame-{}",request["sessionId"].as_str().unwrap()),"loaderId":realm_loader,"url":if mode=="borrowed-capture" {"https://initial.test/"} else {"about:blank"}}}}),
                             "Target.getTargets" if mode=="tracked" || mode=="late-popup"=>json!({"targetInfos":[
                                 {"targetId":"initial-target","browserContextId":"owned-context","type":"page"},
                                 {"targetId":"queued-popup","browserContextId":"owned-context","type":"page","openerId":"initial-target"},
@@ -3642,6 +4040,277 @@ mod tests {
             "https:[external URL omitted]"
         );
         assert!(diagnostic_url(&format!("http://127.0.0.1/{}", "a".repeat(100000))).len() < 200);
+    }
+    async fn realm_test_owner() -> (
+        Arc<ClientEnrollment>,
+        BrowserExecutionLease,
+        Notices,
+        tokio::sync::mpsc::Sender<Value>,
+        JoinHandle<()>,
+    ) {
+        let (owner, notices, _log, emit, server) = fixture("normal").await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+        let page = owner.lease(&entry).unwrap();
+        (owner, page, notices, emit, server)
+    }
+    fn realm_test_binding() -> super::super::element::ExactBinding {
+        super::super::element::ExactBinding {
+            page_session: "initial".into(),
+            session: "initial".into(),
+            frame: "frame-initial".into(),
+            loader: "synthetic-loader".into(),
+            actionable: true,
+        }
+    }
+    fn realm_created(id: i64, unique: &str) -> Value {
+        json!({"method":"Runtime.executionContextCreated","sessionId":"initial","params":{"context":{"id":id,"uniqueId":unique,"name":"agent-browser-native-observation","auxData":{"frameId":"frame-initial","isDefault":false}}}})
+    }
+    async fn realm_emit(
+        owner: &Arc<ClientEnrollment>,
+        emit: &tokio::sync::mpsc::Sender<Value>,
+        event: Value,
+    ) {
+        let watermark = owner.realm_watermark().unwrap();
+        let before = watermark.received().unwrap();
+        emit.send(event).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while watermark.received().unwrap() == before {
+                tokio::task::yield_now().await;
+            }
+            owner
+                .drain_capture_watermark(&watermark, &owner.operation())
+                .await
+                .unwrap();
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn exact_realm_destroy_before_bind_survives_numeric_id_reuse_and_needs_new_document() {
+        let (owner, page, _notices, emit, server) = realm_test_owner().await;
+        let op = owner.operation();
+        let capture = owner
+            .reserve_exact_realm(&page, &realm_test_binding(), &op)
+            .unwrap();
+        realm_emit(&owner, &emit, realm_created(7, "original-unique")).await;
+        realm_emit(&owner,&emit,json!({"method":"Runtime.executionContextDestroyed","sessionId":"initial","params":{"executionContextId":7,"executionContextUniqueId":"original-unique"}})).await;
+        let original = capture.bind(7, &op).await.unwrap();
+        assert_eq!(original.destroyed(), Ok(true));
+        // Realm destruction alone is not proof of checked-action navigation.
+        assert_eq!(original.document_retired(&op).await, Ok(false));
+        let capture = owner
+            .reserve_exact_realm(&page, &realm_test_binding(), &op)
+            .unwrap();
+        realm_emit(&owner, &emit, realm_created(7, "replacement-unique")).await;
+        let replacement = capture.bind(7, &op).await.unwrap();
+        assert_eq!(replacement.destroyed(), Ok(false));
+        realm_emit(&owner,&emit,json!({"method":"Page.frameNavigated","sessionId":"initial","params":{"frame":{"id":"frame-initial","loaderId":"next-loader","url":"https://synthetic.test/next"}}})).await;
+        assert_eq!(original.document_retired(&op).await, Ok(true));
+        // BFCache/live old realm: loader replacement never waives cleanup.
+        assert_eq!(replacement.document_retired(&op).await, Ok(false));
+        let (cancel, cancellation) = watch::channel(CancelSignal::Requested);
+        let mut cancelled = owner.operation();
+        cancelled.cancellation = cancellation;
+        assert_eq!(
+            original.document_retired(&cancelled).await,
+            Err(ProtocolError::Cancelled)
+        );
+        drop(cancel);
+        owner.poison(ProtocolError::BrowserFailure);
+        assert_eq!(original.destroyed(), Err(ProtocolError::BrowserFailure));
+        drop(page);
+        let _ = owner.close().await;
+        server.abort();
+    }
+    #[tokio::test]
+    async fn exact_realm_ack_numeric_id_reuse_before_bind_is_ambiguous() {
+        for destroy in [false, true] {
+            let (owner, page, _notices, emit, server) = realm_test_owner().await;
+            let op = owner.operation();
+            let capture = owner
+                .reserve_exact_realm(&page, &realm_test_binding(), &op)
+                .unwrap();
+            realm_emit(&owner, &emit, realm_created(7, "original")).await;
+            let original = owner
+                .index
+                .lock()
+                .unwrap()
+                .realms
+                .get(&("initial".into(), 7))
+                .unwrap()
+                .clone();
+            if destroy {
+                realm_emit(&owner,&emit,json!({"method":"Runtime.executionContextDestroyed","sessionId":"initial","params":{"executionContextId":7,"executionContextUniqueId":"original"}})).await;
+            }
+            realm_emit(&owner, &emit, realm_created(7, "reused")).await;
+            assert_eq!(original.destroyed.load(Ordering::SeqCst), destroy);
+            assert!(matches!(
+                capture.bind(7, &op).await,
+                Err(ProtocolError::StaleReference)
+            ));
+            assert_eq!(owner.index.lock().unwrap().realm_tickets, 0);
+            drop(page);
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn exact_realm_reuse_after_bind_cannot_own_later_resolution_handle() {
+        let (owner, page, _notices, emit, server) = realm_test_owner().await;
+        let op = owner.operation();
+        let capture = owner
+            .reserve_exact_realm(&page, &realm_test_binding(), &op)
+            .unwrap();
+        realm_emit(&owner, &emit, realm_created(7, "original")).await;
+        let ticket = capture.bind(7, &op).await.unwrap();
+        assert_eq!(ticket.verify_resolution_owner(&op).await, Ok(()));
+        realm_emit(&owner,&emit,json!({"method":"Runtime.executionContextDestroyed","sessionId":"initial","params":{"executionContextId":7,"executionContextUniqueId":"original"}})).await;
+        realm_emit(&owner, &emit, realm_created(7, "replacement")).await;
+        // A successful numeric-ID ResolveNode ACK does not establish ownership.
+        assert_eq!(
+            ticket.verify_resolution_owner(&op).await,
+            Err(ProtocolError::StaleReference)
+        );
+        assert_eq!(ticket.destroyed(), Ok(true));
+        drop(page);
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn action_resolve_ack_after_realm_reuse_releases_handle_without_input() {
+        use super::super::{
+            client_actions::{ActionContext, ActionRealmAuthority, ClientActions},
+            client_geometry::GeometrySnapshot,
+            client_observation::ObservationFrame,
+            client_protocol::Effects,
+            element::RefMap,
+        };
+        for failed_release in [false, true] {
+            let mode = if failed_release {
+                "realm-resolve-reuse-release-fails"
+            } else {
+                "realm-resolve-reuse"
+            };
+            let (owner, _notices, log, _emit, server) = fixture(mode).await;
+            let op = owner.operation();
+            owner
+                .enroll_existing("initial-target", "initial", "page", &op)
+                .await
+                .unwrap();
+            owner.start(&op).await.unwrap();
+            let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&entry).unwrap();
+            let binding = realm_test_binding();
+            let mut refs = RefMap::new();
+            let id = refs.bind_exact(42, "checkbox", "", binding.clone());
+            let geometry = GeometrySnapshot::capture(
+                &owner.client,
+                "initial",
+                &[ObservationFrame {
+                    parent_frame_id: None,
+                    owner_backend_id: None,
+                    url: "about:blank".into(),
+                    binding,
+                    offset_x: 0.,
+                    offset_y: 0.,
+                    frame_path: vec![],
+                }],
+                &op,
+            )
+            .await
+            .unwrap();
+            let blobs = BlobStore::new(BlobLimits::default()).unwrap();
+            let frames = HashMap::new();
+            let failure=ClientActions::default().execute(ActionContext {
+                realm_authority:ActionRealmAuthority::Enrolled(&owner),page:&page,operation:&op,
+                page_state:&owner.page,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry,
+            },"browser.perform",&json!({"identityScope":"owned-scope","ref":{"id":format!("@{id}"),"revision":"1"},"action":{"kind":"check"}})).await.unwrap_err();
+            assert_eq!(failure.error, ProtocolError::StaleReference);
+            assert_eq!(failure.effects, Effects::NotDispatched);
+            assert_eq!(failure.cleanup_failed, failed_release);
+            let commands = log.lock().unwrap().clone();
+            assert!(commands.iter().any(|r| r["method"] == "DOM.resolveNode"));
+            assert!(commands
+                .iter()
+                .any(|r| r["method"] == "Runtime.releaseObject"
+                    && r["params"]["objectId"] == "replacement-handle"));
+            assert!(!commands.iter().any(|r| r["method"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("Input."))));
+            drop(page);
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn exact_realm_clear_is_session_local_and_cannot_retire_later_context() {
+        let (owner, page, _notices, emit, server) = realm_test_owner().await;
+        let op = owner.operation();
+        let capture = owner
+            .reserve_exact_realm(&page, &realm_test_binding(), &op)
+            .unwrap();
+        realm_emit(&owner, &emit, realm_created(9, "before-clear")).await;
+        let first = capture.bind(9, &op).await.unwrap();
+        realm_emit(
+            &owner,
+            &emit,
+            json!({"method":"Runtime.executionContextsCleared","sessionId":"foreign","params":{}}),
+        )
+        .await;
+        assert_eq!(first.destroyed(), Ok(false));
+        realm_emit(
+            &owner,
+            &emit,
+            json!({"method":"Runtime.executionContextsCleared","sessionId":"initial","params":{}}),
+        )
+        .await;
+        assert_eq!(first.destroyed(), Ok(true));
+        let capture = owner
+            .reserve_exact_realm(&page, &realm_test_binding(), &op)
+            .unwrap();
+        realm_emit(&owner, &emit, realm_created(9, "after-clear")).await;
+        let later = capture.bind(9, &op).await.unwrap();
+        assert_eq!(later.destroyed(), Ok(false));
+        assert_eq!(owner.index.lock().unwrap().realm_tickets, 2);
+        drop(first);
+        drop(later);
+        assert_eq!(owner.index.lock().unwrap().realm_tickets, 0);
+        drop(page);
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn exact_realm_pending_holds_are_bounded_and_retired_session_never_proves_destruction() {
+        let (owner, page, _notices, emit, server) = realm_test_owner().await;
+        let op = owner.operation();
+        let mut holds = Vec::new();
+        for _ in 0..MAX_REALM_HOLDS {
+            holds.push(
+                owner
+                    .reserve_exact_realm(&page, &realm_test_binding(), &op)
+                    .unwrap(),
+            );
+        }
+        assert!(matches!(
+            owner.reserve_exact_realm(&page, &realm_test_binding(), &op),
+            Err(ProtocolError::CapacityExceeded)
+        ));
+        holds.clear();
+        let capture = owner
+            .reserve_exact_realm(&page, &realm_test_binding(), &op)
+            .unwrap();
+        realm_emit(&owner, &emit, realm_created(11, "detached-original")).await;
+        let ticket = capture.bind(11, &op).await.unwrap();
+        realm_emit(&owner,&emit,json!({"method":"Target.detachedFromTarget","params":{"sessionId":"initial","targetId":"initial-target"}})).await;
+        assert!(ticket.destroyed().is_err());
+        drop(page);
+        let _ = owner.close().await;
+        server.abort();
     }
     #[tokio::test]
     async fn first_request_cannot_continue_before_complete_target_configuration() {

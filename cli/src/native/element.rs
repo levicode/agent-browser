@@ -48,11 +48,16 @@ struct DocumentRefs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefAllocationError {
     Exhausted,
+    Capacity,
 }
+
+/// Exact metadata admission is bounded; exhaustion never evicts published authority.
+pub(crate) const MAX_EXACT_REFERENCES: usize = 100_000;
 
 #[derive(Clone)]
 pub struct RefMap {
     map: HashMap<String, RefEntry>,
+    exact_ref_limit: usize,
     documents: HashMap<(String, Option<String>), DocumentRefs>,
     next_ref: Arc<AtomicUsize>,
     viewport_ref: Arc<OnceLock<Result<String, RefAllocationError>>>,
@@ -62,6 +67,7 @@ impl RefMap {
     pub fn new() -> Self {
         Self {
             map: HashMap::new(),
+            exact_ref_limit: MAX_EXACT_REFERENCES,
             documents: HashMap::new(),
             next_ref: Arc::new(AtomicUsize::new(1)),
             viewport_ref: Arc::new(OnceLock::new()),
@@ -142,6 +148,7 @@ impl RefMap {
         name: &str,
         binding: ExactBinding,
     ) -> Result<String, RefAllocationError> {
+        self.check_exact_admission(&binding, &[backend_node_id])?;
         self.observe_document(
             &binding.page_session,
             Some(&binding.frame),
@@ -243,6 +250,78 @@ impl RefMap {
 
     pub fn remove(&mut self, ref_id: &str) {
         self.map.remove(ref_id);
+    }
+
+    pub(crate) fn retained_identity_counts(&self) -> (usize, usize) {
+        (
+            self.map.len(),
+            self.documents.values().map(|d| d.refs.len()).sum(),
+        )
+    }
+
+    pub(crate) fn check_exact_admission(
+        &self,
+        binding: &ExactBinding,
+        backends: &[i64],
+    ) -> Result<(), RefAllocationError> {
+        let document = self
+            .documents
+            .get(&(binding.page_session.clone(), Some(binding.frame.clone())))
+            .filter(|d| d.session == binding.session && d.loader == binding.loader);
+        let mut new_durable = 0usize;
+        let mut new_map = 0usize;
+        let mut seen = std::collections::HashSet::new();
+        for backend in backends {
+            if !seen.insert(*backend) {
+                continue;
+            }
+            match document.and_then(|d| d.refs.get(backend)) {
+                Some(id) => {
+                    if !self.map.contains_key(id) {
+                        new_map += 1;
+                    }
+                }
+                None => {
+                    new_durable += 1;
+                    new_map += 1;
+                }
+            }
+        }
+        let (entries, durable) = self.retained_identity_counts();
+        let replaced = self
+            .documents
+            .get(&(binding.page_session.clone(), Some(binding.frame.clone())))
+            .filter(|d| d.session != binding.session || d.loader != binding.loader)
+            .map_or(0, |d| d.refs.len());
+        let durable = durable.saturating_sub(replaced);
+        if entries.saturating_add(new_map) > self.exact_ref_limit
+            || durable.saturating_add(new_durable) > self.exact_ref_limit
+        {
+            return Err(RefAllocationError::Capacity);
+        }
+        Ok(())
+    }
+
+    /// Query matching may inspect many candidates. Only returned identities gain
+    /// durable authority; previously published identities are never evicted.
+    pub(crate) fn retain_query_additions(
+        &mut self,
+        baseline: &Self,
+        matched: &std::collections::HashSet<String>,
+    ) {
+        self.map
+            .retain(|id, _| baseline.map.contains_key(id) || matched.contains(id));
+        for (key, document) in &mut self.documents {
+            let previous = baseline.documents.get(key);
+            document.refs.retain(|backend, id| {
+                matched.contains(id) || previous.and_then(|d| d.refs.get(backend)) == Some(id)
+            });
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_exact_limit_for_test(&mut self, limit: usize) {
+        self.exact_ref_limit = limit;
     }
 
     pub fn begin_snapshot(&mut self) {
@@ -1011,11 +1090,53 @@ pub async fn resolve_element_object_id(
 
 /// Resolve into the frame's isolated realm and prove document ownership, not
 /// just connectedness (adoptNode can move a still-connected node across frames).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExactResolutionError {
+    StaleReference,
+    BackendFailure,
+    CleanupFailed {
+        primary: Option<Box<ExactResolutionError>>,
+    },
+}
+impl std::fmt::Display for ExactResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::StaleReference => "Reference no longer belongs to its document",
+            Self::BackendFailure => "Exact reference proof unavailable",
+            Self::CleanupFailed { .. } => "Exact reference cleanup failed",
+        })
+    }
+}
+impl From<String> for ExactResolutionError {
+    fn from(_: String) -> Self {
+        Self::BackendFailure
+    }
+}
+
 pub async fn resolve_exact_object(
     client: &CdpClient,
     binding: &ExactBinding,
     backend: i64,
 ) -> Result<String, String> {
+    resolve_exact_object_typed(client, binding, backend)
+        .await
+        .map_err(|error| error.to_string())
+}
+
+/// Stale requires a successful native negative proof. Protocol exceptions,
+/// malformed replies and lost acknowledgements never authorize retry.
+pub async fn resolve_exact_object_typed(
+    client: &CdpClient,
+    binding: &ExactBinding,
+    backend: i64,
+) -> Result<String, ExactResolutionError> {
+    let context = create_exact_realm(client, binding).await?;
+    resolve_exact_object_in_realm_typed(client, binding, backend, context).await
+}
+pub async fn create_exact_realm(
+    client: &CdpClient,
+    binding: &ExactBinding,
+) -> Result<i64, ExactResolutionError> {
     let world = client
         .send_command(
             "Page.createIsolatedWorld",
@@ -1027,65 +1148,150 @@ pub async fn resolve_exact_object(
         .await?;
     let context = world["executionContextId"]
         .as_i64()
-        .ok_or("Cannot establish reference realm")?;
+        .ok_or(ExactResolutionError::BackendFailure)?;
+    Ok(context)
+}
+pub async fn resolve_exact_object_in_realm_typed(
+    client: &CdpClient,
+    binding: &ExactBinding,
+    backend: i64,
+    context: i64,
+) -> Result<String, ExactResolutionError> {
     let result = client.send_command("DOM.resolveNode", Some(serde_json::json!({
         "backendNodeId": backend, "executionContextId": context, "objectGroup": "native-exact"
     })), Some(&binding.session)).await?;
     let object = result["object"]["objectId"]
         .as_str()
-        .ok_or("Exact node resolution failed")?
+        .ok_or(ExactResolutionError::BackendFailure)?
         .to_string();
-    let proof: Result<(),String> = async {
-    let result = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
-        "objectId": object, "functionDeclaration": "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }", "returnByValue": true
-    })), Some(&binding.session)).await?;
-    release_evaluation_handles(client, &binding.session, &result, &object).await;
-    if result.get("exceptionDetails").is_some() || result["result"]["value"] != true {
-        return Err("Reference no longer belongs to its document".to_string());
-    }
-    validate_exact_binding(client, &binding.page_session, binding).await?;
-        Ok(())
+    let proof: Result<(), ExactResolutionError> = async {
+        let result = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
+            "objectId": object, "functionDeclaration": "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }", "returnByValue": true
+        })), Some(&binding.session)).await?;
+        let mut seen = std::collections::HashSet::new();
+        let mut cleanup_failed = false;
+        for handle in [result["result"]["objectId"].as_str(), result["exceptionDetails"]["exception"]["objectId"].as_str()].into_iter().flatten() {
+            if handle != object && seen.insert(handle) { cleanup_failed |= !release_exact_handle(client, &binding.session, handle).await; }
+        }
+        let result = if result.get("exceptionDetails").is_some() { Err(ExactResolutionError::BackendFailure) } else {
+            match result["result"]["value"].as_bool() {
+                Some(true) => validate_exact_binding_typed(client, &binding.page_session, binding).await,
+                Some(false) => Err(ExactResolutionError::StaleReference),
+                None => Err(ExactResolutionError::BackendFailure),
+            }
+        };
+        if cleanup_failed { Err(ExactResolutionError::CleanupFailed { primary: result.err().map(Box::new) }) } else { result }
     }.await;
     if let Err(error) = proof {
-        let _ = tokio::time::timeout(
+        if !release_exact_handle(client, &binding.session, &object).await {
+            return Err(ExactResolutionError::CleanupFailed {
+                primary: Some(Box::new(error)),
+            });
+        }
+        return Err(error);
+    }
+    Ok(object)
+}
+async fn release_exact_handle(client: &CdpClient, session: &str, object: &str) -> bool {
+    matches!(
+        tokio::time::timeout(
             std::time::Duration::from_millis(250),
             client.send_command(
                 "Runtime.releaseObject",
                 Some(serde_json::json!({"objectId":object})),
-                Some(&binding.session),
+                Some(session),
             ),
         )
-        .await;
-        return Err(error);
-    }
-
-    Ok(object)
+        .await,
+        Ok(Ok(_))
+    )
 }
-
 pub async fn validate_exact_binding(
     client: &CdpClient,
     page_session: &str,
     binding: &ExactBinding,
 ) -> Result<(), String> {
+    validate_exact_binding_typed(client, page_session, binding)
+        .await
+        .map_err(|error| error.to_string())
+}
+pub async fn validate_exact_binding_typed(
+    client: &CdpClient,
+    page_session: &str,
+    binding: &ExactBinding,
+) -> Result<(), ExactResolutionError> {
     if page_session != binding.page_session {
-        return Err("Reference belongs to another page".into());
+        return Err(ExactResolutionError::StaleReference);
     }
     let tree = client
         .send_command_no_params("Page.getFrameTree", Some(&binding.session))
         .await?;
-    fn loader<'a>(tree: &'a Value, frame: &str) -> Option<&'a str> {
-        if tree["frame"]["id"].as_str() == Some(frame) {
-            return tree["frame"]["loaderId"].as_str();
+    exact_document_present(&tree, binding)
+}
+fn exact_document_present(
+    tree: &Value,
+    binding: &ExactBinding,
+) -> Result<(), ExactResolutionError> {
+    if exact_document_loader(tree, binding)? == Some(binding.loader.as_str()) {
+        Ok(())
+    } else {
+        Err(ExactResolutionError::StaleReference)
+    }
+}
+/// Positive replacement evidence is narrower than generic stale reference:
+/// a missing frame or empty loader cannot certify a new document.
+pub(crate) async fn exact_document_replaced(
+    client: &CdpClient,
+    binding: &ExactBinding,
+) -> Result<bool, ExactResolutionError> {
+    let tree = client
+        .send_command_no_params("Page.getFrameTree", Some(&binding.session))
+        .await?;
+    exact_document_replacement_in_tree(&tree, binding)
+}
+fn exact_document_replacement_in_tree(
+    tree: &Value,
+    binding: &ExactBinding,
+) -> Result<bool, ExactResolutionError> {
+    Ok(exact_document_loader(tree, binding)?
+        .is_some_and(|loader| !loader.is_empty() && loader != binding.loader))
+}
+fn exact_document_loader<'a>(
+    tree: &'a Value,
+    binding: &ExactBinding,
+) -> Result<Option<&'a str>, ExactResolutionError> {
+    let mut pending = vec![(&tree["frameTree"], 0usize)];
+    let mut ids = std::collections::HashSet::new();
+    let mut found = None;
+    while let Some((node, depth)) = pending.pop() {
+        if depth > 64 || ids.len() >= 4096 {
+            return Err(ExactResolutionError::BackendFailure);
         }
-        tree["childFrames"]
-            .as_array()?
-            .iter()
-            .find_map(|child| loader(child, frame))
+        let frame = &node["frame"];
+        let id = frame["id"]
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or(ExactResolutionError::BackendFailure)?;
+        let loader = frame["loaderId"]
+            .as_str()
+            .ok_or(ExactResolutionError::BackendFailure)?;
+        if !ids.insert(id) {
+            return Err(ExactResolutionError::BackendFailure);
+        }
+        if id == binding.frame {
+            found = Some(loader);
+        }
+        if let Some(children) = node.get("childFrames") {
+            let children = children
+                .as_array()
+                .ok_or(ExactResolutionError::BackendFailure)?;
+            if children.len() > 4096 {
+                return Err(ExactResolutionError::BackendFailure);
+            }
+            pending.extend(children.iter().map(|child| (child, depth + 1)));
+        }
     }
-    if loader(&tree["frameTree"], &binding.frame) != Some(binding.loader.as_str()) {
-        return Err("Reference document is stale".into());
-    }
-    Ok(())
+    Ok(found)
 }
 
 async fn release_native_object(client: &CdpClient, session: &str, object: &str) {
@@ -1953,6 +2159,138 @@ pub async fn get_element_styles(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exact_document_stale_requires_well_formed_complete_native_tree() {
+        let binding = ExactBinding {
+            page_session: "page".into(),
+            session: "page".into(),
+            frame: "main".into(),
+            loader: "old".into(),
+            actionable: true,
+        };
+        assert_eq!(
+            exact_document_present(
+                &serde_json::json!({"frameTree":{"frame":{"id":"main","loaderId":"new"}}}),
+                &binding
+            ),
+            Err(ExactResolutionError::StaleReference)
+        );
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"frameTree":{"frame":{"id":"main"}}}),
+            serde_json::json!({"frameTree":{"frame":{"id":"main","loaderId":"new"},"childFrames":[{"frame":{"id":"main","loaderId":"new"}}]}}),
+        ] {
+            assert_eq!(
+                exact_document_present(&malformed, &binding),
+                Err(ExactResolutionError::BackendFailure)
+            );
+        }
+    }
+
+    #[test]
+    fn exact_document_replacement_requires_present_frame_and_new_nonempty_loader() {
+        let binding = ExactBinding {
+            page_session: "page".into(),
+            session: "page".into(),
+            frame: "main".into(),
+            loader: "old".into(),
+            actionable: true,
+        };
+        for (id, loader, replaced) in [
+            ("main", "new", true),
+            ("main", "old", false),
+            ("main", "", false),
+            ("other", "new", false),
+        ] {
+            let tree = serde_json::json!({"frameTree":{"frame":{"id":id,"loaderId":loader}}});
+            assert_eq!(
+                exact_document_replacement_in_tree(&tree, &binding),
+                Ok(replaced)
+            );
+        }
+    }
+    #[test]
+    fn exact_default_admission_boundary_is_documented_and_non_mutating() {
+        let refs = RefMap::new();
+        let binding = ExactBinding {
+            page_session: "page".into(),
+            session: "session".into(),
+            frame: "frame".into(),
+            loader: "doc".into(),
+            actionable: true,
+        };
+        let backends = (0..MAX_EXACT_REFERENCES as i64).collect::<Vec<_>>();
+        assert_eq!(refs.check_exact_admission(&binding, &backends), Ok(()));
+        let mut excessive = backends;
+        excessive.push(MAX_EXACT_REFERENCES as i64);
+        assert_eq!(
+            refs.check_exact_admission(&binding, &excessive),
+            Err(RefAllocationError::Capacity)
+        );
+        assert_eq!(refs.retained_identity_counts(), (0, 0));
+    }
+    #[test]
+    fn exact_quota_rejects_atomically_and_retirement_never_reuses_ids() {
+        let mut refs = RefMap::new();
+        refs.set_exact_limit_for_test(2);
+        let binding = ExactBinding {
+            page_session: "page".into(),
+            session: "session".into(),
+            frame: "frame".into(),
+            loader: "doc".into(),
+            actionable: true,
+        };
+        let first = refs
+            .try_bind_exact(1, "button", "", binding.clone())
+            .unwrap();
+        let second = refs
+            .try_bind_exact(2, "button", "", binding.clone())
+            .unwrap();
+        assert_eq!(
+            refs.try_bind_exact(3, "button", "", binding.clone()),
+            Err(RefAllocationError::Capacity)
+        );
+        assert_eq!(refs.retained_identity_counts(), (2, 2));
+        assert!(refs.get(&first).is_some());
+        assert!(refs.get(&second).is_some());
+        refs.invalidate_all_documents();
+        assert_eq!(refs.retained_identity_counts(), (0, 0));
+        assert!(refs.get(&first).is_none());
+        let replacement = refs.try_bind_exact(1, "button", "", binding).unwrap();
+        assert_ne!(first, replacement);
+        assert_ne!(second, replacement);
+    }
+    #[test]
+    fn query_retains_only_matched_additions_and_all_previous_authority() {
+        let mut baseline = RefMap::new();
+        let binding = ExactBinding {
+            page_session: "page".into(),
+            session: "session".into(),
+            frame: "frame".into(),
+            loader: "doc".into(),
+            actionable: true,
+        };
+        let old = baseline
+            .try_bind_exact(1, "button", "", binding.clone())
+            .unwrap();
+        let mut staged = baseline.clone();
+        let kept = staged
+            .try_bind_exact(2, "button", "", binding.clone())
+            .unwrap();
+        let discarded = staged
+            .try_bind_exact(3, "button", "", binding.clone())
+            .unwrap();
+        staged.retain_query_additions(&baseline, &std::collections::HashSet::from([kept.clone()]));
+        assert_eq!(staged.retained_identity_counts(), (2, 2));
+        assert!(staged.get(&old).is_some());
+        assert!(staged.get(&kept).is_some());
+        assert!(staged.get(&discarded).is_none());
+        assert!(staged.durable_ref("page", Some("frame"), 3).is_none());
+        assert_ne!(
+            staged.try_bind_exact(3, "button", "", binding).unwrap(),
+            discarded
+        );
+    }
     #[test]
     fn viewport_capability_is_shared_stable_and_never_a_dom_identity() {
         let mut refs = RefMap::new();
