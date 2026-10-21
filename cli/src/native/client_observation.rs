@@ -159,11 +159,36 @@ async fn command(
     check(lease)?;
     let mut cancellation = lease.cancellation.clone();
     tokio::select! {
-        result = client.send_command(method, Some(args), Some(session)) => { check(lease)?; result.map_err(|_|ObservationError::BackendFailure) }
+        result = client.send_command(method, Some(args), Some(session)) => {
+            check(lease)?;
+            #[cfg(test)]
+            match &result {
+                Ok(value) => diagnostic_exception(method, value),
+                Err(_) => eprintln!("native observation protocol failure at {method}; details omitted"),
+            }
+            result.map_err(|_|ObservationError::BackendFailure)
+        }
         _ = cancellation.changed() => Err(ObservationError::Cancelled),
         _ = tokio::time::sleep_until(lease.deadline.into()) => Err(ObservationError::DeadlineExceeded),
     }
 }
+#[cfg(test)]
+fn diagnostic_exception(method: &str, value: &Value) {
+    let Some(details) = value.get("exceptionDetails") else {
+        return;
+    };
+    let class = details["exception"]["className"]
+        .as_str()
+        .filter(|name| {
+            matches!(
+                *name,
+                "TypeError" | "ReferenceError" | "SyntaxError" | "RangeError" | "Error"
+            )
+        })
+        .unwrap_or("unclassified");
+    eprintln!("native observation renderer failure at {method}: class={class}, line={:?}, column={:?}; details omitted",details["lineNumber"].as_u64(),details["columnNumber"].as_u64());
+}
+
 async fn validate_frame(
     client: &CdpClient,
     frame: &ObservationFrame,
@@ -1662,46 +1687,46 @@ mod tests {
         let run=async {
             let mgr=state.browser.as_ref().ok_or("Missing browser")?;
             let session=mgr.active_session_id()?;
-            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"document.body.innerHTML='<main><label for="account">Account</label><input id="account" value="synthetic-user"><input id="secret" type="password" value="synthetic-password"><ul><li>Alpha <button>Save</button></li><li>Beta <button>Save</button></li></ul><div id="shadow"></div></main>'; const root=document.querySelector('#shadow').attachShadow({mode:'closed'}); root.innerHTML='<button>Shadow save</button>'; true"#,"returnByValue":true})),Some(session)).await?;
+            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"document.body.innerHTML='<main><label for="account">Account</label><input id="account" value="synthetic-user"><input id="secret" type="password" value="synthetic-password"><ul><li>Alpha <button>Save</button></li><li>Beta <button>Save</button></li></ul><div id="shadow"></div></main>'; const root=document.querySelector('#shadow').attachShadow({mode:'closed'}); root.innerHTML='<button>Shadow save</button>'; true"#,"returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_1".to_string())?;
             let (mut lease,_sender)=lease();lease.deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);let mut refs=RefMap::new();
-            let frames=enumerate_frames(&mgr.client,session,&HashMap::new(),&lease).await?;
-            let observation=observe(&mgr.client,&frames,&mut refs,"fixture",1,&ObservationOptions::default(),&lease).await?;
+            let frames=enumerate_frames(&mgr.client,session,&HashMap::new(),&lease).await.map_err(|_| "native observation stage: enumerate_frames_1".to_string())?;
+            let observation=observe(&mgr.client,&frames,&mut refs,"fixture",1,&ObservationOptions::default(),&lease).await.map_err(|_| "native observation stage: observe_1".to_string())?;
             let serialized=serde_json::to_string(&observation).unwrap();
             if serialized.contains("synthetic-password"){return Err("Password leaked in observation".to_string());}
             let options:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"index","source":{"kind":"query","query":{"kind":"role","value":{"kind":"string","value":"button","exact":true},"name":{"kind":"string","value":"Save","exact":true}}},"index":"last"}})).unwrap();
-            let result=query(&mgr.client,&frames,&mut refs,"fixture",1,&options,&lease).await?;
+            let result=query(&mgr.client,&frames,&mut refs,"fixture",1,&options,&lease).await.map_err(|_| "native observation stage: query_1".to_string())?;
             if result.nodes.len()!=1{return Err("Query index failed".into());}
             let old=result.nodes[0].reference.id.clone();
-            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelectorAll('li button')[1].outerHTML='<button>Save</button>'; true","returnByValue":true})),Some(session)).await?;
+            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelectorAll('li button')[1].outerHTML='<button>Save</button>'; true","returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_2".to_string())?;
             if super::super::element::resolve_element_object_id(&mgr.client,session,&refs,&old,&HashMap::new()).await.is_ok(){return Err("Removed exact node rebound".into());}
-            let replacement=query(&mgr.client,&frames,&mut refs,"fixture",1,&options,&lease).await?;
+            let replacement=query(&mgr.client,&frames,&mut refs,"fixture",1,&options,&lease).await.map_err(|_| "native observation stage: query_2".to_string())?;
             if replacement.nodes[0].reference.id==old{return Err("Replacement reused exact ref".into());}
             let options:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"query","query":{"kind":"role","value":{"kind":"string","value":"button","exact":true},"name":{"kind":"regexp","source":"Shadow save","flags":"u"}}}})).unwrap();
-            if query(&mgr.client,&frames,&mut refs,"fixture",1,&options,&lease).await?.nodes.len()!=1{return Err("Closed shadow query failed".into());}
+            if query(&mgr.client,&frames,&mut refs,"fixture",1,&options,&lease).await.map_err(|_| "native observation stage: query_3".to_string())?.nodes.len()!=1{return Err("Closed shadow query failed".into());}
             let options:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"query","query":{"kind":"label","value":{"kind":"string","value":"Account","exact":true}}}})).unwrap();
-            let result=query(&mgr.client,&frames,&mut refs,"fixture",1,&options,&lease).await?;
+            let result=query(&mgr.client,&frames,&mut refs,"fixture",1,&options,&lease).await.map_err(|_| "native observation stage: query_4".to_string())?;
             if result.nodes.len()!=1||result.nodes[0].value.as_deref()!=Some("synthetic-user"){return Err("Label/read contract failed".into());}
-            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"new Promise(resolve=>{const f=document.createElement('iframe');f.dataset.frame='demo';f.onload=resolve;f.srcdoc='<button id="inner">Frame action</button>';document.body.appendChild(f);})"#,"awaitPromise":true,"returnByValue":true})),Some(session)).await?;
-            let frames=enumerate_frames(&mgr.client,session,&HashMap::new(),&lease).await?;
+            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"new Promise(resolve=>{const f=document.createElement('iframe');f.dataset.frame='demo';f.onload=resolve;f.srcdoc='<button id="inner">Frame action</button>';document.body.appendChild(f);})"#,"awaitPromise":true,"returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_3".to_string())?;
+            let frames=enumerate_frames(&mgr.client,session,&HashMap::new(),&lease).await.map_err(|_| "native observation stage: enumerate_frames_2".to_string())?;
             if frames.len()!=2{return Err("Same-process frame missing".into());}
             let framed:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"frame","selector":"iframe[data-frame=demo]","source":{"kind":"selector","selector":"#inner"}}})).unwrap();
-            let result=query(&mgr.client,&frames,&mut refs,"fixture",1,&framed,&lease).await?;
+            let result=query(&mgr.client,&frames,&mut refs,"fixture",1,&framed,&lease).await.map_err(|_| "native observation stage: query_5".to_string())?;
             if result.nodes.len()!=1||result.nodes[0].name.as_deref()!=Some("Frame action"){return Err("Frame query failed".into());}
-            let framed_observation=observe(&mgr.client,&frames,&mut refs,"fixture",2,&ObservationOptions::default(),&lease).await?;
+            let framed_observation=observe(&mgr.client,&frames,&mut refs,"fixture",2,&ObservationOptions::default(),&lease).await.map_err(|_| "native observation stage: observe_2".to_string())?;
             if framed_observation.roots.len()!=1||!serde_json::to_string(&framed_observation).unwrap().contains("Frame action"){return Err("Frame subtree was flattened or lost".into());}
             let adopt:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"selector","selector":"li button"}})).unwrap();
-            let result=query(&mgr.client,&frames,&mut refs,"fixture",2,&adopt,&lease).await?;
+            let result=query(&mgr.client,&frames,&mut refs,"fixture",2,&adopt,&lease).await.map_err(|_| "native observation stage: query_6".to_string())?;
             let adopted=result.nodes[0].reference.id.clone();
-            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelector('iframe').contentDocument.body.appendChild(document.querySelector('li button')); true","returnByValue":true})),Some(session)).await?;
+            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelector('iframe').contentDocument.body.appendChild(document.querySelector('li button')); true","returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_4".to_string())?;
             if super::super::element::resolve_element_object_id(&mgr.client,session,&refs,&adopted,&HashMap::new()).await.is_ok(){return Err("Cross-document adopted node retained old exact authority".into());}
-            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"for(const mode of ['open','closed']){const h=document.createElement('div');h.id=mode+'-secure-host';h.className='secure';document.body.appendChild(h);h.attachShadow({mode}).innerHTML='<span>synthetic-shadow-secret</span><input value="synthetic-shadow-secret">';}const h=document.createElement('div');h.id='unmarked-host';document.body.appendChild(h);h.attachShadow({mode:'closed'}).innerHTML='<span class="secure">synthetic-closed-child</span>';const b=document.createElement('button');b.setAttribute('aria-labelledby','unmarked-host');document.body.appendChild(b);true"#,"returnByValue":true})),Some(session)).await?;
+            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"for(const mode of ['open','closed']){const h=document.createElement('div');h.id=mode+'-secure-host';h.className='secure';document.body.appendChild(h);h.attachShadow({mode}).innerHTML='<span>synthetic-shadow-secret</span><input value="synthetic-shadow-secret">';}const h=document.createElement('div');h.id='unmarked-host';document.body.appendChild(h);h.attachShadow({mode:'closed'}).innerHTML='<span class="secure">synthetic-closed-child</span>';const b=document.createElement('button');b.setAttribute('aria-labelledby','unmarked-host');document.body.appendChild(b);true"#,"returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_5".to_string())?;
             let policy=ObservationOptions{secure_field_selector:".secure".into(),..Default::default()};
-            let secret_tree=observe(&mgr.client,&frames,&mut refs,"fixture",3,&policy,&lease).await?;
+            let secret_tree=observe(&mgr.client,&frames,&mut refs,"fixture",3,&policy,&lease).await.map_err(|_| "native observation stage: observe_3".to_string())?;
             let serialized=serde_json::to_string(&secret_tree).unwrap();if serialized.contains("synthetic-shadow-secret")||serialized.contains("synthetic-closed-child"){return Err("Shadow secure subtree leaked in observation".into());}
             let unmarked:QueryOptions=serde_json::from_value(json!({"secureFieldSelector":".secure","expression":{"kind":"selector","selector":"#unmarked-host"}})).unwrap();
-            let found=query(&mgr.client,&frames,&mut refs,"fixture",3,&unmarked,&lease).await?;
+            let found=query(&mgr.client,&frames,&mut refs,"fixture",3,&unmarked,&lease).await.map_err(|_| "native observation stage: query_7".to_string())?;
             let read_options:ReadOptions=serde_json::from_value(json!({"ref":found.nodes[0].reference.id,"secureFieldSelector":".secure"})).unwrap();
-            let one=read(&mgr.client,&frames,&mut refs,3,&read_options,&lease).await?;if one.to_string().contains("synthetic-closed-child"){return Err("Closed secure descendant leaked in full read".into());}
+            let one=read(&mgr.client,&frames,&mut refs,3,&read_options,&lease).await.map_err(|_| "native observation stage: read_1".to_string())?;if one.to_string().contains("synthetic-closed-child"){return Err("Closed secure descendant leaked in full read".into());}
             Ok::<(),String>(())
         }.await;
         let close = execute_command(

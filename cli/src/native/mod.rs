@@ -17,6 +17,8 @@ pub mod client_network;
 #[allow(dead_code)]
 pub mod client_observation;
 #[allow(dead_code)]
+pub mod client_protected_read;
+#[allow(dead_code)]
 pub mod client_protocol;
 #[allow(dead_code)]
 pub mod client_session;
