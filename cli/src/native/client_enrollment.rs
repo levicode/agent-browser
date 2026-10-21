@@ -1395,6 +1395,48 @@ mod tests {
             params: json!({"sessionId":session,"waitingForDebugger":true,"targetInfo":{"targetId":target,"type":kind,"browserContextId":context}}),
         }
     }
+    fn diagnostic_url(value: &str) -> String {
+        let Ok(parsed) = url::Url::parse(value) else {
+            return "[invalid URL]".into();
+        };
+        if matches!(parsed.scheme(), "http" | "https") {
+            let host = parsed.host_str().unwrap_or("");
+            if matches!(host, "127.0.0.1" | "localhost" | "[::1]" | "::1") {
+                return format!(
+                    "{}://{}{}",
+                    parsed.scheme(),
+                    host,
+                    parsed
+                        .path()
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(160)
+                        .collect::<String>()
+                );
+            }
+            return format!("{}:[external URL omitted]", parsed.scheme());
+        }
+        format!(
+            "{}:[payload omitted]",
+            parsed.scheme().chars().take(24).collect::<String>()
+        )
+    }
+    #[test]
+    fn enrollment_diagnostic_urls_are_bounded_and_omit_payload_credentials_and_query() {
+        assert_eq!(
+            diagnostic_url("http://user:secret@127.0.0.1:1234/must-not-start?token=private#secret"),
+            "http://127.0.0.1/must-not-start"
+        );
+        assert_eq!(
+            diagnostic_url(&format!("data:image/png;base64,{}", "a".repeat(100000))),
+            "data:[payload omitted]"
+        );
+        assert_eq!(
+            diagnostic_url("https://private.example/path?secret=1"),
+            "https:[external URL omitted]"
+        );
+        assert!(diagnostic_url(&format!("http://127.0.0.1/{}", "a".repeat(100000))).len() < 200);
+    }
     #[tokio::test]
     async fn first_request_cannot_continue_before_complete_target_configuration() {
         for fail in [false, true] {
@@ -2432,8 +2474,21 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires hosted Chromium: initialization failure contains first request"]
-    async fn e2e_enrollment_configuration_failure_contains_owned_first_request() {
+    #[ignore = "known external CDP ingress limitation: deliberately red manual diagnostic, NOT a containment acceptance gate"]
+    async fn diagnostic_external_direct_url_ingress_precedes_enrollment() {
+        hosted_initial_request_failure("raw-direct-url").await;
+    }
+    #[tokio::test]
+    #[ignore = "requires hosted Chromium: managed creation contains failed initialization before navigation"]
+    async fn e2e_managed_blank_initialization_failure_prevents_navigation_request() {
+        hosted_initial_request_failure("managed").await;
+    }
+    #[tokio::test]
+    #[ignore = "requires hosted Chromium: window.open first request is held through failed popup configuration"]
+    async fn e2e_popup_initial_request_is_contained_when_configuration_fails() {
+        hosted_initial_request_failure("popup").await;
+    }
+    async fn hosted_initial_request_failure(mode: &str) {
         use super::super::cdp::chrome::{launch_chrome, LaunchOptions};
         use std::sync::atomic::AtomicUsize;
         let mut chrome = launch_chrome(&LaunchOptions {
@@ -2442,6 +2497,25 @@ mod tests {
         })
         .unwrap();
         let client = Arc::new(CdpClient::connect(&chrome.ws_url).await.unwrap());
+        let version = client
+            .send_command("Browser.getVersion", Some(json!({})), None)
+            .await
+            .unwrap();
+        eprintln!(
+            "containment mode={mode} product={} revision={}",
+            version["product"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(100)
+                .collect::<String>(),
+            version["revision"]
+                .as_str()
+                .unwrap_or("")
+                .chars()
+                .take(100)
+                .collect::<String>()
+        );
         let context = client
             .send_command(
                 "Target.createBrowserContext",
@@ -2467,15 +2541,35 @@ mod tests {
                 65536,
             )
             .unwrap();
+        let popup_links: Arc<Mutex<Vec<(String, String)>>> = Arc::default();
+        let recorded_links = popup_links.clone();
         let event_trace = trace.clone();
         let event_reader = tokio::spawn(async move {
             while let Ok(event) = events.recv().await {
+                if event.method == "Target.attachedToTarget" {
+                    if let (Some(target), Some(opener)) = (
+                        event
+                            .params
+                            .pointer("/targetInfo/targetId")
+                            .and_then(Value::as_str),
+                        event
+                            .params
+                            .pointer("/targetInfo/openerId")
+                            .and_then(Value::as_str),
+                    ) {
+                        let mut links = recorded_links.lock().unwrap();
+                        if links.len() < 64 {
+                            links.push((target.to_owned(), opener.to_owned()));
+                        }
+                    }
+                }
                 let url = event
                     .params
                     .pointer("/request/url")
                     .or_else(|| event.params.pointer("/targetInfo/url"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                let url = diagnostic_url(url);
                 let mut trace = event_trace.lock().unwrap();
                 if trace.len() < 64 {
                     trace.push(format!(
@@ -2513,10 +2607,12 @@ mod tests {
                             trace.push(format!(
                                 "t={:?} decision Continue event={event} url={}",
                                 trace_started.elapsed(),
-                                payload
-                                    .pointer("/request/url")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
+                                diagnostic_url(
+                                    payload
+                                        .pointer("/request/url")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or("")
+                                )
                             ));
                         }
                     }
@@ -2530,9 +2626,46 @@ mod tests {
                 }
             }
         });
+        let popup_parent = if mode == "popup" {
+            let target = client
+                .send_command(
+                    "Target.createTarget",
+                    Some(json!({"browserContextId":context,"url":"about:blank"})),
+                    None,
+                )
+                .await
+                .unwrap()["targetId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let session = client
+                .send_command(
+                    "Target.attachToTarget",
+                    Some(json!({"targetId":target,"flatten":true})),
+                    None,
+                )
+                .await
+                .unwrap()["sessionId"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            // Initialize the opener using the production registration and
+            // configuration methods before starting the retained supervisor.
+            // Only future popup configuration is fault-injected below.
+            let entry = owner
+                .register(&context, &target, &session, "page", None)
+                .unwrap()
+                .unwrap();
+            owner.initialize(entry, &owner.operation()).await.unwrap();
+            Some((target, session))
+        } else {
+            None
+        };
         Arc::get_mut(&mut owner).unwrap().config.timezone_id =
             Some("Synthetic/Invalid-Timezone".into());
-        owner.start(&owner.operation()).await.unwrap();
+        if mode != "managed" {
+            owner.start(&owner.operation()).await.unwrap();
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/must-not-start", listener.local_addr().unwrap());
         let requests = Arc::new(AtomicUsize::new(0));
@@ -2549,7 +2682,10 @@ mod tests {
                         .lines()
                         .next()
                         .unwrap_or("")
-                        .to_owned();
+                        .chars()
+                        .filter(|c| !c.is_control())
+                        .take(240)
+                        .collect::<String>();
                     let mut trace = http_trace.lock().unwrap();
                     if trace.len() < 64 {
                         trace.push(format!(
@@ -2563,17 +2699,97 @@ mod tests {
                     .await;
             }
         });
-        let _ = client
-            .send_command(
-                "Target.createTarget",
-                Some(json!({"browserContextId":context,"url":url})),
-                None,
-            )
-            .await;
+        match mode {
+            "raw-direct-url" => {
+                let _ = client
+                    .send_command(
+                        "Target.createTarget",
+                        Some(json!({"browserContextId":context,"url":url})),
+                        None,
+                    )
+                    .await;
+            }
+            "managed" => {
+                let target = client
+                    .send_command(
+                        "Target.createTarget",
+                        Some(json!({"browserContextId":context,"url":"about:blank"})),
+                        None,
+                    )
+                    .await
+                    .unwrap()["targetId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let session = client
+                    .send_command(
+                        "Target.attachToTarget",
+                        Some(json!({"targetId":target,"flatten":true})),
+                        None,
+                    )
+                    .await
+                    .unwrap()["sessionId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                let initialized = owner
+                    .enroll_existing(&target, &session, "page", &owner.operation())
+                    .await;
+                // This is the managed lifecycle contract: never dispatch the
+                // requested navigation if owned blank-page initialization fails.
+                if initialized.is_ok() {
+                    client
+                        .send_command("Page.navigate", Some(json!({"url":url})), Some(&session))
+                        .await
+                        .unwrap();
+                }
+                assert!(initialized.is_err());
+            }
+            "popup" => {
+                let expression = format!(
+                    "(() => {{ const popup=window.open({}); return popup !== null; }})()",
+                    serde_json::to_string(&url).unwrap()
+                );
+                let result=client.send_command("Runtime.evaluate",Some(json!({"expression":expression,"userGesture":true,"returnByValue":true})),popup_parent.as_ref().map(|(_,session)|session.as_str())).await.unwrap();
+                assert_eq!(
+                    result["result"]["value"], true,
+                    "window.open was blocked before a popup was created"
+                );
+            }
+            _ => unreachable!(),
+        }
         assert!(tokio::time::timeout(Duration::from_secs(15), owner.drain())
             .await
             .unwrap()
             .is_err());
+        if let Some((parent, _)) = &popup_parent {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if popup_links
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|(_, opener)| opener == parent)
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("no popup with exact opener attribution was observed");
+            let index = owner.index.lock().unwrap();
+            let links = popup_links.lock().unwrap();
+            assert!(
+                index.sessions.values().any(|entry| entry.target != *parent
+                    && entry.application
+                    && !entry.resumed
+                    && links
+                        .iter()
+                        .any(|(target, opener)| target == &entry.target && opener == parent)),
+                "configuration failure was not attributed to the newly created popup"
+            );
+        }
         let proof = owner.contain_owned_resources().await.unwrap();
         owner.release_after_containment(proof).await.unwrap();
         let outcome = owner.cleanup_outcome().unwrap();
