@@ -326,27 +326,316 @@ pub struct OwnedBrowser {
     pub page_state: Arc<super::client_page::ClientPageState>,
     pub ui: Arc<super::client_ui::UiGate>,
     runtime: Option<OwnedRuntime>,
+    replacement_actions: Option<Arc<super::client_actions::ClientActions>>,
+    replacement_routes: Option<super::client_network::RouteTransfer>,
+    disconnected_routes: Option<super::client_network::DisconnectedRoutes>,
+    reconnect_proof: Option<super::client_reconnect::VerifiedReconnectProof>,
+    persistent_probe: super::client_persistent::OwnedProbeJournal,
+    borrowed_targets: Option<Vec<String>>,
+    browser_tenure: String,
 }
 
 /// The lifecycle owner retains this journal before the first enrollment RPC.
 /// Teardown contains exact owned resources before releasing attachment barriers.
+struct RuntimeInitialization<'a> {
+    operation: &'a super::client_session::OperationLease,
+    retirement: &'a Arc<Mutex<RetirementJournal>>,
+    options: &'a ScopeCreationOptions,
+    replacement: Option<ReplacementSeed>,
+}
+
+/// Native lifecycle-only declarations and attempt ownership. No old session,
+/// document, input, or blob authority is copied into the replacement.
+struct ReplacementSeed {
+    page_config: super::client_page::PageConfigSnapshot,
+    policy: super::client_observation_dispatch::ReadPolicy,
+    downloads: DownloadConfiguration,
+    actions: Arc<super::client_actions::ClientActions>,
+}
+
 struct OwnedRuntime {
     enrollment: Arc<super::client_enrollment::ClientEnrollment>,
     network: Arc<super::client_network::ClientNetwork>,
     blobs: Arc<super::client_blobs::BlobStore>,
     scope: super::client_blobs::BlobScope,
+    configuration: Arc<Mutex<RuntimeConfiguration>>,
+    page_active: Arc<std::sync::atomic::AtomicBool>,
+    activation: Arc<PageActivation>,
+    block_service_workers: bool,
+    creation_options: ScopeCreationOptions,
+    actions: Arc<super::client_actions::ClientActions>,
+    input_gate: Arc<tokio::sync::Mutex<()>>,
+    download_cleanup: tokio::sync::Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
+}
+struct PageActivation {
+    borrowed: bool,
+    active: Arc<std::sync::atomic::AtomicBool>,
+    serial: tokio::sync::Mutex<()>,
+    page_state: Arc<super::client_page::ClientPageState>,
+    network: Arc<super::client_network::ClientNetwork>,
+    enrollment: Arc<super::client_enrollment::ClientEnrollment>,
+}
+impl PageActivation {
+    // Original persistent ensurePage performs its initial blank navigation only
+    // after callback registration, at first page activation, never before open ACK.
+    async fn ensure(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &super::client_session::OperationLease,
+        dispatched: &mut bool,
+    ) -> Result<(), ProtocolError> {
+        if !self.borrowed || self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let mut cancellation = operation.cancellation.clone();
+        check_lifecycle_budget(operation)?;
+        let _serial = tokio::select! {
+            biased;
+            _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+            result = tokio::time::timeout_at(operation.deadline.into(), self.serial.lock()) => result.map_err(|_| ProtocolError::DeadlineExceeded)?,
+        };
+        page.permit.check()?;
+        check_lifecycle_budget(operation)?;
+        if self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _navigation = self.network.begin_app_navigation(page, operation)?;
+        *dispatched = true;
+        self.page_state
+            .execute(
+                page,
+                std::slice::from_ref(&page.page_session_id),
+                operation,
+                "page.navigate",
+                &serde_json::json!({"url":"about:blank","waitUntil":"domcontentloaded"}),
+            )
+            .await?;
+        self.enrollment.flush_app_events(page, operation).await?;
+        page.permit.check()?;
+        check_lifecycle_budget(operation)?;
+        self.active.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+#[derive(Default)]
+struct RuntimeConfiguration {
+    policy: Option<super::client_observation_dispatch::ReadPolicy>,
+    download_directory: Option<tempfile::TempDir>,
+    downloads: Option<DownloadConfiguration>,
+    configuring: bool,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConfigureRequest {
+    test_id_attribute: String,
+    secure_field_selector: String,
+    request_policy: RequestPolicy,
+    downloads: DownloadConfiguration,
+}
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RequestPolicy {
+    site: Option<String>,
+    headers: Option<std::collections::HashMap<String, String>>,
+    basic_auth: Option<BasicCredentials>,
+}
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BasicCredentials {
+    username: String,
+    password: String,
+}
+#[derive(Clone, serde::Deserialize)]
+#[serde(tag = "source", rename_all = "lowercase", deny_unknown_fields)]
+enum DownloadConfiguration {
+    Local,
+    Provider {
+        #[serde(rename = "remoteDirectory")]
+        remote_directory: String,
+    },
+}
+impl ConfigureRequest {
+    fn validate(&self, block_service_workers: bool) -> Result<(), ProtocolError> {
+        if self.test_id_attribute.is_empty()
+            || self.test_id_attribute.len() > 16 * 1024
+            || self.test_id_attribute.contains('\0')
+            || self.secure_field_selector != "input[type=\"password\" i]"
+            || self.request_policy.headers.is_some() != block_service_workers
+            || self
+                .request_policy
+                .site
+                .as_ref()
+                .is_some_and(|site| url::Url::parse(site).is_err())
+            || self.request_policy.headers.as_ref().is_some_and(|headers| {
+                headers.iter().any(|(key, value)| {
+                    key.is_empty()
+                        || key.contains(['\r', '\n', '\0'])
+                        || value.contains(['\r', '\n', '\0'])
+                })
+            })
+            || self
+                .request_policy
+                .basic_auth
+                .as_ref()
+                .is_some_and(|auth| auth.username.contains('\0') || auth.password.contains('\0'))
+        {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        if let DownloadConfiguration::Provider { remote_directory } = &self.downloads {
+            if remote_directory.is_empty() || remote_directory.contains('\0') {
+                return Err(ProtocolError::InvalidArguments);
+            }
+        }
+        Ok(())
+    }
 }
 impl OwnedRuntime {
+    async fn remove_download_directory(&self) -> Result<(), ProtocolError> {
+        let mut cleanup = self.download_cleanup.lock().await;
+        if cleanup.is_none() {
+            let path = self
+                .configuration
+                .lock()
+                .map_err(|_| ProtocolError::CleanupFailed)?
+                .download_directory
+                .as_ref()
+                .map(|directory| directory.path().to_owned());
+            let Some(path) = path else {
+                return Ok(());
+            };
+            *cleanup = Some(tokio::task::spawn_blocking(
+                move || match std::fs::remove_dir_all(path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+            ));
+        }
+        // The join stays journaled if the lifecycle waiter is canceled. Keep
+        // TempDir itself on error; Drop is not our cleanup success evidence.
+        let result = cleanup.as_mut().expect("journaled cleanup").await;
+        cleanup.take();
+        match result {
+            Ok(Ok(())) => {
+                self.configuration
+                    .lock()
+                    .map_err(|_| ProtocolError::CleanupFailed)?
+                    .download_directory
+                    .take();
+                Ok(())
+            }
+            _ => Err(ProtocolError::CleanupFailed),
+        }
+    }
+    async fn release_terminal_connection(
+        &self,
+        client: &Arc<super::cdp::client::CdpClient>,
+        preserve_recording: bool,
+    ) -> Result<(), ProtocolError> {
+        let proof = match self
+            .enrollment
+            .terminal_connection_proof()
+            .and_then(|proof| {
+                proof.check_client(client)?;
+                Ok(proof)
+            }) {
+            Ok(proof) => proof,
+            Err(_) => {
+                // A failed proof forbids recovery, but cannot skip final local
+                // drainage or leave an internally parked route unretired.
+                if !preserve_recording {
+                    self.enrollment.seal();
+                    let drained = self.enrollment.drain().await;
+                    let network = self.network.close().await;
+                    let _ = self.actions.cleanup().await;
+                    // Reader drainage, not remote detach proof, permits deleting
+                    // this runtime's private local download directory. Failed
+                    // cleanup keeps its TempDir/join journal for later retry.
+                    if drained.is_ok() && network.is_ok() {
+                        let _ = self.remove_download_directory().await;
+                    }
+                    let _ = self.blobs.revoke_scope(&self.scope);
+                }
+                return Err(ProtocolError::CleanupFailed);
+            }
+        };
+        self.enrollment.seal();
+        let drained = self.enrollment.drain().await;
+        let network = self.network.close_for_remote_disconnect(&proof).await;
+        let terminal_recording = self.actions.settle_terminal_recording(client, &proof).await;
+        let actions = if preserve_recording {
+            let recording = self
+                .actions
+                .recording_page_closing(&self.scope.identity_scope, &self.blobs)
+                .await;
+            let uploads = self.actions.cleanup_scope_uploads().await;
+            if recording.is_err() || uploads.is_err() {
+                Err(ProtocolError::CleanupFailed)
+            } else {
+                Ok(())
+            }
+        } else {
+            self.actions.cleanup().await
+        };
+        let retired = if preserve_recording {
+            Ok(())
+        } else {
+            self.network.close().await
+        };
+        let directory = if drained.is_ok() && network.is_ok() {
+            self.remove_download_directory().await
+        } else {
+            Err(ProtocolError::CleanupFailed)
+        };
+        let blobs = self.blobs.revoke_scope(&self.scope);
+        if drained.is_err()
+            || network.is_err()
+            || terminal_recording.is_err()
+            || actions.is_err()
+            || retired.is_err()
+            || directory.is_err()
+            || blobs.is_err()
+        {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
     async fn contain_and_release(&self) -> Result<(), ProtocolError> {
+        self.contain_and_release_mode(false).await
+    }
+    async fn contain_and_release_mode(
+        &self,
+        preserve_recording: bool,
+    ) -> Result<(), ProtocolError> {
         self.enrollment.seal();
         let drain_failed = self.enrollment.drain().await.is_err();
+        let action_cleanup_failed = if preserve_recording {
+            let recording = self
+                .actions
+                .recording_page_closing(&self.scope.identity_scope, &self.blobs)
+                .await;
+            let uploads = self.actions.cleanup_scope_uploads().await;
+            recording.is_err() || uploads.is_err()
+        } else {
+            self.actions.cleanup().await.is_err()
+        };
         let contained = self.enrollment.contain_owned_resources().await;
         let release = match contained {
             Ok(proof) => self.enrollment.release_after_containment(proof).await,
             Err(error) => Err(error),
         };
+        let directory_failed = if !drain_failed && release.is_ok() {
+            self.remove_download_directory().await.is_err()
+        } else {
+            false
+        };
         let revoked = self.blobs.revoke_scope(&self.scope);
-        if drain_failed || release.is_err() || revoked.is_err() {
+        if drain_failed
+            || action_cleanup_failed
+            || release.is_err()
+            || directory_failed
+            || revoked.is_err()
+        {
             Err(ProtocolError::CleanupFailed)
         } else {
             Ok(())
@@ -365,69 +654,60 @@ impl OwnedBrowser {
         Self::isolated(manager).await
     }
 
-    /// Persistent attachment is restricted to a dedicated default context.
-    /// Validation precedes any page reads, scripts, or navigation.
-    pub async fn connect_persistent(endpoint: &str) -> Result<Self, ProtocolError> {
-        let mut manager = super::browser::BrowserManager::connect_owned_browser(endpoint, None)
+    /// Initial persistent attachment selects only the verified default-context page.
+    /// Unrelated contexts remain untouched; reconnect has a separate restriction.
+    async fn connect_persistent(
+        endpoint: &str,
+        failed: &mut Option<OwnedBrowser>,
+    ) -> Result<Self, ProtocolError> {
+        let manager = super::browser::BrowserManager::connect_owned_browser(endpoint, None)
             .await
             .map_err(|_| ProtocolError::BrowserFailure)?;
-        let prepared = async {
-            let contexts = manager
-                .client
-                .send_command_no_params("Target.getBrowserContexts", None)
-                .await
-                .map_err(|_| ProtocolError::BrowserFailure)?;
-            let context_id = dedicated_default_context(&contexts)?;
-            let targets = manager
-                .client
-                .send_command_no_params("Target.getTargets", None)
-                .await
-                .map_err(|_| ProtocolError::BrowserFailure)?;
-            if let Some(target_id) = dedicated_default_page(&targets, &context_id)? {
-                manager
-                    .adopt_verified_page(&target_id, &context_id)
-                    .await
-                    .map_err(|_| ProtocolError::BrowserFailure)?;
-            } else {
-                manager
-                    .owned_blank_page(None)
-                    .await
-                    .map_err(|_| ProtocolError::BrowserFailure)?;
-            }
-            manager
-                .navigate("about:blank", super::browser::WaitUntil::DomContentLoaded)
-                .await
-                .map_err(|_| ProtocolError::BrowserFailure)?;
-            Ok::<_, ProtocolError>(context_id)
-        }
-        .await;
-        let context_id = match prepared {
-            Ok(id) => id,
-            Err(error) => {
-                return Err(if manager.close().await.is_err() {
-                    ProtocolError::CleanupFailed
-                } else {
-                    error
-                });
-            }
-        };
         let identity_scope = uuid::Uuid::new_v4().to_string();
-        Ok(Self {
+        let mut resource = Self {
             targets: super::client_targets::ClientTargets::new(
-                context_id.clone(),
+                String::new(),
                 identity_scope.clone(),
             ),
             page_state: Arc::new(super::client_page::ClientPageState::new(
                 identity_scope.clone(),
-                context_id.clone(),
+                String::new(),
             )),
             ui: Arc::new(super::client_ui::UiGate::default()),
             manager,
-            context_id,
+            context_id: String::new(),
             identity_scope,
             owns_context: false,
             runtime: None,
-        })
+            replacement_actions: None,
+            replacement_routes: None,
+            disconnected_routes: None,
+            reconnect_proof: None,
+            persistent_probe: Default::default(),
+            borrowed_targets: None,
+            browser_tenure: uuid::Uuid::new_v4().to_string(),
+        };
+        match super::client_persistent::prepare_persistent(&mut resource.manager).await {
+            Ok(prepared) => {
+                resource.context_id = prepared.context_id;
+                resource.borrowed_targets = Some(vec![prepared.target_id]);
+                resource.persistent_probe = prepared.probe;
+                resource.targets = super::client_targets::ClientTargets::new(
+                    resource.context_id.clone(),
+                    resource.identity_scope.clone(),
+                );
+                resource.page_state = Arc::new(super::client_page::ClientPageState::new(
+                    resource.identity_scope.clone(),
+                    resource.context_id.clone(),
+                ));
+                Ok(resource)
+            }
+            Err(failure) => {
+                resource.persistent_probe = failure.probe;
+                *failed = Some(resource);
+                Err(failure.error)
+            }
+        }
     }
 
     pub async fn launch(
@@ -536,7 +816,64 @@ impl OwnedBrowser {
             page_state,
             ui: Arc::new(super::client_ui::UiGate::default()),
             runtime: None,
+            replacement_actions: None,
+            replacement_routes: None,
+            disconnected_routes: None,
+            reconnect_proof: None,
+            persistent_probe: Default::default(),
+            borrowed_targets: None,
+            browser_tenure: uuid::Uuid::new_v4().to_string(),
         })
+    }
+
+    async fn replace_cleaned_context(
+        &mut self,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        // Caller has a complete old-context cleanup proof. Keep this object in
+        // the lifecycle owner journal while the new context identity is unknown.
+        let ids = self
+            .manager
+            .pages_list()
+            .into_iter()
+            .map(|page| page.target_id)
+            .collect();
+        self.manager.forget_disposed_targets(&ids);
+        self.replacement_actions = self.runtime.as_ref().map(|runtime| runtime.actions.clone());
+        self.runtime = None;
+        let value = self
+            .manager
+            .client
+            .send_command(
+                "Target.createBrowserContext",
+                Some(serde_json::json!({"disposeOnDetach":true})),
+                None,
+            )
+            .await
+            .map_err(|_| ProtocolError::BrowserFailure)?;
+        let context = value
+            .get("browserContextId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .ok_or(ProtocolError::InvalidFrame)?
+            .to_owned();
+        self.context_id = context;
+        self.identity_scope = uuid::Uuid::new_v4().to_string();
+        self.targets = super::client_targets::ClientTargets::new(
+            self.context_id.clone(),
+            self.identity_scope.clone(),
+        );
+        self.page_state = Arc::new(super::client_page::ClientPageState::new(
+            self.identity_scope.clone(),
+            self.context_id.clone(),
+        ));
+        self.ui = Arc::new(super::client_ui::UiGate::default());
+        check_lifecycle_budget(operation)?;
+        self.manager
+            .owned_blank_page(Some(&self.context_id))
+            .await
+            .map_err(|_| ProtocolError::BrowserFailure)?;
+        check_lifecycle_budget(operation)
     }
 
     /// Enroll only this unpublished context. The supervisor retains both the
@@ -547,11 +884,24 @@ impl OwnedBrowser {
         broker: Arc<super::client_session::ClientSession>,
         sink: super::client_transport::ClientEventSink,
         blobs: Arc<super::client_blobs::BlobStore>,
-        operation: &super::client_session::OperationLease,
-        retirement: &Arc<Mutex<RetirementJournal>>,
+        request: RuntimeInitialization<'_>,
     ) -> Result<LifecycleInitialization, ProtocolError> {
-        if !self.owns_context || self.runtime.is_some() {
+        let RuntimeInitialization {
+            operation,
+            retirement,
+            options,
+            mut replacement,
+        } = request;
+        if self.runtime.is_some() || (!self.owns_context && self.borrowed_targets.is_none()) {
             return Err(ProtocolError::PolicyDenied);
+        }
+        let seeded = replacement.is_some();
+        if let Some(seed) = &replacement {
+            self.page_state = Arc::new(super::client_page::ClientPageState::from_config_snapshot(
+                self.identity_scope.clone(),
+                self.context_id.clone(),
+                seed.page_config.clone(),
+            )?);
         }
         // The primitive blank-page constructor's provisional registry has never
         // been published. Enrollment alone now proves the complete inventory.
@@ -567,6 +917,7 @@ impl OwnedBrowser {
         blobs
             .activate_scope(scope.clone())
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let sink = sink.stage_until_result(operation, &self.identity_scope)?;
         let network = Arc::new(super::client_network::ClientNetwork::new(
             self.manager.client.clone(),
             broker,
@@ -574,7 +925,9 @@ impl OwnedBrowser {
             scope.clone(),
             blobs.clone(),
             self.ui.clone(),
-            super::client_network::NetworkPolicy::default(),
+            super::client_network::NetworkPolicy {
+                bypass_service_worker: options.block_service_workers,
+            },
         ));
         let target = self
             .manager
@@ -594,25 +947,179 @@ impl OwnedBrowser {
             gate,
             operation.generation,
             session.clone(),
-            super::client_enrollment::ScopeConfig::default(),
-            super::client_enrollment::ScopeOwnership::IsolatedContext,
+            super::client_enrollment::ScopeConfig {
+                viewport: if seeded {
+                    self.page_state.requested_viewport()?
+                } else {
+                    options.viewport.as_ref().map(|v| (v.width, v.height))
+                },
+                user_agent: options.user_agent.clone(),
+                locale: options.locale.clone(),
+                timezone_id: options.timezone_id.clone(),
+                block_service_workers: options.block_service_workers,
+            },
+            match &self.borrowed_targets {
+                Some(targets) => {
+                    super::client_enrollment::ScopeOwnership::BorrowedTargets(targets.clone())
+                }
+                None => super::client_enrollment::ScopeOwnership::IsolatedContext,
+            },
             Some(authority.access()),
         );
+        let page_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let activation = Arc::new(PageActivation {
+            borrowed: !self.owns_context,
+            active: page_active.clone(),
+            serial: tokio::sync::Mutex::new(()),
+            page_state: self.page_state.clone(),
+            network: network.clone(),
+            enrollment: enrollment.clone(),
+        });
         self.runtime = Some(OwnedRuntime {
             enrollment: enrollment.clone(),
             network,
             blobs,
             scope,
+            configuration: Arc::new(Mutex::new(RuntimeConfiguration::default())),
+            page_active,
+            activation,
+            block_service_workers: options.block_service_workers,
+            creation_options: options.clone(),
+            actions: replacement
+                .as_ref()
+                .map(|seed| seed.actions.clone())
+                .unwrap_or_else(|| Arc::new(super::client_actions::ClientActions::default())),
+            input_gate: Arc::new(tokio::sync::Mutex::new(())),
+            download_cleanup: tokio::sync::Mutex::new(None),
         });
         retirement
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             .register(&enrollment)?;
+        if let Some(seed) = replacement.as_mut() {
+            let runtime = self
+                .runtime
+                .as_ref()
+                .ok_or(ProtocolError::ScopeUnavailable)?;
+            if let Some(routes) = &mut self.disconnected_routes {
+                let proof = self
+                    .reconnect_proof
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                routes.bind(&runtime.network, &self.targets, proof, operation)?;
+                routes.adopt(&self.targets, operation)?;
+                self.disconnected_routes = None;
+            } else {
+                let routes = self
+                    .replacement_routes
+                    .as_mut()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                routes.bind(&runtime.network)?;
+                routes.adopt(operation)?;
+                self.replacement_routes = None;
+            }
+            // Fresh local ownership, never a path into the removed old TempDir.
+            let source = match &seed.downloads {
+                DownloadConfiguration::Local => {
+                    let directory = tempfile::Builder::new()
+                        .prefix("agent-browser-download-")
+                        .tempdir()
+                        .map_err(|_| ProtocolError::BrowserFailure)?;
+                    let path = std::fs::canonicalize(directory.path())
+                        .map_err(|_| ProtocolError::BrowserFailure)?;
+                    runtime
+                        .configuration
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?
+                        .download_directory = Some(directory);
+                    super::client_network::DownloadSource::Local(path)
+                }
+                DownloadConfiguration::Provider { remote_directory } => {
+                    super::client_network::DownloadSource::Provider(remote_directory.clone())
+                }
+            };
+            runtime
+                .network
+                .configure_downloads(&self.context_id, source, operation)
+                .await?;
+            let mut configuration = runtime
+                .configuration
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            configuration.policy = Some(seed.policy.clone());
+            configuration.downloads = Some(seed.downloads.clone());
+        }
         enrollment
             .enroll_existing(&target, &session, "page", operation)
             .await?;
+        if !seeded {
+            let page = self.lease(authority.enter(&self.targets)?)?;
+            for source in &options.init_scripts {
+                self.page_state
+                    .execute(
+                        &page,
+                        std::slice::from_ref(&session),
+                        operation,
+                        "context.init-script",
+                        &serde_json::json!({"source": source}),
+                    )
+                    .await?;
+            }
+            let mut media = serde_json::Map::new();
+            if let Some(value) = &options.media.color_scheme {
+                media.insert("colorScheme".into(), value.clone().into());
+            }
+            if let Some(value) = &options.media.reduced_motion {
+                media.insert("reducedMotion".into(), value.clone().into());
+            }
+            if !media.is_empty() {
+                self.page_state
+                    .execute(
+                        &page,
+                        std::slice::from_ref(&session),
+                        operation,
+                        "context.media",
+                        &serde_json::Value::Object(media),
+                    )
+                    .await?;
+            }
+        }
         enrollment.start(operation).await?;
+        // The new runtime now owns the same attempt ledger. Before this point
+        // partial initialization still retains the independent cleanup journal.
+        self.replacement_actions = None;
         Ok(authority)
+    }
+
+    fn recovery_identity(&self) -> serde_json::Value {
+        use sha2::{Digest, Sha256};
+        let opaque = |kind: &str, target: &str| {
+            let mut hash = Sha256::new();
+            hash.update(b"agent-browser/recovery-identity/1\0");
+            hash.update(kind.as_bytes());
+            hash.update(b"\0");
+            // Browser tenure is private and retained across reset/reconnect.
+            // Context/page fingerprints bind actual native object identities;
+            // an endpoint alias or connection-local browser agent is not proof.
+            if kind == "browser" {
+                hash.update(self.browser_tenure.as_bytes());
+            }
+            hash.update(b"\0");
+            if kind != "browser" {
+                hash.update(self.context_id.as_bytes());
+                hash.update(b"\0");
+            }
+            hash.update(target.as_bytes());
+            format!("{:x}", hash.finalize())
+        };
+        // These opaque fingerprints identify captured native objects, not
+        // standalone authority. Recovery must also prove retained ownership and
+        // compare the exact browser context/target before any page adoption.
+        serde_json::json!({
+            "browser": opaque("browser", ""),
+            "context": opaque("context", ""),
+            "page": opaque("page", self.manager.active_target_id().unwrap_or_default()),
+        })
     }
 
     pub fn lease(&self, permit: ScopePermit) -> Result<BrowserExecutionLease, ProtocolError> {
@@ -635,12 +1142,45 @@ impl OwnedBrowser {
         })
     }
 
+    async fn cleanup_replacement_actions(&mut self) -> Result<(), ProtocolError> {
+        let mut failed = false;
+        if let Some(routes) = &mut self.disconnected_routes {
+            if routes.retire().is_ok() {
+                self.disconnected_routes = None;
+            } else {
+                failed = true;
+            }
+        }
+        if let Some(routes) = &mut self.replacement_routes {
+            if routes.retire().is_ok() {
+                self.replacement_routes = None;
+            } else {
+                failed = true;
+            }
+        }
+        if let Some(actions) = &self.replacement_actions {
+            if actions.cleanup().await.is_ok() {
+                self.replacement_actions = None;
+            } else {
+                failed = true;
+            }
+        }
+        if failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Dispose the owned context while retaining the worker browser. The caller
     /// has drained operations and callback resources before entering this path.
     async fn dispose_context(&mut self) -> Result<(), ProtocolError> {
         if !self.owns_context {
-            return Err(ProtocolError::PolicyDenied);
+            // Ordinary borrowed scope end owns only our sessions and transport.
+            // It never acquires context/page destruction authority.
+            return self.close().await;
         }
+        let retained_cleanup_failed = self.cleanup_replacement_actions().await.is_err();
         let ids = self
             .manager
             .pages_list()
@@ -651,7 +1191,11 @@ impl OwnedBrowser {
             self.ui.seal();
             runtime.contain_and_release().await?;
             self.manager.forget_disposed_targets(&ids);
-            return Ok(());
+            return if retained_cleanup_failed {
+                Err(ProtocolError::CleanupFailed)
+            } else {
+                Ok(())
+            };
         }
         self.ui.seal();
         self.targets.seal();
@@ -665,17 +1209,34 @@ impl OwnedBrowser {
             .await
             .map_err(|_| ProtocolError::CleanupFailed)?;
         self.manager.forget_disposed_targets(&ids);
-        Ok(())
+        if retained_cleanup_failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
     }
 
     /// Caller seals and drains its gate first. A failed dispose is never
     /// rewritten as successful cleanup merely because the connection closes.
     pub async fn close(&mut self) -> Result<(), ProtocolError> {
+        let retained_cleanup_failed = self.cleanup_replacement_actions().await.is_err();
         if let Some(runtime) = &self.runtime {
             self.ui.seal();
-            let contained = runtime.contain_and_release().await;
+            let contained =
+                if !self.owns_context && *self.manager.client.remote_connection_closed().borrow() {
+                    runtime
+                        .release_terminal_connection(&self.manager.client, false)
+                        .await
+                } else {
+                    runtime.contain_and_release().await
+                };
+            let probe = self.persistent_probe.cleanup(&self.manager.client).await;
             let closed = self.manager.close().await;
-            return if contained.is_ok() && closed.is_ok() {
+            return if contained.is_ok()
+                && probe.is_ok()
+                && closed.is_ok()
+                && !retained_cleanup_failed
+            {
                 Ok(())
             } else {
                 Err(ProtocolError::CleanupFailed)
@@ -683,11 +1244,13 @@ impl OwnedBrowser {
         }
         self.targets.seal();
         if !self.owns_context {
-            return self
-                .manager
-                .close()
-                .await
-                .map_err(|_| ProtocolError::CleanupFailed);
+            let probe = self.persistent_probe.cleanup(&self.manager.client).await;
+            let closed = self.manager.close().await;
+            return if probe.is_ok() && closed.is_ok() && !retained_cleanup_failed {
+                Ok(())
+            } else {
+                Err(ProtocolError::CleanupFailed)
+            };
         }
         let disposed = self
             .manager
@@ -699,7 +1262,7 @@ impl OwnedBrowser {
             )
             .await;
         let closed = self.manager.close().await;
-        if disposed.is_err() || closed.is_err() {
+        if disposed.is_err() || closed.is_err() || retained_cleanup_failed {
             Err(ProtocolError::CleanupFailed)
         } else {
             Ok(())
@@ -707,62 +1270,151 @@ impl OwnedBrowser {
     }
 }
 
-fn dedicated_default_context(value: &serde_json::Value) -> Result<String, ProtocolError> {
-    let contexts = value
-        .get("browserContextIds")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(ProtocolError::BrowserFailure)?;
-    if !contexts.is_empty() {
-        return Err(ProtocolError::PolicyDenied);
-    }
-    value
-        .get("defaultBrowserContextId")
-        .and_then(serde_json::Value::as_str)
-        .filter(|id| !id.is_empty())
-        .map(str::to_owned)
-        .ok_or(ProtocolError::PolicyDenied)
+#[derive(Clone, Debug, Default, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct InitialMedia {
+    color_scheme: Option<String>,
+    reduced_motion: Option<String>,
 }
-
-fn dedicated_default_page(
-    value: &serde_json::Value,
-    context: &str,
-) -> Result<Option<String>, ProtocolError> {
-    let targets = value
-        .get("targetInfos")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(ProtocolError::BrowserFailure)?;
-    match targets.iter().find(|target| {
-        target.get("type").and_then(serde_json::Value::as_str) == Some("page")
-            && target
-                .get("browserContextId")
-                .is_none_or(|id| id.as_str() == Some(context))
-    }) {
-        None => Ok(None),
-        Some(target) => target
-            .get("targetId")
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| !id.is_empty())
-            .map(|id| Some(id.to_owned()))
-            .ok_or(ProtocolError::BrowserFailure),
-    }
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InitialViewport {
+    width: u32,
+    height: u32,
 }
-
+#[derive(Clone, Debug, Default)]
+struct ScopeCreationOptions {
+    block_service_workers: bool,
+    viewport: Option<InitialViewport>,
+    user_agent: Option<String>,
+    locale: Option<String>,
+    timezone_id: Option<String>,
+    media: InitialMedia,
+    init_scripts: Vec<String>,
+}
 #[derive(serde::Deserialize)]
-#[serde(tag = "source", rename_all = "kebab-case", deny_unknown_fields)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ScopeOpenWire {
+    source: String,
+    context: Option<String>,
+    executable_path: Option<String>,
+    headless: Option<bool>,
+    endpoint: Option<String>,
+    #[serde(default)]
+    block_service_workers: bool,
+    viewport: Option<InitialViewport>,
+    user_agent: Option<String>,
+    locale: Option<String>,
+    timezone_id: Option<String>,
+    #[serde(default)]
+    media: InitialMedia,
+    #[serde(default)]
+    init_scripts: Vec<String>,
+}
 enum OpenRequest {
     Launch {
-        #[serde(rename = "executablePath")]
         executable_path: Option<String>,
-        #[serde(default = "yes")]
         headless: bool,
+        options: ScopeCreationOptions,
     },
     Connect {
         endpoint: String,
+        persistent: bool,
+        options: ScopeCreationOptions,
     },
-    Reuse {},
+    Reuse {
+        options: ScopeCreationOptions,
+    },
 }
-fn yes() -> bool {
-    true
+impl<'de> serde::Deserialize<'de> for OpenRequest {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = <serde_json::Value as serde::Deserialize>::deserialize(deserializer)?;
+        // viewport:null is the public no-override form; optional scalar fields
+        // and media members must not silently turn explicit null into omission.
+        if [
+            "context",
+            "executablePath",
+            "headless",
+            "endpoint",
+            "userAgent",
+            "locale",
+            "timezoneId",
+        ]
+        .iter()
+        .any(|key| value.get(*key) == Some(&serde_json::Value::Null))
+            || ["colorScheme", "reducedMotion"].iter().any(|key| {
+                value.get("media").and_then(|media| media.get(*key))
+                    == Some(&serde_json::Value::Null)
+            })
+        {
+            return Err(D::Error::custom("invalid null scope option"));
+        }
+        let wire: ScopeOpenWire = serde_json::from_value(value).map_err(D::Error::custom)?;
+        if wire.viewport.as_ref().is_some_and(|v| {
+            v.width == 0 || v.height == 0 || v.width > i32::MAX as u32 || v.height > i32::MAX as u32
+        }) || wire.init_scripts.len() > 1024
+            || wire
+                .init_scripts
+                .iter()
+                .map(String::len)
+                .try_fold(0usize, usize::checked_add)
+                .is_none_or(|size| size > 8 * 1024 * 1024)
+            || wire
+                .media
+                .color_scheme
+                .as_ref()
+                .is_some_and(|v| !matches!(v.as_str(), "light" | "dark" | "no-preference"))
+            || wire
+                .media
+                .reduced_motion
+                .as_ref()
+                .is_some_and(|v| !matches!(v.as_str(), "reduce" | "no-preference"))
+        {
+            return Err(D::Error::custom("invalid scope creation options"));
+        }
+        let context = wire.context.as_deref().unwrap_or("isolated");
+        let options = ScopeCreationOptions {
+            block_service_workers: wire.block_service_workers,
+            viewport: wire.viewport,
+            user_agent: wire.user_agent,
+            locale: wire.locale,
+            timezone_id: wire.timezone_id,
+            media: wire.media,
+            init_scripts: wire.init_scripts,
+        };
+        match wire.source.as_str() {
+            "launch" if context == "isolated" && wire.endpoint.is_none() => Ok(Self::Launch {
+                executable_path: wire.executable_path,
+                headless: wire.headless.unwrap_or(true),
+                options,
+            }),
+            "connect"
+                if matches!(context, "isolated" | "persistent")
+                    && wire.executable_path.is_none()
+                    && wire.headless.is_none() =>
+            {
+                let endpoint = wire
+                    .endpoint
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| D::Error::custom("missing endpoint"))?;
+                Ok(Self::Connect {
+                    endpoint,
+                    persistent: context == "persistent",
+                    options,
+                })
+            }
+            "reuse"
+                if context == "isolated"
+                    && wire.endpoint.is_none()
+                    && wire.executable_path.is_none()
+                    && wire.headless.is_none() =>
+            {
+                Ok(Self::Reuse { options })
+            }
+            _ => Err(D::Error::custom("invalid scope source")),
+        }
+    }
 }
 
 /// One native client owns one resource scope. Capabilities remain narrow until
@@ -808,16 +1460,23 @@ pub struct ClientBrowser {
     startup_uncertain: Arc<std::sync::atomic::AtomicBool>,
     startup_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     connection_watch: ConnectionWatch,
+    tasks: Arc<super::client_tasks::RetainedTasks>,
+    observation: Arc<super::client_observation_dispatch::ObservationDispatch>,
+    #[cfg(feature = "acceptance-faults")]
+    faults: Arc<super::client_test_faults::FaultController>,
 }
 impl ClientBrowser {
     pub fn new(broker: Arc<super::client_session::ClientSession>) -> Self {
+        let refs = Arc::new(Mutex::new(super::element::RefMap::new()));
+        let observation =
+            super::client_observation_dispatch::ObservationDispatch::new(refs.clone());
         Self {
             broker,
             event_sink: std::sync::OnceLock::new(),
             gate: Arc::new(ExecutionGate::default()),
             owner: Arc::new(tokio::sync::Mutex::new(None)),
             retained_browser: Arc::new(tokio::sync::Mutex::new(None)),
-            refs: Arc::new(Mutex::new(super::element::RefMap::new())),
+            refs,
             blobs: Arc::new(
                 super::client_blobs::BlobStore::new(Default::default())
                     .expect("fixed valid native blob limits"),
@@ -827,6 +1486,10 @@ impl ClientBrowser {
             startup_uncertain: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             startup_task: tokio::sync::Mutex::new(None),
             connection_watch: Arc::new(tokio::sync::Mutex::new(None)),
+            tasks: Arc::new(super::client_tasks::RetainedTasks::default()),
+            observation,
+            #[cfg(feature = "acceptance-faults")]
+            faults: Arc::new(super::client_test_faults::FaultController::default()),
         }
     }
 
@@ -835,11 +1498,14 @@ impl ClientBrowser {
         request: OpenRequest,
         operation: super::client_session::OperationLease,
     ) -> Result<serde_json::Value, ProtocolError> {
+        // Persistent detach-only cleanup needs a proven pause settlement path;
+        // do not adopt or navigate a host page before that contract is wired.
         let transition = self.lifecycle.clone().lock_owned().await;
         if self.owner.lock().await.is_some() {
             return Err(ProtocolError::InvalidArguments);
         }
-        if !matches!(request, OpenRequest::Reuse {}) && self.retained_browser.lock().await.is_some()
+        if !matches!(request, OpenRequest::Reuse { .. })
+            && self.retained_browser.lock().await.is_some()
         {
             return Err(ProtocolError::InvalidArguments);
         }
@@ -867,15 +1533,32 @@ impl ClientBrowser {
         // its resources instead of publishing into an already closed scope.
         *task_slot = Some(tokio::spawn(async move {
             let _transition = transition;
+            let options = match &request {
+                OpenRequest::Launch { options, .. }
+                | OpenRequest::Connect { options, .. }
+                | OpenRequest::Reuse { options } => options.clone(),
+            };
+            let mut failed_persistent = None;
             let created = match request {
-                OpenRequest::Reuse {} => match retained_browser.lock().await.take() {
+                OpenRequest::Reuse { .. } => match retained_browser.lock().await.take() {
                     Some(manager) => OwnedBrowser::isolated(manager).await,
                     None => Err(ProtocolError::ScopeUnavailable),
                 },
-                OpenRequest::Connect { endpoint } => OwnedBrowser::connect(&endpoint, None).await,
+                OpenRequest::Connect {
+                    endpoint,
+                    persistent,
+                    ..
+                } => {
+                    if persistent {
+                        OwnedBrowser::connect_persistent(&endpoint, &mut failed_persistent).await
+                    } else {
+                        OwnedBrowser::connect(&endpoint, None).await
+                    }
+                }
                 OpenRequest::Launch {
                     executable_path,
                     headless,
+                    ..
                 } => {
                     OwnedBrowser::launch(
                         super::cdp::chrome::LaunchOptions {
@@ -889,17 +1572,31 @@ impl ClientBrowser {
                 }
             };
             let result = match created {
-                Err(error) => Err(error),
+                Err(error) => {
+                    if let Some(mut resource) = failed_persistent {
+                        if resource.close().await.is_err() {
+                            *owner.lock().await = Some(resource);
+                        } else {
+                            uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                    Err(error)
+                }
                 Ok(mut resource) => {
                     let identity = resource.identity_scope.clone();
+                    let recovery = resource.recovery_identity();
                     let authority = match resource
                         .initialize_runtime(
                             gate.clone(),
                             broker,
                             event_sink.clone(),
                             blobs,
-                            &operation,
-                            &retirement,
+                            RuntimeInitialization {
+                                operation: &operation,
+                                retirement: &retirement,
+                                options: &options,
+                                replacement: None,
+                            },
                         )
                         .await
                     {
@@ -929,9 +1626,17 @@ impl ClientBrowser {
                         if std::time::Instant::now() >= operation.deadline {
                             break Err(ProtocolError::DeadlineExceeded);
                         }
-                        match authority.publish() {
+                        match resource
+                            .runtime
+                            .as_ref()
+                            .ok_or(ProtocolError::ScopeUnavailable)
+                            .and_then(|runtime| runtime.enrollment.publish_initialized(&authority))
+                        {
                             Ok(epoch) => break Ok(epoch),
                             Err(error) => {
+                                if error != ProtocolError::ScopeUnavailable {
+                                    break Err(error);
+                                }
                                 if std::time::Instant::now() >= operation.deadline
                                     || *operation.cancellation.borrow()
                                         != super::client_session::CancelSignal::None
@@ -947,7 +1652,23 @@ impl ClientBrowser {
                     };
                     match published {
                         Ok(_) => {
+                            if let Err(error) = resource
+                                .persistent_probe
+                                .commit(resource.manager.active_target_id().unwrap_or_default())
+                            {
+                                *current = Some(resource);
+                                let _ = send.send(Err(error));
+                                return;
+                            }
                             let mut watch_slot = connection_watch.lock().await;
+                            // A completed borrowed scope may reopen on a different
+                            // connection. Join the old event-only watcher before
+                            // installing the exact current connection's watcher.
+                            if let Some(previous) = watch_slot.as_mut() {
+                                previous.abort();
+                                let _ = previous.await;
+                            }
+                            *watch_slot = None;
                             if watch_slot.is_none() {
                                 {
                                     let sink = event_sink;
@@ -972,7 +1693,9 @@ impl ClientBrowser {
                             drop(watch_slot);
                             *current = Some(resource);
                             uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
-                            Ok(serde_json::json!({"identityScope": identity}))
+                            Ok(
+                                serde_json::json!({"identityScope": identity, "recoveryIdentity": recovery}),
+                            )
                         }
                         Err(error) => {
                             drop(current);
@@ -1011,6 +1734,8 @@ impl ClientBrowser {
             return Err(ProtocolError::StaleScope);
         }
         self.stop_enrollment(false)?;
+        #[cfg(feature = "acceptance-faults")]
+        self.faults.retire_scope(&identity_scope)?;
         self.gate.begin_transition()?;
         self.gate.drained().await?;
         let mut slot = self.startup_task.lock().await;
@@ -1020,11 +1745,13 @@ impl ClientBrowser {
         let owner = self.owner.clone();
         let retained = self.retained_browser.clone();
         let refs = self.refs.clone();
+        let tasks = self.tasks.clone();
         let uncertain = self.startup_uncertain.clone();
         let (send, receive) = tokio::sync::oneshot::channel();
         *slot = Some(tokio::spawn(async move {
             let _transition = transition;
             let result = async {
+                let task_cleanup_failed = tasks.drain().await.is_err();
                 // Revoke exact authority while the resource is still journaled.
                 // A poisoned map must not drop a live browser manager.
                 refs.lock()
@@ -1037,6 +1764,10 @@ impl ClientBrowser {
                     *owner.lock().await = Some(resource);
                     return Err(error);
                 }
+                if task_cleanup_failed {
+                    *owner.lock().await = Some(resource);
+                    return Err(ProtocolError::CleanupFailed);
+                }
                 if let Err(error) = gate.commit_transition() {
                     if resource.manager.close().await.is_err() {
                         *owner.lock().await = Some(resource);
@@ -1045,7 +1776,9 @@ impl ClientBrowser {
                     uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
                     return Err(error);
                 }
-                *retained.lock().await = Some(resource.manager);
+                if resource.owns_context {
+                    *retained.lock().await = Some(resource.manager);
+                }
                 uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
                 Ok(serde_json::Value::Null)
             }
@@ -1088,10 +1821,76 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             .map_err(|_| ProtocolError::InvalidArguments)
     }
 
+    fn prepare_decision(
+        &self,
+        generation: u64,
+        token: &str,
+        decision: &super::client_protocol::Decision,
+    ) -> Result<(), ProtocolError> {
+        let Some(handle) = decision.body_handle() else {
+            return Ok(());
+        };
+        let identity_scope = self.broker.decision_resource_scope(generation, token)?;
+        self.blobs
+            .reserve(
+                &super::client_blobs::BlobScope {
+                    generation,
+                    identity_scope,
+                },
+                handle,
+                token,
+            )
+            .map_err(|error| match error {
+                super::client_blobs::BlobError::StaleScope => ProtocolError::StaleScope,
+                super::client_blobs::BlobError::Closed => ProtocolError::ScopeUnavailable,
+                super::client_blobs::BlobError::QuotaExceeded => ProtocolError::CapacityExceeded,
+                super::client_blobs::BlobError::Reserved => ProtocolError::PolicyDenied,
+                _ => ProtocolError::InvalidArguments,
+            })
+    }
+
+    fn finish_decision(&self, token: &str, accepted: bool) -> Result<(), ProtocolError> {
+        if !accepted {
+            self.blobs
+                .rollback(token)
+                .map_err(|_| ProtocolError::CleanupFailed)?;
+        }
+        Ok(())
+    }
+
     fn capabilities(&self) -> Vec<String> {
         // Capabilities describe implemented, wired candidate contracts. External
         // acceptance evidence separately determines release readiness.
-        vec!["browser.scope/1".into(), "browser.evaluate/1".into()]
+        let capabilities = [
+            "browser.scope/1",
+            "browser.lifecycle/1",
+            "browser.evaluate/1",
+            "browser.page/1",
+            "browser.observe/1",
+            "browser.query/1",
+            "browser.actions/1",
+            "browser.network/1",
+            "browser.dialog/1",
+            "browser.download/1",
+            "browser.capture/1",
+            "browser.state/1",
+            "browser.recording/1",
+            "browser.blobs/1",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect::<Vec<_>>();
+        #[cfg(feature = "acceptance-faults")]
+        {
+            capabilities
+                .into_iter()
+                .chain(std::iter::once("acceptance.faults/1".into()))
+                .collect()
+        }
+        #[cfg(not(feature = "acceptance-faults"))]
+        {
+            capabilities
+        }
     }
 
     async fn execute(
@@ -1138,9 +1937,40 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             }
             Some(scope)
         };
+        let resource_command = matches!(
+            command.as_str(),
+            "blob.create"
+                | "blob.write"
+                | "blob.seal"
+                | "blob.release"
+                | "blob.read"
+                | "network.routes.replace"
+                | "network.responses.subscribe"
+                | "network.responses.unsubscribe"
+                | "network.body.read"
+                | "network.body.release"
+                | "dialog.register"
+                | "download.subscribe"
+                | "download.unsubscribe"
+                | "download.metadata"
+                | "download.read"
+                | "download.release"
+        );
         let mutating = matches!(
             command.as_str(),
-            "scope.open" | "scope.end" | "page.evaluate"
+            "scope.open"
+                | "scope.end"
+                | "page.evaluate"
+                | "page.navigate"
+                | "page.reload"
+                | "page.back"
+                | "page.forward"
+                | "context.cookies.set"
+                | "context.init-script"
+                | "context.media"
+                | "context.viewport"
+                | "input.keyboard"
+                | "input.mouse"
         );
         let prepared = match command.as_str() {
             "scope.open" => {
@@ -1162,7 +1992,43 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     effects: Effects::NotDispatched,
                 }
             }
-            "page.title" | "page.url" if args.is_empty() => Ok(None),
+            _ if resource_command => Ok(None),
+            #[cfg(feature = "acceptance-faults")]
+            "test.fault.arm" | "test.fault.status" | "test.fault.release" => Ok(None),
+            "browser.perform"
+            | "browser.pointer"
+            | "browser.keyboard.type"
+            | "browser.keyboard.press"
+            | "recording.start"
+            | "recording.stop" => Ok(None),
+            "state.restore" => Ok(None),
+            "scope.reconnect" => {
+                serde_json::from_value::<ReconnectRequest>(serde_json::Value::Object(args.clone()))
+                    .map(|_| None)
+            }
+            "scope.configure" | "browser.observe" | "browser.query" | "fixture.query"
+            | "capture.screenshot" => Ok(None),
+            "page.navigate"
+            | "page.reload"
+            | "page.back"
+            | "page.forward"
+            | "context.cookies.get"
+            | "context.cookies.set"
+            | "context.init-script"
+            | "context.media"
+            | "context.viewport"
+            | "input.keyboard"
+            | "input.mouse" => Ok(None),
+            "page.title"
+            | "page.url"
+            | "session.environment"
+            | "state.capture"
+            | "scope.restart"
+            | "scope.reset"
+                if args.is_empty() =>
+            {
+                Ok(None)
+            }
             "page.evaluate"
                 if args.len() == 2
                     && args.get("source").is_some_and(serde_json::Value::is_string)
@@ -1170,7 +2036,13 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             {
                 Ok(None)
             }
-            "page.title" | "page.url" | "page.evaluate" => {
+            "page.title"
+            | "page.url"
+            | "page.evaluate"
+            | "session.environment"
+            | "state.capture"
+            | "scope.restart"
+            | "scope.reset" => {
                 return NativeOutcome {
                     result: Err(ProtocolError::InvalidArguments),
                     effects: Effects::NotDispatched,
@@ -1207,6 +2079,645 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 }
             }
         }
+        if matches!(command.as_str(), "scope.reset" | "state.restore") {
+            let identity = captured_scope.unwrap_or_default();
+            let restore = if command == "state.restore" {
+                args.insert("identityScope".into(), identity.clone().into());
+                Some(serde_json::Value::Object(args))
+            } else {
+                None
+            };
+            return self.replace_scope(identity, restore, lease).await;
+        }
+        if command == "scope.reconnect" {
+            let request =
+                match serde_json::from_value::<ReconnectRequest>(serde_json::Value::Object(args)) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return NativeOutcome {
+                            result: Err(ProtocolError::InvalidArguments),
+                            effects: Effects::NotDispatched,
+                        }
+                    }
+                };
+            return self
+                .reconnect_scope(captured_scope.unwrap_or_default(), request, lease)
+                .await;
+        }
+        if command == "scope.restart" {
+            return self
+                .restart_pages(captured_scope.unwrap_or_default(), lease)
+                .await;
+        }
+        #[cfg(feature = "acceptance-faults")]
+        if matches!(
+            command.as_str(),
+            "test.fault.arm" | "test.fault.status" | "test.fault.release"
+        ) {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Arm {
+                phase: super::client_test_faults::Phase,
+            }
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Token {
+                token: String,
+            }
+            let result = async {
+                let page = self.page_lease(lease.is_callback).await?;
+                if captured_scope.as_deref() != Some(page.identity_scope.as_str()) { return Err(ProtocolError::StaleScope); }
+                page.permit.check()?;
+                // Test controls intentionally bypass UI admission so a held
+                // protected transaction can be inspected and released.
+                let value = serde_json::Value::Object(args);
+                if command == "test.fault.arm" {
+                    let arm: Arm = serde_json::from_value(value).map_err(|_| ProtocolError::InvalidArguments)?;
+                    Ok(serde_json::json!({"token": self.faults.arm(&page.identity_scope, arm.phase)?}))
+                } else {
+                    let token: Token = serde_json::from_value(value).map_err(|_| ProtocolError::InvalidArguments)?;
+                    if command == "test.fault.status" {
+                        serde_json::to_value(self.faults.status(&page.identity_scope, &token.token)?).map_err(|_| ProtocolError::BrowserFailure)
+                    } else {
+                        self.faults.release(&page.identity_scope, &token.token)?;
+                        Ok(serde_json::json!({"released":true}))
+                    }
+                }
+            }.await;
+            let effects = if result.is_ok() {
+                Effects::Completed
+            } else {
+                Effects::NotDispatched
+            };
+            return NativeOutcome { result, effects };
+        }
+        if command == "scope.configure" {
+            let request: ConfigureRequest =
+                match serde_json::from_value(serde_json::Value::Object(args)) {
+                    Ok(request) => request,
+                    Err(_) => {
+                        return NativeOutcome {
+                            result: Err(ProtocolError::InvalidArguments),
+                            effects: Effects::NotDispatched,
+                        }
+                    }
+                };
+            let captured = async {
+                let page = self.page_lease(lease.is_callback).await?;
+                if captured_scope.as_deref() != Some(page.identity_scope.as_str()) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let owner = self.owner.lock().await;
+                let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+                if owner.identity_scope != page.identity_scope {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let runtime = owner
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                request.validate(runtime.block_service_workers)?;
+                Ok((
+                    page,
+                    runtime.configuration.clone(),
+                    runtime.network.clone(),
+                    runtime.enrollment.config_gate(),
+                    owner.context_id.clone(),
+                ))
+            }
+            .await;
+            let (page, configuration, network, config_gate, context_id) = match captured {
+                Ok(value) => value,
+                Err(error) => {
+                    return NativeOutcome {
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let receive = self.tasks.start(page.identity_scope.clone(), page.targets.clone(), async move {
+                let mut dispatched = false;
+                let result = async {
+                    page.permit.check()?;
+                    let mut cancellation = lease.cancellation.clone();
+                    if *cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
+                    let _configuration = tokio::select! {
+                        biased;
+                        _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                        guard = tokio::time::timeout_at(lease.deadline.into(), config_gate.lock()) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
+                    };
+                    page.permit.check()?;
+                    {
+                        let mut state = configuration.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+                        if state.configuring || state.policy.is_some() { return Err(ProtocolError::InvalidArguments); }
+                        state.configuring = true;
+                    }
+                    let downloads = request.downloads.clone();
+                    let source = match request.downloads {
+                        DownloadConfiguration::Local => {
+                            let directory = tempfile::Builder::new().prefix("agent-browser-download-").tempdir().map_err(|_| ProtocolError::BrowserFailure)?;
+                            let path = std::fs::canonicalize(directory.path()).map_err(|_| ProtocolError::BrowserFailure)?;
+                            configuration.lock().map_err(|_| ProtocolError::ScopeUnavailable)?.download_directory = Some(directory);
+                            super::client_network::DownloadSource::Local(path)
+                        },
+                        DownloadConfiguration::Provider { remote_directory } => super::client_network::DownloadSource::Provider(remote_directory),
+                    };
+                    // Journal directory before the first browser effect. The
+                    // retained scope owner keeps it even on an unknown ACK.
+                    dispatched = true;
+                    network.configure_downloads(&context_id, source, &lease).await?;
+                    page.permit.check()?;
+                    let mut state = configuration.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    state.policy = Some(super::client_observation_dispatch::ReadPolicy { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector });
+                    state.downloads = Some(downloads);
+                    state.configuring = false;
+                    Ok(serde_json::Value::Null)
+                }.await;
+                let failed = result.is_err() && dispatched;
+                if failed { page.targets.seal(); }
+                let effects = if failed { Effects::Unknown } else if result.is_err() { Effects::NotDispatched } else { Effects::Completed };
+                (NativeOutcome { result, effects }, failed)
+            }).await;
+            return await_retained(receive).await;
+        }
+        if matches!(
+            command.as_str(),
+            "browser.observe" | "browser.query" | "fixture.query" | "capture.screenshot"
+        ) {
+            use super::client_observation_dispatch::{
+                DispatchContext, DispatchRequest, QueryPurpose, QueryRequest,
+            };
+            let value = serde_json::Value::Object(args);
+            let request = match command.as_str() {
+                "browser.observe" => serde_json::from_value(value).map(DispatchRequest::Observe),
+                "capture.screenshot" => {
+                    serde_json::from_value(value).map(DispatchRequest::Screenshot)
+                }
+                _ => serde_json::from_value(value).map(|options| {
+                    DispatchRequest::Query(QueryRequest {
+                        options,
+                        purpose: if command == "fixture.query" {
+                            QueryPurpose::Fixture
+                        } else {
+                            QueryPurpose::Protected
+                        },
+                    })
+                }),
+            };
+            let request = match request {
+                Ok(request) => request,
+                Err(_) => {
+                    return NativeOutcome {
+                        result: Err(ProtocolError::InvalidArguments),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let captured = async {
+                let page = self.page_lease(lease.is_callback).await?;
+                if captured_scope.as_deref() != Some(page.identity_scope.as_str()) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let owner = self.owner.lock().await;
+                let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+                if owner.identity_scope != page.identity_scope {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let runtime = owner
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                if !runtime
+                    .page_active
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                let policy = runtime
+                    .configuration
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    .policy
+                    .clone()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                Ok(DispatchContext {
+                    page,
+                    ui: owner.ui.clone(),
+                    blobs: runtime.blobs.clone(),
+                    scope: runtime.scope.clone(),
+                    policy,
+                    lifecycle_known_active: true,
+                    #[cfg(feature = "acceptance-faults")]
+                    faults: self.faults.clone(),
+                })
+            }
+            .await;
+            let context = match captured {
+                Ok(context) => context,
+                Err(error) => {
+                    return NativeOutcome {
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let observation = self.observation.clone();
+            let receive = self
+                .tasks
+                .start(
+                    context.scope.identity_scope.clone(),
+                    context.page.targets.clone(),
+                    async move {
+                        if let Err(error) = context.page.permit.check() {
+                            return (
+                                NativeOutcome {
+                                    result: Err(error),
+                                    effects: Effects::NotDispatched,
+                                },
+                                false,
+                            );
+                        }
+                        // The accepted outer task owns the inner retained transaction;
+                        // registry rejection cannot leave an already spawned journal.
+                        let task = observation.start(context, request, lease);
+                        let output = task.result.await;
+                        let cleanup = task.join.await;
+                        let cleanup_failed = !matches!(cleanup, Ok(Ok(())))
+                            || matches!(&output, Ok(Err(failure)) if failure.cleanup_integrity_lost);
+                        let outcome = match output {
+                            Ok(Ok(value)) if !cleanup_failed => NativeOutcome {
+                                result: Ok(value),
+                                effects: Effects::Completed,
+                            },
+                            Ok(Err(failure)) => NativeOutcome {
+                                result: Err(failure.error),
+                                effects: Effects::NotDispatched,
+                            },
+                            _ => NativeOutcome {
+                                result: Err(ProtocolError::CleanupFailed),
+                                effects: Effects::Unknown,
+                            },
+                        };
+                        let cleanup_failed = cleanup_failed
+                            || matches!(outcome.result, Err(ProtocolError::CleanupFailed));
+                        (outcome, cleanup_failed)
+                    },
+                )
+                .await;
+            return await_retained(receive).await;
+        }
+        if matches!(
+            command.as_str(),
+            "browser.perform"
+                | "browser.pointer"
+                | "browser.keyboard.type"
+                | "browser.keyboard.press"
+                | "recording.start"
+                | "recording.stop"
+        ) {
+            let captured = async {
+                let page = self.page_lease(lease.is_callback).await?;
+                if captured_scope.as_deref() != Some(page.identity_scope.as_str()) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let owner = self.owner.lock().await;
+                let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+                if owner.identity_scope != page.identity_scope {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let runtime = owner
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                if !matches!(command.as_str(), "recording.start" | "recording.stop")
+                    && !runtime
+                        .page_active
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                Ok((
+                    page,
+                    owner.page_state.clone(),
+                    owner.ui.clone(),
+                    runtime.actions.clone(),
+                    runtime.input_gate.clone(),
+                    runtime.blobs.clone(),
+                    runtime.page_active.clone(),
+                    runtime.activation.clone(),
+                ))
+            }
+            .await;
+            let (page, page_state, ui, actions, input_gate, blobs, page_active, activation) =
+                match captured {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return NativeOutcome {
+                            result: Err(error),
+                            effects: Effects::NotDispatched,
+                        }
+                    }
+                };
+            // The action helper validates an internal captured identity, not a
+            // purpose or authority chosen in the command payload.
+            args.insert("identityScope".into(), page.identity_scope.clone().into());
+            let observation = self.observation.clone();
+            let receive = self.tasks.start(page.identity_scope.clone(), page.targets.clone(), async move {
+                let mut activation_dispatched = false;
+                let preflight = async {
+                    page.permit.check()?;
+                    let ui_permit = ui.enter(false, lease.is_callback, lease.deadline, lease.cancellation.clone()).await?;
+                    page.permit.check()?;
+                    let mut cancellation = lease.cancellation.clone();
+                    if *cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
+                    let input_permit = tokio::select! {
+                        biased;
+                        _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                        guard = tokio::time::timeout_at(lease.deadline.into(), input_gate.lock()) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
+                    };
+                    page.permit.check()?;
+                    if command == "recording.start" {
+                        super::client_actions::ClientActions::validate_recording_start(&page.identity_scope, &serde_json::Value::Object(args.clone()))?;
+                        activation.ensure(&page, &lease, &mut activation_dispatched).await?;
+                    }
+                    let frames = super::client_observation_dispatch::verified_frames(&page, &lease).await?;
+                    let geometry = super::client_geometry::GeometrySnapshot::capture(&page.client, &page.page_session_id, &frames, &lease).await.map_err(|error| {
+                        use super::client_geometry::GeometryError;
+                        match error {
+                            GeometryError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
+                            GeometryError::Cancelled => ProtocolError::Cancelled,
+                            GeometryError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
+                            GeometryError::StaleIdentity => ProtocolError::StaleScope,
+                            _ => ProtocolError::BrowserFailure,
+                        }
+                    })?;
+                    let (revision, refs) = observation.snapshot_for_action(&lease).await?;
+                    let sessions = frames.into_iter().filter(|frame| frame.parent_frame_id.is_some())
+                        .map(|frame| (frame.binding.frame, frame.binding.session)).collect::<std::collections::HashMap<_,_>>();
+                    Ok((ui_permit, input_permit, revision, refs, sessions, geometry))
+                }.await;
+                let (_ui, _input, revision, refs, sessions, geometry) = match preflight {
+                    Ok(value) => value,
+                    Err(error) => { let cleanup_failed = error == ProtocolError::CleanupFailed; return (NativeOutcome { result: Err(error), effects: if activation_dispatched { Effects::Unknown } else { Effects::NotDispatched } }, cleanup_failed); },
+                };
+                match actions.execute(super::client_actions::ActionContext { page:&page, operation:&lease, page_state:&page_state, refs:&refs, revision, iframe_sessions:&sessions, blobs:&blobs, geometry:&geometry }, &command, &serde_json::Value::Object(args)).await {
+                    Ok(value) => {
+                        if command == "recording.start" { page_active.store(true, std::sync::atomic::Ordering::SeqCst); }
+                        (NativeOutcome { result: Ok(value), effects: Effects::Completed }, false)
+                    },
+                    Err(failure) => {
+                        if command == "recording.start" && failure.effects != Effects::NotDispatched { page_active.store(true, std::sync::atomic::Ordering::SeqCst); }
+                        use super::client_actions::ActionReason;
+                        let error = match failure.reason {
+                            Some(ActionReason::InterceptedPointer) => ProtocolError::InterceptedPointer,
+                            Some(ActionReason::CheckedStateUnchanged) => ProtocolError::CheckedStateUnchanged,
+                            Some(ActionReason::ControlReplacedAfterClick) => ProtocolError::CheckedControlReplaced,
+                            _ => failure.error,
+                        };
+                        (NativeOutcome { result: Err(error), effects: if activation_dispatched && failure.effects == Effects::NotDispatched { Effects::Completed } else { failure.effects } }, failure.cleanup_failed)
+                    }
+                }
+            }).await;
+            return await_retained(receive).await;
+        }
+        if command == "state.capture" {
+            let captured = async {
+                if lease.is_callback {
+                    return Err(ProtocolError::InvalidArguments);
+                }
+                let page = self.page_lease(false).await?;
+                if captured_scope.as_deref() != Some(page.identity_scope.as_str()) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let owner = self.owner.lock().await;
+                let owner = owner
+                    .as_ref()
+                    .filter(|owner| owner.identity_scope == page.identity_scope)
+                    .ok_or(ProtocolError::StaleScope)?;
+                let runtime = owner
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                Ok((
+                    page,
+                    owner.page_state.clone(),
+                    owner.ui.clone(),
+                    runtime.enrollment.clone(),
+                    runtime.blobs.clone(),
+                    runtime.scope.clone(),
+                    if owner.owns_context {
+                        super::client_state_dispatch::StateContextKind::Isolated
+                    } else {
+                        super::client_state_dispatch::StateContextKind::Persistent
+                    },
+                ))
+            }
+            .await;
+            let (page, page_state, ui, enrollment, blobs, scope, context_kind) = match captured {
+                Ok(value) => value,
+                Err(error) => {
+                    return NativeOutcome {
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let receive = self
+                .tasks
+                .start(
+                    page.identity_scope.clone(),
+                    page.targets.clone(),
+                    async move {
+                        use super::client_state_dispatch::CapturedStateContext;
+                        let admission = async {
+                            page.permit.check()?;
+                            let permit = ui
+                                .enter(true, false, lease.deadline, lease.cancellation.clone())
+                                .await?;
+                            page.permit.check()?;
+                            let attestation = enrollment.attest_capture(&lease).await?;
+                            let origins = page_state.visited_origins()?;
+                            Ok((permit, attestation, origins))
+                        }
+                        .await;
+                        let (ui_permit, attestation, origins) = match admission {
+                            Ok(value) => value,
+                            Err(error) => {
+                                return (
+                                    NativeOutcome {
+                                        result: Err(error),
+                                        effects: Effects::NotDispatched,
+                                    },
+                                    false,
+                                )
+                            }
+                        };
+                        let context = match CapturedStateContext::new(
+                            &page,
+                            &ui,
+                            &ui_permit,
+                            super::client_state::NativeStateContext {
+                                client: &page.client,
+                                context_id: &page.targets.context_id,
+                                targets: &page.targets,
+                                origins: &origins,
+                                origins_complete: true,
+                            },
+                            context_kind,
+                        ) {
+                            Ok(context) => context,
+                            Err(failure) => {
+                                return (
+                                    NativeOutcome {
+                                        result: Err(failure.error),
+                                        effects: Effects::NotDispatched,
+                                    },
+                                    failure.cleanup_integrity_lost,
+                                )
+                            }
+                        };
+                        match super::client_state_dispatch::capture_state(
+                            &context, &blobs, &scope, &lease,
+                        )
+                        .await
+                        {
+                            Err(failure) => (
+                                NativeOutcome {
+                                    result: Err(failure.error),
+                                    effects: Effects::NotDispatched,
+                                },
+                                failure.cleanup_integrity_lost,
+                            ),
+                            Ok(captured) => {
+                                let checked = async {
+                                    enrollment
+                                        .verify_capture_attestation(&attestation, &lease)
+                                        .await?;
+                                    if page_state.visited_origins()? != origins {
+                                        return Err(ProtocolError::ScopeUnavailable);
+                                    }
+                                    page.permit.check()?;
+                                    serde_json::to_value(&captured)
+                                        .map_err(|_| ProtocolError::BrowserFailure)
+                                }
+                                .await;
+                                match checked {
+                                    Ok(value) => (
+                                        NativeOutcome {
+                                            result: Ok(value),
+                                            effects: Effects::Completed,
+                                        },
+                                        false,
+                                    ),
+                                    Err(error) => {
+                                        let cleanup_failed =
+                                            blobs.release(&scope, &captured.blob.handle).is_err();
+                                        (
+                                            NativeOutcome {
+                                                result: Err(error),
+                                                effects: Effects::NotDispatched,
+                                            },
+                                            cleanup_failed,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    },
+                )
+                .await;
+            return await_retained(receive).await;
+        }
+        if resource_command {
+            // The resource helper owns exact effect classification. In particular,
+            // rejected resource validation must not become a fictitious browser
+            // mutation, and callback resource reads must not wait on the UI gate.
+            let captured = async {
+                let page = self.page_lease(lease.is_callback).await?;
+                if captured_scope.as_deref() != Some(page.identity_scope.as_str()) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let owner = self.owner.lock().await;
+                let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+                if owner.identity_scope != page.identity_scope {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let runtime = owner
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                Ok((
+                    page,
+                    runtime.network.clone(),
+                    runtime.blobs.clone(),
+                    runtime.scope.clone(),
+                ))
+            }
+            .await;
+            let (page, network, blobs, scope) = match captured {
+                Ok(captured) => captured,
+                Err(error) => {
+                    return NativeOutcome {
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let broker = self.broker.clone();
+            let receive = self
+                .tasks
+                .start(
+                    page.identity_scope.clone(),
+                    page.targets.clone(),
+                    async move {
+                        if let Err(error) = page.permit.check() {
+                            return (
+                                NativeOutcome {
+                                    result: Err(error),
+                                    effects: Effects::NotDispatched,
+                                },
+                                false,
+                            );
+                        }
+                        let outcome = match super::client_resource_dispatch::execute(
+                            super::client_resource_dispatch::ResourceContext {
+                                network: &network,
+                                blobs: &blobs,
+                                scope: &scope,
+                                operation: &lease,
+                                permit: &page.permit,
+                            },
+                            &command,
+                            &serde_json::Value::Object(args),
+                        )
+                        .await
+                        {
+                            Ok(value) => NativeOutcome {
+                                result: Ok(value),
+                                effects: Effects::Completed,
+                            },
+                            Err(failure) => {
+                                if failure.error == ProtocolError::CleanupFailed
+                                    || failure.effects == Effects::Unknown
+                                {
+                                    page.targets.seal();
+                                    let _ = broker.quarantine();
+                                }
+                                NativeOutcome {
+                                    result: Err(failure.error),
+                                    effects: failure.effects,
+                                }
+                            }
+                        };
+                        let cleanup_failed =
+                            matches!(outcome.result, Err(ProtocolError::CleanupFailed));
+                        (outcome, cleanup_failed)
+                    },
+                )
+                .await;
+            return await_retained(receive).await;
+        }
+
         let result = if let Some(request) = prepared {
             self.open(
                 request,
@@ -1228,24 +2739,69 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             )
             .await
         } else {
-            match self.page_lease(lease.is_callback).await {
-                Err(error) => Err(error),
-                Ok(page) => {
-                    if captured_scope.as_deref() != Some(page.identity_scope.as_str()) {
-                        return NativeOutcome {
-                            result: Err(ProtocolError::StaleScope),
-                            effects: Effects::NotDispatched,
-                        };
+            let page = match self.page_lease(lease.is_callback).await {
+                Ok(page) if captured_scope.as_deref() == Some(page.identity_scope.as_str()) => page,
+                Ok(_) => {
+                    return NativeOutcome {
+                        result: Err(ProtocolError::StaleScope),
+                        effects: Effects::NotDispatched,
                     }
-                    async {
-                        let (page_state, ui) = {
-                            let owner = self.owner.lock().await;
-                            let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
-                            if owner.identity_scope != page.identity_scope {
-                                return Err(ProtocolError::StaleScope);
-                            }
-                            (owner.page_state.clone(), owner.ui.clone())
-                        };
+                }
+                Err(error) => {
+                    return NativeOutcome {
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let captured = {
+                let owner = self.owner.lock().await;
+                owner
+                    .as_ref()
+                    .filter(|owner| owner.identity_scope == page.identity_scope)
+                    .and_then(|owner| {
+                        owner.runtime.as_ref().map(|runtime| {
+                            (
+                                owner.page_state.clone(),
+                                owner.ui.clone(),
+                                runtime.enrollment.config_gate(),
+                                runtime.page_active.clone(),
+                                runtime.input_gate.clone(),
+                                runtime.creation_options.user_agent.clone(),
+                                runtime.network.clone(),
+                                runtime.enrollment.clone(),
+                                runtime.activation.clone(),
+                            )
+                        })
+                    })
+            };
+            let Some((
+                page_state,
+                ui,
+                config_gate,
+                page_active,
+                input_gate,
+                configured_user_agent,
+                network,
+                enrollment,
+                activation,
+            )) = captured
+            else {
+                return NativeOutcome {
+                    result: Err(ProtocolError::StaleScope),
+                    effects: Effects::NotDispatched,
+                };
+            };
+            let broker = self.broker.clone();
+            let receive = self.tasks.start(page.identity_scope.clone(), page.targets.clone(), async move {
+                if let Err(error) = page.permit.check() {
+                    return (NativeOutcome { result: Err(error), effects: Effects::NotDispatched }, false);
+                }
+                let mut dispatched = false;
+                let result = async {
+                        if command != "page.navigate" && command != "session.environment" && !command.starts_with("context.") && !page_active.load(std::sync::atomic::Ordering::SeqCst) {
+                            return Err(ProtocolError::ScopeUnavailable);
+                        }
                         let _ui = ui
                             .enter(
                                 false,
@@ -1255,22 +2811,93 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             )
                             .await?;
                         page.permit.check()?;
+                        // Enrollment and context changes share only this narrow
+                        // configuration boundary; navigation and callback reads
+                        // must never hold it while waiting on application work.
+                        let _configuration = if matches!(
+                            command.as_str(),
+                            "context.init-script" | "context.media" | "context.viewport"
+                        ) {
+                            let mut cancellation = lease.cancellation.clone();
+                            if *cancellation.borrow() != super::client_session::CancelSignal::None {
+                                return Err(ProtocolError::Cancelled);
+                            }
+                            Some(tokio::select! {
+                                biased;
+                                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                                result = tokio::time::timeout_at(lease.deadline.into(), config_gate.lock()) =>
+                                    result.map_err(|_| ProtocolError::DeadlineExceeded)?,
+                            })
+                        } else {
+                            None
+                        };
+                        page.permit.check()?;
+                        let _input = if matches!(command.as_str(), "input.keyboard" | "input.mouse") {
+                            let mut cancellation = lease.cancellation.clone();
+                            if *cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
+                            Some(tokio::select! {
+                                biased;
+                                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                                guard = tokio::time::timeout_at(lease.deadline.into(), input_gate.lock()) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
+                            })
+                        } else { None };
+                        if command == "session.environment" {
+                            return environment_facts(&page, &lease, configured_user_agent.as_deref()).await;
+                        }
+                        let sessions = page
+                            .targets
+                            .inventory()?
+                            .1
+                            .into_iter()
+                            .filter(|target| {
+                                target.purpose
+                                    == Some(super::client_targets::TargetPurpose::Application)
+                                    && matches!(target.kind.as_str(), "page" | "iframe")
+                            })
+                            .map(|target| target.session_id)
+                            .collect::<Vec<_>>();
+                        if command == "page.navigate" {
+                            super::client_page::ClientPageState::validate_navigation(&serde_json::Value::Object(args.clone()))?;
+                            activation.ensure(&page, &lease, &mut dispatched).await?;
+                        }
                         // The same native primitive implements both direct API
                         // dispatch and callback child execution; no second JS reader.
-                        page_state
+                        if command == "page.navigate" { page_active.store(true, std::sync::atomic::Ordering::SeqCst); }
+                        let navigation = if matches!(command.as_str(), "page.navigate" | "page.back" | "page.forward" | "page.reload") {
+                            Some(network.begin_app_navigation(&page, &lease)?)
+                        } else { None };
+                        dispatched = true;
+                        let output = page_state
                             .execute(
                                 &page,
-                                &[],
+                                &sessions,
                                 &lease,
                                 &command,
                                 &serde_json::Value::Object(args),
                             )
-                            .await
-                    }
-                    .await
-                }
-            }
+                            .await;
+                        if navigation.is_some() {
+                            let flushed = enrollment.flush_app_events(&page, &lease).await;
+                            if output.is_ok() { flushed?; }
+                        }
+                        drop(navigation);
+                        output
+                }.await;
+                let cleanup_failed = matches!(result, Err(ProtocolError::CleanupFailed));
+                let expired = *lease.cancellation.borrow() != super::client_session::CancelSignal::None
+                    || std::time::Instant::now() >= lease.deadline;
+                let effects = if !dispatched || matches!(result, Err(ProtocolError::InvalidArguments | ProtocolError::UnsupportedCommand)) {
+                    Effects::NotDispatched
+                } else if expired || (result.is_err() && mutating) {
+                    let _ = broker.quarantine();
+                    Effects::Unknown
+                } else { Effects::Completed };
+                let result = if expired { Err(ProtocolError::Cancelled) } else { result };
+                (NativeOutcome { result, effects }, cleanup_failed)
+            }).await;
+            return await_retained(receive).await;
         };
+
         if *lease.cancellation.borrow() != super::client_session::CancelSignal::None
             || std::time::Instant::now() >= lease.deadline
         {
@@ -1280,7 +2907,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 effects: Effects::Unknown,
             };
         }
-        let effects = if result.is_err() && mutating {
+        let effects = if matches!(
+            result,
+            Err(ProtocolError::InvalidArguments | ProtocolError::UnsupportedCommand)
+        ) {
+            Effects::NotDispatched
+        } else if result.is_err() && mutating {
             let _ = self.broker.quarantine();
             Effects::Unknown
         } else {
@@ -1301,16 +2933,28 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         drop(startup);
         let _lifecycle = self.lifecycle.lock().await;
         let drain_failed = self.gate.drained().await.is_err();
-        let mut owner = self.owner.lock().await.take();
+        self.tasks.seal().await;
+        let task_cleanup_failed = self.tasks.drain().await.is_err();
+        // Keep both journals in owner storage across cancellation or failed
+        // final cleanup. A local take would drop unresolved retained resources.
+        let mut owner = self.owner.lock().await;
         let cleaned = match owner.as_mut() {
             Some(owner) => owner.close().await,
             None => Ok(()),
         };
-        let mut retained = self.retained_browser.lock().await.take();
+        if cleaned.is_ok() {
+            *owner = None;
+        }
+        drop(owner);
+        let mut retained = self.retained_browser.lock().await;
         let retained_failed = match retained.as_mut() {
             Some(manager) => manager.close().await.is_err(),
             None => false,
         };
+        if !retained_failed {
+            *retained = None;
+        }
+        drop(retained);
         // This task only watches native connection evidence and publishes an
         // event. Stopping it never abandons CDP/resource cleanup. Retain the
         // handle until its cancellation has settled.
@@ -1330,6 +2974,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             || stop_failed
             || watch_failed
             || drain_failed
+            || task_cleanup_failed
             || retained_failed
             || self
                 .startup_uncertain
@@ -1341,9 +2986,1007 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
     }
 }
 
+/// Native metadata read on the captured connection, without page source or secrets.
+async fn environment_facts(
+    page: &BrowserExecutionLease,
+    operation: &super::client_session::OperationLease,
+    configured_user_agent: Option<&str>,
+) -> Result<serde_json::Value, ProtocolError> {
+    page.permit.check()?;
+    let mut cancellation = operation.cancellation.clone();
+    if *cancellation.borrow() != super::client_session::CancelSignal::None {
+        return Err(ProtocolError::Cancelled);
+    }
+    if std::time::Instant::now() >= operation.deadline {
+        return Err(ProtocolError::DeadlineExceeded);
+    }
+    let value = tokio::select! {
+        biased;
+        _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+        value = tokio::time::timeout_at(operation.deadline.into(), page.client.send_command("Browser.getVersion", None, None)) =>
+            value.map_err(|_| ProtocolError::DeadlineExceeded)?.map_err(|_| ProtocolError::BrowserFailure)?,
+    };
+    page.permit.check()?;
+    let browser = value
+        .get("product")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && value.len() <= 1024)
+        .ok_or(ProtocolError::BrowserFailure)?;
+    let user_agent = configured_user_agent
+        .or_else(|| value.get("userAgent").and_then(serde_json::Value::as_str));
+    if user_agent.is_some_and(|value| value.len() > 16 * 1024) {
+        return Err(ProtocolError::CapacityExceeded);
+    }
+    let mut result = serde_json::json!({"identityScope": page.identity_scope, "browser": browser});
+    if let Some(user_agent) = user_agent {
+        result["userAgent"] = user_agent.into();
+    }
+    Ok(result)
+}
+
+async fn await_retained(
+    receiver: Result<
+        tokio::sync::oneshot::Receiver<super::client_transport::NativeOutcome>,
+        ProtocolError,
+    >,
+) -> super::client_transport::NativeOutcome {
+    use super::client_protocol::Effects;
+    use super::client_transport::NativeOutcome;
+    match receiver {
+        Ok(receiver) => receiver.await.unwrap_or(NativeOutcome {
+            result: Err(ProtocolError::CleanupFailed),
+            effects: Effects::Unknown,
+        }),
+        Err(error) => NativeOutcome {
+            result: Err(error),
+            effects: Effects::NotDispatched,
+        },
+    }
+}
+
+impl ClientBrowser {
+    async fn restart_pages(
+        &self,
+        scope: String,
+        operation: super::client_session::OperationLease,
+    ) -> super::client_transport::NativeOutcome {
+        use super::client_protocol::Effects;
+        use super::client_transport::NativeOutcome;
+        let captured = async {
+            if operation.is_callback { return Err(ProtocolError::InvalidArguments); }
+            let mut cancellation = operation.cancellation.clone();
+            if *cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
+            let transition = tokio::select! {
+                biased;
+                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                result = tokio::time::timeout_at(operation.deadline.into(), self.lifecycle.clone().lock_owned()) => result.map_err(|_| ProtocolError::DeadlineExceeded)?,
+            };
+            let page = self.page_lease(false).await?;
+            if page.identity_scope != scope { return Err(ProtocolError::StaleScope); }
+            let owner = self.owner.lock().await;
+            let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+            if owner.identity_scope != scope { return Err(ProtocolError::StaleScope); }
+            if !owner.owns_context && owner.borrowed_targets.is_none() { return Err(ProtocolError::UnsupportedCapability); }
+            let runtime = owner.runtime.as_ref().ok_or(ProtocolError::ScopeUnavailable)?;
+            Ok((transition, page, owner.ui.clone(), owner.page_state.clone(), runtime.enrollment.clone(), runtime.actions.clone(), runtime.input_gate.clone(), runtime.blobs.clone(), runtime.page_active.clone(), !owner.owns_context))
+        }.await;
+        let (
+            transition,
+            page,
+            ui,
+            page_state,
+            enrollment,
+            actions,
+            input_gate,
+            blobs,
+            active,
+            borrowed,
+        ) = match captured {
+            Ok(value) => value,
+            Err(error) => {
+                return NativeOutcome {
+                    result: Err(error),
+                    effects: Effects::NotDispatched,
+                }
+            }
+        };
+        let owner = self.owner.clone();
+        let gate = self.gate.clone();
+        let refs = self.refs.clone();
+        let observation = self.observation.clone();
+        let targets = page.targets.clone();
+        let event_sink = match self.event_sink.get().cloned() {
+            Some(sink) => sink,
+            None => {
+                return NativeOutcome {
+                    result: Err(ProtocolError::ScopeUnavailable),
+                    effects: Effects::NotDispatched,
+                }
+            }
+        };
+        let receive = self.tasks.start(scope.clone(), targets.clone(), async move {
+            let _transition = transition;
+            let mut effects = false;
+            let mut dirty = false;
+            let result = async {
+                page.permit.check()?;
+                let exclusive = ui.enter(true, false, operation.deadline, operation.cancellation.clone()).await?;
+                let mut cancellation = operation.cancellation.clone();
+                if *cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
+                let _input = tokio::select! {
+                    biased;
+                    _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                    result = tokio::time::timeout_at(operation.deadline.into(), input_gate.lock()) => result.map_err(|_| ProtocolError::DeadlineExceeded)?,
+                };
+                page.permit.check()?;
+                let staged = event_sink.stage_until_result(&operation, &scope)?;
+                let context = if borrowed {
+                    super::client_restart::RestartContext::new_persistent(&page, &enrollment, &ui, &exclusive, &operation)?
+                } else {
+                    super::client_restart::RestartContext::new(&page, &enrollment, &ui, &exclusive, &operation)?
+                }.with_staged_sink(staged);
+                // Capture/encoder resources settle before any old page closes.
+                effects = true;
+                page_state.release_input(&page).await.inspect_err(|_| { dirty = true; })?;
+                actions.recording_page_closing(&scope, &blobs).await.inspect_err(|_| { dirty = true; })?;
+                refs.lock().map_err(|_| ProtocolError::ScopeUnavailable)?.invalidate_all_documents();
+                let replacement = super::client_restart::replace_pages(&context).await.map_err(|failure| {
+                    dirty |= failure.cleanup_integrity_lost || failure.effects_started;
+                    failure.error
+                })?;
+                replacement.validate(&context)?;
+                actions.cleanup_scope_uploads().await.inspect_err(|_| { dirty = true; })?;
+                let (next, recovery_identity) = {
+                    let mut owner = owner.lock().await;
+                    let owner = owner.as_mut().ok_or(ProtocolError::StaleScope)?;
+                    if owner.identity_scope != scope || !Arc::ptr_eq(&owner.targets, &targets) { return Err(ProtocolError::StaleScope); }
+                    replacement.validate(&context)?;
+                    owner.manager.forget_disposed_targets(&replacement.closed_targets.iter().cloned().collect());
+                    owner.manager.register_discovered_page(&replacement.target_id, &replacement.session_id, "about:blank".into(), String::new(), "page".into());
+                    if !owner.manager.restore_target_binding(&replacement.target_id, "about:blank") || owner.manager.active_session_id().ok() != Some(replacement.session_id.as_str()) { return Err(ProtocolError::StaleScope); }
+                    if borrowed { owner.borrowed_targets = Some(vec![replacement.target_id.clone()]); }
+                    (owner.lease(gate.enter(false)?)?, owner.recovery_identity())
+                };
+                active.store(true, std::sync::atomic::Ordering::SeqCst);
+                if actions.is_recording_armed().await? {
+                    let frames = super::client_observation_dispatch::verified_frames(&next, &operation).await?;
+                    let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
+                    let (revision, references) = observation.snapshot_for_action(&operation).await?;
+                    let sessions = frames.into_iter().filter(|frame| frame.parent_frame_id.is_some()).map(|frame| (frame.binding.frame, frame.binding.session)).collect();
+                    actions.recording_page_opened(super::client_actions::ActionContext { page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, blobs:&blobs, geometry:&geometry }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
+                }
+                if *operation.cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
+                if std::time::Instant::now() >= operation.deadline { return Err(ProtocolError::DeadlineExceeded); }
+                next.permit.check()?;
+                Ok(serde_json::json!({"identityScope":scope,"recoveryIdentity":recovery_identity}))
+            }.await;
+            // Any failed destructive restart cannot be replayed against its new
+            // page. Retain the original context for normal lifecycle containment.
+            dirty |= effects && result.is_err();
+            if dirty { targets.seal(); }
+            let effect = if result.is_ok() { Effects::Completed } else if effects { Effects::Unknown } else { Effects::NotDispatched };
+            (NativeOutcome { result, effects:effect }, dirty)
+        }).await;
+        await_retained(receive).await
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReconnectRequest {
+    endpoint: String,
+    expected_browser_identity: String,
+    expected_context_identity: String,
+    expected_page_identity: String,
+}
+fn check_lifecycle_budget(
+    operation: &super::client_session::OperationLease,
+) -> Result<(), ProtocolError> {
+    if *operation.cancellation.borrow() != super::client_session::CancelSignal::None {
+        return Err(ProtocolError::Cancelled);
+    }
+    if std::time::Instant::now() >= operation.deadline {
+        return Err(ProtocolError::DeadlineExceeded);
+    }
+    Ok(())
+}
+impl ClientBrowser {
+    async fn replace_scope(
+        &self,
+        scope: String,
+        restore: Option<serde_json::Value>,
+        operation: super::client_session::OperationLease,
+    ) -> super::client_transport::NativeOutcome {
+        use super::client_protocol::Effects;
+        use super::client_transport::NativeOutcome;
+        if operation.is_callback {
+            return NativeOutcome {
+                result: Err(ProtocolError::InvalidArguments),
+                effects: Effects::NotDispatched,
+            };
+        }
+        let mut cancellation = operation.cancellation.clone();
+        if let Err(error) = check_lifecycle_budget(&operation) {
+            return NativeOutcome {
+                result: Err(error),
+                effects: Effects::NotDispatched,
+            };
+        }
+        let transition = tokio::select! {
+            biased;
+            _ = cancellation.changed() => return NativeOutcome { result:Err(ProtocolError::Cancelled), effects:Effects::NotDispatched },
+            value = tokio::time::timeout_at(operation.deadline.into(), self.lifecycle.clone().lock_owned()) => match value {
+                Ok(value) => value,
+                Err(_) => return NativeOutcome { result:Err(ProtocolError::DeadlineExceeded), effects:Effects::NotDispatched },
+            },
+        };
+        let mut slot = self.startup_task.lock().await;
+        let owner = self.owner.clone();
+        let gate = self.gate.clone();
+        let broker = self.broker.clone();
+        let retirement = self.retirement.clone();
+        let blobs = self.blobs.clone();
+        let refs = self.refs.clone();
+        let tasks = self.tasks.clone();
+        let observation = self.observation.clone();
+        let uncertain = self.startup_uncertain.clone();
+        let Some(sink) = self.event_sink.get().cloned() else {
+            return NativeOutcome {
+                result: Err(ProtocolError::ScopeUnavailable),
+                effects: Effects::NotDispatched,
+            };
+        };
+        #[cfg(feature = "acceptance-faults")]
+        let faults = self.faults.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        *slot = Some(tokio::spawn(async move {
+            let _transition = transition;
+            let mut accepted = false;
+            let result = async {
+                check_lifecycle_budget(&operation)?;
+                // The resource never leaves this journal, including partial new
+                // context creation and failed initialization/import.
+                let mut journal = owner.lock().await;
+                let resource = journal.as_mut().ok_or(ProtocolError::StaleScope)?;
+                if resource.identity_scope != scope {
+                    return Err(ProtocolError::StaleScope);
+                }
+                if !resource.owns_context {
+                    return Err(ProtocolError::UnsupportedCapability);
+                }
+                let runtime = resource
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                let options = runtime.creation_options.clone();
+                let actions = runtime.actions.clone();
+                let (policy, downloads) = {
+                    let configuration = runtime
+                        .configuration
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    (
+                        configuration
+                            .policy
+                            .clone()
+                            .ok_or(ProtocolError::ScopeUnavailable)?,
+                        configuration
+                            .downloads
+                            .clone()
+                            .ok_or(ProtocolError::ScopeUnavailable)?,
+                    )
+                };
+                let prepared = restore
+                    .as_ref()
+                    .map(|args| {
+                        super::client_state_dispatch::prepare_restore(
+                            &blobs,
+                            &runtime.scope,
+                            args,
+                            &operation,
+                        )
+                    })
+                    .transpose()
+                    .map_err(|failure| failure.error)?;
+                if resource.replacement_routes.is_some() {
+                    return Err(ProtocolError::CleanupFailed);
+                }
+                resource.replacement_routes =
+                    Some(runtime.network.capture_route_transfer(&operation)?);
+                // Registry capture is acceptance; retain it before stop can
+                // independently drain/revoke the old native network owner.
+                accepted = true;
+                uncertain.store(true, std::sync::atomic::Ordering::SeqCst);
+                let state = prepared
+                    .map(|prepared| prepared.accept(&operation))
+                    .transpose()
+                    .map_err(|failure| failure.error)?;
+                retirement
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    .stop(false);
+                #[cfg(feature = "acceptance-faults")]
+                faults.retire_scope(&scope)?;
+                gate.begin_transition()?;
+                // Owner mutex cannot remain held while admitted operations are
+                // finishing their captured ownership checks.
+                drop(journal);
+                gate.drained().await?;
+                tasks.drain().await?;
+                let mut journal = owner.lock().await;
+                let resource = journal.as_mut().ok_or(ProtocolError::StaleScope)?;
+                if resource.identity_scope != scope {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let page_config = resource.page_state.snapshot_config(&scope)?;
+                let was_recording = actions.is_recording_armed().await?;
+                resource.ui.seal();
+                resource
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?
+                    .contain_and_release_mode(true)
+                    .await?;
+                refs.lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    .invalidate_all_documents();
+                check_lifecycle_budget(&operation)?;
+                resource.replace_cleaned_context(&operation).await?;
+                let authority = resource
+                    .initialize_runtime(
+                        gate.clone(),
+                        broker,
+                        sink,
+                        blobs.clone(),
+                        RuntimeInitialization {
+                            operation: &operation,
+                            retirement: &retirement,
+                            options: &options,
+                            replacement: Some(ReplacementSeed {
+                                page_config,
+                                policy,
+                                downloads,
+                                actions: actions.clone(),
+                            }),
+                        },
+                    )
+                    .await?;
+                let expose_page = state.is_none() || was_recording;
+                {
+                    let page = resource.lease(authority.enter(&resource.targets)?)?;
+                    let exclusive = resource
+                        .ui
+                        .enter(
+                            true,
+                            false,
+                            operation.deadline,
+                            operation.cancellation.clone(),
+                        )
+                        .await?;
+                    if let Some(state) = state {
+                        let imported_origins =
+                            state.origins().map(str::to_owned).collect::<Vec<_>>();
+                        let new_runtime = resource
+                            .runtime
+                            .as_ref()
+                            .ok_or(ProtocolError::ScopeUnavailable)?;
+                        let attestation = new_runtime.enrollment.attest_capture(&operation).await?;
+                        let empty_origins = resource.page_state.visited_origins()?;
+                        if !empty_origins.is_empty() {
+                            return Err(ProtocolError::ScopeUnavailable);
+                        }
+                        new_runtime
+                            .enrollment
+                            .verify_capture_attestation(&attestation, &operation)
+                            .await?;
+                        let context = super::client_state_dispatch::CapturedStateContext::new(
+                            &page,
+                            &resource.ui,
+                            &exclusive,
+                            super::client_state::NativeStateContext {
+                                client: &page.client,
+                                targets: &page.targets,
+                                context_id: &resource.context_id,
+                                origins: &empty_origins,
+                                origins_complete: true,
+                            },
+                            super::client_state_dispatch::StateContextKind::Isolated,
+                        )
+                        .map_err(|failure| failure.error)?;
+                        state
+                            .import(&context, &operation)
+                            .await
+                            .map_err(|failure| failure.error)?;
+                        for origin in imported_origins {
+                            resource.page_state.record_origin(&page, &origin)?;
+                        }
+                    }
+                    if was_recording {
+                        let frames =
+                            super::client_observation_dispatch::verified_frames(&page, &operation)
+                                .await?;
+                        let geometry = super::client_geometry::GeometrySnapshot::capture(
+                            &page.client,
+                            &page.page_session_id,
+                            &frames,
+                            &operation,
+                        )
+                        .await
+                        .map_err(|_| ProtocolError::BrowserFailure)?;
+                        let (revision, references) =
+                            observation.snapshot_for_action(&operation).await?;
+                        let sessions = frames
+                            .into_iter()
+                            .filter(|frame| frame.parent_frame_id.is_some())
+                            .map(|frame| (frame.binding.frame, frame.binding.session))
+                            .collect();
+                        actions
+                            .recording_page_opened(super::client_actions::ActionContext {
+                                page: &page,
+                                operation: &operation,
+                                page_state: &resource.page_state,
+                                refs: &references,
+                                revision,
+                                iframe_sessions: &sessions,
+                                blobs: &blobs,
+                                geometry: &geometry,
+                            })
+                            .await
+                            .map_err(|failure| failure.error)?;
+                    }
+                }
+                loop {
+                    check_lifecycle_budget(&operation)?;
+                    match resource
+                        .runtime
+                        .as_ref()
+                        .ok_or(ProtocolError::ScopeUnavailable)
+                        .and_then(|runtime| runtime.enrollment.publish_initialized(&authority))
+                    {
+                        Ok(_) => break,
+                        Err(ProtocolError::ScopeUnavailable) => {
+                            if gate.state.lock().map_or(true, |state| state.closed) {
+                                return Err(ProtocolError::ScopeUnavailable);
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                resource
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?
+                    .page_active
+                    .store(expose_page, std::sync::atomic::Ordering::SeqCst);
+                uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"identityScope":resource.identity_scope}))
+            }
+            .await;
+            if accepted && result.is_err() {
+                gate.seal();
+                if let Some(resource) = owner.lock().await.as_mut() {
+                    resource.targets.seal();
+                    // Preserve the primary failure; failed retirement remains
+                    // journaled for explicit final cleanup, never hidden in Drop.
+                    if let Some(routes) = &mut resource.replacement_routes {
+                        if routes.retire().is_ok() {
+                            resource.replacement_routes = None;
+                        }
+                    }
+                }
+            }
+            let effects = if result.is_ok() {
+                Effects::Completed
+            } else if accepted {
+                Effects::Unknown
+            } else {
+                Effects::NotDispatched
+            };
+            let _ = send.send(NativeOutcome { result, effects });
+        }));
+        drop(slot);
+        receive.await.unwrap_or(NativeOutcome {
+            result: Err(ProtocolError::CleanupFailed),
+            effects: Effects::Unknown,
+        })
+    }
+}
+
+impl ClientBrowser {
+    async fn reconnect_scope(
+        &self,
+        scope: String,
+        request: ReconnectRequest,
+        operation: super::client_session::OperationLease,
+    ) -> super::client_transport::NativeOutcome {
+        use super::client_protocol::Effects;
+        use super::client_transport::NativeOutcome;
+        if operation.is_callback
+            || request.endpoint.trim().is_empty()
+            || request.endpoint.len() > 16 * 1024
+            || request.endpoint.contains('\0')
+            || [
+                &request.expected_browser_identity,
+                &request.expected_context_identity,
+                &request.expected_page_identity,
+            ]
+            .iter()
+            .any(|v| v.is_empty() || v.len() > 1024)
+        {
+            return NativeOutcome {
+                result: Err(ProtocolError::InvalidArguments),
+                effects: Effects::NotDispatched,
+            };
+        }
+        if let Err(error) = check_lifecycle_budget(&operation) {
+            return NativeOutcome {
+                result: Err(error),
+                effects: Effects::NotDispatched,
+            };
+        }
+        let mut cancellation = operation.cancellation.clone();
+        let transition = tokio::select! {
+            biased;
+            _ = cancellation.changed() => return NativeOutcome { result: Err(ProtocolError::Cancelled), effects: Effects::NotDispatched },
+            result = tokio::time::timeout_at(operation.deadline.into(), self.lifecycle.clone().lock_owned()) => match result {
+                Ok(guard) => guard,
+                Err(_) => return NativeOutcome { result: Err(ProtocolError::DeadlineExceeded), effects: Effects::NotDispatched },
+            },
+        };
+        let Some(sink) = self.event_sink.get().cloned() else {
+            return NativeOutcome {
+                result: Err(ProtocolError::ScopeUnavailable),
+                effects: Effects::NotDispatched,
+            };
+        };
+        let mut slot = self.startup_task.lock().await;
+        let owner = self.owner.clone();
+        let gate = self.gate.clone();
+        let broker = self.broker.clone();
+        let retirement = self.retirement.clone();
+        let blobs = self.blobs.clone();
+        let refs = self.refs.clone();
+        let tasks = self.tasks.clone();
+        let observation = self.observation.clone();
+        let uncertain = self.startup_uncertain.clone();
+        let connection_watch = self.connection_watch.clone();
+        #[cfg(feature = "acceptance-faults")]
+        let faults = self.faults.clone();
+        let (send, receive) = tokio::sync::oneshot::channel();
+        *slot = Some(tokio::spawn(async move {
+            let _transition = transition;
+            let mut accepted = false;
+            let result = async {
+                check_lifecycle_budget(&operation)?;
+                let mut journal = owner.lock().await;
+                let resource = journal.as_mut().ok_or(ProtocolError::StaleScope)?;
+                if resource.identity_scope != scope {
+                    return Err(ProtocolError::StaleScope);
+                }
+                if resource.owns_context || resource.borrowed_targets.is_none() {
+                    return Err(ProtocolError::UnsupportedCapability);
+                }
+                let expected = resource.recovery_identity();
+                if expected["browser"] != request.expected_browser_identity
+                    || expected["context"] != request.expected_context_identity
+                    || expected["page"] != request.expected_page_identity
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let runtime = resource
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                let terminal = runtime.enrollment.terminal_connection_proof()?;
+                terminal.check_client(&resource.manager.client)?;
+                let retained = super::client_reconnect::RetainedIdentity::capture(
+                    &resource.manager,
+                    &resource.context_id,
+                )?;
+                let options = runtime.creation_options.clone();
+                let actions = runtime.actions.clone();
+                let active = runtime
+                    .page_active
+                    .load(std::sync::atomic::Ordering::SeqCst);
+                let (policy, downloads) = {
+                    let configuration = runtime
+                        .configuration
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    (
+                        configuration
+                            .policy
+                            .clone()
+                            .ok_or(ProtocolError::ScopeUnavailable)?,
+                        configuration
+                            .downloads
+                            .clone()
+                            .ok_or(ProtocolError::ScopeUnavailable)?,
+                    )
+                };
+                if resource.disconnected_routes.is_some() || resource.replacement_routes.is_some() {
+                    return Err(ProtocolError::CleanupFailed);
+                }
+                resource.replacement_actions = Some(actions.clone());
+                accepted = true;
+                uncertain.store(true, std::sync::atomic::Ordering::SeqCst);
+                retirement
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    .stop(false);
+                #[cfg(feature = "acceptance-faults")]
+                faults.retire_scope(&scope)?;
+                gate.begin_transition()?;
+                drop(journal);
+                gate.drained().await?;
+                tasks.drain().await?;
+                let mut journal = owner.lock().await;
+                let resource = journal.as_mut().ok_or(ProtocolError::StaleScope)?;
+                if resource.identity_scope != scope {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let page_config = resource.page_state.snapshot_config(&scope)?;
+                let recording = actions.is_recording_armed().await?;
+                resource.ui.seal();
+                let runtime = resource
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                runtime
+                    .release_terminal_connection(&resource.manager.client, true)
+                    .await?;
+                resource.disconnected_routes = Some(
+                    runtime
+                        .network
+                        .take_disconnected_routes(&resource.targets, &operation)?,
+                );
+                resource.runtime = None;
+                refs.lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    .invalidate_all_documents();
+                // Exact terminal local cleanup has settled; this closes only the
+                // old socket. Host page/context ownership is never acquired.
+                resource.manager.client.close().await;
+                check_lifecycle_budget(&operation)?;
+                let verified =
+                    super::client_reconnect::reconnect(&request.endpoint, &retained, &operation)
+                        .await?;
+                let (manager, context_id, target_id, proof) = verified.into_parts();
+                // Journal the new transport before any initialization await.
+                resource.manager = manager;
+                resource.context_id = context_id;
+                resource.identity_scope = uuid::Uuid::new_v4().to_string();
+                resource.borrowed_targets = Some(vec![target_id]);
+                resource.reconnect_proof = Some(proof);
+                resource.targets = super::client_targets::ClientTargets::new(
+                    resource.context_id.clone(),
+                    resource.identity_scope.clone(),
+                );
+                resource.ui = Arc::new(super::client_ui::UiGate::default());
+                let authority = resource
+                    .initialize_runtime(
+                        gate.clone(),
+                        broker,
+                        sink.clone(),
+                        blobs.clone(),
+                        RuntimeInitialization {
+                            operation: &operation,
+                            retirement: &retirement,
+                            options: &options,
+                            replacement: Some(ReplacementSeed {
+                                page_config,
+                                policy,
+                                downloads,
+                                actions: actions.clone(),
+                            }),
+                        },
+                    )
+                    .await?;
+                let runtime = resource
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                runtime
+                    .page_active
+                    .store(active, std::sync::atomic::Ordering::SeqCst);
+                if recording {
+                    let page = resource.lease(authority.enter(&resource.targets)?)?;
+                    let _exclusive = resource
+                        .ui
+                        .enter(
+                            true,
+                            false,
+                            operation.deadline,
+                            operation.cancellation.clone(),
+                        )
+                        .await?;
+                    let frames =
+                        super::client_observation_dispatch::verified_frames(&page, &operation)
+                            .await?;
+                    let geometry = super::client_geometry::GeometrySnapshot::capture(
+                        &page.client,
+                        &page.page_session_id,
+                        &frames,
+                        &operation,
+                    )
+                    .await
+                    .map_err(|_| ProtocolError::BrowserFailure)?;
+                    let (revision, references) =
+                        observation.snapshot_for_action(&operation).await?;
+                    let sessions = frames
+                        .into_iter()
+                        .filter(|frame| frame.parent_frame_id.is_some())
+                        .map(|frame| (frame.binding.frame, frame.binding.session))
+                        .collect();
+                    actions
+                        .recording_page_opened(super::client_actions::ActionContext {
+                            page: &page,
+                            operation: &operation,
+                            page_state: &resource.page_state,
+                            refs: &references,
+                            revision,
+                            iframe_sessions: &sessions,
+                            blobs: &blobs,
+                            geometry: &geometry,
+                        })
+                        .await
+                        .map_err(|failure| failure.error)?;
+                }
+                loop {
+                    check_lifecycle_budget(&operation)?;
+                    match runtime.enrollment.publish_initialized(&authority) {
+                        Ok(_) => break,
+                        Err(ProtocolError::ScopeUnavailable)
+                            if !gate.state.lock().map_or(true, |state| state.closed) =>
+                        {
+                            tokio::time::sleep(std::time::Duration::from_millis(1)).await
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                resource.reconnect_proof = None;
+                let mut watch = connection_watch.lock().await;
+                if let Some(old) = watch.as_mut() {
+                    old.abort();
+                    let _ = old.await;
+                }
+                let mut lost = resource.manager.client.remote_connection_closed();
+                *watch = Some(tokio::spawn(async move {
+                    loop {
+                        if *lost.borrow() {
+                            return sink.emit(
+                                "browser.disconnected".into(),
+                                serde_json::json!({"reason":"browser-connection-closed"}),
+                                None,
+                            );
+                        }
+                        if lost.changed().await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }));
+                uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"identityScope":resource.identity_scope}))
+            }
+            .await;
+            if accepted && result.is_err() {
+                gate.seal();
+                if let Some(resource) = owner.lock().await.as_mut() {
+                    resource.targets.seal();
+                    if let Some(routes) = &mut resource.disconnected_routes {
+                        if routes.retire().is_ok() {
+                            resource.disconnected_routes = None;
+                        }
+                    }
+                }
+            }
+            let _ = send.send(result.map_err(|error| (error, accepted)));
+        }));
+        drop(slot);
+        match receive.await {
+            Ok(Ok(value)) => NativeOutcome {
+                result: Ok(value),
+                effects: Effects::Completed,
+            },
+            Ok(Err((error, accepted))) => NativeOutcome {
+                result: Err(error),
+                effects: if accepted {
+                    Effects::Unknown
+                } else {
+                    Effects::NotDispatched
+                },
+            },
+            Err(_) => NativeOutcome {
+                result: Err(ProtocolError::CleanupFailed),
+                effects: Effects::Unknown,
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configuration_pins_original_password_policy_and_creation_service_worker_mode() {
+        let value = serde_json::json!({
+            "testIdAttribute":"data-testid", "secureFieldSelector":"input[type=\"password\" i]",
+            "requestPolicy":{}, "downloads":{"source":"local"}
+        });
+        let request: ConfigureRequest = serde_json::from_value(value.clone()).unwrap();
+        request.validate(false).unwrap();
+        assert_eq!(request.validate(true), Err(ProtocolError::InvalidArguments));
+        let mut weakened = value.clone();
+        weakened["secureFieldSelector"] = "input[data-user-selected]".into();
+        assert_eq!(
+            serde_json::from_value::<ConfigureRequest>(weakened)
+                .unwrap()
+                .validate(false),
+            Err(ProtocolError::InvalidArguments)
+        );
+        let mut privileged = value.clone();
+        privileged["purpose"] = "fixture".into();
+        assert!(serde_json::from_value::<ConfigureRequest>(privileged).is_err());
+        let mut headers = value;
+        headers["requestPolicy"] = serde_json::json!({"headers":{}});
+        serde_json::from_value::<ConfigureRequest>(headers)
+            .unwrap()
+            .validate(true)
+            .unwrap();
+    }
+
+    #[test]
+    fn candidate_advertises_the_complete_wired_public_contract() {
+        use super::super::client_transport::ClientExecutor;
+        let browser =
+            ClientBrowser::new(Arc::new(super::super::client_session::ClientSession::new()));
+        let capabilities = browser.capabilities();
+        let families = capabilities
+            .iter()
+            .filter(|capability| capability.starts_with("browser."))
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(families.len(), 14);
+        for family in [
+            "scope",
+            "lifecycle",
+            "evaluate",
+            "page",
+            "observe",
+            "query",
+            "actions",
+            "network",
+            "dialog",
+            "download",
+            "capture",
+            "state",
+            "recording",
+            "blobs",
+        ] {
+            assert!(capabilities.contains(&format!("browser.{family}/1")));
+        }
+    }
+
+    #[test]
+    fn acceptance_fault_marker_is_compiled_only_in_instrumented_binary() {
+        use super::super::client_transport::ClientExecutor;
+        let browser =
+            ClientBrowser::new(Arc::new(super::super::client_session::ClientSession::new()));
+        assert_eq!(
+            browser
+                .capabilities()
+                .iter()
+                .any(|value| value == "acceptance.faults/1"),
+            cfg!(feature = "acceptance-faults")
+        );
+    }
+
+    #[test]
+    fn decision_upload_reservation_uses_original_token_scope_and_rolls_back_rejection() {
+        use super::super::client_blobs::BlobScope;
+        use super::super::client_protocol::{Decision, RequestOverrides};
+        use super::super::client_session::{ClientSession, DecisionKind, DecisionOwner};
+        use super::super::client_transport::ClientExecutor;
+        let broker = Arc::new(ClientSession::new());
+        let browser = ClientBrowser::new(broker.clone());
+        let old = BlobScope {
+            generation: 1,
+            identity_scope: "old-scope".into(),
+        };
+        browser.blobs.activate_scope(old.clone()).unwrap();
+        let body = browser
+            .blobs
+            .insert_sealed(old.clone(), b"synthetic")
+            .unwrap();
+        let token = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                None,
+                Some(old.identity_scope.clone()),
+            )
+            .unwrap();
+        let decision = Decision::Continue {
+            overrides: RequestOverrides {
+                body_handle: Some(body.handle.clone()),
+                ..Default::default()
+            },
+        };
+        browser
+            .prepare_decision(1, &token.token, &decision)
+            .unwrap();
+        assert!(browser.blobs.borrow_sealed(&old, &body.handle).is_err());
+        browser.finish_decision(&token.token, false).unwrap();
+        assert!(browser.blobs.borrow_sealed(&old, &body.handle).is_ok());
+        browser.blobs.revoke_scope(&old).unwrap();
+        let next = BlobScope {
+            generation: 1,
+            identity_scope: "new-scope".into(),
+        };
+        browser.blobs.activate_scope(next.clone()).unwrap();
+        let replacement = browser
+            .blobs
+            .insert_sealed(next.clone(), b"replacement")
+            .unwrap();
+        let stale_decision = Decision::Continue {
+            overrides: RequestOverrides {
+                body_handle: Some(replacement.handle.clone()),
+                ..Default::default()
+            },
+        };
+        assert_eq!(
+            browser.prepare_decision(1, &token.token, &stale_decision),
+            Err(ProtocolError::StaleScope)
+        );
+        assert!(browser
+            .blobs
+            .borrow_sealed(&next, &replacement.handle)
+            .is_ok());
+        assert_eq!(
+            browser.prepare_decision(2, &token.token, &stale_decision),
+            Err(ProtocolError::StaleGeneration)
+        );
+    }
+
+    #[test]
+    fn scope_creation_decodes_public_options_and_rejects_cross_source_fields() {
+        let request: OpenRequest = serde_json::from_value(serde_json::json!({
+            "source":"launch", "context":"isolated", "headless":true,
+            "blockServiceWorkers":true, "viewport":{"width":900,"height":700},
+            "userAgent":"synthetic-agent", "locale":"en-US", "timezoneId":"UTC",
+            "media":{"colorScheme":"dark","reducedMotion":"reduce"},
+            "initScripts":["window.synthetic = 1"]
+        }))
+        .unwrap();
+        let OpenRequest::Launch { options, .. } = request else {
+            panic!("wrong source")
+        };
+        assert!(options.block_service_workers);
+        assert_eq!(options.viewport.unwrap().width, 900);
+        assert_eq!(options.media.color_scheme.as_deref(), Some("dark"));
+        assert_eq!(options.init_scripts.len(), 1);
+        for invalid in [
+            serde_json::json!({"source":"launch","endpoint":"ws://fixture.invalid"}),
+            serde_json::json!({"source":"reuse","headless":true}),
+            serde_json::json!({"source":"connect","endpoint":"","context":"isolated"}),
+            serde_json::json!({"source":"launch","context":"persistent"}),
+            serde_json::json!({"source":"launch","viewport":{"width":0,"height":700}}),
+            serde_json::json!({"source":"launch","media":{"colorScheme":"invalid"}}),
+            serde_json::json!({"source":"launch","unknown":true}),
+            serde_json::json!({"source":"reuse","headless":null}),
+            serde_json::json!({"source":"launch","locale":null}),
+            serde_json::json!({"source":"launch","media":{"colorScheme":null}}),
+        ] {
+            assert!(serde_json::from_value::<OpenRequest>(invalid).is_err());
+        }
+        assert!(serde_json::from_value::<OpenRequest>(
+            serde_json::json!({"source":"launch","viewport":null})
+        )
+        .is_ok());
+    }
 
     #[tokio::test]
     async fn retirement_journal_fences_both_registration_orders_and_allows_scope_reuse() {
@@ -1462,36 +4105,6 @@ mod tests {
             assert_eq!(outcome.effects, Effects::NotDispatched);
             assert!(browser.owner.lock().await.is_none());
         }
-    }
-
-    #[test]
-    fn persistent_identity_requires_dedicated_default_context() {
-        use serde_json::json;
-        assert_eq!(
-            dedicated_default_context(
-                &json!({"browserContextIds":[],"defaultBrowserContextId":"default-1"})
-            )
-            .unwrap(),
-            "default-1"
-        );
-        for value in [
-            json!({}),
-            json!({"browserContextIds":[]}),
-            json!({"browserContextIds":[],"defaultBrowserContextId":""}),
-            json!({"browserContextIds":["foreign"],"defaultBrowserContextId":"default-1"}),
-        ] {
-            assert!(dedicated_default_context(&value).is_err());
-        }
-        let targets = json!({"targetInfos":[
-            {"type":"page","targetId":"foreign","browserContextId":"other"},
-            {"type":"worker","targetId":"worker"},
-            {"type":"page","targetId":"owned","browserContextId":"default-1"}
-        ]});
-        assert_eq!(
-            dedicated_default_page(&targets, "default-1").unwrap(),
-            Some("owned".into())
-        );
-        assert_eq!(dedicated_default_page(&json!({"targetInfos":[{"type":"page","targetId":"foreign","browserContextId":"other"}]}), "default-1").unwrap(), None);
     }
 
     fn initialization_registry() -> Arc<super::super::client_targets::ClientTargets> {
@@ -1744,7 +4357,14 @@ mod tests {
             cancellation: operation_cancellation.clone(),
         };
         let opened = browser
-            .open(OpenRequest::Connect { endpoint }, operation())
+            .open(
+                OpenRequest::Connect {
+                    endpoint,
+                    persistent: false,
+                    options: Default::default(),
+                },
+                operation(),
+            )
             .await
             .unwrap();
         assert!(opened["identityScope"]
@@ -1799,7 +4419,12 @@ mod tests {
             .unwrap()
             .contains(&serde_json::json!(old_context)));
         let reopened = browser
-            .open(OpenRequest::Reuse {}, operation())
+            .open(
+                OpenRequest::Reuse {
+                    options: Default::default(),
+                },
+                operation(),
+            )
             .await
             .unwrap();
         assert_ne!(reopened["identityScope"], first_scope);

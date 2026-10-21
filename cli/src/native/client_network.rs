@@ -2,13 +2,17 @@
 //! callbacks stay in e2e; no JavaScript function or matcher is interpreted here.
 use super::cdp::client::CdpClient;
 use super::cdp::types::CdpEvent;
+use super::client_app_events::{
+    AppEventContext, AppEventProjector, AppNavigationContext, OwnNavigationGuard,
+};
 use super::client_blobs::{
     BlobChunk, BlobLease, BlobProducer, BlobScope, BlobStore, MAX_CHUNK_BYTES,
 };
+use super::client_browser::BrowserExecutionLease;
 use super::client_protocol::{Decision, DecisionNotice, ProtocolError, RequestOverrides};
 use super::client_session::{
     CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
-    OperationLease,
+    OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
 };
 use super::client_transport::ClientEventSink;
 use base64::Engine;
@@ -20,8 +24,14 @@ use std::sync::{Arc, Mutex};
 pub struct ClientNetwork {
     pub client: Arc<CdpClient>,
     broker: Arc<ClientSession>,
-    sink: ClientEventSink,
+    future_session_sink: Mutex<ClientEventSink>,
+    retirement_sink: ClientEventSink,
+    app_events: AppEventProjector,
     registry: Mutex<Option<u64>>,
+    disconnected_routes: Mutex<DisconnectedRouteSlot>,
+    routes_frozen: AtomicBool,
+    close_gate: tokio::sync::Mutex<NetworkCloseState>,
+    cleanup_drained: AtomicBool,
     tokens: Mutex<HashMap<String, String>>,
     scope: BlobScope,
     policy: Mutex<NetworkPolicy>,
@@ -36,13 +46,326 @@ pub struct ClientNetwork {
     dialog_enabled: AtomicBool,
     auth_attempts: Mutex<std::collections::HashSet<(String, String)>>,
     request_ids: Mutex<HashMap<(String, String), String>>,
+    pending_interceptions: Mutex<HashMap<(String, String, String), ()>>,
     response_subscriptions: Mutex<std::collections::HashSet<String>>,
     responses: Mutex<HashMap<(String, String), String>>,
     resources: Mutex<HashMap<String, Arc<BodyResource>>>,
     downloads: Mutex<HashMap<String, DownloadEntry>>,
     download_source: Mutex<Option<DownloadSource>>,
     download_context: Mutex<Option<String>>,
+    download_ready: AtomicBool,
     download_subscriptions: Mutex<std::collections::HashSet<String>>,
+}
+
+enum NetworkCloseState {
+    Open,
+    Running(tokio::task::JoinHandle<Result<(), ProtocolError>>),
+    Finished(Result<(), ProtocolError>),
+}
+
+/// Native private authority across one exact old-to-new scope transition.
+/// Failed bind/adopt keeps this guard available for explicit restore/retire.
+/// Drop always retires, never silently reactivates an abandoned route list.
+pub(crate) struct RouteTransfer {
+    source: Arc<ClientNetwork>,
+    replacement: Option<Arc<ClientNetwork>>,
+    registry: Option<RouteRegistryTransfer>,
+    sequence: u64,
+    deadline: std::time::Instant,
+    cancellation: tokio::sync::watch::Receiver<CancelSignal>,
+    active: bool,
+}
+impl RouteTransfer {
+    fn check_operation(&self, operation: &OperationLease) -> Result<(), ProtocolError> {
+        if !self.active {
+            return Err(ProtocolError::StaleScope);
+        }
+        if operation.generation != self.source.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if operation.is_callback || operation.sequence != self.sequence {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        if *self.cancellation.borrow() != CancelSignal::None
+            || *operation.cancellation.borrow() != CancelSignal::None
+        {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= self.deadline
+            || std::time::Instant::now() >= operation.deadline
+        {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+    /// Bind once to the exact replacement, not a string token supplied by a
+    /// client. Its route slot is frozen until successful adoption/publication.
+    pub(crate) fn bind(&mut self, replacement: &Arc<ClientNetwork>) -> Result<(), ProtocolError> {
+        if !self.active || self.replacement.is_some() {
+            return Err(ProtocolError::StaleScope);
+        }
+        if *self.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= self.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if replacement.scope.generation != self.source.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if Arc::ptr_eq(&self.source, replacement)
+            || replacement.scope.identity_scope.is_empty()
+            || replacement.scope.identity_scope == self.source.scope.identity_scope
+            || !Arc::ptr_eq(&self.source.client, &replacement.client)
+            || !Arc::ptr_eq(&self.source.broker, &replacement.broker)
+            || !Arc::ptr_eq(&self.source.blobs, &replacement.blobs)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        replacement.check()?;
+        let current = replacement
+            .registry
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if current.is_some() || replacement.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        replacement.routes_frozen.store(true, Ordering::Release);
+        self.replacement = Some(replacement.clone());
+        Ok(())
+    }
+    /// Old native callbacks and blocking readers must have actually settled.
+    /// No version is re-registered; the broker moves its immutable snapshot.
+    pub(crate) fn adopt(&mut self, operation: &OperationLease) -> Result<(), ProtocolError> {
+        self.check_operation(operation)?;
+        let replacement = self
+            .replacement
+            .as_ref()
+            .ok_or(ProtocolError::InvalidArguments)?;
+        replacement.check()?;
+        if !self.source.sealed.load(Ordering::Acquire)
+            || !self.source.cleanup_drained.load(Ordering::Acquire)
+        {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        if !self
+            .source
+            .tokens
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .is_empty()
+        {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        let mut current = replacement
+            .registry
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if current.is_some() || !replacement.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        if let Some(registry) = &mut self.registry {
+            self.source.broker.adopt_registry_transfer(
+                registry,
+                &replacement.scope.identity_scope,
+                operation,
+            )?;
+            *current = Some(registry.version());
+        }
+        replacement.routes_frozen.store(false, Ordering::Release);
+        self.active = false;
+        Ok(())
+    }
+    /// Explicit failure recovery before source revocation only. Cancellation,
+    /// expired operations, and post-teardown failures must retire instead.
+    pub(crate) fn restore(&mut self, operation: &OperationLease) -> Result<(), ProtocolError> {
+        self.check_operation(operation)?;
+        self.source.check()?;
+        let mut current = self
+            .source
+            .registry
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if current.is_some() || !self.source.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        if let Some(registry) = &mut self.registry {
+            self.source
+                .broker
+                .restore_registry_transfer(registry, operation)?;
+            *current = Some(registry.version());
+        }
+        self.source.routes_frozen.store(false, Ordering::Release);
+        self.active = false;
+        Ok(())
+    }
+    pub(crate) fn retire(&mut self) -> Result<(), ProtocolError> {
+        if !self.active {
+            return Err(ProtocolError::StaleScope);
+        }
+        if let Some(registry) = &mut self.registry {
+            self.source.broker.retire_registry_transfer(registry)?;
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+impl Drop for RouteTransfer {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.retire();
+        }
+    }
+}
+
+/// A terminal route slot is never reconstructed after ordinary revocation.
+/// The network retains it until reconnect takes the exact guard or final close
+/// explicitly retires it. Empty route lists still have a one-shot authority.
+enum DisconnectedRouteSlot {
+    Uncaptured,
+    Parked(ParkedRoutes),
+    Taken,
+    Retired,
+}
+struct ParkedRoutes {
+    targets: Arc<super::client_targets::ClientTargets>,
+    target_id: String,
+    registry: Option<ParkedRouteRegistry>,
+}
+/// Native-only journal entry for a verified terminal old connection. There is
+/// no restore operation: cancellation/failure must explicitly retire this hold.
+/// Drop is only a last-resort retirement attempt, never cleanup success proof.
+pub(crate) struct DisconnectedRoutes {
+    source: Arc<ClientNetwork>,
+    parked: ParkedRoutes,
+    replacement: Option<(
+        Arc<ClientNetwork>,
+        Arc<super::client_targets::ClientTargets>,
+    )>,
+    sequence: u64,
+    deadline: std::time::Instant,
+    cancellation: tokio::sync::watch::Receiver<CancelSignal>,
+    active: bool,
+}
+impl DisconnectedRoutes {
+    fn check_operation(&self, operation: &OperationLease) -> Result<(), ProtocolError> {
+        if !self.active {
+            return Err(ProtocolError::StaleScope);
+        }
+        if operation.generation != self.source.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if operation.sequence != self.sequence
+            || operation.deadline != self.deadline
+            || !operation.cancellation.same_channel(&self.cancellation)
+        {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        self.source.broker.validate_reconnect_operation(operation)
+    }
+    /// Bind once to the exact freshly verified transport and retained host
+    /// identity. String equality alone never authorizes a new CDP client.
+    pub(super) fn bind(
+        &mut self,
+        replacement: &Arc<ClientNetwork>,
+        targets: &Arc<super::client_targets::ClientTargets>,
+        verified: &super::client_reconnect::VerifiedReconnectProof,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check_operation(operation)?;
+        if self.replacement.is_some() {
+            return Err(ProtocolError::StaleScope);
+        }
+        if replacement.scope.generation != self.source.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if Arc::ptr_eq(&self.source, replacement)
+            || Arc::ptr_eq(&self.source.client, &replacement.client)
+            || !Arc::ptr_eq(&self.source.broker, &replacement.broker)
+            || !Arc::ptr_eq(&self.source.blobs, &replacement.blobs)
+            || Arc::ptr_eq(&self.parked.targets, targets)
+            || replacement.scope.identity_scope.is_empty()
+            || replacement.scope.identity_scope == self.source.scope.identity_scope
+            || targets.identity_scope != replacement.scope.identity_scope
+            || targets.context_id != self.parked.targets.context_id
+            || *replacement.client.remote_connection_closed().borrow()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        verified.check(
+            &replacement.client,
+            &self.parked.targets.context_id,
+            &self.parked.target_id,
+            operation,
+        )?;
+        replacement.check()?;
+        let current = replacement
+            .registry
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        replacement.check()?;
+        if current.is_some() || replacement.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        replacement.routes_frozen.store(true, Ordering::Release);
+        self.replacement = Some((replacement.clone(), targets.clone()));
+        Ok(())
+    }
+    pub(crate) fn adopt(
+        &mut self,
+        targets: &Arc<super::client_targets::ClientTargets>,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check_operation(operation)?;
+        let (replacement, captured_targets) = self
+            .replacement
+            .as_ref()
+            .ok_or(ProtocolError::InvalidArguments)?;
+        if !Arc::ptr_eq(targets, captured_targets)
+            || *replacement.client.remote_connection_closed().borrow()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.source.check_disconnected_drain()?;
+        let mut current = replacement
+            .registry
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        replacement.check()?;
+        if current.is_some() || !replacement.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        if let Some(registry) = &mut self.parked.registry {
+            self.source.broker.adopt_parked_registry(
+                registry,
+                &replacement.scope.identity_scope,
+                operation,
+            )?;
+            *current = Some(registry.version());
+        } else {
+            self.source.broker.validate_reconnect_operation(operation)?;
+        }
+        replacement.routes_frozen.store(false, Ordering::Release);
+        self.active = false;
+        Ok(())
+    }
+    pub(crate) fn retire(&mut self) -> Result<(), ProtocolError> {
+        if !self.active {
+            return Err(ProtocolError::StaleScope);
+        }
+        if let Some(registry) = &mut self.parked.registry {
+            self.source.broker.retire_parked_registry(registry)?;
+        }
+        self.active = false;
+        Ok(())
+    }
+}
+impl Drop for DisconnectedRoutes {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = self.retire();
+        }
+    }
 }
 
 impl ClientNetwork {
@@ -59,8 +382,14 @@ impl ClientNetwork {
         Self {
             client,
             broker,
-            sink,
+            retirement_sink: sink.clone(),
+            future_session_sink: Mutex::new(sink),
+            app_events: AppEventProjector::new(),
             registry: Mutex::new(None),
+            disconnected_routes: Mutex::new(DisconnectedRouteSlot::Uncaptured),
+            routes_frozen: AtomicBool::new(false),
+            close_gate: tokio::sync::Mutex::new(NetworkCloseState::Open),
+            cleanup_drained: AtomicBool::new(false),
             tokens: Mutex::new(HashMap::new()),
             scope,
             policy: Mutex::new(policy),
@@ -75,18 +404,59 @@ impl ClientNetwork {
             dialog_enabled: AtomicBool::new(false),
             auth_attempts: Mutex::new(std::collections::HashSet::new()),
             request_ids: Mutex::new(HashMap::new()),
+            pending_interceptions: Mutex::new(HashMap::new()),
             response_subscriptions: Mutex::new(std::collections::HashSet::new()),
             responses: Mutex::new(HashMap::new()),
             resources: Mutex::new(HashMap::new()),
             downloads: Mutex::new(HashMap::new()),
             download_source: Mutex::new(None),
             download_context: Mutex::new(None),
+            download_ready: AtomicBool::new(false),
             download_subscriptions: Mutex::new(std::collections::HashSet::new()),
         }
     }
 
+    pub(crate) fn check_event_sink(&self, sink: &ClientEventSink) -> Result<(), ProtocolError> {
+        if !self.retirement_sink.same_client(sink) {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
     /// Enrollment is supplied by the scope owner. This module never discovers
     /// targets, changes purposes, adopts bootstrap pages, or resumes execution.
+    /// Lifecycle selects only the default for targets enrolled after this
+    /// exact operation. Existing sessions and retained callbacks keep theirs.
+    pub(crate) fn set_future_session_sink(
+        &self,
+        staged: ClientEventSink,
+        identity_scope: &str,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check()?;
+        if operation.is_callback {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        if identity_scope != self.scope.identity_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        if operation.generation != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let mut source = self
+            .future_session_sink
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        staged.validate_stage(&source, operation, identity_scope)?;
+        self.check()?;
+        *source = staged;
+        Ok(())
+    }
     pub async fn configure_session(
         &self,
         session: ApplicationSession,
@@ -104,6 +474,10 @@ impl ClientNetwork {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         let id = session.session_id.clone();
         {
+            let sink = self
+                .future_session_sink
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
             let mut sessions = self
                 .sessions
                 .lock()
@@ -115,6 +489,7 @@ impl ClientNetwork {
             sessions.insert(
                 id.clone(),
                 EnrolledSession {
+                    sink: sink.clone(),
                     application: session,
                     configuration_ready,
                 },
@@ -240,6 +615,86 @@ impl ClientNetwork {
         result
     }
 
+    /// Native owner identity check only; this does not grant or change UI admission.
+    pub(crate) fn uses_ui_gate(&self, gate: &Arc<super::client_ui::UiGate>) -> bool {
+        Arc::ptr_eq(&self.ui_gate, gate)
+    }
+
+    fn validate_app_page(&self, page: &BrowserExecutionLease) -> Result<(), ProtocolError> {
+        page.permit.check()?;
+        self.check()?;
+        if page.identity_scope != self.scope.identity_scope
+            || !Arc::ptr_eq(&page.client, &self.client)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    pub(crate) fn begin_app_navigation(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<OwnNavigationGuard, ProtocolError> {
+        self.validate_app_page(page)?;
+        if op.generation != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if *op.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= op.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let session = sessions
+            .get(&page.page_session_id)
+            .ok_or(ProtocolError::StaleReference)?;
+        if !session.application.active_page
+            || session.application.root_page_session != page.page_session_id
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        self.app_events.begin_navigation(&page.page_session_id)
+    }
+    /// Existing enrollment event pump supplies exact Application/frame identity.
+    /// Keep its lease alive through the synchronous projection and publication.
+    pub(crate) fn publish_app_event(
+        &self,
+        page: &BrowserExecutionLease,
+        event: &CdpEvent,
+        navigation: Option<AppNavigationContext<'_>>,
+    ) -> Result<(), ProtocolError> {
+        self.validate_app_page(page)?;
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !sessions.contains_key(&page.page_session_id)
+            || event.session_id.as_deref() != Some(page.page_session_id.as_str())
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        let projected = self.app_events.project(
+            event,
+            AppEventContext {
+                session_id: &page.page_session_id,
+                navigation,
+            },
+        )?;
+        self.validate_app_page(page)?;
+        if let Some(projected) = projected {
+            let (name, payload) = projected.into_wire(&self.scope.identity_scope)?;
+            sessions
+                .get(&page.page_session_id)
+                .ok_or(ProtocolError::StaleReference)?
+                .sink
+                .emit(name.into(), payload, None)?;
+        }
+        Ok(())
+    }
     pub fn set_active_root(&self, root: &str) -> Result<(), ProtocolError> {
         self.check()?;
         for session in self
@@ -303,7 +758,7 @@ impl ClientNetwork {
         for handle in handles {
             self.finish_resource(&handle, Err(ProtocolError::StaleScope))?;
         }
-        Ok(())
+        self.app_events.forget_session(session)
     }
 
     pub fn register_dialog(&self, enabled: bool) -> Result<(), ProtocolError> {
@@ -339,16 +794,52 @@ impl ClientNetwork {
         &self,
         context_id: &str,
         source: DownloadSource,
+        operation: &OperationLease,
     ) -> Result<(), ProtocolError> {
-        self.check()?;
+        self.check_download_operation(operation)?;
+        if context_id.is_empty() || context_id.len() > 1024 || context_id.contains('\0') {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let mut cancellation = operation.cancellation.clone();
+        let mut scope_cancellation = self.cancellation.subscribe();
         let directory = match &source {
             DownloadSource::Local(directory) => {
-                let canonical = std::fs::canonicalize(directory)
-                    .map_err(|_| ProtocolError::InvalidArguments)?;
-                if &canonical != directory || !canonical.is_dir() {
-                    return Err(ProtocolError::InvalidArguments);
+                let directory = directory.clone();
+                let (sent, received) = tokio::sync::oneshot::channel();
+                // Even cancellation of setup cannot detach an outstanding
+                // filesystem job from the scope's retained reader drain.
+                {
+                    let mut readers = self
+                        .blocking_reads
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    self.check_download_operation(operation)?;
+                    while let Some(result) = readers.try_join_next() {
+                        result.map_err(|_| ProtocolError::CleanupFailed)?;
+                    }
+                    if readers.len() >= 64 {
+                        return Err(ProtocolError::CapacityExceeded);
+                    }
+                    readers.spawn_blocking(move || {
+                        let result = std::fs::canonicalize(&directory)
+                            .map_err(|_| ProtocolError::InvalidArguments)
+                            .and_then(|canonical| {
+                                if canonical != directory || !canonical.is_dir() {
+                                    Err(ProtocolError::InvalidArguments)
+                                } else {
+                                    Ok(canonical.to_string_lossy().into_owned())
+                                }
+                            });
+                        let _ = sent.send(result);
+                    });
                 }
-                directory.to_string_lossy().into_owned()
+                tokio::select! {
+                    biased;
+                    _=cancellation.changed()=>return Err(ProtocolError::Cancelled),
+                    _=scope_cancellation.changed()=>return Err(ProtocolError::Cancelled),
+                    _=tokio::time::sleep_until(operation.deadline.into())=>return Err(ProtocolError::DeadlineExceeded),
+                    result=received=>result.map_err(|_|ProtocolError::BrowserFailure)??,
+                }
             }
             DownloadSource::Provider(directory) => {
                 if directory.is_empty() || directory.contains('\0') {
@@ -357,34 +848,57 @@ impl ClientNetwork {
                 directory.clone()
             }
         };
-        if self
-            .download_source
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?
-            .is_some()
+        self.check_download_operation(operation)?;
         {
-            return Err(ProtocolError::InvalidArguments);
+            let mut current = self
+                .download_source
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            let mut context = self
+                .download_context
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if current.is_some() || context.is_some() {
+                return Err(ProtocolError::InvalidArguments);
+            }
+            // Journal before dispatch: lost ACK never relinquishes the source
+            // or allows a second setup to overwrite uncertain browser policy.
+            *context = Some(context_id.into());
+            *current = Some(source);
         }
-        self.client.send_command("Browser.setDownloadBehavior",Some(json!({"behavior":"allowAndName","browserContextId":context_id,"downloadPath":directory,"eventsEnabled":true})),None).await.map_err(|_|ProtocolError::BrowserFailure)?;
+        let mut dispatched = DownloadSetupDispatch {
+            broker: &self.broker,
+            completed: false,
+        };
+        let result = tokio::select! {
+            biased;
+            _=cancellation.changed()=>Err(ProtocolError::Cancelled),
+            _=scope_cancellation.changed()=>Err(ProtocolError::Cancelled),
+            _=tokio::time::sleep_until(operation.deadline.into())=>Err(ProtocolError::DeadlineExceeded),
+            result=self.client.send_command("Browser.setDownloadBehavior",Some(json!({"behavior":"allowAndName","browserContextId":context_id,"downloadPath":directory,"eventsEnabled":true})),None)=>result.map(|_|()).map_err(|_|ProtocolError::BrowserFailure),
+        };
+        result?;
+        self.check_download_operation(operation)?;
+        self.download_ready.store(true, Ordering::Release);
+        dispatched.completed = true;
+        Ok(())
+    }
+    fn check_download_operation(&self, operation: &OperationLease) -> Result<(), ProtocolError> {
         self.check()?;
-        *self
-            .download_source
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)? = Some(source);
-        *self
-            .download_context
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)? = Some(context_id.into());
+        if operation.generation != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
         Ok(())
     }
     pub fn subscribe_downloads(&self) -> Result<String, ProtocolError> {
         self.check()?;
-        if self
-            .download_source
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?
-            .is_none()
-        {
+        if !self.download_ready.load(Ordering::Acquire) {
             return Err(ProtocolError::UnsupportedCapability);
         }
         let mut subscriptions = self
@@ -410,6 +924,7 @@ impl ClientNetwork {
         &self,
         session: &ApplicationSession,
         params: &Value,
+        sink: &ClientEventSink,
     ) -> Result<(), ProtocolError> {
         if self
             .download_source
@@ -454,7 +969,7 @@ impl ClientNetwork {
         if !published {
             return Ok(());
         }
-        self.sink.emit("download.started".into(),json!({"identityScope":self.scope.identity_scope,"activePage":session.active_page,"handle":handle,"suggestedFilename":required_string(params,"suggestedFilename")?}),None)
+        sink.emit("download.started".into(),json!({"identityScope":self.scope.identity_scope,"activePage":session.active_page,"handle":handle,"suggestedFilename":required_string(params,"suggestedFilename")?}),None)
     }
     async fn download_finished(&self, params: Value) -> Result<(), ProtocolError> {
         let guid = required_string(&params, "guid")?;
@@ -713,13 +1228,15 @@ impl ClientNetwork {
         let Some(session) = session else {
             return Ok(());
         };
+        let sink = session.sink.clone();
         let configuration_ready = session.configuration_ready.subscribe();
+        let session_tenure = configuration_ready.clone();
         let session = session.application;
         if matches!(
             event.method.as_str(),
             "Browser.downloadWillBegin" | "Page.downloadWillBegin"
         ) {
-            return self.download_started(&session, &event.params);
+            return self.download_started(&session, &event.params, &sink);
         }
         let supported = matches!(
             event.method.as_str(),
@@ -744,10 +1261,31 @@ impl ClientNetwork {
                 {
                     let (handle, _) = self.new_resource()?;
                     self.finish_resource(&handle, Err(ProtocolError::RedirectBodyUnavailable))?;
-                    self.sink.emit("network.response".into(),json!({"identityScope":self.scope.identity_scope,"activePage":session.active_page,"handle":handle,"url":required_string(response,"url")?,"status":response.get("status"),"headers":response.get("headers")}),None)?;
+                    sink.emit("network.response".into(),json!({"identityScope":self.scope.identity_scope,"activePage":session.active_page,"handle":handle,"url":required_string(response,"url")?,"status":response.get("status"),"headers":response.get("headers")}),None)?;
                 }
             }
             return Ok(());
+        }
+        let pending_key = match event.method.as_str() {
+            "Fetch.requestPaused" | "Fetch.authRequired" => Some((
+                session_id.to_owned(),
+                event.method.clone(),
+                required_string(&event.params, "requestId")?.to_owned(),
+            )),
+            "Page.javascriptDialogOpening" => {
+                Some((session_id.to_owned(), event.method.clone(), String::new()))
+            }
+            _ => None,
+        };
+        if let Some(key) = &pending_key {
+            let mut pending = self
+                .pending_interceptions
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if pending.len() >= 2048 {
+                return Err(ProtocolError::CapacityExceeded);
+            }
+            pending.insert(key.clone(), ());
         }
         // Accounting happens in event order before tasks are launched.
         if event.method == "Fetch.requestPaused" {
@@ -813,7 +1351,7 @@ impl ClientNetwork {
             }
             let (handle, _) = self.new_resource()?;
             responses.insert((session_id.into(), id.into()), handle.clone());
-            self.sink.emit("network.response".into(),json!({"identityScope":self.scope.identity_scope,"activePage":session.active_page,"handle":handle,"url":required_string(&response,"url")?,"status":response.get("status"),"headers":response.get("headers")}),None)?;
+            sink.emit("network.response".into(),json!({"identityScope":self.scope.identity_scope,"activePage":session.active_page,"handle":handle,"url":required_string(&response,"url")?,"status":response.get("status"),"headers":response.get("headers")}),None)?;
             return Ok(());
         }
         if event.method == "Network.loadingFinished" {
@@ -863,10 +1401,15 @@ impl ClientNetwork {
             self.broker.quarantine()?;
             return Err(ProtocolError::CapacityExceeded);
         }
-        let callback_reservation = if matches!(
+        let callback_event = matches!(
             event.method.as_str(),
             "Fetch.requestPaused" | "Fetch.authRequired" | "Page.javascriptDialogOpening"
-        ) {
+        );
+        let unpublished_callback = callback_event && sink.is_publication_pending()?;
+        // A paused request from an unpublished page must not reserve UI ahead
+        // of the lifecycle owner's exclusive restore/import work. Live-session
+        // callbacks retain their original immediate reservation ordering.
+        let callback_reservation = if callback_event && !unpublished_callback {
             Some(self.ui_gate.reserve_callback()?)
         } else {
             None
@@ -888,24 +1431,54 @@ impl ClientNetwork {
                 network: &this,
                 token: lease.token.clone(),
             });
-            if callback_reservation.is_some() {
+            if callback_event {
                 if let Err(error) = this
                     .wait_for_configuration(configuration_ready, deadline)
                     .await
                 {
+                    if !this.session_tenure_live(&session.session_id, &session_tenure)? {
+                        return Ok(());
+                    }
                     // No callback/default Continue is emitted before commit.
                     // A timed-out admission can only abort the held request.
                     if event.method == "Fetch.requestPaused" {
                         let request_id = required_string(&event.params, "requestId")?;
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            this.abort_request(&session.session_id, request_id),
-                        )
-                        .await;
+                        if matches!(
+                            tokio::time::timeout(
+                                std::time::Duration::from_secs(2),
+                                this.abort_request(&session.session_id, request_id),
+                            )
+                            .await,
+                            Ok(Ok(()))
+                        ) {
+                            if let Some(key) = &pending_key {
+                                this.pending_interceptions
+                                    .lock()
+                                    .map_err(|_| ProtocolError::CleanupFailed)?
+                                    .remove(key);
+                            }
+                        }
                     }
                     return Err(error);
                 }
             }
+            let callback_reservation = if unpublished_callback {
+                if let Err(error) = sink
+                    .wait_publication(deadline, this.cancellation.subscribe())
+                    .await
+                {
+                    if !this.session_tenure_live(&session.session_id, &session_tenure)? {
+                        return Ok(());
+                    }
+                    return Err(error);
+                }
+                if !this.session_tenure_live(&session.session_id, &session_tenure)? {
+                    return Ok(());
+                }
+                Some(this.ui_gate.reserve_callback()?)
+            } else {
+                callback_reservation
+            };
             let _callback_permit = if let Some(reservation) = callback_reservation {
                 match reservation
                     .enter(deadline, this.cancellation.subscribe())
@@ -913,6 +1486,9 @@ impl ClientNetwork {
                 {
                     Ok(permit) => Some(permit),
                     Err(error) => {
+                        if !this.session_tenure_live(&session.session_id, &session_tenure)? {
+                            return Ok(());
+                        }
                         if !this.sealed.load(Ordering::Acquire) {
                             let _ = this.broker.quarantine();
                         }
@@ -922,24 +1498,40 @@ impl ClientNetwork {
             } else {
                 None
             };
+            // An exclusive page replacement may retire this session while its
+            // callback waits. Neither the same scope nor a reused textual ID
+            // grants the old event authority over the replacement document.
+            if !this.session_tenure_live(&session.session_id, &session_tenure)? {
+                return Ok(());
+            }
             let result = match event.method.as_str() {
                 "Fetch.requestPaused" => {
                     this.paused_request_captured(
                         &session.session_id,
                         event.params,
                         captured.ok_or(ProtocolError::DecisionMissing)?,
+                        &sink,
                     )
                     .await
                 }
                 "Fetch.authRequired" => {
-                    this.authentication(&session.session_id, event.params).await
+                    this.authentication(&session.session_id, event.params, &sink)
+                        .await
                 }
                 "Page.javascriptDialogOpening" => {
-                    this.dialog(&session.session_id, event.params).await
+                    this.dialog(&session.session_id, event.params, &sink).await
                 }
                 "Network.loadingFinished" => this.response_finished(&session, event.params).await,
                 _ => Ok(()),
             };
+            if result.is_ok() {
+                if let Some(key) = pending_key {
+                    this.pending_interceptions
+                        .lock()
+                        .map_err(|_| ProtocolError::CleanupFailed)?
+                        .remove(&key);
+                }
+            }
             if !this
                 .sessions
                 .lock()
@@ -961,8 +1553,364 @@ impl ClientNetwork {
         Ok(())
     }
 
-    pub async fn close(&self) -> Result<(), ProtocolError> {
-        let mut failed = self.revoke().is_err();
+    pub(crate) async fn settle_borrowed_event(
+        &self,
+        event: &CdpEvent,
+    ) -> Result<(), ProtocolError> {
+        let Some(session) = event.session_id.as_deref() else {
+            return Ok(());
+        };
+        if !self
+            .sessions
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .contains_key(session)
+        {
+            return Ok(());
+        }
+        let (method, params) = match event.method.as_str() {
+            "Fetch.requestPaused" => (
+                "Fetch.failRequest",
+                json!({"requestId":required_string(&event.params,"requestId")?,"errorReason":"Aborted"}),
+            ),
+            "Fetch.authRequired" => (
+                "Fetch.continueWithAuth",
+                json!({"requestId":required_string(&event.params,"requestId")?,"authChallengeResponse":{"response":"CancelAuth"}}),
+            ),
+            "Page.javascriptDialogOpening" => {
+                ("Page.handleJavaScriptDialog", json!({"accept":false}))
+            }
+            _ => return Ok(()),
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.client
+                .send_command(method, Some(params), Some(session)),
+        )
+        .await
+        .map_err(|_| ProtocolError::CleanupFailed)?
+        .map_err(|_| ProtocolError::CleanupFailed)?;
+        Ok(())
+    }
+    /// After the event reader and retained callbacks have drained, undo only
+    /// interception installed by this connection. Never closes a host target.
+    /// Caller still detaches if any acknowledgement below is unknown.
+    pub(crate) async fn release_borrowed_interception(
+        &self,
+        identity_scope: &str,
+        session: &str,
+        deadline: std::time::Instant,
+    ) -> Result<(), ProtocolError> {
+        if identity_scope != self.scope.identity_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        if !self
+            .sessions
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .contains_key(session)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let pending: Vec<_> = self
+            .pending_interceptions
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .keys()
+            .filter(|(owner, _, _)| owner == session)
+            .cloned()
+            .collect();
+        let mut failed = false;
+        for key in pending {
+            if std::time::Instant::now() >= deadline {
+                failed = true;
+                break;
+            }
+            let (method, params) = match key.1.as_str() {
+                "Fetch.requestPaused" => (
+                    "Fetch.failRequest",
+                    json!({"requestId":key.2,"errorReason":"Aborted"}),
+                ),
+                "Fetch.authRequired" => (
+                    "Fetch.continueWithAuth",
+                    json!({"requestId":key.2,"authChallengeResponse":{"response":"CancelAuth"}}),
+                ),
+                "Page.javascriptDialogOpening" => {
+                    ("Page.handleJavaScriptDialog", json!({"accept":false}))
+                }
+                _ => return Err(ProtocolError::CleanupFailed),
+            };
+            if matches!(
+                tokio::time::timeout_at(
+                    deadline.into(),
+                    self.client
+                        .send_command(method, Some(params), Some(session))
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                self.pending_interceptions
+                    .lock()
+                    .map_err(|_| ProtocolError::CleanupFailed)?
+                    .remove(&key);
+            } else {
+                failed = true;
+            }
+        }
+        for (method, params) in [("Fetch.disable", json!({})), ("Network.disable", json!({}))] {
+            if std::time::Instant::now() >= deadline {
+                failed = true;
+                break;
+            }
+            if !matches!(
+                tokio::time::timeout_at(
+                    deadline.into(),
+                    self.client
+                        .send_command(method, Some(params), Some(session))
+                )
+                .await,
+                Ok(Ok(_))
+            ) {
+                failed = true;
+            }
+        }
+        if failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
+    fn session_tenure_live(
+        &self,
+        session: &str,
+        captured: &tokio::sync::watch::Receiver<bool>,
+    ) -> Result<bool, ProtocolError> {
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        Ok(sessions.get(session).is_some_and(|current| {
+            current
+                .configuration_ready
+                .subscribe()
+                .same_channel(captured)
+        }))
+    }
+
+    fn check_terminal_proof(
+        self: &Arc<Self>,
+        proof: &super::client_enrollment::NativeTerminalProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check_network(self)?;
+        proof.check_client(&self.client)?;
+        if proof.generation() != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if proof.targets().identity_scope != self.scope.identity_scope
+            || proof.targets().context_id.is_empty()
+            || proof.active_target().is_empty()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    fn park_disconnected_routes(
+        self: &Arc<Self>,
+        proof: &super::client_enrollment::NativeTerminalProof,
+    ) -> Result<(), ProtocolError> {
+        self.check_terminal_proof(proof)?;
+        let mut slot = self
+            .disconnected_routes
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !matches!(*slot, DisconnectedRouteSlot::Uncaptured) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut current = self
+            .registry
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.check()?;
+        if self.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        let registry = current
+            .map(|version| {
+                self.broker.park_registry(
+                    self.scope.generation,
+                    version,
+                    &self.scope.identity_scope,
+                )
+            })
+            .transpose()?;
+        self.routes_frozen.store(true, Ordering::Release);
+        *current = None;
+        *slot = DisconnectedRouteSlot::Parked(ParkedRoutes {
+            targets: proof.targets().clone(),
+            target_id: proof.active_target().to_owned(),
+            registry,
+        });
+        Ok(())
+    }
+    fn check_disconnected_drain(&self) -> Result<(), ProtocolError> {
+        if !*self.client.remote_connection_closed().borrow()
+            || !self.sealed.load(Ordering::Acquire)
+            || !self.cleanup_drained.load(Ordering::Acquire)
+            || !self
+                .tokens
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                .is_empty()
+        {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        Ok(())
+    }
+    /// Called by the retained reconnect supervisor, after terminal retirement
+    /// has joined every old callback and body reader. Rejections leave the exact
+    /// hold in this owner; success moves it once into the supervisor journal.
+    pub(crate) fn take_disconnected_routes(
+        self: &Arc<Self>,
+        targets: &Arc<super::client_targets::ClientTargets>,
+        operation: &OperationLease,
+    ) -> Result<DisconnectedRoutes, ProtocolError> {
+        if operation.generation != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        self.broker.validate_reconnect_operation(operation)?;
+        self.check_disconnected_drain()?;
+        let mut slot = self
+            .disconnected_routes
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let DisconnectedRouteSlot::Parked(parked) = &mut *slot else {
+            return Err(ProtocolError::StaleScope);
+        };
+        if !Arc::ptr_eq(targets, &parked.targets)
+            || targets.identity_scope != self.scope.identity_scope
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if let Some(registry) = &mut parked.registry {
+            self.broker.bind_parked_registry(registry, operation)?;
+        }
+        let DisconnectedRouteSlot::Parked(parked) =
+            std::mem::replace(&mut *slot, DisconnectedRouteSlot::Taken)
+        else {
+            unreachable!("parked route slot checked under lock")
+        };
+        Ok(DisconnectedRoutes {
+            source: self.clone(),
+            parked,
+            replacement: None,
+            sequence: operation.sequence,
+            deadline: operation.deadline,
+            cancellation: operation.cancellation.clone(),
+            active: true,
+        })
+    }
+    fn retire_disconnected_routes(&self) -> Result<(), ProtocolError> {
+        let mut slot = self
+            .disconnected_routes
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let DisconnectedRouteSlot::Parked(parked) = &mut *slot {
+            if let Some(registry) = &mut parked.registry {
+                self.broker.retire_parked_registry(registry)?;
+            }
+        }
+        // A moved guard remains in the lifecycle journal, not this network.
+        if !matches!(*slot, DisconnectedRouteSlot::Taken) {
+            *slot = DisconnectedRouteSlot::Retired;
+        }
+        Ok(())
+    }
+    /// Verified remote EOF is the only close path which preserves a route
+    /// snapshot. Local close, overflow, and final abandonment always retire it.
+    pub(crate) async fn close_for_remote_disconnect(
+        self: &Arc<Self>,
+        proof: &super::client_enrollment::NativeTerminalProof,
+    ) -> Result<(), ProtocolError> {
+        self.check_terminal_proof(proof)?;
+        self.close_with_terminal_proof(Some(proof)).await
+    }
+
+    /// Keep the close worker retained if its caller is cancelled or dropped.
+    /// A second close awaits that same worker rather than treating moved-out
+    /// task/reader sets as proof that their work already completed.
+    pub async fn close(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        self.close_with_terminal_proof(None).await
+    }
+    async fn close_with_terminal_proof(
+        self: &Arc<Self>,
+        proof: Option<&super::client_enrollment::NativeTerminalProof>,
+    ) -> Result<(), ProtocolError> {
+        let mut state = self.close_gate.lock().await;
+        let retire_failed = if let Some(proof) = proof {
+            self.check_terminal_proof(proof)?;
+            if matches!(*state, NetworkCloseState::Open) {
+                self.park_disconnected_routes(proof)?;
+            } else if !matches!(
+                *self
+                    .disconnected_routes
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?,
+                DisconnectedRouteSlot::Parked(_) | DisconnectedRouteSlot::Taken
+            ) {
+                return Err(ProtocolError::StaleScope);
+            }
+            false
+        } else {
+            // Even a completed terminal drain must explicitly retire its hold
+            // when this is final close, rather than return cached success.
+            self.retire_disconnected_routes().is_err()
+        };
+        if matches!(*state, NetworkCloseState::Open) {
+            // Preserve the original close admission boundary: revoke and abort
+            // owner tasks before yielding to the retained drain worker. In
+            // particular, quarantined readiness waiters must not get a new
+            // scheduling turn to emit cleanup commands before they are aborted.
+            let revoke_failed = self.revoke_resources().is_err();
+            let mut failed = retire_failed || revoke_failed;
+            match self.tasks.lock() {
+                Ok(mut tasks) => tasks.abort_all(),
+                Err(poisoned) => {
+                    failed = true;
+                    poisoned.into_inner().abort_all();
+                }
+            }
+            let network = self.clone();
+            let terminal = proof.cloned();
+            *state = NetworkCloseState::Running(tokio::spawn(async move {
+                network.close_retained(failed, terminal).await
+            }));
+        }
+        let result = match &mut *state {
+            NetworkCloseState::Finished(result) => {
+                return if retire_failed {
+                    Err(ProtocolError::CleanupFailed)
+                } else {
+                    result.clone()
+                };
+            }
+            NetworkCloseState::Running(task) => match task.await {
+                Ok(result) => result,
+                Err(_) => Err(ProtocolError::CleanupFailed),
+            },
+            NetworkCloseState::Open => unreachable!("close worker was started"),
+        };
+        *state = NetworkCloseState::Finished(result.clone());
+        if retire_failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            result
+        }
+    }
+    async fn close_retained(
+        self: &Arc<Self>,
+        mut failed: bool,
+        terminal: Option<super::client_enrollment::NativeTerminalProof>,
+    ) -> Result<(), ProtocolError> {
         // Cleanup failure never short-circuits owned-task drainage. In
         // particular spawn_blocking cannot be canceled by dropping its handle.
         let mut tasks = {
@@ -975,12 +1923,31 @@ impl ClientNetwork {
             };
             std::mem::take(&mut *current)
         };
-        tasks.abort_all();
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
                 if !error.is_cancelled() {
                     failed = true;
                 }
+            }
+        }
+        if let Some(proof) = terminal {
+            // Enrollment has stopped intake and every asynchronous emitter has
+            // joined. Revoke once more after joins to catch a token captured in
+            // the pre-abort interval; no future event producer can mint another.
+            // This fence retires callbacks only. File readers and recorders may
+            // still be running, and route adoption still requires full cleanup.
+            let retired = proof
+                .check_network(self)
+                .and_then(|()| {
+                    self.broker
+                        .revoke_scope_decisions(&self.scope.identity_scope)
+                })
+                .and_then(|()| {
+                    self.retirement_sink
+                        .retire_callbacks_after_terminal_drain(&proof)
+                });
+            if retired.is_err() {
+                failed = true;
             }
         }
         let mut readers = {
@@ -1015,11 +1982,17 @@ impl ClientNetwork {
         if failed {
             Err(ProtocolError::CleanupFailed)
         } else {
+            self.cleanup_drained.store(true, Ordering::Release);
             Ok(())
         }
     }
 
-    async fn authentication(&self, session: &str, params: Value) -> Result<(), ProtocolError> {
+    async fn authentication(
+        &self,
+        session: &str,
+        params: Value,
+        sink: &ClientEventSink,
+    ) -> Result<(), ProtocolError> {
         let request_id = required_string(&params, "requestId")?;
         let challenge = params
             .get("authChallenge")
@@ -1065,7 +2038,7 @@ impl ClientNetwork {
             Some(self.scope.identity_scope.clone()),
         )?;
         let _token = self.track_token(session, &lease.token)?;
-        self.sink.emit("network.auth".into(),json!({"identityScope":self.scope.identity_scope,"origin":parsed.origin().ascii_serialization(),"source":"Server","scheme":challenge.get("scheme"),"realm":challenge.get("realm")}),Some(DecisionNotice{token:lease.token,timeout_ms:30_000}))?;
+        sink.emit("network.auth".into(),json!({"identityScope":self.scope.identity_scope,"origin":parsed.origin().ascii_serialization(),"source":"Server","scheme":challenge.get("scheme"),"realm":challenge.get("realm")}),Some(DecisionNotice{token:lease.token,timeout_ms:30_000}))?;
         let response = match lease
             .outcome
             .await
@@ -1087,7 +2060,12 @@ impl ClientNetwork {
             .map_err(|_| ProtocolError::BrowserFailure)
     }
 
-    async fn dialog(&self, session: &str, params: Value) -> Result<(), ProtocolError> {
+    async fn dialog(
+        &self,
+        session: &str,
+        params: Value,
+        sink: &ClientEventSink,
+    ) -> Result<(), ProtocolError> {
         let kind = required_string(&params, "type")?;
         if !matches!(kind, "alert" | "confirm" | "prompt" | "beforeunload") {
             return Err(ProtocolError::InvalidArguments);
@@ -1102,7 +2080,7 @@ impl ClientNetwork {
             Some(self.scope.identity_scope.clone()),
         )?;
         let _token = self.track_token(session, &lease.token)?;
-        self.sink.emit(
+        sink.emit(
             "dialog.opened".into(),
             json!({"identityScope":self.scope.identity_scope,"type":kind,"message":message}),
             Some(DecisionNotice {
@@ -1218,28 +2196,33 @@ impl ClientNetwork {
         {
             return Err(ProtocolError::PolicyDenied);
         }
-        self.downloads
+        // Same nested order as download_started: downloads then resources.
+        // finish_resource/revoke serialize completion under resources; neither
+        // holds that lock while acquiring downloads. All fallible locks and
+        // backing-store release precede infallible map/watch mutations.
+        let mut downloads = self
+            .downloads
             .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?
-            .retain(|_, entry| entry.handle != handle);
-        let resource = self
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let mut resources = self
             .resources
             .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?
-            .remove(handle);
-        if let Some(resource) = resource {
-            if let Some(Ok(blob)) = resource
-                .completed
-                .send_replace(Some(Err(ProtocolError::StaleScope)))
-            {
-                if blob.starts_with("provider:") {
-                    return Ok(());
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(resource) = resources.get(handle) {
+            let completed = resource.completed.borrow().clone();
+            if let Some(Ok(blob)) = completed {
+                if !blob.starts_with("provider:") {
+                    self.blobs
+                        .release(&self.scope, &blob)
+                        .map_err(|_| ProtocolError::CleanupFailed)?;
                 }
-                self.blobs
-                    .release(&self.scope, &blob)
-                    .map_err(|_| ProtocolError::CleanupFailed)?;
             }
+            resource
+                .completed
+                .send_replace(Some(Err(ProtocolError::StaleScope)));
         }
+        resources.remove(handle);
+        downloads.retain(|_, entry| entry.handle != handle);
         Ok(())
     }
     async fn response_finished(
@@ -1324,6 +2307,13 @@ impl ClientNetwork {
             token: token.into(),
         })
     }
+    /// Bind a dispatch context to this exact captured resource generation.
+    pub fn validate_scope(&self, scope: &BlobScope) -> Result<(), ProtocolError> {
+        if scope != &self.scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.check()
+    }
     fn check(&self) -> Result<(), ProtocolError> {
         if self.sealed.load(Ordering::Acquire) {
             return Err(ProtocolError::StaleScope);
@@ -1340,6 +2330,11 @@ impl ClientNetwork {
     /// Lifecycle owner calls this before context disposal. Read aliases carry no
     /// upload authority and are removed even when callback tasks are cancelled.
     pub fn revoke(&self) -> Result<(), ProtocolError> {
+        let routes = self.retire_disconnected_routes();
+        let resources = self.revoke_resources();
+        routes.and(resources)
+    }
+    fn revoke_resources(&self) -> Result<(), ProtocolError> {
         self.sealed.store(true, Ordering::Release);
         self.cancellation.send_replace(CancelSignal::SessionClosed);
         self.broker
@@ -1389,7 +2384,7 @@ impl ClientNetwork {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             .clear();
-        Ok(())
+        self.app_events.clear()
     }
 
     pub fn read_body(
@@ -1441,6 +2436,56 @@ impl ClientNetwork {
         }
     }
 
+    /// The retained lifecycle supervisor captures this before source teardown.
+    /// Remove its route slot under the same lock that excludes new captures, so
+    /// a late source revoke cannot retire the eventual replacement's registry.
+    pub(crate) fn capture_route_transfer(
+        self: &Arc<Self>,
+        operation: &OperationLease,
+    ) -> Result<RouteTransfer, ProtocolError> {
+        self.check()?;
+        if operation.generation != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if operation.is_callback {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let mut current = self
+            .registry
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.check()?;
+        if self.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        let registry = current
+            .map(|version| {
+                self.broker.capture_registry_transfer(
+                    version,
+                    &self.scope.identity_scope,
+                    operation,
+                )
+            })
+            .transpose()?;
+        self.routes_frozen.store(true, Ordering::Release);
+        *current = None;
+        Ok(RouteTransfer {
+            source: self.clone(),
+            replacement: None,
+            registry,
+            sequence: operation.sequence,
+            deadline: operation.deadline,
+            cancellation: operation.cancellation.clone(),
+            active: true,
+        })
+    }
+
     /// Replacement affects future captures only. Broker retains retired
     /// snapshots until every paused request/fallback chain releases them.
     pub fn replace_routes(
@@ -1448,20 +2493,22 @@ impl ClientNetwork {
         version: u64,
         registrations: Vec<String>,
     ) -> Result<(), ProtocolError> {
+        self.check()?;
         let mut current = self
             .registry
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        let (generation, _) = self.broker.health()?;
-        self.broker.register_routes_scoped(
-            generation,
+        self.check()?;
+        if self.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.broker.replace_routes_scoped(
+            self.scope.generation,
             version,
             registrations,
             Some(self.scope.identity_scope.clone()),
+            *current,
         )?;
-        if let Some(old) = *current {
-            self.broker.retire_registry(generation, old)?;
-        }
         *current = Some(version);
         Ok(())
     }
@@ -1477,6 +2524,9 @@ impl ClientNetwork {
             .registry
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if self.routes_frozen.load(Ordering::Acquire) {
+            return Err(ProtocolError::StaleScope);
+        }
         let lease = self.broker.decision_scoped(
             self.scope.generation,
             owner,
@@ -1502,6 +2552,7 @@ impl ClientNetwork {
         session: &str,
         params: Value,
         mut lease: DecisionLease,
+        sink: &ClientEventSink,
     ) -> Result<(), ProtocolError> {
         self.check()?;
         let request_id = params
@@ -1575,7 +2626,7 @@ impl ClientNetwork {
             if let Some(previous) = &fallback_of {
                 payload["fallbackOf"] = json!(previous);
             }
-            self.sink.emit(
+            sink.emit(
                 "network.request".into(),
                 payload,
                 Some(DecisionNotice {
@@ -1786,6 +2837,7 @@ impl Drop for AliasCleanup<'_> {
 
 #[derive(Clone)]
 struct EnrolledSession {
+    sink: ClientEventSink,
     application: ApplicationSession,
     configuration_ready: tokio::sync::watch::Sender<bool>,
 }
@@ -1804,6 +2856,19 @@ fn required_string<'a>(value: &'a Value, field: &str) -> Result<&'a str, Protoco
 
 struct BodyResource {
     completed: tokio::sync::watch::Sender<Option<Result<String, ProtocolError>>>,
+}
+
+/// A caller dropping its retained setup task cannot certify a lost ACK.
+struct DownloadSetupDispatch<'a> {
+    broker: &'a ClientSession,
+    completed: bool,
+}
+impl Drop for DownloadSetupDispatch<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.broker.quarantine();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1966,6 +3031,16 @@ mod bridge_tests {
         tokio::sync::mpsc::Receiver<Value>,
         tokio::task::JoinHandle<()>,
     ) {
+        fixture_with_download_delay(false).await
+    }
+    async fn fixture_with_download_delay(
+        delay: bool,
+    ) -> (
+        Arc<ClientNetwork>,
+        tokio::sync::mpsc::Receiver<ServerMessage>,
+        tokio::sync::mpsc::Receiver<Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (commands, received) = tokio::sync::mpsc::channel(64);
@@ -1983,6 +3058,9 @@ mod bridge_tests {
                     json!({})
                 };
                 commands.send(command.clone()).await.unwrap();
+                if delay && command["method"] == "Browser.setDownloadBehavior" {
+                    tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                }
                 if socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
                         json!({"id":command["id"],"result":result}).to_string(),
@@ -2020,6 +3098,7 @@ mod bridge_tests {
         network.sessions.lock().unwrap().insert(
             "owned".into(),
             EnrolledSession {
+                sink: network.future_session_sink.lock().unwrap().clone(),
                 application: ApplicationSession {
                     session_id: "owned".into(),
                     root_page_session: "owned".into(),
@@ -2029,6 +3108,1383 @@ mod bridge_tests {
             },
         );
         (network, events, received, server)
+    }
+    fn route_replacement(source: &Arc<ClientNetwork>, identity: &str) -> Arc<ClientNetwork> {
+        Arc::new(ClientNetwork::new(
+            source.client.clone(),
+            source.broker.clone(),
+            source.future_session_sink.lock().unwrap().clone(),
+            BlobScope {
+                generation: source.scope.generation,
+                identity_scope: identity.into(),
+            },
+            source.blobs.clone(),
+            Arc::new(super::super::client_ui::UiGate::default()),
+            NetworkPolicy::default(),
+        ))
+    }
+    struct TerminalFixture {
+        source: Arc<ClientNetwork>,
+        targets: Arc<super::super::client_targets::ClientTargets>,
+        retained: super::super::client_reconnect::RetainedIdentity,
+        endpoint: String,
+        disconnect: tokio::sync::watch::Sender<bool>,
+        server: tokio::task::JoinHandle<()>,
+        _events: tokio::sync::mpsc::Receiver<ServerMessage>,
+    }
+    async fn terminal_fixture() -> TerminalFixture {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (disconnect, closed) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let mut tasks = tokio::task::JoinSet::new();
+            for connection in 0..2 {
+                let (socket, _) = listener.accept().await.unwrap();
+                let mut closed = closed.clone();
+                tasks.spawn(async move {
+                    let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+                    loop {
+                        let incoming = tokio::select! {
+                            _ = closed.changed(), if connection == 0 => break,
+                            message = socket.next() => message,
+                        };
+                        let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = incoming else { break };
+                        let command: Value = serde_json::from_str(&text).unwrap();
+                        let result = match command["method"].as_str() {
+                            Some("Target.attachToTarget") => json!({"sessionId":if connection == 0 {"owned"} else {"new-session"}}),
+                            Some("Target.getTargetInfo") => json!({"targetInfo":{"targetId":"retained-page","type":"page","browserContextId":"retained-context"}}),
+                            Some("Target.getBrowserContexts") => json!({"browserContextIds":[],"defaultBrowserContextId":"retained-context"}),
+                            _ => json!({}),
+                        };
+                        if socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":command["id"],"result":result}).to_string())).await.is_err() { break; }
+                    }
+                });
+            }
+            while tasks.join_next().await.is_some() {}
+        });
+        let mut manager =
+            super::super::browser::BrowserManager::connect_owned_browser(&endpoint, None)
+                .await
+                .unwrap();
+        manager
+            .adopt_verified_page("retained-page", "retained-context")
+            .await
+            .unwrap();
+        let retained =
+            super::super::client_reconnect::RetainedIdentity::capture(&manager, "retained-context")
+                .unwrap();
+        let broker = Arc::new(ClientSession::new());
+        let (sink, events) = ClientEventSink::test_channel(broker.clone());
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "terminal-source".into(),
+        };
+        let (_stage_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let stage_op = OperationLease {
+            generation: 1,
+            sequence: 900,
+            is_callback: false,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(60),
+            cancellation,
+        };
+        let scoped_sink = sink
+            .stage_until_result(&stage_op, &scope.identity_scope)
+            .unwrap();
+        sink.acknowledge_result_for_test(&ServerMessage::Result {
+            id: "initial".into(),
+            generation: 1,
+            operation_seq: 900,
+            ok: true,
+            data: Some(json!({"identityScope":scope.identity_scope})),
+            error: None,
+            effects: super::super::client_protocol::Effects::Completed,
+            scope_state: super::super::client_protocol::ScopeState::Usable,
+        })
+        .unwrap();
+        let sink = scoped_sink;
+        let blobs =
+            Arc::new(BlobStore::new(super::super::client_blobs::BlobLimits::default()).unwrap());
+        blobs.activate_scope(scope.clone()).unwrap();
+        let source = Arc::new(ClientNetwork::new(
+            manager.client.clone(),
+            broker,
+            sink,
+            scope.clone(),
+            blobs,
+            Arc::new(super::super::client_ui::UiGate::default()),
+            NetworkPolicy::default(),
+        ));
+        source.sessions.lock().unwrap().insert(
+            "owned".into(),
+            EnrolledSession {
+                sink: source.future_session_sink.lock().unwrap().clone(),
+                application: ApplicationSession {
+                    session_id: "owned".into(),
+                    root_page_session: "owned".into(),
+                    active_page: true,
+                },
+                configuration_ready: tokio::sync::watch::channel(true).0,
+            },
+        );
+        let targets = super::super::client_targets::ClientTargets::new(
+            "retained-context".into(),
+            scope.identity_scope,
+        );
+        TerminalFixture {
+            source,
+            targets,
+            retained,
+            endpoint,
+            disconnect,
+            server,
+            _events: events,
+        }
+    }
+    async fn disconnect_terminal(
+        fixture: &TerminalFixture,
+    ) -> super::super::client_enrollment::NativeTerminalProof {
+        fixture.disconnect.send_replace(true);
+        let mut closed = fixture.source.client.remote_connection_closed();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while !*closed.borrow_and_update() {
+                closed.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        super::super::client_enrollment::NativeTerminalProof::for_test(
+            fixture.source.client.clone(),
+            fixture.targets.clone(),
+            &fixture.source,
+            1,
+            "retained-page".into(),
+        )
+        .unwrap()
+    }
+    async fn reconnected_network(
+        fixture: &TerminalFixture,
+        operation: &OperationLease,
+    ) -> (
+        Arc<ClientNetwork>,
+        Arc<super::super::client_targets::ClientTargets>,
+        super::super::client_reconnect::VerifiedReconnectProof,
+    ) {
+        let verified = super::super::client_reconnect::reconnect(
+            &fixture.endpoint,
+            &fixture.retained,
+            operation,
+        )
+        .await
+        .unwrap();
+        let (manager, context, target, proof) = verified.into_parts();
+        assert_eq!(target, "retained-page");
+        let replacement = Arc::new(ClientNetwork::new(
+            manager.client.clone(),
+            fixture.source.broker.clone(),
+            fixture.source.future_session_sink.lock().unwrap().clone(),
+            BlobScope {
+                generation: 1,
+                identity_scope: "terminal-replacement".into(),
+            },
+            fixture.source.blobs.clone(),
+            Arc::new(super::super::client_ui::UiGate::default()),
+            NetworkPolicy::default(),
+        ));
+        let targets = super::super::client_targets::ClientTargets::new(
+            context,
+            replacement.scope.identity_scope.clone(),
+        );
+        (replacement, targets, proof)
+    }
+    #[tokio::test]
+    async fn terminal_routes_hold_release_until_exact_reconnect_and_ignore_late_old_scope() {
+        let fixture = terminal_fixture().await;
+        let source = &fixture.source;
+        source
+            .replace_routes(7, vec!["first".into(), "second".into()])
+            .unwrap();
+        let pending = source
+            .capture_request("owned", DecisionOwner::Scope, 1000)
+            .unwrap();
+        let registrations = pending.registrations.clone();
+        let terminal = disconnect_terminal(&fixture).await;
+        source.close_for_remote_disconnect(&terminal).await.unwrap();
+        assert!(matches!(
+            pending.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        assert_eq!(
+            source.broker.decision_resource_scope(1, &pending.token),
+            Err(ProtocolError::DecisionMissing)
+        );
+        assert!(source.tokens.lock().unwrap().is_empty());
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        let operation = source.broker.admit(1, 1, 5000).unwrap();
+        let wrong_targets = super::super::client_targets::ClientTargets::new(
+            "retained-context".into(),
+            source.scope.identity_scope.clone(),
+        );
+        assert!(matches!(
+            source.take_disconnected_routes(&wrong_targets, &operation),
+            Err(ProtocolError::StaleScope)
+        ));
+        let mut routes = source
+            .take_disconnected_routes(&fixture.targets, &operation)
+            .unwrap();
+        assert!(source
+            .take_disconnected_routes(&fixture.targets, &operation)
+            .is_err());
+        let (replacement, targets, verified) = reconnected_network(&fixture, &operation).await;
+        routes
+            .bind(&replacement, &targets, &verified, &operation)
+            .unwrap();
+        let wrong_targets = super::super::client_targets::ClientTargets::new(
+            targets.context_id.clone(),
+            targets.identity_scope.clone(),
+        );
+        assert_eq!(
+            routes.adopt(&wrong_targets, &operation),
+            Err(ProtocolError::StaleScope)
+        );
+        routes.adopt(&targets, &operation).unwrap();
+        assert_eq!(*replacement.registry.lock().unwrap(), Some(7));
+        let next = replacement
+            .capture_request("new-session", DecisionOwner::Scope, 1000)
+            .unwrap();
+        assert!(Arc::ptr_eq(&registrations, &next.registrations));
+        source.revoke().unwrap();
+        source.close().await.unwrap();
+        assert_eq!(
+            source
+                .broker
+                .decision_resource_scope(1, &next.token)
+                .unwrap(),
+            "terminal-replacement"
+        );
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        assert!(source
+            .capture_request("owned", DecisionOwner::Scope, 1000)
+            .is_err());
+        replacement.close().await.unwrap();
+        assert_eq!(
+            source.broker.take_released_registry_events(8).unwrap(),
+            vec![(7, Some("terminal-replacement".into()))]
+        );
+        replacement.client.close().await;
+        fixture.server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn terminal_routes_wrong_replacement_authority_never_mutates_hold() {
+        let fixture = terminal_fixture().await;
+        let source = &fixture.source;
+        source.replace_routes(1, vec!["route".into()]).unwrap();
+        let terminal = disconnect_terminal(&fixture).await;
+        source.close_for_remote_disconnect(&terminal).await.unwrap();
+        let operation = source.broker.admit(1, 1, 5000).unwrap();
+        let mut routes = source
+            .take_disconnected_routes(&fixture.targets, &operation)
+            .unwrap();
+        let (replacement, targets, verified) = reconnected_network(&fixture, &operation).await;
+        for wrong in [
+            "client",
+            "store",
+            "broker",
+            "generation",
+            "scope",
+            "context",
+        ] {
+            let candidate = Arc::new(ClientNetwork::new(
+                if wrong == "client" {
+                    source.client.clone()
+                } else {
+                    replacement.client.clone()
+                },
+                if wrong == "broker" {
+                    Arc::new(ClientSession::new())
+                } else {
+                    source.broker.clone()
+                },
+                source.future_session_sink.lock().unwrap().clone(),
+                BlobScope {
+                    generation: if wrong == "generation" { 2 } else { 1 },
+                    identity_scope: if wrong == "scope" {
+                        source.scope.identity_scope.clone()
+                    } else {
+                        "candidate".into()
+                    },
+                },
+                if wrong == "store" {
+                    Arc::new(
+                        BlobStore::new(super::super::client_blobs::BlobLimits::default()).unwrap(),
+                    )
+                } else {
+                    source.blobs.clone()
+                },
+                Arc::new(super::super::client_ui::UiGate::default()),
+                NetworkPolicy::default(),
+            ));
+            let candidate_targets = super::super::client_targets::ClientTargets::new(
+                if wrong == "context" {
+                    "foreign-context".into()
+                } else {
+                    "retained-context".into()
+                },
+                candidate.scope.identity_scope.clone(),
+            );
+            assert!(
+                routes
+                    .bind(&candidate, &candidate_targets, &verified, &operation)
+                    .is_err(),
+                "{wrong}"
+            );
+            assert!(!candidate.routes_frozen.load(Ordering::Acquire));
+        }
+        routes
+            .bind(&replacement, &targets, &verified, &operation)
+            .unwrap();
+        assert_eq!(
+            routes.bind(&replacement, &targets, &verified, &operation),
+            Err(ProtocolError::StaleScope)
+        );
+        source.broker.cancel(1, 1).unwrap();
+        assert_eq!(
+            routes.adopt(&targets, &operation),
+            Err(ProtocolError::Cancelled)
+        );
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        routes.retire().unwrap();
+        assert_eq!(
+            source.broker.take_released_registry_events(8).unwrap(),
+            vec![(1, Some(source.scope.identity_scope.clone()))]
+        );
+        assert!(routes.adopt(&targets, &operation).is_err());
+        source.close().await.unwrap();
+        replacement.close().await.unwrap();
+        replacement.client.close().await;
+        fixture.server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn terminal_close_canceled_waiter_cannot_acknowledge_held_reader_early() {
+        let fixture = terminal_fixture().await;
+        let source = &fixture.source;
+        source.replace_routes(1, vec!["route".into()]).unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        source
+            .blocking_reads
+            .lock()
+            .unwrap()
+            .spawn_blocking(move || {
+                let _ = started.send(());
+                blocked.recv().unwrap();
+            });
+        entered.await.unwrap();
+        let terminal = Arc::new(disconnect_terminal(&fixture).await);
+        let first_source = source.clone();
+        let first_terminal = terminal.clone();
+        let first = tokio::spawn(async move {
+            first_source
+                .close_for_remote_disconnect(&first_terminal)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !source.sealed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first.abort();
+        let _ = first.await;
+        let operation = source.broker.admit(1, 1, 5000).unwrap();
+        assert!(matches!(
+            source.take_disconnected_routes(&fixture.targets, &operation),
+            Err(ProtocolError::RegistryInUse)
+        ));
+        let second_source = source.clone();
+        let second_terminal = terminal.clone();
+        let mut second = tokio::spawn(async move {
+            second_source
+                .close_for_remote_disconnect(&second_terminal)
+                .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err()
+        );
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        release.send(()).unwrap();
+        second.await.unwrap().unwrap();
+        // Ordinary close after terminal cleanup must retire, not return cached
+        // successful cleanup while silently keeping a dormant route snapshot.
+        source.close().await.unwrap();
+        assert_eq!(
+            source.broker.take_released_registry_events(8).unwrap(),
+            vec![(1, Some(source.scope.identity_scope.clone()))]
+        );
+        assert!(source
+            .take_disconnected_routes(&fixture.targets, &operation)
+            .is_err());
+        assert!(source.close_for_remote_disconnect(&terminal).await.is_err());
+        fixture.server.abort();
+    }
+    #[tokio::test]
+    async fn terminal_callback_retirement_precedes_blocking_reader_cleanup_and_fences_late_emit() {
+        let mut fixture = terminal_fixture().await;
+        let source = fixture.source.clone();
+        source.replace_routes(1, vec!["route".into()]).unwrap();
+        let pending = source
+            .capture_request("owned", DecisionOwner::Scope, 30_000)
+            .unwrap();
+        source
+            .retirement_sink
+            .emit(
+                "network.request".into(),
+                json!({"identityScope":source.scope.identity_scope}),
+                Some(DecisionNotice {
+                    token: pending.token.clone(),
+                    timeout_ms: 30_000,
+                }),
+            )
+            .unwrap();
+        struct ProducerEnded(Arc<AtomicBool>);
+        impl Drop for ProducerEnded {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let producer_ended = Arc::new(AtomicBool::new(false));
+        let ended = producer_ended.clone();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        source.tasks.lock().unwrap().spawn(async move {
+            let _ended = ProducerEnded(ended);
+            let _ = started.send(());
+            std::future::pending::<()>().await;
+            Ok(())
+        });
+        entered.await.unwrap();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        source
+            .blocking_reads
+            .lock()
+            .unwrap()
+            .spawn_blocking(move || {
+                let _ = started.send(());
+                let _ = blocked.recv();
+            });
+        entered.await.unwrap();
+        let terminal = disconnect_terminal(&fixture).await;
+        let closing = source.clone();
+        let close =
+            tokio::spawn(async move { closing.close_for_remote_disconnect(&terminal).await });
+        let first = tokio::time::timeout(std::time::Duration::from_secs(2), fixture._events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let ServerMessage::Event {
+            sequence: first_sequence,
+            event,
+            ..
+        } = first
+        else {
+            panic!("missing old callback");
+        };
+        assert_eq!(event, "network.request");
+        let retired =
+            tokio::time::timeout(std::time::Duration::from_secs(2), fixture._events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        let ServerMessage::Event {
+            sequence,
+            event,
+            payload,
+            decision,
+            ..
+        } = retired
+        else {
+            panic!("missing callback retirement proof");
+        };
+        assert_eq!(event, "scope.callbacks-retired");
+        assert_eq!(
+            payload,
+            json!({"identityScope":source.scope.identity_scope,"throughEventSequence":first_sequence})
+        );
+        assert_eq!(sequence, first_sequence + 1);
+        assert!(decision.is_none());
+        assert!(producer_ended.load(Ordering::Acquire));
+        assert!(matches!(
+            pending.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        assert!(
+            !close.is_finished(),
+            "blocking reader must still be retained"
+        );
+        assert!(!source.cleanup_drained.load(Ordering::Acquire));
+        assert!(source
+            .retirement_sink
+            .emit(
+                "app.log".into(),
+                json!({"identityScope":source.scope.identity_scope}),
+                None
+            )
+            .is_err());
+        assert!(fixture._events.try_recv().is_err());
+        release.send(()).unwrap();
+        close.await.unwrap().unwrap();
+        fixture.server.abort();
+    }
+
+    #[tokio::test]
+    async fn terminal_failed_drain_and_abandoned_hold_never_reactivate() {
+        for fail_reader in [false, true] {
+            let fixture = terminal_fixture().await;
+            let source = &fixture.source;
+            source.replace_routes(1, vec!["route".into()]).unwrap();
+            if fail_reader {
+                source
+                    .blocking_reads
+                    .lock()
+                    .unwrap()
+                    .spawn_blocking(|| panic!("synthetic terminal reader failure"));
+            }
+            let terminal = disconnect_terminal(&fixture).await;
+            let outcome = source.close_for_remote_disconnect(&terminal).await;
+            let operation = source.broker.admit(1, 1, 5000).unwrap();
+            if fail_reader {
+                assert_eq!(outcome, Err(ProtocolError::CleanupFailed));
+                assert!(!source.cleanup_drained.load(Ordering::Acquire));
+                assert!(matches!(
+                    source.take_disconnected_routes(&fixture.targets, &operation),
+                    Err(ProtocolError::RegistryInUse)
+                ));
+                assert!(source
+                    .broker
+                    .take_released_registry_events(8)
+                    .unwrap()
+                    .is_empty());
+                // Final retirement is attempted independently of cached drain
+                // failure, but must still return that unresolved failure.
+                assert_eq!(source.close().await, Err(ProtocolError::CleanupFailed));
+            } else {
+                outcome.unwrap();
+                drop(
+                    source
+                        .take_disconnected_routes(&fixture.targets, &operation)
+                        .unwrap(),
+                );
+                source.close().await.unwrap();
+            }
+            assert_eq!(
+                source.broker.take_released_registry_events(8).unwrap(),
+                vec![(1, Some(source.scope.identity_scope.clone()))]
+            );
+            assert!(source
+                .take_disconnected_routes(&fixture.targets, &operation)
+                .is_err());
+            fixture.server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn route_transfer_adopts_same_version_only_after_exact_source_drain() {
+        let (source, _events, _commands, server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        source
+            .replace_routes(7, vec!["first".into(), "second".into()])
+            .unwrap();
+        let mut transfer = source.capture_route_transfer(&operation).unwrap();
+        assert_eq!(
+            source
+                .capture_request("owned", DecisionOwner::Scope, 1000)
+                .err()
+                .unwrap(),
+            ProtocolError::StaleScope
+        );
+        assert_eq!(
+            source.replace_routes(8, vec![]),
+            Err(ProtocolError::StaleScope)
+        );
+        let replacement = route_replacement(&source, "replacement");
+        transfer.bind(&replacement).unwrap();
+        assert_eq!(
+            transfer.adopt(&operation),
+            Err(ProtocolError::RegistryInUse)
+        );
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        source.close().await.unwrap();
+        assert!(source.cleanup_drained.load(Ordering::Acquire));
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        transfer.adopt(&operation).unwrap();
+        let request = replacement
+            .capture_request("replacement-page", DecisionOwner::Scope, 1000)
+            .unwrap();
+        assert_eq!(request.registry_version, Some(7));
+        assert_eq!(
+            request.registrations.as_ref(),
+            &["first".to_owned(), "second".to_owned()]
+        );
+        assert_eq!(
+            source
+                .broker
+                .decision_scoped(
+                    1,
+                    DecisionOwner::Scope,
+                    DecisionKind::Request,
+                    1000,
+                    Some(7),
+                    Some(source.scope.identity_scope.clone())
+                )
+                .err()
+                .unwrap(),
+            ProtocolError::StaleScope
+        );
+        source.revoke().unwrap();
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        replacement.replace_routes(8, vec![]).unwrap();
+        replacement.broker.revoke_decision(&request.token).unwrap();
+        assert_eq!(
+            source.broker.take_released_registry_events(8).unwrap(),
+            vec![(7, Some("replacement".into()))]
+        );
+        replacement.close().await.unwrap();
+        assert_eq!(
+            source.broker.take_released_registry_events(8).unwrap(),
+            vec![(8, Some("replacement".into()))]
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn route_transfer_rejects_foreign_client_store_broker_generation_and_rebinding() {
+        let (source, _events, _commands, server) = fixture().await;
+        let (foreign, _foreign_events, _foreign_commands, foreign_server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        source.replace_routes(1, vec!["route".into()]).unwrap();
+        let mut transfer = source.capture_route_transfer(&operation).unwrap();
+        assert_eq!(transfer.bind(&source), Err(ProtocolError::StaleScope));
+        for kind in ["client", "broker", "store", "generation", "identity"] {
+            let client = if kind == "client" {
+                foreign.client.clone()
+            } else {
+                source.client.clone()
+            };
+            let broker = if kind == "broker" {
+                foreign.broker.clone()
+            } else {
+                source.broker.clone()
+            };
+            let blobs = if kind == "store" {
+                foreign.blobs.clone()
+            } else {
+                source.blobs.clone()
+            };
+            let candidate = Arc::new(ClientNetwork::new(
+                client,
+                broker,
+                source.future_session_sink.lock().unwrap().clone(),
+                BlobScope {
+                    generation: if kind == "generation" { 2 } else { 1 },
+                    identity_scope: if kind == "identity" {
+                        source.scope.identity_scope.clone()
+                    } else {
+                        format!("wrong-{kind}")
+                    },
+                },
+                blobs,
+                Arc::new(super::super::client_ui::UiGate::default()),
+                NetworkPolicy::default(),
+            ));
+            assert_eq!(
+                transfer.bind(&candidate),
+                Err(if kind == "generation" {
+                    ProtocolError::StaleGeneration
+                } else {
+                    ProtocolError::StaleScope
+                })
+            );
+            assert!(!candidate.routes_frozen.load(Ordering::Acquire));
+        }
+        let replacement = route_replacement(&source, "replacement");
+        let other = route_replacement(&source, "other-replacement");
+        transfer.bind(&replacement).unwrap();
+        assert_eq!(transfer.bind(&other), Err(ProtocolError::StaleScope));
+        assert!(!other.routes_frozen.load(Ordering::Acquire));
+        transfer.restore(&operation).unwrap();
+        assert!(!source.routes_frozen.load(Ordering::Acquire));
+        assert_eq!(*source.registry.lock().unwrap(), Some(1));
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        source.close().await.unwrap();
+        replacement.close().await.unwrap();
+        foreign.close().await.unwrap();
+        server.abort();
+        foreign_server.abort();
+    }
+    #[tokio::test]
+    async fn canceled_or_abandoned_transfer_never_reactivates_routes() {
+        for cancel_after_close in [false, true] {
+            let (source, _events, _commands, server) = fixture().await;
+            let (cancel, operation) = download_operation();
+            source.replace_routes(1, vec!["route".into()]).unwrap();
+            let mut transfer = source.capture_route_transfer(&operation).unwrap();
+            let replacement = route_replacement(&source, "replacement");
+            transfer.bind(&replacement).unwrap();
+            if cancel_after_close {
+                source.close().await.unwrap();
+            }
+            cancel.send(CancelSignal::Requested).unwrap();
+            assert_eq!(transfer.adopt(&operation), Err(ProtocolError::Cancelled));
+            assert_eq!(transfer.restore(&operation), Err(ProtocolError::Cancelled));
+            assert!(source
+                .broker
+                .take_released_registry_events(8)
+                .unwrap()
+                .is_empty());
+            drop(transfer);
+            assert_eq!(
+                source.broker.take_released_registry_events(8).unwrap(),
+                vec![(1, Some(source.scope.identity_scope.clone()))]
+            );
+            assert!(source.routes_frozen.load(Ordering::Acquire));
+            assert!(replacement.routes_frozen.load(Ordering::Acquire));
+            assert!(source.replace_routes(2, vec![]).is_err());
+            source.close().await.unwrap();
+            replacement.close().await.unwrap();
+            assert!(source
+                .broker
+                .take_released_registry_events(8)
+                .unwrap()
+                .is_empty());
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn close_seals_and_aborts_owner_tasks_before_first_yield() {
+        let (source, mut events, mut commands, server) = fixture().await;
+        let ran = Arc::new(AtomicBool::new(false));
+        let task_ran = ran.clone();
+        source.tasks.lock().unwrap().spawn(async move {
+            task_ran.store(true, Ordering::Release);
+            Ok(())
+        });
+        let mut first = Box::pin(source.close());
+        std::future::poll_fn(|context| {
+            assert!(std::future::Future::poll(first.as_mut(), context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        assert!(source.sealed.load(Ordering::Acquire));
+        assert_eq!(*source.cancellation.borrow(), CancelSignal::SessionClosed);
+        assert!(!source.cleanup_drained.load(Ordering::Acquire));
+        drop(first);
+        source.close().await.unwrap();
+        assert!(!ran.load(Ordering::Acquire));
+        assert!(source.cleanup_drained.load(Ordering::Acquire));
+        assert!(events.try_recv().is_err());
+        assert!(commands.try_recv().is_err());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn retained_close_survives_canceled_waiter_and_blocks_transfer_until_reader_settles() {
+        let (source, _events, _commands, server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        source.replace_routes(1, vec!["route".into()]).unwrap();
+        let mut transfer = source.capture_route_transfer(&operation).unwrap();
+        let replacement = route_replacement(&source, "replacement");
+        transfer.bind(&replacement).unwrap();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, entered) = tokio::sync::oneshot::channel();
+        source
+            .blocking_reads
+            .lock()
+            .unwrap()
+            .spawn_blocking(move || {
+                let _ = started.send(());
+                wait.recv().unwrap();
+            });
+        entered.await.unwrap();
+        let first_source = source.clone();
+        let first = tokio::spawn(async move { first_source.close().await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !source.sealed.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        first.abort();
+        let _ = first.await;
+        let second_source = source.clone();
+        let mut second = tokio::spawn(async move { second_source.close().await });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), &mut second)
+                .await
+                .is_err()
+        );
+        assert!(!source.cleanup_drained.load(Ordering::Acquire));
+        assert_eq!(
+            transfer.adopt(&operation),
+            Err(ProtocolError::RegistryInUse)
+        );
+        assert!(source
+            .broker
+            .take_released_registry_events(8)
+            .unwrap()
+            .is_empty());
+        release.send(()).unwrap();
+        second.await.unwrap().unwrap();
+        source.close().await.unwrap();
+        assert!(source.cleanup_drained.load(Ordering::Acquire));
+        transfer.adopt(&operation).unwrap();
+        replacement.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn failed_close_is_retained_and_never_becomes_empty_set_success() {
+        let (source, _events, _commands, server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        source.replace_routes(1, vec!["route".into()]).unwrap();
+        let mut transfer = source.capture_route_transfer(&operation).unwrap();
+        let replacement = route_replacement(&source, "replacement");
+        transfer.bind(&replacement).unwrap();
+        source
+            .blocking_reads
+            .lock()
+            .unwrap()
+            .spawn_blocking(|| panic!("synthetic retained reader failure"));
+        assert_eq!(source.close().await, Err(ProtocolError::CleanupFailed));
+        assert_eq!(source.close().await, Err(ProtocolError::CleanupFailed));
+        assert!(!source.cleanup_drained.load(Ordering::Acquire));
+        assert_eq!(
+            transfer.adopt(&operation),
+            Err(ProtocolError::RegistryInUse)
+        );
+        assert_eq!(transfer.restore(&operation), Err(ProtocolError::StaleScope));
+        transfer.retire().unwrap();
+        replacement.close().await.unwrap();
+        server.abort();
+    }
+    fn download_operation() -> (tokio::sync::watch::Sender<CancelSignal>, OperationLease) {
+        let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        (
+            cancel,
+            OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                cancellation,
+            },
+        )
+    }
+    #[tokio::test]
+    async fn replacement_session_events_keep_captured_ack_sink_while_old_session_stays_live() {
+        let (network, mut events, _commands, server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        let source = network.future_session_sink.lock().unwrap().clone();
+        let staged = source
+            .stage_until_result(&operation, &network.scope.identity_scope)
+            .unwrap();
+        network
+            .set_future_session_sink(staged.clone(), &network.scope.identity_scope, &operation)
+            .unwrap();
+        network
+            .configure_session(
+                ApplicationSession {
+                    session_id: "replacement".into(),
+                    root_page_session: "replacement".into(),
+                    active_page: true,
+                },
+                &operation,
+            )
+            .await
+            .unwrap();
+        network.subscribe_responses().unwrap();
+        for session in ["replacement", "owned"] {
+            network.event(&CdpEvent {method:"Network.responseReceived".into(),session_id:Some(session.into()),
+                params:json!({"requestId":session,"response":{"url":format!("https://synthetic.test/{session}"),"status":200,"headers":{}}})}).unwrap();
+        }
+        let ServerMessage::Event { event, payload, .. } = events.try_recv().unwrap() else {
+            panic!("expected old-session response")
+        };
+        assert_eq!(event, "network.response");
+        assert_eq!(payload["url"], "https://synthetic.test/owned");
+        assert!(events.try_recv().is_err());
+        assert!(network
+            .sessions
+            .lock()
+            .unwrap()
+            .get("replacement")
+            .unwrap()
+            .sink
+            .validate_stage(&source, &operation, &network.scope.identity_scope)
+            .is_ok());
+        assert!(network
+            .sessions
+            .lock()
+            .unwrap()
+            .get("owned")
+            .unwrap()
+            .sink
+            .validate_stage(&source, &operation, &network.scope.identity_scope)
+            .is_err());
+        network.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn unpublished_callback_does_not_block_exclusive_initialization_before_ack() {
+        let (network, mut events, _commands, server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        let source = network.future_session_sink.lock().unwrap().clone();
+        let staged = source
+            .stage_until_result(&operation, &network.scope.identity_scope)
+            .unwrap();
+        network
+            .set_future_session_sink(staged, &network.scope.identity_scope, &operation)
+            .unwrap();
+        network
+            .configure_session(
+                ApplicationSession {
+                    session_id: "replacement".into(),
+                    root_page_session: "replacement".into(),
+                    active_page: true,
+                },
+                &operation,
+            )
+            .await
+            .unwrap();
+        network
+            .configuration_committed("replacement", &operation)
+            .unwrap();
+        network.replace_routes(1, vec!["route".into()]).unwrap();
+        network.event(&CdpEvent {method:"Fetch.requestPaused".into(),session_id:Some("replacement".into()),
+            params:json!({"requestId":"first-script","request":{"url":"https://synthetic.test/first","method":"GET","headers":{}}})}).unwrap();
+        let exclusive = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            network.ui_gate.enter(
+                true,
+                false,
+                operation.deadline,
+                operation.cancellation.clone(),
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        tokio::task::yield_now().await;
+        assert!(events.try_recv().is_err());
+        source
+            .acknowledge_result_for_test(&ServerMessage::Result {
+                id: "restart".into(),
+                generation: 1,
+                operation_seq: operation.sequence,
+                ok: true,
+                data: Some(json!({"identityScope":network.scope.identity_scope})),
+                error: None,
+                effects: super::super::client_protocol::Effects::Completed,
+                scope_state: super::super::client_protocol::ScopeState::Usable,
+            })
+            .unwrap();
+        assert!(events.try_recv().is_err());
+        drop(exclusive);
+        let ServerMessage::Event {
+            event,
+            decision: Some(decision),
+            ..
+        } = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        else {
+            panic!("expected post-ACK request")
+        };
+        assert_eq!(event, "network.request");
+        network
+            .broker
+            .resolve(
+                1,
+                &decision.token,
+                Decision::Continue {
+                    overrides: Default::default(),
+                },
+            )
+            .unwrap();
+        let mut tasks = std::mem::take(&mut *network.tasks.lock().unwrap());
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        network.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn future_session_sink_rejects_wrong_scope_and_cancelled_operation() {
+        let (network, _events, _commands, server) = fixture().await;
+        let (cancel, operation) = download_operation();
+        let source = network.future_session_sink.lock().unwrap().clone();
+        let staged = source
+            .stage_until_result(&operation, &network.scope.identity_scope)
+            .unwrap();
+        assert_eq!(
+            network.set_future_session_sink(staged.clone(), "other", &operation),
+            Err(ProtocolError::StaleScope)
+        );
+        cancel.send_replace(CancelSignal::SessionClosed);
+        assert_eq!(
+            network.set_future_session_sink(staged, &network.scope.identity_scope, &operation),
+            Err(ProtocolError::Cancelled)
+        );
+        network.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn download_setup_rejects_stale_cancelled_expired_before_journal_or_cdp() {
+        for mode in 0..3 {
+            let (network, _events, mut commands, server) = fixture().await;
+            let (cancel, mut operation) = download_operation();
+            let expected = match mode {
+                0 => {
+                    operation.generation += 1;
+                    ProtocolError::StaleGeneration
+                }
+                1 => {
+                    cancel.send_replace(CancelSignal::Requested);
+                    ProtocolError::Cancelled
+                }
+                _ => {
+                    operation.deadline = std::time::Instant::now();
+                    ProtocolError::DeadlineExceeded
+                }
+            };
+            assert_eq!(
+                network
+                    .configure_downloads(
+                        "owned-context",
+                        DownloadSource::Provider("/provider-owned".into()),
+                        &operation
+                    )
+                    .await,
+                Err(expected)
+            );
+            assert!(network.download_source.lock().unwrap().is_none());
+            assert!(network.download_context.lock().unwrap().is_none());
+            assert!(commands.try_recv().is_err());
+            assert_eq!(
+                network.broker.health().unwrap().1,
+                super::super::client_protocol::ScopeState::Usable
+            );
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn download_setup_acknowledges_once_and_rejects_replacement() {
+        let (network, _events, mut commands, server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        network
+            .configure_downloads(
+                "owned-context",
+                DownloadSource::Provider("/provider-owned".into()),
+                &operation,
+            )
+            .await
+            .unwrap();
+        assert!(network.download_ready.load(Ordering::Acquire));
+        assert!(network.subscribe_downloads().is_ok());
+        let command = commands.recv().await.unwrap();
+        assert_eq!(command["method"], "Browser.setDownloadBehavior");
+        assert_eq!(command["params"]["browserContextId"], "owned-context");
+        assert_eq!(
+            network
+                .configure_downloads(
+                    "other",
+                    DownloadSource::Provider("/replacement".into()),
+                    &operation
+                )
+                .await,
+            Err(ProtocolError::InvalidArguments)
+        );
+        assert!(commands.try_recv().is_err());
+        assert_eq!(
+            network.download_context.lock().unwrap().as_deref(),
+            Some("owned-context")
+        );
+        network.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn local_download_setup_retains_and_drains_directory_validation_worker() {
+        let (network, _events, mut commands, server) = fixture().await;
+        let (_cancel, operation) = download_operation();
+        let directory = tempfile::tempdir().unwrap();
+        let canonical = std::fs::canonicalize(directory.path()).unwrap();
+        network
+            .configure_downloads(
+                "owned-context",
+                DownloadSource::Local(canonical.clone()),
+                &operation,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            commands.recv().await.unwrap()["params"]["downloadPath"],
+            canonical.to_string_lossy().as_ref()
+        );
+        network.close().await.unwrap();
+        assert!(network.blocking_reads.lock().unwrap().is_empty());
+        assert!(
+            matches!(&*network.download_source.lock().unwrap(),Some(DownloadSource::Local(path)) if path==&canonical)
+        );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn lost_download_setup_ack_retains_journal_and_quarantines_timeout_cancel_or_drop() {
+        for mode in 0..3 {
+            let (network, _events, mut commands, server) = fixture_with_download_delay(true).await;
+            let (cancel, mut operation) = download_operation();
+            if mode == 0 {
+                operation.deadline =
+                    std::time::Instant::now() + std::time::Duration::from_millis(100);
+            }
+            let child = network.clone();
+            let task = tokio::spawn(async move {
+                child
+                    .configure_downloads(
+                        "owned-context",
+                        DownloadSource::Provider("/provider-owned".into()),
+                        &operation,
+                    )
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!network.download_ready.load(Ordering::Acquire));
+            assert_eq!(
+                network.subscribe_downloads(),
+                Err(ProtocolError::UnsupportedCapability)
+            );
+            if mode == 2 {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                if mode == 1 {
+                    cancel.send_replace(CancelSignal::Requested);
+                }
+                assert_eq!(
+                    task.await.unwrap(),
+                    Err(if mode == 0 {
+                        ProtocolError::DeadlineExceeded
+                    } else {
+                        ProtocolError::Cancelled
+                    })
+                );
+            }
+            assert!(
+                matches!(&*network.download_source.lock().unwrap(),Some(DownloadSource::Provider(path)) if path=="/provider-owned")
+            );
+            assert_eq!(
+                network.download_context.lock().unwrap().as_deref(),
+                Some("owned-context")
+            );
+            assert!(!network.download_ready.load(Ordering::Acquire));
+            assert_eq!(
+                network.broker.health().unwrap().1,
+                super::super::client_protocol::ScopeState::Quarantined
+            );
+            network.close().await.unwrap();
+            assert!(network.download_source.lock().unwrap().is_some());
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn expired_borrowed_cleanup_budget_never_restarts_per_request() {
+        let (network, _events, mut commands, server) = fixture().await;
+        {
+            let mut pending = network.pending_interceptions.lock().unwrap();
+            for index in 0..2048 {
+                pending.insert(
+                    (
+                        "owned".into(),
+                        "Fetch.requestPaused".into(),
+                        format!("request-{index}"),
+                    ),
+                    (),
+                );
+            }
+        }
+        let started = std::time::Instant::now();
+        assert_eq!(
+            network
+                .release_borrowed_interception(&network.scope.identity_scope, "owned", started)
+                .await,
+            Err(ProtocolError::CleanupFailed)
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(commands.try_recv().is_err());
+        assert_eq!(network.pending_interceptions.lock().unwrap().len(), 2048);
+        server.abort();
+    }
+    #[tokio::test]
+    async fn borrowed_retirement_settles_owned_auth_dialog_and_request_only() {
+        let (network, _events, mut commands, server) = fixture().await;
+        for (method, params) in [
+            (
+                "Fetch.requestPaused",
+                json!({"requestId":"pending-request","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}}),
+            ),
+            (
+                "Fetch.authRequired",
+                json!({"requestId":"pending-auth","request":{"url":"https://synthetic.test/"},"authChallenge":{"source":"Server","origin":"https://synthetic.test","scheme":"Basic","realm":"synthetic"}}),
+            ),
+            (
+                "Page.javascriptDialogOpening",
+                json!({"type":"confirm","message":"synthetic"}),
+            ),
+        ] {
+            network
+                .event(&CdpEvent {
+                    method: method.into(),
+                    session_id: Some("owned".into()),
+                    params,
+                })
+                .unwrap();
+        }
+        network.close().await.unwrap();
+        assert_eq!(
+            network
+                .release_borrowed_interception(
+                    "wrong-scope",
+                    "owned",
+                    std::time::Instant::now() + std::time::Duration::from_secs(2)
+                )
+                .await,
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            network
+                .release_borrowed_interception(
+                    &network.scope.identity_scope,
+                    "foreign",
+                    std::time::Instant::now() + std::time::Duration::from_secs(2)
+                )
+                .await,
+            Err(ProtocolError::StaleScope)
+        );
+        network
+            .release_borrowed_interception(
+                &network.scope.identity_scope,
+                "owned",
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        let mut recorded = Vec::new();
+        while let Ok(command) = commands.try_recv() {
+            recorded.push(command);
+        }
+        for method in [
+            "Fetch.failRequest",
+            "Fetch.continueWithAuth",
+            "Page.handleJavaScriptDialog",
+            "Fetch.disable",
+            "Network.disable",
+        ] {
+            assert!(
+                recorded.iter().any(|v| v["method"] == method),
+                "missing {method}"
+            );
+        }
+        assert!(recorded.iter().all(|v| v["sessionId"] == "owned"));
+        assert!(network.pending_interceptions.lock().unwrap().is_empty());
+        server.abort();
+    }
+    #[tokio::test]
+    async fn rejected_resource_release_keeps_maps_body_and_quota_intact() {
+        let (mut network, _events, _commands, server) = fixture().await;
+        let blobs = Arc::new(
+            BlobStore::new(super::super::client_blobs::BlobLimits {
+                max_blob_bytes: 3,
+                max_total_bytes: 3,
+                max_handles: 1,
+            })
+            .unwrap(),
+        );
+        blobs.activate_scope(network.scope.clone()).unwrap();
+        Arc::get_mut(&mut network).unwrap().blobs = blobs.clone();
+        let blob = blobs.insert_sealed(network.scope.clone(), b"abc").unwrap();
+        let (handle, resource) = network.new_resource().unwrap();
+        network
+            .finish_resource(&handle, Ok(blob.handle.clone()))
+            .unwrap();
+        network.downloads.lock().unwrap().insert(
+            "guid".into(),
+            DownloadEntry {
+                handle: handle.clone(),
+                resource,
+                completed: true,
+                terminal_started: true,
+                published: true,
+                reservation: None,
+            },
+        );
+        blobs
+            .reserve(&network.scope, &blob.handle, "body-owner")
+            .unwrap();
+        assert_eq!(
+            network.release_body(&handle),
+            Err(ProtocolError::CleanupFailed)
+        );
+        assert!(network.resources.lock().unwrap().contains_key(&handle));
+        assert!(network.downloads.lock().unwrap().contains_key("guid"));
+        assert_eq!(
+            blobs.read(&network.scope, &blob.handle, 0, 3).unwrap(),
+            b"abc"
+        );
+        assert!(matches!(
+            blobs.create(network.scope.clone(), 1, "0".repeat(64)),
+            Err(super::super::client_blobs::BlobError::QuotaExceeded)
+        ));
+        blobs.rollback("body-owner").unwrap();
+        network.release_body(&handle).unwrap();
+        assert!(!network.resources.lock().unwrap().contains_key(&handle));
+        assert!(network.downloads.lock().unwrap().is_empty());
+        assert!(blobs
+            .create(network.scope.clone(), 3, "0".repeat(64))
+            .is_ok());
+        server.abort();
     }
     #[tokio::test]
     async fn uncommitted_session_hold_uses_original_deadline_and_scope_cancellation() {
@@ -2057,6 +4513,131 @@ mod bridge_tests {
                 .unwrap()
                 .is_err()
         );
+        server.abort();
+    }
+    #[tokio::test]
+    async fn retired_page_callbacks_never_rebind_after_exclusive_ui_wait() {
+        for reuse_textual_session in [false, true] {
+            let (network, mut events, mut commands, server) = fixture().await;
+            assert!(network.uses_ui_gate(&network.ui_gate));
+            assert!(!network.uses_ui_gate(&Arc::new(super::super::client_ui::UiGate::default())));
+            let (_cancel, operation) = download_operation();
+            let exclusive = network
+                .ui_gate
+                .enter(
+                    true,
+                    false,
+                    operation.deadline,
+                    operation.cancellation.clone(),
+                )
+                .await
+                .unwrap();
+            for (method, params) in [
+                (
+                    "Fetch.requestPaused",
+                    json!({"requestId":"old-request","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}}),
+                ),
+                (
+                    "Fetch.authRequired",
+                    json!({"requestId":"old-auth","request":{"url":"https://synthetic.test/"},"authChallenge":{"source":"Server","origin":"https://synthetic.test","scheme":"basic","realm":"synthetic"}}),
+                ),
+                (
+                    "Page.javascriptDialogOpening",
+                    json!({"type":"alert","message":"synthetic old page"}),
+                ),
+            ] {
+                network
+                    .event(&CdpEvent {
+                        method: method.into(),
+                        session_id: Some("owned".into()),
+                        params,
+                    })
+                    .unwrap();
+            }
+            tokio::task::yield_now().await;
+            network.detach_session("owned").unwrap();
+            if reuse_textual_session {
+                network.sessions.lock().unwrap().insert(
+                    "owned".into(),
+                    EnrolledSession {
+                        sink: network.future_session_sink.lock().unwrap().clone(),
+                        application: ApplicationSession {
+                            session_id: "owned".into(),
+                            root_page_session: "owned".into(),
+                            active_page: true,
+                        },
+                        configuration_ready: tokio::sync::watch::channel(true).0,
+                    },
+                );
+            }
+            drop(exclusive);
+            let mut tasks = std::mem::take(&mut *network.tasks.lock().unwrap());
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap().unwrap();
+            }
+            assert_eq!(network.pending_callbacks().unwrap(), 0);
+            assert!(events.try_recv().is_err());
+            assert!(commands.try_recv().is_err());
+            assert!(network.check().is_ok());
+            network.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn surviving_worker_callback_keeps_its_original_route_after_page_retirement() {
+        let (network, mut events, mut commands, server) = fixture().await;
+        network.sessions.lock().unwrap().insert(
+            "worker".into(),
+            EnrolledSession {
+                sink: network.future_session_sink.lock().unwrap().clone(),
+                application: ApplicationSession {
+                    session_id: "worker".into(),
+                    root_page_session: "worker".into(),
+                    active_page: false,
+                },
+                configuration_ready: tokio::sync::watch::channel(true).0,
+            },
+        );
+        network
+            .replace_routes(1, vec!["attempt-route".into()])
+            .unwrap();
+        let (_cancel, operation) = download_operation();
+        let exclusive = network
+            .ui_gate
+            .enter(
+                true,
+                false,
+                operation.deadline,
+                operation.cancellation.clone(),
+            )
+            .await
+            .unwrap();
+        network.event(&CdpEvent {
+            method: "Fetch.requestPaused".into(),
+            session_id: Some("worker".into()),
+            params: json!({"requestId":"worker-request","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}}),
+        }).unwrap();
+        tokio::task::yield_now().await;
+        network.detach_session("owned").unwrap();
+        drop(exclusive);
+        let (name, payload, decision) = next_event(&mut events).await;
+        assert_eq!(name, "network.request");
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["registrationIds"], json!(["attempt-route"]));
+        network
+            .broker
+            .resolve(1, &decision.unwrap().token, Decision::Abort {})
+            .unwrap();
+        let mut tasks = std::mem::take(&mut *network.tasks.lock().unwrap());
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap().unwrap();
+        }
+        let command = commands.recv().await.unwrap();
+        assert_eq!(command["method"], "Fetch.failRequest");
+        assert_eq!(command["sessionId"], "worker");
+        assert_eq!(network.pending_callbacks().unwrap(), 0);
+        assert!(network.check().is_ok());
+        network.close().await.unwrap();
         server.abort();
     }
     #[tokio::test]
@@ -2160,6 +4741,7 @@ mod bridge_tests {
         let canonical = std::fs::canonicalize(directory.path()).unwrap();
         *network.download_source.lock().unwrap() = Some(DownloadSource::Local(canonical.clone()));
         *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
         network.subscribe_downloads().unwrap();
         std::fs::write(canonical.join("synthetic-guid"), b"downloaded").unwrap();
         network.event(&CdpEvent{method:"Browser.downloadWillBegin".into(),session_id:Some("owned".into()),params:json!({"guid":"synthetic-guid","frameId":"owned-frame","suggestedFilename":"example.txt"})}).unwrap();
@@ -2199,6 +4781,7 @@ mod bridge_tests {
         let canonical = std::fs::canonicalize(directory.path()).unwrap();
         *network.download_source.lock().unwrap() = Some(DownloadSource::Local(canonical.clone()));
         *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
         std::fs::write(canonical.join("hidden-guid"), b"hidden").unwrap();
         network.event(&CdpEvent{method:"Browser.downloadWillBegin".into(),session_id:Some("owned".into()),params:json!({"guid":"hidden-guid","frameId":"owned-frame","suggestedFilename":"hidden.txt"})}).unwrap();
         assert!(events.try_recv().is_err());

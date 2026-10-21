@@ -2,7 +2,7 @@
 //! waits on this registry before configuration/resume; no URL or timing guess
 //! assigns a bootstrap target to a generic request handler.
 use super::client_protocol::ProtocolError;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -26,10 +26,17 @@ struct Registry {
     revision: u64,
     sealed: bool,
     reservations: usize,
+    creation_sequence: u64,
+    bootstrap_creations: HashMap<u64, Option<String>>,
+    native_bootstrap_cleanup: HashSet<String>,
+    bootstrap_cleanup_reservations: HashSet<u64>,
+    unknown_bootstrap_create: bool,
     resuming: usize,
     protected_read: bool,
     enrollment_ready: bool,
     targets: HashMap<String, OwnedTarget>,
+    auxiliary_sequence: u64,
+    auxiliary: HashMap<u64, AuxiliaryAttachment>,
 }
 pub struct ClientTargets {
     pub context_id: String,
@@ -40,7 +47,33 @@ pub struct ClientTargets {
 pub struct CreationReservation {
     registry: Arc<ClientTargets>,
     purpose: TargetPurpose,
+    bootstrap_nonce: Option<u64>,
+    native_created_target: Option<String>,
     claimed: bool,
+}
+struct AuxiliaryAttachment {
+    target: String,
+    primary_session: String,
+    acknowledged_session: Option<String>,
+    claimed_session: Option<String>,
+    candidates: HashSet<String>,
+    cleanup_owned: HashSet<String>,
+    cleanup_acknowledged: HashSet<String>,
+    detached: bool,
+    terminal_connection_retired: bool,
+    failed: bool,
+}
+/// Retained by the native recording task from before attach dispatch through
+/// exact detach acknowledgement. This authority is never exposed on the wire.
+pub(crate) struct AuxiliaryAttachmentReservation {
+    registry: Arc<ClientTargets>,
+    nonce: u64,
+    completed: bool,
+}
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AuxiliaryDisposition {
+    Ordinary,
+    RecorderOwned,
 }
 pub struct InventoryStamp {
     pub revision: u64,
@@ -135,6 +168,32 @@ impl ClientTargets {
         state.enrollment_ready = true;
         Ok(())
     }
+    /// Final publication uses index -> targets -> execution-gate ordering.
+    /// Holding this registry guard prevents independent auxiliary/creation
+    /// retirement from sealing targets between the health check and publish.
+    pub(crate) fn publish_initialization(
+        self: &Arc<Self>,
+        authority: &super::client_browser::LifecycleInitialization,
+    ) -> Result<u64, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || !state.enrollment_ready
+            || state.reservations != 0
+            || state.resuming != 0
+            || state.protected_read
+            || state
+                .targets
+                .values()
+                .any(|target| target.purpose.is_none() || !target.configured || !target.resumed)
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        drop(authority.enter(self)?);
+        authority.publish()
+    }
     pub fn protected_read_barrier(
         self: &Arc<Self>,
     ) -> Result<ProtectedTargetBarrier, ProtocolError> {
@@ -147,6 +206,10 @@ impl ClientTargets {
             || state.protected_read
             || state.reservations != 0
             || state.resuming != 0
+            || state
+                .auxiliary
+                .values()
+                .any(|entry| !entry.detached && entry.claimed_session.is_none())
             || state
                 .targets
                 .values()
@@ -222,15 +285,274 @@ impl ClientTargets {
         if state.sealed || state.protected_read {
             return Err(ProtocolError::StaleScope);
         }
-        state.reservations = state
+        let reservations = state
             .reservations
             .checked_add(1)
             .ok_or(ProtocolError::CapacityExceeded)?;
+        let bootstrap_nonce = if purpose == TargetPurpose::StateBootstrap {
+            if state.bootstrap_creations.len() >= 64
+                || state.native_bootstrap_cleanup.len() + state.bootstrap_cleanup_reservations.len()
+                    >= 64
+            {
+                return Err(ProtocolError::CapacityExceeded);
+            }
+            let nonce = state
+                .creation_sequence
+                .checked_add(1)
+                .ok_or(ProtocolError::IdentifierExhausted)?;
+            state.creation_sequence = nonce;
+            state.bootstrap_creations.insert(nonce, None);
+            state.bootstrap_cleanup_reservations.insert(nonce);
+            Some(nonce)
+        } else {
+            None
+        };
+        state.reservations = reservations;
         Ok(CreationReservation {
             registry: self.clone(),
             purpose,
+            bootstrap_nonce,
+            native_created_target: None,
             claimed: false,
         })
+    }
+    /// Exact native-created temporary resources remain owned after reservation
+    /// completion, until the state owner proves close ACK or inventory absence.
+    pub(crate) fn native_bootstrap_cleanup_complete(&self) -> Result<bool, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        Ok(!state.unknown_bootstrap_create
+            && state.native_bootstrap_cleanup.is_empty()
+            && state.bootstrap_cleanup_reservations.is_empty())
+    }
+    pub(crate) fn native_bootstrap_cleanup_targets(&self) -> Result<Vec<String>, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        let mut targets = state
+            .native_bootstrap_cleanup
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        targets.sort();
+        Ok(targets)
+    }
+    pub(crate) fn settle_native_bootstrap_cleanup(
+        &self,
+        target: &str,
+    ) -> Result<(), ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        if !state.native_bootstrap_cleanup.remove(target) {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    /// Exact ACK-bound native bootstrap admission, never context-wide adoption.
+    pub(crate) fn is_native_bootstrap_target(&self, target: &str) -> Result<bool, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed {
+            return Ok(false);
+        }
+        Ok(state
+            .bootstrap_creations
+            .values()
+            .any(|id| id.as_deref() == Some(target)))
+    }
+    pub(crate) async fn wait_native_bootstrap_target(
+        &self,
+        target: &str,
+    ) -> Result<bool, ProtocolError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if state.sealed {
+                    return Ok(false);
+                }
+                if state
+                    .bootstrap_creations
+                    .values()
+                    .any(|id| id.as_deref() == Some(target))
+                {
+                    return Ok(true);
+                }
+                if !state.bootstrap_creations.values().any(Option::is_none) {
+                    return Ok(false);
+                }
+            }
+            changed.await;
+        }
+    }
+    pub(crate) fn reserve_auxiliary_attachment(
+        self: &Arc<Self>,
+        expected_scope: &str,
+        target_id: &str,
+        primary_session: &str,
+    ) -> Result<AuxiliaryAttachmentReservation, ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if expected_scope != self.identity_scope || state.sealed {
+            return Err(ProtocolError::StaleScope);
+        }
+        let target = state
+            .targets
+            .get(target_id)
+            .ok_or(ProtocolError::StaleReference)?;
+        if target.session_id != primary_session
+            || target.purpose != Some(TargetPurpose::Application)
+            || !target.resumed
+            || !target.configured
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if state.protected_read
+            || state
+                .auxiliary
+                .values()
+                .any(|entry| entry.target == target_id && !entry.detached)
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        // Retain exact-session tombstones for the entire scope tenure. A delayed
+        // attach event after detach ACK must never regain generic ownership.
+        if state.auxiliary.len() >= 1024 {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        let nonce = state
+            .auxiliary_sequence
+            .checked_add(1)
+            .ok_or(ProtocolError::IdentifierExhausted)?;
+        state.auxiliary_sequence = nonce;
+        state.auxiliary.insert(
+            nonce,
+            AuxiliaryAttachment {
+                target: target_id.into(),
+                primary_session: primary_session.into(),
+                acknowledged_session: None,
+                claimed_session: None,
+                candidates: HashSet::new(),
+                cleanup_owned: HashSet::new(),
+                cleanup_acknowledged: HashSet::new(),
+                detached: false,
+                terminal_connection_retired: false,
+                failed: false,
+            },
+        );
+        Ok(AuxiliaryAttachmentReservation {
+            registry: self.clone(),
+            nonce,
+            completed: false,
+        })
+    }
+    /// Resolve only against the attach RPC's exact returned session. Receipt of
+    /// a same-target event alone never gives the recorder ownership of it.
+    pub(crate) async fn classify_auxiliary_attachment(
+        &self,
+        target_id: &str,
+        session_id: &str,
+    ) -> Result<AuxiliaryDisposition, ProtocolError> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let mut state = self
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if state.auxiliary.values().any(|entry| {
+                    entry.target == target_id
+                        && (entry.acknowledged_session.as_deref() == Some(session_id)
+                            || entry.cleanup_owned.contains(session_id))
+                }) {
+                    return Ok(AuxiliaryDisposition::RecorderOwned);
+                }
+                let sealed = state.sealed;
+                let pending = state.auxiliary.values_mut().find(|entry| {
+                    entry.target == target_id
+                        && entry.acknowledged_session.is_none()
+                        && !entry.detached
+                });
+                let Some(pending) = pending else {
+                    return Ok(AuxiliaryDisposition::Ordinary);
+                };
+                if pending.primary_session == session_id {
+                    return Ok(AuxiliaryDisposition::Ordinary);
+                }
+                if session_id.is_empty() || session_id.len() > 1024 {
+                    return Err(ProtocolError::InvalidFrame);
+                }
+                if pending.candidates.len() >= 64 && !pending.candidates.contains(session_id) {
+                    pending.failed = true;
+                    state.sealed = true;
+                    self.changed.notify_waiters();
+                    return Err(ProtocolError::CapacityExceeded);
+                }
+                pending.candidates.insert(session_id.into());
+                if sealed || pending.failed {
+                    // The retained recorder supervisor, not generic enrollment,
+                    // owns this candidate's detach. A later exact ACK must not
+                    // create a second concurrent cleanup owner.
+                    pending.cleanup_owned.insert(session_id.into());
+                    return Ok(AuxiliaryDisposition::RecorderOwned);
+                }
+            }
+            changed.await;
+        }
+    }
+    pub(crate) fn auxiliary_cleanup_complete(&self) -> Result<bool, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        Ok(state.auxiliary.values().all(|entry| {
+            entry.detached
+                && entry.cleanup_owned.iter().all(|session| {
+                    entry.acknowledged_session.as_deref() == Some(session)
+                        || entry.cleanup_acknowledged.contains(session)
+                })
+        }))
+    }
+    /// Retirement checks exact auxiliary cleanup evidence instead of racing
+    /// the retained recorder owner with another detach. None is generic-owned.
+    pub(crate) fn auxiliary_detach_acknowledged(
+        &self,
+        target_id: &str,
+        session_id: &str,
+    ) -> Result<Option<bool>, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        for entry in state
+            .auxiliary
+            .values()
+            .filter(|entry| entry.target == target_id)
+        {
+            if entry.acknowledged_session.as_deref() == Some(session_id) {
+                return Ok(Some(entry.detached));
+            }
+            if entry.cleanup_owned.contains(session_id) {
+                return Ok(Some(entry.cleanup_acknowledged.contains(session_id)));
+            }
+        }
+        Ok(None)
     }
     /// Return false for another tenant without registering or configuring it.
     pub fn attached(
@@ -433,7 +755,297 @@ impl ClientTargets {
         self.changed.notify_waiters();
     }
 }
+impl AuxiliaryAttachmentReservation {
+    /// Retire local auxiliary ownership only after proven terminal transport.
+    /// Does not invent an attach ACK, detach ACK, or remote stop acknowledgement.
+    pub(crate) fn settle_terminal_connection(
+        &mut self,
+        proof: &super::client_enrollment::NativeTerminalProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check_targets(&self.registry)?;
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        let entry = state
+            .auxiliary
+            .get_mut(&self.nonce)
+            .ok_or(ProtocolError::StaleScope)?;
+        if entry.terminal_connection_retired {
+            self.completed = true;
+            return Ok(());
+        }
+        entry.terminal_connection_retired = true;
+        self.completed = true;
+        drop(state);
+        self.registry.changed.notify_waiters();
+        Ok(())
+    }
+    pub(crate) fn claim(&mut self, session_id: &str) -> Result<(), ProtocolError> {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if self.completed {
+            return Err(ProtocolError::StaleScope);
+        }
+        if session_id.is_empty()
+            || session_id.len() > 1024
+            || state
+                .targets
+                .values()
+                .any(|target| target.session_id == session_id)
+            || state
+                .auxiliary
+                .values()
+                .any(|entry| entry.acknowledged_session.as_deref() == Some(session_id))
+        {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let reserved = state
+            .auxiliary
+            .get(&self.nonce)
+            .ok_or(ProtocolError::StaleScope)?;
+        if session_id == reserved.primary_session {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        if reserved.acknowledged_session.is_some() {
+            return Err(ProtocolError::StaleScope);
+        }
+        let valid = !state.sealed
+            && !reserved.failed
+            && state.targets.get(&reserved.target).is_some_and(|target| {
+                target.session_id == reserved.primary_session
+                    && target.purpose == Some(TargetPurpose::Application)
+                    && target.configured
+                    && target.resumed
+            });
+        let entry = state
+            .auxiliary
+            .get_mut(&self.nonce)
+            .ok_or(ProtocolError::StaleScope)?;
+        // Even a late rejected ACK identifies a session we must clean up. Never
+        // lose it merely because its attach notification has not arrived yet.
+        entry.acknowledged_session = Some(session_id.into());
+        if !valid {
+            entry.failed = true;
+            state.sealed = true;
+            drop(state);
+            self.registry.changed.notify_waiters();
+            return Err(ProtocolError::StaleScope);
+        }
+        entry.claimed_session = Some(session_id.into());
+        drop(state);
+        self.registry.changed.notify_waiters();
+        Ok(())
+    }
+    /// Stop new scope work and wake enrollment while retaining this token's
+    /// exact candidate journal for the recorder's bounded failure cleanup.
+    pub(crate) fn quarantine(&self) {
+        if let Ok(mut state) = self.registry.state.lock() {
+            if let Some(entry) = state.auxiliary.get_mut(&self.nonce) {
+                entry.failed = true;
+                if entry.acknowledged_session.is_none() {
+                    entry.cleanup_owned.extend(entry.candidates.iter().cloned());
+                }
+            }
+            state.sealed = true;
+        }
+        self.registry.changed.notify_waiters();
+    }
+    /// Only for a retained startup path that proves attach was never sent.
+    pub(crate) fn cancel_unsubmitted(mut self) -> Result<(), ProtocolError> {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let entry = state
+            .auxiliary
+            .get(&self.nonce)
+            .ok_or(ProtocolError::StaleScope)?;
+        if entry.acknowledged_session.is_some() || !entry.candidates.is_empty() {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        state.auxiliary.remove(&self.nonce);
+        self.completed = true;
+        drop(state);
+        self.registry.changed.notify_waiters();
+        Ok(())
+    }
+    /// Cleanup candidates are connection-owned attachments, not owned host
+    /// pages. Unknown ACK with an empty list is NOT proof of successful cleanup.
+    pub(crate) fn cleanup_sessions(&self) -> Result<Vec<String>, ProtocolError> {
+        let state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let entry = state
+            .auxiliary
+            .get(&self.nonce)
+            .ok_or(ProtocolError::StaleScope)?;
+        let mut sessions: Vec<_> = if let Some(session) = &entry.acknowledged_session {
+            vec![session.clone()]
+        } else {
+            entry.candidates.iter().cloned().collect()
+        };
+        sessions.extend(entry.cleanup_owned.iter().cloned());
+        sessions.retain(|session| !entry.cleanup_acknowledged.contains(session));
+        sessions.sort();
+        sessions.dedup();
+        Ok(sessions)
+    }
+    /// Record an actual detach ACK for a candidate explicitly handed to this
+    /// supervisor. This is not proof that an unknown attach ACK is complete.
+    pub(crate) fn candidate_detached(&mut self, session_id: &str) -> Result<(), ProtocolError> {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let entry = state
+            .auxiliary
+            .get_mut(&self.nonce)
+            .ok_or(ProtocolError::StaleScope)?;
+        if !entry.cleanup_owned.contains(session_id) {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        entry.cleanup_acknowledged.insert(session_id.into());
+        Ok(())
+    }
+    /// Call only after the recorder has joined and exact native detach ACK.
+    pub(crate) fn detached(&mut self, session_id: &str) -> Result<(), ProtocolError> {
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let entry = state
+            .auxiliary
+            .get_mut(&self.nonce)
+            .ok_or(ProtocolError::StaleScope)?;
+        // Cleanup acknowledgement does not grant execution authority or clear
+        // quarantine. A known ACK rejected during retirement is still ours to
+        // detach; unknown-ACK candidate enumeration cannot certify completion.
+        if entry.acknowledged_session.as_deref() != Some(session_id) {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        if entry.cleanup_owned.iter().any(|candidate| {
+            candidate != session_id && !entry.cleanup_acknowledged.contains(candidate)
+        }) {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        entry.detached = true;
+        self.completed = true;
+        drop(state);
+        self.registry.changed.notify_waiters();
+        Ok(())
+    }
+}
+impl Drop for AuxiliaryAttachmentReservation {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.quarantine();
+        }
+    }
+}
 impl CreationReservation {
+    /// Journal the native create RPC's exact ACK before any further await.
+    /// Purpose alone never grants cleanup of a preexisting host page.
+    pub(crate) fn record_native_created_target(
+        &mut self,
+        target: &str,
+    ) -> Result<(), ProtocolError> {
+        if self.purpose != TargetPurpose::StateBootstrap
+            || self.claimed
+            || self.native_created_target.is_some()
+            || target.is_empty()
+            || target.len() > 1024
+        {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        let nonce = self.bootstrap_nonce.ok_or(ProtocolError::PolicyDenied)?;
+        if !state.bootstrap_cleanup_reservations.contains(&nonce) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if state
+            .targets
+            .get(target)
+            .is_some_and(|entry| entry.purpose.is_some())
+            || state.native_bootstrap_cleanup.contains(target)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        state.native_bootstrap_cleanup.insert(target.into());
+        state.bootstrap_cleanup_reservations.remove(&nonce);
+        self.native_created_target = Some(target.into());
+        Ok(())
+    }
+    /// Called only by native state IO after its create ACK and exact target
+    /// metadata recheck. The wire cannot mint this reservation or bind a host page.
+    pub(crate) fn acknowledge_native_created_target(
+        &mut self,
+        info: &serde_json::Value,
+    ) -> Result<(), ProtocolError> {
+        let target = info
+            .get("targetId")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 1024)
+            .ok_or(ProtocolError::InvalidFrame)?;
+        if self.purpose != TargetPurpose::StateBootstrap
+            || self.claimed
+            || info
+                .get("browserContextId")
+                .and_then(serde_json::Value::as_str)
+                != Some(self.registry.context_id.as_str())
+            || info.get("type").and_then(serde_json::Value::as_str) != Some("page")
+            || info.get("url").and_then(serde_json::Value::as_str) != Some("about:blank")
+        {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        if self.native_created_target.as_deref() != Some(target) {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || state
+                .targets
+                .get(target)
+                .is_some_and(|entry| entry.purpose.is_some())
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if state
+            .bootstrap_creations
+            .values()
+            .any(|id| id.as_deref() == Some(target))
+        {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let bound = state
+            .bootstrap_creations
+            .get_mut(&self.bootstrap_nonce.ok_or(ProtocolError::PolicyDenied)?)
+            .ok_or(ProtocolError::StaleScope)?;
+        if bound.is_some() {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        *bound = Some(target.into());
+        drop(state);
+        self.registry.changed.notify_waiters();
+        Ok(())
+    }
     pub fn claim(&mut self, target_id: &str) -> Result<(), ProtocolError> {
         let mut state = self
             .registry
@@ -441,6 +1053,14 @@ impl CreationReservation {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if state.sealed || self.claimed {
+            return Err(ProtocolError::StaleScope);
+        }
+        if self
+            .bootstrap_nonce
+            .and_then(|nonce| state.bootstrap_creations.get(&nonce))
+            .and_then(Option::as_deref)
+            .is_some_and(|id| id != target_id)
+        {
             return Err(ProtocolError::StaleScope);
         }
         let target = state
@@ -464,6 +1084,17 @@ impl Drop for CreationReservation {
             // Never reinterpret that unclaimed bootstrap as application work.
             if !self.claimed {
                 state.sealed = true;
+                if self.purpose == TargetPurpose::StateBootstrap
+                    && self.native_created_target.is_none()
+                {
+                    // No exact create ACK means no safe target to close. Keep
+                    // this uncertainty after the pending reservation is gone.
+                    state.unknown_bootstrap_create = true;
+                }
+            }
+            if let Some(nonce) = self.bootstrap_nonce {
+                state.bootstrap_creations.remove(&nonce);
+                state.bootstrap_cleanup_reservations.remove(&nonce);
             }
             state.reservations = state.reservations.saturating_sub(1);
             if state.reservations == 0 && !state.sealed {
@@ -480,6 +1111,364 @@ impl Drop for CreationReservation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn unknown_bootstrap_ack_cannot_be_certified_by_empty_cleanup_inventory() {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        let reservation = registry
+            .reserve_creation(super::TargetPurpose::StateBootstrap)
+            .unwrap();
+        assert!(!registry.native_bootstrap_cleanup_complete().unwrap());
+        drop(reservation);
+        assert!(registry
+            .native_bootstrap_cleanup_targets()
+            .unwrap()
+            .is_empty());
+        assert!(!registry.native_bootstrap_cleanup_complete().unwrap());
+        assert!(registry.state.lock().unwrap().sealed);
+    }
+    #[test]
+    fn native_bootstrap_cleanup_capacity_is_reserved_before_browser_creation() {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        {
+            let mut state = registry.state.lock().unwrap();
+            state
+                .native_bootstrap_cleanup
+                .extend((0..63).map(|i| format!("retained-{i}")));
+        }
+        let mut last = registry
+            .reserve_creation(super::TargetPurpose::StateBootstrap)
+            .unwrap();
+        assert!(matches!(
+            registry.reserve_creation(super::TargetPurpose::StateBootstrap),
+            Err(super::ProtocolError::CapacityExceeded)
+        ));
+        last.record_native_created_target("last-ack").unwrap();
+        assert_eq!(
+            registry.native_bootstrap_cleanup_targets().unwrap().len(),
+            64
+        );
+        assert!(matches!(
+            registry.reserve_creation(super::TargetPurpose::StateBootstrap),
+            Err(super::ProtocolError::CapacityExceeded)
+        ));
+    }
+    #[tokio::test]
+    async fn native_bootstrap_ack_is_exact_and_never_adopts_existing_application() {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        registry
+            .attached("ctx", "host".into(), "host-session".into(), "page".into())
+            .unwrap();
+        let mut reservation = registry
+            .reserve_creation(super::TargetPurpose::StateBootstrap)
+            .unwrap();
+        let info = |target: &str, context: &str| serde_json::json!({"targetId":target,"browserContextId":context,"type":"page","url":"about:blank"});
+        assert_eq!(
+            reservation.acknowledge_native_created_target(&info("created", "other")),
+            Err(super::ProtocolError::PolicyDenied)
+        );
+        assert_eq!(
+            reservation.record_native_created_target("host"),
+            Err(super::ProtocolError::StaleScope)
+        );
+        assert!(!registry.is_native_bootstrap_target("host").unwrap());
+        reservation.record_native_created_target("created").unwrap();
+        reservation
+            .acknowledge_native_created_target(&info("created", "ctx"))
+            .unwrap();
+        assert!(registry
+            .wait_native_bootstrap_target("created")
+            .await
+            .unwrap());
+        assert!(!registry
+            .wait_native_bootstrap_target("unrelated")
+            .await
+            .unwrap());
+        registry
+            .attached(
+                "ctx",
+                "created".into(),
+                "created-session".into(),
+                "page".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            reservation.claim("host"),
+            Err(super::ProtocolError::StaleScope)
+        );
+        reservation.claim("created").unwrap();
+        drop(reservation);
+        assert!(!registry.is_native_bootstrap_target("created").unwrap());
+        assert_eq!(
+            registry.native_bootstrap_cleanup_targets().unwrap(),
+            vec!["created"]
+        );
+        registry.settle_native_bootstrap_cleanup("created").unwrap();
+        assert!(registry
+            .native_bootstrap_cleanup_targets()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            registry.owned_target("host").unwrap().purpose,
+            Some(super::TargetPurpose::Application)
+        );
+        assert_eq!(
+            registry.owned_target("created").unwrap().purpose,
+            Some(super::TargetPurpose::StateBootstrap)
+        );
+    }
+    fn auxiliary_registry() -> std::sync::Arc<super::ClientTargets> {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        registry
+            .attached("ctx", "target".into(), "primary".into(), "page".into())
+            .unwrap();
+        {
+            let mut state = registry.state.lock().unwrap();
+            let target = state.targets.get_mut("target").unwrap();
+            target.configured = true;
+            target.resumed = true;
+            state.enrollment_ready = true;
+        }
+        registry
+    }
+    #[tokio::test]
+    async fn auxiliary_event_before_ack_waits_exact_claim_not_next_candidate() {
+        let registry = auxiliary_registry();
+        let mut reservation = registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .unwrap();
+        assert!(registry.protected_read_barrier().is_err());
+        let owned = registry.classify_auxiliary_attachment("target", "recorder");
+        let unrelated = registry.classify_auxiliary_attachment("target", "other");
+        tokio::pin!(owned, unrelated);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut owned)
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut unrelated)
+                .await
+                .is_err()
+        );
+        reservation.claim("recorder").unwrap();
+        assert_eq!(
+            owned.await.unwrap(),
+            super::AuxiliaryDisposition::RecorderOwned
+        );
+        assert_eq!(
+            unrelated.await.unwrap(),
+            super::AuxiliaryDisposition::Ordinary
+        );
+        assert_eq!(reservation.cleanup_sessions().unwrap(), vec!["recorder"]);
+        reservation.detached("recorder").unwrap();
+    }
+    #[tokio::test]
+    async fn auxiliary_ack_before_event_and_detach_tombstone_preserve_exact_identity() {
+        let registry = auxiliary_registry();
+        let mut reservation = registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .unwrap();
+        assert!(reservation.claim("primary").is_err());
+        reservation.claim("recorder").unwrap();
+        reservation.detached("recorder").unwrap();
+        drop(reservation);
+        let next = registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .unwrap();
+        assert_eq!(
+            registry
+                .classify_auxiliary_attachment("target", "recorder")
+                .await
+                .unwrap(),
+            super::AuxiliaryDisposition::RecorderOwned
+        );
+        next.cancel_unsubmitted().unwrap();
+        assert_eq!(
+            registry
+                .classify_auxiliary_attachment("target", "unrelated")
+                .await
+                .unwrap(),
+            super::AuxiliaryDisposition::Ordinary
+        );
+    }
+    #[tokio::test]
+    async fn auxiliary_unknown_ack_retains_candidates_and_seal_wakes_waiter() {
+        let registry = auxiliary_registry();
+        let mut reservation = registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .unwrap();
+        let pending = registry.classify_auxiliary_attachment("target", "unknown");
+        tokio::pin!(pending);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut pending)
+                .await
+                .is_err()
+        );
+        assert_eq!(reservation.cleanup_sessions().unwrap(), vec!["unknown"]);
+        assert_eq!(
+            reservation.detached("unknown"),
+            Err(super::ProtocolError::CleanupFailed)
+        );
+        drop(reservation);
+        assert_eq!(
+            pending.await.unwrap(),
+            super::AuxiliaryDisposition::RecorderOwned
+        );
+        assert!(registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .is_err());
+        assert!(registry
+            .state
+            .lock()
+            .unwrap()
+            .targets
+            .contains_key("target"));
+    }
+    #[tokio::test]
+    async fn auxiliary_late_ack_after_seal_or_target_replacement_remains_cleanup_owned() {
+        for change in ["seal", "remove", "replace"] {
+            let registry = auxiliary_registry();
+            let mut token = registry
+                .reserve_auxiliary_attachment("scope", "target", "primary")
+                .unwrap();
+            match change {
+                "seal" => registry.seal(),
+                "remove" => registry.detach("target").unwrap(),
+                _ => {
+                    registry
+                        .state
+                        .lock()
+                        .unwrap()
+                        .targets
+                        .get_mut("target")
+                        .unwrap()
+                        .session_id = "replacement".into()
+                }
+            }
+            assert_eq!(
+                token.claim("primary"),
+                Err(super::ProtocolError::InvalidArguments)
+            );
+            assert!(token.cleanup_sessions().unwrap().is_empty());
+            assert_eq!(
+                token.claim("late-recorder"),
+                Err(super::ProtocolError::StaleScope)
+            );
+            assert_eq!(token.cleanup_sessions().unwrap(), vec!["late-recorder"]);
+            assert_eq!(
+                registry
+                    .classify_auxiliary_attachment("target", "late-recorder")
+                    .await
+                    .unwrap(),
+                super::AuxiliaryDisposition::RecorderOwned
+            );
+            token.detached("late-recorder").unwrap();
+            assert!(registry.state.lock().unwrap().sealed);
+            assert_eq!(
+                registry
+                    .classify_auxiliary_attachment("target", "late-recorder")
+                    .await
+                    .unwrap(),
+                super::AuxiliaryDisposition::RecorderOwned
+            );
+        }
+    }
+    #[tokio::test]
+    async fn auxiliary_seal_candidate_handoff_then_late_ack_has_one_cleanup_owner() {
+        let registry = auxiliary_registry();
+        let mut token = registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .unwrap();
+        registry.seal();
+        assert_eq!(
+            registry
+                .classify_auxiliary_attachment("target", "late")
+                .await
+                .unwrap(),
+            super::AuxiliaryDisposition::RecorderOwned
+        );
+        assert_eq!(token.cleanup_sessions().unwrap(), vec!["late"]);
+        assert_eq!(
+            registry
+                .classify_auxiliary_attachment("target", "other-unknown")
+                .await
+                .unwrap(),
+            super::AuxiliaryDisposition::RecorderOwned
+        );
+        assert_eq!(token.claim("late"), Err(super::ProtocolError::StaleScope));
+        assert_eq!(
+            token.cleanup_sessions().unwrap(),
+            vec!["late", "other-unknown"]
+        );
+        assert_eq!(
+            registry
+                .classify_auxiliary_attachment("target", "later-unrelated")
+                .await
+                .unwrap(),
+            super::AuxiliaryDisposition::Ordinary
+        );
+
+        assert_eq!(
+            token.detached("late"),
+            Err(super::ProtocolError::CleanupFailed)
+        );
+        token.candidate_detached("other-unknown").unwrap();
+        token.detached("late").unwrap();
+        assert_eq!(
+            registry
+                .classify_auxiliary_attachment("target", "late")
+                .await
+                .unwrap(),
+            super::AuxiliaryDisposition::RecorderOwned
+        );
+    }
+    #[tokio::test]
+    async fn completed_auxiliary_cleanup_stays_complete_under_sealed_late_events() {
+        let registry = auxiliary_registry();
+        let mut token = registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .unwrap();
+        token.claim("recorder").unwrap();
+        token.detached("recorder").unwrap();
+        registry.seal();
+        assert!(registry.auxiliary_cleanup_complete().unwrap());
+        assert_eq!(
+            registry
+                .classify_auxiliary_attachment("target", "recorder")
+                .await
+                .unwrap(),
+            super::AuxiliaryDisposition::RecorderOwned
+        );
+        assert_eq!(
+            registry
+                .classify_auxiliary_attachment("target", "unrelated")
+                .await
+                .unwrap(),
+            super::AuxiliaryDisposition::Ordinary
+        );
+        assert!(registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .is_err());
+        assert!(registry.auxiliary_cleanup_complete().unwrap());
+    }
+    #[test]
+    fn auxiliary_reservation_rejects_wrong_scope_primary_and_duplicate_admission() {
+        let registry = auxiliary_registry();
+        assert!(registry
+            .reserve_auxiliary_attachment("other", "target", "primary")
+            .is_err());
+        assert!(registry
+            .reserve_auxiliary_attachment("scope", "target", "other")
+            .is_err());
+        let token = registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .unwrap();
+        assert!(registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .is_err());
+        token.cancel_unsubmitted().unwrap();
+        assert!(!registry.state.lock().unwrap().sealed);
+    }
     use super::*;
     #[tokio::test]
     async fn creation_reservation_keeps_bootstrap_out_of_generic_request_handling() {
@@ -602,5 +1591,38 @@ mod tests {
         assert!(reservation.claim("target").is_err());
         drop(reservation);
         assert!(registry.inventory().is_err());
+    }
+    #[test]
+    fn initialization_publication_rejects_sealed_or_unacknowledged_registry() {
+        let registry = ClientTargets::new("owned".into(), "scope".into());
+        let gate = Arc::new(super::super::client_browser::ExecutionGate::default());
+        gate.begin_transition().unwrap();
+        let authority = gate.initialization(registry.clone()).unwrap();
+        assert!(registry.publish_initialization(&authority).is_err());
+        registry.acknowledge_enrollment().unwrap();
+        registry.seal();
+        assert!(registry.publish_initialization(&authority).is_err());
+        assert!(gate.enter(false).is_err());
+    }
+    #[test]
+    fn initialization_publication_preserves_exact_registry_and_gate_health() {
+        let registry = ClientTargets::new("owned".into(), "scope".into());
+        let other = ClientTargets::new("owned".into(), "other".into());
+        registry.acknowledge_enrollment().unwrap();
+        other.acknowledge_enrollment().unwrap();
+        let gate = Arc::new(super::super::client_browser::ExecutionGate::default());
+        gate.begin_transition().unwrap();
+        let authority = gate.initialization(registry.clone()).unwrap();
+        assert_eq!(
+            other.publish_initialization(&authority),
+            Err(ProtocolError::StaleScope)
+        );
+        let held = authority.enter(&registry).unwrap();
+        assert!(registry.publish_initialization(&authority).is_err());
+        drop(held);
+        registry.publish_initialization(&authority).unwrap();
+        drop(gate.enter(false).unwrap());
+        gate.seal();
+        assert!(registry.publish_initialization(&authority).is_err());
     }
 }

@@ -51,6 +51,7 @@ type BoundedMethodTaps = Arc<std::sync::Mutex<HashMap<u64, BoundedMethodRoute>>>
 struct BoundedMethodRoute {
     methods: &'static [&'static str],
     sender: mpsc::Sender<BoundedCdpEvent>,
+    received: Arc<AtomicU64>,
     budget: Arc<EventBudget>,
     failed: Arc<AtomicBool>,
     max_event_bytes: usize,
@@ -81,8 +82,12 @@ pub struct EventBudgetLease {
 pub struct BoundedCdpEvent {
     event: CdpEvent,
     charge: EventBudgetLease,
+    sequence: u64,
 }
 impl BoundedCdpEvent {
+    pub fn sequence(&self) -> u64 {
+        self.sequence
+    }
     pub fn budget_lease(&self) -> EventBudgetLease {
         self.charge.clone()
     }
@@ -109,13 +114,42 @@ impl EventBudget {
         })
     }
 }
+/// Exact subscription-tenure watermark. It proves reader admission only,
+/// never renderer quiescence or application configuration completion.
+#[derive(Clone)]
+pub struct BoundedEventWatermark {
+    routes: std::sync::Weak<std::sync::Mutex<HashMap<u64, BoundedMethodRoute>>>,
+    id: u64,
+    received: Arc<AtomicU64>,
+    failed: Arc<AtomicBool>,
+}
+impl BoundedEventWatermark {
+    pub fn received(&self) -> Result<u64, &'static str> {
+        let routes = self.routes.upgrade().ok_or("control event stream closed")?;
+        let routes = routes.lock().map_err(|_| "control event stream poisoned")?;
+        let route = routes.get(&self.id).ok_or("control event stream closed")?;
+        if self.failed.load(Ordering::SeqCst) || !Arc::ptr_eq(&route.received, &self.received) {
+            return Err("control event stream unavailable");
+        }
+        Ok(self.received.load(Ordering::SeqCst))
+    }
+}
 pub struct BoundedMethodEvents {
     receiver: mpsc::Receiver<BoundedCdpEvent>,
     failed: Arc<AtomicBool>,
     routes: BoundedMethodTaps,
     id: u64,
+    received: Arc<AtomicU64>,
 }
 impl BoundedMethodEvents {
+    pub fn watermark(&self) -> BoundedEventWatermark {
+        BoundedEventWatermark {
+            routes: Arc::downgrade(&self.routes),
+            id: self.id,
+            received: self.received.clone(),
+            failed: self.failed.clone(),
+        }
+    }
     pub async fn recv(&mut self) -> Result<BoundedCdpEvent, &'static str> {
         if self.failed.load(Ordering::SeqCst) {
             return Err("control event overflow");
@@ -154,9 +188,21 @@ fn publish_bounded(taps: &BoundedMethodTaps, event: &CdpEvent, bytes: usize) {
                 route.failed.store(true, Ordering::SeqCst);
                 return false;
             };
+            #[allow(deprecated)]
+            let Ok(previous) =
+                route
+                    .received
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |value| {
+                        value.checked_add(1)
+                    })
+            else {
+                route.failed.store(true, Ordering::SeqCst);
+                return false;
+            };
             match route.sender.try_send(BoundedCdpEvent {
                 event: event.clone(),
                 charge,
+                sequence: previous + 1,
             }) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -539,15 +585,16 @@ impl CdpClient {
             // Reader loop exited (connection closed or error). Drop all pending
             // command senders so callers get an immediate channel-closed error
             // instead of waiting for the 30-second timeout.
+            // Publish terminal classification before dropping bounded senders:
+            // a receiver on another runtime thread may wake immediately on EOF.
+            // Local teardown sets closed first and never grants remote-loss proof.
+            if !closed_reader.swap(true, Ordering::SeqCst) {
+                remote_closed_tx.send_replace(true);
+            }
             bounded_taps_clone
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
-            // Local teardown sets closed before stopping the reader. Only an
-            // independently ended browser connection authorizes replacement.
-            if !closed_reader.swap(true, Ordering::SeqCst) {
-                remote_closed_tx.send_replace(true);
-            }
             pending_clone.lock().await.clear();
 
             // Stop the keepalive task because the connection is gone.
@@ -767,6 +814,7 @@ impl CdpClient {
             .map_err(|_| "control subscription ids exhausted")?;
         let (sender, receiver) = mpsc::channel(capacity);
         let failed = Arc::new(AtomicBool::new(false));
+        let received = Arc::new(AtomicU64::new(0));
         self.bounded_method_taps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -775,6 +823,7 @@ impl CdpClient {
                 BoundedMethodRoute {
                     methods,
                     sender,
+                    received: received.clone(),
                     failed: failed.clone(),
                     max_event_bytes,
                     budget: Arc::new(EventBudget {
@@ -785,6 +834,7 @@ impl CdpClient {
             );
         Ok(BoundedMethodEvents {
             receiver,
+            received,
             failed,
             routes: self.bounded_method_taps.clone(),
             id,
@@ -991,9 +1041,17 @@ mod tests {
             });
             let client = CdpClient::connect(&url).await.unwrap();
             let mut loss = client.remote_connection_closed();
+            let mut events = client
+                .subscribe_bounded_methods(&["Target.attachedToTarget"], 4, 65536)
+                .unwrap();
             assert!(!*loss.borrow());
             if remote {
                 release.send(()).unwrap();
+                let end = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap();
+                assert!(matches!(end, Err("control event stream closed")));
+                assert!(*loss.borrow(), "terminal classification precedes tap EOF");
                 tokio::time::timeout(Duration::from_secs(2), loss.wait_for(|value| *value))
                     .await
                     .unwrap()
@@ -1057,11 +1115,13 @@ mod tests {
         let routes = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let (sender, receiver) = mpsc::channel(capacity);
         let failed = Arc::new(AtomicBool::new(false));
+        let received = Arc::new(AtomicU64::new(0));
         routes.lock().unwrap().insert(
             1,
             BoundedMethodRoute {
                 methods: &["Fetch.requestPaused"],
                 sender,
+                received: received.clone(),
                 failed: failed.clone(),
                 max_event_bytes,
                 budget: Arc::new(EventBudget {
@@ -1072,6 +1132,7 @@ mod tests {
         );
         let events = BoundedMethodEvents {
             receiver,
+            received,
             failed,
             routes: routes.clone(),
             id: 1,
@@ -1084,6 +1145,49 @@ mod tests {
             params: json!({"requestId":"synthetic"}),
             session_id: Some("owned".into()),
         }
+    }
+    #[tokio::test]
+    async fn exact_tap_watermark_includes_queued_events_and_sequence_survives_recv() {
+        let (routes, mut events) = bounded_fixture(4, 100);
+        let watermark = events.watermark();
+        assert_eq!(watermark.received(), Ok(0));
+        publish_bounded(&routes, &paused_event(), 30);
+        publish_bounded(&routes, &paused_event(), 30);
+        assert_eq!(watermark.received(), Ok(2));
+        let first = events.recv().await.unwrap();
+        assert_eq!(first.sequence(), 1);
+        assert_eq!(watermark.received(), Ok(2));
+        assert_eq!(events.recv().await.unwrap().sequence(), 2);
+        drop(events);
+        assert!(watermark.received().is_err());
+        // An old in-flight charge never revives a retired subscription.
+        assert_eq!(first.sequence(), 1);
+    }
+    #[test]
+    fn exact_tap_watermark_fails_on_overflow_disconnect_and_counter_exhaustion() {
+        for mode in 0..3 {
+            let (routes, events) = bounded_fixture(1, 100);
+            let watermark = events.watermark();
+            match mode {
+                0 => {
+                    publish_bounded(&routes, &paused_event(), 30);
+                    publish_bounded(&routes, &paused_event(), 30);
+                }
+                1 => routes.lock().unwrap().clear(),
+                _ => {
+                    events.received.store(u64::MAX, Ordering::SeqCst);
+                    publish_bounded(&routes, &paused_event(), 30);
+                }
+            }
+            assert!(watermark.received().is_err());
+        }
+    }
+    #[test]
+    fn exact_tap_watermark_rejects_same_id_replaced_subscription() {
+        let (routes, events) = bounded_fixture(1, 100);
+        let watermark = events.watermark();
+        routes.lock().unwrap().get_mut(&1).unwrap().received = Arc::new(AtomicU64::new(0));
+        assert!(watermark.received().is_err());
     }
     #[tokio::test]
     async fn bounded_control_overflow_never_delivers_partial_history_as_complete() {

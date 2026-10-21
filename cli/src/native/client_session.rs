@@ -98,6 +98,81 @@ struct Registry {
     registrations: Arc<[String]>,
     references: usize,
     retired: bool,
+    transfer: Option<String>,
+}
+
+/// Native-only, non-cloneable hold on one exact client-tenure route snapshot.
+/// Abandonment retires it; it never silently restores admission.
+pub(crate) struct RouteRegistryTransfer {
+    broker: Arc<ClientSession>,
+    generation: u64,
+    operation: Option<RegistryTransferOperation>,
+    version: u64,
+    source_scope: String,
+    nonce: String,
+    completed: bool,
+}
+/// A parked terminal snapshot has no RPC operation until reconnect admission.
+/// It shares the same registry/nonce engine as ordinary scope replacement, but
+/// exposes no rollback into a disconnected source.
+pub(crate) struct ParkedRouteRegistry {
+    held: RouteRegistryTransfer,
+}
+struct RegistryTransferOperation {
+    sequence: u64,
+    deadline: Instant,
+    cancellation: watch::Receiver<CancelSignal>,
+}
+impl RegistryTransferOperation {
+    fn capture(operation: &OperationLease) -> Self {
+        Self {
+            sequence: operation.sequence,
+            deadline: operation.deadline,
+            cancellation: operation.cancellation.clone(),
+        }
+    }
+}
+impl ParkedRouteRegistry {
+    pub(crate) fn version(&self) -> u64 {
+        self.held.version
+    }
+}
+impl RouteRegistryTransfer {
+    pub(crate) fn version(&self) -> u64 {
+        self.version
+    }
+    fn check_operation(&self, operation: &OperationLease) -> Result<(), ProtocolError> {
+        if self.completed {
+            return Err(ProtocolError::StaleScope);
+        }
+        if operation.generation != self.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        let captured = self
+            .operation
+            .as_ref()
+            .ok_or(ProtocolError::InvalidSequence)?;
+        if operation.is_callback || operation.sequence != captured.sequence {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        if *captured.cancellation.borrow() != CancelSignal::None
+            || *operation.cancellation.borrow() != CancelSignal::None
+        {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= captured.deadline || Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+}
+impl Drop for RouteRegistryTransfer {
+    fn drop(&mut self) {
+        if !self.completed {
+            let broker = self.broker.clone();
+            let _ = broker.retire_registry_transfer(self);
+        }
+    }
 }
 
 pub struct DecisionLease {
@@ -345,6 +420,18 @@ impl ClientSession {
         registrations: Vec<String>,
         identity_scope: Option<String>,
     ) -> Result<(), ProtocolError> {
+        self.replace_routes_scoped(generation, version, registrations, identity_scope, None)
+    }
+    /// Publish the new immutable snapshot and retire the old one under one
+    /// broker lock. Every rejection happens before either registry changes.
+    pub fn replace_routes_scoped(
+        &self,
+        generation: u64,
+        version: u64,
+        registrations: Vec<String>,
+        identity_scope: Option<String>,
+        previous: Option<u64>,
+    ) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
         Self::check(&inner, generation)?;
         if version == 0 || version > MAX_SAFE_SEQUENCE || version <= inner.registry_high_water {
@@ -363,6 +450,26 @@ impl ClientSession {
         {
             return Err(ProtocolError::InvalidFrame);
         }
+        if identity_scope.as_ref().is_some_and(|scope| {
+            inner.registry_scopes.iter().any(|(version, owner)| {
+                owner == scope
+                    && inner
+                        .registries
+                        .get(version)
+                        .is_some_and(|registry| registry.transfer.is_some())
+            })
+        }) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        if let Some(old) = previous {
+            let registry = inner
+                .registries
+                .get(&old)
+                .ok_or(ProtocolError::RegistryMissing)?;
+            if registry.retired || inner.registry_scopes.get(&old) != identity_scope.as_ref() {
+                return Err(ProtocolError::StaleScope);
+            }
+        }
         if let Some(scope) = identity_scope {
             if scope.is_empty() {
                 return Err(ProtocolError::InvalidArguments);
@@ -376,8 +483,285 @@ impl ClientSession {
                 registrations: registrations.into(),
                 references: 0,
                 retired: false,
+                transfer: None,
             },
         );
+        if let Some(old) = previous {
+            // Presence and identity were checked under this same lock.
+            let old_registry = inner
+                .registries
+                .get_mut(&old)
+                .expect("validated previous registry");
+            old_registry.retired = true;
+            if old_registry.references == 0 && old_registry.transfer.is_none() {
+                inner.registries.remove(&old);
+                inner.released_registries.push(old);
+            }
+        }
+        Ok(())
+    }
+
+    /// Capture before source teardown. Existing paused/fallback chains retain
+    /// their references, but new captures cannot use this held registry.
+    pub(crate) fn capture_registry_transfer(
+        self: &Arc<Self>,
+        version: u64,
+        source_scope: &str,
+        operation: &OperationLease,
+    ) -> Result<RouteRegistryTransfer, ProtocolError> {
+        let mut inner = self.lock()?;
+        Self::check(&inner, operation.generation)?;
+        if source_scope.is_empty() || operation.is_callback {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        self.hold_registry(&mut inner, version, source_scope, Some(operation))
+    }
+    /// Terminal owner calls this before revoking the disconnected source. No
+    /// operation is admitted or fabricated at EOF, and a retired registry can
+    /// never be reconstructed from its version or registration IDs.
+    pub(crate) fn park_registry(
+        self: &Arc<Self>,
+        generation: u64,
+        version: u64,
+        source_scope: &str,
+    ) -> Result<ParkedRouteRegistry, ProtocolError> {
+        let mut inner = self.lock()?;
+        Self::check(&inner, generation)?;
+        if source_scope.is_empty() {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        Ok(ParkedRouteRegistry {
+            held: self.hold_registry(&mut inner, version, source_scope, None)?,
+        })
+    }
+    fn hold_registry(
+        self: &Arc<Self>,
+        inner: &mut Inner,
+        version: u64,
+        source_scope: &str,
+        operation: Option<&OperationLease>,
+    ) -> Result<RouteRegistryTransfer, ProtocolError> {
+        if inner.registry_scopes.get(&version).map(String::as_str) != Some(source_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let registry = inner
+            .registries
+            .get_mut(&version)
+            .ok_or(ProtocolError::RegistryMissing)?;
+        if registry.retired || registry.transfer.is_some() {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        let nonce = Uuid::new_v4().to_string();
+        registry.retired = true;
+        registry.transfer = Some(nonce.clone());
+        Ok(RouteRegistryTransfer {
+            broker: self.clone(),
+            generation: inner.generation,
+            operation: operation.map(RegistryTransferOperation::capture),
+            version,
+            source_scope: source_scope.into(),
+            nonce,
+            completed: false,
+        })
+    }
+    fn check_transfer(
+        &self,
+        inner: &Inner,
+        transfer: &RouteRegistryTransfer,
+    ) -> Result<(), ProtocolError> {
+        if !std::ptr::eq(self, transfer.broker.as_ref()) || transfer.completed {
+            return Err(ProtocolError::StaleScope);
+        }
+        if inner.generation != transfer.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if inner.registry_scopes.get(&transfer.version) != Some(&transfer.source_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let registry = inner
+            .registries
+            .get(&transfer.version)
+            .ok_or(ProtocolError::RegistryMissing)?;
+        if registry.transfer.as_deref() != Some(&transfer.nonce) || !registry.retired {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    fn check_live_operation(
+        inner: &Inner,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        Self::check(inner, operation.generation)?;
+        if operation.is_callback {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let admitted = inner
+            .operations
+            .get(&operation.sequence)
+            .ok_or(ProtocolError::OperationMissing)?;
+        if admitted.callback_token.is_some()
+            || admitted.deadline != operation.deadline
+            || !admitted
+                .cancel
+                .subscribe()
+                .same_channel(&operation.cancellation)
+        {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+    pub(crate) fn validate_reconnect_operation(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let inner = self.lock()?;
+        Self::check_live_operation(&inner, operation)
+    }
+    /// Bind once, only after real lifecycle admission. Failure leaves the hold
+    /// dormant and available for explicit retirement, not implicit restoration.
+    pub(crate) fn bind_parked_registry(
+        &self,
+        parked: &mut ParkedRouteRegistry,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let inner = self.lock()?;
+        Self::check_live_operation(&inner, operation)?;
+        self.check_transfer(&inner, &parked.held)?;
+        if parked.held.operation.is_some() {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        parked.held.operation = Some(RegistryTransferOperation::capture(operation));
+        Ok(())
+    }
+    pub(crate) fn adopt_parked_registry(
+        &self,
+        parked: &mut ParkedRouteRegistry,
+        replacement_scope: &str,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let captured = parked
+            .held
+            .operation
+            .as_ref()
+            .ok_or(ProtocolError::InvalidSequence)?;
+        if captured.deadline != operation.deadline
+            || !captured.cancellation.same_channel(&operation.cancellation)
+        {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        self.adopt_held_registry(&mut parked.held, replacement_scope, operation, true)
+    }
+    pub(crate) fn retire_parked_registry(
+        &self,
+        parked: &mut ParkedRouteRegistry,
+    ) -> Result<(), ProtocolError> {
+        self.retire_registry_transfer(&mut parked.held)
+    }
+    /// Move the existing immutable version, never register a second snapshot or
+    /// lower the client's monotonic version high-water mark. Network ownership
+    /// additionally proves its retained readers have completed before calling.
+    pub(crate) fn adopt_registry_transfer(
+        &self,
+        transfer: &mut RouteRegistryTransfer,
+        replacement_scope: &str,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.adopt_held_registry(transfer, replacement_scope, operation, false)
+    }
+    fn adopt_held_registry(
+        &self,
+        transfer: &mut RouteRegistryTransfer,
+        replacement_scope: &str,
+        operation: &OperationLease,
+        require_admitted: bool,
+    ) -> Result<(), ProtocolError> {
+        transfer.check_operation(operation)?;
+        let mut inner = self.lock()?;
+        Self::check(&inner, transfer.generation)?;
+        if require_admitted {
+            Self::check_live_operation(&inner, operation)?;
+        }
+        self.check_transfer(&inner, transfer)?;
+        if replacement_scope.is_empty() || replacement_scope == transfer.source_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        if inner.registry_scopes.iter().any(|(version, scope)| {
+            scope == replacement_scope && inner.registries.contains_key(version)
+        }) {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        if inner.registries[&transfer.version].references != 0
+            || inner
+                .decisions
+                .values()
+                .any(|pending| pending.resource_scope.as_deref() == Some(&transfer.source_scope))
+        {
+            return Err(ProtocolError::RegistryInUse);
+        }
+        let registry = inner
+            .registries
+            .get_mut(&transfer.version)
+            .expect("validated transfer registry");
+        registry.transfer = None;
+        registry.retired = false;
+        inner
+            .registry_scopes
+            .insert(transfer.version, replacement_scope.into());
+        transfer.completed = true;
+        Ok(())
+    }
+    /// Explicit rollback is available only while the captured operation is
+    /// still live. Native network ownership must also verify the source has not
+    /// been revoked. Drop and cancellation never call this method.
+    pub(crate) fn restore_registry_transfer(
+        &self,
+        transfer: &mut RouteRegistryTransfer,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        transfer.check_operation(operation)?;
+        let mut inner = self.lock()?;
+        Self::check(&inner, transfer.generation)?;
+        self.check_transfer(&inner, transfer)?;
+        let registry = inner
+            .registries
+            .get_mut(&transfer.version)
+            .expect("validated transfer registry");
+        registry.transfer = None;
+        registry.retired = false;
+        transfer.completed = true;
+        Ok(())
+    }
+    /// Retirement remains available after cancellation or broker quarantine.
+    /// The original scope attribution survives until its release event drains.
+    pub(crate) fn retire_registry_transfer(
+        &self,
+        transfer: &mut RouteRegistryTransfer,
+    ) -> Result<(), ProtocolError> {
+        let mut inner = self.lock()?;
+        self.check_transfer(&inner, transfer)?;
+        let registry = inner
+            .registries
+            .get_mut(&transfer.version)
+            .expect("validated transfer registry");
+        registry.transfer = None;
+        registry.retired = true;
+        if registry.references == 0 {
+            inner.registries.remove(&transfer.version);
+            inner.released_registries.push(transfer.version);
+        }
+        transfer.completed = true;
         Ok(())
     }
 
@@ -431,6 +815,9 @@ impl ClientSession {
             DecisionOwner::Scope => policy_deadline,
         };
         let registrations = if let Some(version) = registry {
+            if inner.registry_scopes.get(&version) != resource_scope.as_ref() {
+                return Err(ProtocolError::StaleScope);
+            }
             let entry = inner
                 .registries
                 .get_mut(&version)
@@ -465,6 +852,31 @@ impl ClientSession {
             registrations,
             outcome,
         })
+    }
+
+    /// Capture the pending decision's original resource scope on the control
+    /// lane. Never derive upload authority from the currently active page.
+    pub fn decision_resource_scope(
+        &self,
+        generation: u64,
+        token: &str,
+    ) -> Result<String, ProtocolError> {
+        let inner = self.lock()?;
+        Self::check(&inner, generation)?;
+        let pending = inner
+            .decisions
+            .get(token)
+            .ok_or(ProtocolError::DecisionMissing)?;
+        if Instant::now() >= pending.deadline {
+            return Err(ProtocolError::DecisionExpired);
+        }
+        if pending.selected.is_some() {
+            return Err(ProtocolError::DecisionMissing);
+        }
+        pending
+            .resource_scope
+            .clone()
+            .ok_or(ProtocolError::StaleScope)
     }
 
     pub fn resolve(
@@ -684,7 +1096,7 @@ impl ClientSession {
             .get_mut(&version)
             .ok_or(ProtocolError::RegistryMissing)?;
         registry.retired = true;
-        if registry.references == 0 {
+        if registry.references == 0 && registry.transfer.is_none() {
             inner.registries.remove(&version);
             inner.released_registries.push(version);
         }
@@ -695,7 +1107,7 @@ impl ClientSession {
         if let Some(version) = version {
             if let Some(registry) = inner.registries.get_mut(&version) {
                 registry.references -= 1;
-                if registry.retired && registry.references == 0 {
+                if registry.retired && registry.references == 0 && registry.transfer.is_none() {
                     inner.registries.remove(&version);
                     inner.released_registries.push(version);
                 }
@@ -763,6 +1175,454 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn parked_registry_waits_for_old_callbacks_and_preserves_exact_version() {
+        let broker = Arc::new(ClientSession::new());
+        broker
+            .register_routes_scoped(
+                1,
+                7,
+                vec!["first".into(), "second".into()],
+                Some("old".into()),
+            )
+            .unwrap();
+        let pending = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(7),
+                Some("old".into()),
+            )
+            .unwrap();
+        let registrations = pending.registrations.clone();
+        let mut parked = broker.park_registry(1, 7, "old").unwrap();
+        assert!(parked.held.operation.is_none());
+        broker.retire_registry(1, 7).unwrap();
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        assert!(broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(7),
+                Some("old".into())
+            )
+            .is_err());
+        let operation = broker.admit(1, 1, 5000).unwrap();
+        broker
+            .bind_parked_registry(&mut parked, &operation)
+            .unwrap();
+        assert_eq!(
+            broker.adopt_parked_registry(&mut parked, "new", &operation),
+            Err(ProtocolError::RegistryInUse)
+        );
+        broker.revoke_scope_decisions("old").unwrap();
+        assert!(matches!(
+            pending.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        assert_eq!(
+            broker.decision_resource_scope(1, &pending.token),
+            Err(ProtocolError::DecisionMissing)
+        );
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        broker
+            .adopt_parked_registry(&mut parked, "new", &operation)
+            .unwrap();
+        let next = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(7),
+                Some("new".into()),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&registrations, &next.registrations));
+        assert_eq!(next.registry_version, Some(7));
+        broker.revoke_scope_decisions("old").unwrap();
+        assert!(broker.decision_resource_scope(1, &next.token).is_ok());
+        broker.revoke_scope_decisions("new").unwrap();
+        broker.retire_registry(1, 7).unwrap();
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(7, Some("new".into()))]
+        );
+    }
+    #[test]
+    fn parked_registry_requires_exact_admitted_operation_and_owner() {
+        let broker = Arc::new(ClientSession::new());
+        let other = Arc::new(ClientSession::new());
+        broker
+            .register_routes_scoped(1, 1, vec!["route".into()], Some("old".into()))
+            .unwrap();
+        assert!(broker.park_registry(1, 1, "foreign").is_err());
+        assert!(broker.park_registry(2, 1, "old").is_err());
+        let mut parked = broker.park_registry(1, 1, "old").unwrap();
+        let (_cancel, invented) = transfer_operation();
+        assert_eq!(
+            broker.bind_parked_registry(&mut parked, &invented),
+            Err(ProtocolError::OperationMissing)
+        );
+        let operation = broker.admit(1, 1, 5000).unwrap();
+        let foreign_operation = other.admit(1, 1, 5000).unwrap();
+        assert_eq!(
+            broker.bind_parked_registry(&mut parked, &foreign_operation),
+            Err(ProtocolError::InvalidSequence)
+        );
+        assert_eq!(
+            other.bind_parked_registry(&mut parked, &foreign_operation),
+            Err(ProtocolError::StaleScope)
+        );
+        broker
+            .bind_parked_registry(&mut parked, &operation)
+            .unwrap();
+        assert_eq!(
+            broker.bind_parked_registry(&mut parked, &operation),
+            Err(ProtocolError::InvalidSequence)
+        );
+        assert_eq!(
+            broker.adopt_parked_registry(&mut parked, "old", &operation),
+            Err(ProtocolError::StaleScope)
+        );
+        broker.retire_parked_registry(&mut parked).unwrap();
+        assert!(broker
+            .adopt_parked_registry(&mut parked, "new", &operation)
+            .is_err());
+        assert!(broker.park_registry(1, 1, "old").is_err());
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(1, Some("old".into()))]
+        );
+    }
+    #[tokio::test]
+    async fn parked_registry_expiry_cancellation_and_abandonment_never_revive() {
+        for expire in [false, true] {
+            let broker = Arc::new(ClientSession::new());
+            broker
+                .register_routes_scoped(1, 1, vec!["route".into()], Some("old".into()))
+                .unwrap();
+            let mut parked = broker.park_registry(1, 1, "old").unwrap();
+            let operation = broker.admit(1, 1, if expire { 1 } else { 5000 }).unwrap();
+            broker
+                .bind_parked_registry(&mut parked, &operation)
+                .unwrap();
+            if expire {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            } else {
+                broker.cancel(1, 1).unwrap();
+            }
+            assert_eq!(
+                broker.adopt_parked_registry(&mut parked, "new", &operation),
+                Err(if expire {
+                    ProtocolError::DeadlineExceeded
+                } else {
+                    ProtocolError::Cancelled
+                })
+            );
+            assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+            broker.quarantine().unwrap();
+            broker.retire_parked_registry(&mut parked).unwrap();
+            assert_eq!(
+                broker.take_released_registry_events(8).unwrap(),
+                vec![(1, Some("old".into()))]
+            );
+        }
+        let broker = Arc::new(ClientSession::new());
+        broker
+            .register_routes_scoped(1, 3, vec!["route".into()], Some("old".into()))
+            .unwrap();
+        drop(broker.park_registry(1, 3, "old").unwrap());
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(3, Some("old".into()))]
+        );
+        assert!(broker.park_registry(1, 3, "old").is_err());
+    }
+    fn transfer_operation() -> (watch::Sender<CancelSignal>, OperationLease) {
+        let (send, cancellation) = watch::channel(CancelSignal::None);
+        (
+            send,
+            OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: Instant::now() + Duration::from_secs(5),
+                cancellation,
+            },
+        )
+    }
+    #[tokio::test]
+    async fn route_transfer_holds_release_until_old_decisions_drain_and_preserves_version() {
+        let broker = Arc::new(ClientSession::new());
+        let (_cancel, operation) = transfer_operation();
+        broker
+            .register_routes_scoped(
+                1,
+                7,
+                vec!["first".into(), "second".into()],
+                Some("old".into()),
+            )
+            .unwrap();
+        let pending = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(7),
+                Some("old".into()),
+            )
+            .unwrap();
+        let registrations = pending.registrations.clone();
+        let mut transfer = broker
+            .capture_registry_transfer(7, "old", &operation)
+            .unwrap();
+        broker.retire_registry(1, 7).unwrap();
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        assert_eq!(
+            broker.adopt_registry_transfer(&mut transfer, "new", &operation),
+            Err(ProtocolError::RegistryInUse)
+        );
+        assert!(broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(7),
+                Some("old".into())
+            )
+            .is_err());
+        broker.revoke_scope_decisions("old").unwrap();
+        assert!(matches!(
+            pending.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        broker
+            .adopt_registry_transfer(&mut transfer, "new", &operation)
+            .unwrap();
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        assert_eq!(
+            broker
+                .decision_scoped(
+                    1,
+                    DecisionOwner::Scope,
+                    DecisionKind::Request,
+                    1000,
+                    Some(7),
+                    Some("old".into())
+                )
+                .err()
+                .unwrap(),
+            ProtocolError::StaleScope
+        );
+        let current = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(7),
+                Some("new".into()),
+            )
+            .unwrap();
+        assert_eq!(current.registry_version, Some(7));
+        assert!(Arc::ptr_eq(&registrations, &current.registrations));
+        assert_eq!(
+            broker.register_routes_scoped(1, 7, vec![], Some("new".into())),
+            Err(ProtocolError::InvalidSequence)
+        );
+        broker
+            .replace_routes_scoped(1, 8, vec![], Some("new".into()), Some(7))
+            .unwrap();
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        broker.revoke_decision(&current.token).unwrap();
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(7, Some("new".into()))]
+        );
+        broker.retire_registry(1, 8).unwrap();
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(8, Some("new".into()))]
+        );
+    }
+    #[test]
+    fn route_transfer_rejects_wrong_owner_scope_generation_and_cancellation() {
+        let broker = Arc::new(ClientSession::new());
+        let other = ClientSession::new();
+        let (cancel, mut operation) = transfer_operation();
+        broker
+            .register_routes_scoped(1, 1, vec!["route".into()], Some("old".into()))
+            .unwrap();
+        assert!(broker
+            .capture_registry_transfer(1, "foreign", &operation)
+            .is_err());
+        let mut transfer = broker
+            .capture_registry_transfer(1, "old", &operation)
+            .unwrap();
+        assert_eq!(
+            other.adopt_registry_transfer(&mut transfer, "new", &operation),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            broker.adopt_registry_transfer(&mut transfer, "old", &operation),
+            Err(ProtocolError::StaleScope)
+        );
+        operation.generation = 2;
+        assert_eq!(
+            broker.adopt_registry_transfer(&mut transfer, "new", &operation),
+            Err(ProtocolError::StaleGeneration)
+        );
+        operation.generation = 1;
+        operation.sequence = 2;
+        assert_eq!(
+            broker.restore_registry_transfer(&mut transfer, &operation),
+            Err(ProtocolError::InvalidSequence)
+        );
+        operation.sequence = 1;
+        cancel.send(CancelSignal::Requested).unwrap();
+        assert_eq!(
+            broker.adopt_registry_transfer(&mut transfer, "new", &operation),
+            Err(ProtocolError::Cancelled)
+        );
+        assert_eq!(
+            broker.restore_registry_transfer(&mut transfer, &operation),
+            Err(ProtocolError::Cancelled)
+        );
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        broker.retire_registry_transfer(&mut transfer).unwrap();
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(1, Some("old".into()))]
+        );
+        assert_eq!(
+            broker.restore_registry_transfer(&mut transfer, &operation),
+            Err(ProtocolError::StaleScope)
+        );
+    }
+    #[test]
+    fn explicit_restore_and_abandonment_never_confuse_route_ownership() {
+        let broker = Arc::new(ClientSession::new());
+        let (_cancel, operation) = transfer_operation();
+        broker
+            .register_routes_scoped(1, 1, vec!["route".into()], Some("old".into()))
+            .unwrap();
+        let mut transfer = broker
+            .capture_registry_transfer(1, "old", &operation)
+            .unwrap();
+        assert_eq!(
+            broker.replace_routes_scoped(1, 2, vec![], Some("old".into()), None),
+            Err(ProtocolError::RegistryInUse)
+        );
+        broker
+            .restore_registry_transfer(&mut transfer, &operation)
+            .unwrap();
+        drop(transfer);
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        let transfer = broker
+            .capture_registry_transfer(1, "old", &operation)
+            .unwrap();
+        drop(transfer);
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(1, Some("old".into()))]
+        );
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        assert!(broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(1),
+                Some("old".into())
+            )
+            .is_err());
+    }
+    #[tokio::test]
+    async fn abandoned_transfer_waits_for_its_final_reader_and_survives_quarantine() {
+        let broker = Arc::new(ClientSession::new());
+        let (_cancel, operation) = transfer_operation();
+        broker
+            .register_routes_scoped(1, 1, vec!["route".into()], Some("old".into()))
+            .unwrap();
+        let pending = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(1),
+                Some("old".into()),
+            )
+            .unwrap();
+        let transfer = broker
+            .capture_registry_transfer(1, "old", &operation)
+            .unwrap();
+        drop(transfer);
+        assert!(broker.take_released_registry_events(8).unwrap().is_empty());
+        broker.quarantine().unwrap();
+        assert!(matches!(
+            pending.outcome.await.unwrap(),
+            DecisionOutcome::SessionClosed
+        ));
+        assert_eq!(
+            broker.take_released_registry_events(8).unwrap(),
+            vec![(1, Some("old".into()))]
+        );
+    }
+    #[test]
+    fn route_replacement_rejection_never_retires_old_or_publishes_new() {
+        let broker = ClientSession::new();
+        broker
+            .register_routes_scoped(1, 1, vec!["old".into()], Some("scope".into()))
+            .unwrap();
+        for (previous, registrations, scope) in [
+            (
+                Some(1),
+                vec!["duplicate".into(), "duplicate".into()],
+                "scope",
+            ),
+            (Some(99), vec!["new".into()], "scope"),
+            (Some(1), vec!["new".into()], "foreign"),
+        ] {
+            assert!(broker
+                .replace_routes_scoped(1, 2, registrations, Some(scope.into()), previous)
+                .is_err());
+            let inner = broker.lock().unwrap();
+            assert!(!inner.registries[&1].retired);
+            assert!(!inner.registries.contains_key(&2));
+            assert_eq!(inner.registry_high_water, 1);
+            assert!(inner.released_registries.is_empty());
+        }
+        let old = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                1000,
+                Some(1),
+                Some("scope".into()),
+            )
+            .unwrap();
+        broker
+            .replace_routes_scoped(1, 2, vec!["new".into()], Some("scope".into()), Some(1))
+            .unwrap();
+        let inner = broker.lock().unwrap();
+        assert!(inner.registries[&1].retired);
+        assert_eq!(inner.registries[&1].references, 1);
+        assert!(!inner.registries[&2].retired);
+        assert_eq!(inner.registry_high_water, 2);
+        drop(inner);
+        drop(old);
+    }
+    #[tokio::test]
     async fn scope_revoke_cancels_fallback_before_resource_task_observes_it() {
         let broker = ClientSession::new();
         let first = broker
@@ -806,12 +1666,13 @@ mod tests {
             .register_routes_scoped(1, 1, vec!["route".into()], Some("old-context".into()))
             .unwrap();
         let lease = broker
-            .decision(
+            .decision_scoped(
                 1,
                 DecisionOwner::Scope,
                 DecisionKind::Request,
                 1000,
                 Some(1),
+                Some("old-context".into()),
             )
             .unwrap();
         broker.retire_registry(1, 1).unwrap();

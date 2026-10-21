@@ -1777,14 +1777,20 @@ impl BrowserManager {
         Ok(target_id)
     }
 
-    /// Bind only a target whose dedicated-context authority the caller has
-    /// already verified. Failure detaches our session, never closes host data.
+    /// Bind only a target whose exact context authority the caller has already
+    /// verified. Missing context metadata is not permission to adopt a target.
+    /// Failure detaches our session, never closes host data. This is a metadata-
+    /// only bind: the enrollment supervisor must install its event tap before
+    /// configuring domains, recursive autoattach, or debugger resume.
     pub async fn adopt_verified_page(
         &mut self,
         target_id: &str,
         context_id: &str,
     ) -> Result<(), String> {
-        if target_id.is_empty() || self.pages.iter().any(|page| page.target_id == target_id) {
+        if target_id.is_empty()
+            || context_id.is_empty()
+            || self.pages.iter().any(|page| page.target_id == target_id)
+        {
             return Err("Invalid verified target identity".into());
         }
         let attached = self
@@ -1816,9 +1822,8 @@ impl BrowserManager {
             .is_some_and(|info| {
                 info.get("targetId").and_then(Value::as_str) == Some(target_id)
                     && info.get("type").and_then(Value::as_str) == Some("page")
-                    && info
-                        .get("browserContextId")
-                        .is_none_or(|id| id.as_str() == Some(context_id))
+                    && info.get("browserContextId").and_then(Value::as_str) == Some(context_id)
+                    && info.get("subtype").is_none()
             });
         if !valid {
             self.client
@@ -1829,16 +1834,6 @@ impl BrowserManager {
                 )
                 .await?;
             return Err("Verified page identity changed".into());
-        }
-        if let Err(error) = self.enable_domains(&session_id).await {
-            self.client
-                .send_command(
-                    "Target.detachFromTarget",
-                    Some(json!({"sessionId": session_id})),
-                    None,
-                )
-                .await?;
-            return Err(error);
         }
         let tab_id = self.assign_tab_id();
         self.pages.push(PageInfo {

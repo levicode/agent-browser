@@ -6,6 +6,7 @@ use super::client_targets::{ClientTargets, TargetPurpose};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashSet;
+use std::io::{self, Write};
 use std::sync::Arc;
 
 const MAX_STATE_BYTES: usize = 32 * 1024 * 1024;
@@ -20,6 +21,106 @@ pub enum StateError {
     Deadline,
     BrowserFailure,
     CleanupIntegrityLost,
+}
+
+/// Keep the operation cause separate from cleanup certainty. An uncertain
+/// bootstrap target requires native lifecycle containment even when the cause
+/// is a cancellation, deadline, or ordinary browser error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StateFailure {
+    pub error: StateError,
+    pub cleanup_integrity_lost: bool,
+}
+impl From<StateError> for StateFailure {
+    fn from(error: StateError) -> Self {
+        Self {
+            error,
+            cleanup_integrity_lost: error == StateError::CleanupIntegrityLost,
+        }
+    }
+}
+fn cleanup_outcome<T>(
+    result: Result<T, StateError>,
+    cleanup: Result<(), StateError>,
+) -> Result<T, StateFailure> {
+    match (result, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error.into()),
+        (Ok(_), Err(_)) => Err(StateError::CleanupIntegrityLost.into()),
+        (Err(error), Err(_)) => Err(StateFailure {
+            error,
+            cleanup_integrity_lost: true,
+        }),
+    }
+}
+
+// Logical serialized-size accounting, not a claim about CDP/JavaScript heap
+// usage. Count borrowed cookies and each next origin before retaining it.
+struct CountingWriter {
+    used: usize,
+    limit: usize,
+}
+impl Write for CountingWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.limit.saturating_sub(self.used) {
+            return Err(io::Error::other("State size limit exceeded"));
+        }
+        self.used += bytes.len();
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+fn serialized_size(value: &impl Serialize, limit: usize) -> Result<usize, StateError> {
+    let mut writer = CountingWriter { used: 0, limit };
+    serde_json::to_writer(&mut writer, value).map_err(|_| StateError::InvalidInput)?;
+    Ok(writer.used)
+}
+struct StateSize {
+    used: usize,
+    limit: usize,
+    cookies: usize,
+    origins: usize,
+}
+impl StateSize {
+    fn new(limit: usize) -> Result<Self, StateError> {
+        let empty = NativeState {
+            version: 1,
+            cookies: Vec::new(),
+            origins: Vec::new(),
+        };
+        Ok(Self {
+            used: serialized_size(&empty, limit)?,
+            limit,
+            cookies: 0,
+            origins: 0,
+        })
+    }
+    fn add(&mut self, value: &impl Serialize, comma: bool) -> Result<(), StateError> {
+        let mut writer = CountingWriter {
+            used: self.used,
+            limit: self.limit,
+        };
+        if comma {
+            writer
+                .write_all(b",")
+                .map_err(|_| StateError::InvalidInput)?;
+        }
+        serde_json::to_writer(&mut writer, value).map_err(|_| StateError::InvalidInput)?;
+        self.used = writer.used;
+        Ok(())
+    }
+    fn cookie(&mut self, value: &Value) -> Result<(), StateError> {
+        self.add(value, self.cookies > 0)?;
+        self.cookies += 1;
+        Ok(())
+    }
+    fn origin(&mut self, value: &OriginState) -> Result<(), StateError> {
+        self.add(value, self.origins > 0)?;
+        self.origins += 1;
+        Ok(())
+    }
 }
 
 /// Supplied by the native lifecycle owner under exclusive state admission.
@@ -201,17 +302,11 @@ fn cookie_parameters(cookie: &Value) -> Result<Value, StateError> {
     }
     Ok(Value::Object(result))
 }
-fn validate_state(state: &NativeState) -> Result<(), StateError> {
+pub(crate) fn validate_state(state: &NativeState) -> Result<(), StateError> {
     if state.version != 1 || state.origins.len() > MAX_ORIGINS {
         return Err(StateError::InvalidInput);
     }
-    if serde_json::to_vec(state)
-        .map_err(|_| StateError::InvalidInput)?
-        .len()
-        > MAX_STATE_BYTES
-    {
-        return Err(StateError::InvalidInput);
-    }
+    serialized_size(state, MAX_STATE_BYTES)?;
     let mut origins = HashSet::new();
     for item in &state.origins {
         origin(&item.origin)?;
@@ -249,30 +344,101 @@ impl Drop for PrivateSubscription<'_> {
         self.client.unsubscribe_session(self.session);
     }
 }
-async fn close_bootstrap(client: &CdpClient, target: &str) -> Result<(), StateError> {
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        client.send_command("Target.closeTarget", Some(json!({"targetId":target})), None),
+async fn close_bootstrap(context: &NativeStateContext<'_>, target: &str) -> Result<(), StateError> {
+    retire_native_bootstrap_target(
+        context.client,
+        context.targets,
+        target,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
     )
     .await
-    {
-        Ok(Ok(value)) if value.get("success").and_then(Value::as_bool) == Some(true) => Ok(()),
-        _ => Err(StateError::CleanupIntegrityLost),
+}
+/// Retire only exact create-ACK journal entries, never arbitrary host targets.
+/// Uses the caller's overall cleanup deadline and retains entries on uncertainty.
+pub(crate) async fn retire_native_bootstrap_pages(
+    client: &CdpClient,
+    targets: &Arc<ClientTargets>,
+    deadline: std::time::Instant,
+) -> Result<(), StateError> {
+    let pending = targets
+        .native_bootstrap_cleanup_targets()
+        .map_err(|_| StateError::CleanupIntegrityLost)?;
+    for target in pending {
+        retire_native_bootstrap_target(client, targets, &target, deadline).await?;
     }
+    if !targets
+        .native_bootstrap_cleanup_complete()
+        .map_err(|_| StateError::CleanupIntegrityLost)?
+    {
+        return Err(StateError::CleanupIntegrityLost);
+    }
+    Ok(())
+}
+async fn retire_native_bootstrap_target(
+    client: &CdpClient,
+    targets: &Arc<ClientTargets>,
+    target: &str,
+    deadline: std::time::Instant,
+) -> Result<(), StateError> {
+    if !targets
+        .native_bootstrap_cleanup_targets()
+        .map_err(|_| StateError::CleanupIntegrityLost)?
+        .iter()
+        .any(|id| id == target)
+    {
+        return Err(StateError::CleanupIntegrityLost);
+    }
+    let inventory = tokio::time::timeout_at(
+        deadline.into(),
+        client.send_command("Target.getTargets", Some(json!({})), None),
+    )
+    .await
+    .map_err(|_| StateError::CleanupIntegrityLost)?
+    .map_err(|_| StateError::CleanupIntegrityLost)?;
+    let infos = inventory
+        .get("targetInfos")
+        .and_then(Value::as_array)
+        .filter(|infos| infos.len() <= 8192)
+        .ok_or(StateError::CleanupIntegrityLost)?;
+    if let Some(info) = infos
+        .iter()
+        .find(|info| info.get("targetId").and_then(Value::as_str) == Some(target))
+    {
+        if info.get("browserContextId").and_then(Value::as_str) != Some(targets.context_id.as_str())
+            || info.get("type").and_then(Value::as_str) != Some("page")
+        {
+            return Err(StateError::CleanupIntegrityLost);
+        }
+        let closed = tokio::time::timeout_at(
+            deadline.into(),
+            client.send_command("Target.closeTarget", Some(json!({"targetId":target})), None),
+        )
+        .await
+        .map_err(|_| StateError::CleanupIntegrityLost)?
+        .map_err(|_| StateError::CleanupIntegrityLost)?;
+        if closed.get("success").and_then(Value::as_bool) != Some(true) {
+            return Err(StateError::CleanupIntegrityLost);
+        }
+    }
+    targets
+        .settle_native_bootstrap_cleanup(target)
+        .map_err(|_| StateError::CleanupIntegrityLost)
 }
 async fn bootstrap(
     context: &NativeStateContext<'_>,
     origin: &str,
     operation: &OperationLease,
-) -> Result<Bootstrap, StateError> {
+) -> Result<Bootstrap, StateFailure> {
     // Reserve exact purpose before browser-side creation. No URL/opener guess
     // and no second target attachment competes with the native event owner.
     let mut reservation = context
         .targets
         .reserve_creation(TargetPurpose::StateBootstrap)
         .map_err(|_| StateError::IncompleteInventory)?;
-    // Creation may have happened if acknowledgement is lost. The caller must
-    // dispose the replacement context on any uncertainty, not reuse it.
+    // Creation may have happened if acknowledgement is lost. Preserve cleanup
+    // uncertainty for the lifecycle owner. An isolated replacement may be
+    // disposed; a borrowed host context/page must never be closed to hide an
+    // unknown temporary target. Borrowed failure quarantines our connection.
     let created = command(
         context.client,
         None,
@@ -281,12 +447,28 @@ async fn bootstrap(
         operation,
     )
     .await
-    .map_err(|_| StateError::CleanupIntegrityLost)?;
+    .map_err(|error| StateFailure {
+        error,
+        cleanup_integrity_lost: true,
+    })?;
     let target = created["targetId"]
         .as_str()
-        .ok_or(StateError::CleanupIntegrityLost)?
+        .ok_or(StateFailure {
+            error: StateError::BrowserFailure,
+            cleanup_integrity_lost: true,
+        })?
         .to_owned();
-    let result = async {
+    reservation
+        .record_native_created_target(&target)
+        .map_err(|_| StateFailure {
+            error: StateError::IncompleteInventory,
+            cleanup_integrity_lost: true,
+        })?;
+    let result: Result<Bootstrap, StateError> = async {
+        let info = command(context.client, None, "Target.getTargetInfo", json!({"targetId":target}), operation).await?;
+        let info = info.get("targetInfo").ok_or(StateError::BrowserFailure)?;
+        if info.get("targetId").and_then(Value::as_str) != Some(target.as_str()) { return Err(StateError::IncompleteInventory); }
+        reservation.acknowledge_native_created_target(info).map_err(|_|StateError::IncompleteInventory)?;
         let mut cancellation=operation.cancellation.clone();
         tokio::select! {
             result=context.targets.wait_attached(&target)=>result.map_err(|_|StateError::IncompleteInventory)?,
@@ -356,10 +538,7 @@ async fn bootstrap(
     }.await;
     match result {
         Ok(page) => Ok(page),
-        Err(error) => {
-            close_bootstrap(context.client, &target).await?;
-            Err(error)
-        }
+        Err(error) => cleanup_outcome(Err(error), close_bootstrap(context, &target).await),
     }
 }
 async fn evaluate(
@@ -411,7 +590,7 @@ async fn evaluate(
 pub async fn export_state(
     context: &NativeStateContext<'_>,
     operation: &OperationLease,
-) -> Result<NativeState, StateError> {
+) -> Result<NativeState, StateFailure> {
     validate_context(context)?;
     let value = command(
         context.client,
@@ -421,13 +600,16 @@ pub async fn export_state(
         operation,
     )
     .await?;
-    let cookies = value["cookies"]
+    let source_cookies = value["cookies"]
         .as_array()
-        .ok_or(StateError::BrowserFailure)?
-        .clone();
-    for cookie in &cookies {
+        .ok_or(StateError::BrowserFailure)?;
+    let mut size = StateSize::new(MAX_STATE_BYTES)?;
+    for cookie in source_cookies {
+        size.cookie(cookie)?;
         cookie_parameters(cookie)?;
     }
+    let cookies = source_cookies.clone();
+    drop(value);
     let mut origins = Vec::new();
     for origin in context.origins {
         let page = bootstrap(context, origin, operation).await?;
@@ -438,13 +620,13 @@ pub async fn export_state(
             operation,
         )
         .await;
-        close_bootstrap(context.client, &page.target).await?;
-        let mut entry: OriginState =
-            serde_json::from_value(result?).map_err(|_| StateError::BrowserFailure)?;
+        let result = cleanup_outcome(result, close_bootstrap(context, &page.target).await)?;
+        let entry: OriginState =
+            serde_json::from_value(result).map_err(|_| StateError::BrowserFailure)?;
         if entry.origin != *origin {
-            return Err(StateError::BrowserFailure);
+            return Err(StateError::BrowserFailure.into());
         }
-        entry.origin = origin.clone();
+        size.origin(&entry)?;
         origins.push(entry);
     }
     let state = NativeState {
@@ -463,11 +645,11 @@ pub async fn import_state(
     context: &NativeStateContext<'_>,
     state: &NativeState,
     operation: &OperationLease,
-) -> Result<(), StateError> {
+) -> Result<(), StateFailure> {
     validate_context(context)?;
     validate_state(state)?;
     if !context.origins.is_empty() {
-        return Err(StateError::InvalidInput);
+        return Err(StateError::InvalidInput.into());
     }
     let cookies: Vec<Value> = state
         .cookies
@@ -492,12 +674,12 @@ pub async fn import_state(
             operation,
         )
         .await;
-        close_bootstrap(context.client, &page.target).await?;
-        if result? != Value::Bool(true) {
-            return Err(StateError::BrowserFailure);
+        let result = cleanup_outcome(result, close_bootstrap(context, &page.target).await)?;
+        if result != Value::Bool(true) {
+            return Err(StateError::BrowserFailure.into());
         }
     }
-    check(operation)
+    check(operation).map_err(Into::into)
 }
 
 // Runs only in a native-owned isolated synthetic document. IndexedDB uses its
@@ -618,13 +800,7 @@ const STATE_SCRIPT: &str = r#"async function(mode, input) {
 /// Import the former public engine envelope's DATA only. This is a validated
 /// format conversion, not a Playwright runtime or a relabelled native snapshot.
 pub fn convert_playwright_state(input: Value) -> Result<NativeState, StateError> {
-    if serde_json::to_vec(&input)
-        .map_err(|_| StateError::InvalidInput)?
-        .len()
-        > MAX_STATE_BYTES
-    {
-        return Err(StateError::InvalidInput);
-    }
+    serialized_size(&input, MAX_STATE_BYTES)?;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Legacy {
@@ -1063,6 +1239,218 @@ impl LegacyGraph {
 mod tests {
     use super::*;
     #[test]
+    fn cleanup_retains_original_operation_error() {
+        for error in [
+            StateError::Cancelled,
+            StateError::Deadline,
+            StateError::BrowserFailure,
+        ] {
+            assert_eq!(
+                cleanup_outcome::<()>(Err(error), Err(StateError::CleanupIntegrityLost)),
+                Err(StateFailure {
+                    error,
+                    cleanup_integrity_lost: true
+                })
+            );
+            assert_eq!(
+                cleanup_outcome::<()>(Err(error), Ok(())),
+                Err(StateFailure {
+                    error,
+                    cleanup_integrity_lost: false
+                })
+            );
+        }
+        assert_eq!(
+            cleanup_outcome(Ok(()), Err(StateError::CleanupIntegrityLost)),
+            Err(StateError::CleanupIntegrityLost.into())
+        );
+        assert_eq!(cleanup_outcome(Ok(7), Ok(())), Ok(7));
+    }
+    #[test]
+    fn cumulative_origins_and_cookies_use_exact_serialized_budget() {
+        let cookie = json!({"name":"synthetic","value":"quoted\"\n世界","domain":"fixture.invalid","path":"/"});
+        let first = OriginState {
+            origin: "https://one.invalid".into(),
+            local_storage: vec![StorageEntry {
+                name: "key".into(),
+                value: "\"\n世界".into(),
+            }],
+            indexed_db: json!([]),
+        };
+        let second = OriginState {
+            origin: "https://two.invalid".into(),
+            ..first.clone()
+        };
+        let state = NativeState {
+            version: 1,
+            cookies: vec![cookie.clone(), cookie.clone()],
+            origins: vec![first.clone(), second.clone()],
+        };
+        let exact = serde_json::to_vec(&state).unwrap().len();
+        let mut budget = StateSize::new(exact - 1).unwrap();
+        budget.cookie(&cookie).unwrap();
+        budget.cookie(&cookie).unwrap();
+        budget.origin(&first).unwrap();
+        let before = budget.used;
+        assert_eq!(budget.origin(&second), Err(StateError::InvalidInput));
+        assert_eq!(budget.used, before);
+        assert_eq!(budget.origins, 1);
+        let mut budget = StateSize::new(exact).unwrap();
+        budget.cookie(&cookie).unwrap();
+        budget.cookie(&cookie).unwrap();
+        budget.origin(&first).unwrap();
+        budget.origin(&second).unwrap();
+        assert_eq!(budget.used, exact);
+        assert_eq!(serialized_size(&state, exact).unwrap(), exact);
+        assert_eq!(
+            serialized_size(&state, exact - 1),
+            Err(StateError::InvalidInput)
+        );
+
+        let cookies = NativeState {
+            version: 1,
+            cookies: vec![cookie.clone(), cookie.clone()],
+            origins: vec![],
+        };
+        let mut budget = StateSize::new(serde_json::to_vec(&cookies).unwrap().len() - 1).unwrap();
+        budget.cookie(&cookie).unwrap();
+        assert_eq!(budget.cookie(&cookie), Err(StateError::InvalidInput));
+        assert_eq!(budget.cookies, 1);
+    }
+    #[tokio::test]
+    async fn native_bootstrap_cleanup_retains_failed_ack_and_never_closes_host() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let closed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded = closed.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Target.getTargets" => {
+                        json!({"targetInfos":[{"targetId":"a-temp","browserContextId":"ctx","type":"page"},{"targetId":"b-temp","browserContextId":"ctx","type":"page"},{"targetId":"host-page","browserContextId":"ctx","type":"page"}]})
+                    }
+                    "Target.closeTarget" => {
+                        let mut log = recorded.lock().unwrap();
+                        log.push(request["params"]["targetId"].as_str().unwrap().into());
+                        json!({"success":log.last().unwrap()=="a-temp" || log.iter().filter(|target|target.as_str()=="b-temp").count()>1})
+                    }
+                    _ => panic!("unexpected cleanup command"),
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let targets = ClientTargets::new("ctx".into(), "scope".into());
+        let mut reservation = targets
+            .reserve_creation(TargetPurpose::StateBootstrap)
+            .unwrap();
+        reservation.record_native_created_target("a-temp").unwrap();
+        let mut second = targets
+            .reserve_creation(TargetPurpose::StateBootstrap)
+            .unwrap();
+        second.record_native_created_target("b-temp").unwrap();
+        drop(reservation);
+        drop(second);
+        assert_eq!(
+            retire_native_bootstrap_pages(
+                &client,
+                &targets,
+                std::time::Instant::now() + std::time::Duration::from_secs(2)
+            )
+            .await,
+            Err(StateError::CleanupIntegrityLost)
+        );
+        assert_eq!(
+            targets.native_bootstrap_cleanup_targets().unwrap(),
+            vec!["b-temp"]
+        );
+        retire_native_bootstrap_pages(
+            &client,
+            &targets,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        assert!(targets
+            .native_bootstrap_cleanup_targets()
+            .unwrap()
+            .is_empty());
+        assert_eq!(*closed.lock().unwrap(), vec!["a-temp", "b-temp", "b-temp"]);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn bootstrap_timeout_plus_failed_close_preserves_both_outcomes() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let result = match request["method"].as_str().unwrap() {
+                    "Storage.getCookies" => json!({"cookies":[]}),
+                    "Target.createTarget" => json!({"targetId":"synthetic-bootstrap"}),
+                    "Target.getTargetInfo" => {
+                        json!({"targetInfo":{"targetId":"synthetic-bootstrap","browserContextId":"synthetic-context","type":"page","url":"about:blank"}})
+                    }
+                    "Target.getTargets" => {
+                        json!({"targetInfos":[{"targetId":"synthetic-bootstrap","browserContextId":"synthetic-context","type":"page"}]})
+                    }
+                    "Target.closeTarget" => json!({"success":false}),
+                    _ => panic!("Unexpected synthetic state command"),
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if request["method"] == "Target.closeTarget" {
+                    break;
+                }
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let targets = ClientTargets::new("synthetic-context".into(), "synthetic-scope".into());
+        let origins = vec!["https://fixture.invalid".to_owned()];
+        let context = NativeStateContext {
+            client: &client,
+            context_id: "synthetic-context",
+            targets: &targets,
+            origins: &origins,
+            origins_complete: true,
+        };
+        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 1,
+            deadline: std::time::Instant::now() + std::time::Duration::from_millis(250),
+            cancellation,
+        };
+        assert_eq!(
+            export_state(&context, &operation).await.err().unwrap(),
+            StateFailure {
+                error: StateError::Deadline,
+                cleanup_integrity_lost: true
+            }
+        );
+        server.await.unwrap();
+    }
+    #[test]
     fn origin_scope_rejects_credentials_paths_and_opaque_origins() {
         for value in [
             "file:///tmp/x",
@@ -1234,7 +1622,7 @@ mod tests {
                 )
                 .await
             } else {
-                Err(StateError::InvalidInput)
+                Err(StateError::InvalidInput.into())
             };
             // Even failure disposes the replacement context before assertions.
             let cleanup = owner.close().await;
@@ -1243,7 +1631,7 @@ mod tests {
                 "synthetic replacement context cleanup failed"
             );
             if duplicate {
-                assert_eq!(result, Err(StateError::UnsupportedValue));
+                assert_eq!(result, Err(StateError::UnsupportedValue.into()));
             } else {
                 assert_eq!(result, Ok(()), "valid control import failed");
                 let exported = exported.expect("valid control export failed");

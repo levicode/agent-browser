@@ -177,7 +177,10 @@
     "not-actionable",
     "locator-not-found",
     "content-length-mismatch",
-    "redirect-body-unavailable"
+    "redirect-body-unavailable",
+    "intercepted-pointer",
+    "checked-state-unchanged",
+    "checked-control-replaced"
   ],
   "validDecision": [
     {

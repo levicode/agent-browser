@@ -178,6 +178,8 @@ async fn command(
     lease: &OperationLease,
 ) -> Result<Value, ObservationError> {
     check(lease)?;
+    #[cfg(test)]
+    let args = equivalence_tests::instrument(method, args, lease);
     let mut cancellation = lease.cancellation.clone();
     #[cfg(test)]
     let diagnostic_site = diagnostic_site(&args);
@@ -188,6 +190,10 @@ async fn command(
             match &result {
                 Ok(value) => diagnostic_exception(method, diagnostic_site, value),
                 Err(_) => eprintln!("native observation protocol failure at {method}; details omitted"),
+            }
+            #[cfg(test)]
+            if let Ok(value) = &result {
+                equivalence_tests::after_command(client, session, method, diagnostic_site, value, lease).await?;
             }
             result.map_err(|_|ObservationError::BackendFailure)
         }
@@ -930,7 +936,7 @@ pub async fn query(
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing query realm")?;
         use futures_util::{stream,StreamExt,TryStreamExt};
-        let objects:Vec<String>=stream::iter(ids.iter().map(|backend| {
+        let objects:Vec<String>=stream::iter(ids.iter().copied().map(|backend: i64| {
             let group=&group;
             async move {
                 let value=command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}),lease).await?;
@@ -1071,10 +1077,11 @@ async fn read_batch(
     let result=async {
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing isolated realm")?;
-        let resolved:Vec<Value>=stream::iter(nodes.iter().map(|ax| {
+        let backend_ids:Vec<Option<i64>>=nodes.iter().map(|ax|ax.backend_d_o_m_node_id).collect();
+        let resolved:Vec<Value>=stream::iter(backend_ids.into_iter().map(|backend| {
             let group=&group;
             async move {
-                command(client,session,"DOM.resolveNode",json!({"backendNodeId":ax.backend_d_o_m_node_id,"executionContextId":context,"objectGroup":group}),lease).await
+                command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}),lease).await
             }
         })).buffered(16).try_collect().await?;
         let has_pseudo=resolved.iter().any(|value|value["object"]["subtype"]!="node");
@@ -1355,10 +1362,42 @@ pub async fn enumerate_frames(
     iframe_sessions: &HashMap<String, String>,
     lease: &OperationLease,
 ) -> Result<Vec<ObservationFrame>, ObservationError> {
+    if iframe_sessions.len() > 256 {
+        return Err(ObservationError::InvalidArguments);
+    }
+    let mut owned_trees = HashMap::new();
+    for (frame, session) in iframe_sessions {
+        let tree = command(client, session, "Page.getFrameTree", json!({}), lease).await?;
+        if tree["frameTree"]["frame"]["id"].as_str() != Some(frame.as_str()) {
+            return Err(ObservationError::StaleReference);
+        }
+        owned_trees.insert(frame.clone(), tree["frameTree"].clone());
+    }
     let tree = command(client, page_session, "Page.getFrameTree", json!({}), lease).await?;
     let mut queue = std::collections::VecDeque::from([(tree["frameTree"].clone(), None::<usize>)]);
     let mut frames: Vec<ObservationFrame> = Vec::new();
-    while let Some((tree, parent)) = queue.pop_front() {
+    let mut visited = std::collections::HashSet::new();
+    while let Some((mut tree, parent)) = queue.pop_front() {
+        let id = tree["frame"]["id"]
+            .as_str()
+            .ok_or(ObservationError::StaleReference)?
+            .to_owned();
+        if !visited.insert(id.clone()) {
+            return Err(ObservationError::StaleReference);
+        }
+        if let Some(owned) = owned_trees.remove(&id) {
+            if let Some(loader) = tree["frame"]["loaderId"].as_str().filter(|v| !v.is_empty()) {
+                if owned["frame"]["loaderId"].as_str() != Some(loader) {
+                    return Err(ObservationError::StaleReference);
+                }
+            }
+            tree = owned;
+        }
+        if let Some(declared) = tree["frame"]["parentId"].as_str() {
+            if parent.map(|index| frames[index].binding.frame.as_str()) != Some(declared) {
+                return Err(ObservationError::StaleReference);
+            }
+        }
         if frames.len() >= 256 {
             return Err("Frame limit exceeded".into());
         }
@@ -1372,10 +1411,11 @@ pub async fn enumerate_frames(
             .filter(|v| !v.is_empty())
             .ok_or("Frame document identity unavailable")?
             .to_string();
-        let session = iframe_sessions
-            .get(&id)
-            .cloned()
-            .unwrap_or_else(|| page_session.into());
+        let session = iframe_sessions.get(&id).cloned().unwrap_or_else(|| {
+            parent
+                .map(|index| frames[index].binding.session.clone())
+                .unwrap_or_else(|| page_session.into())
+        });
         // Prove this session owns the document before issuing any metadata read.
         command(
             client,
@@ -1459,6 +1499,9 @@ pub async fn enumerate_frames(
                 queue.push_back((child.clone(), Some(index)));
             }
         }
+    }
+    if !owned_trees.is_empty() {
+        return Err(ObservationError::StaleReference);
     }
     for frame in &frames {
         validate_frame(client, frame, lease).await?;
@@ -1739,6 +1782,106 @@ async fn security_inventory(
     )
     .await;
     result
+}
+
+/// Project staged semantic rectangles through the same native proof used by
+/// protected pixels. Callers must revalidate the proof before publication. This
+/// does not allocate, resolve selectors, or turn read-only AX identities into DOM.
+pub async fn project_geometry(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    refs: &RefMap,
+    geometry: &super::client_geometry::GeometrySnapshot,
+    nodes: &mut [SemanticNode],
+    lease: &OperationLease,
+) -> Result<(), super::client_geometry::GeometryError> {
+    use super::client_geometry::GeometryError;
+    use futures_util::{stream, StreamExt, TryStreamExt};
+    let mut pending = nodes.iter().map(|node| (node, 0usize)).collect::<Vec<_>>();
+    let mut requests = Vec::new();
+    let mut visited = 0usize;
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if visited > 100_000 || depth > 256 {
+            return Err(GeometryError::InvalidGeometry);
+        }
+        pending.extend(node.children.iter().map(|child| (child, depth + 1)));
+        if node.rect.is_none() {
+            continue;
+        }
+        let id =
+            super::element::parse_ref(&node.reference.id).ok_or(GeometryError::StaleIdentity)?;
+        let entry = refs.get(&id).ok_or(GeometryError::StaleIdentity)?;
+        if entry.kind != super::element::NativeReferenceKind::Dom {
+            return Err(GeometryError::InvalidGeometry);
+        }
+        let binding = entry
+            .exact_binding
+            .as_ref()
+            .ok_or(GeometryError::StaleIdentity)?;
+        let frame = frames
+            .iter()
+            .find(|frame| {
+                frame.binding.page_session == binding.page_session
+                    && frame.binding.session == binding.session
+                    && frame.binding.frame == binding.frame
+                    && frame.binding.loader == binding.loader
+            })
+            .ok_or(GeometryError::StaleIdentity)?
+            .clone();
+        requests.push((
+            node.reference.id.clone(),
+            frame,
+            entry.backend_node_id.ok_or(GeometryError::StaleIdentity)?,
+        ));
+    }
+    let rectangles: HashMap<String, Rect> =
+        stream::iter(requests.into_iter().map(|(id, frame, backend)| async move {
+            let polygons = geometry
+                .node_border_polygons(client, &frame, backend, lease)
+                .await?;
+            let mut bounds = None::<super::client_geometry::Bounds>;
+            for polygon in polygons {
+                if let Some(next) = polygon.bounds() {
+                    bounds = Some(match bounds {
+                        None => next,
+                        Some(old) => {
+                            let x = old.x.min(next.x);
+                            let y = old.y.min(next.y);
+                            super::client_geometry::Bounds {
+                                x,
+                                y,
+                                width: (old.x + old.width).max(next.x + next.width) - x,
+                                height: (old.y + old.height).max(next.y + next.height) - y,
+                            }
+                        }
+                    });
+                }
+            }
+            let b = bounds.ok_or(GeometryError::InvalidGeometry)?;
+            Ok::<_, GeometryError>((
+                id,
+                Rect {
+                    x: b.x,
+                    y: b.y,
+                    width: b.width,
+                    height: b.height,
+                },
+            ))
+        }))
+        .buffered(16)
+        .try_collect()
+        .await?;
+    fn apply(nodes: &mut [SemanticNode], rectangles: &HashMap<String, Rect>) {
+        for node in nodes {
+            if let Some(rect) = rectangles.get(&node.reference.id) {
+                node.rect = Some(rect.clone());
+            }
+            apply(&mut node.children, rectangles);
+        }
+    }
+    apply(nodes, &rectangles);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2621,3 +2764,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client_observation_equivalence_tests.rs"]
+mod equivalence_tests;

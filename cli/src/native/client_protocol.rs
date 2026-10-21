@@ -237,6 +237,9 @@ pub enum ProtocolError {
     LocatorNotFound,
     ContentLengthMismatch,
     RedirectBodyUnavailable,
+    InterceptedPointer,
+    CheckedStateUnchanged,
+    CheckedControlReplaced,
 }
 
 /// Server envelopes are strict and correlated. A result terminates an RPC;

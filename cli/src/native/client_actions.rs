@@ -2,8 +2,9 @@
 //! fallback, second identity registry, or renderer handles cross the wire.
 //! The owner retains execution and cleanup through cancellation, and quarantines
 //! Unknown effects before disposing the original context.
-use super::client_blobs::{BlobLease, BlobProducer, BlobScope, BlobStore};
+use super::client_blobs::{ArtifactReservation, AttemptArtifacts, BlobLease, BlobScope, BlobStore};
 use super::client_browser::BrowserExecutionLease;
+use super::client_geometry::{GeometryError, GeometrySnapshot, Point as GeometryPoint};
 use super::client_observation::NodeReference;
 use super::client_page::ClientPageState;
 use super::client_protocol::{Effects, ProtocolError};
@@ -23,6 +24,9 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActionReason {
     InterceptedPointer,
+    CheckedStateUnchanged,
+    ControlReplacedAfterClick,
+    RecordingSegmentMissing { ordinal: u64 },
 }
 #[derive(Debug)]
 pub struct ActionFailure {
@@ -36,6 +40,10 @@ struct Dispatch {
     sent: AtomicBool,
     cleanup: AtomicBool,
     intercepted: AtomicBool,
+    checked_unchanged: AtomicBool,
+    checked_replaced: AtomicBool,
+    recording_missing: std::sync::atomic::AtomicU64,
+    acknowledged_postcondition: AtomicBool,
 }
 impl Dispatch {
     fn mark(&self) {
@@ -45,11 +53,24 @@ impl Dispatch {
         ActionFailure {
             error,
             cleanup_failed: self.cleanup.load(Ordering::SeqCst),
-            reason: self
-                .intercepted
-                .load(Ordering::SeqCst)
-                .then_some(ActionReason::InterceptedPointer),
-            effects: if self.sent.load(Ordering::SeqCst) {
+            reason: if self.intercepted.load(Ordering::SeqCst) {
+                Some(ActionReason::InterceptedPointer)
+            } else if self.checked_replaced.load(Ordering::SeqCst) {
+                Some(ActionReason::ControlReplacedAfterClick)
+            } else if self.checked_unchanged.load(Ordering::SeqCst) {
+                Some(ActionReason::CheckedStateUnchanged)
+            } else if self.recording_missing.load(Ordering::SeqCst) > 0 {
+                Some(ActionReason::RecordingSegmentMissing {
+                    ordinal: self.recording_missing.load(Ordering::SeqCst),
+                })
+            } else {
+                None
+            },
+            effects: if self.acknowledged_postcondition.load(Ordering::SeqCst)
+                && !self.cleanup.load(Ordering::SeqCst)
+            {
+                Effects::Completed
+            } else if self.sent.load(Ordering::SeqCst) {
                 Effects::Unknown
             } else {
                 Effects::NotDispatched
@@ -65,6 +86,7 @@ pub struct ActionContext<'a> {
     pub revision: u64,
     pub iframe_sessions: &'a HashMap<String, String>,
     pub blobs: &'a BlobStore,
+    pub geometry: &'a GeometrySnapshot,
 }
 impl ActionContext<'_> {
     fn check(&self) -> Result<(), ProtocolError> {
@@ -420,7 +442,62 @@ async fn release_call_handles(
         Ok(())
     }
 }
-async fn resolve(ctx: &ActionContext<'_>, r: &NodeReference) -> Result<Resolved, ProtocolError> {
+async fn resolve_action_object(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    binding: &ExactBinding,
+    backend: i64,
+) -> Result<String, ProtocolError> {
+    ctx.check()?;
+    let future = element::resolve_exact_object(&ctx.page.client, binding, backend);
+    tokio::pin!(future);
+    let mut cancellation = ctx.operation.cancellation.clone();
+    let outcome = tokio::select! {
+        result=&mut future => Ok(result),
+        _=cancellation.changed()=>Err(ProtocolError::Cancelled),
+        _=tokio::time::sleep_until(ctx.operation.deadline.into())=>Err(ProtocolError::DeadlineExceeded),
+    };
+    let (result, interrupted) = match outcome {
+        Ok(result) => (result, None),
+        Err(primary) => match tokio::time::timeout(Duration::from_millis(250), &mut future).await {
+            Ok(result) => (result, Some(primary)),
+            Err(_) => {
+                d.cleanup.store(true, Ordering::SeqCst);
+                return Err(primary);
+            }
+        },
+    };
+    let object = match result {
+        Ok(object) => object,
+        Err(_) => {
+            if interrupted.is_some() {
+                d.cleanup.store(true, Ordering::SeqCst);
+            }
+            return Err(interrupted.unwrap_or(ProtocolError::BrowserFailure));
+        }
+    };
+    if let Some(primary) = interrupted.or_else(|| ctx.check().err()) {
+        let released = tokio::time::timeout(
+            Duration::from_millis(250),
+            ctx.page.client.send_command(
+                "Runtime.releaseObject",
+                Some(json!({"objectId":object})),
+                Some(&binding.session),
+            ),
+        )
+        .await;
+        if !matches!(released, Ok(Ok(_))) {
+            d.cleanup.store(true, Ordering::SeqCst);
+        }
+        return Err(primary);
+    }
+    Ok(object)
+}
+async fn resolve(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    r: &NodeReference,
+) -> Result<Resolved, ProtocolError> {
     let (entry, binding) = reference(ctx, r)?;
     let backend = entry.backend_node_id.ok_or(ProtocolError::StaleReference)?;
     ctx.bounded(element::validate_exact_binding(
@@ -429,13 +506,7 @@ async fn resolve(ctx: &ActionContext<'_>, r: &NodeReference) -> Result<Resolved,
         &binding,
     ))
     .await?;
-    let object = ctx
-        .bounded(element::resolve_exact_object(
-            &ctx.page.client,
-            &binding,
-            backend,
-        ))
-        .await?;
+    let object = resolve_action_object(ctx, d, &binding, backend).await?;
     Ok(Resolved {
         object,
         session: binding.session.clone(),
@@ -447,17 +518,28 @@ async fn resolve(ctx: &ActionContext<'_>, r: &NodeReference) -> Result<Resolved,
 /// RPC. The scope owner must await cleanup before disposing its context.
 pub struct ClientActions {
     uploads: tokio::sync::Mutex<Vec<UploadResource>>,
-    recording: tokio::sync::Mutex<Option<OwnedRecording>>,
+    recording: tokio::sync::Mutex<RecordingLedger>,
 }
 impl Default for ClientActions {
     fn default() -> Self {
         Self {
             uploads: tokio::sync::Mutex::new(Vec::new()),
-            recording: tokio::sync::Mutex::new(None),
+            recording: tokio::sync::Mutex::new(RecordingLedger::default()),
         }
     }
 }
 impl ClientActions {
+    /// Validate without activating a borrowed page or mutating attempt state.
+    pub(crate) fn validate_recording_start(
+        identity_scope: &str,
+        args: &Value,
+    ) -> Result<(), ProtocolError> {
+        let request: RecordingStart = decode(args)?;
+        if request.identity_scope != identity_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        request.capture_options(None).map(|_| ())
+    }
     pub async fn execute(
         &self,
         ctx: ActionContext<'_>,
@@ -804,7 +886,7 @@ async fn action_target(
     d: &Dispatch,
     r: &NodeReference,
 ) -> Result<Resolved, ProtocolError> {
-    let resolved = resolve(ctx, r).await?;
+    let resolved = resolve(ctx, d, r).await?;
     let (_, binding) = reference(ctx, r)?;
     if binding.actionable {
         return Ok(resolved);
@@ -866,6 +948,23 @@ async fn center(
         }
     }
 }
+fn geometry_failure(d: &Dispatch, error: GeometryError) -> ProtocolError {
+    match error {
+        GeometryError::Cancelled => ProtocolError::Cancelled,
+        GeometryError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
+        GeometryError::StaleIdentity => ProtocolError::StaleReference,
+        GeometryError::CleanupFailed { primary } => {
+            d.cleanup.store(true, Ordering::SeqCst);
+            primary
+                .map(|e| geometry_failure(d, *e))
+                .unwrap_or(ProtocolError::CleanupFailed)
+        }
+        GeometryError::InvalidGeometry | GeometryError::IncompleteInventory => {
+            ProtocolError::UnsupportedCapability
+        }
+        GeometryError::BackendFailure => ProtocolError::BrowserFailure,
+    }
+}
 async fn center_once(
     ctx: &ActionContext<'_>,
     d: &Dispatch,
@@ -881,6 +980,11 @@ async fn center_once(
         json!({"objectId":node.object}),
     )
     .await?;
+    let geometry = ctx
+        .geometry
+        .refresh_after_scroll(&ctx.page.client, ctx.operation)
+        .await
+        .map_err(|e| geometry_failure(d, e))?;
     let bounds = ctx
         .command(
             d,
@@ -904,18 +1008,40 @@ async fn center_once(
                 .ok_or(ProtocolError::BrowserFailure)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let local = Point {
+    let local = GeometryPoint {
         x: (values[0] + values[2] + values[4] + values[6]) / 4.0,
         y: (values[1] + values[3] + values[5] + values[7]) / 4.0,
+    };
+    let root = geometry
+        .project_native_point(
+            &node.binding.frame,
+            GeometryPoint {
+                x: local.x,
+                y: local.y,
+            },
+        )
+        .map_err(|e| geometry_failure(d, e))?;
+    // Public Input rounds once in root space. Hit-test precisely that eventual
+    // dispatch point, not a separately rounded renderer-local coordinate.
+    let rounded = Point {
+        x: root.x,
+        y: root.y,
     }
     .validate()?;
+    let root = GeometryPoint {
+        x: rounded.x,
+        y: rounded.y,
+    };
+    let local = geometry
+        .root_to_frame_point(&node.binding.frame, root)
+        .map_err(|e| geometry_failure(d, e))?;
     let function = format!(
         r#"function(x,y,enabled){{
       if(!this.isConnected||this.ownerDocument!==document)return {{status:'stale'}};
       const rect=this.getBoundingClientRect();const style=this.ownerDocument.defaultView.getComputedStyle(this);
       if(rect.width<=0||rect.height<=0||style.visibility==='hidden'||style.visibility==='collapse')return {{status:'not-actionable'}};
-      let doc=this.ownerDocument;while(doc.defaultView&&doc.defaultView.frameElement)doc=doc.defaultView.frameElement.ownerDocument;
-      if(typeof doc.elementFromPoint!=='function'||typeof this.matches!=='function')return {{status:'not-actionable'}};
+      const doc=this.ownerDocument;
+      if(typeof doc.elementFromPoint!=='function'||typeof this.matches!=='function'||!doc.elementFromPoint(x,y))return {{status:'not-actionable'}};
       const blocker={};const actionable={};
       if(blocker(doc,this,x,y)!==null)return {{status:'intercepted-pointer'}};
       if(enabled&&actionable(doc,this,x,y)!==null)return {{status:'not-actionable'}};
@@ -933,18 +1059,46 @@ async fn center_once(
             vec![json!(local.x), json!(local.y), json!(enabled)],
         )
         .await?;
-    let offset = ctx
-        .bounded(element::session_viewport_offset(
-            &ctx.page.client,
-            &ctx.page.page_session_id,
-            &node.session,
-            ctx.iframe_sessions,
-        ))
-        .await?;
+    // A child-frame local hit can be unobscured while its iframe is covered in
+    // an ancestor. Prove each exact native owner in its own parent realm.
+    for (binding, backend) in geometry
+        .owner_chain(&node.binding.frame)
+        .map_err(|e| geometry_failure(d, e))?
+    {
+        let local = geometry
+            .root_to_frame_point(&binding.frame, root)
+            .map_err(|e| geometry_failure(d, e))?;
+        let object = resolve_action_object(ctx, d, &binding, backend).await?;
+        let owner = Resolved {
+            object,
+            session: binding.session.clone(),
+            binding,
+        };
+        let result = owner
+            .call(
+                ctx,
+                d,
+                false,
+                &function,
+                vec![json!(local.x), json!(local.y), json!(false)],
+            )
+            .await;
+        let cleanup = owner.release(ctx).await;
+        if cleanup.is_err() {
+            d.cleanup.store(true, Ordering::SeqCst);
+        }
+        result?;
+        cleanup?;
+    }
+    geometry
+        .revalidate(&ctx.page.client, ctx.operation)
+        .await
+        .map_err(|e| geometry_failure(d, e))?;
+    ctx.check()?;
     Ok((
         Point {
-            x: local.x + offset.0,
-            y: local.y + offset.1,
+            x: root.x,
+            y: root.y,
         }
         .validate()?,
         (
@@ -1232,28 +1386,11 @@ impl ClientActions {
         .await?;
         Ok(())
     }
-    pub async fn cleanup(&self) -> Result<(), ProtocolError> {
-        let mut recording = self.recording.lock().await;
-        let stopped = if let Some(owned) = recording.as_mut() {
-            recording::stop_recording_task(&mut owned.state)
-                .await
-                .map_err(|_| ProtocolError::CleanupFailed)
-        } else {
-            Ok(())
-        };
-        let mut recording_failed = stopped.is_err();
-        if let Some(owned) = recording.as_mut() {
-            if let Some(job) = owned.read_job.as_mut() {
-                recording_failed |= job.await.is_err();
-            }
-            owned.read_job.take();
-        }
-        if let Some(owned) = recording.take() {
-            recording_failed |= owned.directory.close().is_err();
-        }
-        drop(recording);
+    /// Scope teardown drains only scope-local uploads. Recording is owned by
+    /// the attempt and survives a properly sequenced page replacement.
+    pub async fn cleanup_scope_uploads(&self) -> Result<(), ProtocolError> {
         let mut uploads = self.uploads.lock().await;
-        let mut failed = recording_failed;
+        let mut failed = false;
         for upload in uploads.iter_mut() {
             failed |= upload.settle().await.is_err();
         }
@@ -1265,6 +1402,15 @@ impl ClientActions {
             }
         }
         if failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
+    pub async fn cleanup(&self) -> Result<(), ProtocolError> {
+        let recording = self.abandon_recording().await;
+        let uploads = self.cleanup_scope_uploads().await;
+        if recording.is_err() || uploads.is_err() {
             Err(ProtocolError::CleanupFailed)
         } else {
             Ok(())
@@ -1351,19 +1497,76 @@ async fn set_checked(
     let (point, _) = center(ctx, d, node, true).await?;
     click(ctx, d, point, "left", 1, Duration::ZERO).await?;
     let mut first = true;
+    let mut largest_read = Duration::ZERO;
     loop {
+        // A completed unchanged read is evidence; a timed-out in-flight read is
+        // not. Do not dispatch another poll after its measured round-trip budget
+        // has gone, and never reinterpret a transport timeout as unchanged.
+        if !first {
+            ctx.page.permit.check()?;
+            if *ctx.operation.cancellation.borrow() != CancelSignal::None {
+                return Err(ProtocolError::Cancelled);
+            }
+            if !checked_poll_fits(
+                Instant::now(),
+                ctx.operation.deadline,
+                Duration::ZERO,
+                largest_read,
+            ) {
+                return checked_unchanged(d);
+            }
+        }
+        let read_started = Instant::now();
         match node.call(ctx, d, false, CHECKED_STATE, vec![]).await {
             Ok(value) if value["checked"] == wanted => return Ok(()),
             Err(ProtocolError::StaleReference) if first => return Ok(()),
+            Err(ProtocolError::StaleReference) => {
+                d.checked_replaced.store(true, Ordering::SeqCst);
+                d.acknowledged_postcondition.store(true, Ordering::SeqCst);
+                return Err(ProtocolError::NotActionable);
+            }
             Err(error) => return Err(error),
             _ => {}
         }
+        largest_read = largest_read.max(read_started.elapsed());
         first = false;
-        if Instant::now() + Duration::from_millis(20) >= ctx.operation.deadline {
-            return Err(ProtocolError::NotActionable);
+        let interval = Duration::from_millis(20);
+        if !checked_poll_fits(
+            Instant::now(),
+            ctx.operation.deadline,
+            interval,
+            largest_read,
+        ) {
+            return checked_unchanged(d);
         }
-        ctx.pause(Duration::from_millis(20)).await?;
+        match ctx.pause(interval).await {
+            Ok(()) => (),
+            Err(ProtocolError::DeadlineExceeded) => {
+                ctx.page.permit.check()?;
+                if *ctx.operation.cancellation.borrow() != CancelSignal::None {
+                    return Err(ProtocolError::Cancelled);
+                }
+                return checked_unchanged(d);
+            }
+            Err(error) => return Err(error),
+        }
     }
+}
+fn checked_poll_fits(
+    now: Instant,
+    deadline: Instant,
+    pause: Duration,
+    last_read: Duration,
+) -> bool {
+    pause
+        .checked_add(last_read)
+        .and_then(|budget| now.checked_add(budget))
+        .is_some_and(|due| due < deadline)
+}
+fn checked_unchanged(d: &Dispatch) -> Result<(), ProtocolError> {
+    d.checked_unchanged.store(true, Ordering::SeqCst);
+    d.acknowledged_postcondition.store(true, Ordering::SeqCst);
+    Err(ProtocolError::NotActionable)
 }
 
 #[derive(Deserialize)]
@@ -1379,20 +1582,391 @@ struct RecordingStart {
     size: Option<RecordingSize>,
     quality: Option<u8>,
 }
+impl RecordingStart {
+    fn capture_options(
+        &self,
+        output_limit: Option<usize>,
+    ) -> Result<CaptureOptions, ProtocolError> {
+        CaptureOptions {
+            size: self.size.as_ref().map(|s| (s.width, s.height)),
+            jpeg: true,
+            quality: self.quality,
+            output_limit,
+        }
+        .validate()
+        .map_err(|_| ProtocolError::InvalidArguments)
+    }
+}
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RecordingStop {
     identity_scope: String,
 }
+struct RecordingAttachment {
+    client: Arc<super::cdp::client::CdpClient>,
+    reservation: super::client_targets::AuxiliaryAttachmentReservation,
+    startup: Option<tokio::task::JoinHandle<Result<String, String>>>,
+    session: Option<String>,
+    detached: Arc<AtomicBool>,
+    acknowledged_cleanup: HashSet<String>,
+    terminal_complete: bool,
+    cleanup_failed: bool,
+}
+impl RecordingAttachment {
+    async fn settle_terminal(
+        &mut self,
+        client: &Arc<super::cdp::client::CdpClient>,
+        proof: &super::client_enrollment::NativeTerminalProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check_client(client)?;
+        if !Arc::ptr_eq(client, &self.client) || !*self.client.remote_connection_closed().borrow() {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        if let Some(job) = self.startup.as_mut() {
+            // Retain the handle until its await completes, including when this
+            // cleanup call is cancelled. A lost attach ACK is not replayed.
+            let result = job.await;
+            self.startup.take();
+            if let Ok(Ok(session)) = result {
+                self.session = Some(session.clone());
+                let _ = self.reservation.claim(&session);
+            }
+        }
+        self.reservation.settle_terminal_connection(proof)?;
+        self.terminal_complete = true;
+        self.cleanup_failed = false;
+        Ok(())
+    }
+    async fn settle(&mut self) -> bool {
+        if self.terminal_complete {
+            return true;
+        }
+        if let Some(job) = self.startup.as_mut() {
+            let result = job.await;
+            self.startup.take();
+            match result {
+                Ok(Ok(session)) => {
+                    self.session = Some(session.clone());
+                    let _ = self.reservation.claim(&session);
+                }
+                _ => self.reservation.quarantine(),
+            }
+        }
+        if self.detached.load(Ordering::SeqCst) {
+            if let Some(session) = &self.session {
+                self.acknowledged_cleanup.insert(session.clone());
+            }
+        }
+        let Ok(sessions) = self.reservation.cleanup_sessions() else {
+            self.cleanup_failed = true;
+            return false;
+        };
+        if self.session.is_none()
+            || sessions
+                .iter()
+                .any(|s| !self.acknowledged_cleanup.contains(s))
+        {
+            self.reservation.quarantine();
+        }
+        for session in sessions {
+            if !self.acknowledged_cleanup.contains(&session) {
+                if recording::detach_capture_session_checked(&self.client, &session).await {
+                    self.acknowledged_cleanup.insert(session.clone());
+                } else {
+                    self.cleanup_failed = true;
+                    continue;
+                }
+            }
+            if self.session.as_deref() != Some(session.as_str()) {
+                self.cleanup_failed |= self.reservation.candidate_detached(&session).is_err();
+            }
+        }
+        let complete = self.session.as_ref().is_some_and(|session| {
+            self.acknowledged_cleanup.contains(session)
+                && self.reservation.detached(session).is_ok()
+        });
+        complete && !self.cleanup_failed
+    }
+}
 struct OwnedRecording {
     state: RecordingState,
     directory: OwnedDirectory,
-    producer: Option<BlobProducer>,
+    reservation: Option<ArtifactReservation>,
     scope: BlobScope,
     started_at: String,
+    ordinal: u64,
     read_job: Option<tokio::task::JoinHandle<Result<Vec<u8>, ProtocolError>>>,
+    bytes: Option<Vec<u8>>,
+    cleanup_complete: Arc<AtomicBool>,
+    attachment: Option<RecordingAttachment>,
+}
+#[derive(Default)]
+struct RecordingLedger {
+    authority: Option<AttemptArtifacts>,
+    options: Option<CaptureOptions>,
+    current: Option<OwnedRecording>,
+    finished: Vec<OwnedRecording>,
+    armed: bool,
+    abandoned: bool,
+    ordinal: u64,
+    lost: Option<u64>,
+    cleanup_failed: bool,
+    filesystem_cleanup_failed: bool,
+}
+impl RecordingLedger {
+    async fn finish_current(&mut self, blobs: &BlobStore) -> Result<(), ProtocolError> {
+        let Some(owned) = self.current.as_mut() else {
+            return Ok(());
+        };
+        // A failed native stop can still leave a valid finalized WebM. Retain
+        // that artifact rather than discarding it because of the stop status.
+        let had_capture = owned.state.capture_task.is_some();
+        let _stop = recording::stop_recording_task(&mut owned.state).await;
+        if let Some(attachment) = owned.attachment.as_mut() {
+            let clean = attachment.settle().await;
+            self.cleanup_failed |= !clean;
+            if !had_capture
+                && clean
+                && owned.state.encoder_complete.load(Ordering::SeqCst)
+                && !owned.state.cleanup_task_failed
+            {
+                owned.cleanup_complete.store(true, Ordering::SeqCst);
+            }
+        }
+        self.cleanup_failed |= !owned.cleanup_complete.load(Ordering::SeqCst);
+        let _ = recording::recording_stop(&mut owned.state);
+        if owned.read_job.is_none() && owned.bytes.is_none() {
+            let path = owned.state.output_path.clone();
+            let limit = blobs.producer_limit();
+            let (sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            owned.read_job = Some(tokio::task::spawn_blocking(move || {
+                let _sender = sender;
+                read_recording(
+                    path,
+                    limit,
+                    Instant::now() + Duration::from_secs(30),
+                    cancellation,
+                )
+            }));
+        }
+        let result = if let Some(job) = owned.read_job.as_mut() {
+            let result = job.await;
+            owned.read_job.take();
+            result
+                .map_err(|_| ProtocolError::BrowserFailure)
+                .and_then(|v| v)
+        } else {
+            Ok(owned.bytes.take().ok_or(ProtocolError::BrowserFailure)?)
+        };
+        match result {
+            Ok(bytes) => {
+                blobs
+                    .shrink_artifact(
+                        owned
+                            .reservation
+                            .as_mut()
+                            .ok_or(ProtocolError::BrowserFailure)?,
+                        bytes.len(),
+                    )
+                    .map_err(|_| ProtocolError::CapacityExceeded)?;
+                owned.bytes = Some(bytes);
+                self.finished
+                    .push(self.current.take().ok_or(ProtocolError::BrowserFailure)?);
+            }
+            Err(_) => {
+                self.lost.get_or_insert(owned.ordinal);
+                if !owned.cleanup_complete.load(Ordering::SeqCst) {
+                    return Err(ProtocolError::CleanupFailed);
+                }
+                let owned = self.current.take().ok_or(ProtocolError::BrowserFailure)?;
+                if owned.directory.close().is_err() {
+                    self.cleanup_failed = true;
+                    self.filesystem_cleanup_failed = true;
+                    return Err(ProtocolError::CleanupFailed);
+                }
+            }
+        }
+        Ok(())
+    }
+    async fn settle_start(
+        &mut self,
+        d: &Dispatch,
+        result: Result<(), ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        self.armed = result.is_ok();
+        if result.is_err() && self.discard_current().await.is_err() {
+            d.cleanup.store(true, Ordering::SeqCst);
+        }
+        result
+    }
+    async fn discard_current(&mut self) -> Result<(), ProtocolError> {
+        let mut failed = false;
+        if let Some(owned) = self.current.as_mut() {
+            let had_capture = owned.state.capture_task.is_some();
+            let _ = recording::stop_recording_task(&mut owned.state).await;
+            if let Some(attachment) = owned.attachment.as_mut() {
+                let clean = attachment.settle().await;
+                failed |= !clean;
+                if !had_capture
+                    && clean
+                    && owned.state.encoder_complete.load(Ordering::SeqCst)
+                    && !owned.state.cleanup_task_failed
+                {
+                    owned.cleanup_complete.store(true, Ordering::SeqCst);
+                }
+            }
+            failed |= !owned.cleanup_complete.load(Ordering::SeqCst);
+            if let Some(job) = owned.read_job.as_mut() {
+                failed |= job.await.is_err();
+            }
+            owned.read_job.take();
+        }
+        // A failed startup/stop still owns its exact attachment and private
+        // reservation. Keep it available for proven terminal settlement.
+        if failed {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        if let Some(owned) = self.current.take() {
+            failed |= owned.directory.close().is_err();
+        }
+        if failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
 }
 impl ClientActions {
+    /// Settle only resources belonging to the exact terminal native connection.
+    /// This does not prove host target, process, or evaluate termination, and
+    /// leaves private files, quota reservations, and attempt authority intact.
+    pub(crate) async fn settle_terminal_recording(
+        &self,
+        client: &Arc<super::cdp::client::CdpClient>,
+        proof: &super::client_enrollment::NativeTerminalProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check_client(client)?;
+        if !*client.remote_connection_closed().borrow() {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let mut ledger = self.recording.lock().await;
+            let mut failed = false;
+            let RecordingLedger {
+                current, finished, ..
+            } = &mut *ledger;
+            for owned in current.iter_mut().chain(finished.iter_mut()) {
+                let Some(attachment) = owned.attachment.as_mut() else {
+                    // No connection-specific ownership means no authority to
+                    // clear an existing unrelated cleanup failure.
+                    failed |= !owned.cleanup_complete.load(Ordering::SeqCst);
+                    continue;
+                };
+                if !Arc::ptr_eq(&attachment.client, client) {
+                    // Earlier, already settled segments may belong to a previous
+                    // connection; their artifacts remain in the same attempt.
+                    failed |= !owned.cleanup_complete.load(Ordering::SeqCst);
+                    continue;
+                }
+                let _ = recording::stop_recording_task(&mut owned.state).await;
+                let remote = attachment.settle_terminal(client, proof).await.is_ok();
+                if let Some(job) = owned.read_job.as_mut() {
+                    let result = job.await;
+                    owned.read_job.take();
+                    match result {
+                        Ok(Ok(bytes)) => owned.bytes = Some(bytes),
+                        Ok(Err(_)) => {} // Artifact validity is independent.
+                        Err(_) => owned.state.cleanup_task_failed = true,
+                    }
+                }
+                let complete = remote
+                    && owned.state.encoder_complete.load(Ordering::SeqCst)
+                    && !owned.state.cleanup_task_failed;
+                owned.cleanup_complete.store(complete, Ordering::SeqCst);
+                failed |= !complete;
+            }
+            // Do not clear historical filesystem failures with connection proof.
+            if !failed && (ledger.current.is_some() || !ledger.finished.is_empty()) {
+                ledger.cleanup_failed = ledger.filesystem_cleanup_failed;
+            }
+            if failed || ledger.cleanup_failed {
+                Err(ProtocolError::CleanupFailed)
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .map_err(|_| ProtocolError::CleanupFailed)?
+    }
+    /// Read the one attempt ledger, bounded independently of a caller RPC.
+    pub async fn is_recording_armed(&self) -> Result<bool, ProtocolError> {
+        let ledger = tokio::time::timeout(Duration::from_secs(5), self.recording.lock())
+            .await
+            .map_err(|_| ProtocolError::DeadlineExceeded)?;
+        Ok(ledger.armed && !ledger.abandoned)
+    }
+    /// Lifecycle-only: call before disposing/revoking the recorded page scope.
+    /// The owner retains this future until capture and file reads have joined.
+    pub async fn recording_page_closing(
+        &self,
+        expected_scope: &str,
+        blobs: &BlobStore,
+    ) -> Result<(), ProtocolError> {
+        let mut ledger = self.recording.lock().await;
+        if ledger
+            .current
+            .as_ref()
+            .is_some_and(|v| v.scope.identity_scope != expected_scope)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        ledger.finish_current(blobs).await?;
+        if ledger.cleanup_failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
+    /// Lifecycle-only: new scope is already initialized and admitted. This
+    /// never observes target events or creates a second page registry.
+    pub async fn recording_page_opened(&self, ctx: ActionContext<'_>) -> Result<(), ActionFailure> {
+        let d = Dispatch::default();
+        let mut ledger = self.recording.lock().await;
+        if !ledger.armed || ledger.abandoned {
+            return Ok(());
+        }
+        if ledger.current.is_some() {
+            return Err(d.failure(ProtocolError::NotActionable));
+        }
+        let result = Self::begin_segment(&ctx, &d, &mut ledger).await;
+        ledger
+            .settle_start(&d, result)
+            .await
+            .map_err(|error| d.failure(error))
+    }
+    /// Final attempt teardown. Disarm before awaiting so queued page-open
+    /// hooks cannot create another segment; retire publication authority first.
+    pub async fn abandon_recording(&self) -> Result<(), ProtocolError> {
+        let mut ledger = self.recording.lock().await;
+        ledger.abandoned = true;
+        ledger.armed = false;
+        let mut failed = ledger.cleanup_failed;
+        failed |= ledger
+            .authority
+            .as_ref()
+            .is_some_and(|a| a.retire().is_err());
+        failed |= ledger.discard_current().await.is_err();
+        for owned in ledger.finished.drain(..) {
+            failed |= owned.directory.close().is_err();
+        }
+        ledger.lost = None;
+        ledger.authority.take();
+        if failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
     async fn record_start(
         &self,
         ctx: &ActionContext<'_>,
@@ -1400,43 +1974,104 @@ impl ClientActions {
         request: RecordingStart,
     ) -> Result<(), ProtocolError> {
         scope(ctx, &request.identity_scope)?;
-        let options = CaptureOptions {
-            size: request.size.map(|s| (s.width, s.height)),
-            jpeg: true,
-            quality: request.quality,
+        let options = request.capture_options(Some(ctx.blobs.producer_limit()))?;
+        let mut ledger = self.recording.lock().await;
+        if ledger.abandoned {
+            return Err(ProtocolError::StaleScope);
         }
-        .validate()
-        .map_err(|_| ProtocolError::InvalidArguments)?;
-        let mut slot = self.recording.lock().await;
-        if slot.is_some() {
-            return Err(ProtocolError::NotActionable);
+        if ledger.current.is_some() {
+            ledger.armed = true;
+            return Ok(());
+        }
+        if ledger.authority.is_none() {
+            ledger.authority = Some(
+                ctx.blobs
+                    .begin_artifact_attempt(&ctx.blob_scope())
+                    .map_err(|_| ProtocolError::StaleScope)?,
+            );
+        }
+        ledger.options = Some(options);
+        let result = Self::begin_segment(ctx, d, &mut ledger).await;
+        ledger.settle_start(d, result).await
+    }
+    async fn begin_segment(
+        ctx: &ActionContext<'_>,
+        d: &Dispatch,
+        ledger: &mut RecordingLedger,
+    ) -> Result<(), ProtocolError> {
+        ctx.check()?;
+        let mut options = ledger.options.ok_or(ProtocolError::BrowserFailure)?;
+        if options.size.is_none() {
+            let metrics = ctx
+                .command(
+                    d,
+                    false,
+                    &ctx.page.page_session_id,
+                    "Page.getLayoutMetrics",
+                    json!({}),
+                )
+                .await?;
+            let viewport = &metrics["cssLayoutViewport"];
+            let width = viewport["clientWidth"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or(ProtocolError::BrowserFailure)?;
+            let height = viewport["clientHeight"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or(ProtocolError::BrowserFailure)?;
+            options.size = Some((width, height));
+            options = options
+                .validate()
+                .map_err(|_| ProtocolError::InvalidArguments)?;
         }
         ctx.bounded(recording::check_ffmpeg_available()).await?;
-        let producer = ctx
+        let reservation = ctx
             .blobs
-            .reserve_producer(ctx.blob_scope())
+            .reserve_artifact(
+                ledger
+                    .authority
+                    .as_ref()
+                    .ok_or(ProtocolError::BrowserFailure)?,
+                &ctx.blob_scope(),
+            )
             .map_err(|_| ProtocolError::CapacityExceeded)?;
         let directory = OwnedDirectory::create()?;
+        ledger.ordinal = ledger
+            .ordinal
+            .checked_add(1)
+            .filter(|v| *v <= 1_000_000)
+            .ok_or(ProtocolError::IdentifierExhausted)?;
+        let name = if ledger.ordinal == 1 {
+            "video.webm".into()
+        } else {
+            format!("video-part{}.webm", ledger.ordinal)
+        };
         let path = directory
             .path
-            .join("recording.webm")
+            .join(name)
             .to_str()
             .ok_or(ProtocolError::BrowserFailure)?
             .to_owned();
         let mut state = RecordingState::new();
         recording::recording_start(&mut state, &path, RecordingOptions::default())
             .map_err(|_| ProtocolError::BrowserFailure)?;
-        // Publish ownership, never user-visible success, before the first await
-        // that can allocate a remote capture resource.
-        *slot = Some(OwnedRecording {
+        ledger.current = Some(OwnedRecording {
             state,
             directory,
-            producer: Some(producer),
+            reservation: Some(reservation),
             scope: ctx.blob_scope(),
-            read_job: None,
             started_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+            ordinal: ledger.ordinal,
+            read_job: None,
+            bytes: None,
+            cleanup_complete: Arc::new(AtomicBool::new(true)),
+            attachment: None,
         });
-        let owned = slot.as_mut().ok_or(ProtocolError::BrowserFailure)?;
+        let owned = ledger
+            .current
+            .as_mut()
+            .ok_or(ProtocolError::BrowserFailure)?;
         let initial = ctx
             .bounded(recording::capture_initial_image_with_options(
                 &ctx.page.client,
@@ -1444,20 +2079,71 @@ impl ClientActions {
                 options,
             ))
             .await?;
+        ctx.check()?;
+        let reservation = ctx.page.targets.reserve_auxiliary_attachment(
+            &ctx.page.identity_scope,
+            &ctx.page.target_id,
+            &ctx.page.page_session_id,
+        )?;
+        let client = ctx.page.client.clone();
+        let target = ctx.page.target_id.clone();
+        let shared = owned.state.capture_session.clone();
+        // Register retained ownership synchronously with spawn, before any
+        // cancellation-sensitive await. The bounded job still owns an unknown
+        // attachment outcome when the caller stops waiting.
         d.mark();
-        let capture = ctx
-            .bounded(recording::attach_capture_session(
-                &ctx.page.client,
-                &ctx.page.page_session_id,
-                &owned.state.capture_session,
-            ))
-            .await?;
+        owned.cleanup_complete.store(false, Ordering::SeqCst);
+        owned.attachment = Some(RecordingAttachment {
+            client: client.clone(),
+            reservation,
+            session: None,
+            detached: Arc::new(AtomicBool::new(false)),
+            acknowledged_cleanup: HashSet::new(),
+            terminal_complete: false,
+            cleanup_failed: false,
+            startup: Some(tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    recording::attach_capture_session_to_target(&client, &target, &shared),
+                )
+                .await
+                .map_err(|_| "Native recorder attach outcome unknown".to_owned())?
+            })),
+        });
+        let attachment = owned
+            .attachment
+            .as_mut()
+            .ok_or(ProtocolError::BrowserFailure)?;
+        let job = attachment
+            .startup
+            .as_mut()
+            .ok_or(ProtocolError::BrowserFailure)?;
+        let mut cancellation = ctx.operation.cancellation.clone();
+        let result = tokio::select! {
+            result = job => result,
+            _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+            _ = tokio::time::sleep_until(ctx.operation.deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+        };
+        // Clear a terminal JoinHandle before propagating any failure. A pending
+        // handle remains owned above when cancellation wins the select.
+        attachment.startup.take();
+        let capture = match result {
+            Ok(Ok(session)) => session,
+            _ => {
+                attachment.reservation.quarantine();
+                return Err(ProtocolError::BrowserFailure);
+            }
+        };
+        attachment.session = Some(capture.clone());
+        attachment.reservation.claim(&capture)?;
+        ctx.check()?;
         let frames = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let captured = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let sheets = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel();
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-        owned.state.capture_task = Some(recording::spawn_recording_task_with_options(
+        owned.state.encoder_complete.store(false, Ordering::SeqCst);
+        owned.state.capture_task = Some(recording::spawn_recording_task_with_session_proof(
             ctx.page.client.clone(),
             capture,
             initial,
@@ -1475,6 +2161,9 @@ impl ClientActions {
             cancel_rx,
             options,
             Some(ready_tx),
+            Some(owned.cleanup_complete.clone()),
+            Some(attachment.detached.clone()),
+            Some(owned.state.encoder_complete.clone()),
         ));
         owned.state.cancel_tx = Some(cancel_tx);
         owned.state.shared_frame_count = Some(frames);
@@ -1495,50 +2184,66 @@ impl ClientActions {
         request: RecordingStop,
     ) -> Result<Value, ProtocolError> {
         scope(ctx, &request.identity_scope)?;
-        let mut slot = self.recording.lock().await;
-        let Some(owned) = slot.as_mut() else {
-            return Ok(json!({"identityScope":ctx.page.identity_scope,"segments":[]}));
-        };
-        if owned.scope != ctx.blob_scope() {
-            return Err(ProtocolError::StaleScope);
+        let mut ledger = self.recording.lock().await;
+        ledger.armed = false;
+        if ledger.current.is_some() {
+            d.mark();
         }
-        // Retain the recorder join across RPC cancellation. Its existing native
-        // teardown owns screencast ACKs, encoder completion, and session detach.
-        d.mark();
-        recording::stop_recording_task(&mut owned.state)
-            .await
-            .map_err(|_| ProtocolError::CleanupFailed)?;
-        recording::recording_stop(&mut owned.state).map_err(|_| ProtocolError::BrowserFailure)?;
+        let finalized = ledger.finish_current(ctx.blobs).await;
+        d.cleanup.store(ledger.cleanup_failed, Ordering::SeqCst);
+        finalized?;
         ctx.check()?;
-        let limit = ctx.blobs.producer_limit();
-        let path = owned.state.output_path.clone();
-        let deadline = ctx.operation.deadline;
-        let cancellation = ctx.operation.cancellation.clone();
-        owned.read_job = Some(tokio::task::spawn_blocking(move || {
-            read_recording(path, limit, deadline, cancellation)
-        }));
-        let read = owned
-            .read_job
-            .as_mut()
-            .ok_or(ProtocolError::BrowserFailure)?
-            .await;
-        owned.read_job.take();
-        let bytes = read.map_err(|_| ProtocolError::BrowserFailure)??;
-        ctx.check()?;
-        let producer = owned.producer.take().ok_or(ProtocolError::BrowserFailure)?;
-        let info = ctx
-            .blobs
-            .finish_producer(producer, bytes)
-            .map_err(|_| ProtocolError::BrowserFailure)?;
-        let started_at = owned.started_at.clone();
-        let owned = slot.take().ok_or(ProtocolError::BrowserFailure)?;
-        if owned.directory.close().is_err() {
-            let _ = ctx.blobs.release(&ctx.blob_scope(), &info.handle);
+        if ledger.cleanup_failed {
             return Err(ProtocolError::CleanupFailed);
         }
-        Ok(
-            json!({"identityScope":ctx.page.identity_scope,"segments":[{"identityScope":ctx.page.identity_scope,"handle":info.handle,"size":info.size,"sha256":info.sha256,"mediaType":"video/webm","startedAt":started_at}]}),
-        )
+        if let Some(ordinal) = ledger.lost.take() {
+            d.recording_missing.store(ordinal, Ordering::SeqCst);
+            return Err(ProtocolError::BrowserFailure);
+        }
+        if ledger
+            .finished
+            .iter()
+            .any(|v| v.reservation.is_none() || v.bytes.is_none())
+        {
+            return Err(ProtocolError::BrowserFailure);
+        }
+        let mut items = Vec::with_capacity(ledger.finished.len());
+        for owned in &mut ledger.finished {
+            items.push((
+                owned
+                    .reservation
+                    .take()
+                    .ok_or(ProtocolError::BrowserFailure)?,
+                owned.bytes.take().ok_or(ProtocolError::BrowserFailure)?,
+            ));
+        }
+        let infos = match ctx.blobs.finish_artifact_batch(items, ctx.blob_scope()) {
+            Ok(infos) => infos,
+            Err((_, items)) => {
+                for (owned, (reservation, bytes)) in ledger.finished.iter_mut().zip(items) {
+                    owned.reservation = Some(reservation);
+                    owned.bytes = Some(bytes);
+                }
+                return Err(ProtocolError::StaleScope);
+            }
+        };
+        let mut segments: Vec<Value> = Vec::with_capacity(infos.len());
+        let mut cleanup_failed = false;
+        for (owned, info) in ledger.finished.drain(..).zip(&infos) {
+            let started_at = owned.started_at;
+            cleanup_failed |= owned.directory.close().is_err();
+            segments.push(json!({"identityScope":ctx.page.identity_scope,"handle":info.handle,"size":info.size,"sha256":info.sha256,"mediaType":"video/webm","startedAt":started_at}));
+        }
+        let check = ctx.check();
+        if cleanup_failed || check.is_err() {
+            for info in infos {
+                cleanup_failed |= ctx.blobs.release(&ctx.blob_scope(), &info.handle).is_err();
+            }
+            d.cleanup.store(cleanup_failed, Ordering::SeqCst);
+            return Err(check.err().unwrap_or(ProtocolError::CleanupFailed));
+        }
+
+        Ok(json!({"identityScope":ctx.page.identity_scope,"segments":segments}))
     }
 }
 
@@ -1708,7 +2413,7 @@ fn read_recording(
     cancellation: tokio::sync::watch::Receiver<CancelSignal>,
 ) -> Result<Vec<u8>, ProtocolError> {
     let metadata = std::fs::metadata(&path).map_err(|_| ProtocolError::BrowserFailure)?;
-    if metadata.len() == 0 || metadata.len() > limit as u64 {
+    if metadata.len() == 0 || metadata.len() >= limit as u64 {
         return Err(ProtocolError::CapacityExceeded);
     }
     let mut file = std::fs::File::open(path).map_err(|_| ProtocolError::BrowserFailure)?;
@@ -1754,6 +2459,7 @@ mod tests {
         refs: RefMap,
         blobs: BlobStore,
         frames: HashMap<String, String>,
+        geometry: GeometrySnapshot,
         log: Log,
         server: tokio::task::JoinHandle<()>,
     }
@@ -1767,6 +2473,7 @@ mod tests {
                 revision: 1,
                 iframe_sessions: &self.frames,
                 blobs: &self.blobs,
+                geometry: &self.geometry,
             }
         }
         fn inputs(&self) -> Vec<Value> {
@@ -1800,6 +2507,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut checked_reads = 0;
             while let Some(Ok(message)) = socket.next().await {
                 let Ok(text) = message.to_text() else {
                     continue;
@@ -1831,11 +2539,15 @@ mod tests {
                     }
                     "Page.createIsolatedWorld" => json!({"executionContextId":1}),
                     "DOM.resolveNode" => {
+                        if mode == "resolve-cancel" {
+                            server_cancel.send_replace(CancelSignal::Requested);
+                            tokio::time::sleep(Duration::from_millis(30)).await;
+                        }
                         json!({"object":{"objectId":"exact-node","subtype":"node"}})
                     }
                     "DOM.getBoxModel" => json!({"model":{"border":[0,0,100,0,100,50,0,50]}}),
                     "Page.getLayoutMetrics" => {
-                        json!({"cssLayoutViewport":{"clientWidth":100,"clientHeight":200}})
+                        json!({"cssVisualViewport":{"clientWidth":100.,"clientHeight":200.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":100.,"clientHeight":200.}})
                     }
                     "Browser.getVersion" => json!({"userAgent":"Synthetic Linux"}),
                     "Accessibility.getFullAXTree" => {
@@ -1847,6 +2559,18 @@ mod tests {
                                 json!({"result":{"value":{"status":"intercepted-pointer"}}})
                             } else {
                                 json!({"result":{"value":{"width":100,"height":50}}})
+                            }
+                        } else if source == CHECKED_STATE {
+                            checked_reads += 1;
+                            if mode == "check-read-stalled" && checked_reads == 2 {
+                                tokio::time::sleep(Duration::from_secs(2)).await;
+                            }
+                            if (mode == "check-replaced" && checked_reads > 2)
+                                || (mode == "check-immediate-replacement" && checked_reads > 1)
+                            {
+                                json!({"result":{"value":{"status":"stale"}}})
+                            } else {
+                                json!({"result":{"value":{"checked":false,"radio":false}}})
                             }
                         } else if source == PREPARE_FILL {
                             json!({"result":{"value":{"complete":false}}})
@@ -1904,7 +2628,25 @@ mod tests {
                 identity_scope: "scope".into(),
             })
             .unwrap();
+        let geometry = GeometrySnapshot::capture(
+            &page.client,
+            "page",
+            &[super::super::client_observation::ObservationFrame {
+                parent_frame_id: None,
+                owner_backend_id: None,
+                url: "about:blank".into(),
+                binding: refs.get("e1").unwrap().exact_binding.clone().unwrap(),
+                offset_x: 0.,
+                offset_y: 0.,
+                frame_path: vec![],
+            }],
+            &op,
+        )
+        .await
+        .unwrap();
+        log.lock().unwrap().clear();
         Fixture {
+            geometry,
             page,
             op,
             _cancel: cancel,
@@ -1915,6 +2657,23 @@ mod tests {
             log,
             server,
         }
+    }
+    #[tokio::test]
+    async fn cancelled_exact_resolution_drains_and_releases_late_remote_handle() {
+        let f = fixture("resolve-cancel").await;
+        let d = Dispatch::default();
+        let binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
+        let result = resolve_action_object(&f.context(), &d, &binding, 42).await;
+        assert_eq!(result, Err(ProtocolError::Cancelled));
+        assert!(!d.cleanup.load(Ordering::SeqCst));
+        assert!(f.inputs().is_empty());
+        assert!(f
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|v| v["method"] == "Runtime.releaseObject"
+                && v["params"]["objectId"] == "exact-node"));
     }
     #[test]
     fn upload_paths_refuse_escapes_and_preserve_nested_directory_paths() {
@@ -2078,6 +2837,853 @@ mod tests {
         assert_eq!(error.error, ProtocolError::Cancelled);
     }
 
+    async fn seed_recording(
+        actions: &ClientActions,
+        f: &Fixture,
+        ordinal: u64,
+        bytes: Option<&[u8]>,
+        stop_error: bool,
+    ) {
+        let mut ledger = actions.recording.lock().await;
+        if ledger.authority.is_none() {
+            ledger.authority = Some(
+                f.blobs
+                    .begin_artifact_attempt(&f.context().blob_scope())
+                    .unwrap(),
+            );
+        }
+        let reservation = f
+            .blobs
+            .reserve_artifact(
+                ledger.authority.as_ref().unwrap(),
+                &f.context().blob_scope(),
+            )
+            .unwrap();
+        let directory = OwnedDirectory::create().unwrap();
+        let path = directory.path.join(format!("video-part{ordinal}.webm"));
+        if let Some(bytes) = bytes {
+            std::fs::write(&path, bytes).unwrap();
+        }
+        let mut state = RecordingState::new();
+        state.output_path = path.to_string_lossy().into_owned();
+        state.active = true;
+        state.frame_count = 1;
+        state.capture_task = Some(tokio::spawn(async move {
+            if stop_error {
+                Err("Synthetic stop failure".into())
+            } else {
+                Ok(())
+            }
+        }));
+        ledger.armed = true;
+        ledger.ordinal = ordinal;
+        ledger.current = Some(OwnedRecording {
+            state,
+            directory,
+            reservation: Some(reservation),
+            scope: f.context().blob_scope(),
+            started_at: format!("2026-10-21T00:00:0{ordinal}.000Z"),
+            ordinal,
+            read_job: None,
+            bytes: None,
+            cleanup_complete: Arc::new(AtomicBool::new(true)),
+            attachment: None,
+        });
+    }
+    async fn collect_recording(
+        actions: &ClientActions,
+        f: &Fixture,
+    ) -> Result<Value, ActionFailure> {
+        actions
+            .execute(
+                f.context(),
+                "recording.stop",
+                &json!({"identityScope":f.page.identity_scope}),
+            )
+            .await
+    }
+    #[tokio::test]
+    async fn recording_ledger_preserves_order_start_instants_and_rotated_scope() {
+        let mut f = fixture("normal").await;
+        let actions = ClientActions::default();
+        let bytes = [0x1a, 0x45, 0xdf, 0xa3, 1];
+        seed_recording(&actions, &f, 1, Some(&bytes), false).await;
+        actions
+            .recording_page_closing("scope", &f.blobs)
+            .await
+            .unwrap();
+        assert!(actions.recording.lock().await.armed);
+        f.blobs.revoke_scope(&f.context().blob_scope()).unwrap();
+        f.page.identity_scope = "replacement".into();
+        f.blobs.activate_scope(f.context().blob_scope()).unwrap();
+        seed_recording(&actions, &f, 2, Some(&bytes), false).await;
+        let result = collect_recording(&actions, &f).await.unwrap();
+        let segments = result["segments"].as_array().unwrap();
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0]["startedAt"], "2026-10-21T00:00:01.000Z");
+        assert_eq!(segments[1]["startedAt"], "2026-10-21T00:00:02.000Z");
+        for segment in segments {
+            assert_eq!(segment["identityScope"], "replacement");
+            let handle = segment["handle"].as_str().unwrap();
+            assert_eq!(
+                f.blobs
+                    .read(&f.context().blob_scope(), handle, 0, 5)
+                    .unwrap(),
+                bytes
+            );
+            f.blobs.release(&f.context().blob_scope(), handle).unwrap();
+        }
+        assert!(!actions.recording.lock().await.armed);
+        assert_eq!(
+            collect_recording(&actions, &f).await.unwrap()["segments"],
+            json!([])
+        );
+    }
+    #[tokio::test]
+    async fn recording_batch_rejection_preserves_two_private_segments_for_current_scope() {
+        let mut f = fixture("normal").await;
+        let actions = ClientActions::default();
+        let bytes = [0x1a, 0x45, 0xdf, 0xa3, 1];
+        for ordinal in [1, 2] {
+            seed_recording(&actions, &f, ordinal, Some(&bytes), false).await;
+            actions
+                .recording_page_closing("scope", &f.blobs)
+                .await
+                .unwrap();
+        }
+        f.blobs.revoke_scope(&f.context().blob_scope()).unwrap();
+        assert_eq!(
+            collect_recording(&actions, &f).await.unwrap_err().error,
+            ProtocolError::StaleScope
+        );
+        {
+            let ledger = actions.recording.lock().await;
+            assert_eq!(ledger.finished.len(), 2);
+            assert!(ledger
+                .finished
+                .iter()
+                .all(|v| v.reservation.is_some() && v.bytes.as_deref() == Some(&bytes)));
+        }
+        f.page.identity_scope = "replacement".into();
+        f.blobs.activate_scope(f.context().blob_scope()).unwrap();
+        let result = collect_recording(&actions, &f).await.unwrap();
+        assert_eq!(result["segments"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            collect_recording(&actions, &f).await.unwrap()["segments"],
+            json!([])
+        );
+    }
+    #[tokio::test]
+    async fn recording_valid_file_does_not_hide_unproved_capture_cleanup() {
+        let f = fixture("normal").await;
+        let actions = ClientActions::default();
+        seed_recording(&actions, &f, 1, Some(&[0x1a, 0x45, 0xdf, 0xa3]), true).await;
+        actions
+            .recording
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .unwrap()
+            .cleanup_complete
+            .store(false, Ordering::SeqCst);
+        let failure = collect_recording(&actions, &f).await.unwrap_err();
+        assert_eq!(failure.error, ProtocolError::CleanupFailed);
+        assert!(failure.cleanup_failed);
+        assert_eq!(actions.recording.lock().await.finished.len(), 1);
+        assert_eq!(
+            actions.abandon_recording().await,
+            Err(ProtocolError::CleanupFailed)
+        );
+    }
+    #[tokio::test]
+    async fn recording_failed_stop_keeps_valid_file_and_reports_missing_once() {
+        let f = fixture("normal").await;
+        let actions = ClientActions::default();
+        let bytes = [0x1a, 0x45, 0xdf, 0xa3, 1];
+        seed_recording(&actions, &f, 1, Some(&bytes), true).await;
+        actions
+            .recording_page_closing("scope", &f.blobs)
+            .await
+            .unwrap();
+        seed_recording(&actions, &f, 2, None, true).await;
+        assert_eq!(
+            collect_recording(&actions, &f).await.unwrap_err().error,
+            ProtocolError::BrowserFailure
+        );
+        assert!(!actions.recording.lock().await.armed);
+        let result = collect_recording(&actions, &f).await.unwrap();
+        assert_eq!(result["segments"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            result["segments"][0]["startedAt"],
+            "2026-10-21T00:00:01.000Z"
+        );
+        assert_eq!(
+            collect_recording(&actions, &f).await.unwrap()["segments"],
+            json!([])
+        );
+    }
+    #[tokio::test]
+    async fn recording_abandon_joins_and_prevents_late_page_segments() {
+        let f = fixture("normal").await;
+        let actions = ClientActions::default();
+        seed_recording(&actions, &f, 1, Some(&[0x1a, 0x45, 0xdf, 0xa3]), false).await;
+        let path = actions
+            .recording
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .unwrap()
+            .directory
+            .path
+            .clone();
+        actions.abandon_recording().await.unwrap();
+        assert!(!path.exists());
+        actions.recording_page_opened(f.context()).await.unwrap();
+        assert!(actions.recording.lock().await.current.is_none());
+        assert!(f.log.lock().unwrap().is_empty());
+        assert_eq!(
+            collect_recording(&actions, &f).await.unwrap()["segments"],
+            json!([])
+        );
+    }
+    #[tokio::test]
+    async fn recording_failed_first_start_disarms_and_joins_owned_resources() {
+        let f = fixture("normal").await;
+        let actions = ClientActions::default();
+        seed_recording(&actions, &f, 1, Some(&[0x1a, 0x45, 0xdf, 0xa3]), false).await;
+        let path = actions
+            .recording
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .unwrap()
+            .directory
+            .path
+            .clone();
+        let d = Dispatch::default();
+        let result = actions
+            .recording
+            .lock()
+            .await
+            .settle_start(&d, Err(ProtocolError::BrowserFailure))
+            .await;
+        assert_eq!(result, Err(ProtocolError::BrowserFailure));
+        assert!(!actions.recording.lock().await.armed);
+        assert!(actions.recording.lock().await.current.is_none());
+        assert!(!path.exists());
+        actions.recording_page_opened(f.context()).await.unwrap();
+        assert_eq!(
+            collect_recording(&actions, &f).await.unwrap()["segments"],
+            json!([])
+        );
+        assert!(f.log.lock().unwrap().is_empty());
+    }
+    async fn enroll_recording_fixture(page: &BrowserExecutionLease) {
+        page.targets
+            .attached(
+                &page.targets.context_id,
+                page.target_id.clone(),
+                page.page_session_id.clone(),
+                "page".into(),
+            )
+            .unwrap();
+        page.targets.configured(&page.target_id).unwrap();
+        page.targets.acknowledge_enrollment().unwrap();
+        page.targets
+            .resume_permit(&page.target_id)
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+    }
+    #[test]
+    fn recording_start_preflight_reuses_strict_shape_scope_size_quality_validation() {
+        for args in [
+            json!({"identityScope":"scope"}),
+            json!({"identityScope":"scope", "size":{"width":320,"height":200},"quality":70}),
+            json!({"identityScope":"scope", "quality":0}),
+            json!({"identityScope":"scope", "quality":100}),
+        ] {
+            assert_eq!(
+                ClientActions::validate_recording_start("scope", &args),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            ClientActions::validate_recording_start("scope", &json!({"identityScope":"other"})),
+            Err(ProtocolError::StaleScope)
+        );
+        for args in [
+            Value::Null,
+            json!([]),
+            json!({}),
+            json!({"identityScope":3}),
+            json!({"identityScope":"scope","unknown":true}),
+            json!({"identityScope":"scope","size":{"width":320}}),
+            json!({"identityScope":"scope","size":{"width":320,"height":200,"unknown":0}}),
+            json!({"identityScope":"scope","size":{"width":0,"height":200}}),
+            json!({"identityScope":"scope","size":{"width":16385,"height":1}}),
+            json!({"identityScope":"scope","size":{"width":10000,"height":10000}}),
+            json!({"identityScope":"scope","size":{"width":-1,"height":200}}),
+            json!({"identityScope":"scope","quality":101}),
+            json!({"identityScope":"scope","quality":256}),
+            json!({"identityScope":"scope","quality":-1}),
+            json!({"identityScope":"scope","quality":70.5}),
+            json!({"identityScope":"scope","quality":"70"}),
+        ] {
+            assert_eq!(
+                ClientActions::validate_recording_start("scope", &args),
+                Err(ProtocolError::InvalidArguments),
+                "{args}"
+            );
+        }
+    }
+    fn terminal_recording_proof(
+        f: &Fixture,
+    ) -> Result<
+        (
+            super::super::client_enrollment::NativeTerminalProof,
+            Arc<super::super::client_network::ClientNetwork>,
+        ),
+        ProtocolError,
+    > {
+        use super::super::{
+            client_enrollment::NativeTerminalProof,
+            client_network::{ClientNetwork, NetworkPolicy},
+            client_session::ClientSession,
+            client_transport::ClientEventSink,
+            client_ui::UiGate,
+        };
+        let broker = Arc::new(ClientSession::new());
+        let (sink, _notices) = ClientEventSink::test_channel(broker.clone());
+        let blobs = Arc::new(BlobStore::new(BlobLimits::default()).unwrap());
+        let network = Arc::new(ClientNetwork::new(
+            f.page.client.clone(),
+            broker,
+            sink,
+            f.context().blob_scope(),
+            blobs,
+            Arc::new(UiGate::default()),
+            NetworkPolicy::default(),
+        ));
+        let proof = NativeTerminalProof::for_test(
+            f.page.client.clone(),
+            f.page.targets.clone(),
+            &network,
+            1,
+            "target".into(),
+        )?;
+        Ok((proof, network))
+    }
+    async fn seed_terminal_recording(actions: &ClientActions, f: &Fixture) {
+        enroll_recording_fixture(&f.page).await;
+        seed_recording(actions, f, 1, Some(&[0x1a, 0x45, 0xdf, 0xa3]), false).await;
+        let mut reservation = f
+            .page
+            .targets
+            .reserve_auxiliary_attachment("scope", "target", "page")
+            .unwrap();
+        reservation.claim("recorder").unwrap();
+        let mut ledger = actions.recording.lock().await;
+        let owned = ledger.current.as_mut().unwrap();
+        owned.cleanup_complete.store(false, Ordering::SeqCst);
+        owned.attachment = Some(RecordingAttachment {
+            client: f.page.client.clone(),
+            reservation,
+            startup: None,
+            session: Some("recorder".into()),
+            detached: Arc::new(AtomicBool::new(false)),
+            acknowledged_cleanup: HashSet::new(),
+            terminal_complete: false,
+            cleanup_failed: false,
+        });
+    }
+    async fn disconnect_recording_fixture(f: &Fixture) {
+        let mut closed = f.page.client.remote_connection_closed();
+        f.server.abort();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !*closed.borrow_and_update() {
+                closed.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+    }
+    #[tokio::test]
+    async fn terminal_recording_missing_file_retains_attempt_and_failed_start_ownership() {
+        let f = fixture("normal").await;
+        let actions = ClientActions::default();
+        seed_terminal_recording(&actions, &f).await;
+        disconnect_recording_fixture(&f).await;
+        {
+            let mut ledger = actions.recording.lock().await;
+            let owned = ledger.current.as_mut().unwrap();
+            std::fs::remove_file(&owned.state.output_path).unwrap();
+            owned.state.encoder_complete.store(false, Ordering::SeqCst);
+            assert_eq!(
+                ledger.finish_current(&f.blobs).await,
+                Err(ProtocolError::CleanupFailed)
+            );
+            assert_eq!(
+                ledger.discard_current().await,
+                Err(ProtocolError::CleanupFailed)
+            );
+            assert!(ledger.current.as_ref().unwrap().reservation.is_some());
+            assert!(ledger.current.as_ref().unwrap().directory.path.exists());
+        }
+        assert_eq!(
+            actions
+                .settle_terminal_recording(&f.page.client, &terminal_recording_proof(&f).unwrap().0)
+                .await,
+            Err(ProtocolError::CleanupFailed)
+        );
+        assert!(actions.recording.lock().await.current.is_some());
+    }
+    #[tokio::test]
+    async fn terminal_recording_refuses_live_or_different_native_connection() {
+        let f = fixture("normal").await;
+        let other = fixture("normal").await;
+        let actions = ClientActions::default();
+        seed_terminal_recording(&actions, &f).await;
+        assert!(matches!(
+            terminal_recording_proof(&f),
+            Err(ProtocolError::StaleScope)
+        ));
+        disconnect_recording_fixture(&other).await;
+        // Foreign proof is rejected by the scope-authority layer before any
+        // recording cleanup. A valid proof for another attachment below is
+        // instead a recording cleanup ownership failure.
+        assert_eq!(
+            actions
+                .settle_terminal_recording(
+                    &f.page.client,
+                    &terminal_recording_proof(&other).unwrap().0
+                )
+                .await,
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            actions
+                .settle_terminal_recording(
+                    &other.page.client,
+                    &terminal_recording_proof(&other).unwrap().0
+                )
+                .await,
+            Err(ProtocolError::CleanupFailed)
+        );
+        let ledger = actions.recording.lock().await;
+        assert!(ledger
+            .current
+            .as_ref()
+            .unwrap()
+            .state
+            .capture_task
+            .is_some());
+        assert!(f.log.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn terminal_before_and_after_stop_retains_file_and_does_not_forge_detach_ack() {
+        for after_stop in [false, true] {
+            let f = fixture("normal").await;
+            let actions = ClientActions::default();
+            seed_terminal_recording(&actions, &f).await;
+            disconnect_recording_fixture(&f).await;
+            if after_stop {
+                let mut ledger = actions.recording.lock().await;
+                ledger.finish_current(&f.blobs).await.unwrap();
+                assert!(ledger.cleanup_failed);
+                assert_eq!(ledger.finished.len(), 1);
+            }
+            actions
+                .settle_terminal_recording(&f.page.client, &terminal_recording_proof(&f).unwrap().0)
+                .await
+                .unwrap();
+            let ledger = actions.recording.lock().await;
+            let owned = ledger
+                .current
+                .as_ref()
+                .unwrap_or_else(|| &ledger.finished[0]);
+            assert!(owned.directory.path.exists());
+            assert!(owned.reservation.is_some());
+            assert!(owned.state.capture_task.is_none());
+            assert!(owned.cleanup_complete.load(Ordering::SeqCst));
+            let attachment = owned.attachment.as_ref().unwrap();
+            assert!(!attachment.detached.load(Ordering::SeqCst));
+            assert!(attachment.acknowledged_cleanup.is_empty());
+            assert!(f.log.lock().unwrap().is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn terminal_recording_cancel_retains_capture_attach_read_and_encoder_proof() {
+        let f = fixture("normal").await;
+        let actions = ClientActions::default();
+        seed_terminal_recording(&actions, &f).await;
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        let (attach_release, attach_wait) = tokio::sync::oneshot::channel::<()>();
+        let (read_release, read_wait) = tokio::sync::oneshot::channel::<()>();
+        {
+            let mut ledger = actions.recording.lock().await;
+            let owned = ledger.current.as_mut().unwrap();
+            recording::stop_recording_task(&mut owned.state)
+                .await
+                .unwrap();
+            owned.state.encoder_complete.store(false, Ordering::SeqCst);
+            owned.state.capture_task = Some(tokio::spawn(async move {
+                let _ = wait.await;
+                Ok(())
+            }));
+            owned.attachment.as_mut().unwrap().startup = Some(tokio::spawn(async move {
+                let _ = attach_wait.await;
+                Err("terminal attach".into())
+            }));
+            owned.read_job = Some(tokio::spawn(async move {
+                let _ = read_wait.await;
+                Ok(vec![0x1a, 0x45, 0xdf, 0xa3])
+            }));
+        }
+        disconnect_recording_fixture(&f).await;
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            actions.settle_terminal_recording(
+                &f.page.client,
+                &terminal_recording_proof(&f).unwrap().0
+            )
+        )
+        .await
+        .is_err());
+        {
+            let ledger = actions.recording.lock().await;
+            let owned = ledger.current.as_ref().unwrap();
+            assert!(owned.state.capture_task.is_some());
+            assert!(owned.attachment.as_ref().unwrap().startup.is_some());
+            assert!(owned.read_job.is_some());
+            assert!(owned.directory.path.exists());
+        }
+        release.send(()).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            actions.settle_terminal_recording(
+                &f.page.client,
+                &terminal_recording_proof(&f).unwrap().0
+            )
+        )
+        .await
+        .is_err());
+        attach_release.send(()).unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            actions.settle_terminal_recording(
+                &f.page.client,
+                &terminal_recording_proof(&f).unwrap().0
+            )
+        )
+        .await
+        .is_err());
+        assert!(actions
+            .recording
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .unwrap()
+            .read_job
+            .is_some());
+        read_release.send(()).unwrap();
+        // A valid file and joined synthetic task cannot substitute for child wait.
+        assert_eq!(
+            actions
+                .settle_terminal_recording(&f.page.client, &terminal_recording_proof(&f).unwrap().0)
+                .await,
+            Err(ProtocolError::CleanupFailed)
+        );
+        let ledger = actions.recording.lock().await;
+        let owned = ledger.current.as_ref().unwrap();
+        assert!(owned.bytes.is_some());
+        assert!(!owned.cleanup_complete.load(Ordering::SeqCst));
+        assert!(owned.reservation.is_some());
+    }
+    #[tokio::test]
+    async fn recorder_cancelled_attach_retains_ack_and_detaches_exact_session() {
+        let f = fixture("normal").await;
+        enroll_recording_fixture(&f.page).await;
+        let reservation = f
+            .page
+            .targets
+            .reserve_auxiliary_attachment("scope", "target", "page")
+            .unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let mut attachment = RecordingAttachment {
+            client: f.page.client.clone(),
+            reservation,
+            startup: Some(tokio::spawn(async move {
+                let _ = wait.await;
+                Ok("recorder".to_owned())
+            })),
+            session: None,
+            detached: Arc::new(AtomicBool::new(false)),
+            acknowledged_cleanup: HashSet::new(),
+            terminal_complete: false,
+            cleanup_failed: false,
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), attachment.settle())
+                .await
+                .is_err()
+        );
+        assert!(attachment.startup.is_some());
+        release.send(()).unwrap();
+        assert!(attachment.settle().await);
+        assert!(attachment.startup.is_none());
+        let calls = f.log.lock().unwrap().clone();
+        let detaches = calls
+            .iter()
+            .filter(|v| v["method"] == "Target.detachFromTarget")
+            .collect::<Vec<_>>();
+        assert_eq!(detaches.len(), 1);
+        assert_eq!(detaches[0]["params"]["sessionId"], "recorder");
+        assert!(f.page.targets.protected_read_barrier().is_err()); // quarantine remains
+    }
+    #[tokio::test]
+    async fn recorder_unknown_attach_is_not_cleaned_by_empty_candidate_list() {
+        let f = fixture("normal").await;
+        enroll_recording_fixture(&f.page).await;
+        let reservation = f
+            .page
+            .targets
+            .reserve_auxiliary_attachment("scope", "target", "page")
+            .unwrap();
+        let mut attachment = RecordingAttachment {
+            client: f.page.client.clone(),
+            reservation,
+            startup: Some(tokio::spawn(async {
+                Err("synthetic unknown ACK".to_owned())
+            })),
+            session: None,
+            detached: Arc::new(AtomicBool::new(false)),
+            acknowledged_cleanup: HashSet::new(),
+            terminal_complete: false,
+            cleanup_failed: false,
+        };
+        assert!(!attachment.settle().await);
+        assert!(attachment.startup.is_none());
+        assert!(!attachment.settle().await); // terminal handle was consumed, not polled twice
+        assert!(f.log.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn recorder_settlement_drains_owned_candidates_before_completing_exact_ack() {
+        let f = fixture("normal").await;
+        enroll_recording_fixture(&f.page).await;
+        let mut reservation = f
+            .page
+            .targets
+            .reserve_auxiliary_attachment("scope", "target", "page")
+            .unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            f.page
+                .targets
+                .classify_auxiliary_attachment("target", "uncertain")
+        )
+        .await
+        .is_err());
+        reservation.quarantine();
+        assert!(reservation.claim("recorder").is_err());
+        let mut attachment = RecordingAttachment {
+            client: f.page.client.clone(),
+            reservation,
+            startup: None,
+            session: Some("recorder".into()),
+            detached: Arc::new(AtomicBool::new(true)),
+            acknowledged_cleanup: HashSet::new(),
+            terminal_complete: false,
+            cleanup_failed: false,
+        };
+        assert!(attachment.settle().await);
+        assert!(attachment.settle().await);
+        let calls = f.log.lock().unwrap().clone();
+        let detaches = calls
+            .iter()
+            .filter(|v| v["method"] == "Target.detachFromTarget")
+            .collect::<Vec<_>>();
+        assert_eq!(detaches.len(), 1);
+        assert_eq!(detaches[0]["params"]["sessionId"], "uncertain");
+        assert!(f.page.targets.protected_read_barrier().is_err());
+    }
+    #[tokio::test]
+    async fn recorder_detach_ack_settles_reservation_without_touching_primary() {
+        let f = fixture("normal").await;
+        enroll_recording_fixture(&f.page).await;
+        let mut reservation = f
+            .page
+            .targets
+            .reserve_auxiliary_attachment("scope", "target", "page")
+            .unwrap();
+        reservation.claim("recorder").unwrap();
+        let mut attachment = RecordingAttachment {
+            client: f.page.client.clone(),
+            reservation,
+            startup: None,
+            session: Some("recorder".into()),
+            detached: Arc::new(AtomicBool::new(true)),
+            acknowledged_cleanup: HashSet::new(),
+            terminal_complete: false,
+            cleanup_failed: false,
+        };
+        assert!(attachment.settle().await);
+        assert!(f.log.lock().unwrap().is_empty());
+        assert!(f.page.targets.protected_read_barrier().is_ok());
+    }
+    #[tokio::test]
+    async fn recording_cancelled_close_retains_join_and_artifact_ownership() {
+        let f = fixture("normal").await;
+        let actions = ClientActions::default();
+        seed_recording(&actions, &f, 1, Some(&[0x1a, 0x45, 0xdf, 0xa3]), false).await;
+        let (release, wait) = tokio::sync::oneshot::channel();
+        actions
+            .recording
+            .lock()
+            .await
+            .current
+            .as_mut()
+            .unwrap()
+            .state
+            .capture_task = Some(tokio::spawn(async move {
+            let _ = wait.await;
+            Ok(())
+        }));
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            actions.recording_page_closing("scope", &f.blobs)
+        )
+        .await
+        .is_err());
+        assert!(actions
+            .recording
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .unwrap()
+            .state
+            .capture_task
+            .is_some());
+        release.send(()).unwrap();
+        actions
+            .recording_page_closing("scope", &f.blobs)
+            .await
+            .unwrap();
+        assert_eq!(actions.recording.lock().await.finished.len(), 1);
+        actions.abandon_recording().await.unwrap();
+    }
+    #[tokio::test]
+    async fn immediate_click_replacement_preserves_original_success_semantics() {
+        let f = fixture("check-immediate-replacement").await;
+        let node = Resolved {
+            object: "exact-node".into(),
+            session: "page".into(),
+            binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
+        };
+        let d = Dispatch::default();
+        set_checked(&f.context(), &d, &node, true).await.unwrap();
+        assert!(d.sent.load(Ordering::SeqCst));
+        assert!(!d.checked_replaced.load(Ordering::SeqCst));
+    }
+    #[test]
+    fn checked_poll_admission_reserves_completed_read_latency_without_extending_deadline() {
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(35);
+        assert!(!checked_poll_fits(
+            now,
+            deadline,
+            Duration::from_millis(20),
+            Duration::from_millis(25)
+        ));
+        assert!(checked_poll_fits(
+            now,
+            deadline,
+            Duration::from_millis(20),
+            Duration::from_millis(10)
+        ));
+        assert!(!checked_poll_fits(
+            deadline,
+            deadline,
+            Duration::ZERO,
+            Duration::ZERO
+        ));
+        let d = Dispatch::default();
+        d.mark();
+        let failure = d.failure(ProtocolError::DeadlineExceeded);
+        assert_eq!(failure.effects, Effects::Unknown);
+        assert_eq!(failure.reason, None);
+        assert_eq!(checked_unchanged(&d), Err(ProtocolError::NotActionable));
+        assert_eq!(
+            d.failure(ProtocolError::NotActionable).effects,
+            Effects::Completed
+        );
+    }
+    #[tokio::test]
+    async fn checked_postconditions_distinguish_replacement_from_unchanged() {
+        for (mode, reason) in [
+            ("check-replaced", ActionReason::ControlReplacedAfterClick),
+            ("check-unchanged", ActionReason::CheckedStateUnchanged),
+        ] {
+            let mut f = fixture(mode).await;
+            f.op.deadline = Instant::now() + Duration::from_millis(350);
+            let node = Resolved {
+                object: "exact-node".into(),
+                session: "page".into(),
+                binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
+            };
+            let d = Dispatch::default();
+            let error = set_checked(&f.context(), &d, &node, true)
+                .await
+                .unwrap_err();
+            let failure = d.failure(error);
+            assert_eq!(failure.error, ProtocolError::NotActionable);
+            assert_eq!(failure.reason, Some(reason));
+            assert_eq!(failure.effects, Effects::Completed);
+            d.cleanup.store(true, Ordering::SeqCst);
+            assert_eq!(
+                d.failure(ProtocolError::NotActionable).effects,
+                Effects::Unknown
+            );
+            assert_eq!(
+                f.inputs()
+                    .iter()
+                    .filter(|v| v["params"]["type"] == "mouseReleased")
+                    .count(),
+                1
+            );
+        }
+    }
+    #[tokio::test]
+    async fn checked_inflight_postcondition_timeout_keeps_unknown_outcome() {
+        let mut f = fixture("check-read-stalled").await;
+        f.op.deadline = Instant::now() + Duration::from_millis(350);
+        let node = Resolved {
+            object: "exact-node".into(),
+            session: "page".into(),
+            binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
+        };
+        let d = Dispatch::default();
+        let error = set_checked(&f.context(), &d, &node, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error, ProtocolError::DeadlineExceeded);
+        let failure = d.failure(error);
+        assert_eq!(failure.effects, Effects::Unknown);
+        assert_eq!(failure.reason, None);
+        assert_eq!(
+            f.inputs()
+                .iter()
+                .filter(|request| request["params"]["type"] == "mouseReleased")
+                .count(),
+            1
+        );
+    }
     #[tokio::test]
     async fn obscured_action_exposes_only_closed_interception_reason() {
         let mut f = fixture("intercepted").await;
@@ -2195,23 +3801,178 @@ mod tests {
             blobs.activate_scope(BlobScope {generation:1, identity_scope:page.identity_scope.clone()}).unwrap();
             let state = ClientPageState::new(page.identity_scope.clone(), "fixture-context".into());
             let actions = ClientActions::default();
+            let geometry = action_fixture_geometry(&page,&operation).await?;
             for (selector, action) in [
                 ("#text", json!({"kind":"fill","value":"native synthetic","sensitive":false})),
                 ("#pick", json!({"kind":"selectOption","value":{"label":"Beta"}})),
                 ("#check", json!({"kind":"check"})),
                 ("#button", json!({"kind":"doubleTap"})),
             ] {
-                actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
+                actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
             }
             let value = evaluate_on(&browser.client,&session,"[document.querySelector('#text').value,document.querySelector('#pick').value,document.querySelector('#check').checked,document.querySelector('#button').dataset.clicked]").await?;
             assert_eq!(value,json!(["native synthetic","b",true,"2"]));
-            actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
+            actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
             evaluate_on(&browser.client,&session,"document.querySelector('#button').remove(); true").await?;
-            assert!(actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
+            assert!(actions.execute(ActionContext {page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
             actions.cleanup().await.map_err(|_|"cleanup failed")?;
             Ok::<(),String>(())
         }.await;
         browser.close().await.unwrap();
+        result.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires hosted Chromium; transformed nested-frame input and ancestor occlusion"]
+    async fn chromium_nested_frame_action_projects_input_and_checks_exact_ancestor_occlusion() {
+        use super::super::browser::{evaluate_on, BrowserManager};
+        let mut browser = BrowserManager::launch(Default::default(), None)
+            .await
+            .unwrap();
+        let result=async {
+            let session=browser.active_session_id()?.to_owned();
+            evaluate_on(&browser.client,&session,r#"(async()=>{
+              document.body.style.margin='0';const outer=document.createElement('iframe');
+              outer.id='outer';outer.style.cssText='position:absolute;left:100px;top:80px;width:300px;height:200px;border:5px solid black;padding:3px;transform:scale(1.25);transform-origin:0 0';
+              const loaded=new Promise(r=>outer.onload=r);outer.srcdoc='<body style="margin:0"></body>';document.body.append(outer);await loaded;
+              const inner=outer.contentDocument.createElement('iframe');inner.id='inner';inner.style.cssText='position:absolute;left:20px;top:30px;width:160px;height:100px;border:4px solid black;transform:scale(.75);transform-origin:0 0';
+              const ready=new Promise(r=>inner.onload=r);inner.srcdoc='<body style="margin:0"><button style="position:absolute;left:12px;top:15px;width:80px;height:30px" onclick="this.dataset.clicks=Number(this.dataset.clicks||0)+1">Nested</button></body>';
+              outer.contentDocument.body.append(inner);await ready;return true;
+            })()"#).await?;
+            let gate=Arc::new(ExecutionGate::default());
+            let page=BrowserExecutionLease{client:browser.client.clone(),page_session_id:session.clone(),target_id:browser.active_target_id()?.into(),identity_scope:"nested-actions".into(),permit:gate.enter(false).unwrap(),targets:ClientTargets::new("fixture".into(),"nested-actions".into())};
+            let (_cancel,cancellation)=tokio::sync::watch::channel(CancelSignal::None);
+            let mut operation=OperationLease{is_callback:false,generation:1,sequence:1,deadline:Instant::now()+Duration::from_secs(20),cancellation};
+            let inventory=super::super::client_observation::enumerate_frames(&page.client,&session,&HashMap::new(),&operation).await.map_err(|_|"Frame inventory failed")?;
+            assert_eq!(inventory.len(),3);
+            let frame=inventory.iter().find(|f|f.parent_frame_id.as_ref().is_some_and(|parent|inventory.iter().any(|p|p.binding.frame==*parent && p.parent_frame_id.is_some()))).ok_or("Nested frame missing")?;
+            let world=page.client.send_command("Page.createIsolatedWorld",Some(json!({"frameId":frame.binding.frame,"worldName":"native-action-fixture"})),Some(&frame.binding.session)).await?;
+            let object=page.client.send_command("Runtime.evaluate",Some(json!({"contextId":world["executionContextId"],"expression":"document.querySelector('button')"})),Some(&frame.binding.session)).await?;
+            let object_id=object["result"]["objectId"].as_str().ok_or("Button handle missing")?;
+            let described=page.client.send_command("DOM.describeNode",Some(json!({"objectId":object_id})),Some(&frame.binding.session)).await?;
+            page.client.send_command("Runtime.releaseObject",Some(json!({"objectId":object_id})),Some(&frame.binding.session)).await?;
+            let backend=described["node"]["backendNodeId"].as_i64().ok_or("Button backend missing")?;
+            let mut refs=RefMap::new();let mut binding=frame.binding.clone();binding.actionable=true;
+            let id=format!("@{}",refs.bind_exact(backend,"button","Nested",binding));
+            let geometry=GeometrySnapshot::capture(&page.client,&session,&inventory,&operation).await.map_err(|_|"Geometry proof failed")?;
+            let state=ClientPageState::new(page.identity_scope.clone(),"fixture".into());let blobs=BlobStore::new(BlobLimits::default()).unwrap();
+            blobs.activate_scope(BlobScope{generation:1,identity_scope:page.identity_scope.clone()}).unwrap();
+            let sessions=HashMap::new();let actions=ClientActions::default();
+            let args=json!({"identityScope":page.identity_scope,"ref":{"id":id,"revision":"1"},"action":{"kind":"tap"}});
+            actions.execute(ActionContext{page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.map_err(|e|format!("Nested action failed: {:?}",e.error))?;
+            assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
+            evaluate_on(&page.client,&session,"const cover=document.createElement('div');cover.style.cssText='position:fixed;inset:0;z-index:999;background:red';document.body.append(cover);true").await?;
+            operation.deadline=Instant::now()+Duration::from_secs(2);
+            let error=actions.execute(ActionContext{page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.unwrap_err();
+            assert_eq!(error.error,ProtocolError::NotActionable);assert_eq!(error.reason,Some(ActionReason::InterceptedPointer));
+            assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
+            actions.cleanup().await.map_err(|_|"Action cleanup failed")?;Ok::<(),String>(())
+        }.await;
+        browser.close().await.unwrap();
+        result.unwrap();
+    }
+    async fn action_fixture_geometry(
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+    ) -> Result<GeometrySnapshot, String> {
+        let frames = super::super::client_observation::enumerate_frames(
+            &page.client,
+            &page.page_session_id,
+            &HashMap::new(),
+            operation,
+        )
+        .await
+        .map_err(|_| "Fixture frame inventory failed")?;
+        GeometrySnapshot::capture(&page.client, &page.page_session_id, &frames, operation)
+            .await
+            .map_err(|_| "Fixture geometry failed".to_owned())
+    }
+    #[tokio::test]
+    #[ignore = "requires real Chromium and ffmpeg/ffprobe in hosted CI; no mock encoding"]
+    async fn chromium_recording_attempt_segments_first_frame_size_and_scope_rotation() {
+        use super::super::browser::{evaluate_on, BrowserManager};
+        async fn page_lease(browser: &BrowserManager, identity: &str) -> BrowserExecutionLease {
+            let gate = Arc::new(ExecutionGate::default());
+            let page = BrowserExecutionLease {
+                client: browser.client.clone(),
+                page_session_id: browser.active_session_id().unwrap().into(),
+                target_id: browser.active_target_id().unwrap().into(),
+                identity_scope: identity.into(),
+                permit: gate.enter(false).unwrap(),
+                targets: ClientTargets::new(format!("context-{identity}"), identity.into()),
+            };
+            enroll_recording_fixture(&page).await;
+            page
+        }
+        let mut first = BrowserManager::launch(Default::default(), None)
+            .await
+            .unwrap();
+        let mut second = BrowserManager::launch(Default::default(), None)
+            .await
+            .unwrap();
+        let actions = ClientActions::default();
+        let result = async {
+            let first_page = page_lease(&first, "record-first").await;
+            let second_page = page_lease(&second, "record-second").await;
+            for page in [&first_page, &second_page] {
+                evaluate_on(&page.client, &page.page_session_id, "document.documentElement.style.background='rgb(20,40,80)'; document.body.style.margin='0'; document.body.innerHTML='<div style=\"width:100vw;height:100vh;background:rgb(20,40,80)\"></div>'; true").await?;
+            }
+            let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease { is_callback:false, generation:1, sequence:1, deadline:Instant::now()+Duration::from_secs(45), cancellation };
+            let refs = RefMap::new(); let frames = HashMap::new();
+            let blobs = BlobStore::new(BlobLimits::default()).unwrap();
+            let first_state = ClientPageState::new(first_page.identity_scope.clone(), "context-first".into());
+            let second_state = ClientPageState::new(second_page.identity_scope.clone(), "context-second".into());
+            let first_scope = BlobScope {generation:1,identity_scope:first_page.identity_scope.clone()};
+            let second_scope = BlobScope {generation:1,identity_scope:second_page.identity_scope.clone()};
+            blobs.activate_scope(first_scope.clone()).unwrap();
+            let first_geometry=action_fixture_geometry(&first_page,&operation).await?;
+            let second_geometry=action_fixture_geometry(&second_page,&operation).await?;
+            let first_context = || ActionContext {page:&first_page,operation:&operation,page_state:&first_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&first_geometry};
+            actions.execute(first_context(), "recording.start", &json!({"identityScope":first_page.identity_scope,"size":{"width":320,"height":200},"quality":70})).await.map_err(|e|format!("record start {:?}",e.error))?;
+            actions.recording_page_closing(&first_page.identity_scope, &blobs).await.map_err(|e|format!("record close {e:?}"))?;
+            blobs.revoke_scope(&first_scope).unwrap();
+            blobs.activate_scope(second_scope.clone()).unwrap();
+            let second_context = || ActionContext {page:&second_page,operation:&operation,page_state:&second_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&second_geometry};
+            actions.recording_page_opened(second_context()).await.map_err(|e|format!("record reopen {:?}",e.error))?;
+            let output = actions.execute(second_context(), "recording.stop", &json!({"identityScope":second_page.identity_scope})).await.map_err(|e|format!("record stop {:?}",e.error))?;
+            let segments = output["segments"].as_array().ok_or("missing segments")?;
+            assert_eq!(segments.len(), 2);
+            let first_instant = chrono::DateTime::parse_from_rfc3339(segments[0]["startedAt"].as_str().unwrap()).unwrap();
+            let second_instant = chrono::DateTime::parse_from_rfc3339(segments[1]["startedAt"].as_str().unwrap()).unwrap();
+            assert!(first_instant <= second_instant);
+            let directory = OwnedDirectory::create().map_err(|_|"test directory")?;
+            for (index, segment) in segments.iter().enumerate() {
+                assert_eq!(segment["identityScope"], second_page.identity_scope);
+                let handle = segment["handle"].as_str().unwrap();
+                let size = segment["size"].as_u64().unwrap() as usize;
+                let mut bytes = Vec::new();
+                while bytes.len() < size { bytes.extend(blobs.read(&second_scope, handle, bytes.len(), (size-bytes.len()).min(super::super::client_blobs::MAX_CHUNK_BYTES)).unwrap()); }
+                blobs.release(&second_scope, handle).unwrap();
+                let video = directory.path.join(format!("segment-{index}.webm"));
+                let image_path = directory.path.join(format!("segment-{index}.png"));
+                tokio::fs::write(&video, bytes).await.map_err(|_|"test video write")?;
+                let probe = tokio::process::Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries","stream=codec_name,width,height","-of","json"]).arg(&video).output().await.map_err(|_|"ffprobe required")?;
+                assert!(probe.status.success());
+                let metadata: Value = serde_json::from_slice(&probe.stdout).unwrap();
+                assert_eq!(metadata["streams"][0]["codec_name"], "vp8");
+                assert_eq!(metadata["streams"][0]["width"], 320);
+                assert_eq!(metadata["streams"][0]["height"], 200);
+                let decoded = tokio::process::Command::new("ffmpeg").args(["-v","error","-i"]).arg(&video).args(["-frames:v","1"]).arg(&image_path).output().await.map_err(|_|"ffmpeg required")?;
+                assert!(decoded.status.success());
+                let image = image::open(&image_path).unwrap().to_rgb8();
+                let pixel = image.get_pixel(160,100).0;
+                for (actual, expected) in pixel.into_iter().zip([20u8,40,80]) { assert!(actual.abs_diff(expected)<20, "first frame must not be blank"); }
+            }
+            directory.close().map_err(|_|"test artifact cleanup")?;
+            assert_eq!(actions.execute(second_context(), "recording.stop", &json!({"identityScope":second_page.identity_scope})).await.map_err(|_|"second collection")?["segments"], json!([]));
+            Ok::<(),String>(())
+        }.await;
+        let cleanup = actions.cleanup().await;
+        let first_closed = first.close().await;
+        let second_closed = second.close().await;
+        cleanup.unwrap();
+        first_closed.unwrap();
+        second_closed.unwrap();
         result.unwrap();
     }
 }

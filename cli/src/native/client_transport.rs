@@ -48,14 +48,46 @@ pub trait ClientExecutor: Send + Sync + 'static {
     fn shutdown(&self) -> impl std::future::Future<Output = Result<(), ProtocolError>> + Send;
 }
 
-/// Reliable bounded event lane. Engine handles and callback policy stay out
-/// of this type; overflow revokes the scope rather than losing a control event.
+const MAX_STAGED_EVENTS: usize = 64;
+const MAX_STAGED_BYTES: usize = 4 * MAX_FRAME_BYTES;
+#[derive(Default)]
+struct EventOrder {
+    sequence: u64,
+    barriers: std::collections::HashMap<(u64, u64), std::sync::Arc<EventBarrier>>,
+    scope_gates: std::collections::HashMap<(u64, String), std::sync::Weak<ScopeEmissionGate>>,
+    staged_count: usize,
+    staged_bytes: usize,
+}
+struct ScopeEmissionGate {
+    closed: std::sync::atomic::AtomicBool,
+}
+struct EventBarrier {
+    key: (u64, u64),
+    identity_scope: String,
+    scope_gate: std::sync::Arc<ScopeEmissionGate>,
+    deadline: std::time::Instant,
+    state: std::sync::Mutex<EventBarrierState>,
+    changed: tokio::sync::Notify,
+}
+enum EventBarrierState {
+    Holding(Vec<StagedEvent>),
+    Live,
+    Discarded,
+}
+struct StagedEvent {
+    message: ServerMessage,
+    bytes: usize,
+    decision_deadline: Option<std::time::Instant>,
+}
+/// Reliable bounded event lane. A replacement producer receives a distinct
+/// operation-bound clone; old callback producers retain their live clone.
 #[derive(Clone)]
 pub struct ClientEventSink {
     sender: mpsc::Sender<ServerMessage>,
     broker: std::sync::Arc<ClientSession>,
-    sequence: std::sync::Arc<std::sync::Mutex<u64>>,
+    sequence: std::sync::Arc<std::sync::Mutex<EventOrder>>,
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    barrier: Option<std::sync::Arc<EventBarrier>>,
 }
 impl ClientEventSink {
     #[cfg(test)]
@@ -67,11 +99,208 @@ impl ClientEventSink {
             Self {
                 sender,
                 broker,
-                sequence: std::sync::Arc::new(std::sync::Mutex::new(0)),
+                sequence: Default::default(),
                 open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                barrier: None,
             },
             receiver,
         )
+    }
+    /// Native lifecycle-only. No waiting task or action lock is held by the
+    /// barrier: the actual result writer performs publication after flush.
+    pub(crate) fn stage_until_result(
+        &self,
+        operation: &OperationLease,
+        identity_scope: &str,
+    ) -> Result<Self, ProtocolError> {
+        self.check_open()?;
+        if identity_scope.is_empty()
+            || identity_scope.len() > 256
+            || identity_scope.chars().any(char::is_control)
+        {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        if operation.is_callback || operation.sequence == 0 {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        if *operation.cancellation.borrow() != super::client_session::CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if self.broker.health()?.0 != operation.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        let mut order = self
+            .sequence
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let key = (operation.generation, operation.sequence);
+        if order.barriers.contains_key(&key) {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        if order.barriers.len() >= 64 {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        order.scope_gates.retain(|_, gate| gate.strong_count() != 0);
+        let scope_key = (operation.generation, identity_scope.to_owned());
+        let scope_gate = match order
+            .scope_gates
+            .get(&scope_key)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            Some(gate) => {
+                if gate.closed.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                gate
+            }
+            None => {
+                if order.scope_gates.len() >= 64 {
+                    return Err(ProtocolError::CapacityExceeded);
+                }
+                let gate = std::sync::Arc::new(ScopeEmissionGate {
+                    closed: std::sync::atomic::AtomicBool::new(false),
+                });
+                order
+                    .scope_gates
+                    .insert(scope_key, std::sync::Arc::downgrade(&gate));
+                gate
+            }
+        };
+        let barrier = std::sync::Arc::new(EventBarrier {
+            key,
+            identity_scope: identity_scope.into(),
+            scope_gate,
+            deadline: operation.deadline,
+            state: std::sync::Mutex::new(EventBarrierState::Holding(Vec::new())),
+            changed: tokio::sync::Notify::new(),
+        });
+        order.barriers.insert(key, barrier.clone());
+        Ok(Self {
+            barrier: Some(barrier),
+            ..self.clone()
+        })
+    }
+    pub(crate) fn validate_stage(
+        &self,
+        source: &Self,
+        operation: &OperationLease,
+        identity_scope: &str,
+    ) -> Result<(), ProtocolError> {
+        let generation = self.check_open()?;
+        if !std::sync::Arc::ptr_eq(&self.sequence, &source.sequence)
+            || !std::sync::Arc::ptr_eq(&self.broker, &source.broker)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let barrier = self.barrier.as_ref().ok_or(ProtocolError::StaleScope)?;
+        if generation != barrier.key.0
+            || barrier.key != (operation.generation, operation.sequence)
+            || barrier.identity_scope != identity_scope
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if *operation.cancellation.borrow() != super::client_session::CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= barrier.deadline
+            || std::time::Instant::now() >= operation.deadline
+        {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if !matches!(
+            *barrier
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?,
+            EventBarrierState::Holding(_)
+        ) {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    pub(crate) fn is_publication_pending(&self) -> Result<bool, ProtocolError> {
+        let generation = self.check_open()?;
+        let Some(barrier) = &self.barrier else {
+            return Ok(false);
+        };
+        if barrier.key.0 != generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        match &*barrier
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+        {
+            EventBarrierState::Holding(_) => {
+                if std::time::Instant::now() >= barrier.deadline {
+                    return Err(ProtocolError::DeadlineExceeded);
+                }
+                Ok(true)
+            }
+            EventBarrierState::Live => Ok(false),
+            EventBarrierState::Discarded => Err(ProtocolError::StaleScope),
+        }
+    }
+    /// Called before acquiring any callback/UI admission lease. Native event
+    /// bytes and decision tokens remain retained by the caller while waiting.
+    pub(crate) async fn wait_publication(
+        &self,
+        deadline: std::time::Instant,
+        mut cancellation: tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+    ) -> Result<(), ProtocolError> {
+        loop {
+            if *cancellation.borrow() != super::client_session::CancelSignal::None {
+                return Err(ProtocolError::Cancelled);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            let Some(barrier) = &self.barrier else {
+                self.check_open()?;
+                return Ok(());
+            };
+            let changed = barrier.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if !self.is_publication_pending()? {
+                return Ok(());
+            }
+            tokio::select! {
+                biased;
+                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                _ = tokio::time::sleep_until(std::cmp::min(deadline,barrier.deadline).into()) => return Err(ProtocolError::DeadlineExceeded),
+                _ = changed => {},
+            }
+        }
+    }
+    fn check_open(&self) -> Result<u64, ProtocolError> {
+        if !self.open.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let (generation, health) = self.broker.health()?;
+        if health != ScopeState::Usable {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        Ok(generation)
+    }
+    fn enqueue_event(
+        &self,
+        order: &mut EventOrder,
+        mut message: ServerMessage,
+    ) -> Result<(), ProtocolError> {
+        if order.sequence >= MAX_SAFE_SEQUENCE {
+            return Err(ProtocolError::IdentifierExhausted);
+        }
+        order.sequence += 1;
+        if let ServerMessage::Event { sequence, .. } = &mut message {
+            *sequence = order.sequence;
+        }
+        self.sender
+            .try_send(message)
+            .map_err(|_| ProtocolError::CapacityExceeded)
     }
     pub fn emit(
         &self,
@@ -79,48 +308,264 @@ impl ClientEventSink {
         payload: serde_json::Value,
         decision: Option<DecisionNotice>,
     ) -> Result<(), ProtocolError> {
-        use std::sync::atomic::Ordering;
-        if !self.open.load(Ordering::Acquire) {
-            return Err(ProtocolError::ScopeUnavailable);
+        let generation = self.check_open()?;
+        if let Some(barrier) = &self.barrier {
+            if generation != barrier.key.0 {
+                return Err(ProtocolError::StaleGeneration);
+            }
+            if payload
+                .get("identityScope")
+                .and_then(serde_json::Value::as_str)
+                != Some(barrier.identity_scope.as_str())
+            {
+                return Err(ProtocolError::StaleScope);
+            }
         }
-        let (generation, health) = self.broker.health()?;
-        if health != ScopeState::Usable {
-            return Err(ProtocolError::ScopeUnavailable);
-        }
-        // Allocate and enqueue under one short lock so concurrent native
-        // event producers cannot publish sequence n+1 before sequence n.
-        let mut counter = self
-            .sequence
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if !self.open.load(Ordering::Acquire) {
-            return Err(ProtocolError::ScopeUnavailable);
-        }
-        if *counter >= MAX_SAFE_SEQUENCE {
-            let _ = self.broker.quarantine();
-            return Err(ProtocolError::IdentifierExhausted);
-        }
-        *counter += 1;
-        let sequence = *counter;
+        let decision_deadline = decision.as_ref().map(|notice| {
+            std::time::Instant::now() + std::time::Duration::from_millis(notice.timeout_ms)
+        });
+        // Size against the largest sequence representation, allocated only at
+        // real enqueue so staged events cannot invert live event ordering.
         let message = ServerMessage::Event {
             generation,
-            sequence,
+            sequence: MAX_SAFE_SEQUENCE,
             event,
             payload,
             decision,
         };
-        if serde_json::to_vec(&message)
+        let bytes = serde_json::to_vec(&message)
             .map_err(|_| ProtocolError::InvalidFrame)?
-            .len()
-            > MAX_FRAME_BYTES
-        {
+            .len();
+        let result = (|| {
+            if bytes > MAX_FRAME_BYTES {
+                return Err(ProtocolError::CapacityExceeded);
+            }
+            let mut order = self
+                .sequence
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            self.check_open()?;
+            if let Some(barrier) = &self.barrier {
+                if barrier
+                    .scope_gate
+                    .closed
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let mut state = barrier
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                match &mut *state {
+                    EventBarrierState::Discarded => return Err(ProtocolError::StaleScope),
+                    EventBarrierState::Holding(events) => {
+                        if std::time::Instant::now() >= barrier.deadline {
+                            return Err(ProtocolError::DeadlineExceeded);
+                        }
+                        if order.staged_count >= MAX_STAGED_EVENTS
+                            || bytes > MAX_STAGED_BYTES.saturating_sub(order.staged_bytes)
+                        {
+                            return Err(ProtocolError::CapacityExceeded);
+                        }
+                        order.staged_count += 1;
+                        order.staged_bytes += bytes;
+                        events.push(StagedEvent {
+                            message,
+                            bytes,
+                            decision_deadline,
+                        });
+                        return Ok(());
+                    }
+                    EventBarrierState::Live => {}
+                }
+            }
+            self.enqueue_event(&mut order, message)
+        })();
+        if result.is_err() && result != Err(ProtocolError::StaleScope) {
             let _ = self.broker.quarantine();
-            return Err(ProtocolError::CapacityExceeded);
         }
-        self.sender.try_send(message).map_err(|_| {
+        result
+    }
+    pub(crate) fn same_client(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.broker, &other.broker)
+            && std::sync::Arc::ptr_eq(&self.sequence, &other.sequence)
+    }
+    /// Caller has stopped enrollment intake, revoked exact-scope decision
+    /// admission and joined every asynchronous event producer. This proves only
+    /// callback authority retirement, not file/encoder/browser cleanup.
+    pub(crate) fn retire_callbacks_after_terminal_drain(
+        &self,
+        proof: &super::client_enrollment::NativeTerminalProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check_event_sink(self)?;
+        proof.check_targets(proof.targets())?;
+        self.retire_scope_callbacks(proof.generation(), &proof.targets().identity_scope)
+    }
+    fn retire_scope_callbacks(&self, generation: u64, scope: &str) -> Result<(), ProtocolError> {
+        let barrier = self.barrier.as_ref().ok_or(ProtocolError::StaleScope)?;
+        if barrier.key.0 != generation || barrier.identity_scope != scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        let result = (|| {
+            let mut order = self
+                .sequence
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if self.check_open()? != generation {
+                return Err(ProtocolError::StaleGeneration);
+            }
+            if barrier
+                .scope_gate
+                .closed
+                .load(std::sync::atomic::Ordering::Acquire)
+                || order
+                    .barriers
+                    .values()
+                    .any(|pending| std::sync::Arc::ptr_eq(&pending.scope_gate, &barrier.scope_gate))
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            if !matches!(
+                *barrier
+                    .state
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?,
+                EventBarrierState::Live
+            ) {
+                return Err(ProtocolError::StaleScope);
+            }
+            // Seal before enqueue. Queue failure must never reopen old producers.
+            barrier
+                .scope_gate
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            let through = order.sequence;
+            self.enqueue_event(&mut order, ServerMessage::Event {
+                generation, sequence: MAX_SAFE_SEQUENCE,
+                event: "scope.callbacks-retired".into(),
+                payload: serde_json::json!({"identityScope":scope,"throughEventSequence":through}),
+                decision: None,
+            })
+        })();
+        if result.is_err() && result != Err(ProtocolError::StaleScope) {
             let _ = self.broker.quarantine();
-            ProtocolError::CapacityExceeded
-        })
+        }
+        result
+    }
+    #[cfg(test)]
+    pub(crate) fn acknowledge_result_for_test(
+        &self,
+        message: &ServerMessage,
+    ) -> Result<(), ProtocolError> {
+        self.result_written(message)
+    }
+    /// Only called by the single writer AFTER write_all and flush succeeded.
+    fn result_written(&self, message: &ServerMessage) -> Result<(), ProtocolError> {
+        let ServerMessage::Result {
+            generation,
+            operation_seq,
+            ok,
+            data,
+            effects,
+            scope_state,
+            ..
+        } = message
+        else {
+            return Ok(());
+        };
+        let mut order = self
+            .sequence
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let Some(barrier) = order.barriers.remove(&(*generation, *operation_seq)) else {
+            return Ok(());
+        };
+        let mut state = barrier
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let EventBarrierState::Holding(events) =
+            std::mem::replace(&mut *state, EventBarrierState::Discarded)
+        else {
+            return Err(ProtocolError::StaleScope);
+        };
+        // State is already Discarded until every checked enqueue succeeds.
+        // Wake waiters on both success and every early-return failure below.
+        barrier.changed.notify_waiters();
+        order.staged_count -= events.len();
+        order.staged_bytes -= events.iter().map(|event| event.bytes).sum::<usize>();
+        if !ok || *scope_state != ScopeState::Usable || *effects != Effects::Completed {
+            return Ok(());
+        }
+        if data
+            .as_ref()
+            .and_then(|value| value.get("identityScope"))
+            .and_then(serde_json::Value::as_str)
+            != Some(barrier.identity_scope.as_str())
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.check_open()?;
+        if barrier
+            .scope_gate
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if std::time::Instant::now() >= barrier.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        for mut event in events {
+            if let Some(deadline) = event.decision_deadline {
+                let remaining = deadline
+                    .checked_duration_since(std::time::Instant::now())
+                    .ok_or(ProtocolError::DeadlineExceeded)?;
+                let millis = u64::try_from(remaining.as_millis())
+                    .map_err(|_| ProtocolError::CapacityExceeded)?;
+                if millis == 0 {
+                    return Err(ProtocolError::DeadlineExceeded);
+                }
+                if let ServerMessage::Event {
+                    decision: Some(notice),
+                    ..
+                } = &mut event.message
+                {
+                    notice.timeout_ms = millis;
+                }
+            }
+            self.enqueue_event(&mut order, event.message)?;
+        }
+        *state = EventBarrierState::Live;
+        Ok(())
+    }
+    fn expire_publications(&self) -> Result<(), ProtocolError> {
+        let order = self
+            .sequence
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if order
+            .barriers
+            .values()
+            .any(|barrier| std::time::Instant::now() >= barrier.deadline)
+        {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+    fn close_publications(&self) {
+        self.open.store(false, std::sync::atomic::Ordering::Release);
+        if let Ok(mut order) = self.sequence.lock() {
+            for (_, barrier) in order.barriers.drain() {
+                if let Ok(mut state) = barrier.state.lock() {
+                    *state = EventBarrierState::Discarded;
+                }
+                barrier.changed.notify_waiters();
+            }
+            order.staged_bytes = 0;
+            order.staged_count = 0;
+        }
     }
 }
 
@@ -227,16 +672,18 @@ where
     let (results, mut results_rx) = mpsc::channel::<ServerMessage>(64);
     let sender = Outgoing { control, results };
     let sink_open = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let event_order = std::sync::Arc::new(std::sync::Mutex::new(0));
+    let event_order = std::sync::Arc::new(std::sync::Mutex::new(EventOrder::default()));
     let sink = ClientEventSink {
         sender: sender.control.clone(),
         broker: broker.clone(),
         sequence: event_order.clone(),
         open: sink_open.clone(),
+        barrier: None,
     };
     let (drain, mut drain_requested) = tokio::sync::oneshot::channel::<()>();
     let (failed, mut failure) = tokio::sync::oneshot::channel::<()>();
     let writing_ids = outstanding.clone();
+    let writer_sink = sink.clone();
     let writer_task = tokio::spawn(async move {
         let mut control_open = true;
         let mut results_open = true;
@@ -259,7 +706,18 @@ where
                 break;
             }
             bytes.push(b'\n');
-            if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+            if !matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                    writer.write_all(&bytes).await?;
+                    writer.flush().await
+                })
+                .await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+            if writer_sink.result_written(&message).is_err() {
+                let _ = writer_sink.broker.quarantine();
                 break;
             }
             let id = match &message {
@@ -276,7 +734,8 @@ where
                 }
             }
         }
-        let _ = writer.shutdown().await;
+        writer_sink.close_publications();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), writer.shutdown()).await;
         let _ = failed.send(());
     });
     let ClientMessage::Hello {
@@ -332,6 +791,7 @@ where
                 _ = &mut failure => break,
                 _ = timer.tick() => {
                     let _ = broker.expire_decisions();
+                    if sink.expire_publications().is_err() { let _ = broker.quarantine(); break; }
                     if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { break; }
                     for (version,identity_scope) in broker.take_released_registry_events(16).unwrap_or_default() {
                         let mut payload=serde_json::json!({ "registryVersion": version });
@@ -475,10 +935,7 @@ where
         }
     }
     // Seal before cancelling native work. EOF never proves resource teardown.
-    {
-        let _order = event_order.lock().ok();
-        sink_open.store(false, std::sync::atomic::Ordering::Release);
-    }
+    sink.close_publications();
     let _ = broker.quarantine();
     operations.abort_all();
     // Aborting schedules cancellation; joining proves execution guards dropped.
@@ -751,6 +1208,616 @@ fn respond<E: ClientExecutor>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn publication_operation() -> (
+        tokio::sync::watch::Sender<super::super::client_session::CancelSignal>,
+        OperationLease,
+    ) {
+        let (sender, cancellation) =
+            tokio::sync::watch::channel(super::super::client_session::CancelSignal::None);
+        (
+            sender,
+            OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 7,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                cancellation,
+            },
+        )
+    }
+    fn publication_result(ok: bool) -> ServerMessage {
+        result_message(
+            "request".into(),
+            1,
+            7,
+            NativeOutcome {
+                result: if ok {
+                    Ok(serde_json::json!({"identityScope":"same-scope"}))
+                } else {
+                    Err(ProtocolError::Cancelled)
+                },
+                effects: if ok {
+                    Effects::Completed
+                } else {
+                    Effects::NotDispatched
+                },
+            },
+            ScopeState::Usable,
+        )
+    }
+    fn live_scope_sink(sink: &ClientEventSink, sequence: u64, scope: &str) -> ClientEventSink {
+        let (_sender, mut operation) = publication_operation();
+        operation.sequence = sequence;
+        let staged = sink.stage_until_result(&operation, scope).unwrap();
+        sink.result_written(&result_message(
+            "test".into(),
+            1,
+            sequence,
+            NativeOutcome {
+                result: Ok(serde_json::json!({"identityScope":scope})),
+                effects: Effects::Completed,
+            },
+            ScopeState::Usable,
+        ))
+        .unwrap();
+        staged
+    }
+    #[test]
+    fn terminal_callback_cut_fences_all_same_scope_clones_but_not_sibling() {
+        let (root, mut events) =
+            ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let old = live_scope_sink(&root, 7, "old");
+        let restarted = live_scope_sink(&root, 8, "old");
+        let sibling = live_scope_sink(&root, 9, "other");
+        assert!(old.same_client(&sibling));
+        old.emit(
+            "dialog".into(),
+            serde_json::json!({"identityScope":"old"}),
+            None,
+        )
+        .unwrap();
+        restarted
+            .emit(
+                "response".into(),
+                serde_json::json!({"identityScope":"old"}),
+                None,
+            )
+            .unwrap();
+        old.retire_scope_callbacks(1, "old").unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ServerMessage::Event { sequence: 1, .. }
+        ));
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ServerMessage::Event { sequence: 2, .. }
+        ));
+        match events.try_recv().unwrap() {
+            ServerMessage::Event {
+                sequence: 3,
+                event,
+                payload,
+                decision: None,
+                ..
+            } => {
+                assert_eq!(event, "scope.callbacks-retired");
+                assert_eq!(
+                    payload,
+                    serde_json::json!({"identityScope":"old","throughEventSequence":2})
+                );
+            }
+            _ => panic!("missing exact retirement proof"),
+        }
+        for sink in [&old, &restarted] {
+            assert_eq!(
+                sink.emit(
+                    "late".into(),
+                    serde_json::json!({"identityScope":"old"}),
+                    None
+                ),
+                Err(ProtocolError::StaleScope)
+            );
+        }
+        assert_eq!(
+            old.retire_scope_callbacks(1, "old"),
+            Err(ProtocolError::StaleScope)
+        );
+        sibling
+            .emit(
+                "live".into(),
+                serde_json::json!({"identityScope":"other"}),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            ServerMessage::Event { sequence: 4, .. }
+        ));
+        let (_sender, mut op) = publication_operation();
+        op.sequence = 10;
+        assert!(matches!(
+            root.stage_until_result(&op, "old"),
+            Err(ProtocolError::StaleScope)
+        ));
+        assert_eq!(root.broker.health().unwrap().1, ScopeState::Usable);
+    }
+    #[test]
+    fn terminal_callback_cut_rejects_root_wrong_scope_and_unpublished_replacement() {
+        let (root, mut events) =
+            ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let old = live_scope_sink(&root, 7, "old");
+        assert_eq!(
+            root.retire_scope_callbacks(1, "old"),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            old.retire_scope_callbacks(1, "foreign"),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            old.retire_scope_callbacks(2, "old"),
+            Err(ProtocolError::StaleScope)
+        );
+        let (_sender, mut op) = publication_operation();
+        op.sequence = 8;
+        let _replacement = root.stage_until_result(&op, "old").unwrap();
+        assert_eq!(
+            old.retire_scope_callbacks(1, "old"),
+            Err(ProtocolError::StaleScope)
+        );
+        assert!(events.try_recv().is_err());
+        old.emit(
+            "still-live".into(),
+            serde_json::json!({"identityScope":"old"}),
+            None,
+        )
+        .unwrap();
+    }
+    #[test]
+    fn terminal_callback_cut_queue_failure_seals_and_quarantines() {
+        let (root, mut events) =
+            ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let old = live_scope_sink(&root, 7, "old");
+        for _ in 0..64 {
+            old.emit(
+                "queued".into(),
+                serde_json::json!({"identityScope":"old"}),
+                None,
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            old.retire_scope_callbacks(1, "old"),
+            Err(ProtocolError::CapacityExceeded)
+        );
+        assert_eq!(root.broker.health().unwrap().1, ScopeState::Quarantined);
+        while let Ok(event) = events.try_recv() {
+            assert!(
+                !matches!(event,ServerMessage::Event {event,..} if event=="scope.callbacks-retired")
+            );
+        }
+        assert!(old
+            .barrier
+            .as_ref()
+            .unwrap()
+            .scope_gate
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire));
+    }
+    #[test]
+    fn lifecycle_sink_waits_for_exact_result_and_preserves_old_live_sequence() {
+        let (sink, mut rx) =
+            ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let (_sender, op) = publication_operation();
+        let staged = sink.stage_until_result(&op, "same-scope").unwrap();
+        staged.validate_stage(&sink, &op, "same-scope").unwrap();
+        staged
+            .emit(
+                "new".into(),
+                serde_json::json!({"identityScope":"same-scope"}),
+                None,
+            )
+            .unwrap();
+        sink.emit(
+            "old".into(),
+            serde_json::json!({"identityScope":"same-scope"}),
+            None,
+        )
+        .unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(), ServerMessage::Event { sequence:1, event, .. } if event=="old")
+        );
+        assert!(rx.try_recv().is_err());
+        let wrong = result_message(
+            "other".into(),
+            1,
+            8,
+            NativeOutcome {
+                result: Ok(serde_json::json!({"identityScope":"same-scope"})),
+                effects: Effects::Completed,
+            },
+            ScopeState::Usable,
+        );
+        sink.result_written(&wrong).unwrap();
+        assert!(rx.try_recv().is_err());
+        sink.result_written(&publication_result(true)).unwrap();
+        assert!(
+            matches!(rx.try_recv().unwrap(), ServerMessage::Event { sequence:2, event, .. } if event=="new")
+        );
+        staged
+            .emit(
+                "later".into(),
+                serde_json::json!({"identityScope":"same-scope"}),
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            rx.try_recv().unwrap(),
+            ServerMessage::Event { sequence: 3, .. }
+        ));
+        assert!(staged.validate_stage(&sink, &op, "same-scope").is_err());
+    }
+    #[test]
+    fn failed_result_disconnect_and_foreign_stage_never_release_replacement_events() {
+        for disconnect in [false, true] {
+            let (sink, mut rx) =
+                ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+            let (_sender, op) = publication_operation();
+            let staged = sink.stage_until_result(&op, "same-scope").unwrap();
+            let (foreign, _) =
+                ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+            assert!(staged.validate_stage(&foreign, &op, "same-scope").is_err());
+            let wrong = OperationLease {
+                sequence: op.sequence + 1,
+                cancellation: op.cancellation.clone(),
+                is_callback: op.is_callback,
+                generation: op.generation,
+                deadline: op.deadline,
+            };
+            assert!(staged.validate_stage(&sink, &wrong, "same-scope").is_err());
+            staged
+                .emit(
+                    "new".into(),
+                    serde_json::json!({"identityScope":"same-scope"}),
+                    None,
+                )
+                .unwrap();
+            if disconnect {
+                sink.close_publications();
+            } else {
+                sink.result_written(&publication_result(false)).unwrap();
+            }
+            assert!(rx.try_recv().is_err());
+            assert!(staged
+                .emit(
+                    "late".into(),
+                    serde_json::json!({"identityScope":"same-scope"}),
+                    None
+                )
+                .is_err());
+            assert_eq!(sink.sequence.lock().unwrap().staged_bytes, 0);
+        }
+    }
+    #[test]
+    fn staged_event_capacity_and_expiry_fail_closed_without_output() {
+        let (sink, mut rx) =
+            ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let (_sender, op) = publication_operation();
+        let staged = sink.stage_until_result(&op, "same-scope").unwrap();
+        for _ in 0..MAX_STAGED_EVENTS {
+            staged
+                .emit(
+                    "new".into(),
+                    serde_json::json!({"identityScope":"same-scope"}),
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            staged.emit(
+                "overflow".into(),
+                serde_json::json!({"identityScope":"same-scope"}),
+                None
+            ),
+            Err(ProtocolError::CapacityExceeded)
+        );
+        assert!(rx.try_recv().is_err());
+        let (sink, mut rx) =
+            ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let (_sender, op) = publication_operation();
+        let staged = sink.stage_until_result(&op, "same-scope").unwrap();
+        staged
+            .emit(
+                "expired-decision".into(),
+                serde_json::json!({"identityScope":"same-scope"}),
+                Some(DecisionNotice {
+                    token: "synthetic".into(),
+                    timeout_ms: 0,
+                }),
+            )
+            .unwrap();
+        assert_eq!(
+            sink.result_written(&publication_result(true)),
+            Err(ProtocolError::DeadlineExceeded)
+        );
+        assert!(rx.try_recv().is_err());
+    }
+    #[test]
+    fn partial_release_capacity_failure_never_marks_barrier_live() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let (sink, mut rx) = ClientEventSink::test_channel(broker.clone());
+        let (_sender, op) = publication_operation();
+        let staged = sink.stage_until_result(&op, "same-scope").unwrap();
+        for _ in 0..2 {
+            staged
+                .emit(
+                    "new".into(),
+                    serde_json::json!({"identityScope":"same-scope"}),
+                    None,
+                )
+                .unwrap();
+        }
+        for _ in 0..63 {
+            sink.emit("old".into(), serde_json::json!({}), None)
+                .unwrap();
+        }
+        assert_eq!(
+            sink.result_written(&publication_result(true)),
+            Err(ProtocolError::CapacityExceeded)
+        );
+        assert!(matches!(
+            *staged.barrier.as_ref().unwrap().state.lock().unwrap(),
+            EventBarrierState::Discarded
+        ));
+        assert!(sink.sequence.lock().unwrap().barriers.is_empty());
+        // The actual writer quarantines and seals on this exact error, so any
+        // partially enqueued notices cannot grant an independently live scope.
+        broker.quarantine().unwrap();
+        sink.close_publications();
+        assert_eq!(broker.health().unwrap().1, ScopeState::Quarantined);
+        assert!(staged
+            .emit(
+                "late".into(),
+                serde_json::json!({"identityScope":"same-scope"}),
+                None
+            )
+            .is_err());
+        let mut count = 0;
+        while rx.try_recv().is_ok() {
+            count += 1;
+        }
+        assert_eq!(count, 64);
+    }
+    #[tokio::test]
+    async fn pending_publication_wait_wakes_on_ack_discard_and_cancellation() {
+        for success in [false, true] {
+            let (sink, _rx) =
+                ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+            let (_sender, op) = publication_operation();
+            let staged = sink.stage_until_result(&op, "same-scope").unwrap();
+            assert!(staged.is_publication_pending().unwrap());
+            let wait = {
+                let staged = staged.clone();
+                let cancellation = op.cancellation.clone();
+                tokio::spawn(
+                    async move { staged.wait_publication(op.deadline, cancellation).await },
+                )
+            };
+            tokio::task::yield_now().await;
+            assert!(!wait.is_finished());
+            sink.result_written(&publication_result(success)).unwrap();
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), wait)
+                .await
+                .unwrap()
+                .unwrap();
+            if success {
+                assert!(result.is_ok());
+            } else {
+                assert_eq!(result, Err(ProtocolError::StaleScope));
+            }
+        }
+        let (sink, _rx) = ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let (sender, op) = publication_operation();
+        let staged = sink.stage_until_result(&op, "same-scope").unwrap();
+        sender.send_replace(super::super::client_session::CancelSignal::Requested);
+        assert_eq!(
+            staged.wait_publication(op.deadline, op.cancellation).await,
+            Err(ProtocolError::Cancelled)
+        );
+    }
+    struct PublishingExecutor {
+        sink: std::sync::Mutex<Option<ClientEventSink>>,
+    }
+    impl ClientExecutor for PublishingExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        fn set_event_sink(&self, sink: ClientEventSink) -> Result<(), ProtocolError> {
+            *self.sink.lock().unwrap() = Some(sink);
+            Ok(())
+        }
+        async fn execute(
+            &self,
+            _: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            lease: OperationLease,
+        ) -> NativeOutcome {
+            let sink = self.sink.lock().unwrap().clone().unwrap();
+            let staged = sink.stage_until_result(&lease, "same-scope").unwrap();
+            staged
+                .emit(
+                    "new".into(),
+                    serde_json::json!({"identityScope":"same-scope"}),
+                    None,
+                )
+                .unwrap();
+            sink.emit(
+                "old".into(),
+                serde_json::json!({"identityScope":"same-scope"}),
+                None,
+            )
+            .unwrap();
+            NativeOutcome {
+                result: Ok(serde_json::json!({"identityScope":"same-scope"})),
+                effects: Effects::Completed,
+            }
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn actual_result_writer_flushes_ack_before_replacement_event() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let executor = std::sync::Arc::new(PublishingExecutor {
+            sink: std::sync::Mutex::new(None),
+        });
+        let (client, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let task = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker,
+            executor,
+        ));
+        let mut client = tokio::io::BufReader::new(client);
+        read_frame(&mut client).await.unwrap();
+        client.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":7,\"timeoutMs\":5000,\"command\":\"test\",\"args\":{}}\n").await.unwrap();
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let bytes =
+                tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut client))
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+            frames.push(serde_json::from_slice::<serde_json::Value>(&bytes).unwrap());
+        }
+        assert_eq!(frames[0]["event"], "old");
+        assert_eq!(frames[1]["type"], "result");
+        assert_eq!(frames[2]["event"], "new");
+        assert_eq!(frames[0]["sequence"], 1);
+        assert_eq!(frames[2]["sequence"], 2);
+        drop(client);
+        assert!(task.await.unwrap());
+    }
+    #[derive(Default)]
+    struct FlushGate {
+        result_seen: std::sync::atomic::AtomicBool,
+        released: std::sync::atomic::AtomicBool,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+    struct GatedWriter<W> {
+        inner: W,
+        gate: std::sync::Arc<FlushGate>,
+    }
+    impl<W: AsyncWrite + Unpin> AsyncWrite for GatedWriter<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let result = std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes);
+            if let std::task::Poll::Ready(Ok(count)) = result {
+                if bytes[..count]
+                    .windows(b"\"type\":\"result\"".len())
+                    .any(|part| part == b"\"type\":\"result\"")
+                {
+                    self.gate
+                        .result_seen
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            result
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let mut waker = self.gate.waker.lock().unwrap();
+            if self
+                .gate
+                .result_seen
+                .load(std::sync::atomic::Ordering::SeqCst)
+                && !self.gate.released.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                *waker = Some(cx.waker().clone());
+                return std::task::Poll::Pending;
+            }
+            drop(waker);
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+    #[tokio::test]
+    async fn result_bytes_without_flush_ack_do_not_release_staged_events() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let executor = std::sync::Arc::new(PublishingExecutor {
+            sink: std::sync::Mutex::new(None),
+        });
+        let (client, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let gate = std::sync::Arc::new(FlushGate::default());
+        let task = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            GatedWriter {
+                inner: writer,
+                gate: gate.clone(),
+            },
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker,
+            executor,
+        ));
+        let mut client = tokio::io::BufReader::new(client);
+        read_frame(&mut client).await.unwrap();
+        client.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":7,\"timeoutMs\":5000,\"command\":\"test\",\"args\":{}}\n").await.unwrap();
+        read_frame(&mut client).await.unwrap(); // Old producer remains live.
+        let result = read_frame(&mut client).await.unwrap().unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&result).unwrap()["type"],
+            "result"
+        );
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            read_frame(&mut client)
+        )
+        .await
+        .is_err());
+        {
+            let mut waker = gate.waker.lock().unwrap();
+            gate.released
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(waker) = waker.take() {
+                waker.wake();
+            }
+        }
+        let event =
+            tokio::time::timeout(std::time::Duration::from_secs(1), read_frame(&mut client))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&event).unwrap()["event"],
+            "new"
+        );
+        drop(client);
+        assert!(task.await.unwrap());
+    }
     struct StalledExecutor {
         broker: std::sync::Arc<ClientSession>,
         cleanup_succeeds: bool,
@@ -784,8 +1851,9 @@ mod tests {
         let sink = ClientEventSink {
             sender,
             broker: broker.clone(),
-            sequence: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            sequence: Default::default(),
             open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            barrier: None,
         };
         let threads: Vec<_> = (0..16)
             .map(|_| {

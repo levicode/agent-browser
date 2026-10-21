@@ -193,6 +193,23 @@ impl Drop for CallbackReservation {
         }
     }
 }
+impl UiPermit {
+    /// Check retained exclusive admission for the exact captured scope gate.
+    pub(crate) fn check_exclusive(&self, expected: &Arc<UiGate>) -> Result<(), ProtocolError> {
+        if !self.exclusive || !Arc::ptr_eq(&self.gate, expected) {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let state = self
+            .gate
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed || !state.exclusive {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+}
 impl Drop for UiPermit {
     fn drop(&mut self) {
         if let Ok(mut state) = self.gate.state.lock() {

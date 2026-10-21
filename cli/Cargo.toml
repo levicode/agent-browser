@@ -10,7 +10,13 @@ readme = "../README.md"
 keywords = ["browser", "automation", "ai", "cdp", "chrome"]
 categories = ["command-line-utilities", "web-programming"]
 
+[features]
+default = []
+# Never enable in a distributed runtime or bundle.
+acceptance-faults = []
+
 [dependencies]
+tempfile = "3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 dirs = "5.0"
@@ -47,7 +53,6 @@ libc = "0.2"
 windows-sys = { version = "0.52", features = ["Win32_System_Threading", "Win32_Foundation", "Win32_Storage_FileSystem", "Win32_Security", "Win32_System_JobObjects", "Win32_System_StationsAndDesktops", "Win32_Graphics_Gdi"] }
 
 [dev-dependencies]
-tempfile = "3"
 
 [build-dependencies]
 serde = { version = "1.0", features = ["derive"] }

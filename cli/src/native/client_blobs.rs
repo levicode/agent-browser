@@ -118,6 +118,37 @@ pub struct BlobProducer {
     charge: Charge,
 }
 
+/// Native-only attempt authority. It carries no blob handle or wire authority.
+/// The lifecycle owner retires it before ending the attempt; publication and
+/// retirement share a lock so a late producer cannot pass a check then publish.
+pub struct AttemptArtifacts {
+    state: Arc<ArtifactAuthority>,
+}
+struct ArtifactAuthority {
+    generation: u64,
+    budget: Arc<Mutex<Budget>>,
+    retired: Mutex<bool>,
+}
+impl AttemptArtifacts {
+    pub fn retire(&self) -> Result<(), BlobError> {
+        *self.state.retired.lock().map_err(|_| BlobError::Closed)? = true;
+        Ok(())
+    }
+}
+impl Drop for AttemptArtifacts {
+    fn drop(&mut self) {
+        if let Ok(mut retired) = self.state.retired.lock() {
+            *retired = true;
+        }
+    }
+}
+/// Quota ownership may survive page scope rotation, never attempt retirement.
+/// Only a currently admitted scope can turn it into a new immutable blob.
+pub struct ArtifactReservation {
+    authority: Arc<ArtifactAuthority>,
+    charge: Charge,
+}
+
 impl BlobStore {
     pub fn new(limits: BlobLimits) -> Result<Self, BlobError> {
         if limits.max_blob_bytes == 0
@@ -368,6 +399,149 @@ impl BlobStore {
             },
         })
     }
+    pub fn begin_artifact_attempt(&self, scope: &BlobScope) -> Result<AttemptArtifacts, BlobError> {
+        let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        if inner.active_scope.as_ref() != Some(scope) {
+            return Err(BlobError::StaleScope);
+        }
+        Ok(AttemptArtifacts {
+            state: Arc::new(ArtifactAuthority {
+                generation: scope.generation,
+                budget: self.budget.clone(),
+                retired: Mutex::new(false),
+            }),
+        })
+    }
+    pub fn reserve_artifact(
+        &self,
+        authority: &AttemptArtifacts,
+        scope: &BlobScope,
+    ) -> Result<ArtifactReservation, BlobError> {
+        let retired = authority
+            .state
+            .retired
+            .lock()
+            .map_err(|_| BlobError::Closed)?;
+        if *retired
+            || authority.state.generation != scope.generation
+            || !Arc::ptr_eq(&authority.state.budget, &self.budget)
+        {
+            return Err(BlobError::StaleScope);
+        }
+        let producer = self.reserve_producer(scope.clone())?;
+        Ok(ArtifactReservation {
+            authority: authority.state.clone(),
+            charge: producer.charge,
+        })
+    }
+    pub fn shrink_artifact(
+        &self,
+        reservation: &mut ArtifactReservation,
+        size: usize,
+    ) -> Result<(), BlobError> {
+        let retired = reservation
+            .authority
+            .retired
+            .lock()
+            .map_err(|_| BlobError::Closed)?;
+        if *retired || !Arc::ptr_eq(&reservation.authority.budget, &self.budget) {
+            return Err(BlobError::StaleScope);
+        }
+        if size > reservation.charge.size {
+            return Err(BlobError::QuotaExceeded);
+        }
+        let mut budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        budget.bytes -= reservation.charge.size - size;
+        reservation.charge.size = size;
+        Ok(())
+    }
+    pub fn finish_artifact(
+        &self,
+        reservation: ArtifactReservation,
+        scope: BlobScope,
+        bytes: Vec<u8>,
+    ) -> Result<BlobInfo, BlobError> {
+        self.finish_artifact_batch(vec![(reservation, bytes)], scope)
+            .map(|mut infos| infos.remove(0))
+            .map_err(|(error, _)| error)
+    }
+    /// All-or-nothing publication: a failed scope/authority check returns every
+    /// private reservation and byte buffer intact, with no visible handles.
+    #[allow(clippy::type_complexity)]
+    pub fn finish_artifact_batch(
+        &self,
+        items: Vec<(ArtifactReservation, Vec<u8>)>,
+        scope: BlobScope,
+    ) -> Result<Vec<BlobInfo>, (BlobError, Vec<(ArtifactReservation, Vec<u8>)>)> {
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let authority = items[0].0.authority.clone();
+        if authority.generation != scope.generation
+            || !Arc::ptr_eq(&authority.budget, &self.budget)
+            || items
+                .iter()
+                .any(|(r, _)| !Arc::ptr_eq(&r.authority, &authority))
+        {
+            return Err((BlobError::StaleScope, items));
+        }
+        if items.iter().any(|(r, b)| b.len() > r.charge.size) {
+            return Err((BlobError::QuotaExceeded, items));
+        }
+        let hashes: Vec<String> = items
+            .iter()
+            .map(|(_, bytes)| format!("{:x}", Sha256::digest(bytes)))
+            .collect();
+        let retired = match authority.retired.lock() {
+            Ok(v) => v,
+            Err(_) => return Err((BlobError::Closed, items)),
+        };
+        if *retired {
+            return Err((BlobError::StaleScope, items));
+        }
+        let mut inner = match self.inner.lock() {
+            Ok(v) => v,
+            Err(_) => return Err((BlobError::Closed, items)),
+        };
+        if inner.closed {
+            return Err((BlobError::Closed, items));
+        }
+        if inner.active_scope.as_ref() != Some(&scope) {
+            return Err((BlobError::StaleScope, items));
+        }
+        let mut budget = match self.budget.lock() {
+            Ok(v) => v,
+            Err(_) => return Err((BlobError::Closed, items)),
+        };
+        let mut infos = Vec::with_capacity(items.len());
+        for ((mut reservation, bytes), sha256) in items.into_iter().zip(hashes) {
+            budget.bytes -= reservation.charge.size - bytes.len();
+            reservation.charge.size = bytes.len();
+            let handle = Uuid::new_v4().to_string();
+            infos.push(BlobInfo {
+                handle: handle.clone(),
+                size: bytes.len(),
+                sha256: sha256.clone(),
+            });
+            inner.entries.insert(
+                handle,
+                Entry {
+                    scope: scope.clone(),
+                    bytes: Arc::new(bytes),
+                    expected_sha256: sha256,
+                    hasher: Sha256::new(),
+                    sealed: true,
+                    reserved_by: None,
+                    charge: Arc::new(reservation.charge),
+                },
+            );
+        }
+        Ok(infos)
+    }
+
     pub fn producer_limit(&self) -> usize {
         self.limits.max_blob_bytes
     }
@@ -804,5 +978,104 @@ mod producer_tests {
                 identity_scope: "next".into(),
             })
             .unwrap();
+    }
+    #[test]
+    fn attempt_artifact_rotates_scope_without_rebinding_old_handles() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 4,
+        })
+        .unwrap();
+        let old = BlobScope {
+            generation: 1,
+            identity_scope: "old".into(),
+        };
+        let next = BlobScope {
+            generation: 1,
+            identity_scope: "next".into(),
+        };
+        store.activate_scope(old.clone()).unwrap();
+        let authority = store.begin_artifact_attempt(&old).unwrap();
+        let mut held = store.reserve_artifact(&authority, &old).unwrap();
+        store.shrink_artifact(&mut held, 3).unwrap();
+        assert_eq!(store.budget.lock().unwrap().bytes, 3);
+        store.revoke_scope(&old).unwrap();
+        store.activate_scope(next.clone()).unwrap();
+        let result = store
+            .finish_artifact(held, next.clone(), b"abc".to_vec())
+            .unwrap();
+        assert!(matches!(
+            store.read(&old, &result.handle, 0, 3),
+            Err(BlobError::StaleScope)
+        ));
+        assert_eq!(store.read(&next, &result.handle, 0, 3).unwrap(), b"abc");
+        store.release(&next, &result.handle).unwrap();
+        assert_eq!(store.budget.lock().unwrap().bytes, 0);
+    }
+    #[test]
+    fn attempt_artifact_rejects_retirement_foreign_store_generation_and_growth() {
+        let limits = BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 4,
+        };
+        let store = BlobStore::new(limits).unwrap();
+        let foreign = BlobStore::new(limits).unwrap();
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "scope".into(),
+        };
+        store.activate_scope(scope.clone()).unwrap();
+        foreign.activate_scope(scope.clone()).unwrap();
+        let authority = store.begin_artifact_attempt(&scope).unwrap();
+        assert!(matches!(
+            foreign.reserve_artifact(&authority, &scope),
+            Err(BlobError::StaleScope)
+        ));
+        let mut held = store.reserve_artifact(&authority, &scope).unwrap();
+        assert_eq!(
+            store.shrink_artifact(&mut held, 9),
+            Err(BlobError::QuotaExceeded)
+        );
+        authority.retire().unwrap();
+        assert_eq!(
+            store.finish_artifact(held, scope.clone(), vec![1]),
+            Err(BlobError::StaleScope)
+        );
+        assert_eq!(store.budget.lock().unwrap().bytes, 0);
+        assert!(matches!(
+            store.reserve_artifact(&authority, &scope),
+            Err(BlobError::StaleScope)
+        ));
+        let authority = store.begin_artifact_attempt(&scope).unwrap();
+        let held = store.reserve_artifact(&authority, &scope).unwrap();
+        store.revoke_scope(&scope).unwrap();
+        let next = BlobScope {
+            generation: 2,
+            identity_scope: "next".into(),
+        };
+        store.activate_scope(next.clone()).unwrap();
+        assert_eq!(
+            store.finish_artifact(held, next, vec![1]),
+            Err(BlobError::StaleScope)
+        );
+    }
+    #[test]
+    fn dropping_attempt_authority_seals_retained_artifact() {
+        let store = BlobStore::new(BlobLimits::default()).unwrap();
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "scope".into(),
+        };
+        store.activate_scope(scope.clone()).unwrap();
+        let authority = store.begin_artifact_attempt(&scope).unwrap();
+        let held = store.reserve_artifact(&authority, &scope).unwrap();
+        drop(authority);
+        assert_eq!(
+            store.finish_artifact(held, scope, vec![1]),
+            Err(BlobError::StaleScope)
+        );
+        assert_eq!(store.budget.lock().unwrap().bytes, 0);
     }
 }

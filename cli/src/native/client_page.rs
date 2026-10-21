@@ -23,7 +23,16 @@ struct Config {
     scripts: Vec<Arc<str>>,
     color_scheme: Option<String>,
     reduced_motion: Option<String>,
+    service_worker_policy: bool,
 }
+/// Native-private declarative configuration, not a scope or browser authority.
+/// Installed registrations and observations are deliberately never transferred.
+#[derive(Clone)]
+pub(crate) struct PageConfigSnapshot {
+    config: Config,
+    requested_viewport: Option<(u32, u32)>,
+}
+const BLOCK_SERVICE_WORKERS: &str = "if (globalThis.ServiceWorkerContainer) ServiceWorkerContainer.prototype.register = async () => { console.warn('Service Worker registration blocked by agent-browser'); };";
 #[derive(Clone, Default)]
 struct InputState {
     keys: BTreeMap<String, Key>,
@@ -64,6 +73,8 @@ impl Default for NetworkActivity {
 struct State {
     config: Config,
     installed_scripts: HashMap<String, usize>,
+    script_ids: HashMap<String, Vec<String>>,
+    uncertain_scripts: BTreeSet<String>,
     configuration_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     input: InputState,
     origins: BTreeSet<String>,
@@ -78,6 +89,27 @@ pub struct ClientPageState {
     context_id: String,
     state: Mutex<State>,
     network_changed: tokio::sync::Notify,
+}
+
+fn append_script(config: &mut Config, source: Arc<str>) -> Result<(), ProtocolError> {
+    if config.scripts.len() >= 1024
+        || config
+            .scripts
+            .iter()
+            .map(|item| item.len())
+            .sum::<usize>()
+            .saturating_add(source.len())
+            > 8 * 1024 * 1024
+    {
+        return Err(ProtocolError::CapacityExceeded);
+    }
+    let revision = config
+        .revision
+        .checked_add(1)
+        .ok_or(ProtocolError::IdentifierExhausted)?;
+    config.scripts.push(source);
+    config.revision = revision;
+    Ok(())
 }
 
 fn invalid<T>() -> Result<T, ProtocolError> {
@@ -155,6 +187,18 @@ struct Navigation {
     url: String,
     wait_until: String,
 }
+fn navigation_wait(wait: &str) -> Result<&'static str, ProtocolError> {
+    match wait {
+        "load" => Ok("load"),
+        "domcontentloaded" | "networkidle" => Ok("DOMContentLoaded"),
+        _ => invalid(),
+    }
+}
+fn decode_navigation(args: &Value) -> Result<Navigation, ProtocolError> {
+    let navigation: Navigation = decode(args)?;
+    navigation_wait(&navigation.wait_until)?;
+    Ok(navigation)
+}
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Keyboard {
@@ -185,6 +229,60 @@ impl ClientPageState {
             state: Mutex::new(State::default()),
             network_changed: tokio::sync::Notify::new(),
         }
+    }
+    /// Caller holds the scope configuration gate after draining prior commands.
+    pub(crate) fn snapshot_config(
+        &self,
+        expected_scope: &str,
+    ) -> Result<PageConfigSnapshot, ProtocolError> {
+        if expected_scope != self.identity_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        let state = self.state()?;
+        let mut config = state.config.clone();
+        // Revisions belong to one registry tenure, not transferable configuration.
+        config.revision = 0;
+        Ok(PageConfigSnapshot {
+            config,
+            requested_viewport: state.requested_viewport,
+        })
+    }
+    /// Construct before any new target is enrolled. This cannot overwrite a live
+    /// page registry or transfer old session/permit/input/origin ownership.
+    pub(crate) fn from_config_snapshot(
+        identity_scope: String,
+        context_id: String,
+        snapshot: PageConfigSnapshot,
+    ) -> Result<Self, ProtocolError> {
+        if identity_scope.is_empty() || context_id.is_empty() {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        Ok(Self {
+            identity_scope,
+            context_id,
+            state: Mutex::new(State {
+                config: snapshot.config,
+                requested_viewport: snapshot.requested_viewport,
+                ..State::default()
+            }),
+            network_changed: tokio::sync::Notify::new(),
+        })
+    }
+    /// Add the immutable native policy exactly once to the same ordered script
+    /// registry used by application init scripts. Enrollment applies it below.
+    pub(crate) fn ensure_service_worker_policy(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.validate(page, op)?;
+        let mut state = self.state()?;
+        if state.config.service_worker_policy {
+            return Ok(());
+        }
+        append_script(&mut state.config, Arc::from(BLOCK_SERVICE_WORKERS))?;
+        state.config.service_worker_policy = true;
+        Ok(())
     }
     fn state(&self) -> Result<MutexGuard<'_, State>, ProtocolError> {
         self.state
@@ -431,6 +529,7 @@ impl ClientPageState {
             )
         };
         for (index, source) in config.scripts.iter().enumerate().skip(installed) {
+            self.state()?.uncertain_scripts.insert(session.into());
             let installed_script = command(
                 page,
                 op,
@@ -446,10 +545,17 @@ impl ClientPageState {
             {
                 return Err(ProtocolError::BrowserFailure);
             }
+            {
+                let mut state = self.state()?;
+                state
+                    .script_ids
+                    .entry(session.into())
+                    .or_default()
+                    .push(installed_script["identifier"].as_str().unwrap().to_owned());
+                state.uncertain_scripts.remove(session);
+                state.installed_scripts.insert(session.into(), index + 1);
+            }
             self.validate(page, op)?;
-            self.state()?
-                .installed_scripts
-                .insert(session.into(), index + 1);
         }
         let mut features = Vec::new();
         if let Some(value) = &config.color_scheme {
@@ -468,9 +574,60 @@ impl ClientPageState {
         .await?;
         Ok(config.revision)
     }
+    /// Lifecycle-only cleanup; the caller has drained operations and retains
+    /// this future. This removes future registrations, not script side effects
+    /// already executed in the borrowed host document.
+    pub(crate) async fn remove_session_scripts(
+        &self,
+        client: &super::cdp::client::CdpClient,
+        identity_scope: &str,
+        session: &str,
+        deadline: Instant,
+    ) -> Result<(), ProtocolError> {
+        if identity_scope != self.identity_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        let (ids, mut failed) = {
+            let state = self.state()?;
+            (
+                state.script_ids.get(session).cloned().unwrap_or_default(),
+                state.uncertain_scripts.contains(session),
+            )
+        };
+        for id in ids {
+            if Instant::now() >= deadline {
+                failed = true;
+                break;
+            }
+            match tokio::time::timeout_at(
+                deadline.into(),
+                client.send_command(
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    Some(json!({"identifier":id})),
+                    Some(session),
+                ),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    if let Some(ids) = self.state()?.script_ids.get_mut(session) {
+                        ids.retain(|value| value != &id);
+                    }
+                }
+                _ => failed = true,
+            }
+        }
+        if failed {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
     pub fn forget_session(&self, session: &str) -> Result<(), ProtocolError> {
         let mut state = self.state()?;
         state.installed_scripts.remove(session);
+        state.script_ids.remove(session);
+        state.uncertain_scripts.remove(session);
         state.configuration_locks.remove(session);
         if state.input.session.as_deref() == Some(session) {
             state.input = InputState::default();
@@ -558,7 +715,7 @@ impl ClientPageState {
                 Ok(result)
             }
             "page.navigate" => {
-                let a: Navigation = decode(args)?;
+                let a = decode_navigation(args)?;
                 self.navigate(
                     page,
                     op,
@@ -642,23 +799,7 @@ impl ClientPageState {
                 let a: Source = decode(args)?;
                 {
                     let mut s = self.state()?;
-                    if s.config.scripts.len() >= 1024
-                        || s.config
-                            .scripts
-                            .iter()
-                            .map(|source| source.len())
-                            .sum::<usize>()
-                            .saturating_add(a.source.len())
-                            > 8 * 1024 * 1024
-                    {
-                        return Err(ProtocolError::CapacityExceeded);
-                    }
-                    s.config.revision = s
-                        .config
-                        .revision
-                        .checked_add(1)
-                        .ok_or(ProtocolError::IdentifierExhausted)?;
-                    s.config.scripts.push(Arc::from(a.source));
+                    append_script(&mut s.config, Arc::from(a.source))?;
                 }
                 self.apply_existing(page, sessions, op).await?;
                 Ok(Value::Null)
@@ -741,12 +882,7 @@ impl ClientPageState {
         args: Value,
         wait: &str,
     ) -> Result<(), ProtocolError> {
-        let expected = match wait {
-            "load" => "load",
-            "domcontentloaded" => "DOMContentLoaded",
-            "networkidle" => "DOMContentLoaded",
-            _ => return invalid(),
-        };
+        let expected = navigation_wait(wait)?;
         if wait == "networkidle" {
             let state = self.state()?;
             if !state
@@ -871,7 +1007,13 @@ impl ClientPageState {
             evaluate_on(&page.client, &page.page_session_id, "location.href"),
         )
         .await?;
-        if let Some(url) = value.as_str().and_then(|s| url::Url::parse(s).ok()) {
+        // Same-document navigation from an attached profile's initial page
+        // does not add a visited origin in the original context contract.
+        if let Some(url) = value
+            .as_str()
+            .filter(|_| loader.is_some())
+            .and_then(|s| url::Url::parse(s).ok())
+        {
             let origin = url.origin().ascii_serialization();
             if origin != "null" {
                 self.state()?.origins.insert(origin);
@@ -936,6 +1078,10 @@ impl ClientPageState {
         )
         .await?;
         Ok(())
+    }
+    /// Pure preflight before deferred borrowed-page activation or any CDP work.
+    pub(crate) fn validate_navigation(args: &Value) -> Result<(), ProtocolError> {
+        decode_navigation(args).map(|_| ())
     }
     /// Pure API preflight, shared with locator actions before focus or selection.
     pub(crate) fn validate_keyboard_command(
@@ -1187,20 +1333,44 @@ impl ClientPageState {
     /// this future until it settles and quarantine this scope on any failure.
     /// Do not call after disposing or replacing the owned context.
     pub async fn release_input(&self, page: &BrowserExecutionLease) -> Result<(), ProtocolError> {
-        if page.identity_scope != self.identity_scope {
+        page.permit.check()?;
+        let session = self
+            .state()?
+            .input
+            .session
+            .clone()
+            .unwrap_or_else(|| page.page_session_id.clone());
+        self.release_borrowed_input(
+            &page.client,
+            &page.identity_scope,
+            &session,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await?;
+        page.permit.check()
+    }
+    pub(crate) async fn release_borrowed_input(
+        &self,
+        client: &super::cdp::client::CdpClient,
+        identity_scope: &str,
+        session: &str,
+        deadline: Instant,
+    ) -> Result<(), ProtocolError> {
+        if identity_scope != self.identity_scope {
             return Err(ProtocolError::StaleScope);
         }
-        page.permit.check()?;
+        if Instant::now() >= deadline {
+            return Err(ProtocolError::CleanupFailed);
+        }
         let mut input = self.state()?.input.clone();
-        let session = input
-            .session
-            .as_deref()
-            .unwrap_or(&page.page_session_id)
-            .to_owned();
+        if input.session.as_deref().is_some_and(|old| old != session) {
+            return Ok(());
+        }
+        let session = session.to_owned();
         let cleanup = async {
             for key in input.keys.clone().into_values() {
                 input.keys.remove(&key.code);
-                page.client
+                client
                     .send_command(
                         "Input.dispatchKeyEvent",
                         Some(key_params(&key, false, false, modifiers(&input), false)),
@@ -1230,7 +1400,7 @@ impl ClientPageState {
                     None,
                     Some(0),
                 );
-                page.client
+                client
                     .send_command(
                         "Input.dispatchMouseEvent",
                         Some(
@@ -1243,11 +1413,10 @@ impl ClientPageState {
             }
             Ok::<(), String>(())
         };
-        tokio::time::timeout(Duration::from_secs(2), cleanup)
+        tokio::time::timeout_at(deadline.into(), cleanup)
             .await
             .map_err(|_| ProtocolError::CleanupFailed)?
             .map_err(|_| ProtocolError::CleanupFailed)?;
-        page.permit.check()?;
         self.state()?.input = InputState {
             mouse: input.mouse,
             session: Some(session),
@@ -1697,6 +1866,89 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::watch;
     use tokio_tungstenite::tungstenite::Message;
+
+    #[test]
+    fn config_snapshot_transfers_declarations_not_scope_authority() {
+        let old = ClientPageState::new("old".into(), "context-old".into());
+        {
+            let mut state = old.state().unwrap();
+            append_script(&mut state.config, Arc::from("globalThis.first = 1")).unwrap();
+            append_script(&mut state.config, Arc::from("globalThis.second = 2")).unwrap();
+            state.config.color_scheme = Some("dark".into());
+            state.config.reduced_motion = Some("reduce".into());
+            state.requested_viewport = Some((0, 720));
+            state.origins.insert("https://old.example".into());
+            state.installed_scripts.insert("old-session".into(), 2);
+            state.input.session = Some("old-session".into());
+            state.browser_is_mac = Some(true);
+            state
+                .network_roots
+                .insert("old-session".into(), "old-session".into());
+        }
+        assert!(matches!(
+            old.snapshot_config("new"),
+            Err(ProtocolError::StaleScope)
+        ));
+        let snapshot = old.snapshot_config("old").unwrap();
+        let fresh = ClientPageState::from_config_snapshot(
+            "new".into(),
+            "context-new".into(),
+            snapshot.clone(),
+        )
+        .unwrap();
+        assert!(ClientPageState::from_config_snapshot("".into(), "ctx".into(), snapshot).is_err());
+        let state = fresh.state().unwrap();
+        assert_eq!(
+            state
+                .config
+                .scripts
+                .iter()
+                .map(AsRef::as_ref)
+                .collect::<Vec<&str>>(),
+            vec!["globalThis.first = 1", "globalThis.second = 2"]
+        );
+        assert_eq!(state.config.color_scheme.as_deref(), Some("dark"));
+        assert_eq!(state.config.reduced_motion.as_deref(), Some("reduce"));
+        assert_eq!(state.requested_viewport, Some((0, 720)));
+        assert_eq!(state.config.revision, 0);
+        assert!(state.origins.is_empty() && state.installed_scripts.is_empty());
+        assert!(state.input.session.is_none() && state.browser_is_mac.is_none());
+        assert!(state.network_roots.is_empty() && state.network.is_empty());
+        assert!(state.configuration_locks.is_empty());
+    }
+    #[tokio::test]
+    async fn seeded_native_policy_is_not_duplicated_and_scripts_reinstall_per_new_session() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let old = ClientPageState::new("scope".into(), "context".into());
+        old.ensure_service_worker_policy(&page, &op).unwrap();
+        old.ensure_service_worker_policy(&page, &op).unwrap();
+        let fresh = ClientPageState::from_config_snapshot(
+            "scope".into(),
+            "replacement-context".into(),
+            old.snapshot_config("scope").unwrap(),
+        )
+        .unwrap();
+        fresh.ensure_service_worker_policy(&page, &op).unwrap();
+        assert_eq!(fresh.state().unwrap().config.scripts.len(), 1);
+        fresh
+            .apply_to_new_session(&page, "new-session", &op)
+            .await
+            .unwrap();
+        fresh
+            .apply_to_new_session(&page, "new-session", &op)
+            .await
+            .unwrap();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event["method"] == "Page.addScriptToEvaluateOnNewDocument")
+                .count(),
+            1
+        );
+        task.abort();
+    }
 
     fn operation() -> (OperationLease, watch::Sender<CancelSignal>) {
         let (sender, cancellation) = watch::channel(CancelSignal::None);
@@ -2749,5 +3001,25 @@ mod tests {
         state.release_input(&page).await.unwrap();
         drop(page);
         browser.close().await.unwrap();
+    }
+    #[test]
+    fn navigation_preflight_reuses_strict_public_schema_without_browser_effects() {
+        for wait in ["load", "domcontentloaded", "networkidle"] {
+            assert!(ClientPageState::validate_navigation(
+                &json!({"url":"https://synthetic.test/","waitUntil":wait})
+            )
+            .is_ok());
+        }
+        for args in [
+            json!({"url":"https://synthetic.test/"}),
+            json!({"url":false,"waitUntil":"load"}),
+            json!({"url":"https://synthetic.test/","waitUntil":"commit"}),
+            json!({"url":"https://synthetic.test/","waitUntil":"load","extra":true}),
+        ] {
+            assert_eq!(
+                ClientPageState::validate_navigation(&args),
+                Err(ProtocolError::InvalidArguments)
+            );
+        }
     }
 }

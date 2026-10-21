@@ -35,6 +35,7 @@ pub struct ProtectedReadJournal<'a> {
     touched: Vec<(String, f64)>,
     restored: bool,
     started: bool,
+    freeze_completed: bool,
 }
 impl<'a> ProtectedReadJournal<'a> {
     pub fn begin(
@@ -82,6 +83,7 @@ impl<'a> ProtectedReadJournal<'a> {
             touched: Vec::new(),
             restored: false,
             started: false,
+            freeze_completed: false,
         };
         journal.check().map_err(failure)?;
         Ok(journal)
@@ -101,6 +103,14 @@ impl<'a> ProtectedReadJournal<'a> {
             return Err(ProtectedReadReason::Deadline);
         }
         Ok(())
+    }
+    /// A successful begin is not evidence that browser execution was frozen.
+    /// Pixel and semantic consumers use this before reading protected content.
+    pub fn require_frozen(&self) -> Result<(), ProtectedReadReason> {
+        if !self.freeze_completed || self.restored {
+            return Err(ProtectedReadReason::IncompleteInventory);
+        }
+        self.check()
     }
     pub fn contains_session(&self, session: &str) -> bool {
         self.sessions.iter().any(|value| value == session)
@@ -154,7 +164,9 @@ impl<'a> ProtectedReadJournal<'a> {
             )
             .await?;
         }
-        self.check()
+        self.check()?;
+        self.freeze_completed = true;
+        Ok(())
     }
     /// Always call after freeze, including a failed/cancelled freeze. Cleanup
     /// ignores the expired operation budget but has one total three-second cap.
@@ -301,9 +313,12 @@ mod tests {
     async fn protected_journal_restores_before_releasing_barrier() {
         let (page, operation, _sender, server) = journal_fixture(false, false).await;
         let mut journal = super::ProtectedReadJournal::begin(&page, &operation, true).unwrap();
+        assert!(journal.require_frozen().is_err());
         journal.freeze().await.unwrap();
+        journal.require_frozen().unwrap();
         assert!(page.targets.protected_read_barrier().is_err());
         journal.restore().await.unwrap();
+        assert!(journal.require_frozen().is_err());
         journal.check().unwrap();
         drop(journal);
         assert!(page.targets.protected_read_barrier().is_ok());

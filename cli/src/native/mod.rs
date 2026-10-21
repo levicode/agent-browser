@@ -11,6 +11,8 @@ pub mod cdp;
 #[allow(dead_code)]
 pub mod client_actions;
 #[allow(dead_code)]
+pub mod client_app_events;
+#[allow(dead_code)]
 pub mod client_blobs;
 #[allow(dead_code)]
 pub mod client_browser;
@@ -19,21 +21,34 @@ pub mod client_capture;
 #[allow(dead_code)]
 pub mod client_enrollment;
 #[allow(dead_code)]
+pub mod client_geometry;
+#[allow(dead_code)]
 pub mod client_network;
 #[allow(dead_code)]
 pub mod client_observation;
+#[allow(dead_code)] // Executor wiring and capabilities are separately reviewed.
+pub mod client_observation_dispatch;
 #[allow(dead_code)]
 pub mod client_page;
+#[allow(dead_code)]
+pub mod client_persistent;
 #[allow(dead_code)]
 pub mod client_protected_read;
 #[allow(dead_code)]
 pub mod client_protocol;
 #[allow(dead_code)]
+pub mod client_reconnect;
+#[allow(dead_code)]
+pub mod client_resource_dispatch;
+#[allow(dead_code)]
 pub mod client_session;
 #[allow(dead_code)]
 pub mod client_state;
 #[allow(dead_code)]
+pub mod client_state_dispatch;
+#[allow(dead_code)]
 pub mod client_targets;
+pub mod client_tasks;
 pub mod client_transport;
 pub mod client_ui;
 #[allow(dead_code)]
@@ -81,3 +96,10 @@ pub mod webmcp;
 mod e2e_tests;
 #[cfg(test)]
 mod parity_tests;
+
+#[cfg(feature = "acceptance-faults")]
+#[allow(dead_code)]
+pub mod client_test_faults;
+
+#[allow(dead_code)]
+pub mod client_restart;
