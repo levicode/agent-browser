@@ -93,6 +93,8 @@ pub struct ActionContext<'a> {
     pub page_state: &'a ClientPageState,
     pub refs: &'a RefMap,
     pub revision: u64,
+    pub observation_after: Option<u64>,
+    pub observed_revision: u64,
     pub iframe_sessions: &'a HashMap<String, String>,
     pub blobs: &'a BlobStore,
     pub geometry: &'a GeometrySnapshot,
@@ -672,6 +674,7 @@ impl ClientActions {
             "browser.pointer" => {
                 let request: Pointer = decode(args)?;
                 scope(ctx, &request.identity_scope)?;
+                require_recovery_observation(ctx)?;
                 self.pointer(ctx, d, request.point.validate()?, request.action)
                     .await?;
             }
@@ -691,6 +694,7 @@ impl ClientActions {
             "browser.keyboard.press" => {
                 let request: KeyboardPress = decode(args)?;
                 scope(ctx, &request.identity_scope)?;
+                require_recovery_observation(ctx)?;
                 keyboard(ctx, d, "press", &request.key).await?;
             }
             "recording.start" => {
@@ -2435,13 +2439,20 @@ fn observation_action_error(
         ObservationError::BackendFailure => ProtocolError::BrowserFailure,
     }
 }
+fn require_recovery_observation(ctx: &ActionContext<'_>) -> Result<(), ProtocolError> {
+    if ctx
+        .observation_after
+        .is_some_and(|baseline| ctx.observed_revision <= baseline)
+    {
+        return Err(ProtocolError::StaleReference);
+    }
+    Ok(())
+}
 async fn require_editable_focus(
     ctx: &ActionContext<'_>,
     d: &Dispatch,
 ) -> Result<(), ProtocolError> {
-    if ctx.revision == 0 {
-        return Err(ProtocolError::StaleReference);
-    }
+    require_recovery_observation(ctx)?;
     let frames = super::client_observation::enumerate_frames(
         &ctx.page.client,
         &ctx.page.page_session_id,
@@ -2620,6 +2631,50 @@ fn read_recording(
     Ok(bytes)
 }
 
+/// Direct-executor fixtures must reproduce the real reader's broker admission
+/// and settlement. ClientBrowser itself owns start(); never pre-start its lease.
+#[cfg(test)]
+pub(crate) struct FixtureOperations {
+    broker: Arc<super::client_session::ClientSession>,
+    sequence: u64,
+}
+#[cfg(test)]
+impl FixtureOperations {
+    pub(crate) fn new(broker: Arc<super::client_session::ClientSession>) -> Self {
+        Self {
+            broker,
+            sequence: 0,
+        }
+    }
+    pub(crate) async fn execute(
+        &mut self,
+        executor: &impl super::client_transport::ClientExecutor,
+        command: &str,
+        args: Value,
+        seconds: u64,
+    ) -> Result<super::client_transport::NativeOutcome, ProtocolError> {
+        let args = args
+            .as_object()
+            .ok_or(ProtocolError::InvalidArguments)?
+            .clone();
+        self.sequence = self
+            .sequence
+            .checked_add(1)
+            .ok_or(ProtocolError::IdentifierExhausted)?;
+        let lease = self.broker.admit(
+            1,
+            self.sequence,
+            seconds
+                .checked_mul(1000)
+                .ok_or(ProtocolError::InvalidTimeout)?,
+        )?;
+        self.broker.validate_reconnect_operation(&lease)?;
+        let outcome = executor.execute(command.into(), args, lease).await;
+        self.broker.settle(1, self.sequence, outcome.effects)?;
+        Ok(outcome)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -2644,6 +2699,8 @@ mod tests {
     impl Fixture {
         fn context(&self) -> ActionContext<'_> {
             ActionContext {
+                observation_after: None,
+                observed_revision: 0,
                 realm_authority: ActionRealmAuthority::UntrackedFixture,
                 page: &self.page,
                 operation: &self.op,
@@ -2937,6 +2994,69 @@ mod tests {
             ProtocolError::BrowserFailure
         );
     }
+    #[tokio::test]
+    async fn direct_browser_fixture_admits_and_settles_real_broker_operations() {
+        use super::super::{
+            client_browser::ClientBrowser, client_session::ClientSession,
+            client_transport::ClientExecutor,
+        };
+        let broker = Arc::new(ClientSession::new());
+        let browser = ClientBrowser::new(broker.clone());
+        let mut operations = FixtureOperations::new(broker.clone());
+        for _ in 0..2 {
+            let outcome = operations
+                .execute(
+                    &browser,
+                    "page.title",
+                    json!({"identityScope":"not-open"}),
+                    2,
+                )
+                .await
+                .unwrap();
+            assert_eq!(outcome.result, Err(ProtocolError::StaleScope));
+            assert_eq!(outcome.effects, Effects::NotDispatched);
+            assert_eq!(
+                broker.cancel(1, operations.sequence),
+                Err(ProtocolError::OperationMissing)
+            );
+        }
+        assert_eq!(operations.sequence, 2);
+        browser.shutdown().await.unwrap();
+        // Unlike a scope mismatch, reuse enters the real lifecycle dispatch and
+        // calls broker.start. No retained browser exists, so the expected later
+        // failure is ScopeUnavailable, never OperationMissing or pre-start cancel.
+        let broker = Arc::new(ClientSession::new());
+        let browser = ClientBrowser::new(broker.clone());
+        let (sink, _events) =
+            super::super::client_transport::ClientEventSink::test_channel(broker.clone());
+        browser.set_event_sink(sink).unwrap();
+        let mut operations = FixtureOperations::new(broker.clone());
+        let outcome = operations
+            .execute(
+                &browser,
+                "scope.open",
+                json!({"source":"reuse","context":"isolated"}),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.result, Err(ProtocolError::ScopeUnavailable));
+        // Failed mutating lifecycle work quarantines the broker. cancel checks
+        // health before operation existence; settle still proves exact removal.
+        assert_eq!(outcome.effects, Effects::Unknown);
+        assert_eq!(
+            broker.health().unwrap().1,
+            super::super::client_protocol::ScopeState::Quarantined
+        );
+        assert_eq!(broker.cancel(1, 1), Err(ProtocolError::ScopeUnavailable));
+        assert_eq!(
+            broker.settle(1, 1, Effects::NotDispatched),
+            Err(ProtocolError::OperationMissing)
+        );
+        // The deliberately failed mutating startup retains its uncertainty
+        // journal. Drain it, but do not relabel that production outcome clean.
+        assert_eq!(browser.shutdown().await, Err(ProtocolError::CleanupFailed));
+    }
     #[test]
     fn stale_does_not_erase_unknown_effects_after_dispatch() {
         let d = Dispatch::default();
@@ -3086,6 +3206,61 @@ mod tests {
                 assert_eq!(error.error, ProtocolError::StaleScope);
             } else {
                 assert_eq!(error.error, ProtocolError::Cancelled);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn initial_focused_keyboard_needs_no_snapshot_but_reconnect_does() {
+        for (baseline, revision, allowed) in [
+            (None, 0, true),
+            (Some(0), 0, false),
+            (Some(0), 1, true),
+            (Some(7), 7, false),
+            (Some(7), 8, true),
+        ] {
+            let f = fixture("normal").await;
+            if !allowed {
+                for (command, args) in [
+                    (
+                        "browser.keyboard.press",
+                        json!({"identityScope":"scope","key":"Enter"}),
+                    ),
+                    (
+                        "browser.pointer",
+                        json!({"identityScope":"scope","point":{"x":10,"y":20},"action":{"kind":"tap"}}),
+                    ),
+                ] {
+                    let mut context = f.context();
+                    context.observation_after = baseline;
+                    context.observed_revision = revision;
+                    let failure = ClientActions::default()
+                        .execute(context, command, &args)
+                        .await
+                        .unwrap_err();
+                    assert_eq!(failure.error, ProtocolError::StaleReference);
+                    assert_eq!(failure.effects, Effects::NotDispatched);
+                    assert!(f.inputs().is_empty());
+                }
+            }
+            let mut context = f.context();
+            context.observation_after = baseline;
+            context.observed_revision = revision;
+            context.revision = revision;
+            let result = ClientActions::default()
+                .execute(
+                    context,
+                    "browser.keyboard.type",
+                    &json!({"identityScope":"scope","replace":true,"text":"Z"}),
+                )
+                .await;
+            if allowed {
+                result.unwrap();
+                assert!(!f.inputs().is_empty());
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.error, ProtocolError::StaleReference);
+                assert_eq!(failure.effects, Effects::NotDispatched);
+                assert!(f.inputs().is_empty());
             }
         }
     }
@@ -4102,6 +4277,19 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires hosted Chromium: production protected observe then exact checked action with bounded stage evidence"]
     async fn chromium_protected_observe_then_exact_check_uses_committed_snapshot() {
+        chromium_checked_action_acquisition("protected").await;
+    }
+    #[tokio::test]
+    #[ignore = "requires hosted Chromium: production query then checked action baseline"]
+    async fn chromium_fixture_query_then_exact_check_without_observation() {
+        chromium_checked_action_acquisition("fixture").await;
+    }
+    #[tokio::test]
+    #[ignore = "requires hosted Chromium: production iframe query then checked action without observation"]
+    async fn chromium_iframe_query_then_exact_check_without_observation() {
+        chromium_checked_action_acquisition("iframe").await;
+    }
+    async fn chromium_checked_action_acquisition(acquisition: &str) {
         use super::super::{
             client_browser::ClientBrowser,
             client_session::ClientSession,
@@ -4109,27 +4297,16 @@ mod tests {
         };
         async fn run(
             browser: &ClientBrowser,
-            sequence: &mut u64,
-            cancellation: &tokio::sync::watch::Receiver<CancelSignal>,
+            operations: &mut FixtureOperations,
             command: &str,
             args: Value,
             seconds: u64,
         ) -> Result<Value, String> {
-            *sequence += 1;
             eprintln!("native-observe-action-stage command.start {command}");
-            let outcome = browser
-                .execute(
-                    command.into(),
-                    args.as_object().ok_or("fixture shape")?.clone(),
-                    OperationLease {
-                        generation: 1,
-                        sequence: *sequence,
-                        is_callback: false,
-                        deadline: Instant::now() + Duration::from_secs(seconds),
-                        cancellation: cancellation.clone(),
-                    },
-                )
-                .await;
+            let outcome = operations
+                .execute(browser, command, args, seconds)
+                .await
+                .map_err(|error| format!("fixture admission/settlement: {error:?}"))?;
             eprintln!(
                 "native-observe-action-stage command.settled {command} effects={:?}",
                 outcome.effects
@@ -4149,35 +4326,44 @@ mod tests {
         }
         let broker = Arc::new(ClientSession::new());
         let browser = ClientBrowser::new(broker.clone());
-        let (sink, _events) = ClientEventSink::test_channel(broker);
+        let (sink, _events) = ClientEventSink::test_channel(broker.clone());
         browser.set_event_sink(sink).unwrap();
-        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
-        let mut sequence = 0;
+        let mut operations = FixtureOperations::new(broker);
         let result: Result<(), String> = async {
-            let opened = run(&browser, &mut sequence, &cancellation, "scope.open", json!({
+            let opened = run(&browser, &mut operations, "scope.open", json!({
                 "source":"launch", "context":"isolated", "headless":true,
                 "blockServiceWorkers":false,"viewport":{"width":800,"height":600},"media":{},"initScripts":[]
             }), 30).await?;
             let scope = opened["identityScope"].as_str().ok_or("missing scope")?;
-            run(&browser, &mut sequence, &cancellation, "scope.configure", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","requestPolicy":{},"downloads":{"source":"local"}}), 30).await?;
-            run(&browser, &mut sequence, &cancellation, "page.activate", json!({"identityScope":scope}), 30).await?;
-            run(&browser, &mut sequence, &cancellation, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}), 2).await?;
-            let query = run(&browser, &mut sequence, &cancellation, "fixture.query", json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#box"}}), 2).await?;
+            run(&browser, &mut operations, "scope.configure", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","requestPolicy":{},"downloads":{"source":"local"}}), 30).await?;
+            run(&browser, &mut operations, "page.activate", json!({"identityScope":scope}), 30).await?;
+            run(&browser, &mut operations, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}), 2).await?;
+            if acquisition=="iframe" {
+                // Install a same-origin frame synchronously, without timer sleeps.
+                run(&browser,&mut operations,"page.evaluate",json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<iframe id=child></iframe>';document.querySelector('#child').contentDocument.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}),2).await?;
+            }
+            eprintln!("native-observe-action-stage acquisition {acquisition}");
+            let expression=if acquisition=="iframe" {json!({"kind":"frame","selector":"#child","source":{"kind":"selector","selector":"#box"}})} else {json!({"kind":"selector","selector":"#box"})};
+            let query = run(&browser, &mut operations, "fixture.query", json!({"identityScope":scope,"expression":expression}), 2).await?;
             let nodes = query["nodes"].as_array().ok_or("missing query nodes")?;
             if nodes.len() != 1 { return Err("query did not locate one synthetic checkbox".into()); }
-            let snapshot = run(&browser, &mut sequence, &cancellation, "browser.observe", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","options":{}}), 2).await?;
-            let reference = find(&snapshot["root"], &nodes[0]["ref"]["id"]).ok_or("query identity missing from committed observation")?;
+            let reference=if acquisition=="protected" {
+                let snapshot = run(&browser, &mut operations, "browser.observe", json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","options":{}}), 2).await?;
+                find(&snapshot["root"], &nodes[0]["ref"]["id"]).ok_or("query identity missing from committed observation")?
+            } else {nodes[0]["ref"].clone()};
             // Actual central dispatch acquires snapshot_for_action; no supplied
             // ref map, synthetic readiness ACK or protected-read bypass.
-            run(&browser, &mut sequence, &cancellation, "browser.perform", json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}), 2).await?;
-            let state = run(&browser, &mut sequence, &cancellation, "page.evaluate", json!({"identityScope":scope,"source":"()=>document.querySelector('#box').checked","argument":null}), 2).await?;
+            run(&browser, &mut operations, "browser.perform", json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}), 2).await?;
+            let source=if acquisition=="iframe" {"()=>document.querySelector('#child').contentDocument.querySelector('#box').checked"} else {"()=>document.querySelector('#box').checked"};
+            let state = run(&browser, &mut operations, "page.evaluate", json!({"identityScope":scope,"source":source,"argument":null}), 2).await?;
             if state["value"] != true { return Err("observed checkbox did not become checked".into()); }
-            run(&browser, &mut sequence, &cancellation, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=radio type=radio>Navigate</label>';document.querySelector('#radio').addEventListener('click',()=>location.replace('about:blank?native-checked-navigation'));return true}","argument":null}), 2).await?;
-            let query=run(&browser,&mut sequence,&cancellation,"fixture.query",json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#radio"}}),2).await?;
-            let snapshot=run(&browser,&mut sequence,&cancellation,"browser.observe",json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","options":{}}),2).await?;
+            if acquisition!="protected" {return Ok(());}
+            run(&browser, &mut operations, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=radio type=radio>Navigate</label>';document.querySelector('#radio').addEventListener('click',()=>location.replace('about:blank?native-checked-navigation'));return true}","argument":null}), 2).await?;
+            let query=run(&browser,&mut operations,"fixture.query",json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#radio"}}),2).await?;
+            let snapshot=run(&browser,&mut operations,"browser.observe",json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password]","options":{}}),2).await?;
             let reference=find(&snapshot["root"],&query["nodes"][0]["ref"]["id"]).ok_or("radio missing from committed snapshot")?;
-            run(&browser,&mut sequence,&cancellation,"browser.perform",json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}),2).await?;
-            let location=run(&browser,&mut sequence,&cancellation,"page.evaluate",json!({"identityScope":scope,"source":"()=>location.href","argument":null}),2).await?;
+            run(&browser,&mut operations,"browser.perform",json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}),2).await?;
+            let location=run(&browser,&mut operations,"page.evaluate",json!({"identityScope":scope,"source":"()=>location.href","argument":null}),2).await?;
             if location["value"]!="about:blank?native-checked-navigation" {return Err("checked radio did not navigate".into());}
             Ok(())
         }.await;
@@ -4229,13 +4415,13 @@ mod tests {
                 ("#check", json!({"kind":"check"})),
                 ("#button", json!({"kind":"doubleTap"})),
             ] {
-                actions.execute(ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
+                actions.execute(ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
             }
             let value = evaluate_on(&browser.client,&session,"[document.querySelector('#text').value,document.querySelector('#pick').value,document.querySelector('#check').checked,document.querySelector('#button').dataset.clicked]").await?;
             assert_eq!(value,json!(["native synthetic","b",true,"2"]));
-            actions.execute(ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
+            actions.execute(ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
             evaluate_on(&browser.client,&session,"document.querySelector('#button').remove(); true").await?;
-            assert!(actions.execute(ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
+            assert!(actions.execute(ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
             actions.cleanup().await.map_err(|_|"cleanup failed")?;
             Ok::<(),String>(())
         }.await;
@@ -4279,11 +4465,11 @@ mod tests {
             blobs.activate_scope(BlobScope{generation:1,identity_scope:page.identity_scope.clone()}).unwrap();
             let sessions=HashMap::new();let actions=ClientActions::default();
             let args=json!({"identityScope":page.identity_scope,"ref":{"id":id,"revision":"1"},"action":{"kind":"tap"}});
-            actions.execute(ActionContext{realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.map_err(|e|format!("Nested action failed: {:?}",e.error))?;
+            actions.execute(ActionContext{ observation_after: None, observed_revision: 0,realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.map_err(|e|format!("Nested action failed: {:?}",e.error))?;
             assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
             evaluate_on(&page.client,&session,"const cover=document.createElement('div');cover.style.cssText='position:fixed;inset:0;z-index:999;background:red';document.body.append(cover);true").await?;
             operation.deadline=Instant::now()+Duration::from_secs(2);
-            let error=actions.execute(ActionContext{realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.unwrap_err();
+            let error=actions.execute(ActionContext{ observation_after: None, observed_revision: 0,realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.unwrap_err();
             assert_eq!(error.error,ProtocolError::NotActionable);assert_eq!(error.reason,Some(ActionReason::InterceptedPointer));
             assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
             actions.cleanup().await.map_err(|_|"Action cleanup failed")?;Ok::<(),String>(())
@@ -4348,12 +4534,12 @@ mod tests {
             blobs.activate_scope(first_scope.clone()).unwrap();
             let first_geometry=action_fixture_geometry(&first_page,&operation).await?;
             let second_geometry=action_fixture_geometry(&second_page,&operation).await?;
-            let first_context = || ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&first_page,operation:&operation,page_state:&first_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&first_geometry};
+            let first_context = || ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&first_page,operation:&operation,page_state:&first_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&first_geometry};
             actions.execute(first_context(), "recording.start", &json!({"identityScope":first_page.identity_scope,"size":{"width":320,"height":200},"quality":70})).await.map_err(|e|format!("record start {:?}",e.error))?;
             actions.recording_page_closing(&first_page.identity_scope, &blobs).await.map_err(|e|format!("record close {e:?}"))?;
             blobs.revoke_scope(&first_scope).unwrap();
             blobs.activate_scope(second_scope.clone()).unwrap();
-            let second_context = || ActionContext { realm_authority: ActionRealmAuthority::UntrackedFixture, page:&second_page,operation:&operation,page_state:&second_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&second_geometry};
+            let second_context = || ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&second_page,operation:&operation,page_state:&second_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&second_geometry};
             actions.recording_page_opened(second_context()).await.map_err(|e|format!("record reopen {:?}",e.error))?;
             let output = actions.execute(second_context(), "recording.stop", &json!({"identityScope":second_page.identity_scope})).await.map_err(|e|format!("record stop {:?}",e.error))?;
             let segments = output["segments"].as_array().ok_or("missing segments")?;

@@ -85,6 +85,7 @@ pub struct DispatchTask {
 struct Publication {
     revision: u64,
     published_revision: u64,
+    observed_revision: u64,
 }
 #[derive(Clone, Copy)]
 enum PublicationKind {
@@ -115,6 +116,9 @@ impl Publication {
         if !matches!(kind, PublicationKind::PixelsOnly) {
             *destination = staged;
             self.published_revision = revision;
+            if matches!(kind, PublicationKind::Snapshot) {
+                self.observed_revision = revision;
+            }
         }
     }
 }
@@ -133,6 +137,7 @@ impl ObservationDispatch {
             publication: tokio::sync::Mutex::new(Publication {
                 revision: 0,
                 published_revision: 0,
+                observed_revision: 0,
             }),
         })
     }
@@ -142,6 +147,13 @@ impl ObservationDispatch {
         &self,
         operation: &OperationLease,
     ) -> Result<(u64, RefMap), ProtocolError> {
+        let (revision, refs, _) = self.snapshot_with_observation(operation).await?;
+        Ok((revision, refs))
+    }
+    pub async fn snapshot_with_observation(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<(u64, RefMap, u64), ProtocolError> {
         let mut cancellation = operation.cancellation.clone();
         if *cancellation.borrow() != CancelSignal::None {
             return Err(ProtocolError::Cancelled);
@@ -166,7 +178,11 @@ impl ObservationDispatch {
         if Instant::now() >= operation.deadline {
             return Err(ProtocolError::DeadlineExceeded);
         }
-        Ok((publication.published_revision, refs))
+        Ok((
+            publication.published_revision,
+            refs,
+            publication.observed_revision,
+        ))
     }
     pub fn start(
         self: Arc<Self>,
@@ -1736,10 +1752,45 @@ mod tests {
         assert_ne!(current, original); // Strict action revision equality rejects the old ref.
     }
     #[test]
+    fn only_committed_observation_advances_reconnect_evidence() {
+        let mut publication = Publication {
+            revision: 0,
+            published_revision: 0,
+            observed_revision: 0,
+        };
+        let mut refs = RefMap::new();
+        for kind in [PublicationKind::AdditiveQuery, PublicationKind::PixelsOnly] {
+            let revision = publication.stage_revision(kind).unwrap();
+            publication.commit_refs(kind, revision, &mut refs, RefMap::new());
+            assert_eq!(publication.observed_revision, 0);
+        }
+        let abandoned = publication
+            .stage_revision(PublicationKind::Snapshot)
+            .unwrap();
+        assert_eq!(publication.observed_revision, 0);
+        let committed = publication
+            .stage_revision(PublicationKind::Snapshot)
+            .unwrap();
+        assert!(committed > abandoned);
+        publication.commit_refs(
+            PublicationKind::Snapshot,
+            committed,
+            &mut refs,
+            RefMap::new(),
+        );
+        assert_eq!(publication.observed_revision, committed);
+        for kind in [PublicationKind::AdditiveQuery, PublicationKind::PixelsOnly] {
+            let revision = publication.stage_revision(kind).unwrap();
+            publication.commit_refs(kind, revision, &mut refs, RefMap::new());
+            assert_eq!(publication.observed_revision, committed);
+        }
+    }
+    #[test]
     fn initial_query_allocates_epoch_and_pixels_do_not_allocate_one() {
         let mut publication = Publication {
             revision: 0,
             published_revision: 0,
+            observed_revision: 0,
         };
         assert_eq!(
             publication

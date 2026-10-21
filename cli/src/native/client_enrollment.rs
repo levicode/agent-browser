@@ -1997,6 +1997,17 @@ impl ClientEnrollment {
             .await?;
         let page_target = matches!(entry.kind.as_str(), "page" | "iframe");
         if page_target {
+            // Chromium fixes includeWhitespace at the first DOM.enable (and
+            // DOM.getDocument implicitly enables with the default "none").
+            // Set it once on our Application session before any DOM consumer;
+            // observer-only host sessions and workers never enter this branch.
+            self.command(
+                op,
+                Some(&entry.session),
+                "DOM.enable",
+                json!({"includeWhitespace":"all"}),
+            )
+            .await?;
             self.initial_settings(&entry, op).await?;
             self.command(op, Some(&entry.session), "Page.enable", json!({}))
                 .await?;
@@ -3897,6 +3908,7 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut detach_count = 0;
             let mut realm_loader = "synthetic-loader".to_owned();
+            let mut whitespace = HashMap::<String, bool>::new();
             let mut closed_targets = std::collections::HashSet::<String>::new();
             loop {
                 tokio::select! {
@@ -3954,7 +3966,15 @@ mod tests {
                                 socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic release failure"}}).to_string())).await.unwrap();continue;
                             }
                         }
+                        if mode=="dom-enable-fails" && method=="DOM.enable" {
+                            socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic DOM enable failure"}}).to_string())).await.unwrap();continue;
+                        }
+                        if matches!(method,"DOM.enable"|"DOM.getDocument") {
+                            let session=request["sessionId"].as_str().unwrap().to_owned();
+                            whitespace.entry(session).or_insert(method=="DOM.enable" && request["params"]["includeWhitespace"]=="all");
+                        }
                         let mut result=match method {
+                            "DOM.getDocument"=>json!({"root":{"nodeId":1,"children":if whitespace.get(request["sessionId"].as_str().unwrap())==Some(&true) {vec![json!({"nodeId":2,"nodeType":3,"nodeValue":" "})]}else{vec![]}}}),
                             "Page.createIsolatedWorld" if mode.starts_with("realm-resolve-reuse")=>json!({"executionContextId":7}),
                             "DOM.resolveNode" if mode.starts_with("realm-resolve-reuse")=>json!({"object":{"objectId":"replacement-handle","subtype":"node"}}),
                             "Runtime.callFunctionOn" if mode.starts_with("realm-resolve-reuse")=>json!({"result":{"value":true}}),
@@ -4226,7 +4246,7 @@ mod tests {
             .unwrap();
             let blobs = BlobStore::new(BlobLimits::default()).unwrap();
             let frames = HashMap::new();
-            let failure=ClientActions::default().execute(ActionContext {
+            let failure=ClientActions::default().execute(ActionContext { observation_after: None, observed_revision: 0,
                 realm_authority:ActionRealmAuthority::Enrolled(&owner),page:&page,operation:&op,
                 page_state:&owner.page,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry,
             },"browser.perform",&json!({"identityScope":"owned-scope","ref":{"id":format!("@{id}"),"revision":"1"},"action":{"kind":"check"}})).await.unwrap_err();
@@ -6060,6 +6080,92 @@ mod tests {
             Some((AppNavigationKind::Frame, Some("checkout".into())))
         );
         owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn application_dom_whitespace_is_enabled_before_first_document_and_resume() {
+        let (owner, _notices, log, _emit, server) = fixture("normal").await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner
+            .attached(attach(
+                "owned-context",
+                "child-target",
+                "child",
+                "iframe",
+                Some("initial"),
+            ))
+            .await
+            .unwrap();
+        owner
+            .attached(attach(
+                "owned-context",
+                "worker-target",
+                "worker",
+                "worker",
+                Some("initial"),
+            ))
+            .await
+            .unwrap();
+        for session in ["initial", "child"] {
+            let tree = owner
+                .client
+                .send_command_no_params("DOM.getDocument", Some(session))
+                .await
+                .unwrap();
+            assert_eq!(tree["root"]["children"][0]["nodeValue"], " ");
+            let commands = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["sessionId"] == session)
+                .cloned()
+                .collect::<Vec<_>>();
+            let enabled = commands
+                .iter()
+                .position(|r| r["method"] == "DOM.enable")
+                .unwrap();
+            assert_eq!(
+                commands[enabled]["params"],
+                json!({"includeWhitespace":"all"})
+            );
+            let first_dom = commands
+                .iter()
+                .position(|r| r["method"].as_str().is_some_and(|m| m.starts_with("DOM.")))
+                .unwrap();
+            assert_eq!(enabled, first_dom);
+            for method in ["DOM.getDocument", "Runtime.runIfWaitingForDebugger"] {
+                assert!(enabled < commands.iter().position(|r| r["method"] == method).unwrap());
+            }
+            assert!(!commands.iter().any(|r| r["method"] == "DOM.disable"));
+        }
+        assert!(!log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["sessionId"] == "worker"
+                && r["method"].as_str().is_some_and(|m| m.starts_with("DOM."))));
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn failed_initial_dom_enable_does_not_resume_application() {
+        let (owner, _notices, log, _emit, server) = fixture("dom-enable-fails").await;
+        assert_eq!(
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await,
+            Err(ProtocolError::BrowserFailure)
+        );
+        let commands = log.lock().unwrap().clone();
+        assert!(commands.iter().any(|r| r["method"] == "DOM.enable"));
+        assert!(!commands.iter().any(|r| matches!(
+            r["method"].as_str(),
+            Some("DOM.getDocument" | "DOM.disable" | "Runtime.runIfWaitingForDebugger")
+        )));
+        let _ = owner.close().await;
         server.abort();
     }
     #[tokio::test]

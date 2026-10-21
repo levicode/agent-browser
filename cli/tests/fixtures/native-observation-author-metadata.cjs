@@ -63,3 +63,18 @@ assert.equal(read.call(full, 'data-testid', '.secure', true).__nativeStatus, 're
 const elementRead = new Element(); elementRead.innerText = 'Full fixture text';
 assert.equal(read.call(elementRead, 'data-testid', '.secure').text, 'Full fixture text');
 console.log('PASS: bounded observation never materializes full Text/ancestor text; direct reads retain full text');
+
+// Author tree suppression accepts ARIA boolean values case-insensitively;
+// this does not rewrite raw layout visibility or direct-read text.
+for (const value of ['true', 'TRUE', 'TrUe']) {
+  const hidden = new Element(); hidden.innerText = 'Still readable by exact reference';
+  hidden.getAttribute = name => name === 'aria-hidden' ? value : null;
+  const facts = read.call(hidden, 'data-testid', '.secure', true);
+  assert.equal(facts.author.suppress, true);
+  assert.equal(facts.states.hidden, false);
+  assert.equal(read.call(hidden, 'data-testid', '.secure').text, hidden.innerText);
+}
+const shown = new Element();
+shown.getAttribute = name => name === 'aria-hidden' ? 'FALSE' : null;
+assert.equal(read.call(shown, 'data-testid', '.secure', true).author.suppress, false);
+console.log('PASS: aria-hidden suppression is case-insensitive without changing raw visibility or exact reads');

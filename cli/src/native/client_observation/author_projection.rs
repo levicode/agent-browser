@@ -433,6 +433,12 @@ pub(super) fn compact(
             )?);
         }
         if keep {
+            // Public observation omits false flags, but preserves explicit
+            // false values for checkable/selection/expansion states. Keep the
+            // raw read and internal visibility facts untouched.
+            node.states.retain(|name, value| {
+                *value || !matches!(name.as_str(), "disabled" | "focused" | "hidden" | "secure")
+            });
             node.children = children;
             Ok(vec![node])
         } else {
@@ -552,6 +558,25 @@ mod tests {
     fn texts(nodes: &[SemanticNode]) -> Vec<Option<&str>> {
         flat(nodes).into_iter().map(|n| n.text.as_deref()).collect()
     }
+    #[test]
+    fn emitted_flags_omit_false_without_losing_explicit_control_states() {
+        let mut fixture = Fixture::default();
+        let element = fixture.el("button", Some("button"), vec![]);
+        let id = element["backendNodeId"].as_i64().unwrap();
+        let node = fixture.nodes.get_mut(&id).unwrap();
+        for name in [
+            "disabled", "focused", "hidden", "secure", "checked", "selected", "expanded", "pressed",
+        ] {
+            node.states.insert(name.into(), false);
+        }
+        let result = fixture.run(vec![element]);
+        assert_eq!(result[0].states.len(), 4);
+        for name in ["checked", "selected", "expanded", "pressed"] {
+            assert_eq!(result[0].states.get(name), Some(&false));
+        }
+        assert_eq!(result[0].reference.id, format!("@fixture{id}"));
+    }
+
     fn reference(node: &Value) -> String {
         format!("@fixture{}", node["backendNodeId"])
     }

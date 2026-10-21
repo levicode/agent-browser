@@ -445,7 +445,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const inline=!!style&&(style.display.startsWith('inline')||style.display.startsWith('ruby')||style.display==='contents');
  const breaking=!!e&&(Element.prototype.matches.call(e,'br,input,textarea,select,button,iframe')||e.isContentEditable);
  const action=!!e&&(e.hasAttribute('onclick')||typeof e.onclick==='function'||tag==='a'||/^\s*[-+]?\d/.test(e.getAttribute('tabindex')||''));
- const suppress=!!e&&(Element.prototype.matches.call(e,'script,style,head,template,noscript')||e.getAttribute('aria-hidden')==='true'||e.hasAttribute('inert')||style.display==='none');
+ const suppress=!!e&&(Element.prototype.matches.call(e,'script,style,head,template,noscript')||(e.getAttribute('aria-hidden')||'').toLowerCase()==='true'||e.hasAttribute('inert')||style.display==='none');
  let textVisible=false;
  if(this.nodeType===3&&!secure){
    const parent=this.parentElement||this.getRootNode()?.host;
@@ -546,13 +546,23 @@ fn project_node(
         })
         .transpose()?;
     if author.is_some()
-        && data["attributes"]["role"].is_null()
+        // AX has already selected the effective role. An arbitrary authored
+        // attribute is not evidence that an incidental AX role was requested:
+        // ARIA token separation is ASCII whitespace, not Unicode whitespace.
+        && !data["attributes"]["role"].as_str().is_some_and(|authored| {
+            authored.split_ascii_whitespace().any(|token| {
+                Some(token) == role.as_deref()
+                    && !matches!(token, "LabelText" | "sectionheader" | "sectionfooter")
+            })
+        })
         && matches!(
             role.as_deref(),
             Some(
                 "generic"
                     | "none"
                     | "LabelText"
+                    | "sectionheader"
+                    | "sectionfooter"
                     | "paragraph"
                     | "strong"
                     | "emphasis"
@@ -670,6 +680,63 @@ fn project_node(
     Ok(node)
 }
 
+// Capture parents first so an exact, validated hidden iframe owner can exclude
+// its document before any child content is acquired. A missing/cyclic parent is
+// not evidence of invisibility and must fail closed.
+fn observation_frame_order(
+    frames: &[ObservationFrame],
+) -> Result<Vec<&ObservationFrame>, ObservationError> {
+    if frames.len() > 100_000 {
+        return Err(ObservationError::ResourceLimit);
+    }
+    let mut by_id = HashMap::new();
+    for frame in frames {
+        if by_id.insert(frame.binding.frame.as_str(), frame).is_some() {
+            return Err(ObservationError::BackendFailure);
+        }
+    }
+    let mut ordered = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let mut ancestor = frame;
+        let mut depth = 0usize;
+        while let Some(parent) = ancestor.parent_frame_id.as_deref() {
+            depth += 1;
+            if depth > 256 {
+                return Err(ObservationError::BackendFailure);
+            }
+            ancestor = by_id
+                .get(parent)
+                .copied()
+                .ok_or(ObservationError::BackendFailure)?;
+        }
+        ordered.push((depth, frame));
+    }
+    ordered.sort_by_key(|(depth, _)| *depth);
+    Ok(ordered.into_iter().map(|(_, frame)| frame).collect())
+}
+
+fn proven_hidden_iframe(node: &SemanticNode) -> bool {
+    node.states.get("hidden") == Some(&true)
+        && node
+            .author
+            .as_ref()
+            .is_some_and(|facts| facts.node_type == 1 && facts.tag == "iframe")
+}
+
+fn frame_has_hidden_owner(
+    frame: &ObservationFrame,
+    hidden_owners: &std::collections::HashSet<(String, i64)>,
+    skipped_frames: &std::collections::HashSet<String>,
+) -> Result<bool, ObservationError> {
+    let Some(parent) = frame.parent_frame_id.as_ref() else {
+        return Ok(false);
+    };
+    let backend = frame
+        .owner_backend_id
+        .ok_or(ObservationError::BackendFailure)?;
+    Ok(skipped_frames.contains(parent) || hidden_owners.contains(&(parent.clone(), backend)))
+}
+
 /// Capture all requested frames to staging state. A late failure never publishes
 /// a partial tree or reference registry. Reserved IDs remain consumed.
 pub async fn observe(
@@ -689,8 +756,15 @@ pub async fn observe(
     let mut frame_roots: HashMap<String, Vec<SemanticNode>> = HashMap::new();
     let mut count = 0;
     let mut truncated = false;
-    for frame in frames {
+    let ordered_frames = observation_frame_order(frames)?;
+    let mut hidden_owners = std::collections::HashSet::new();
+    let mut skipped_frames = std::collections::HashSet::new();
+    for frame in ordered_frames {
         check(lease)?;
+        if frame_has_hidden_owner(frame, &hidden_owners, &skipped_frames)? {
+            skipped_frames.insert(frame.binding.frame.clone());
+            continue;
+        }
         validate_frame(client, frame, lease).await?;
         let value = command(
             client,
@@ -762,6 +836,15 @@ pub async fn observe(
                 nodes.insert(id, node);
             }
         }
+        // Publish this proof only after revalidating the exact parent loader.
+        // The key is the native owner backend ID, never a selector/name match.
+        validate_frame(client, frame, lease).await?;
+        hidden_owners.extend(
+            nodes
+                .iter()
+                .filter(|(_, node)| proven_hidden_iframe(node))
+                .map(|(id, _)| (frame.binding.frame.clone(), *id)),
+        );
         let (roots, frame_truncated) =
             author_projection::compact(&graph, nodes, options.max_nodes - count)?;
         let mut pending = roots.iter().collect::<Vec<_>>();
@@ -775,7 +858,10 @@ pub async fn observe(
     }
     let mut pending: Vec<&ObservationFrame> = frames.iter().collect();
     pending.sort_by_key(|f| std::cmp::Reverse(f.frame_path.len()));
-    for child in pending.iter().filter(|f| f.parent_frame_id.is_some()) {
+    for child in pending
+        .iter()
+        .filter(|f| f.parent_frame_id.is_some() && !skipped_frames.contains(&f.binding.frame))
+    {
         let parent = child.parent_frame_id.as_ref().unwrap();
         let backend = child.owner_backend_id.ok_or("Missing native frame owner")?;
         let owner = staged
@@ -2273,15 +2359,7 @@ mod tests {
     }
     #[test]
     fn author_formatting_role_is_omitted_without_changing_explicit_role_or_identity() {
-        for native in [
-            "generic",
-            "none",
-            "paragraph",
-            "LabelText",
-            "strong",
-            "emphasis",
-            "code",
-        ] {
+        for native in ["generic", "none", "paragraph", "strong", "emphasis", "code"] {
             let mut ax = ax("formatting", 42, &[]);
             ax.role.as_mut().unwrap().value = Some(json!(native));
             let mut refs = RefMap::new();
@@ -2294,6 +2372,102 @@ mod tests {
             assert_eq!(named.reference, node.reference);
         }
     }
+    #[test]
+    fn incidental_ax_roles_do_not_become_public_roles_from_invalid_authored_tokens() {
+        for (native, authored) in [
+            ("generic", "unknown\u{a0}button"),
+            ("generic", "unknown widget"),
+            ("sectionheader", ""),
+            ("sectionfooter", ""),
+            ("LabelText", "LabelText"),
+        ] {
+            let mut ax = ax("incidental", 42, &[]);
+            ax.role.as_mut().unwrap().value = Some(json!(native));
+            let mut data = metadata();
+            data["attributes"]["role"] = json!(authored);
+            let node = project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+            assert!(node.role.is_none(), "{native} from {authored:?}");
+        }
+        let mut ax = ax("explicit", 42, &[]);
+        ax.role.as_mut().unwrap().value = Some(json!("strong"));
+        let mut data = metadata();
+        data["attributes"]["role"] = json!("unknown\tstrong");
+        let node = project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+        assert_eq!(node.role.as_deref(), Some("strong"));
+    }
+
+    #[test]
+    fn hidden_iframe_proof_survives_compaction_without_tolerating_missing_owners() {
+        let parent = frame();
+        let mut child = frame();
+        child.binding.frame = "child".into();
+        child.parent_frame_id = Some("main".into());
+        child.owner_backend_id = Some(42);
+        let mut owner = SemanticNode {
+            reference: NodeReference {
+                id: "@owner".into(),
+                revision: "1".into(),
+            },
+            role: Some("iframe".into()),
+            author: Some(author_projection::Facts {
+                tag: "iframe".into(),
+                node_type: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        owner.states.insert("hidden".into(), true);
+        assert!(proven_hidden_iframe(&owner));
+        let hidden = std::collections::HashSet::from([("main".into(), 42)]);
+        let mut skipped = std::collections::HashSet::new();
+        assert!(frame_has_hidden_owner(&child, &hidden, &skipped).unwrap());
+        let root = SemanticNode {
+            author: Some(author_projection::Facts {
+                node_type: 9,
+                visible: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let graph = author_projection::Graph::read(
+            &json!({"nodeType":9,"backendNodeId":1,"children":[{"nodeType":1,"backendNodeId":42}]}),
+        )
+        .unwrap();
+        let nodes = HashMap::from([(1, root), (42, owner.clone())]);
+        let emitted = author_projection::compact(&graph, nodes, 100).unwrap().0;
+        assert!(
+            emitted[0].children.is_empty(),
+            "Hidden owner is intentionally absent"
+        );
+        assert!(
+            !frame_has_hidden_owner(&child, &Default::default(), &skipped).unwrap(),
+            "Missing owner is not hidden proof"
+        );
+        owner.states.insert("hidden".into(), false);
+        assert!(!proven_hidden_iframe(&owner));
+        owner.states.insert("hidden".into(), true);
+        owner.author.as_mut().unwrap().tag = "div".into();
+        assert!(!proven_hidden_iframe(&owner));
+        owner.author.as_mut().unwrap().tag = "iframe".into();
+        owner.author.as_mut().unwrap().node_type = 3;
+        assert!(!proven_hidden_iframe(&owner));
+        let mut nested = child.clone();
+        nested.binding.frame = "nested".into();
+        nested.parent_frame_id = Some("child".into());
+        nested.owner_backend_id = Some(43);
+        skipped.insert("child".into());
+        assert!(frame_has_hidden_owner(&nested, &hidden, &skipped).unwrap());
+        nested.owner_backend_id = None;
+        assert!(frame_has_hidden_owner(&nested, &hidden, &skipped).is_err());
+        let frames = [child.clone(), parent];
+        let ordered = observation_frame_order(&frames).unwrap();
+        assert_eq!(ordered[0].binding.frame, "main");
+        assert_eq!(ordered[1].binding.frame, "child");
+        assert!(observation_frame_order(&[child.clone()]).is_err());
+        child.parent_frame_id = Some("child".into());
+        assert!(observation_frame_order(&[child]).is_err());
+    }
+
     #[test]
     fn public_labels_normalize_embedded_control_whitespace() {
         assert_eq!(normalize_public_label("Qty  items"), "Qty items");
@@ -2760,6 +2934,20 @@ mod tests {
                 let node=found.nodes.first().ok_or("Visibility fixture missing")?;
                 if node.states.get("hidden")!=Some(&hidden){return Err(format!("Visibility differs for {selector}"));}
                 if node.rect.is_some()!=has_rect{return Err(format!("Layout box differs for {selector}"));}
+            }
+            // Match the public line-text contract without inferring actionability
+            // from arbitrary addEventListener registrations or executing handlers.
+            mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"document.body.innerHTML='<p>Use <span id="attribute-endpoint" onclick="">attribute</span>, <span id="property-endpoint">property</span>, <span id="tabindex-endpoint" tabindex="-1">tabindex</span>, and <span id="listener-only">listener</span>.</p>'; document.getElementById('property-endpoint').onclick=()=>undefined; document.getElementById('listener-only').addEventListener('click',()=>undefined); true"#,"returnByValue":true})),Some(session)).await?;
+            let tree=observe(&mgr.client,&frames,&mut refs,"fixture",6,&ObservationOptions::default(),&lease).await?;
+            let mut pending=tree.roots.iter().collect::<Vec<_>>();
+            let mut emitted=std::collections::HashSet::new();
+            while let Some(node)=pending.pop(){emitted.insert(node.reference.id.clone());pending.extend(node.children.iter());}
+            for (ordinal,selector,wanted) in [(0,"#attribute-endpoint",true),(1,"#property-endpoint",true),(2,"#tabindex-endpoint",true),(3,"#listener-only",false)] {
+                let options:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"selector","selector":selector}})).unwrap();
+                let found=query(&mgr.client,&frames,&mut refs,"fixture",6,&options,&lease).await?;
+                let node=found.nodes.first().ok_or("Inline endpoint exact query missing")?;
+                let included=emitted.contains(&node.reference.id);
+                if included!=wanted{return Err(format!("Inline endpoint ordinal={ordinal} included={included} expected={wanted}"));}
             }
             Ok::<(),String>(())
         }.await;

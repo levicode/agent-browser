@@ -1,47 +1,25 @@
 //! Hosted attempt-retirement equivalent for located native references.
 //! Included as a child of client_browser so inspection remains test-only.
-use super::super::client_session::{CancelSignal, OperationLease};
+use super::super::client_actions::FixtureOperations;
 use super::super::client_transport::ClientExecutor;
 use super::*;
 use serde_json::{json, Value};
 
-struct Operations {
-    next: u64,
-    cancellation: tokio::sync::watch::Receiver<CancelSignal>,
-}
-impl Operations {
-    fn lease(&mut self) -> OperationLease {
-        self.next += 1;
-        OperationLease {
-            generation: 1,
-            sequence: self.next,
-            is_callback: false,
-            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
-            cancellation: self.cancellation.clone(),
-        }
-    }
-}
 async fn command(
     browser: &ClientBrowser,
-    ops: &mut Operations,
+    ops: &mut FixtureOperations,
     name: &str,
     args: Value,
 ) -> Result<Value, String> {
-    browser
-        .execute(
-            name.into(),
-            args.as_object()
-                .ok_or("fixture args must be object")?
-                .clone(),
-            ops.lease(),
-        )
+    ops.execute(browser, name, args, 30)
         .await
+        .map_err(|error| format!("fixture admission/settlement: {error:?}"))?
         .result
         .map_err(|error| format!("{name}: {error:?}"))
 }
 async fn configure(
     browser: &ClientBrowser,
-    ops: &mut Operations,
+    ops: &mut FixtureOperations,
     scope: &str,
 ) -> Result<(), String> {
     command(
@@ -68,7 +46,7 @@ async fn configure(
 }
 async fn seed_and_query(
     browser: &ClientBrowser,
-    ops: &mut Operations,
+    ops: &mut FixtureOperations,
     scope: &str,
 ) -> Result<Value, String> {
     {
@@ -122,13 +100,9 @@ async fn chromium_located_reference_retirement_across_owned_attempts() {
     let (sink, _events) =
         super::super::client_transport::ClientEventSink::test_channel(browser.broker.clone());
     browser.set_event_sink(sink).unwrap();
-    let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
-    let mut ops = Operations {
-        next: 0,
-        cancellation,
-    };
+    let mut ops = FixtureOperations::new(browser.broker.clone());
     let result:Result<(),String>=async {
-        let opened=browser.open(OpenRequest::Connect{endpoint:host.get_cdp_url().to_owned(),persistent:false,options:Default::default()},ops.lease()).await.map_err(|e|format!("first open: {e:?}"))?;
+        let opened=command(&browser,&mut ops,"scope.open",json!({"source":"connect","endpoint":host.get_cdp_url(),"context":"isolated"})).await?;
         let first_scope=opened["identityScope"].as_str().ok_or("missing first scope")?.to_owned();
         configure(&browser,&mut ops,&first_scope).await?;
         let old_reference=seed_and_query(&browser,&mut ops,&first_scope).await?;
@@ -149,14 +123,14 @@ async fn chromium_located_reference_retirement_across_owned_attempts() {
         let old_blob=browser.blobs.insert_sealed(old_blob_scope.clone(),b"synthetic-attempt-resource").map_err(|e|format!("seed blob: {e:?}"))?;
         // Actual retained production lifecycle; no direct map clearing, manual
         // enrollment acknowledgment, artificial disposal counter or scope swap.
-        browser.end_scope(first_scope.clone()).await.map_err(|e|format!("scope.end: {e:?}"))?;
+        command(&browser,&mut ops,"scope.end",json!({"identityScope":first_scope})).await?;
         if browser.owner.lock().await.is_some() || browser.page_lease(false).await.is_ok() { return Err("scope.end retained live page owner".into()); }
         if old_targets.inventory().is_ok() { return Err("old native target registry remains usable".into()); }
         if browser.blobs.borrow_sealed(&old_blob_scope,&old_blob.handle).is_ok() { return Err("old attempt blob authority survived retirement".into()); }
         if browser.refs.lock().map_err(|_|"reference lock poisoned")?.retained_identity_counts()!=(0,0) { return Err("scope.end retained native map or durable document identities".into()); }
         let contexts=host.client.send_command_no_params("Target.getBrowserContexts",None).await?;
         if contexts["browserContextIds"].as_array().ok_or("missing context inventory")?.contains(&json!(old_context)) { return Err("old owned context survived acknowledged end".into()); }
-        let reopened=browser.open(OpenRequest::Reuse{options:Default::default()},ops.lease()).await.map_err(|e|format!("replacement open: {e:?}"))?;
+        let reopened=command(&browser,&mut ops,"scope.open",json!({"source":"reuse","context":"isolated"})).await?;
         let scope=reopened["identityScope"].as_str().ok_or("missing replacement scope")?.to_owned();
         if scope==first_scope { return Err("replacement reused old identity scope".into()); }
         configure(&browser,&mut ops,&scope).await?;
@@ -165,7 +139,7 @@ async fn chromium_located_reference_retirement_across_owned_attempts() {
         if browser.refs.lock().map_err(|_|"reference lock poisoned")?.get(&old_key).is_some() { return Err("old exact ID aliased replacement native map".into()); }
         // Use the NEW revision and NEW scope deliberately: rejection must be
         // stale located identity, not merely a mismatched revision or scope.
-        let stale=browser.execute("browser.perform".into(),json!({"identityScope":scope,"ref":{"id":old_id,"revision":current["revision"]},"action":{"kind":"tap"}}).as_object().unwrap().clone(),ops.lease()).await;
+        let stale=ops.execute(&browser,"browser.perform",json!({"identityScope":scope,"ref":{"id":old_id,"revision":current["revision"]},"action":{"kind":"tap"}}),30).await.map_err(|e|format!("stale action admission/settlement: {e:?}"))?;
         if stale.result!=Err(ProtocolError::StaleReference) { return Err(format!("old ID under replacement was not stale: {:?}",stale.result)); }
         if clicks(&browser).await?!=json!(0) { return Err("stale old ID mutated replacement element".into()); }
         command(&browser,&mut ops,"browser.perform",json!({"identityScope":scope,"ref":current,"action":{"kind":"tap"}})).await?;
