@@ -5902,16 +5902,18 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     };
 
     let previous_refs = state.ref_map.ref_ids();
-    state.ref_map.begin_snapshot();
+    let mut staged_refs = state.ref_map.clone();
+    staged_refs.begin_snapshot();
     let tree = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
-        &mut state.ref_map,
+        &mut staged_refs,
         state.active_frame_id.as_deref(),
         &state.iframe_sessions,
     )
     .await?;
+    state.ref_map = staged_refs;
 
     let url = mgr.get_url().await.unwrap_or_default();
 
@@ -10477,8 +10479,7 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 
     let (backend_node_id, actual_name) = find_ax_node_by_role(&ax_tree.nodes, role, name, exact)?;
 
-    let ref_num = state.ref_map.next_ref_num();
-    let temp_ref = format!("e{}", ref_num);
+    let temp_ref = state.ref_map.allocate_ref();
     state.ref_map.add_with_frame(
         temp_ref.clone(),
         Some(backend_node_id),
@@ -10487,7 +10488,6 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         None,
         state.active_frame_id.as_deref(),
     );
-    state.ref_map.set_next_ref_num(ref_num + 1);
 
     let result = execute_subaction(cmd, state, &format!("@{}", temp_ref)).await;
     state.ref_map.remove(&temp_ref);

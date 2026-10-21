@@ -758,6 +758,9 @@ fn tool_profile_summaries() -> Vec<Value> {
     .collect()
 }
 
+// Intentionally no session-connect MCP tool: a one-shot tool result cannot
+// proxy a persistent bidirectional JSON-line connection. Existing MCP tools
+// retain canonical one-shot command behavior; session clients use the CLI.
 fn tools() -> Vec<Value> {
     let mut tools = vec![
         tool(
@@ -4217,6 +4220,14 @@ fn write_json_line(stdout: &mut io::Stdout, value: &Value) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn persistent_session_transport_is_not_a_one_shot_mcp_tool() {
+        assert!(tools().iter().all(|tool| !matches!(
+            tool["name"].as_str(),
+            Some("session_connect" | "browser_session_connect")
+        )));
+    }
+
     #[test]
     fn recording_timeline_options_use_cli_parser() {
         for operation in ["start", "restart"] {

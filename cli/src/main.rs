@@ -1389,6 +1389,54 @@ fn run_close_all(flags: &Flags) {
     }
 }
 
+fn isolated_session_arguments(
+    args: &[String],
+) -> Result<Option<(String, Option<String>)>, &'static str> {
+    let clean = clean_args(args);
+    if clean.first().map(String::as_str) != Some("session")
+        || clean.get(1).map(String::as_str) != Some("connect")
+    {
+        return Ok(None);
+    }
+    let mut session = None;
+    let mut namespace = None;
+    let mut json_mode = false;
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--session" | "--namespace" => {
+                let key = args[index].as_str();
+                index += 1;
+                let value = args
+                    .get(index)
+                    .filter(|value| !value.is_empty() && !value.starts_with('-'))
+                    .ok_or("Missing transport option value")?;
+                let target = if key == "--session" {
+                    &mut session
+                } else {
+                    &mut namespace
+                };
+                if target.is_some() {
+                    return Err("Duplicate transport option");
+                }
+                *target = Some(value.clone());
+            }
+            "--json" => json_mode = true,
+            "session" | "connect" => positional.push(args[index].as_str()),
+            _ => return Err("Session connect accepts only --session, --namespace and --json"),
+        }
+        index += 1;
+    }
+    if !json_mode || positional != ["session", "connect"] {
+        return Err("Usage: agent-browser --session <dedicated-name> session connect --json");
+    }
+    Ok(Some((
+        session.ok_or("Session connect requires an explicit dedicated --session")?,
+        namespace,
+    )))
+}
+
 fn main() {
     // Rust ignores SIGPIPE by default, causing println! to panic on broken pipes.
     // Reset to SIG_DFL so the OS terminates the process cleanly instead.
@@ -1402,6 +1450,27 @@ fn main() {
     {
         env::set_var("MSYS_NO_PATHCONV", "1");
         env::set_var("MSYS2_ARG_CONV_EXCL", "*");
+    }
+
+    let args: Vec<String> = env::args().skip(1).collect();
+    // This opt-in transport must bypass config/TLS/plugins before they load.
+    if !args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        match isolated_session_arguments(&args) {
+            Ok(Some((session, namespace))) => {
+                if let Err(error) =
+                    connection::run_isolated_client_session(&session, namespace.as_deref())
+                {
+                    eprintln!("{}", error);
+                    exit(1);
+                }
+                return;
+            }
+            Err(error) => {
+                eprintln!("{}", error);
+                exit(1);
+            }
+            Ok(None) => {}
+        }
     }
 
     // Native daemon mode: when AGENT_BROWSER_DAEMON is set, run as the daemon process
@@ -1429,7 +1498,6 @@ fn main() {
         return;
     }
 
-    let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = parse_flags(&args);
     if flags.restore_uses_session {
         flags.restore = Some(flags.session.clone());
@@ -1573,7 +1641,7 @@ fn main() {
         return;
     }
 
-    // Handle session separately (doesn't need daemon)
+    // Existing session commands remain local.
     if clean.first().map(|s| s.as_str()) == Some("session") {
         run_session(&clean, &flags.session, flags.json);
         return;
@@ -2390,6 +2458,51 @@ fn run_batch(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn session_connect_is_transport_only_and_requires_explicit_session() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            isolated_session_arguments(&args(&[
+                "--session",
+                "dedicated",
+                "session",
+                "connect",
+                "--json"
+            ])),
+            Ok(Some(("dedicated".into(), None)))
+        );
+        assert!(isolated_session_arguments(&args(&["session", "connect", "--json"])).is_err());
+        assert!(isolated_session_arguments(&args(&[
+            "--session",
+            "dedicated",
+            "session",
+            "connect",
+            "--json",
+            "--config",
+            "untrusted.json"
+        ]))
+        .is_err());
+        assert!(isolated_session_arguments(&args(&[
+            "--session",
+            "dedicated",
+            "session",
+            "connect",
+            "--json",
+            "--profile",
+            "existing"
+        ]))
+        .is_err());
+        assert_eq!(
+            isolated_session_arguments(&args(&["session", "list"])),
+            Ok(None)
+        );
+    }
+
     #[test]
     fn input_mode_session_setting_preserves_command_override() {
         let args: Vec<String> = ["--input-mode", "smooth", "click", "#button", "--human"]

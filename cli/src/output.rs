@@ -3143,6 +3143,7 @@ Operations:
   id                   Generate stable session id (--scope worktree|cwd|git-root, --prefix)
   info                 Show daemon, launch, and restore diagnostics
   list                 List all active sessions
+  connect --json       Persistent protocol; explicit one-use --session <dedicated-name>
 
 Environment:
   AGENT_BROWSER_SESSION    Default session name
@@ -3977,6 +3978,7 @@ Confirmation:
 Sessions:
   session                    Show current session name
   session list               List active sessions
+  session connect --json     Persistent protocol; explicit one-use --session required
 
 MCP:
   mcp                        Start an MCP stdio server exposing agent-browser tools

@@ -431,6 +431,7 @@ pub struct DaemonResult {
 /// Note: `confirm_interactive` is intentionally absent -- it is a CLI-side
 /// UX concern (prompting the user on stdin) and not a daemon configuration.
 /// The daemon only needs `confirm_actions` to gate action categories.
+#[derive(Default)]
 pub struct DaemonOptions<'a> {
     pub headed: bool,
     pub debug: bool,
@@ -789,7 +790,125 @@ fn stop_existing_daemon_for_restart(session: &str) {
     }
 }
 
+/// Kernel-released admission lock shared by ordinary startup and the entire
+/// negotiated proxy lifetime. Never delete the lock inode while another process
+/// could be waiting on it.
+fn lock_daemon_admission(session: &str, client: bool) -> Result<std::fs::File, String> {
+    let dir = get_socket_dir();
+    fs::create_dir_all(&dir).map_err(|_| "Session transport directory unavailable".to_string())?;
+    let path = dir.join(format!("{}.admission", session));
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| "Session transport admission unavailable".to_string())?;
+    if !file
+        .metadata()
+        .map_err(|_| "Session transport admission unavailable".to_string())?
+        .is_file()
+    {
+        return Err("Session transport admission unavailable".into());
+    }
+    for _ in 0..50 {
+        if file.try_lock().is_ok() {
+            std::io::Seek::rewind(&mut file)
+                .map_err(|_| "Session transport admission unavailable".to_string())?;
+            let mut mode = String::new();
+            (&mut file)
+                .take(16)
+                .read_to_string(&mut mode)
+                .map_err(|_| "Session transport admission unavailable".to_string())?;
+            let live_pid = fs::read_to_string(get_pid_path(session))
+                .ok()
+                .and_then(|pid| pid.trim().parse::<u32>().ok())
+                .is_some_and(is_pid_alive);
+            // A one-use tombstone also covers proxy death before the child
+            // publishes its PID/socket. Never infer safety from absent liveness.
+            if mode == "client" {
+                return Err("Dedicated session name has already been used".into());
+            }
+            if !mode.is_empty() && mode != "legacy" {
+                return Err("Session transport admission is invalid".into());
+            }
+            if client && (daemon_ready(session) || live_pid) {
+                return Err("Dedicated session already exists".into());
+            }
+            file.set_len(0)
+                .map_err(|_| "Session transport admission unavailable".to_string())?;
+            std::io::Seek::rewind(&mut file)
+                .map_err(|_| "Session transport admission unavailable".to_string())?;
+            file.write_all(if client { b"client" } else { b"legacy" })
+                .map_err(|_| "Session transport admission unavailable".to_string())?;
+            return Ok(file);
+        }
+        let mut mode = String::new();
+        let _ = std::io::Seek::rewind(&mut file);
+        let _ = (&mut file).take(16).read_to_string(&mut mode);
+        if client || mode == "client" {
+            return Err("Session is already owned or starting".into());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err("Session transport admission timed out".into())
+}
+
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+    let _admission = lock_daemon_admission(session, false)?;
+    ensure_daemon_inner(session, opts)
+}
+
+/// New opt-in protocol mode never reuses/restarts another named daemon and
+/// never loads browser launch/plugin configuration before negotiation.
+pub fn run_isolated_client_session(session: &str, namespace: Option<&str>) -> Result<(), String> {
+    if !crate::validation::is_valid_session_name(session) {
+        return Err("Invalid dedicated session name".into());
+    }
+    for (key, _) in env::vars_os() {
+        let key_text = key.to_string_lossy();
+        if key_text.starts_with("AGENT_BROWSER_")
+            && !matches!(
+                key_text.as_ref(),
+                "AGENT_BROWSER_SOCKET_DIR" | "AGENT_BROWSER_NAMESPACE"
+            )
+        {
+            env::remove_var(key);
+        }
+    }
+    if let Some(namespace) = namespace {
+        env::set_var("AGENT_BROWSER_NAMESPACE", namespace);
+    }
+    let _admission = lock_daemon_admission(session, true)?;
+    if daemon_ready(session) {
+        return Err("Dedicated session already exists".into());
+    }
+    env::set_var("AGENT_BROWSER_CLIENT_ONLY", "1");
+    let options = DaemonOptions {
+        idle_timeout: Some("5000"),
+        ..DaemonOptions::default()
+    };
+    let result = ensure_daemon_inner(session, &options)
+        .map_err(|_| "Dedicated session startup failed".to_string())?;
+    if result.already_running || result.restarted {
+        return Err("Dedicated session ownership was not established".into());
+    }
+    proxy_client_session(session)?;
+    // Successful scope teardown requests daemon exit. Keep admission locked
+    // until that process is gone; a later caller must not restart it mid-cleanup.
+    for _ in 0..50 {
+        if !daemon_ready(session) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    Err("Dedicated session teardown was not confirmed".into())
+}
+
+fn ensure_daemon_inner(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
     let mut restarted = false;
 
     // Socket connectivity is the sole liveness check — no PID check — so
@@ -1010,6 +1129,46 @@ fn connect(session: &str) -> Result<Connection, String> {
     }
 }
 
+/// Persistent negotiated transport. Unlike ordinary commands, this never
+/// retries or reconnects after any bytes have been sent.
+pub fn proxy_client_session(session: &str) -> Result<(), String> {
+    use std::net::Shutdown;
+    let mut socket = connect(session).map_err(|_| "Session connection failed".to_string())?;
+    socket
+        .write_all(crate::native::client_protocol::SOCKET_PREFACE)
+        .map_err(|_| "Session connection failed".to_string())?;
+    let mut input_socket = match &socket {
+        #[cfg(unix)]
+        Connection::Unix(stream) => Connection::Unix(
+            stream
+                .try_clone()
+                .map_err(|_| "Session connection failed".to_string())?,
+        ),
+        Connection::Tcp(stream) => Connection::Tcp(
+            stream
+                .try_clone()
+                .map_err(|_| "Session connection failed".to_string())?,
+        ),
+    };
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut input_socket);
+        match input_socket {
+            #[cfg(unix)]
+            Connection::Unix(stream) => {
+                let _ = stream.shutdown(Shutdown::Write);
+            }
+            Connection::Tcp(stream) => {
+                let _ = stream.shutdown(Shutdown::Write);
+            }
+        }
+    });
+    let mut output = std::io::stdout().lock();
+    std::io::copy(&mut socket, &mut output).map_err(|_| "Session transport closed".to_string())?;
+    output
+        .flush()
+        .map_err(|_| "Session output closed".to_string())
+}
+
 /// Failure of a single request attempt, split by whether the daemon may have
 /// received the request.
 #[derive(Debug)]
@@ -1214,6 +1373,27 @@ mod tests {
 
     /// Repro for #2032: a daemon that reads the request and closes without
     /// replying must see the request once.
+    #[test]
+    fn negotiated_admission_excludes_other_startups_and_reuse() {
+        let guard = crate::test_utils::EnvGuard::new(&[
+            "AGENT_BROWSER_SOCKET_DIR",
+            "AGENT_BROWSER_NAMESPACE",
+        ]);
+        let dir = tempfile::tempdir().unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
+        guard.remove("AGENT_BROWSER_NAMESPACE");
+        let admission = lock_daemon_admission("isolated", true).unwrap();
+        assert!(lock_daemon_admission("isolated", true).is_err());
+        assert!(lock_daemon_admission("isolated", false).is_err());
+        drop(admission);
+        assert!(lock_daemon_admission("isolated", false).is_err());
+        assert!(lock_daemon_admission("isolated", true).is_err());
+        assert!(lock_daemon_admission("fresh", true).is_ok());
+        let ordinary = lock_daemon_admission("ordinary", false).unwrap();
+        drop(ordinary);
+        assert!(lock_daemon_admission("ordinary", false).is_ok());
+    }
+
     #[test]
     #[cfg(unix)]
     fn send_command_does_not_resend_when_response_is_lost() {

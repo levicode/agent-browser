@@ -1134,6 +1134,8 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut path_tx = Some(path_tx);
+            // The upstream callback trait requires its unboxed HTTP error response.
+            #[allow(clippy::result_large_err)]
             let _ = tokio_tungstenite::accept_hdr_async(
                 stream,
                 move |

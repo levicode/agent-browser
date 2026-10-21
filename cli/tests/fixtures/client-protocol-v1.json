@@ -1,0 +1,180 @@
+{
+  "protocol": "agent-browser-session/1",
+  "validClient": [
+    {
+      "type": "hello",
+      "id": "h1",
+      "protocol": "agent-browser-session/1",
+      "requiredCapabilities": []
+    },
+    {
+      "type": "request",
+      "id": "r1",
+      "generation": 1,
+      "operationSeq": 1,
+      "timeoutMs": 1000,
+      "command": "session.status",
+      "args": {}
+    },
+    {
+      "type": "cancel",
+      "id": "c1",
+      "generation": 1,
+      "operationSeq": 1
+    },
+    {
+      "type": "decision",
+      "id": "d1",
+      "generation": 1,
+      "token": "opaque-token",
+      "decision": {
+        "kind": "abort"
+      }
+    },
+    {
+      "type": "close",
+      "id": "z1",
+      "generation": 1
+    },
+    {
+      "type": "request",
+      "id": "child",
+      "generation": 1,
+      "operationSeq": 2,
+      "timeoutMs": 1000,
+      "command": "title",
+      "args": {},
+      "callbackToken": "opaque-token"
+    }
+  ],
+  "invalidClient": [
+    {
+      "type": "cancel",
+      "id": "c",
+      "generation": 1,
+      "operationSeq": 1,
+      "unknown": true
+    },
+    {
+      "id": "old",
+      "action": "click"
+    },
+    {
+      "type": "decision",
+      "id": "d",
+      "generation": 1,
+      "token": "t",
+      "decision": {
+        "kind": "abort",
+        "script": "bad"
+      }
+    }
+  ],
+  "server": [
+    {
+      "type": "ready",
+      "id": "h1",
+      "protocol": "agent-browser-session/1",
+      "sessionId": "opaque-session",
+      "generation": 1,
+      "capabilities": [],
+      "limits": {
+        "maxFrameBytes": 1048576,
+        "maxPendingOperations": 64,
+        "maxPendingDecisions": 256,
+        "maxTimeoutMs": 3600000
+      },
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "r1",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": true,
+      "data": {},
+      "effects": "completed",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "r2",
+      "generation": 1,
+      "operationSeq": 2,
+      "ok": false,
+      "error": {
+        "code": "scope-unavailable"
+      },
+      "effects": "unknown",
+      "scopeState": "quarantined"
+    },
+    {
+      "type": "control-result",
+      "id": "c1",
+      "generation": 1,
+      "accepted": true,
+      "scopeState": "usable"
+    },
+    {
+      "type": "control-result",
+      "id": "d1",
+      "generation": 1,
+      "accepted": false,
+      "error": {
+        "code": "decision-missing"
+      },
+      "scopeState": "usable"
+    },
+    {
+      "type": "event",
+      "generation": 1,
+      "sequence": 1,
+      "event": "registry-released",
+      "payload": {
+        "registryVersion": 1
+      }
+    },
+    {
+      "type": "error",
+      "error": {
+        "code": "invalid-frame"
+      },
+      "scopeState": "quarantined"
+    },
+    {
+      "type": "closed",
+      "id": "z1",
+      "generation": 1,
+      "scopeState": "closed"
+    }
+  ],
+  "errorCodes": [
+    "invalid-frame",
+    "unsupported-protocol",
+    "unsupported-capability",
+    "stale-generation",
+    "scope-unavailable",
+    "sequence-reused",
+    "invalid-sequence",
+    "invalid-timeout",
+    "capacity-exceeded",
+    "operation-missing",
+    "decision-missing",
+    "decision-expired",
+    "decision-kind-mismatch",
+    "registry-missing",
+    "registry-in-use",
+    "identifier-exhausted",
+    "unsupported-command",
+    "deadline-exceeded",
+    "cancelled",
+    "invalid-arguments",
+    "browser-failure",
+    "stale-scope",
+    "cleanup-failed",
+    "stale-reference",
+    "policy-denied",
+    "not-actionable",
+    "locator-not-found"
+  ]
+}

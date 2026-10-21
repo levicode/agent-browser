@@ -498,6 +498,37 @@ const OBSCURA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const OBSCURA_CDP_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const OBSCURA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// The shared native evaluation primitive. Captured execution leases can use
+/// it without holding BrowserManager across a user callback or network wait.
+pub async fn evaluate_on(
+    client: &CdpClient,
+    session_id: &str,
+    script: &str,
+) -> Result<Value, String> {
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression: script.to_string(),
+                return_by_value: Some(true),
+                await_promise: Some(true),
+            },
+            Some(session_id),
+        )
+        .await?;
+
+    if let Some(ref details) = result.exception_details {
+        let msg = details
+            .exception
+            .as_ref()
+            .and_then(|e| e.description.as_deref())
+            .unwrap_or(&details.text);
+        return Err(format!("Evaluation error: {}", msg));
+    }
+
+    Ok(result.result.value.unwrap_or(Value::Null))
+}
+
 impl BrowserManager {
     #[cfg(test)]
     pub(super) fn owns_obscura_process(&self) -> bool {
@@ -679,26 +710,36 @@ impl BrowserManager {
     }
 
     pub async fn connect_cdp(url: &str) -> Result<Self, String> {
-        Self::connect_cdp_inner(url, false, None).await
+        Self::connect_cdp_inner(url, false, None, true).await
     }
 
     /// Connect to a provider CDP proxy where the WebSocket IS the page session.
     /// Skips browser-level Target.* commands that most proxies don't support.
     pub async fn connect_cdp_direct(url: &str) -> Result<Self, String> {
-        Self::connect_cdp_inner(url, true, None).await
+        Self::connect_cdp_inner(url, true, None, true).await
     }
 
     pub async fn connect_cdp_with_headers(
         url: &str,
         headers: Option<Vec<(String, String)>>,
     ) -> Result<Self, String> {
-        Self::connect_cdp_inner(url, false, headers).await
+        Self::connect_cdp_inner(url, false, headers, true).await
+    }
+
+    /// Connect without adopting or configuring any existing page. Negotiated
+    /// clients must establish their owned context before attaching targets.
+    pub async fn connect_owned_browser(
+        url: &str,
+        headers: Option<Vec<(String, String)>>,
+    ) -> Result<Self, String> {
+        Self::connect_cdp_inner(url, false, headers, false).await
     }
 
     async fn connect_cdp_inner(
         url: &str,
         direct_page: bool,
         headers: Option<Vec<(String, String)>>,
+        discover_pages: bool,
     ) -> Result<Self, String> {
         let ws_url = resolve_cdp_url(url).await?;
         let client = Arc::new(CdpClient::connect_with_headers(&ws_url, headers).await?);
@@ -720,7 +761,9 @@ impl BrowserManager {
             headless: true,
         };
 
-        let initialization = if direct_page {
+        let initialization = if !discover_pages {
+            Ok(())
+        } else if direct_page {
             let tab_id = manager.assign_tab_id();
             manager.pages.push(PageInfo {
                 tab_id,
@@ -1299,29 +1342,7 @@ impl BrowserManager {
     pub async fn evaluate(&self, script: &str, _args: Option<Value>) -> Result<Value, String> {
         let session_id = self.active_session_id()?.to_string();
 
-        let result: EvaluateResult = self
-            .client
-            .send_command_typed(
-                "Runtime.evaluate",
-                &EvaluateParams {
-                    expression: script.to_string(),
-                    return_by_value: Some(true),
-                    await_promise: Some(true),
-                },
-                Some(&session_id),
-            )
-            .await?;
-
-        if let Some(ref details) = result.exception_details {
-            let msg = details
-                .exception
-                .as_ref()
-                .and_then(|e| e.description.as_deref())
-                .unwrap_or(&details.text);
-            return Err(format!("Evaluation error: {}", msg));
-        }
-
-        Ok(result.result.value.unwrap_or(Value::Null))
+        evaluate_on(&self.client, &session_id, script).await
     }
 
     async fn evaluate_simple(&self, expression: &str) -> Result<Value, String> {
@@ -1639,6 +1660,76 @@ impl BrowserManager {
     /// Returns true iff a tab already carries the given label.
     pub fn has_label(&self, label: &str) -> bool {
         self.pages.iter().any(|p| p.label.as_deref() == Some(label))
+    }
+
+    /// Create and bind a blank page only in an explicitly owned context.
+    /// No real URL is loaded before the caller installs its policies/hooks.
+    pub async fn owned_blank_page(&mut self, context_id: Option<&str>) -> Result<String, String> {
+        let mut params = json!({"url": "about:blank"});
+        if let Some(id) = context_id {
+            params["browserContextId"] = json!(id);
+        }
+        let target = self
+            .client
+            .send_command("Target.createTarget", Some(params), None)
+            .await?;
+        let target_id = target
+            .get("targetId")
+            .and_then(Value::as_str)
+            .ok_or("Missing owned target identity")?
+            .to_owned();
+        let attach = self
+            .client
+            .send_command(
+                "Target.attachToTarget",
+                Some(json!({"targetId": target_id, "flatten": true})),
+                None,
+            )
+            .await;
+        let session_id = match attach {
+            Ok(value) => value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or("Missing owned page session".to_string()),
+            Err(error) => Err(error),
+        };
+        let session_id = match session_id {
+            Ok(id) => id,
+            Err(error) => {
+                self.client
+                    .send_command(
+                        "Target.closeTarget",
+                        Some(json!({"targetId": target_id})),
+                        None,
+                    )
+                    .await?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.enable_domains(&session_id).await {
+            self.client
+                .send_command(
+                    "Target.closeTarget",
+                    Some(json!({"targetId": target_id})),
+                    None,
+                )
+                .await?;
+            return Err(error);
+        }
+        let tab_id = self.assign_tab_id();
+        self.pages.push(PageInfo {
+            tab_id,
+            label: None,
+            target_id: target_id.clone(),
+            session_id,
+            url: "about:blank".into(),
+            title: String::new(),
+            target_type: "page".into(),
+        });
+        self.active_page_index = self.pages.len() - 1;
+        self.bind_active_target();
+        Ok(target_id)
     }
 
     pub async fn tab_new(
@@ -3488,14 +3579,14 @@ mod tests {
         existing: bool,
     ) {
         let (url, server) = initialization_server(fail_method, existing, 2, false).await;
-        let error = BrowserManager::connect_cdp_inner(&url, direct, None)
+        let error = BrowserManager::connect_cdp_inner(&url, direct, None, true)
             .await
             .err()
             .expect("initialization should fail");
         assert!(error.contains("injected initialization failure"), "{error}");
         let mut manager = tokio::time::timeout(
             Duration::from_secs(4),
-            BrowserManager::connect_cdp_inner(&url, direct, None),
+            BrowserManager::connect_cdp_inner(&url, direct, None, true),
         )
         .await
         .expect("retry should succeed after cleanup")
@@ -4283,12 +4374,19 @@ mod tests {
 
         // Keep sending requests so idle is never reached
         tokio::spawn(async move {
-            for i in 0u64.. {
-                let _ = tx.send(cdp_event(
-                    "Network.requestWillBeSent",
-                    session,
-                    json!({ "requestId": format!("r{}", i) }),
-                ));
+            let mut i = 0u64;
+            loop {
+                if tx
+                    .send(cdp_event(
+                        "Network.requestWillBeSent",
+                        session,
+                        json!({ "requestId": format!("r{}", i) }),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                i = i.wrapping_add(1);
                 sleep(Duration::from_millis(100)).await;
             }
         });

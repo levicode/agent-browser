@@ -1,9 +1,23 @@
 use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 
 use serde_json::Value;
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
+
+/// Native-only identity. Never export renderer/backend IDs as client handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactBinding {
+    pub page_session: String,
+    pub session: String,
+    pub frame: String,
+    pub loader: String,
+    pub actionable: bool,
+}
 
 #[derive(Debug, Clone)]
 pub struct RefEntry {
@@ -14,6 +28,7 @@ pub struct RefEntry {
     pub selector: Option<String>,
     pub frame_id: Option<String>,
     allow_role_fallback: bool,
+    pub exact_binding: Option<ExactBinding>,
 }
 
 #[derive(Clone)]
@@ -27,7 +42,7 @@ struct DocumentRefs {
 pub struct RefMap {
     map: HashMap<String, RefEntry>,
     documents: HashMap<(String, Option<String>), DocumentRefs>,
-    next_ref: usize,
+    next_ref: Arc<AtomicUsize>,
 }
 
 impl RefMap {
@@ -35,7 +50,7 @@ impl RefMap {
         Self {
             map: HashMap::new(),
             documents: HashMap::new(),
-            next_ref: 1,
+            next_ref: Arc::new(AtomicUsize::new(1)),
         }
     }
 
@@ -69,6 +84,7 @@ impl RefMap {
                 selector: None,
                 frame_id: frame_id.map(|s| s.to_string()),
                 allow_role_fallback: true,
+                exact_binding: None,
             },
         );
     }
@@ -87,8 +103,48 @@ impl RefMap {
                 selector: None,
                 frame_id: None,
                 allow_role_fallback: false,
+                exact_binding: None,
             },
         );
+    }
+
+    pub fn bind_exact(
+        &mut self,
+        backend_node_id: i64,
+        role: &str,
+        name: &str,
+        binding: ExactBinding,
+    ) -> String {
+        self.observe_document(
+            &binding.page_session,
+            Some(&binding.frame),
+            &binding.session,
+            Some(&binding.loader),
+        );
+        let id = self
+            .durable_ref(&binding.page_session, Some(&binding.frame), backend_node_id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| self.allocate_ref());
+        self.remember_durable_ref(
+            &binding.page_session,
+            Some(&binding.frame),
+            backend_node_id,
+            &id,
+        );
+        self.map.insert(
+            id.clone(),
+            RefEntry {
+                backend_node_id: Some(backend_node_id),
+                role: role.into(),
+                name: name.into(),
+                nth: None,
+                selector: None,
+                frame_id: Some(binding.frame.clone()),
+                allow_role_fallback: false,
+                exact_binding: Some(binding),
+            },
+        );
+        id
     }
 
     pub fn add_selector(
@@ -109,6 +165,7 @@ impl RefMap {
                 selector: Some(selector),
                 frame_id: None,
                 allow_role_fallback: true,
+                exact_binding: None,
             },
         );
     }
@@ -231,12 +288,23 @@ impl RefMap {
         self.map.clear();
     }
 
+    /// Reserve a globally unique ref in this client's lifetime. Cloned staging
+    /// maps share the allocator: abandoning a snapshot never recycles IDs.
+    pub fn allocate_ref(&self) -> String {
+        #[allow(deprecated)] // Keep compatibility with older stable toolchains.
+        let n = self
+            .next_ref
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .expect("native reference space exhausted");
+        format!("e{n}")
+    }
+
     pub fn next_ref_num(&self) -> usize {
-        self.next_ref
+        self.next_ref.load(Ordering::Relaxed)
     }
 
     pub fn set_next_ref_num(&mut self, n: usize) {
-        self.next_ref = n;
+        self.next_ref.fetch_max(n, Ordering::Relaxed);
     }
 }
 
@@ -435,11 +503,39 @@ pub async fn resolve_element_center(
             .get(&ref_id)
             .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
 
-        let effective_session_id =
-            resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+        if let Some(binding) = &entry.exact_binding {
+            validate_exact_binding(client, session_id, binding).await?;
+        }
+        let effective_session_id = entry
+            .exact_binding
+            .as_ref()
+            .map(|b| b.session.as_str())
+            .unwrap_or_else(|| {
+                resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions)
+            });
 
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {
+            if let Some(binding) = &entry.exact_binding {
+                if !binding.actionable {
+                    return Err("Reference is observation-only".into());
+                }
+                let (object, _) = resolve_element_object_id(
+                    client,
+                    session_id,
+                    ref_map,
+                    selector_or_ref,
+                    iframe_sessions,
+                )
+                .await?;
+                let _ = client
+                    .send_command(
+                        "Runtime.releaseObject",
+                        Some(serde_json::json!({"objectId": object})),
+                        Some(effective_session_id),
+                    )
+                    .await;
+            }
             scroll_node_into_view(client, effective_session_id, backend_node_id).await;
             let result: Result<DomGetBoxModelResult, String> = client
                 .send_command_typed(
@@ -705,8 +801,21 @@ pub async fn resolve_element_object_id(
             .get(&ref_id)
             .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
 
-        let effective_session_id =
-            resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
+        if let Some(binding) = &entry.exact_binding {
+            validate_exact_binding(client, session_id, binding).await?;
+            let backend = entry
+                .backend_node_id
+                .ok_or("Exact reference has no DOM node")?;
+            let object = resolve_exact_object(client, binding, backend).await?;
+            return Ok((object, binding.session.clone()));
+        }
+        let effective_session_id = entry
+            .exact_binding
+            .as_ref()
+            .map(|b| b.session.as_str())
+            .unwrap_or_else(|| {
+                resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions)
+            });
 
         // Try cached backend_node_id first (fast path)
         if let Some(backend_node_id) = entry.backend_node_id {
@@ -724,7 +833,12 @@ pub async fn resolve_element_object_id(
 
             if let Ok(r) = result {
                 if let Some(object_id) = r.object.object_id {
-                    if !is_detached(client, effective_session_id, &object_id).await {
+                    let connected = if !entry.allow_role_fallback {
+                        exact_connected(client, effective_session_id, &object_id).await?
+                    } else {
+                        !is_detached(client, effective_session_id, &object_id).await
+                    };
+                    if connected {
                         return Ok((object_id, effective_session_id.to_string()));
                     }
                 }
@@ -809,6 +923,97 @@ pub async fn resolve_element_object_id(
         .object_id
         .ok_or_else(|| format!("Element not found: {}", selector_or_ref))?;
     Ok((object_id, session_id.to_string()))
+}
+
+/// Resolve into the frame's isolated realm and prove document ownership, not
+/// just connectedness (adoptNode can move a still-connected node across frames).
+pub async fn resolve_exact_object(
+    client: &CdpClient,
+    binding: &ExactBinding,
+    backend: i64,
+) -> Result<String, String> {
+    let world = client
+        .send_command(
+            "Page.createIsolatedWorld",
+            Some(serde_json::json!({
+                "frameId": binding.frame, "worldName": "agent-browser-native-observation"
+            })),
+            Some(&binding.session),
+        )
+        .await?;
+    let context = world["executionContextId"]
+        .as_i64()
+        .ok_or("Cannot establish reference realm")?;
+    let result = client.send_command("DOM.resolveNode", Some(serde_json::json!({
+        "backendNodeId": backend, "executionContextId": context, "objectGroup": "native-exact"
+    })), Some(&binding.session)).await?;
+    let object = result["object"]["objectId"]
+        .as_str()
+        .ok_or("Exact node resolution failed")?
+        .to_string();
+    let proof: Result<(),String> = async {
+    let result = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
+        "objectId": object, "functionDeclaration": "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }", "returnByValue": true
+    })), Some(&binding.session)).await?;
+    if result.get("exceptionDetails").is_some() || result["result"]["value"] != true {
+        return Err("Reference no longer belongs to its document".to_string());
+    }
+    validate_exact_binding(client, &binding.page_session, binding).await?;
+        Ok(())
+    }.await;
+    if let Err(error) = proof {
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            client.send_command(
+                "Runtime.releaseObject",
+                Some(serde_json::json!({"objectId":object})),
+                Some(&binding.session),
+            ),
+        )
+        .await;
+        return Err(error);
+    }
+
+    Ok(object)
+}
+
+pub async fn validate_exact_binding(
+    client: &CdpClient,
+    page_session: &str,
+    binding: &ExactBinding,
+) -> Result<(), String> {
+    if page_session != binding.page_session {
+        return Err("Reference belongs to another page".into());
+    }
+    let tree = client
+        .send_command_no_params("Page.getFrameTree", Some(&binding.session))
+        .await?;
+    fn loader<'a>(tree: &'a Value, frame: &str) -> Option<&'a str> {
+        if tree["frame"]["id"].as_str() == Some(frame) {
+            return tree["frame"]["loaderId"].as_str();
+        }
+        tree["childFrames"]
+            .as_array()?
+            .iter()
+            .find_map(|child| loader(child, frame))
+    }
+    if loader(&tree["frameTree"], &binding.frame) != Some(binding.loader.as_str()) {
+        return Err("Reference document is stale".into());
+    }
+    Ok(())
+}
+
+async fn exact_connected(client: &CdpClient, session: &str, object: &str) -> Result<bool, String> {
+    let result = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
+        "objectId": object, "functionDeclaration": "function() { return this.isConnected === true; }",
+        "returnByValue": true
+    })), Some(session)).await?;
+    if result.get("exceptionDetails").is_some() {
+        return Err("Cannot verify reference connectivity".into());
+    }
+    result["result"]["value"]
+        .as_bool()
+        .ok_or_else(|| "Cannot verify reference connectivity".into())
 }
 
 /// Reports whether a resolved node has been removed from its document, releasing it if so.
@@ -1717,6 +1922,28 @@ mod tests {
         assert_eq!(parse_ref("e"), None);
         assert_eq!(parse_ref("1"), None);
         assert_eq!(parse_ref(""), None);
+    }
+
+    #[test]
+    fn cloned_allocators_are_unique_and_cannot_rewind() {
+        let mut map = RefMap::new();
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let clone = map.clone();
+                std::thread::spawn(move || {
+                    (0..100).map(|_| clone.allocate_ref()).collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let ids: std::collections::HashSet<_> = workers
+            .into_iter()
+            .flat_map(|w| w.join().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 800);
+        map.set_next_ref_num(1);
+        assert_eq!(map.allocate_ref(), "e801");
+        map.invalidate_all_documents();
+        assert_eq!(map.allocate_ref(), "e802");
     }
 
     #[test]

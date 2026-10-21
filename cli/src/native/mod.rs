@@ -9,6 +9,22 @@ pub mod browser;
 #[allow(dead_code)]
 pub mod cdp;
 #[allow(dead_code)]
+pub mod client_browser;
+#[allow(dead_code)]
+pub mod client_capture;
+#[allow(dead_code)]
+pub mod client_network;
+#[allow(dead_code)]
+pub mod client_observation;
+#[allow(dead_code)]
+pub mod client_protocol;
+#[allow(dead_code)]
+pub mod client_session;
+#[allow(dead_code)]
+pub mod client_state;
+#[allow(dead_code)]
+pub mod client_transport;
+#[allow(dead_code)]
 pub mod cookies;
 #[allow(dead_code)]
 pub mod daemon;
