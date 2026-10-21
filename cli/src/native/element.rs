@@ -834,7 +834,19 @@ pub async fn resolve_element_object_id(
             if let Ok(r) = result {
                 if let Some(object_id) = r.object.object_id {
                     let connected = if !entry.allow_role_fallback {
-                        exact_connected(client, effective_session_id, &object_id).await?
+                        match exact_connected(client, effective_session_id, &object_id).await {
+                            Ok(true) => true,
+                            Ok(false) => {
+                                release_native_object(client, effective_session_id, &object_id)
+                                    .await;
+                                false
+                            }
+                            Err(error) => {
+                                release_native_object(client, effective_session_id, &object_id)
+                                    .await;
+                                return Err(error);
+                            }
+                        }
                     } else {
                         !is_detached(client, effective_session_id, &object_id).await
                     };
@@ -955,6 +967,7 @@ pub async fn resolve_exact_object(
     let result = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
         "objectId": object, "functionDeclaration": "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }", "returnByValue": true
     })), Some(&binding.session)).await?;
+    release_evaluation_handles(client, &binding.session, &result, &object).await;
     if result.get("exceptionDetails").is_some() || result["result"]["value"] != true {
         return Err("Reference no longer belongs to its document".to_string());
     }
@@ -1003,11 +1016,45 @@ pub async fn validate_exact_binding(
     Ok(())
 }
 
+async fn release_native_object(client: &CdpClient, session: &str, object: &str) {
+    let _ = tokio::time::timeout(
+        std::time::Duration::from_millis(250),
+        client.send_command(
+            "Runtime.releaseObject",
+            Some(serde_json::json!({"objectId":object})),
+            Some(session),
+        ),
+    )
+    .await;
+}
+
+// Even returnByValue calls can return remote exception/result objects. Release
+// those auxiliary handles while keeping the caller's owned node until its proof
+// either succeeds or the caller releases it on every failed outcome.
+async fn release_evaluation_handles(
+    client: &CdpClient,
+    session: &str,
+    result: &Value,
+    owned: &str,
+) {
+    let handles = [
+        result["result"]["objectId"].as_str(),
+        result["exceptionDetails"]["exception"]["objectId"].as_str(),
+    ];
+    let mut released = std::collections::HashSet::new();
+    for handle in handles.into_iter().flatten() {
+        if handle != owned && released.insert(handle) {
+            release_native_object(client, session, handle).await;
+        }
+    }
+}
+
 async fn exact_connected(client: &CdpClient, session: &str, object: &str) -> Result<bool, String> {
     let result = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
         "objectId": object, "functionDeclaration": "function() { return this.isConnected === true; }",
         "returnByValue": true
     })), Some(session)).await?;
+    release_evaluation_handles(client, session, &result, object).await;
     if result.get("exceptionDetails").is_some() {
         return Err("Cannot verify reference connectivity".into());
     }
@@ -1834,6 +1881,119 @@ pub async fn get_element_styles(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn exact_connectivity_releases_owned_and_auxiliary_handles_on_every_failure() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        for scoped in [false, true] {
+            for outcome in [
+                "false",
+                "exception",
+                "protocol",
+                "malformed",
+                "alias",
+                "true",
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("ws://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let mut releases = Vec::new();
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        let mut response = serde_json::json!({"id":request["id"]});
+                        response["result"] = match request["method"].as_str().unwrap() {
+                            "Page.getFrameTree" => {
+                                serde_json::json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader"}}})
+                            }
+                            "Page.createIsolatedWorld" => {
+                                serde_json::json!({"executionContextId":1})
+                            }
+                            "DOM.resolveNode" => {
+                                serde_json::json!({"object":{"type":"object","objectId":"owned-node"}})
+                            }
+                            "Runtime.callFunctionOn" => match outcome {
+                                "exception" => {
+                                    serde_json::json!({"result":{"objectId":"rejected-result"},"exceptionDetails":{"exception":{"objectId":"exception"}}})
+                                }
+                                "alias" => {
+                                    serde_json::json!({"result":{"objectId":"owned-node"},"exceptionDetails":{"exception":{"objectId":"owned-node"}}})
+                                }
+                                "protocol" => {
+                                    response["error"] = serde_json::json!({"code":-32000,"message":"Synthetic failure"});
+                                    Value::Null
+                                }
+                                "malformed" => {
+                                    serde_json::json!({"result":{"objectId":"rejected-result"}})
+                                }
+                                other => {
+                                    serde_json::json!({"result":{"type":"boolean","value":other=="true"}})
+                                }
+                            },
+                            "Runtime.releaseObject" => {
+                                releases.push(
+                                    request["params"]["objectId"].as_str().unwrap().to_string(),
+                                );
+                                serde_json::json!({})
+                            }
+                            other => panic!("Unexpected command {other}"),
+                        };
+                        ws.send(Message::Text(response.to_string())).await.unwrap();
+                    }
+                    releases
+                });
+                let client = CdpClient::connect(&url).await.unwrap();
+                let mut refs = RefMap::new();
+                let reference = if scoped {
+                    refs.bind_exact(
+                        42,
+                        "button",
+                        "",
+                        ExactBinding {
+                            page_session: "session".into(),
+                            session: "session".into(),
+                            frame: "frame".into(),
+                            loader: "loader".into(),
+                            actionable: true,
+                        },
+                    )
+                } else {
+                    refs.add_exact_backend_node("e1".into(), 42);
+                    "e1".into()
+                };
+                let result = resolve_element_object_id(
+                    &client,
+                    "session",
+                    &refs,
+                    &reference,
+                    &HashMap::new(),
+                )
+                .await;
+                assert_eq!(
+                    result.is_ok(),
+                    outcome == "true",
+                    "scoped={scoped}, {outcome}"
+                );
+                if let Ok((object, session)) = result {
+                    release_native_object(&client, &session, &object).await;
+                }
+                client.close().await;
+                let mut released = server.await.unwrap();
+                released.sort();
+                let mut expected = vec!["owned-node"];
+                if matches!(outcome, "exception" | "malformed") {
+                    expected.push("rejected-result");
+                }
+                if outcome == "exception" {
+                    expected.push("exception");
+                }
+                expected.sort();
+                assert_eq!(released, expected, "scoped={scoped}, {outcome}");
+            }
+        }
+    }
+
     use super::*;
 
     fn ax(role: &str, name: &str, id: Option<i64>, ignored: bool) -> AXNode {

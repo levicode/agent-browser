@@ -13864,7 +13864,15 @@ mod tests {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
-        for failure in ["selection", "describe", "fill-exception", "fill-protocol"] {
+        for failure in [
+            "selection",
+            "describe",
+            "fill-exception",
+            "fill-protocol",
+            "connectivity-exception",
+            "connectivity-protocol",
+            "connectivity-false",
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
@@ -13872,9 +13880,22 @@ mod tests {
                 let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
                 let mut releases = Vec::new();
                 let mut attempts = 0;
+                let mut proof_calls = 0;
+                let mut fill_calls = 0;
                 while let Some(Ok(Message::Text(text))) = ws.next().await {
                     let request: Value = serde_json::from_str(&text).unwrap();
                     let mut response = json!({ "id": request["id"] });
+                    let connectivity = request["method"] == "Runtime.callFunctionOn"
+                        && request["params"]["arguments"]
+                            .as_array()
+                            .is_none_or(Vec::is_empty);
+                    if request["method"] == "Runtime.callFunctionOn" {
+                        if connectivity {
+                            proof_calls += 1;
+                        } else {
+                            fill_calls += 1;
+                        }
+                    }
                     response["result"] = match request["method"].as_str().unwrap() {
                         "Runtime.evaluate" => {
                             attempts += 1;
@@ -13898,14 +13919,27 @@ mod tests {
                         "DOM.resolveNode" => {
                             json!({ "object": { "type": "object", "objectId": "login-node" } })
                         }
-                        "Runtime.callFunctionOn" if failure == "fill-exception" => json!({
-                            "result": { "type": "object", "objectId": "rejected-result" },
-                            "exceptionDetails": { "text": "Page exception",
-                                "exception": { "type": "object", "objectId": "exception" } }
-                        }),
-                        "Runtime.callFunctionOn" if failure == "fill-protocol" => {
+                        "Runtime.callFunctionOn"
+                            if (failure == "fill-exception" && !connectivity)
+                                || (failure == "connectivity-exception" && connectivity) =>
+                        {
+                            json!({
+                                "result": { "type": "object", "objectId": "rejected-result" },
+                                "exceptionDetails": { "text": "Page exception",
+                                    "exception": { "type": "object", "objectId": "exception" } }
+                            })
+                        }
+                        "Runtime.callFunctionOn"
+                            if (failure == "fill-protocol" && !connectivity)
+                                || (failure == "connectivity-protocol" && connectivity) =>
+                        {
                             response["error"] = json!({ "code": -32000, "message": "CDP failure" });
                             Value::Null
+                        }
+                        "Runtime.callFunctionOn"
+                            if failure == "connectivity-false" && connectivity =>
+                        {
+                            json!({ "result": { "type": "boolean", "value": false } })
                         }
                         "Runtime.callFunctionOn" => {
                             json!({ "result": { "type": "boolean", "value": true } })
@@ -13919,7 +13953,7 @@ mod tests {
                     };
                     ws.send(Message::Text(response.to_string())).await.unwrap();
                 }
-                (attempts, releases)
+                (attempts, releases, proof_calls, fill_calls)
             });
             let client = CdpClient::connect(&url).await.unwrap();
             let element = super::wait_for_any_selector(&client, "session", &["input"], 1_000)
@@ -13927,13 +13961,32 @@ mod tests {
                 .unwrap();
             let filled = element.fill(&client, "session", "test-value").await;
             client.close().await;
-            let (attempts, mut releases) = server.await.unwrap();
-            assert_eq!(filled.is_ok(), !failure.starts_with("fill"), "{failure}");
-            assert_eq!(attempts, if failure.starts_with("fill") { 1 } else { 2 });
+            let (attempts, mut releases, proof_calls, fill_calls) = server.await.unwrap();
+            assert_eq!(proof_calls, 1, "{failure}");
+            assert_eq!(
+                fill_calls,
+                usize::from(!failure.starts_with("connectivity")),
+                "{failure}"
+            );
+            assert_eq!(
+                filled.is_ok(),
+                matches!(failure, "selection" | "describe"),
+                "{failure}"
+            );
+            assert_eq!(
+                attempts,
+                if matches!(failure, "selection" | "describe") {
+                    2
+                } else {
+                    1
+                }
+            );
             let mut expected = match failure {
                 "selection" => vec!["exception", "rejected-result", "node-2", "login-node"],
                 "describe" => vec!["node-1", "node-2", "login-node"],
-                "fill-exception" => vec!["node-1", "rejected-result", "exception", "login-node"],
+                "fill-exception" | "connectivity-exception" => {
+                    vec!["node-1", "rejected-result", "exception", "login-node"]
+                }
                 _ => vec!["node-1", "login-node"],
             };
             releases.sort();
