@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex,
 };
 use std::time::{Duration, Instant};
 
@@ -42,9 +42,15 @@ struct Dispatch {
     checked_unchanged: AtomicBool,
     checked_replaced: AtomicBool,
     acknowledged_postcondition: AtomicBool,
+    settled_replacement_prefix: Mutex<Option<Arc<SettledReplacementPrefix>>>,
 }
 impl Dispatch {
     fn mark(&self) {
+        // A prefix cannot describe any later mutation, including its pending ACK.
+        match self.settled_replacement_prefix.lock() {
+            Ok(mut prefix) => *prefix = None,
+            Err(_) => self.cleanup.store(true, Ordering::SeqCst),
+        }
         self.sent.store(true, Ordering::SeqCst);
     }
     fn failure(&self, error: ProtocolError) -> ActionFailure {
@@ -71,6 +77,101 @@ impl Dispatch {
             },
         }
     }
+}
+/// A completed prefix is not successful replacement or rollback. It certifies
+/// only whole, acknowledged select-all/Delete substeps on this exact action's
+/// immutable page lease. Capture authority once before select-all and never
+/// rebase it at Delete. Install it in Dispatch only after the entire keyboard
+/// future has returned successfully.
+struct SettledReplacementPrefix {
+    identity_scope: String,
+    session: String,
+    target: String,
+    generation: u64,
+    sequence: u64,
+    target_revision: u64,
+    enrollment: Option<super::client_enrollment::SettledInputAuthority>,
+}
+impl SettledReplacementPrefix {
+    fn capture(ctx: &ActionContext<'_>) -> Result<Self, ProtocolError> {
+        ctx.check()?;
+        if ctx.page.targets.identity_scope != ctx.page.identity_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        let (target_revision, targets) = ctx.page.targets.inventory()?;
+        let enrollment = match ctx.realm_authority {
+            ActionRealmAuthority::Enrolled(owner) => {
+                if !targets.iter().any(|target| {
+                    target.target_id == ctx.page.target_id
+                        && target.session_id == ctx.page.page_session_id
+                        && target.configured
+                        && target.resumed
+                        && target.purpose == Some(super::client_targets::TargetPurpose::Application)
+                }) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                Some(owner.capture_settled_input_authority(ctx.page, ctx.operation)?)
+            }
+            #[cfg(test)]
+            ActionRealmAuthority::UntrackedFixture => None,
+        };
+        Ok(Self {
+            identity_scope: ctx.page.identity_scope.clone(),
+            session: ctx.page.page_session_id.clone(),
+            target: ctx.page.target_id.clone(),
+            generation: ctx.operation.generation,
+            sequence: ctx.operation.sequence,
+            target_revision,
+            enrollment,
+        })
+    }
+    /// Ignore requested cancellation only: it is the result being certified.
+    /// The original permit still fences the exact scope epoch.
+    fn check(&self, ctx: &ActionContext<'_>) -> Result<(), ProtocolError> {
+        ctx.page.permit.check()?;
+        if *ctx.page.client.remote_connection_closed().borrow() {
+            return Err(ProtocolError::BrowserFailure);
+        }
+        if self.identity_scope != ctx.page.identity_scope
+            || self.identity_scope != ctx.page.targets.identity_scope
+            || self.session != ctx.page.page_session_id
+            || self.target != ctx.page.target_id
+            || self.generation != ctx.operation.generation
+            || self.sequence != ctx.operation.sequence
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        ctx.page.targets.check_revision(self.target_revision)?;
+        match (&self.enrollment, &ctx.realm_authority) {
+            (Some(proof), ActionRealmAuthority::Enrolled(owner)) => {
+                proof.check(owner, ctx.page, ctx.operation)
+            }
+            #[cfg(test)]
+            (None, ActionRealmAuthority::UntrackedFixture) => Ok(()),
+            _ => Err(ProtocolError::StaleScope),
+        }
+    }
+}
+async fn settle_replacement_cancellation(ctx: &ActionContext<'_>, d: &Dispatch) -> bool {
+    let prefix = match d.settled_replacement_prefix.lock() {
+        Ok(mut prefix) => prefix.take(),
+        Err(_) => {
+            d.cleanup.store(true, Ordering::SeqCst);
+            return false;
+        }
+    };
+    let Some(prefix) = prefix else { return false };
+    // Retain mandatory key/button cleanup even though the cancelled operation
+    // cannot dispatch another substep. Cleanup has its own existing budget.
+    let authority = prefix.check(ctx);
+    if ctx.page_state.release_input(ctx.page).await.is_err() {
+        d.cleanup.store(true, Ordering::SeqCst);
+        return false;
+    }
+    authority.is_ok()
+        && prefix.check(ctx).is_ok()
+        && *ctx.operation.cancellation.borrow() == CancelSignal::Requested
+        && !d.cleanup.load(Ordering::SeqCst)
 }
 fn finish_dispatch(
     d: &Dispatch,
@@ -655,7 +756,14 @@ impl ClientActions {
     ) -> Result<Value, ActionFailure> {
         let d = Dispatch::default();
         let result = self.execute_inner(&ctx, &d, name, args).await;
-        finish_dispatch(&d, result)
+        let settled_prefix = matches!(&result, Err(ProtocolError::Cancelled))
+            && settle_replacement_cancellation(&ctx, &d).await;
+        finish_dispatch(&d, result).map_err(|mut failure| {
+            if settled_prefix {
+                failure.effects = Effects::Completed;
+            }
+            failure
+        })
     }
     async fn execute_inner(
         &self,
@@ -684,9 +792,9 @@ impl ClientActions {
                 require_editable_focus(ctx, d).await?;
                 ctx.check()?;
                 if request.replace {
-                    keyboard(ctx, d, "press", "ControlOrMeta+A").await?;
+                    replacement_substep(ctx, d, ReplacementStep::SelectAll).await?;
                     ctx.check()?;
-                    keyboard(ctx, d, "press", "Delete").await?;
+                    replacement_substep(ctx, d, ReplacementStep::Delete).await?;
                     ctx.check()?;
                 }
                 keyboard(ctx, d, "type", &request.text).await?;
@@ -816,6 +924,44 @@ fn wheel(
         Direction::Left => (-distance, 0.0),
         Direction::Right => (distance, 0.0),
     })
+}
+enum ReplacementStep {
+    SelectAll,
+    Delete,
+}
+async fn replacement_substep(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    step: ReplacementStep,
+) -> Result<(), ProtocolError> {
+    let key = match step {
+        ReplacementStep::SelectAll => "ControlOrMeta+A",
+        ReplacementStep::Delete => "Delete",
+    };
+    // Proof collection is opportunistic. A queued unrelated enrollment event
+    // must not introduce a new failure into otherwise ordinary typing; it only
+    // prevents a later cancellation from receiving the settled-prefix result.
+    let prefix = match step {
+        ReplacementStep::SelectAll => SettledReplacementPrefix::capture(ctx).ok().map(Arc::new),
+        // Carry only the original authority forward. An unavailable or lost
+        // select-all proof cannot be re-certified against a later healthy epoch.
+        ReplacementStep::Delete => d
+            .settled_replacement_prefix
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .clone(),
+    };
+    // Ok means every key/modifier release was ACKed and the keyboard executor's
+    // post-ACK budget check passed. An error, including keyUp cancellation, must
+    // never mint this proof even when release_input later succeeds.
+    keyboard(ctx, d, "press", key).await?;
+    let prefix = prefix.filter(|prefix| prefix.check(ctx).is_ok());
+    *d.settled_replacement_prefix
+        .lock()
+        .map_err(|_| ProtocolError::CleanupFailed)? = prefix;
+    #[cfg(test)]
+    tests::replacement_boundary_hook(ctx, key);
+    Ok(())
 }
 async fn keyboard(
     ctx: &ActionContext<'_>,
@@ -2743,7 +2889,55 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     type Log = Arc<std::sync::Mutex<Vec<Value>>>;
+    // Hooks are keyed to one exact scope/generation/sequence, never a process-
+    // wide next-action callback. They run only after the real keyboard future
+    // has ACKed every event; the hook cannot manufacture a prefix receipt.
+    type BoundaryKey = (String, u64, u64, String);
+    struct ReplacementHook {
+        run: Box<dyn FnOnce() + Send>,
+    }
+    fn replacement_hooks() -> &'static Mutex<HashMap<BoundaryKey, ReplacementHook>> {
+        static HOOKS: std::sync::OnceLock<Mutex<HashMap<BoundaryKey, ReplacementHook>>> =
+            std::sync::OnceLock::new();
+        HOOKS.get_or_init(Mutex::default)
+    }
+    struct ReplacementBoundary(BoundaryKey);
+    impl ReplacementBoundary {
+        fn install(
+            scope: &str,
+            generation: u64,
+            sequence: u64,
+            key: &'static str,
+            run: impl FnOnce() + Send + 'static,
+        ) -> Self {
+            let binding = (scope.to_owned(), generation, sequence, key.to_owned());
+            assert!(replacement_hooks()
+                .lock()
+                .unwrap()
+                .insert(binding.clone(), ReplacementHook { run: Box::new(run) })
+                .is_none());
+            Self(binding)
+        }
+    }
+    impl Drop for ReplacementBoundary {
+        fn drop(&mut self) {
+            replacement_hooks().lock().unwrap().remove(&self.0);
+        }
+    }
+    pub(super) fn replacement_boundary_hook(ctx: &ActionContext<'_>, key: &str) {
+        let binding = (
+            ctx.page.identity_scope.clone(),
+            ctx.operation.generation,
+            ctx.operation.sequence,
+            key.to_owned(),
+        );
+        let hook = replacement_hooks().lock().unwrap().remove(&binding);
+        if let Some(hook) = hook {
+            (hook.run)();
+        }
+    }
     struct Fixture {
+        gate: Arc<ExecutionGate>,
         page: BrowserExecutionLease,
         op: OperationLease,
         _cancel: tokio::sync::watch::Sender<CancelSignal>,
@@ -2791,6 +2985,9 @@ mod tests {
         }
     }
     async fn fixture(mode: &'static str) -> Fixture {
+        fixture_scoped(mode, "scope").await
+    }
+    async fn fixture_scoped(mode: &'static str, scope: &str) -> Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let log: Log = Arc::default();
@@ -2827,9 +3024,29 @@ mod tests {
                 if method == "Input.dispatchKeyEvent"
                     && request["params"]["type"] == "keyUp"
                     && ((mode == "select-cancel" && request["params"]["code"] == "KeyA")
-                        || (mode == "delete-cancel" && request["params"]["code"] == "Delete"))
+                        || (mode == "select-modifier-cancel"
+                            && matches!(
+                                request["params"]["code"].as_str(),
+                                Some("ControlLeft" | "MetaLeft")
+                            ))
+                        || (mode == "delete-cancel" && request["params"]["code"] == "Delete")
+                        || (mode == "type-cancel" && request["params"]["code"] == "KeyZ"))
                 {
                     server_cancel.send_replace(CancelSignal::Requested);
+                }
+                if mode == "prefix-cleanup-reset"
+                    && method == "Input.dispatchKeyEvent"
+                    && request["params"]["type"] == "keyUp"
+                    && request["params"]["code"] == "ShiftLeft"
+                {
+                    server_gate.seal();
+                }
+                if mode == "prefix-cleanup-disconnected"
+                    && method == "Input.dispatchKeyEvent"
+                    && request["params"]["type"] == "keyUp"
+                    && request["params"]["code"] == "ShiftLeft"
+                {
+                    break;
                 }
                 let result = match method {
                     "Page.getFrameTree" => {
@@ -2946,6 +3163,10 @@ mod tests {
                         && request["params"]["objectId"] == "result-handle"))
                     && method == "Runtime.releaseObject")
                     || (mode == "exact-protocol-error" && method == "DOM.resolveNode")
+                    || (mode == "prefix-cleanup-failed"
+                        && method == "Input.dispatchKeyEvent"
+                        && request["params"]["type"] == "keyUp"
+                        && request["params"]["code"] == "ShiftLeft")
                 {
                     json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic cleanup failure"}})
                 } else {
@@ -2967,9 +3188,9 @@ mod tests {
             client,
             page_session_id: "page".into(),
             target_id: "target".into(),
-            identity_scope: "scope".into(),
+            identity_scope: scope.into(),
             permit: gate.enter(false).unwrap(),
-            targets: ClientTargets::new("context".into(), "scope".into()),
+            targets: ClientTargets::new("context".into(), scope.into()),
         };
         let op = OperationLease {
             is_callback: false,
@@ -2995,7 +3216,7 @@ mod tests {
         blobs
             .activate_scope(BlobScope {
                 generation: 1,
-                identity_scope: "scope".into(),
+                identity_scope: scope.into(),
             })
             .unwrap();
         let geometry = GeometrySnapshot::capture(
@@ -3016,11 +3237,12 @@ mod tests {
         .unwrap();
         log.lock().unwrap().clear();
         Fixture {
+            gate,
             geometry,
             page,
             op,
             _cancel: cancel,
-            state: ClientPageState::new("scope".into(), "context".into()),
+            state: ClientPageState::new(scope.into(), "context".into()),
             refs,
             blobs,
             frames: HashMap::new(),
@@ -3354,6 +3576,7 @@ mod tests {
         for mode in [
             "focus-cancel",
             "select-cancel",
+            "select-modifier-cancel",
             "delete-cancel",
             "focus-reset",
         ] {
@@ -3372,8 +3595,16 @@ mod tests {
                 assert!(inputs.is_empty(), "{mode}");
                 assert_eq!(error.effects, Effects::NotDispatched);
             }
-            if mode == "select-cancel" {
+            if matches!(mode, "select-cancel" | "select-modifier-cancel") {
                 assert!(!inputs.iter().any(|r| r["params"]["code"] == "Delete"));
+            }
+            if matches!(
+                mode,
+                "select-cancel" | "select-modifier-cancel" | "delete-cancel"
+            ) {
+                // The server cancels before replying to keyUp, not between
+                // fully acknowledged substeps. Cleanup cannot settle that ACK.
+                assert_eq!(error.effects, Effects::Unknown, "{mode}");
             }
             assert!(
                 !inputs
@@ -3387,6 +3618,372 @@ mod tests {
                 assert_eq!(error.error, ProtocolError::Cancelled);
             }
         }
+    }
+    #[tokio::test]
+    async fn replacement_acknowledged_substep_cancel_preserves_settled_prefix() {
+        for key in ["ControlOrMeta+A", "Delete"] {
+            let scope = format!("settled-prefix-{}", uuid::Uuid::new_v4());
+            let f = fixture_scoped("normal", &scope).await;
+            let cancel = f._cancel.clone();
+            let reached = Arc::new(AtomicBool::new(false));
+            let acknowledged = reached.clone();
+            let _boundary = ReplacementBoundary::install(&scope, 1, 1, key, move || {
+                acknowledged.store(true, Ordering::SeqCst);
+                cancel.send_replace(CancelSignal::Requested);
+            });
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.keyboard.type",
+                    &json!({
+                        "identityScope":scope, "replace":true, "text":"Z"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(reached.load(Ordering::SeqCst));
+            assert_eq!(failure.error, ProtocolError::Cancelled);
+            assert_eq!(failure.effects, Effects::Completed);
+            assert!(!failure.cleanup_failed);
+            assert_eq!(f.state.held_modifiers().unwrap(), 0);
+            assert_eq!(f.page.client.pending_len().await, 0);
+            f.page.permit.check().unwrap();
+            let inputs = f.inputs();
+            assert!(inputs.iter().all(|request| request["sessionId"] == "page"));
+            let modifier = if cfg!(target_os = "macos") {
+                "MetaLeft"
+            } else {
+                "ControlLeft"
+            };
+            for code in ["KeyA", modifier] {
+                assert!(inputs
+                    .iter()
+                    .any(|request| request["params"]["code"] == code
+                        && request["params"]["type"] == "keyUp"));
+            }
+            assert_eq!(
+                inputs
+                    .iter()
+                    .filter(|request| request["params"]["code"] == "Delete")
+                    .count(),
+                if key == "Delete" { 2 } else { 0 }
+            );
+            assert!(!inputs
+                .iter()
+                .any(|request| request["params"]["code"] == "KeyZ"
+                    || request["method"] == "Input.insertText"));
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_missing_prefix_proof_does_not_interrupt_ordinary_typing() {
+        for cancelled in [false, true] {
+            let scope = format!("unproved-prefix-{}", uuid::Uuid::new_v4());
+            let f = fixture_scoped("normal", &scope).await;
+            // Make the optional inventory proof unavailable while leaving the
+            // existing action permit and actual keyboard transport intact.
+            f.page.targets.seal();
+            let cancel = f._cancel.clone();
+            let _boundary = ReplacementBoundary::install(&scope, 1, 1, "Delete", move || {
+                if cancelled {
+                    cancel.send_replace(CancelSignal::Requested);
+                }
+            });
+            let result = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.keyboard.type",
+                    &json!({
+                        "identityScope":scope, "replace":true, "text":"Z"
+                    }),
+                )
+                .await;
+            if cancelled {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.error, ProtocolError::Cancelled);
+                assert_eq!(failure.effects, Effects::Unknown);
+            } else {
+                result.unwrap();
+            }
+            assert_eq!(
+                f.inputs()
+                    .iter()
+                    .any(|request| request["params"]["code"] == "KeyZ"),
+                !cancelled
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_prefix_cannot_rebase_after_missing_or_changed_initial_authority() {
+        for initially_unavailable in [false, true] {
+            let scope = format!("unrebased-prefix-{}", uuid::Uuid::new_v4());
+            let f = fixture_scoped("normal", &scope).await;
+            let target = f.page.target_id.clone();
+            if initially_unavailable {
+                f.page
+                    .targets
+                    .attached(
+                        "context",
+                        target.clone(),
+                        f.page.page_session_id.clone(),
+                        "page".into(),
+                    )
+                    .unwrap();
+                assert!(f.page.targets.inventory().is_err());
+            }
+            let targets = f.page.targets.clone();
+            let _selected =
+                ReplacementBoundary::install(&scope, 1, 1, "ControlOrMeta+A", move || {
+                    if initially_unavailable {
+                        targets.configured(&target).unwrap();
+                    } else {
+                        targets.invalidate_inventory().unwrap();
+                    }
+                    assert!(targets.inventory().is_ok());
+                });
+            let cancel = f._cancel.clone();
+            let _deleted = ReplacementBoundary::install(&scope, 1, 1, "Delete", move || {
+                cancel.send_replace(CancelSignal::Requested);
+            });
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.keyboard.type",
+                    &json!({
+                        "identityScope":scope, "replace":true, "text":"Z"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, ProtocolError::Cancelled);
+            assert_eq!(failure.effects, Effects::Unknown);
+            let inputs = f.inputs();
+            assert!(inputs
+                .iter()
+                .any(|request| request["params"]["code"] == "Delete"
+                    && request["params"]["type"] == "keyUp"));
+            assert!(!inputs
+                .iter()
+                .any(|request| request["params"]["code"] == "KeyZ"));
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_next_pending_mutation_invalidates_acknowledged_prefix() {
+        for (mode, key) in [
+            ("delete-cancel", "ControlOrMeta+A"),
+            ("type-cancel", "Delete"),
+        ] {
+            let scope = format!("pending-prefix-{}", uuid::Uuid::new_v4());
+            let f = fixture_scoped(mode, &scope).await;
+            let reached = Arc::new(AtomicBool::new(false));
+            let acknowledged = reached.clone();
+            let _boundary = ReplacementBoundary::install(&scope, 1, 1, key, move || {
+                acknowledged.store(true, Ordering::SeqCst);
+            });
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.keyboard.type",
+                    &json!({
+                        "identityScope":scope, "replace":true, "text":"Z"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert!(reached.load(Ordering::SeqCst));
+            assert_eq!(failure.error, ProtocolError::Cancelled);
+            assert_eq!(failure.effects, Effects::Unknown, "{mode}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_cancelled_prefix_requires_cleanup_ack_and_live_authority() {
+        for mode in [
+            "normal",
+            "prefix-cleanup-failed",
+            "prefix-cleanup-reset",
+            "prefix-cleanup-disconnected",
+        ] {
+            let scope = format!("cleanup-prefix-{}", uuid::Uuid::new_v4());
+            let f = fixture_scoped(mode, &scope).await;
+            // An independently held modifier must also be released before a
+            // settled cancellation is reusable, not silently left down.
+            f.state
+                .execute(
+                    &f.page,
+                    &[],
+                    &f.op,
+                    "input.keyboard",
+                    &json!({
+                        "action":"down", "value":"Shift"
+                    }),
+                )
+                .await
+                .unwrap();
+            let cancel = f._cancel.clone();
+            let _boundary = ReplacementBoundary::install(&scope, 1, 1, "Delete", move || {
+                cancel.send_replace(CancelSignal::Requested);
+            });
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.keyboard.type",
+                    &json!({
+                        "identityScope":scope, "replace":true, "text":"Z"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, ProtocolError::Cancelled, "{mode}");
+            assert_eq!(
+                failure.effects,
+                if mode == "normal" {
+                    Effects::Completed
+                } else {
+                    Effects::Unknown
+                },
+                "{mode}"
+            );
+            assert_eq!(failure.cleanup_failed, mode != "normal", "{mode}");
+            assert!(f
+                .inputs()
+                .iter()
+                .any(|request| request["params"]["code"] == "ShiftLeft"
+                    && request["params"]["type"] == "keyUp"));
+            assert!(!f
+                .inputs()
+                .iter()
+                .any(|request| request["params"]["code"] == "KeyZ"));
+            if mode == "normal" {
+                assert_eq!(f.state.held_modifiers().unwrap(), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_prefix_cancel_cannot_hide_retired_epoch_or_inventory() {
+        for retire_permit in [false, true] {
+            let scope = format!("authority-prefix-{}", uuid::Uuid::new_v4());
+            let f = fixture_scoped("normal", &scope).await;
+            let cancel = f._cancel.clone();
+            let targets = f.page.targets.clone();
+            let gate = f.gate.clone();
+            let _boundary =
+                ReplacementBoundary::install(&scope, 1, 1, "ControlOrMeta+A", move || {
+                    if retire_permit {
+                        gate.seal();
+                    } else {
+                        targets.invalidate_inventory().unwrap();
+                    }
+                    cancel.send_replace(CancelSignal::Requested);
+                });
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.keyboard.type",
+                    &json!({
+                        "identityScope":scope, "replace":true, "text":"Z"
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                failure.error,
+                if retire_permit {
+                    ProtocolError::StaleScope
+                } else {
+                    ProtocolError::Cancelled
+                }
+            );
+            assert_eq!(failure.effects, Effects::Unknown);
+            assert!(!f.inputs().iter().any(|request| matches!(
+                request["params"]["code"].as_str(),
+                Some("Delete" | "KeyZ")
+            )));
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_prefix_session_close_is_not_reusable_cancellation() {
+        let scope = format!("closed-prefix-{}", uuid::Uuid::new_v4());
+        let f = fixture_scoped("normal", &scope).await;
+        let cancel = f._cancel.clone();
+        let _boundary = ReplacementBoundary::install(&scope, 1, 1, "Delete", move || {
+            cancel.send_replace(CancelSignal::SessionClosed);
+        });
+        let failure = ClientActions::default()
+            .execute(
+                f.context(),
+                "browser.keyboard.type",
+                &json!({
+                    "identityScope":scope, "replace":true, "text":"Z"
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error, ProtocolError::Cancelled);
+        assert_eq!(failure.effects, Effects::Unknown);
+        assert!(!f
+            .inputs()
+            .iter()
+            .any(|request| request["params"]["code"] == "KeyZ"));
+    }
+
+    #[tokio::test]
+    async fn replacement_prefix_receipt_rejects_observed_transport_loss() {
+        let mut f = fixture("normal").await;
+        let proof = SettledReplacementPrefix::capture(&f.context()).unwrap();
+        let mut lost = f.page.client.remote_connection_closed();
+        f.server.abort();
+        let _ = (&mut f.server).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !*lost.borrow() {
+                lost.changed().await.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            proof.check(&f.context()),
+            Err(ProtocolError::BrowserFailure)
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_prefix_receipt_is_exact_and_never_promotes_other_errors() {
+        let mut f = fixture("normal").await;
+        let proof = SettledReplacementPrefix::capture(&f.context()).unwrap();
+        f.page.page_session_id = "other-session".into();
+        assert_eq!(proof.check(&f.context()), Err(ProtocolError::StaleScope));
+        f.page.page_session_id = "page".into();
+        f.op.sequence += 1;
+        assert_eq!(proof.check(&f.context()), Err(ProtocolError::StaleScope));
+        f.op.sequence -= 1;
+        f.op.generation += 1;
+        assert_eq!(proof.check(&f.context()), Err(ProtocolError::StaleScope));
+        f.op.generation -= 1;
+        f.page.identity_scope = "other-scope".into();
+        assert_eq!(proof.check(&f.context()), Err(ProtocolError::StaleScope));
+        f.page.identity_scope = "scope".into();
+        proof.check(&f.context()).unwrap();
+        let d = Dispatch::default();
+        d.mark();
+        *d.settled_replacement_prefix.lock().unwrap() = Some(Arc::new(proof));
+        for error in [
+            ProtocolError::BrowserFailure,
+            ProtocolError::DeadlineExceeded,
+            ProtocolError::StaleScope,
+            ProtocolError::CleanupFailed,
+        ] {
+            assert_eq!(
+                finish_dispatch(&d, Err(error)).unwrap_err().effects,
+                Effects::Unknown
+            );
+        }
+        d.mark();
+        assert!(d.settled_replacement_prefix.lock().unwrap().is_none());
     }
     #[tokio::test]
     async fn initial_focused_keyboard_needs_no_snapshot_but_reconnect_does() {
@@ -4452,6 +5049,125 @@ mod tests {
         );
         assert!(!path.exists());
         assert!(actions.uploads.lock().await.is_empty());
+    }
+    #[tokio::test]
+    #[ignore = "requires hosted Chromium: ACKed replacement prefix cancellation preserves renderer state and session reuse"]
+    async fn chromium_replacement_acknowledged_prefix_cancel_preserves_selection_and_session() {
+        use super::super::{
+            client_browser::ClientBrowser,
+            client_protocol::ScopeState,
+            client_session::ClientSession,
+            client_transport::{ClientEventSink, ClientExecutor},
+        };
+        async fn run(
+            browser: &ClientBrowser,
+            operations: &mut FixtureOperations,
+            sink: &ClientEventSink,
+            command: &str,
+            args: Value,
+            seconds: u64,
+        ) -> Result<Value, String> {
+            operations
+                .execute_written(browser, sink, command, args, seconds)
+                .await
+                .map_err(|error| format!("{command} admission/settlement: {error:?}"))?
+                .result
+                .map_err(|error| format!("{command}: {error:?}"))
+        }
+        let broker = Arc::new(ClientSession::new());
+        let browser = ClientBrowser::new(broker.clone());
+        let (sink, _events) = ClientEventSink::test_channel(broker.clone());
+        browser.set_event_sink(sink.clone()).unwrap();
+        let mut operations = FixtureOperations::new(broker.clone());
+        let result: Result<(), String> = async {
+            let opened = run(&browser, &mut operations, &sink, "scope.open",
+                fixture_scope_open("launch", None), 30).await?;
+            let scope = opened["identityScope"].as_str().ok_or("missing scope")?.to_owned();
+            run(&browser, &mut operations, &sink, "scope.configure",
+                fixture_configuration(&scope, None), 30).await?;
+            run(&browser, &mut operations, &sink, "network.routes.replace",
+                fixture_routes(&scope), 30).await?;
+            run(&browser, &mut operations, &sink, "page.activate",
+                json!({"identityScope":scope}), 30).await?;
+            for key in ["ControlOrMeta+A", "Delete"] {
+                let token = uuid::Uuid::new_v4().to_string();
+                run(&browser, &mut operations, &sink, "page.evaluate", json!({
+                    "identityScope":scope,
+                    "source":r#"token=>{
+                        document.body.innerHTML='<textarea id="edit">original</textarea>';
+                        window.prefixFixture={token,events:[]};
+                        const edit=document.querySelector('#edit');
+                        for(const type of ['keydown','keyup','input'])
+                            edit.addEventListener(type,event=>prefixFixture.events.push({
+                                type:event.type,code:event.code??null,inputType:event.inputType??null
+                            }));
+                        edit.focus();edit.setSelectionRange(2,2);return true;
+                    }"#,
+                    "argument":token
+                }), 2).await?;
+                let sequence = operations.sequence + 1;
+                let generation = broker.health().map_err(|error| format!("health: {error:?}"))?.0;
+                let cancelling = broker.clone();
+                let reached = Arc::new(AtomicBool::new(false));
+                let acknowledged = reached.clone();
+                let _boundary = ReplacementBoundary::install(&scope, generation, sequence, key, move || {
+                    acknowledged.store(true, Ordering::SeqCst);
+                    cancelling.cancel(generation, sequence).unwrap();
+                });
+                let outcome = operations.execute_written(&browser, &sink, "browser.keyboard.type",
+                    json!({"identityScope":scope,"replace":true,"text":"must-not-type"}), 2).await
+                    .map_err(|error| format!("replacement admission/settlement: {error:?}"))?;
+                if !reached.load(Ordering::SeqCst)
+                    || outcome.result != Err(ProtocolError::Cancelled)
+                    || outcome.effects != Effects::Completed
+                    || broker.health().map_err(|error| format!("health: {error:?}"))?
+                        != (generation, ScopeState::Usable)
+                {
+                    return Err(format!("{key}: prefix did not settle as cancelled and reusable"));
+                }
+                // Both reads are fresh, admitted, post-settlement operations on
+                // the same live ClientBrowser/scope. No reset, reattach, replay,
+                // synthetic renderer result, or independent CDP bypass occurs.
+                let inspect = json!({"identityScope":scope,"source":r#"()=>{
+                    const edit=document.querySelector('#edit');
+                    return {token:prefixFixture.token,value:edit.value,start:edit.selectionStart,
+                        end:edit.selectionEnd,active:document.activeElement.id,events:prefixFixture.events};
+                }"#,"argument":null});
+                let first = run(&browser, &mut operations, &sink, "page.evaluate", inspect.clone(), 2).await?;
+                let second = run(&browser, &mut operations, &sink, "page.evaluate", inspect, 2).await?;
+                let actual = &first["value"];
+                let expected_value = if key == "Delete" { "" } else { "original" };
+                if first != second || actual["token"] != token || actual["value"] != expected_value
+                    || actual["start"] != 0 || actual["end"] != expected_value.len()
+                    || actual["active"] != "edit"
+                {
+                    return Err(format!("{key}: settled selection/deletion or same-document read changed: {actual}"));
+                }
+                let events = actual["events"].as_array().ok_or("missing renderer input evidence")?;
+                for code in ["KeyA", "Delete"] {
+                    let count = events.iter().filter(|event| event["code"] == code).count();
+                    let expected = if code == "Delete" && key != "Delete" { 0 } else { 2 };
+                    if count != expected {
+                        return Err(format!("{key}: renderer {code} event count {count}, expected {expected}"));
+                    }
+                }
+                if !events.iter().any(|event| event["type"] == "keyup"
+                    && matches!(event["code"].as_str(), Some("ControlLeft" | "MetaLeft")))
+                    || events.iter().any(|event| event["code"].as_str().is_some_and(|code|
+                        !matches!(code, "ControlLeft" | "MetaLeft" | "KeyA" | "Delete"))
+                        || event["inputType"].as_str().is_some_and(|kind| kind.starts_with("insert")))
+                {
+                    return Err(format!("{key}: modifier release missing or replacement text was dispatched"));
+                }
+            }
+            Ok(())
+        }.await;
+        let cleanup = browser.shutdown().await;
+        assert!(cleanup.is_ok(), "production scope cleanup: {cleanup:?}");
+        assert!(
+            result.is_ok(),
+            "replacement prefix/session boundary: {result:?}"
+        );
     }
     #[tokio::test]
     #[ignore = "requires hosted Chromium: production protected observe then exact checked action with bounded stage evidence"]

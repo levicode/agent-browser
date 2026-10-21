@@ -632,6 +632,51 @@ pub struct EnrollmentAttestation {
     watermark: BoundedEventWatermark,
 }
 
+/// Read-only, operation-bound application authority for an acknowledged input
+/// prefix. It is not permission to execute input after cancellation.
+pub(crate) struct SettledInputAuthority {
+    owner: Arc<ClientEnrollment>,
+    session: String,
+    target: String,
+    generation: u64,
+    sequence: u64,
+    deadline: Instant,
+    cancellation: watch::Receiver<CancelSignal>,
+    application_epoch: u64,
+}
+impl SettledInputAuthority {
+    pub(crate) fn check(
+        &self,
+        owner: &Arc<ClientEnrollment>,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        if !Arc::ptr_eq(&self.owner, owner)
+            || self.session != page.page_session_id
+            || self.target != page.target_id
+            || self.generation != op.generation
+            || self.sequence != op.sequence
+            || self.deadline != op.deadline
+            || !self.cancellation.same_channel(&op.cancellation)
+            || op.is_callback
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        // Requested cancellation may stop a settled prefix. Session retirement
+        // and expired operation authority may not authorize reusable settlement.
+        if *op.cancellation.borrow() == CancelSignal::SessionClosed {
+            return Err(ProtocolError::StaleScope);
+        }
+        if Instant::now() >= op.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if owner.settled_input_epoch(page, op.generation)? != self.application_epoch {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct ContainmentState {
     task: Option<JoinHandle<Result<(), ProtocolError>>>,
@@ -970,10 +1015,13 @@ impl ClientEnrollment {
                     .collect::<Vec<_>>(),
             )
         };
+        // Attest every enrolled native kind. CDP's omitted filter excludes
+        // browser/tab targets (or inherits a discovery filter); that subset
+        // cannot prove an enrolled target absent. This query grants no ownership.
         // Browser inventory alone is not a renderer flush. Reconcile each
         // exact application session's frame/loader tree as well.
         let inventory = self
-            .command(op, None, "Target.getTargets", json!({}))
+            .command(op, None, "Target.getTargets", json!({"filter":[{}]}))
             .await?;
         let infos = inventory
             .get("targetInfos")
@@ -1560,6 +1608,81 @@ impl ClientEnrollment {
         }
         self.targets.inventory()?;
         Ok(())
+    }
+    /// Capture only already-current enrollment. Never wait, flush, or start a
+    /// second lifecycle stream to turn uncertain authority into settled input.
+    pub(crate) fn capture_settled_input_authority(
+        self: &Arc<Self>,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<SettledInputAuthority, ProtocolError> {
+        self.check_restart_operation(op)?;
+        if op.is_callback {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let application_epoch = self.settled_input_epoch(page, op.generation)?;
+        Ok(SettledInputAuthority {
+            owner: self.clone(),
+            session: page.page_session_id.clone(),
+            target: page.target_id.clone(),
+            generation: op.generation,
+            sequence: op.sequence,
+            deadline: op.deadline,
+            cancellation: op.cancellation.clone(),
+            application_epoch,
+        })
+    }
+    fn settled_input_epoch(
+        &self,
+        page: &BrowserExecutionLease,
+        generation: u64,
+    ) -> Result<u64, ProtocolError> {
+        self.check()?;
+        page.permit.check()?;
+        if generation != self.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if !Arc::ptr_eq(&page.client, &self.client)
+            || !Arc::ptr_eq(&page.targets, &self.targets)
+            || page.identity_scope != self.targets.identity_scope
+            || *self.client.remote_connection_closed().borrow()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let watermark = self.realm_watermark()?;
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.realm_snapshot_healthy(&index, &watermark)?;
+        if !index.pending_enrollment.is_empty()
+            || index
+                .sessions
+                .values()
+                .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
+            || !index.retiring_pages.is_empty()
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let entry = index
+            .sessions
+            .get(&page.page_session_id)
+            .ok_or(ProtocolError::StaleReference)?;
+        if entry.target != page.target_id
+            || entry.kind != "page"
+            || entry.root != entry.session
+            || !entry.application
+            || entry.observation_only
+            || !entry.resumed
+            || *self
+                .active_root
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                != entry.session
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        Ok(index.application_epoch)
     }
     pub(crate) fn reserve_exact_realm(
         self: &Arc<Self>,
@@ -4095,6 +4218,7 @@ mod tests {
                                 {"targetId":"foreign","browserContextId":"other-context","type":"page"}]}),
                             "Target.getTargets" if mode=="observer-detached-live"=>json!({"targetInfos":[{"targetId":"other-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="borrowed-capture"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"},{"targetId":"unadopted-host","type":"page","browserContextId":"owned-context"}]}),
+                            "Target.getTargets" if mode.starts_with("attestation-complete")=>complete_capture_inventory(mode, &request, inventory_reads),
                             "Target.getTargets" if mode=="attestation-missing-target" && inventory_reads>1=>json!({"targetInfos":[]}),
                             "Target.getTargets" if mode=="attestation-missing-context" && inventory_reads>1=>json!({"targetInfos":[{"targetId":"target","type":"page"}]}),
                             "Target.getTargets" if mode=="attestation-foreign-context" && inventory_reads>1=>json!({"targetInfos":[{"targetId":"target","type":"page","browserContextId":"foreign-context"}]}),
@@ -4115,6 +4239,57 @@ mod tests {
         let (owner, notices, broker) =
             coordinator(client, "owned-context", "owned-scope", "initial");
         (owner, notices, log, emit, server, broker)
+    }
+    // Model the pinned CDP TargetFilter rules, including the default omission
+    // of native tab/browser targets. A complete inventory is not an ownership
+    // grant: include unrelated targets so production must retain that boundary.
+    fn complete_capture_inventory(mode: &str, request: &Value, reads: usize) -> Value {
+        let mut tab =
+            json!({"targetId":"tab-target","type":"tab","browserContextId":"owned-context"});
+        match mode {
+            "attestation-complete-missing-context" => {
+                tab.as_object_mut().unwrap().remove("browserContextId");
+            }
+            "attestation-complete-foreign-context" => {
+                tab["browserContextId"] = json!("foreign-context");
+            }
+            _ => {}
+        }
+        let mut infos = vec![
+            json!({"targetId":"target","type":"page","browserContextId":"owned-context"}),
+            json!({"targetId":"unowned-tab","type":"tab","browserContextId":"owned-context"}),
+            json!({"targetId":"foreign-tab","type":"tab","browserContextId":"foreign-context"}),
+            json!({"targetId":"browser","type":"browser"}),
+        ];
+        if mode != "attestation-complete-missing-target" {
+            infos.push(tab);
+        }
+        if reads > 1 {
+            match mode {
+                "attestation-complete-unowned-page" => infos.push(json!({
+                    "targetId":"unowned-page","type":"page","browserContextId":"owned-context"
+                })),
+                "attestation-complete-unknown-kind" => infos.push(json!({
+                    "targetId":"unknown-kind","type":"future-target-kind","browserContextId":"owned-context"
+                })),
+                _ => {}
+            }
+        }
+        let default_filter = json!([
+            {"type":"browser","exclude":true},
+            {"type":"tab","exclude":true},
+            {}
+        ]);
+        let filter = request["params"].get("filter").unwrap_or(&default_filter);
+        infos.retain(|info| {
+            filter
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.get("type").is_none() || entry["type"] == info["type"])
+                .is_some_and(|entry| entry["exclude"].as_bool() != Some(true))
+        });
+        json!({"targetInfos":infos})
     }
     fn attach(
         context: &str,
@@ -4219,6 +4394,215 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+    #[tokio::test]
+    async fn settled_input_authority_is_exact_and_ignores_only_requested_cancellation() {
+        let (owner, mut page, _notices, _emit, server) = realm_test_owner().await;
+        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        let mut op = owner.operation();
+        op.sequence = 77;
+        op.cancellation = cancellation;
+        let mut proof = owner.capture_settled_input_authority(&page, &op).unwrap();
+        op.is_callback = true;
+        assert!(matches!(
+            owner.capture_settled_input_authority(&page, &op),
+            Err(ProtocolError::InvalidArguments)
+        ));
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        op.is_callback = false;
+        let captured_deadline = op.deadline;
+        op.deadline += Duration::from_secs(1);
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        op.deadline = Instant::now();
+        assert!(matches!(
+            owner.capture_settled_input_authority(&page, &op),
+            Err(ProtocolError::DeadlineExceeded)
+        ));
+        op.deadline = captured_deadline;
+        cancel.send_replace(CancelSignal::Requested);
+        proof.check(&owner, &page, &op).unwrap();
+        assert!(matches!(
+            owner.capture_settled_input_authority(&page, &op),
+            Err(ProtocolError::Cancelled)
+        ));
+        op.sequence += 1;
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        op.sequence -= 1;
+        op.generation += 1;
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        op.generation -= 1;
+        let (_foreign_cancel, foreign_receiver) = watch::channel(CancelSignal::Requested);
+        let original_receiver = std::mem::replace(&mut op.cancellation, foreign_receiver);
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        op.cancellation = original_receiver;
+        let original_session = std::mem::replace(&mut page.page_session_id, "foreign".into());
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        page.page_session_id = original_session;
+        let original_scope = std::mem::replace(&mut page.identity_scope, "foreign".into());
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        page.identity_scope = original_scope;
+        proof.check(&owner, &page, &op).unwrap();
+        cancel.send_replace(CancelSignal::SessionClosed);
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        cancel.send_replace(CancelSignal::Requested);
+        // Isolate the expiry guard without wall-clock sleeps: both exact
+        // records now hold the same already-expired captured deadline.
+        proof.deadline = Instant::now();
+        op.deadline = proof.deadline;
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::DeadlineExceeded)
+        );
+        drop(page);
+        owner.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn settled_input_authority_refuses_pending_failed_or_changed_enrollment() {
+        let (owner, page, _notices, emit, server) = realm_test_owner().await;
+        // Establish a real received/applied watermark through the existing
+        // supervisor before modeling a delayed application of that stream.
+        realm_emit(&owner, &emit, realm_created(41, "settled-prefix-realm")).await;
+        let op = owner.operation();
+        let proof = owner.capture_settled_input_authority(&page, &op).unwrap();
+        let watermark = owner.realm_watermark().unwrap();
+        let applied = owner.index.lock().unwrap().applied_watermark;
+        assert!(applied > 0 && applied >= watermark.received().unwrap());
+        owner.index.lock().unwrap().applied_watermark = applied - 1;
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        owner.index.lock().unwrap().applied_watermark = applied;
+        owner
+            .index
+            .lock()
+            .unwrap()
+            .pending_enrollment
+            .insert("pending".into());
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        owner.index.lock().unwrap().pending_enrollment.clear();
+        owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("initial")
+            .unwrap()
+            .resumed = false;
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .get_mut("initial")
+            .unwrap()
+            .resumed = true;
+        owner
+            .index
+            .lock()
+            .unwrap()
+            .retiring_pages
+            .insert("initial-target".into(), "initial".into());
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        owner.index.lock().unwrap().retiring_pages.clear();
+        *owner.active_root.lock().unwrap() = "foreign".into();
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleReference)
+        );
+        *owner.active_root.lock().unwrap() = "initial".into();
+        owner.index.lock().unwrap().failure = Some(ProtocolError::BrowserFailure);
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::BrowserFailure)
+        );
+        owner.index.lock().unwrap().failure = None;
+        proof.check(&owner, &page, &op).unwrap();
+        // A real lifecycle event changes application authority even when the
+        // page session, operation, and browser connection are still the same.
+        realm_emit(
+            &owner,
+            &emit,
+            json!({"method":"Page.frameAttached","sessionId":"initial",
+            "params":{"frameId":"new-child","parentFrameId":"frame-initial"}}),
+        )
+        .await;
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        let current = owner.capture_settled_input_authority(&page, &op).unwrap();
+        owner.seal();
+        assert!(current.check(&owner, &page, &op).is_err());
+        drop(page);
+        let _ = owner.close().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn settled_input_authority_rejects_foreign_owner_client_and_registry() {
+        let (owner, mut page, _notices, _emit, server) = realm_test_owner().await;
+        let (foreign, _notices2, _log, _emit2, server2) = fixture("normal").await;
+        let op = owner.operation();
+        let proof = owner.capture_settled_input_authority(&page, &op).unwrap();
+        assert_eq!(
+            proof.check(&foreign, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        let original_client = std::mem::replace(&mut page.client, foreign.client.clone());
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        page.client = original_client;
+        let original_targets = std::mem::replace(&mut page.targets, foreign.targets.clone());
+        assert_eq!(
+            proof.check(&owner, &page, &op),
+            Err(ProtocolError::StaleScope)
+        );
+        page.targets = original_targets;
+        proof.check(&owner, &page, &op).unwrap();
+        drop(page);
+        owner.close().await.unwrap();
+        foreign.close().await.unwrap();
+        server.abort();
+        server2.abort();
     }
     #[tokio::test]
     async fn exact_realm_destroy_before_bind_survives_numeric_id_reuse_and_needs_new_document() {
@@ -4584,6 +4968,184 @@ mod tests {
             .is_err());
         server.abort();
         other_server.abort();
+    }
+    async fn enroll_capture_tab(
+        owner: &Arc<ClientEnrollment>,
+        emit: &tokio::sync::mpsc::Sender<Value>,
+    ) {
+        owner
+            .enroll_existing("target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        // Exercise the production reader, supervisor, context admission,
+        // initialization and resume path, not a handcrafted Attribution.
+        realm_emit(
+            owner,
+            emit,
+            json!({
+                "method":"Target.attachedToTarget",
+                "params":{
+                    "sessionId":"tab-session",
+                    "waitingForDebugger":true,
+                    "targetInfo":{
+                        "targetId":"tab-target","type":"tab","browserContextId":"owned-context"
+                    }
+                }
+            }),
+        )
+        .await;
+        let owned = owner.targets.owned_target("tab-target").unwrap();
+        assert_eq!(owned.kind, "tab");
+        assert_eq!(owned.purpose, Some(TargetPurpose::Application));
+        assert!(owned.configured && owned.resumed);
+        let entry = owner.index.lock().unwrap().sessions["tab-session"].clone();
+        assert_eq!(entry.kind, "tab");
+        assert!(entry.application && entry.resumed);
+        assert!(!entry.observation_only);
+    }
+    #[tokio::test]
+    async fn capture_attestation_complete_inventory_includes_native_tab_without_adoption() {
+        let (owner, _notices, log, emit, server) = fixture("attestation-complete").await;
+        enroll_capture_tab(&owner, &emit).await;
+        let entries = owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let default_inventory = owner
+            .command(&owner.operation(), None, "Target.getTargets", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(
+            capture_inventory_diagnostic(
+                &entries,
+                default_inventory["targetInfos"].as_array().unwrap(),
+                "owned-context"
+            ),
+            CaptureInventoryDiagnostic {
+                entries: 2,
+                inventory: 1,
+                missing: 1,
+                absent_target: 1,
+                application: 1,
+                other: 1,
+                ..Default::default()
+            }
+        );
+        let revision = owner.targets.inventory().unwrap().0;
+        let epoch = owner.index.lock().unwrap().application_epoch;
+        let proof = owner.attest_capture(&owner.operation()).await.unwrap();
+        owner
+            .verify_capture_attestation(&proof, &owner.operation())
+            .await
+            .unwrap();
+        assert_eq!(owner.targets.inventory().unwrap().0, revision);
+        assert_eq!(owner.targets.inventory().unwrap().1.len(), 2);
+        assert_eq!(owner.index.lock().unwrap().application_epoch, epoch);
+        assert_eq!(owner.index.lock().unwrap().sessions.len(), 2);
+        for target in ["unowned-tab", "foreign-tab", "browser"] {
+            assert!(matches!(
+                owner.targets.owned_target(target),
+                Err(ProtocolError::StaleReference)
+            ));
+        }
+        {
+            let requests = log.lock().unwrap();
+            let inventories = requests
+                .iter()
+                .filter(|request| request["method"] == "Target.getTargets")
+                .collect::<Vec<_>>();
+            assert_eq!(inventories.len(), 4);
+            assert_eq!(
+                inventories[0]["params"],
+                json!({"filter":[{"type":"browser","exclude":true},{"type":"tab","exclude":true},{}]})
+            );
+            assert_eq!(inventories[1]["params"], json!({}));
+            for request in &inventories[2..] {
+                assert_eq!(request["params"], json!({"filter":[{}]}));
+            }
+            assert!(!requests
+                .iter()
+                .any(|request| request["method"] == "Page.getFrameTree"
+                    && request["sessionId"] == "tab-session"));
+            assert!(requests
+                .iter()
+                .filter(|request| request["method"] == "Target.setAutoAttach")
+                .all(|request| request["params"] == autoattach(true)));
+        }
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn capture_attestation_complete_inventory_rejects_missing_foreign_and_unowned_targets() {
+        for (mode, expected) in [
+            (
+                "attestation-complete-missing-target",
+                ProtocolError::StaleScope,
+            ),
+            (
+                "attestation-complete-missing-context",
+                ProtocolError::StaleScope,
+            ),
+            (
+                "attestation-complete-foreign-context",
+                ProtocolError::StaleScope,
+            ),
+            (
+                "attestation-complete-unowned-page",
+                ProtocolError::StaleReference,
+            ),
+            (
+                "attestation-complete-unknown-kind",
+                ProtocolError::StaleReference,
+            ),
+        ] {
+            let (owner, _notices, log, emit, server) = fixture(mode).await;
+            enroll_capture_tab(&owner, &emit).await;
+            let revision = owner.targets.inventory().unwrap().0;
+            let epoch = owner.index.lock().unwrap().application_epoch;
+            let frames_before = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Page.getFrameTree")
+                .count();
+            assert!(
+                matches!(owner.attest_capture(&owner.operation()).await, Err(error) if error == expected),
+                "accepted {mode}"
+            );
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == "Page.getFrameTree")
+                    .count(),
+                frames_before,
+                "{mode} reached renderer capture before inventory proof"
+            );
+            assert_eq!(owner.targets.inventory().unwrap().0, revision);
+            assert_eq!(owner.targets.inventory().unwrap().1.len(), 2);
+            assert_eq!(owner.index.lock().unwrap().application_epoch, epoch);
+            assert_eq!(owner.index.lock().unwrap().sessions.len(), 2);
+            for target in [
+                "unowned-tab",
+                "foreign-tab",
+                "browser",
+                "unowned-page",
+                "unknown-kind",
+            ] {
+                assert!(matches!(
+                    owner.targets.owned_target(target),
+                    Err(ProtocolError::StaleReference)
+                ));
+            }
+            owner.close().await.unwrap();
+            server.abort();
+        }
     }
     #[tokio::test]
     async fn capture_attestation_rejects_each_missing_target_inventory_category() {
