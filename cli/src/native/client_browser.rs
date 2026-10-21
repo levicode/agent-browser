@@ -1961,6 +1961,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             "scope.open"
                 | "scope.end"
                 | "page.evaluate"
+                | "page.activate"
                 | "page.navigate"
                 | "page.reload"
                 | "page.back"
@@ -2019,7 +2020,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             | "context.viewport"
             | "input.keyboard"
             | "input.mouse" => Ok(None),
-            "page.title"
+            "page.activate"
+            | "page.title"
             | "page.url"
             | "session.environment"
             | "state.capture"
@@ -2036,7 +2038,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             {
                 Ok(None)
             }
-            "page.title"
+            "page.activate"
+            | "page.title"
             | "page.url"
             | "page.evaluate"
             | "session.environment"
@@ -2799,7 +2802,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 }
                 let mut dispatched = false;
                 let result = async {
-                        if command != "page.navigate" && command != "session.environment" && !command.starts_with("context.") && !page_active.load(std::sync::atomic::Ordering::SeqCst) {
+                        if command != "page.navigate" && command != "page.activate" && command != "session.environment" && !command.starts_with("context.") && !page_active.load(std::sync::atomic::Ordering::SeqCst) {
                             return Err(ProtocolError::ScopeUnavailable);
                         }
                         let _ui = ui
@@ -2843,6 +2846,16 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         } else { None };
                         if command == "session.environment" {
                             return environment_facts(&page, &lease, configured_user_agent.as_deref()).await;
+                        }
+                        if command == "page.activate" {
+                            // Provider recording needs original ensurePage semantics without
+                            // starting the native encoder or navigating an already active page.
+                            activation.ensure(&page, &lease, &mut dispatched).await?;
+                            page.permit.check()?;
+                            check_lifecycle_budget(&lease)?;
+                            page_active.store(true, std::sync::atomic::Ordering::SeqCst);
+                            dispatched = true;
+                            return Ok(serde_json::json!({"activated": true}));
                         }
                         let sessions = page
                             .targets
@@ -4107,6 +4120,42 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn provider_activation_requires_current_scope_before_browser_work() {
+        use super::super::client_session::{CancelSignal, OperationLease};
+        use super::super::client_transport::ClientExecutor;
+        let browser =
+            ClientBrowser::new(Arc::new(super::super::client_session::ClientSession::new()));
+        for (args, expected) in [
+            (serde_json::json!({}), ProtocolError::InvalidArguments),
+            (
+                serde_json::json!({"identityScope":"retired"}),
+                ProtocolError::StaleScope,
+            ),
+        ] {
+            let (_sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let outcome = browser
+                .execute(
+                    "page.activate".into(),
+                    args.as_object().unwrap().clone(),
+                    OperationLease {
+                        is_callback: false,
+                        generation: 1,
+                        sequence: 1,
+                        deadline: std::time::Instant::now() + std::time::Duration::from_secs(1),
+                        cancellation,
+                    },
+                )
+                .await;
+            assert_eq!(outcome.result, Err(expected));
+            assert_eq!(
+                outcome.effects,
+                super::super::client_protocol::Effects::NotDispatched
+            );
+            assert!(browser.owner.lock().await.is_none());
+        }
+    }
+
     fn initialization_registry() -> Arc<super::super::client_targets::ClientTargets> {
         super::super::client_targets::ClientTargets::new("owned-context".into(), "scope".into())
     }
@@ -4349,10 +4398,10 @@ mod tests {
         browser.set_event_sink(sink).unwrap();
         let (_operation_sender, operation_cancellation) =
             tokio::sync::watch::channel(super::super::client_session::CancelSignal::None);
-        let operation = || super::super::client_session::OperationLease {
+        let operation = |sequence| super::super::client_session::OperationLease {
             is_callback: false,
             generation: 1,
-            sequence: 0,
+            sequence,
             deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
             cancellation: operation_cancellation.clone(),
         };
@@ -4363,7 +4412,7 @@ mod tests {
                     persistent: false,
                     options: Default::default(),
                 },
-                operation(),
+                operation(1),
             )
             .await
             .unwrap();
@@ -4423,7 +4472,7 @@ mod tests {
                 OpenRequest::Reuse {
                     options: Default::default(),
                 },
-                operation(),
+                operation(2),
             )
             .await
             .unwrap();

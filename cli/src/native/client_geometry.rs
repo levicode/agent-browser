@@ -2085,7 +2085,11 @@ mod tests {
             let main=frames.iter().find(|f|f.parent_frame_id.is_none()).ok_or("Missing main frame")?;
             let polygons=geometry.node_border_polygons(&mgr.client,main,backend,&operation).await.map_err(|_|"Inline border proof failed")?;
             let b=polygons[0].bounds().ok_or("Inline bounds missing")?;
-            if json!({"x":b.x,"y":b.y,"width":b.width,"height":b.height})!=*expected{return Err("Native inline union differs from public bounding rectangle".into());}
+            // CDP JSON may encode integral coordinates as integers, while native
+            // bounds serialize f64. Compare exact numeric coordinates, not JSON
+            // Number representation (25 and 25.0 are distinct serde Values).
+            let expected=Bounds{x:expected["x"].as_f64().ok_or("Missing expected x")?,y:expected["y"].as_f64().ok_or("Missing expected y")?,width:expected["width"].as_f64().ok_or("Missing expected width")?,height:expected["height"].as_f64().ok_or("Missing expected height")?};
+            if b!=expected{return Err(format!("Native inline union differs from public bounding rectangle: native={b:?}, expected={expected:?}"));}
             mgr.client.send_command("Runtime.releaseObjectGroup",Some(json!({"objectGroup":"geometry-inline"})),Some(session)).await?;
             Ok::<(),String>(())
         }.await;
@@ -2147,7 +2151,7 @@ mod tests {
                 registry.insert(frame,attached.clone());owned_sessions.push(attached);
             }
             if registry.len()!=2{return Err("Site isolation did not produce two independently verified OOPIF roots".into());}
-            let frames=super::super::client_observation::enumerate_frames(&mgr.client,session,&registry,&operation).await.map_err(|_|"OOPIF enumeration failed")?;
+            let frames=super::super::client_observation::enumerate_frames(&mgr.client,session,&registry,&operation).await.map_err(|e|format!("OOPIF enumeration failed: {e:?}"))?;
             if frames.len()!=3{return Err("OOPIF frame inventory incomplete".into());}
             let geometry=GeometrySnapshot::capture(&mgr.client,session,&frames,&operation).await.map_err(|e|format!("OOPIF geometry capture: {e:?}"))?;
             let leaf_session=leaf_session.ok_or("Missing leaf session")?;

@@ -64,6 +64,8 @@ pub struct Rect {
 pub struct SemanticNode {
     #[serde(skip)]
     pub labels: Vec<String>,
+    #[serde(skip)]
+    pub(crate) safe_public_name: Option<String>,
     #[serde(rename = "ref")]
     pub reference: NodeReference,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -265,6 +267,9 @@ async fn validate_frame(
     }
     Ok(())
 }
+fn normalize_public_label(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
+}
 fn ax_string(value: &Option<super::cdp::types::AXValue>) -> Option<String> {
     value
         .as_ref()?
@@ -289,12 +294,27 @@ const METADATA: &str = r#"function(testId,secureSelector) {
  const secureElement=e||this.parentElement;
  const secure=composedSecure(secureElement);
  const secureDescendants=!!e&&!!Element.prototype.querySelector.call(e,secureSelectorAll);
+ const normalize=s=>String(s??'').replace(/\s+/g,' ').trim();
+ function safeLabelText(node){
+   if(!node||composedSecure(node.nodeType===1?node:node.parentElement))return '';
+   const pending=[node],parts=[];let count=0;
+   while(pending.length){const n=pending.pop();if(++count>10000)return null;if(n===' '){parts.push(' ');continue;}
+     if(n.nodeType===3){if(!composedSecure(n.parentElement))parts.push(n.textContent);continue;}
+     if(n.nodeType!==1&&n.nodeType!==9&&n.nodeType!==11)continue;
+     if(n.nodeType===1){
+       if(composedSecure(n)||Element.prototype.matches.call(n,'input,textarea,select,script,style'))continue;
+       // Text is not an adequate replacement for icon/alternative naming.
+       if(n.shadowRoot||Element.prototype.matches.call(n,'img,svg,canvas,slot')||n.hasAttribute('aria-label')||n.hasAttribute('aria-labelledby'))return null;
+       const style=doc.defaultView.getComputedStyle(n);if(style.display==='none'||style.visibility==='hidden')continue;
+       if(!['inline','contents','inline-block','inline-flex','inline-grid'].includes(style.display)){parts.push(' ');pending.push(' ');}
+     }
+     for(let i=n.childNodes.length-1;i>=0;i--)pending.push(n.childNodes[i]);
+   }
+   return normalize(parts.join(''));
+ }
  function safeText(node){
-   if(!node)return null; if(node.nodeType===3)return composedSecure(node.parentElement)?null:node.textContent;
-   if(!secureDescendants)return node.innerText;
-   const walker=doc.createTreeWalker(node,NodeFilter.SHOW_TEXT);const parts=[];let text;
-   while(text=walker.nextNode()){const p=text.parentElement;if(p&&!composedSecure(p))parts.push(text.textContent);}
-   return parts.join(' ');
+   if(!node)return null;if(node.nodeType===3)return composedSecure(node.parentElement)?null:node.textContent;
+   return secureDescendants?safeLabelText(node):node.innerText;
  }
  const attrs={}; if(e) for(const a of e.attributes) if(!(secure&&a.name.toLowerCase()==='value')) attrs[a.name]=a.value;
  const style=e?doc.defaultView.getComputedStyle(e):null;
@@ -306,11 +326,23 @@ const METADATA: &str = r#"function(testId,secureSelector) {
  else if(!secure&&focused&&e.isContentEditable) selection=String(doc.getSelection()||'')||null;
  const ac=(e&&e.getAttribute('autocomplete')||'').toLowerCase().split(/\s+/);
  const purpose=((e&&Element.prototype.matches.call(e,'input[type="password" i]'))||ac.includes('current-password')||ac.includes('new-password'))?'password':secure?'generic-secret':ac.includes('one-time-code')?'one-time-code':ac.includes('username')?'username':'none';
- const labels=e?[e.getAttribute('aria-label'), ...(e.labels?Array.from(e.labels,l=>l.innerText):[]), ...(e.getAttribute('aria-labelledby')||'').split(/\s+/).map(id=>doc.getElementById(id)?.innerText)].filter(Boolean):[];
+ const associated=e&&e.labels?Array.from(e.labels):[];
+ const referenced=e?(e.getAttribute('aria-labelledby')||'').split(/\s+/).filter(Boolean).map(id=>e.getRootNode().getElementById?.(id)||doc.getElementById(id)).filter(Boolean):[];
+ const labelNodes=[...referenced,...associated];
+ const labelTexts=labelNodes.map(safeLabelText);
+ const labels=e?[e.getAttribute('aria-label'),...labelTexts].filter(s=>s!=null&&s!=='').map(normalize):[];
+ const labelledSecure=labelNodes.some(n=>Element.prototype.querySelector.call(n,secureSelectorAll));
+ let safePublicName=null;
+ if(e&&!secure&&(secureDescendants||labelledSecure)){
+   if(referenced.length){const values=referenced.map(safeLabelText);if(values.every(s=>s!==null))safePublicName=normalize(values.join(' '));}
+   else if(e.hasAttribute('aria-label'))safePublicName=normalize(e.getAttribute('aria-label'));
+   else if(labelNodes.length&&labelTexts.every(s=>s!==null))safePublicName=normalize(labelTexts.join(' '));
+   else if(secureDescendants)safePublicName=safeLabelText(e);
+ }
  let selector=null;if(e&&e.id)selector='#'+CSS.escape(e.id);else if(e&&e.hasAttribute(testId))selector='['+CSS.escape(testId)+'='+JSON.stringify(e.getAttribute(testId))+']';
  const secureText=secure&&(!e||!Element.prototype.matches.call(e,'input,textarea,select'));
  const unsafeLabel=!!e&&(e.getAttribute('aria-labelledby')||'').split(/\s+/).some(id=>composedSecure(doc.getElementById(id)));
- return {selector,redactName:secureText||unsafeLabel,labels:secureText||secureDescendants||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure?null:safeText(this),
+ return {selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure?null:safeText(this),
  value:secure?null:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r&&r.width&&r.height?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
@@ -344,7 +376,18 @@ async fn read_backend(
     .into_iter()
     .next()
     .ok_or(ObservationError::BackendFailure)?;
-    let security = security_inventory(client, frame, options, lease).await?;
+    // Metadata acquisition can race document/frame retirement. Revalidate the
+    // exact identity before the next DOM inventory and after a failed inventory;
+    // only positive retirement evidence changes a backend error into stale.
+    validate_frame(client, frame, lease).await?;
+    let security = match security_inventory(client, frame, options, lease).await {
+        Ok(security) => security,
+        Err(ObservationError::BackendFailure) => {
+            validate_frame(client, frame, lease).await?;
+            return Err(ObservationError::BackendFailure);
+        }
+        Err(error) => return Err(error),
+    };
     apply_security(&mut node, backend, &security);
     Ok(node)
 }
@@ -387,10 +430,21 @@ fn project_node(
         frame_path: frame.frame_path.clone(),
         ..Default::default()
     };
-    if data["secureDescendants"] == true || data["redactName"] == true {
-        node.name = None;
+    node.safe_public_name = data["safePublicName"]
+        .as_str()
+        .filter(|v| !v.is_empty())
+        .map(str::to_owned);
+    if data["secureDescendants"] == true
+        || data["redactName"] == true
+        || node.safe_public_name.is_some()
+    {
+        node.name = node.safe_public_name.clone();
     }
-    node.labels = serde_json::from_value(data["labels"].clone()).map_err(|_| "Invalid labels")?;
+    node.labels = serde_json::from_value::<Vec<String>>(data["labels"].clone())
+        .map_err(|_| "Invalid labels")?
+        .into_iter()
+        .map(|label| normalize_public_label(&label))
+        .collect();
     node.attributes =
         serde_json::from_value(data["attributes"].clone()).map_err(|_| "Invalid attributes")?;
     node.states = serde_json::from_value(data["states"].clone()).map_err(|_| "Invalid states")?;
@@ -428,6 +482,9 @@ fn project_node(
         node.attributes.remove("value");
     }
     if bounded {
+        node.safe_public_name = node
+            .safe_public_name
+            .map(|name| name.chars().take(256).collect());
         node.attributes.retain(|name, _| {
             matches!(
                 name.as_str(),
@@ -823,14 +880,14 @@ fn project_read_fields(
 
 // Matching runs in the browser JavaScript realm to preserve the caller's JS
 // RegExp semantics (including flags); no Rust-regex approximation is used.
-const MATCH_QUERY: &str = r#"function(expression, data, labels, ...elements) {
+const MATCH_QUERY: &str = r#"function(expression, data, labels, safeNames, ...elements) {
  const norm=s=>String(s??'').replace(/[\u200b\u200c\u200d\ufeff]/g,'').replace(/\s+/g,' ').trim();
  function match(p,s,testId=false) { if(p.kind==='regexp') return new RegExp(p.source,p.flags).test(String(s??'')); if(testId)return String(s??'')===p.value; const a=norm(s),b=norm(p.value); return p.exact?a===b:a.toLowerCase().includes(b.toLowerCase()); }
  if(elements.some(e=>!e.isConnected||e.ownerDocument!==document))return {error:'stale-reference'};
  const all=elements.map((_,i)=>i);
  const contains=(a,b)=>{if(a===b)return false;let node=elements[b];const seen=new Set();while(node&&!seen.has(node)){seen.add(node);node=node.parentNode||(node.getRootNode&&node.getRootNode().host);if(node===elements[a])return true;}return false;};
  const redacted=[];
- for(let i=0;i<data.length;i++)if(data.some((n,j)=>n.states.secure&&contains(i,j))){redacted.push(i);delete data[i].name;delete data[i].text;delete data[i].selection;delete data[i].value;labels[i]=[];}
+ for(let i=0;i<data.length;i++)if(data.some((n,j)=>n.states.secure&&contains(i,j))){redacted.push(i);if(safeNames[i]!==null)data[i].name=safeNames[i];else delete data[i].name;delete data[i].text;delete data[i].selection;delete data[i].value;labels[i]=[];}
  function semantic(q,i) {
   const n=data[i],e=elements[i]; if(q.visible&&n.states.hidden)return false;
   if(q.kind==='role') {
@@ -944,7 +1001,7 @@ pub async fn query(
             }
         })).buffered(16).try_collect().await?;
         if objects.is_empty() { return Ok(Vec::new()); }
-        let mut arguments=vec![json!({"value":expression}),json!({"value":nodes}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()})];
+        let mut arguments=vec![json!({"value":expression}),json!({"value":nodes}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()})];
         arguments.extend(objects.iter().map(|id|json!({"objectId":id})));
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
@@ -952,7 +1009,7 @@ pub async fn query(
         match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
         let indices:Vec<usize>=serde_json::from_value(value["indices"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         let redacted:Vec<usize>=serde_json::from_value(value["redacted"].clone()).map_err(|_|ObservationError::BackendFailure)?;
-        for index in redacted { let node=nodes.get_mut(index).ok_or(ObservationError::BackendFailure)?;scrub_content(node); }
+        for index in redacted { let node=nodes.get_mut(index).ok_or(ObservationError::BackendFailure)?;scrub_ancestor_content(node); }
         indices.into_iter().map(|i|nodes.get(i).cloned().ok_or_else(||"Invalid query index".into())).collect::<Result<Vec<_>,ObservationError>>()
     }.await;
     let _ = tokio::time::timeout(
@@ -1229,13 +1286,18 @@ fn scrub_content(node: &mut SemanticNode) {
     node.labels.clear();
     node.attributes.remove("value");
 }
+fn scrub_ancestor_content(node: &mut SemanticNode) {
+    let public_name = node.safe_public_name.clone();
+    scrub_content(node);
+    node.name = public_name;
+}
 fn scrub_sensitive_ancestors(node: &mut SemanticNode) -> bool {
     let mut descendant = false;
     for child in &mut node.children {
         descendant |= scrub_sensitive_ancestors(child);
     }
     if descendant {
-        scrub_content(node);
+        scrub_ancestor_content(node);
     }
     descendant || node.states.get("secure") == Some(&true)
 }
@@ -1356,6 +1418,24 @@ fn assemble_forest(
 
 /// Enumerate only the executor's owned page and attached frame sessions. Missing
 /// renderer ownership is an error, never permission to attach an arbitrary tab.
+fn joined_frame_children(tree: &Value, parent: &str, owned: &HashMap<String, Value>) -> Vec<Value> {
+    let mut children = tree["childFrames"].as_array().cloned().unwrap_or_default();
+    // Renderer trees may omit remote roots. Join only native parentId edges
+    // from independently owned renderer trees, never target IDs or URLs.
+    let mut remote = owned
+        .values()
+        .filter(|root| {
+            root["frame"]["parentId"].as_str() == Some(parent)
+                && !children
+                    .iter()
+                    .any(|child| child["frame"]["id"] == root["frame"]["id"])
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    remote.sort_by(|a, b| a["frame"]["id"].as_str().cmp(&b["frame"]["id"].as_str()));
+    children.extend(remote);
+    children
+}
 pub async fn enumerate_frames(
     client: &CdpClient,
     page_session: &str,
@@ -1494,13 +1574,20 @@ pub async fn enumerate_frames(
         }
         let index = frames.len();
         frames.push(descriptor);
-        if let Some(children) = tree["childFrames"].as_array() {
-            for child in children {
-                queue.push_back((child.clone(), Some(index)));
-            }
+        for child in joined_frame_children(&tree, &id, &owned_trees) {
+            queue.push_back((child, Some(index)));
         }
     }
     if !owned_trees.is_empty() {
+        #[cfg(test)]
+        eprintln!(
+            "native frame inventory: unreachable owned roots={}, roots with native parent={}",
+            owned_trees.len(),
+            owned_trees
+                .values()
+                .filter(|v| v["frame"]["parentId"].is_string())
+                .count()
+        );
         return Err(ObservationError::StaleReference);
     }
     for frame in &frames {
@@ -1679,7 +1766,7 @@ fn apply_security(node: &mut SemanticNode, backend: i64, security: &SecurityInve
     let sensitive_ancestor =
         security.ancestors.contains(&backend) && node.states.get("secure") != Some(&true);
     if sensitive_ancestor || labelled {
-        scrub_content(node);
+        scrub_ancestor_content(node);
     }
 }
 /// Bounded, iterative traversal avoids native stack exhaustion on hostile DOMs.
@@ -1887,6 +1974,31 @@ pub async fn project_geometry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn public_labels_normalize_embedded_control_whitespace() {
+        assert_eq!(normalize_public_label("Qty  items"), "Qty items");
+        assert_eq!(normalize_public_label("  PIN\n \tfield  "), "PIN field");
+    }
+    #[test]
+    fn renderer_tree_join_requires_native_parent_and_preserves_existing_edges() {
+        let child = json!({"frame":{"id":"child","parentId":"main"}});
+        let remote = json!({"frame":{"id":"remote","parentId":"main"}});
+        let foreign = json!({"frame":{"id":"foreign","parentId":"other"}});
+        let unknown = json!({"frame":{"id":"unknown"}});
+        let owned = HashMap::from([
+            ("child".into(), child.clone()),
+            ("remote".into(), remote.clone()),
+            ("foreign".into(), foreign),
+            ("unknown".into(), unknown),
+        ]);
+        let tree = json!({"frame":{"id":"main"},"childFrames":[child.clone()]});
+        assert_eq!(
+            joined_frame_children(&tree, "main", &owned),
+            vec![child, remote]
+        );
+        let unknown_parent = json!({"frame":{"id":"other-unowned"}});
+        assert!(joined_frame_children(&unknown_parent, "other-unowned", &owned).is_empty());
+    }
     fn frame() -> ObservationFrame {
         ObservationFrame {
             parent_frame_id: None,
@@ -2354,6 +2466,46 @@ mod tests {
         let valid = json!({"nodeType":9,"backendNodeId":1,"children":[
             {"nodeType":1,"shadowRoots":[{"nodeType":11,"backendNodeId":2}]}]});
         assert_eq!(security_root_ids(&valid).unwrap(), vec![1, 2]);
+    }
+    #[test]
+    fn secure_ancestor_uses_only_sanitized_public_name_not_ax_content() {
+        let mut data = metadata();
+        data["safePublicName"] = json!("Unlock now");
+        data["secureDescendants"] = json!(true);
+        data["text"] = json!("Unlock now");
+        let mut refs = RefMap::new();
+        let mut node = project_node(
+            &frame(),
+            2,
+            &ax("synthetic-secret", 2, &[]),
+            &mut refs,
+            1,
+            &data,
+            false,
+        )
+        .unwrap();
+        apply_security(
+            &mut node,
+            2,
+            &SecurityInventory {
+                ancestors: std::collections::HashSet::from([2]),
+                label_ids: Default::default(),
+            },
+        );
+        assert_eq!(node.name.as_deref(), Some("Unlock now"));
+        assert!(node.text.is_none());
+        assert!(!serde_json::to_string(&node)
+            .unwrap()
+            .contains("synthetic-secret"));
+        assert!(!serde_json::to_string(&node)
+            .unwrap()
+            .contains("safePublicName"));
+        let mut unproved = SemanticNode {
+            name: Some("synthetic-secret".into()),
+            ..Default::default()
+        };
+        scrub_ancestor_content(&mut unproved);
+        assert!(unproved.name.is_none());
     }
     #[test]
     fn secure_inventory_keeps_public_password_labels_without_value() {

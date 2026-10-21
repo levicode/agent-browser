@@ -3091,13 +3091,13 @@ mod tests {
             )
             .unwrap();
         page.targets.configured(&page.target_id).unwrap();
-        page.targets.acknowledge_enrollment().unwrap();
         page.targets
             .resume_permit(&page.target_id)
             .await
             .unwrap()
             .complete()
             .unwrap();
+        page.targets.acknowledge_enrollment().unwrap();
     }
     #[test]
     fn recording_start_preflight_reuses_strict_shape_scope_size_quality_validation() {

@@ -1450,6 +1450,89 @@ mod tests {
         );
         server.await.unwrap();
     }
+    #[tokio::test]
+    async fn import_without_enrollment_times_out_before_evaluation_and_cleans_bootstrap() {
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut commands = Vec::new();
+            while let Some(Ok(message)) = socket.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let method = request["method"].as_str().unwrap();
+                commands.push(method.to_owned());
+                let result = match method {
+                    "Storage.setCookies" => json!({}),
+                    "Target.createTarget" => json!({"targetId":"synthetic-bootstrap"}),
+                    "Target.getTargetInfo" => {
+                        json!({"targetInfo":{"targetId":"synthetic-bootstrap","browserContextId":"synthetic-context","type":"page","url":"about:blank"}})
+                    }
+                    "Target.getTargets" => {
+                        json!({"targetInfos":[{"targetId":"synthetic-bootstrap","browserContextId":"synthetic-context","type":"page"}]})
+                    }
+                    "Target.closeTarget" => {
+                        assert_eq!(request["params"]["targetId"], "synthetic-bootstrap");
+                        json!({"success":true})
+                    }
+                    _ => panic!("Import must not bypass the missing enrollment owner"),
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if method == "Target.closeTarget" {
+                    break;
+                }
+            }
+            commands
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let targets = ClientTargets::new("synthetic-context".into(), "synthetic-scope".into());
+        let context = NativeStateContext {
+            client: &client,
+            context_id: "synthetic-context",
+            targets: &targets,
+            origins: &[],
+            origins_complete: true,
+        };
+        let state = convert_playwright_state(legacy_payload(
+            json!({"key":7,"value":"synthetic-first"}),
+            false,
+        ))
+        .unwrap();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 1,
+            deadline: std::time::Instant::now() + std::time::Duration::from_millis(250),
+            cancellation,
+        };
+        assert_eq!(
+            import_state(&context, &state, &operation).await,
+            Err(StateFailure {
+                error: StateError::Deadline,
+                cleanup_integrity_lost: false
+            })
+        );
+        assert!(targets.native_bootstrap_cleanup_complete().unwrap());
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "Storage.setCookies",
+                "Target.createTarget",
+                "Target.getTargetInfo",
+                "Target.getTargets",
+                "Target.closeTarget",
+            ]
+        );
+    }
     #[test]
     fn origin_scope_rejects_credentials_paths_and_opaque_origins() {
         for value in [
@@ -1582,7 +1665,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires real Chromium; required strict state import browser gate"]
     async fn chromium_duplicate_state_records_fail_instead_of_overwriting() {
-        use super::super::client_browser::OwnedBrowser;
+        use super::super::client_blobs::{BlobLimits, BlobScope, BlobStore};
+        use super::super::client_browser::{ExecutionGate, OwnedBrowser};
+        use super::super::client_enrollment::{ClientEnrollment, ScopeConfig, ScopeOwnership};
+        use super::super::client_network::{ClientNetwork, NetworkPolicy};
+        use super::super::client_protocol::{Effects, ProtocolError, ScopeState, ServerMessage};
+        use super::super::client_session::ClientSession;
+        use super::super::client_transport::ClientEventSink;
         for duplicate in [false, true] {
             let mut owner = OwnedBrowser::launch(Default::default(), None)
                 .await
@@ -1603,33 +1692,99 @@ mod tests {
                     .push(json!({"key":7,"value":"synthetic-second"}));
             }
             let state = convert_playwright_state(input).unwrap();
-            let context = NativeStateContext {
-                client: &owner.manager.client,
-                context_id: &owner.context_id,
-                targets: &owner.targets,
-                origins: &[],
-                origins_complete: true,
+            // launch() owns the context and initial blank only; it does not
+            // start the native attachment supervisor. Match runtime setup with
+            // a fresh registry and the existing coordinator, never a competing
+            // Target.attachToTarget loop in the storage primitive or fixture.
+            owner.targets =
+                ClientTargets::new(owner.context_id.clone(), owner.identity_scope.clone());
+            let broker = Arc::new(ClientSession::new());
+            let (sink, _notices) = ClientEventSink::test_channel(broker.clone());
+            let scoped_sink = sink
+                .stage_until_result(&operation, &owner.identity_scope)
+                .unwrap();
+            sink.acknowledge_result_for_test(&ServerMessage::Result {
+                id: "synthetic-state-fixture".into(),
+                generation: operation.generation,
+                operation_seq: operation.sequence,
+                ok: true,
+                data: Some(json!({"identityScope":owner.identity_scope})),
+                error: None,
+                effects: Effects::Completed,
+                scope_state: ScopeState::Usable,
+            })
+            .unwrap();
+            let blobs = Arc::new(BlobStore::new(BlobLimits::default()).unwrap());
+            let scope = BlobScope {
+                generation: operation.generation,
+                identity_scope: owner.identity_scope.clone(),
             };
-            let result = import_state(&context, &state, &operation).await;
-            let exported = if !duplicate && result.is_ok() {
-                let origins = vec!["https://fixture.test".to_owned()];
-                export_state(
-                    &NativeStateContext {
-                        origins: &origins,
-                        ..context
-                    },
-                    &operation,
-                )
-                .await
-            } else {
-                Err(StateError::InvalidInput.into())
-            };
-            // Even failure disposes the replacement context before assertions.
-            let cleanup = owner.close().await;
-            assert!(
-                cleanup.is_ok(),
-                "synthetic replacement context cleanup failed"
+            blobs.activate_scope(scope.clone()).unwrap();
+            let network = Arc::new(ClientNetwork::new(
+                owner.manager.client.clone(),
+                broker,
+                scoped_sink,
+                scope.clone(),
+                blobs.clone(),
+                owner.ui.clone(),
+                NetworkPolicy::default(),
+            ));
+            let target = owner.manager.active_target_id().unwrap().to_owned();
+            let session = owner.manager.active_session_id().unwrap().to_owned();
+            let enrollment = ClientEnrollment::new(
+                owner.manager.client.clone(),
+                owner.targets.clone(),
+                owner.page_state.clone(),
+                network,
+                Arc::new(ExecutionGate::default()),
+                operation.generation,
+                session.clone(),
+                ScopeConfig::default(),
+                ScopeOwnership::IsolatedContext,
+                None,
             );
+            let outcome = async {
+                enrollment
+                    .enroll_existing(&target, &session, "page", &operation)
+                    .await?;
+                enrollment.start(&operation).await?;
+                let context = NativeStateContext {
+                    client: &owner.manager.client,
+                    context_id: &owner.context_id,
+                    targets: &owner.targets,
+                    origins: &[],
+                    origins_complete: true,
+                };
+                let result = import_state(&context, &state, &operation).await;
+                let exported = if !duplicate && result.is_ok() {
+                    let origins = vec!["https://fixture.test".to_owned()];
+                    export_state(
+                        &NativeStateContext {
+                            origins: &origins,
+                            ..context
+                        },
+                        &operation,
+                    )
+                    .await
+                } else {
+                    Err(StateError::InvalidInput.into())
+                };
+                Ok::<_, ProtocolError>((result, exported))
+            }
+            .await;
+            // Even initialization/import failure drains the same supervisor and
+            // disposes its exact context before assertions. Do not double-dispose
+            // through owner.close(): this fixture owns enrollment separately.
+            let drained = enrollment.close().await;
+            let released = match enrollment.contain_owned_resources().await {
+                Ok(proof) => enrollment.release_after_containment(proof).await,
+                Err(error) => Err(error),
+            };
+            let revoked = blobs.revoke_scope(&scope);
+            let closed = owner.manager.close().await;
+            assert!(drained.is_ok() && released.is_ok() && revoked.is_ok() && closed.is_ok(),
+                "synthetic replacement cleanup failed: drain={drained:?}, release={released:?}, blobs={revoked:?}, browser={closed:?}");
+            let (result, exported) = outcome.expect("synthetic state enrollment failed");
             if duplicate {
                 assert_eq!(result, Err(StateError::UnsupportedValue.into()));
             } else {

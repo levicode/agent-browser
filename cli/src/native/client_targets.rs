@@ -162,7 +162,15 @@ impl ClientTargets {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed || state.reservations != 0 || state.resuming != 0 {
+        if state.sealed
+            || state.reservations != 0
+            || state.resuming != 0
+            || state.protected_read
+            || state
+                .targets
+                .values()
+                .any(|target| target.purpose.is_none() || !target.configured || !target.resumed)
+        {
             return Err(ProtocolError::ScopeUnavailable);
         }
         state.enrollment_ready = true;

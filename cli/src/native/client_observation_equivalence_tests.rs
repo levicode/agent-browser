@@ -240,6 +240,14 @@ async fn chromium_embedded_control_and_password_public_labels_contract() {
         let whole=observe(&browser.client,&inventory,&mut refs,"equivalence",2,&ObservationOptions::default(),&op).await?;
         assert!(!serde_json::to_string(&whole).unwrap().contains("synthetic-secret"));
         for(id,name)in[("secure","Unlock now"),("secure-label","PIN field")]{assert_eq!(flatten(&whole.roots).into_iter().find(|n|n.test_id.as_deref()==Some(id)).and_then(|n|n.name.as_deref()),Some(name));}
+        evaluate_on(&browser.client,session,r#"document.body.innerHTML='<span id="public-name">Preferred name</span><button data-testid="precedence" aria-label="Secondary name" aria-labelledby="public-name">Unlock <input type="password" value="synthetic-secret"> now</button><button data-testid="blocks"><span style="display:block">Unlock</span><input type="password" value="synthetic-secret"><span style="display:block">now</span></button><button data-testid="ambiguous"><img alt="Icon"><input type="password" value="synthetic-secret"> now</button>';true"#).await?;
+        let precedence=query_testid(&browser,&inventory,&mut refs,&op,"precedence").await;
+        assert_eq!(precedence.name.as_deref(),Some("Preferred name"));
+        let blocks=query_testid(&browser,&inventory,&mut refs,&op,"blocks").await;
+        assert_eq!(blocks.name.as_deref(),Some("Unlock now"));
+        let ambiguous=query_testid(&browser,&inventory,&mut refs,&op,"ambiguous").await;
+        assert!(ambiguous.name.is_none(),"Unproven icon name must not be replaced by arbitrary text");
+        assert!(!serde_json::to_string(&[precedence,blocks,ambiguous]).unwrap().contains("synthetic-secret"));
         Ok::<(),String>(())
     }.await;
     browser.close().await.unwrap();

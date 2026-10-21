@@ -865,10 +865,28 @@ mod tests {
         .unwrap();
         let ready: Value = serde_json::from_slice(&frame).unwrap();
         assert_eq!(ready["type"], "ready");
-        assert_eq!(
-            ready["capabilities"],
-            serde_json::json!(["browser.scope/1", "browser.evaluate/1"])
-        );
+        let expected = vec![
+            "browser.scope/1",
+            "browser.lifecycle/1",
+            "browser.evaluate/1",
+            "browser.page/1",
+            "browser.observe/1",
+            "browser.query/1",
+            "browser.actions/1",
+            "browser.network/1",
+            "browser.dialog/1",
+            "browser.download/1",
+            "browser.capture/1",
+            "browser.state/1",
+            "browser.recording/1",
+            "browser.blobs/1",
+        ];
+        #[cfg(feature = "acceptance-faults")]
+        let expected = expected
+            .into_iter()
+            .chain(std::iter::once("acceptance.faults/1"))
+            .collect::<Vec<_>>();
+        assert_eq!(ready["capabilities"], serde_json::json!(expected));
         assert!(gate.try_read().is_err());
 
         let (legacy, server) = tokio::io::duplex(8192);

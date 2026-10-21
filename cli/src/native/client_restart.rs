@@ -569,6 +569,9 @@ mod tests {
                     {
                         worker_attached = true;
                         before.push(attached("worker", "worker-session", "service_worker"));
+                        if persistent {
+                            before.push(attached("host-page", "host-observer-session", "page"));
+                        }
                         json!({})
                     }
                     "Target.getTargets" => {
@@ -614,6 +617,7 @@ mod tests {
                             targets.remove(target);
                             let session = match target {
                                 "old-page" => "old-session",
+                                "host-page" => "host-observer-session",
                                 "late-popup" => "popup-session",
                                 _ => "replacement-session",
                             };

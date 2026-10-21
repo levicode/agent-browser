@@ -157,6 +157,8 @@ struct Attribution {
     root: String,
     kind: String,
     application: bool,
+    observation_only: bool,
+    observer_paused: bool,
     resumed: bool,
 }
 #[derive(Clone, Debug)]
@@ -181,6 +183,8 @@ struct Index {
     popup_opened: HashSet<String>,
     retiring_pages: HashMap<String, String>,
     retired_page_sessions: HashSet<String>,
+    retired_observer_sessions: HashSet<String>,
+    retired_observer_targets: HashSet<String>,
 }
 
 /// Explicit restart authority, not ordinary borrowed-resource ownership.
@@ -675,6 +679,14 @@ impl ClientEnrollment {
             .pointer("/targetInfo/browserContextId")
             .and_then(Value::as_str)
             != Some(self.targets.context_id.as_str())
+            && !event.session_id.as_ref().is_some_and(|parent| {
+                self.index.lock().is_ok_and(|index| {
+                    index
+                        .sessions
+                        .get(parent)
+                        .is_some_and(|entry| entry.observation_only)
+                })
+            })
         {
             return Ok(None);
         }
@@ -774,7 +786,7 @@ impl ClientEnrollment {
                 || index
                     .sessions
                     .values()
-                    .any(|entry| entry.application && !entry.resumed)
+                    .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
             {
                 return Err(ProtocolError::ScopeUnavailable);
             }
@@ -783,7 +795,7 @@ impl ClientEnrollment {
                 index
                     .sessions
                     .values()
-                    .filter(|entry| entry.application)
+                    .filter(|entry| entry.application || entry.observation_only)
                     .cloned()
                     .collect::<Vec<_>>(),
             )
@@ -814,9 +826,13 @@ impl ClientEnrollment {
             if matches!(self.ownership, ScopeOwnership::BorrowedTargets(_))
                 && !self.authorized(target, None, info.get("openerId").and_then(Value::as_str))?
             {
-                // Preexisting unadopted host pages are not this attachment
-                // tenure's observation authority, nor bootstrap ownership.
-                // An authorized popup not yet enrolled must still fail below.
+                if info.get("type").and_then(Value::as_str) == Some("page")
+                    && !entries.iter().any(|entry| {
+                        entry.target == target && entry.observation_only && entry.resumed
+                    })
+                {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
                 continue;
             }
             let owned = self.targets.owned_target(target)?;
@@ -866,7 +882,7 @@ impl ClientEnrollment {
             || index
                 .sessions
                 .values()
-                .any(|entry| entry.application && !entry.resumed)
+                .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
         {
             return Err(ProtocolError::StaleScope);
         }
@@ -1139,7 +1155,18 @@ impl ClientEnrollment {
             if entry.target != target || entry.kind != "page" || entry.root != session {
                 return Err(ProtocolError::StaleReference);
             }
-            if entry.application && entry.resumed {
+            if entry.resumed
+                && (entry.application
+                    || (entry.observation_only
+                        && self
+                            .index
+                            .lock()
+                            .map_err(|_| ProtocolError::ScopeUnavailable)?
+                            .retiring_pages
+                            .get(target)
+                            .map(String::as_str)
+                            == Some(session)))
+            {
                 return Ok(());
             }
             bounded(op, async {
@@ -1273,7 +1300,7 @@ impl ClientEnrollment {
             || index
                 .sessions
                 .values()
-                .any(|entry| entry.application && !entry.resumed)
+                .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
         {
             return Err(ProtocolError::ScopeUnavailable);
         }
@@ -1477,6 +1504,8 @@ impl ClientEnrollment {
             root,
             kind: kind.into(),
             application: false,
+            observation_only: false,
+            observer_paused: false,
             resumed: false,
         };
         index.sessions.insert(session.into(), entry.clone());
@@ -1769,6 +1798,47 @@ impl ClientEnrollment {
         })
         .await
     }
+    fn acknowledge_start(
+        &self,
+        op: &OperationLease,
+        watermark: &BoundedEventWatermark,
+    ) -> Result<bool, ProtocolError> {
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(error) = &index.failure {
+            return Err(error.clone());
+        }
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(ProtocolError::Cancelled);
+        }
+        if op.generation != self.generation {
+            return Err(ProtocolError::StaleScope);
+        }
+        if *op.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= op.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let received = watermark
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !capture_admission_ready(&index, received)
+            || index
+                .sessions
+                .values()
+                .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
+        {
+            return Ok(false);
+        }
+        // Lock order matches final publication: index -> targets. No await or
+        // independent early readiness write can race stored failure/admission.
+        self.targets.acknowledge_enrollment()?;
+        index.reconciled = true;
+        Ok(true)
+    }
     pub async fn start(self: &Arc<Self>, op: &OperationLease) -> Result<(), ProtocolError> {
         self.check()?;
         if self.started.swap(true, Ordering::AcqRel) {
@@ -1787,6 +1857,15 @@ impl ClientEnrollment {
                     let target = field(info,"targetId")?;
                     if self.authorized(target,None,info.get("openerId").and_then(Value::as_str))? {
                         bounded(op, self.targets.wait_attached(target)).await?;
+                    } else if matches!(self.ownership, ScopeOwnership::BorrowedTargets(_)) && info.get("type").and_then(Value::as_str) == Some("page") {
+                        loop {
+                            let changed = self.changed.notified(); tokio::pin!(changed); changed.as_mut().enable();
+                            self.check()?;
+                            if self.index.lock().map_err(|_|ProtocolError::ScopeUnavailable)?.sessions.values().any(|entry|entry.target==target && entry.observation_only && entry.resumed) { break; }
+                            let retired = self.index.lock().map_err(|_|ProtocolError::ScopeUnavailable)?.retired_observer_targets.contains(target);
+                            if retired && self.observer_target_gone(target, None, op).await? { break; }
+                            bounded(op, async { changed.await; Ok(()) }).await?;
+                        }
                     }
                 }
             }
@@ -1799,15 +1878,16 @@ impl ClientEnrollment {
                 }
                 bounded(op, async { tokio::select! { _=changed=>{}, _=tokio::time::sleep(Duration::from_millis(10))=>{} }; Ok(()) }).await?;
             }
+            let watermark = self.event_watermark.lock().map_err(|_| ProtocolError::ScopeUnavailable)?.clone().ok_or(ProtocolError::ScopeUnavailable)?;
+            loop {
+                self.drain_capture_watermark(&watermark, op).await?;
+                if self.acknowledge_start(op, &watermark)? { break; }
+                bounded(op, async { tokio::time::sleep(Duration::from_millis(10)).await; Ok(()) }).await?;
+            }
             Ok(())
         }.await;
         if let Err(error) = &result {
             self.poison(error.clone());
-        } else {
-            self.index
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?
-                .reconciled = true;
         }
         result
     }
@@ -1828,19 +1908,25 @@ impl ClientEnrollment {
                 .event_watermark
                 .lock()
                 .map_err(|_| ProtocolError::ScopeUnavailable)? = Some(events.watermark());
+            // Capture before spawn; run must also inspect the current value in
+            // case sealing won the race before this subscription was created.
+            let stop = self.stop.subscribe();
             let owner = self.clone();
-            *task = Some(tokio::spawn(async move { owner.run(events).await }));
+            *task = Some(tokio::spawn(async move { owner.run(events, stop).await }));
         }
         Ok(())
     }
-    async fn run(self: Arc<Self>, mut events: BoundedMethodEvents) -> Result<(), ProtocolError> {
+    async fn run(
+        self: Arc<Self>,
+        mut events: BoundedMethodEvents,
+        mut stop: watch::Receiver<CancelSignal>,
+    ) -> Result<(), ProtocolError> {
         let mut tasks = JoinSet::new();
-        let mut stop = self.stop.subscribe();
         let mut terminal = None;
         let mut result = loop {
             tokio::select! {
                 biased;
-                _ = stop.changed() => {
+                _ = async { drop(stop.wait_for(|signal| *signal != CancelSignal::None).await); } => {
                     if *self.client.remote_connection_closed().borrow() {
                         // A lifecycle stop may race delivery of native EOF. Drain
                         // the already bounded dead-connection queue only to learn
@@ -2057,9 +2143,16 @@ impl ClientEnrollment {
                         && self.targets.is_native_bootstrap_target(target)?)
                     || allowed.iter().any(|id| id == target)
                     || index.sessions.values().any(|entry| {
-                        entry.target == target || opener == Some(entry.target.as_str())
+                        !entry.observation_only
+                            && (entry.target == target
+                                || (entry.application && opener == Some(entry.target.as_str())))
                     })
-                    || parent.is_some_and(|session| index.sessions.contains_key(session)))
+                    || parent.is_some_and(|session| {
+                        index
+                            .sessions
+                            .get(session)
+                            .is_some_and(|entry| entry.application)
+                    }))
             }
         }
     }
@@ -2285,6 +2378,12 @@ impl ClientEnrollment {
                 ("Runtime.runIfWaitingForDebugger", json!({})),
                 ("Target.setAutoAttach", autoattach(false)),
             ] {
+                if entry.observation_only
+                    && method == "Runtime.runIfWaitingForDebugger"
+                    && (!entry.observer_paused || entry.resumed)
+                {
+                    continue;
+                }
                 if Instant::now() >= session_deadline {
                     failed = true;
                     break;
@@ -2441,10 +2540,43 @@ impl ClientEnrollment {
     }
     async fn attached(&self, event: CdpEvent) -> Result<(), ProtocolError> {
         let session = field(&event.params, "sessionId")?.to_owned();
-        let info = event
+        let mut info = event
             .params
             .get("targetInfo")
-            .ok_or(ProtocolError::InvalidFrame)?;
+            .ok_or(ProtocolError::InvalidFrame)?
+            .clone();
+        if info
+            .get("browserContextId")
+            .and_then(Value::as_str)
+            .is_none()
+            && info.get("type").and_then(Value::as_str) == Some("iframe")
+            && event.session_id.as_ref().is_some_and(|parent| {
+                self.index.lock().is_ok_and(|index| {
+                    index
+                        .sessions
+                        .get(parent)
+                        .is_some_and(|entry| entry.observation_only)
+                })
+            })
+        {
+            let target = field(&info, "targetId")?.to_owned();
+            let resolved = self
+                .command(
+                    &self.operation(),
+                    None,
+                    "Target.getTargetInfo",
+                    json!({"targetId":target}),
+                )
+                .await?;
+            let exact = resolved
+                .get("targetInfo")
+                .ok_or(ProtocolError::InvalidFrame)?;
+            if field(exact, "targetId")? != target || field(exact, "type")? != "iframe" {
+                return Err(ProtocolError::StaleScope);
+            }
+            info = exact.clone();
+        }
+        let info = &info;
         let target = field(info, "targetId")?;
         let kind = field(info, "type")?;
         // Missing context is not permission to inherit a tenant from an opener.
@@ -2459,7 +2591,18 @@ impl ClientEnrollment {
                 info.get("openerId").and_then(Value::as_str),
             )?
         {
-            let _ = self.borrowed_blank_matches(target).await?;
+            let pending_blank = self
+                .index
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                .borrowed_blank
+                .is_some();
+            let blank_matches = self.borrowed_blank_matches(target).await?;
+            if pending_blank && !blank_matches {
+                return self
+                    .detach_foreign(&session, event.session_id.as_deref())
+                    .await;
+            }
             if matches!(self.ownership, ScopeOwnership::BorrowedTargets(_)) {
                 if let Err(error) = bounded(
                     &self.operation(),
@@ -2477,21 +2620,11 @@ impl ClientEnrollment {
                 }
             }
         }
-        if context != self.targets.context_id
-            || !self.authorized(
-                target,
-                event.session_id.as_deref(),
-                info.get("openerId").and_then(Value::as_str),
-            )?
-        {
-            return self
-                .detach_foreign(&session, event.session_id.as_deref())
-                .await;
-        }
         if event.session_id.as_ref().is_some_and(|parent| {
-            self.index
-                .lock()
-                .is_ok_and(|index| index.retired_page_sessions.contains(parent))
+            self.index.lock().is_ok_and(|index| {
+                index.retired_page_sessions.contains(parent)
+                    || index.retired_observer_sessions.contains(parent)
+            })
         }) {
             // Retain descendants too: a later grandchild event is scoped to
             // this immediate parent session, not necessarily the original root.
@@ -2509,6 +2642,40 @@ impl ClientEnrollment {
             }
             // An already received late child belongs to an explicitly retired
             // root. Detach this connection's session, never adopt it as new.
+            return self
+                .detach_foreign(&session, event.session_id.as_deref())
+                .await;
+        }
+        if context == self.targets.context_id
+            && matches!(self.ownership, ScopeOwnership::BorrowedTargets(_))
+            && !self.authorized(
+                target,
+                event.session_id.as_deref(),
+                info.get("openerId").and_then(Value::as_str),
+            )?
+            && matches!(kind, "page" | "iframe")
+        {
+            return self
+                .observe_context_page(
+                    target,
+                    &session,
+                    kind,
+                    event.session_id.as_deref(),
+                    event
+                        .params
+                        .get("waitingForDebugger")
+                        .and_then(Value::as_bool)
+                        == Some(true),
+                )
+                .await;
+        }
+        if context != self.targets.context_id
+            || !self.authorized(
+                target,
+                event.session_id.as_deref(),
+                info.get("openerId").and_then(Value::as_str),
+            )?
+        {
             return self
                 .detach_foreign(&session, event.session_id.as_deref())
                 .await;
@@ -2541,6 +2708,199 @@ impl ClientEnrollment {
                         .await
                 }
             }
+        }
+    }
+    fn register_observer(
+        &self,
+        target: &str,
+        session: &str,
+        kind: &str,
+        parent: Option<&str>,
+        paused_by_attachment: bool,
+    ) -> Result<Option<Attribution>, ProtocolError> {
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if index.retired_observer_sessions.contains(session)
+            || index.borrowed_retired_targets.contains(target)
+        {
+            return Ok(None);
+        }
+        if index.sessions.contains_key(session) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if index.sessions.values().any(|entry| entry.target == target) {
+            return Ok(None);
+        }
+        if index.sessions.len() >= MAX_SESSIONS {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        let root = if kind == "page" {
+            session.to_owned()
+        } else {
+            let parent = parent
+                .and_then(|id| index.sessions.get(id))
+                .filter(|entry| entry.observation_only)
+                .ok_or(ProtocolError::StaleReference)?;
+            parent.root.clone()
+        };
+        let entry = Attribution {
+            target: target.into(),
+            session: session.into(),
+            parent: parent.map(str::to_owned),
+            root,
+            kind: kind.into(),
+            application: false,
+            observation_only: true,
+            observer_paused: paused_by_attachment,
+            resumed: false,
+        };
+        index.sessions.insert(session.into(), entry.clone());
+        index.application_epoch = index
+            .application_epoch
+            .checked_add(1)
+            .ok_or(ProtocolError::IdentifierExhausted)?;
+        Ok(Some(entry))
+    }
+    /// Same-context storage-origin observation is not Application ownership.
+    /// No Fetch, Runtime events, settings, scripts, input or app notices are installed.
+    async fn observe_context_page(
+        &self,
+        target: &str,
+        session: &str,
+        kind: &str,
+        parent: Option<&str>,
+        paused_by_attachment: bool,
+    ) -> Result<(), ProtocolError> {
+        self.check().map_err(|error| self.admission_error(error))?;
+        for id in [target, session, kind] {
+            valid_id(id)?;
+        }
+        let Some(entry) =
+            self.register_observer(target, session, kind, parent, paused_by_attachment)?
+        else {
+            return self.detach_foreign(session, parent).await;
+        };
+        let op = self.operation();
+        let result = async {
+            let lease = self.lease(&entry)?;
+            self.command(&op, Some(session), "Page.enable", json!({}))
+                .await?;
+            let tree = self
+                .command(&op, Some(session), "Page.getFrameTree", json!({}))
+                .await?;
+            self.frame_tree(
+                &entry,
+                tree.get("frameTree").ok_or(ProtocolError::InvalidFrame)?,
+                0,
+            )?;
+            self.command(&op, Some(session), "Target.setAutoAttach", autoattach(true))
+                .await?;
+            if paused_by_attachment {
+                self.command(
+                    &op,
+                    Some(session),
+                    "Runtime.runIfWaitingForDebugger",
+                    json!({}),
+                )
+                .await?;
+            }
+            lease.permit.check()?;
+            let mut index = self
+                .index
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            let current = index
+                .sessions
+                .get_mut(session)
+                .ok_or(ProtocolError::StaleReference)?;
+            if current.target != target || !current.observation_only {
+                return Err(ProtocolError::StaleScope);
+            }
+            current.resumed = true;
+            self.changed.notify_waiters();
+            Ok(())
+        }
+        .await;
+        match result {
+            Err(error @ (ProtocolError::BrowserFailure | ProtocolError::StaleReference)) => {
+                if self
+                    .observer_target_gone(target, Some(session), &op)
+                    .await?
+                {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+            other => other,
+        }
+    }
+    /// Detach alone may mean lost observation, not host target destruction.
+    /// Require authoritative absence too, and never hide another stored failure.
+    async fn observer_target_gone(
+        &self,
+        target: &str,
+        session: Option<&str>,
+        op: &OperationLease,
+    ) -> Result<bool, ProtocolError> {
+        self.check()?;
+        let inventory = self
+            .command(op, None, "Target.getTargets", json!({}))
+            .await?;
+        let infos = inventory
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .ok_or(ProtocolError::InvalidFrame)?;
+        if infos.len() > 8192 {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        let mut present = false;
+        for info in infos {
+            let id = field(info, "targetId")?;
+            present |= id == target;
+        }
+        if present {
+            return Ok(false);
+        }
+        let watermark = self
+            .event_watermark
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .clone()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        // Only reader-applied accounting, not pending-job completion: this
+        // initialization task may itself be a pending enrollment job.
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            self.check()?;
+            let settled = {
+                let index = self
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                let received = watermark
+                    .received()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                observer_retirement_snapshot(
+                    &index,
+                    self.sealed.load(Ordering::Acquire),
+                    target,
+                    session,
+                    received,
+                )?
+            };
+            if let Some(gone) = settled {
+                return Ok(gone);
+            }
+            bounded(op, async {
+                changed.await;
+                Ok(())
+            })
+            .await?;
         }
     }
     async fn detach_foreign(
@@ -2696,7 +3056,22 @@ impl ClientEnrollment {
                     return Err(ProtocolError::CapacityExceeded);
                 }
                 index.retired_page_sessions.extend(retired);
-                if removed.iter().any(|entry| entry.application) {
+                for entry in removed.iter().filter(|entry| entry.observation_only) {
+                    if index.retired_observer_sessions.len() >= MAX_FRAMES {
+                        return Err(ProtocolError::CapacityExceeded);
+                    }
+                    if index.retired_observer_targets.len() >= MAX_FRAMES {
+                        return Err(ProtocolError::CapacityExceeded);
+                    }
+                    index.retired_observer_targets.insert(entry.target.clone());
+                    index
+                        .retired_observer_sessions
+                        .insert(entry.session.clone());
+                }
+                if removed
+                    .iter()
+                    .any(|entry| entry.application || entry.observation_only)
+                {
                     index.application_epoch = index
                         .application_epoch
                         .checked_add(1)
@@ -2705,7 +3080,9 @@ impl ClientEnrollment {
                 removed
             };
             for entry in entries {
-                self.targets.detach(&entry.target)?;
+                if !entry.observation_only {
+                    self.targets.detach(&entry.target)?;
+                }
                 self.page.forget_session(&entry.session)?;
                 if entry.application {
                     self.network.detach_session(&entry.session)?;
@@ -2767,6 +3144,51 @@ impl ClientEnrollment {
         let Some(entry) = entry else {
             return Ok(());
         };
+        if entry.observation_only {
+            match event.method.as_str() {
+                "Page.frameNavigated" => {
+                    self.bump_application_epoch()?;
+                    self.record_frame(
+                        &entry,
+                        event
+                            .params
+                            .get("frame")
+                            .ok_or(ProtocolError::InvalidFrame)?,
+                        true,
+                    )?;
+                }
+                "Page.frameDetached" => {
+                    self.bump_application_epoch()?;
+                    let frame = field(&event.params, "frameId")?;
+                    let mut index = self
+                        .index
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if index
+                        .frames
+                        .get(frame)
+                        .is_some_and(|owner| owner.session == entry.session)
+                    {
+                        let mut ids = vec![frame.to_owned()];
+                        while let Some(id) = ids.pop() {
+                            ids.extend(
+                                index
+                                    .frames
+                                    .iter()
+                                    .filter(|(_, owner)| owner.parent.as_deref() == Some(&id))
+                                    .map(|(id, _)| id.clone()),
+                            );
+                            index.frames.remove(&id);
+                        }
+                    }
+                }
+                "Page.frameAttached" | "Page.navigatedWithinDocument" => {
+                    self.bump_application_epoch()?;
+                }
+                _ => {}
+            }
+            return Ok(());
+        }
         if !entry.application {
             return Ok(());
         }
@@ -2871,6 +3293,28 @@ impl ClientEnrollment {
         self.seal();
         self.drain().await
     }
+}
+fn observer_retirement_snapshot(
+    index: &Index,
+    sealed: bool,
+    target: &str,
+    session: Option<&str>,
+    received: u64,
+) -> Result<Option<bool>, ProtocolError> {
+    if let Some(error) = &index.failure {
+        return Err(error.clone());
+    }
+    if sealed {
+        return Err(ProtocolError::Cancelled);
+    }
+    Ok((index.applied_watermark >= received).then(|| {
+        index.retired_observer_targets.contains(target)
+            && session.is_none_or(|session| index.retired_observer_sessions.contains(session))
+            && !index
+                .sessions
+                .values()
+                .any(|entry| entry.target == target || session == Some(entry.session.as_str()))
+    }))
 }
 fn capture_admission_ready(index: &Index, received: u64) -> bool {
     index.applied_watermark >= received && index.pending_enrollment.is_empty()
@@ -3088,6 +3532,10 @@ mod tests {
                         let request:Value=serde_json::from_str(&text).unwrap();
                         recorded.lock().unwrap().push(request.clone());
                         let method=request["method"].as_str().unwrap();
+                        if matches!(mode,"observer-close"|"observer-unknown-error"|"observer-detached-live") && method=="Page.enable" && request["sessionId"]=="observer" {
+                            if mode!="observer-unknown-error" { socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"observer","targetId":"other-host"}}).to_string())).await.unwrap(); }
+                            socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"target closed"}}).to_string())).await.unwrap();continue;
+                        }
                         if mode=="delayed-dispose" && method=="Target.disposeBrowserContext" {tokio::time::sleep(Duration::from_millis(40)).await;}
                         if method=="Target.detachFromTarget" {detach_count+=1;}
                         if mode=="hold-timezone" && method=="Emulation.setTimezoneOverride" { continue; }
@@ -3113,12 +3561,14 @@ mod tests {
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
                         }
                         let mut result=match method {
+                            "Target.getTargetInfo" if mode=="observer-context" => json!({"targetInfo":{"targetId":request["params"]["targetId"],"type":"iframe","browserContextId":"owned-context"}}),
                             "Page.getFrameTree"=>json!({"frameTree":{"frame":{"id":format!("frame-{}",request["sessionId"].as_str().unwrap()),"loaderId":"synthetic-loader","url":if mode=="borrowed-capture" {"https://initial.test/"} else {"about:blank"}}}}),
                             "Target.getTargets" if mode=="tracked" || mode=="late-popup"=>json!({"targetInfos":[
                                 {"targetId":"initial-target","browserContextId":"owned-context","type":"page"},
                                 {"targetId":"queued-popup","browserContextId":"owned-context","type":"page","openerId":"initial-target"},
                                 {"targetId":"unrelated","browserContextId":"owned-context","type":"page"},
                                 {"targetId":"foreign","browserContextId":"other-context","type":"page"}]}),
+                            "Target.getTargets" if mode=="observer-detached-live"=>json!({"targetInfos":[{"targetId":"other-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="borrowed-capture"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"},{"targetId":"unadopted-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="attestation"=>json!({"targetInfos":[{"targetId":"target","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets"=>json!({"targetInfos":[]}),
@@ -3507,6 +3957,286 @@ mod tests {
     fn borrowed_info(target: &str) -> Value {
         json!({"targetId":target,"browserContextId":"owned-context","type":"page","url":"about:blank"})
     }
+    #[test]
+    fn observer_retirement_snapshot_preserves_concurrent_failure_and_seal() {
+        let mut index = Index::default();
+        index.retired_observer_targets.insert("target".into());
+        index.retired_observer_sessions.insert("session".into());
+        assert_eq!(
+            observer_retirement_snapshot(&index, false, "target", Some("session"), 0),
+            Ok(Some(true))
+        );
+        assert_eq!(
+            observer_retirement_snapshot(&index, true, "target", Some("session"), 0),
+            Err(ProtocolError::Cancelled)
+        );
+        index.failure = Some(ProtocolError::StaleScope);
+        assert_eq!(
+            observer_retirement_snapshot(&index, true, "target", Some("session"), 0),
+            Err(ProtocolError::StaleScope)
+        );
+    }
+    #[tokio::test]
+    async fn observer_initialization_failure_requires_exact_detach_and_target_absence() {
+        for mode in [
+            "observer-close",
+            "observer-unknown-error",
+            "observer-detached-live",
+        ] {
+            let (mut owner, _notices, log, _emit, server) = fixture(mode).await;
+            Arc::get_mut(&mut owner).unwrap().ownership =
+                ScopeOwnership::BorrowedTargets(vec!["initial-target".into()]);
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            let result = owner
+                .attached(attach(
+                    "owned-context",
+                    "other-host",
+                    "observer",
+                    "page",
+                    None,
+                ))
+                .await;
+            if mode == "observer-close" {
+                result.unwrap();
+                assert!(owner
+                    .observer_target_gone("other-host", Some("observer"), &owner.operation())
+                    .await
+                    .unwrap());
+                owner.poison(ProtocolError::StaleScope);
+                assert_eq!(
+                    owner
+                        .observer_target_gone("other-host", Some("observer"), &owner.operation())
+                        .await,
+                    Err(ProtocolError::StaleScope)
+                );
+            } else {
+                assert_eq!(result, Err(ProtocolError::BrowserFailure));
+            }
+            assert!(!log.lock().unwrap().iter().any(|cmd| matches!(
+                cmd["method"].as_str(),
+                Some("Target.closeTarget" | "Target.disposeBrowserContext" | "Browser.close")
+            )));
+            let _ = owner.close().await;
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn observer_oopif_missing_context_requires_exact_native_metadata() {
+        let (mut owner, _notices, log, _emit, server) = fixture("observer-context").await;
+        Arc::get_mut(&mut owner).unwrap().ownership =
+            ScopeOwnership::BorrowedTargets(vec!["initial-target".into()]);
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner
+            .attached(attach(
+                "owned-context",
+                "other-host",
+                "observer",
+                "page",
+                None,
+            ))
+            .await
+            .unwrap();
+        owner.attached(CdpEvent {method:"Target.attachedToTarget".into(),session_id:Some("observer".into()),params:json!({"sessionId":"child-observer","waitingForDebugger":true,"targetInfo":{"targetId":"child-target","type":"iframe"}})}).await.unwrap();
+        assert!(owner.index.lock().unwrap().sessions["child-observer"].observation_only);
+        assert!(owner.targets.owned_target("child-target").is_err());
+        owner.event(&CdpEvent {method:"Page.frameNavigated".into(),session_id:Some("child-observer".into()),params:json!({"frame":{"id":"child-frame","loaderId":"new","url":"https://iframe-origin.test/"}})}).unwrap();
+        assert_eq!(
+            owner.page.visited_origins().unwrap(),
+            vec!["https://iframe-origin.test"]
+        );
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd["method"] == "Target.getTargetInfo"
+                && cmd["params"]["targetId"] == "child-target"));
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn context_observer_never_gains_application_authority_and_rejects_late_events() {
+        let (owner, _ui, log, _emit, server, _notices) = borrowed_restart_fixture().await;
+        let mut event = attach("owned-context", "other-host", "observer", "page", None);
+        event.params["waitingForDebugger"] = json!(false);
+        owner.attached(event).await.unwrap();
+        assert!(owner.targets.owned_target("other-host").is_err());
+        assert!(!owner.authorized("other-host", None, None).unwrap());
+        assert!(!owner
+            .authorized("popup", Some("observer"), Some("other-host"))
+            .unwrap());
+        assert!(owner.page.visited_origins().unwrap().is_empty());
+        owner.event(&CdpEvent { method:"Page.frameNavigated".into(), session_id:Some("observer".into()), params:json!({"frame":{"id":"frame-observer","loaderId":"l2","url":"https://observed.test/a"}}) }).unwrap();
+        assert_eq!(
+            owner.page.visited_origins().unwrap(),
+            vec!["https://observed.test"]
+        );
+        owner
+            .event(&CdpEvent {
+                method: "Target.detachedFromTarget".into(),
+                session_id: None,
+                params: json!({"sessionId":"observer"}),
+            })
+            .unwrap();
+        owner.event(&CdpEvent { method:"Page.frameNavigated".into(), session_id:Some("observer".into()),params:json!({"frame":{"id":"frame-observer","loaderId":"l3","url":"https://late.test/"}}) }).unwrap();
+        assert_eq!(
+            owner.page.visited_origins().unwrap(),
+            vec!["https://observed.test"]
+        );
+        owner
+            .attached(attach(
+                "owned-context",
+                "replacement",
+                "observer",
+                "page",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert!(!owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("observer"));
+        assert!(owner
+            .index
+            .lock()
+            .unwrap()
+            .retired_observer_sessions
+            .contains("observer"));
+        owner
+            .attached(attach(
+                "owned-context",
+                "late-child",
+                "late-child-session",
+                "iframe",
+                Some("observer"),
+            ))
+            .await
+            .unwrap();
+        assert!(!owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("late-child-session"));
+        assert!(!log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd["sessionId"] == "late-child-session"));
+        owner
+            .attached(attach(
+                "owned-context",
+                "late-grandchild",
+                "late-grandchild-session",
+                "iframe",
+                Some("late-child-session"),
+            ))
+            .await
+            .unwrap();
+        assert!(!owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("late-grandchild-session"));
+        assert!(!log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|cmd| cmd["sessionId"] == "late-grandchild-session"));
+        let observer_commands: Vec<_> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|cmd| cmd["sessionId"] == "observer")
+            .cloned()
+            .collect();
+        // A child-session detach is routed through its exact parent session.
+        // This is cleanup authority, not a Runtime/Fetch/settings operation.
+        assert!(observer_commands
+            .iter()
+            .any(|cmd| cmd["method"] == "Target.detachFromTarget"
+                && cmd["params"]["sessionId"] == "late-child-session"));
+        assert!(observer_commands.iter().all(|cmd| matches!(
+            cmd["method"].as_str(),
+            Some("Page.enable" | "Page.getFrameTree" | "Target.setAutoAttach")
+        ) || (cmd["method"]
+            == "Target.detachFromTarget"
+            && cmd["params"]["sessionId"] == "late-child-session")));
+        owner.close().await.unwrap();
+        assert!(!log.lock().unwrap().iter().any(|cmd| matches!(
+            cmd["method"].as_str(),
+            Some("Target.closeTarget" | "Target.disposeBrowserContext" | "Browser.close")
+        )));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn context_observer_cleanup_only_detaches_and_never_resumes_external_pause() {
+        let (owner, _ui, log, _emit, server, _notices) = borrowed_restart_fixture().await;
+        let mut event = attach("owned-context", "other-host", "observer", "page", None);
+        event.params["waitingForDebugger"] = json!(false);
+        owner.attached(event).await.unwrap();
+        owner
+            .attached(attach(
+                "other-context",
+                "foreign-host",
+                "foreign-observer",
+                "page",
+                None,
+            ))
+            .await
+            .unwrap();
+        owner.event(&CdpEvent { method:"Page.frameNavigated".into(),session_id:Some("foreign-observer".into()),params:json!({"frame":{"id":"foreign","loaderId":"l","url":"https://foreign.test/"}}) }).unwrap();
+        assert!(owner.page.visited_origins().unwrap().is_empty());
+        owner.close().await.unwrap();
+        let proof = owner.contain_owned_resources().await.unwrap();
+        owner.release_after_containment(proof).await.unwrap();
+        let commands = log.lock().unwrap();
+        assert!(commands
+            .iter()
+            .any(|cmd| cmd["method"] == "Target.detachFromTarget"
+                && cmd["params"]["sessionId"] == "observer"));
+        assert!(!commands.iter().any(|cmd| cmd["sessionId"] == "observer"
+            && !matches!(
+                cmd["method"].as_str(),
+                Some("Page.enable" | "Page.getFrameTree" | "Target.setAutoAttach")
+            )));
+        assert!(!commands
+            .iter()
+            .any(|cmd| cmd["sessionId"] == "foreign-observer"));
+        assert!(!commands.iter().any(|cmd| matches!(
+            cmd["method"].as_str(),
+            Some("Target.closeTarget" | "Target.disposeBrowserContext" | "Browser.close")
+        )));
+        server.abort();
+    }
+    #[tokio::test]
+    async fn observer_navigation_during_initial_tree_read_is_not_initial_history() {
+        let (owner, _ui, _log, _emit, server, _notices) = borrowed_restart_fixture().await;
+        // Registration precedes Page.enable/getFrameTree; a real new-document
+        // event interleaved with those replies must remain observed history.
+        let entry = owner
+            .register_observer("other-host", "observer", "page", None, false)
+            .unwrap()
+            .unwrap();
+        owner.event(&CdpEvent {method:"Page.frameNavigated".into(),session_id:Some("observer".into()),params:json!({"frame":{"id":"other-frame","loaderId":"new","url":"https://during-init.test/"}})}).unwrap();
+        owner.frame_tree(&entry,&json!({"frame":{"id":"other-frame","loaderId":"initial","url":"https://historical.test/"}}),0).unwrap();
+        assert_eq!(
+            owner.page.visited_origins().unwrap(),
+            vec!["https://during-init.test"]
+        );
+        assert!(!owner.index.lock().unwrap().sessions["observer"].resumed);
+        owner.close().await.unwrap();
+        server.abort();
+    }
     #[tokio::test]
     async fn borrowed_capture_attests_only_observed_document_origins_not_initial_profile() {
         let (mut owner, _notices, _log, _emit, server) = fixture("borrowed-capture").await;
@@ -3516,6 +4246,13 @@ mod tests {
             .enroll_existing("initial-target", "initial", "page", &owner.operation())
             .await
             .unwrap();
+        owner.index.lock().unwrap().reconciled = true;
+        assert!(matches!(
+            owner.attest_capture(&owner.operation()).await,
+            Err(ProtocolError::ScopeUnavailable)
+        ));
+        owner.index.lock().unwrap().reconciled = false;
+        owner.attached(CdpEvent { method: "Target.attachedToTarget".into(), session_id: None, params: json!({"sessionId":"observer", "waitingForDebugger":false,"targetInfo":{"targetId":"unadopted-host","type":"page","browserContextId":"owned-context"}}) }).await.unwrap();
         owner.start(&owner.operation()).await.unwrap();
         assert!(owner.page.visited_origins().unwrap().is_empty());
         let proof = owner.attest_capture(&owner.operation()).await.unwrap();
@@ -3543,13 +4280,12 @@ mod tests {
             owner.page.visited_origins().unwrap(),
             vec!["https://visited.test"]
         );
-        assert!(!owner
-            .index
-            .lock()
-            .unwrap()
-            .sessions
-            .values()
-            .any(|entry| entry.target == "unadopted-host"));
+        assert!(owner.index.lock().unwrap().sessions["observer"].observation_only);
+        assert!(owner.targets.owned_target("unadopted-host").is_err());
+        owner.event(&CdpEvent { method:"Page.frameNavigated".into(), session_id:Some("observer".into()), params:json!({"frame":{"id":"frame-observer","loaderId":"other-new","url":"https://other-page.test/"}}) }).unwrap();
+        let origins = owner.page.visited_origins().unwrap();
+        assert!(origins.contains(&"https://other-page.test".into()));
+        assert!(origins.contains(&"https://visited.test".into()));
         owner.close().await.unwrap();
         server.abort();
     }
@@ -3612,12 +4348,9 @@ mod tests {
                 .purpose,
             Some(TargetPurpose::StateBootstrap)
         );
-        assert!(!owner
-            .index
-            .lock()
-            .unwrap()
-            .sessions
-            .contains_key("host-session"));
+        assert!(owner.index.lock().unwrap().sessions["host-session"].observation_only);
+        assert!(owner.targets.owned_target("host-unrelated").is_err());
+        assert!(!owner.authorized("host-unrelated", None, None).unwrap());
         assert!(!log
             .lock()
             .unwrap()
@@ -4305,6 +5038,88 @@ mod tests {
         assert_eq!(owner.close().await, Err(ProtocolError::BrowserFailure));
         server.abort();
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn supervisor_stop_before_first_poll_drains_idle_live_connection() {
+        for already_seen in [false, true] {
+            let (owner, _notices, log, _emit, server) = fixture("normal").await;
+            if already_seen {
+                // Model sealing between ensure_supervisor's initial check and
+                // receiver creation: subscribe marks the current value seen.
+                let events = owner
+                    .client
+                    .subscribe_bounded_methods_with_budget(
+                        EVENTS,
+                        256,
+                        128 * 1024 * 1024,
+                        256 * 1024 * 1024,
+                    )
+                    .unwrap();
+                owner.seal();
+                let stop = owner.stop.subscribe();
+                assert_eq!(*stop.borrow(), CancelSignal::SessionClosed);
+                let retained = owner.clone();
+                *owner.supervisor.lock().await =
+                    Some(tokio::spawn(
+                        async move { retained.run(events, stop).await },
+                    ));
+            } else {
+                // Current-thread scheduling and no intervening await/yield mean
+                // the spawned supervisor cannot have subscribed/polled yet.
+                owner.ensure_supervisor().await.unwrap();
+                owner.seal();
+            }
+            tokio::time::timeout(Duration::from_secs(2), owner.drain())
+                .await
+                .expect("idle live peer must not be needed to wake stopped enrollment")
+                .unwrap();
+            assert!(!server.is_finished());
+            assert!(!*owner.client.remote_connection_closed().borrow());
+            assert!(owner.supervisor.lock().await.is_none());
+            assert!(!log.lock().unwrap().iter().any(|cmd| matches!(
+                cmd["method"].as_str(),
+                Some("Target.closeTarget" | "Target.disposeBrowserContext" | "Browser.close")
+            )));
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn start_readiness_rejects_pending_cancelled_and_failed_before_ack() {
+        for case in ["pending", "cancelled", "failed"] {
+            let (mut owner, _notices, _log, _emit, server) = fixture("normal").await;
+            owner.gate.begin_transition().unwrap();
+            let authority = owner.gate.initialization(owner.targets.clone()).unwrap();
+            Arc::get_mut(&mut owner).unwrap().initialization = Some(authority.access());
+            owner.ensure_supervisor().await.unwrap();
+            let watermark = owner.event_watermark.lock().unwrap().clone().unwrap();
+            let mut op = owner.operation();
+            let (_cancel, rx) = watch::channel(CancelSignal::Requested);
+            match case {
+                "pending" => {
+                    owner
+                        .index
+                        .lock()
+                        .unwrap()
+                        .pending_enrollment
+                        .insert("pending".into());
+                }
+                "cancelled" => {
+                    op.cancellation = rx;
+                }
+                _ => owner.poison(ProtocolError::BrowserFailure),
+            }
+            let result = owner.acknowledge_start(&op, &watermark);
+            if case == "pending" {
+                assert_eq!(result, Ok(false));
+            } else {
+                assert!(result.is_err());
+            }
+            assert!(!owner.index.lock().unwrap().reconciled);
+            assert!(owner.targets.publish_initialization(&authority).is_err());
+            owner.index.lock().unwrap().pending_enrollment.clear();
+            let _ = owner.close().await;
+            server.abort();
+        }
+    }
     #[tokio::test]
     async fn initialized_publication_rejects_late_failure_and_pending_events() {
         for failed in [false, true] {
@@ -4313,8 +5128,13 @@ mod tests {
             let authority = owner.gate.initialization(owner.targets.clone()).unwrap();
             Arc::get_mut(&mut owner).unwrap().initialization = Some(authority.access());
             assert!(owner.publish_initialized(&authority).is_err());
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
             owner.start(&owner.operation()).await.unwrap();
-            owner.targets.acknowledge_enrollment().unwrap();
+            // Production start itself must establish readiness, with no manual
+            // test-only acknowledge_enrollment masking a missing lifecycle step.
             let held = authority.enter(&owner.targets).unwrap();
             assert!(owner.publish_initialized(&authority).is_err());
             drop(held);
@@ -4530,6 +5350,8 @@ mod tests {
             parent: None,
             kind: "page".into(),
             application: true,
+            observation_only: false,
+            observer_paused: false,
             resumed: true,
         };
         owner.index.lock().unwrap().frames.insert(
@@ -4617,6 +5439,8 @@ mod tests {
             root: "initial-session".into(),
             kind: "page".into(),
             application: true,
+            observation_only: false,
+            observer_paused: false,
             resumed: false,
         };
         let lease = owner.lease(&entry).unwrap();
