@@ -43,9 +43,20 @@ struct Dispatch {
     checked_replaced: AtomicBool,
     acknowledged_postcondition: AtomicBool,
     settled_replacement_prefix: Mutex<Option<Arc<SettledReplacementPrefix>>>,
+    preparation_enabled: AtomicBool,
+    preparation_refusal: AtomicBool,
+    preparation_stopped: AtomicBool,
+    preparation_disqualified: AtomicBool,
 }
 impl Dispatch {
     fn mark(&self) {
+        self.mark_mutation(false);
+    }
+    fn mark_mutation(&self, preparation: bool) {
+        self.preparation_refusal.store(false, Ordering::SeqCst);
+        if !preparation {
+            self.preparation_disqualified.store(true, Ordering::SeqCst);
+        }
         // A prefix cannot describe any later mutation, including its pending ACK.
         match self.settled_replacement_prefix.lock() {
             Ok(mut prefix) => *prefix = None,
@@ -240,7 +251,7 @@ impl ActionContext<'_> {
     ) -> Result<Value, ProtocolError> {
         self.check()?;
         if mutation {
-            dispatch.mark();
+            dispatch.mark_mutation(method == "DOM.scrollIntoViewIfNeeded");
         }
         self.bounded(
             self.page
@@ -1244,8 +1255,14 @@ async fn center(
     enabled: bool,
 ) -> Result<(Point, (f64, f64)), ProtocolError> {
     let mut previous: Option<(Point, (f64, f64))> = None;
+    let mut longest_attempt = Duration::ZERO;
     loop {
-        match center_once(ctx, d, node, enabled).await {
+        // An earlier ACK cannot certify even a later read which is still pending.
+        d.preparation_refusal.store(false, Ordering::SeqCst);
+        let started = Instant::now();
+        let attempt = center_once(ctx, d, node, enabled).await;
+        longest_attempt = longest_attempt.max(started.elapsed());
+        match attempt {
             Ok(current) => {
                 if previous.as_ref().is_some_and(|old| {
                     (old.0.x - current.0.x).abs() < 0.5
@@ -1257,7 +1274,18 @@ async fn center(
                 }
                 previous = Some(current);
             }
-            Err(ProtocolError::NotActionable) => previous = None,
+            Err(ProtocolError::NotActionable) => {
+                previous = None;
+                if d.preparation_enabled.load(Ordering::SeqCst)
+                    && d.preparation_refusal.load(Ordering::SeqCst)
+                    && !d.preparation_disqualified.load(Ordering::SeqCst)
+                    && preparation_classification_due(ctx.operation.deadline, longest_attempt)
+                {
+                    ctx.check()?;
+                    d.preparation_stopped.store(true, Ordering::SeqCst);
+                    return Err(ProtocolError::NotActionable);
+                }
+            }
             Err(ProtocolError::DeadlineExceeded) => return Err(ProtocolError::NotActionable),
             Err(error) => return Err(error),
         }
@@ -1267,6 +1295,19 @@ async fn center(
             Err(error) => return Err(error),
         }
     }
+}
+/// Leave the existing 250ms exact-handle cleanup budget plus a small positive
+/// classification window. Observed duration is only an admission estimate: any
+/// overrun still fails the original deadline/authority checks after cleanup.
+fn preparation_classification_due(deadline: Instant, longest_attempt: Duration) -> bool {
+    preparation_classification_window(
+        deadline.saturating_duration_since(Instant::now()),
+        longest_attempt,
+    )
+}
+fn preparation_classification_window(remaining: Duration, longest_attempt: Duration) -> bool {
+    remaining >= Duration::from_millis(250 + 16)
+        && remaining <= Duration::from_millis(16 + 250 + 16).saturating_add(longest_attempt)
 }
 fn geometry_failure(d: &Dispatch, error: GeometryError) -> ProtocolError {
     match error {
@@ -1388,7 +1429,21 @@ async fn center_once(
             &function,
             vec![json!(local.x), json!(local.y), json!(enabled)],
         )
-        .await?;
+        .await;
+    let size = match size {
+        Err(ProtocolError::NotActionable) if d.preparation_enabled.load(Ordering::SeqCst) => {
+            // The semantic refusal is ACKed, all auxiliary handles released.
+            // Revalidate the same geometry before recording this attempt only.
+            geometry
+                .revalidate(&ctx.page.client, ctx.operation)
+                .await
+                .map_err(|error| geometry_failure(d, error))?;
+            ctx.check()?;
+            d.preparation_refusal.store(true, Ordering::SeqCst);
+            return Err(ProtocolError::NotActionable);
+        }
+        other => other?,
+    };
     // A child-frame local hit can be unobscured while its iframe is covered in
     // an ancestor. Prove each exact native owner in its own parent realm.
     for (binding, backend) in geometry
@@ -1526,14 +1581,48 @@ impl ClientActions {
         if let LocatorAction::LongPress { duration_ms } = &request.action {
             duration(*duration_ms, 500)?;
         }
+        // Capture before the first scroll; never mint replacement authority at
+        // the end of a deadline or after a retry. Only ordinary Tap participates.
+        let preparation =
+            if matches!(&request.action, LocatorAction::Tap { .. }) && !ctx.operation.is_callback {
+                // Optional settlement evidence is not another action admission gate.
+                // Callback leases cannot obtain this receipt. Any other inability to
+                // capture it keeps the original execution/Unknown classification;
+                // exact resolution still enforces all normal action authority.
+                SettledReplacementPrefix::capture(ctx).ok()
+            } else {
+                None
+            };
         action_stage("exact.resolve.dispatch");
         let node = action_target(ctx, d, &request.reference).await?;
         action_stage("exact.resolve.ack");
+        d.preparation_enabled
+            .store(preparation.is_some(), Ordering::SeqCst);
         let result = self.perform_node(ctx, d, &node, request.action).await;
         let released = node.release(ctx).await;
         if released.is_err() {
             d.cleanup.store(true, Ordering::SeqCst);
             return result.and(Err(ProtocolError::CleanupFailed));
+        }
+        if matches!(&result, Err(ProtocolError::NotActionable))
+            && d.preparation_stopped.load(Ordering::SeqCst)
+            && d.preparation_refusal.load(Ordering::SeqCst)
+            && !d.preparation_disqualified.load(Ordering::SeqCst)
+            && !d.cleanup.load(Ordering::SeqCst)
+            && ctx.check().is_ok()
+            && preparation
+                .as_ref()
+                .is_some_and(|proof| proof.check(ctx).is_ok())
+            && reference(ctx, &request.reference).is_ok()
+            && node
+                .realm
+                .as_ref()
+                .is_none_or(|realm| realm.destroyed() == Ok(false))
+            && ctx.check().is_ok()
+        {
+            // Scroll may have invoked page code. Completed certifies a settled
+            // preparation prefix, not success, rollback, or replay permission.
+            d.acknowledged_postcondition.store(true, Ordering::SeqCst);
         }
         result
     }
@@ -3084,6 +3173,14 @@ mod tests {
                 if mode.starts_with("preparation-") {
                     if method == "DOM.scrollIntoViewIfNeeded" {
                         preparation_scrolls += 1;
+                        if (mode == "preparation-slack-exhausted" && preparation_scrolls == 1)
+                            || (mode == "preparation-latency-spike" && preparation_scrolls == 2)
+                        {
+                            tokio::time::sleep(Duration::from_millis(
+                                if preparation_scrolls == 1 { 700 } else { 850 },
+                            ))
+                            .await;
+                        }
                         if mode == "preparation-scroll-unacked"
                             || (mode == "preparation-later-scroll-unacked"
                                 && preparation_scrolls == 2)
@@ -3114,6 +3211,12 @@ mod tests {
                             ))
                             .await
                             .unwrap();
+                    }
+                    if mode == "preparation-estimate-overrun"
+                        && preparation_scrolls == 2
+                        && source.contains("const blocker=")
+                    {
+                        tokio::time::sleep(Duration::from_millis(850)).await;
                     }
                     if mode == "preparation-authority-lost" && source.contains("const blocker=") {
                         server_gate.seal();
@@ -3309,7 +3412,12 @@ mod tests {
                                     | "preparation-later-scroll-unacked"
                                     | "preparation-handle-cleanup-failed"
                                     | "preparation-authority-lost"
-                            ) {
+                                    | "preparation-slack-exhausted"
+                                    | "preparation-latency-spike"
+                                    | "preparation-estimate-overrun"
+                            ) || (mode == "preparation-retry-success"
+                                && preparation_scrolls == 1)
+                            {
                                 json!({"result":{"value":{"status":"intercepted-pointer"}}})
                             } else if mode == "preparation-not-actionable" {
                                 json!({"result":{"value":{"status":"not-actionable"}}})
@@ -5972,6 +6080,9 @@ mod tests {
             "preparation-intercepted"
                 | "preparation-later-scroll-unacked"
                 | "preparation-handle-cleanup-failed"
+                | "preparation-slack-exhausted"
+                | "preparation-latency-spike"
+                | "preparation-estimate-overrun"
         )
         .then_some(ActionReason::InterceptedPointer);
         let expected_primary = match mode {
@@ -6205,8 +6316,8 @@ mod tests {
             "{mode}"
         );
         if expected_completed {
-            // Authored RED on the frozen base: center currently consumes the
-            // exact operation deadline, and Dispatch remembers only `sent`.
+            // CI14 established RED on the original deadline-exhausting path.
+            // This regression is now mandatory with the preparation receipt.
             // The desired result requires a genuine predeadline classification
             // window AND an original-authority, fully-ACKed preparation receipt.
             // A scroll may run page business logic; Completed is not no effects,
@@ -6247,51 +6358,137 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
     async fn preparation_effect_settlement_acked_interception_is_completed_and_reusable() {
         assert_preparation_effect_settlement("preparation-intercepted").await;
     }
 
     #[tokio::test]
-    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
     async fn preparation_effect_settlement_acked_not_actionable_is_completed_and_reusable() {
         assert_preparation_effect_settlement("preparation-not-actionable").await;
     }
 
     #[tokio::test]
-    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
     async fn preparation_effect_settlement_unacked_first_scroll_remains_unknown() {
         assert_preparation_effect_settlement("preparation-scroll-unacked").await;
     }
 
     #[tokio::test]
-    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
     async fn preparation_effect_settlement_unacked_later_scroll_invalidates_earlier_prefix() {
         assert_preparation_effect_settlement("preparation-later-scroll-unacked").await;
     }
 
     #[tokio::test]
-    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
     async fn preparation_effect_settlement_unacked_input_release_remains_unknown() {
         assert_preparation_effect_settlement("preparation-input-unacked").await;
     }
 
     #[tokio::test]
-    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
     async fn preparation_effect_settlement_dirty_handle_cleanup_quarantines() {
         assert_preparation_effect_settlement("preparation-handle-cleanup-failed").await;
     }
 
     #[tokio::test]
-    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
     async fn preparation_effect_settlement_unacked_geometry_control_remains_unknown() {
         assert_preparation_effect_settlement("preparation-control-unacked").await;
     }
 
     #[tokio::test]
-    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
     async fn preparation_effect_settlement_lost_original_authority_remains_unknown() {
         assert_preparation_effect_settlement("preparation-authority-lost").await;
+    }
+
+    #[tokio::test]
+    async fn preparation_optional_receipt_does_not_reject_enrolled_callback_tap() {
+        let mut f = fixture_scoped("preparation-callback-success", "callback-tap").await;
+        let broker = Arc::new(super::super::client_session::ClientSession::new());
+        let (owner, state, _notices) = preparation_settlement_owner(&f, broker).await;
+        // Exercise the existing action seam with a callback lease. The broker's
+        // callback-token admission is independent and is not simulated here.
+        f.op.is_callback = true;
+        f.op.deadline = Instant::now() + Duration::from_secs(2);
+        assert!(matches!(
+            owner.capture_settled_input_authority(&f.page, &f.op),
+            Err(ProtocolError::InvalidArguments)
+        ));
+        let d = Dispatch::default();
+        let result = ClientActions::default().execute_inner(&ActionContext {
+            realm_authority: ActionRealmAuthority::Enrolled(&owner),
+            page_state: &state,
+            ..f.context()
+        }, &d, "browser.perform", &json!({
+            "identityScope":"callback-tap", "ref":{"id":"@e1","revision":"1"}, "action":{"kind":"tap"}
+        })).await;
+        let inputs = f.inputs();
+        let closed = owner.close().await;
+        f.server.abort();
+        let joined = (&mut f.server).await;
+        assert!(
+            result.is_ok(),
+            "callback tap must retain its original execution path"
+        );
+        assert!(!d.preparation_enabled.load(Ordering::SeqCst));
+        assert!(!d.acknowledged_postcondition.load(Ordering::SeqCst));
+        assert_eq!(
+            inputs
+                .iter()
+                .filter(|request| request["params"]["type"] == "mouseReleased")
+                .count(),
+            1
+        );
+        assert_eq!(closed, Ok(()));
+        assert!(joined.is_err_and(|error| error.is_cancelled()));
+    }
+
+    #[test]
+    fn preparation_receipt_requires_positive_cleanup_slack_and_invalidates_on_any_new_attempt() {
+        let ms = Duration::from_millis;
+        assert!(!preparation_classification_window(ms(265), ms(20)));
+        assert!(preparation_classification_window(ms(280), ms(20)));
+        assert!(!preparation_classification_window(ms(500), ms(20)));
+        assert!(!preparation_classification_window(Duration::ZERO, ms(900)));
+        let d = Dispatch::default();
+        d.preparation_refusal.store(true, Ordering::SeqCst);
+        d.mark_mutation(true);
+        assert!(!d.preparation_refusal.load(Ordering::SeqCst));
+        assert!(!d.preparation_disqualified.load(Ordering::SeqCst));
+        d.mark();
+        d.mark_mutation(true);
+        assert!(d.preparation_disqualified.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn preparation_exhausted_slack_and_unpredicted_latency_keep_unknown_settlement() {
+        for mode in [
+            "preparation-slack-exhausted",
+            "preparation-latency-spike",
+            "preparation-estimate-overrun",
+        ] {
+            assert_preparation_effect_settlement(mode).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn preparation_semantic_refusal_still_retries_into_an_ordinary_successful_tap() {
+        let f = fixture("preparation-retry-success").await;
+        ClientActions::default().execute(f.context(), "browser.perform", &json!({
+            "identityScope":"scope", "ref":{"id":"@e1","revision":"1"}, "action":{"kind":"tap"}
+        })).await.unwrap();
+        let requests = f.log.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "DOM.scrollIntoViewIfNeeded")
+                .count(),
+            3
+        );
+        drop(requests);
+        assert_eq!(
+            f.inputs()
+                .iter()
+                .filter(|request| request["params"]["type"] == "mouseReleased")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]

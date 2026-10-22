@@ -310,6 +310,8 @@ pub(crate) async fn capture_under_journal(
                 return Err(reason);
             }
             // Keep an already-started screenshot inside source-mask ownership.
+            #[cfg(all(test, feature = "acceptance-faults"))]
+            retained_capture_test::entered(context, operation, reason);
             let settled =
                 tokio::time::timeout(std::time::Duration::from_millis(250), &mut capture).await;
             if !matches!(settled, Ok(Ok(_))) {
@@ -1316,6 +1318,67 @@ mod tests {
             let cleanup = owner.close().await;
             assert!(cleanup.is_ok(), "Static fixture context cleanup failed");
             result.unwrap();
+        }
+    }
+}
+
+// Exact-client/operation notification only: tests decide when the fake peer
+// acknowledges the retained screenshot, without changing its drain deadline.
+#[cfg(all(test, feature = "acceptance-faults"))]
+pub(super) mod retained_capture_test {
+    use super::super::cdp::client::CdpClient;
+    use super::*;
+    use std::sync::{Arc, Mutex, OnceLock};
+    use tokio::sync::oneshot;
+
+    type Key = (usize, u64);
+    static HOOKS: OnceLock<Mutex<HashMap<Key, oneshot::Sender<CaptureReason>>>> = OnceLock::new();
+
+    pub struct Registration {
+        client: Arc<CdpClient>,
+        sequence: u64,
+    }
+    impl Registration {
+        fn key(&self) -> Key {
+            (Arc::as_ptr(&self.client) as usize, self.sequence)
+        }
+    }
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            HOOKS.get().unwrap().lock().unwrap().remove(&self.key());
+        }
+    }
+    pub fn register(
+        client: &Arc<CdpClient>,
+        sequence: u64,
+    ) -> (Registration, oneshot::Receiver<CaptureReason>) {
+        let registration = Registration {
+            client: client.clone(),
+            sequence,
+        };
+        let (send, receipt) = oneshot::channel();
+        assert!(HOOKS
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap()
+            .insert(registration.key(), send)
+            .is_none());
+        (registration, receipt)
+    }
+    pub(super) fn entered(
+        context: &CaptureContext,
+        operation: &OperationLease,
+        reason: CaptureReason,
+    ) {
+        let key = (
+            Arc::as_ptr(&context.page.client) as usize,
+            operation.sequence,
+        );
+        let send = HOOKS
+            .get()
+            .and_then(|hooks| hooks.lock().unwrap().remove(&key));
+        if let Some(send) = send {
+            let _ = send.send(reason);
         }
     }
 }

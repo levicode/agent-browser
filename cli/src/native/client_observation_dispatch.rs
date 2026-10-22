@@ -1986,6 +1986,7 @@ mod tests {
         PolicyGate,
         SemanticCancel,
         CaptureCancel,
+        CaptureCancelWithheldAck,
     }
     #[cfg(feature = "acceptance-faults")]
     #[tokio::test]
@@ -2027,8 +2028,12 @@ mod tests {
     #[cfg(feature = "acceptance-faults")]
     #[tokio::test]
     async fn fallback_inflight_capture_cancel_waits_for_restoration_without_publishing() {
-        semantic_timeout_fallback_admission(false, true, FallbackTestMode::CaptureCancel, false)
-            .await;
+        for mode in [
+            FallbackTestMode::CaptureCancel,
+            FallbackTestMode::CaptureCancelWithheldAck,
+        ] {
+            semantic_timeout_fallback_admission(false, true, mode, false).await;
+        }
     }
     #[cfg(feature = "acceptance-faults")]
     #[tokio::test]
@@ -2081,6 +2086,8 @@ mod tests {
             (FallbackTestMode::PolicyGate, false),
             (FallbackTestMode::SemanticCancel, false),
             (FallbackTestMode::CaptureCancel, false),
+            (FallbackTestMode::CaptureCancelWithheldAck, false),
+            (FallbackTestMode::CaptureCancel, true),
             (FallbackTestMode::CoverageCancelDuringRestore, false),
             (
                 FallbackTestMode::CoverageAuthorityRevokedDuringRestore,
@@ -2125,7 +2132,12 @@ mod tests {
                 | FallbackTestMode::CoverageObservedCleanupFlag
         );
         let observed_cleanup = mode == FallbackTestMode::CoverageObservedCleanupFlag;
-        let integrity_lost_expected = dirty_restore || observed_cleanup;
+        let capture_cancel = matches!(
+            mode,
+            FallbackTestMode::CaptureCancel | FallbackTestMode::CaptureCancelWithheldAck
+        );
+        let capture_unsettled = mode == FallbackTestMode::CaptureCancelWithheldAck;
+        let integrity_lost_expected = dirty_restore || observed_cleanup || capture_unsettled;
         let authority_revoked = mode == FallbackTestMode::CoverageAuthorityRevokedDuringRestore;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -2148,13 +2160,16 @@ mod tests {
                 FallbackTestMode::CoverageBrowserFailure
                     | FallbackTestMode::PostCapturePolicy
                     | FallbackTestMode::CaptureCancel
+                    | FallbackTestMode::CaptureCancelWithheldAck
                     | FallbackTestMode::CaptureRefused
             );
         let (capture_reached, capture_receipt) = oneshot::channel();
         let (restore_reached, restore_receipt) = oneshot::channel();
         let (restore_release, restore_release_receipt) = oneshot::channel();
-        let (late_release, late_release_receipt) = oneshot::channel();
-        let (late_sent, late_sent_receipt) = oneshot::channel();
+        let (capture_release, capture_release_receipt) = oneshot::channel();
+        let (capture_sent, capture_sent_receipt) = oneshot::channel();
+        let mut capture_release = Some(capture_release);
+        let mut capture_sent_receipt = Some(capture_sent_receipt);
         let blobs = Arc::new(
             BlobStore::new(BlobLimits {
                 max_blob_bytes: 4096,
@@ -2194,8 +2209,8 @@ mod tests {
             let mut capture_reached = Some(capture_reached);
             let mut restore_reached = Some(restore_reached);
             let mut restore_release_receipt = Some(restore_release_receipt);
-            let mut late_release_receipt = late_release_receipt;
-            let mut late_sent = Some(late_sent);
+            let mut capture_release_receipt = capture_release_receipt;
+            let mut capture_sent = Some(capture_sent);
             let mut held_capture = None::<Value>;
             let mut source_verifications = 0;
             loop {
@@ -2204,11 +2219,11 @@ mod tests {
                         Some(Ok(message)) => message,
                         _ => break,
                     },
-                    release = &mut late_release_receipt, if held_capture.is_some() => {
+                    release = &mut capture_release_receipt, if held_capture.is_some() => {
                         release.unwrap();
                         let response = held_capture.take().unwrap();
                         socket.send(tokio_tungstenite::tungstenite::Message::Text(response.to_string())).await.unwrap();
-                        late_sent.take().unwrap().send(()).unwrap();
+                        capture_sent.take().unwrap().send(()).unwrap();
                         continue;
                     },
                 };
@@ -2328,9 +2343,7 @@ mod tests {
                 } else {
                     json!({"id":request["id"],"sessionId":request["sessionId"],"result":result})
                 };
-                if mode == FallbackTestMode::CaptureCancel
-                    && request["method"] == "Page.captureScreenshot"
-                {
+                if capture_cancel && request["method"] == "Page.captureScreenshot" {
                     assert!(held_capture.replace(response).is_none());
                     capture_reached.take().unwrap().send(()).unwrap();
                     continue;
@@ -2435,6 +2448,12 @@ mod tests {
                 Some(ObservationError::PolicyDenied);
         }
         let original_deadline = operation.deadline;
+        let retained_capture = capture_cancel
+            .then(|| client_capture::retained_capture_test::register(&client, operation.sequence));
+        let (_retained_capture_guard, retained_capture_receipt) = match retained_capture {
+            Some((guard, receipt)) => (Some(guard), Some(receipt)),
+            None => (None, None),
+        };
         let mut task = dispatch.clone().start(
             DispatchContext {
                 faults: faults.clone(),
@@ -2473,13 +2492,40 @@ mod tests {
             .unwrap();
             cancel.send(CancelSignal::Requested).unwrap();
         }
-        if mode == FallbackTestMode::CaptureCancel {
+        if capture_cancel {
             tokio::time::timeout(Duration::from_secs(5), capture_receipt)
                 .await
                 .unwrap()
                 .unwrap();
             assert!(Instant::now() < original_deadline);
             cancel.send(CancelSignal::Requested).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), retained_capture_receipt.unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                CaptureReason::Cancelled,
+                "the screenshot ACK must follow entry into retained cancellation"
+            );
+            assert!(matches!(
+                task.result.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(!task.join.is_finished());
+            assert_eq!(*source_commands.lock().unwrap(), ["holder", "verify"]);
+            assert!(matches!(
+                blobs.reserve_producer(scope.clone()),
+                Err(BlobError::QuotaExceeded)
+            ));
+            if !capture_unsettled {
+                // Settle the actual screenshot within its existing retention
+                // window, then independently block the mandatory restore ACK.
+                capture_release.take().unwrap().send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(5), capture_sent_receipt.take().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
         }
         if hold_restore {
             tokio::time::timeout(Duration::from_secs(5), restore_receipt)
@@ -2545,10 +2591,14 @@ mod tests {
             },
             "only an expired semantic deadline may admit fresh fallback"
         );
-        if mode == FallbackTestMode::CaptureCancel {
+        if capture_unsettled {
+            assert_eq!(output, Err(ProtocolError::CleanupFailed));
+            assert!(targets.inventory().is_err());
             let count_before_late = commands.lock().unwrap().len();
-            late_release.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(5), late_sent_receipt)
+            // Keep the old withheld-ACK schedule as a distinct negative case:
+            // only a terminal CleanupFailed/Unknown result permits this ACK.
+            capture_release.take().unwrap().send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), capture_sent_receipt.take().unwrap())
                 .await
                 .unwrap()
                 .unwrap();
@@ -2601,6 +2651,7 @@ mod tests {
                 FallbackTestMode::SemanticCancel | FallbackTestMode::CaptureCancel => {
                     ProtocolError::Cancelled
                 }
+                FallbackTestMode::CaptureCancelWithheldAck => ProtocolError::CleanupFailed,
                 _ => ProtocolError::BrowserFailure,
             };
             assert_eq!(
@@ -2633,7 +2684,9 @@ mod tests {
                 vec![]
             } else if matches!(
                 mode,
-                FallbackTestMode::CaptureRefused | FallbackTestMode::CaptureCancel
+                FallbackTestMode::CaptureRefused
+                    | FallbackTestMode::CaptureCancel
+                    | FallbackTestMode::CaptureCancelWithheldAck
             ) {
                 vec!["holder", "verify", "remove", "release"]
             } else {
