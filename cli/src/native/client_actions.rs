@@ -3158,6 +3158,8 @@ mod tests {
             let mut checked_reads = 0;
             let mut query_reads = 0;
             let mut preparation_scrolls = 0;
+            let mut held_focus_probe: Option<Value> = None;
+            let mut held_focus_release: Option<Value> = None;
             while let Some(Ok(message)) = socket.next().await {
                 let Ok(text) = message.to_text() else {
                     continue;
@@ -3223,6 +3225,15 @@ mod tests {
                     }
                 }
                 if source.contains("return this.nodeType===1") {
+                    if mode == "focus-cancel-late" {
+                        // Hold only this reply. A real cancellation must unwind
+                        // the focus wait and finish owned cleanup. Only a later
+                        // drain command releases the successful producer result.
+                        assert_eq!(method, "Runtime.callFunctionOn");
+                        assert!(held_focus_probe.replace(request.clone()).is_none());
+                        server_cancel.send_replace(CancelSignal::Requested);
+                        continue;
+                    }
                     if mode == "focus-cancel"
                         || (mode == "focus-root-cancel"
                             && request["params"]["objectId"] == "focused-document")
@@ -3291,7 +3302,7 @@ mod tests {
                         json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":42},{"nodeType":1,"backendNodeId":43}]}})
                     }
                     "Runtime.getProperties" if mode.starts_with("strict-query") => {
-                        json!({"result":[]})
+                        json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
                     }
                     "Accessibility.getPartialAXTree" if mode.starts_with("strict-query") => {
                         json!({"nodes":[{"nodeId":"a","backendDOMNodeId":request["params"]["backendNodeId"],"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}]})
@@ -3489,6 +3500,40 @@ mod tests {
                 } else {
                     json!({"id":request["id"],"result":result})
                 };
+                if method == "Runtime.releaseObject" {
+                    if let Some(focus_request) = held_focus_probe.as_ref() {
+                        assert_eq!(request["sessionId"], focus_request["sessionId"]);
+                        assert_eq!(
+                            request["params"]["objectId"],
+                            focus_request["params"]["objectId"]
+                        );
+                        assert!(held_focus_release.replace(request.clone()).is_none());
+                    }
+                }
+                if method == "Browser.getVersion" {
+                    if let Some(focus_request) = held_focus_probe.take() {
+                        let release_request = held_focus_release.take().unwrap();
+                        assert!(sent_replies.lock().unwrap().iter().any(|entry| {
+                            entry["request"] == release_request
+                                && entry["reply"]["result"] == json!({})
+                                && entry["reply"].get("error").is_none()
+                        }));
+                        let focus_reply =
+                            json!({"id":focus_request["id"],"result":{"result":{"value":true}}});
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                focus_reply.to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        sent_replies.lock().unwrap().push(json!({
+                            "request":focus_request,
+                            "reply":focus_reply,
+                            "heldUntilRequest":request,
+                            "cleanupRequest":release_request
+                        }));
+                    }
+                }
                 if socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
                         reply.to_string(),
@@ -4617,6 +4662,116 @@ mod tests {
                 assert_eq!(error.error, ProtocolError::Cancelled);
             }
         }
+    }
+    #[tokio::test]
+    async fn cancelled_focus_probe_discards_late_success_and_releases_exact_object_once() {
+        let f = fixture("focus-cancel-late").await;
+        let failure = ClientActions::default()
+            .execute(
+                f.context(),
+                "browser.keyboard.type",
+                &json!({"identityScope":"scope","replace":true,"text":"Z"}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(*f.op.cancellation.borrow(), CancelSignal::Requested);
+        assert_eq!(failure.error, ProtocolError::Cancelled);
+        assert_eq!(failure.effects, Effects::NotDispatched);
+        assert!(!failure.cleanup_failed);
+        assert!(f.inputs().is_empty());
+
+        let focus_request = f
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|request| {
+                request["method"] == "Runtime.callFunctionOn"
+                    && request["params"]["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|source| source.contains("return this.nodeType===1"))
+            })
+            .unwrap()
+            .clone();
+        assert!(f
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["request"]["id"] != focus_request["id"]));
+
+        // The caller has already rejected cleanly while the focus reply is held.
+        // Only this post-terminal round trip releases the late focus success;
+        // its ACK drains that reply on the same live connection before checks.
+        f.page
+            .client
+            .send_command("Browser.getVersion", None, Some("page"))
+            .await
+            .unwrap();
+        assert_eq!(f.page.client.pending_len().await, 0);
+        assert!(f.inputs().is_empty());
+        assert_eq!(f.state.held_modifiers().unwrap(), 0);
+        f.page.permit.check().unwrap();
+
+        let log = f.log.lock().unwrap();
+        let resolved: Vec<_> = log
+            .iter()
+            .filter(|request| request["method"] == "DOM.resolveNode")
+            .collect();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0]["sessionId"], "page");
+        assert_eq!(resolved[0]["params"]["backendNodeId"], 42);
+        let releases: Vec<_> = log
+            .iter()
+            .filter(|request| request["method"] == "Runtime.releaseObject")
+            .collect();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0]["sessionId"], "page");
+        assert_eq!(releases[0]["params"]["objectId"], "exact-node");
+
+        let replies = f.replies.lock().unwrap();
+        let resolved_reply = replies
+            .iter()
+            .find(|entry| entry["request"]["id"] == resolved[0]["id"])
+            .unwrap();
+        assert_eq!(
+            resolved_reply["reply"]["result"]["object"]["objectId"],
+            releases[0]["params"]["objectId"]
+        );
+        let focus_replies: Vec<_> = replies
+            .iter()
+            .filter(|entry| entry.get("heldUntilRequest").is_some())
+            .collect();
+        assert_eq!(focus_replies.len(), 1);
+        let focus = focus_replies[0];
+        assert_eq!(focus["request"], focus_request);
+        assert_eq!(focus["request"]["method"], "Runtime.callFunctionOn");
+        assert_eq!(focus["request"]["sessionId"], "page");
+        assert_eq!(focus["request"]["params"]["objectId"], "exact-node");
+        assert_eq!(focus["request"]["params"]["returnByValue"], true);
+        assert_eq!(focus["reply"]["id"], focus["request"]["id"]);
+        assert_eq!(focus["reply"]["result"]["result"]["value"], true);
+        assert_eq!(&focus["cleanupRequest"], releases[0]);
+        assert_eq!(focus["heldUntilRequest"]["method"], "Browser.getVersion");
+        assert_eq!(focus["heldUntilRequest"]["sessionId"], "page");
+        let cleanup_replies: Vec<_> = replies
+            .iter()
+            .filter(|entry| entry["request"]["id"] == releases[0]["id"])
+            .collect();
+        assert_eq!(cleanup_replies.len(), 1);
+        assert_eq!(cleanup_replies[0]["reply"]["id"], releases[0]["id"]);
+        assert_eq!(cleanup_replies[0]["reply"]["result"], json!({}));
+        assert!(cleanup_replies[0]["reply"].get("error").is_none());
+        let reply_position = |id: &Value| {
+            replies
+                .iter()
+                .position(|entry| &entry["request"]["id"] == id)
+                .unwrap()
+        };
+        assert!(reply_position(&releases[0]["id"]) < reply_position(&focus_request["id"]));
+        assert!(
+            reply_position(&focus_request["id"]) < reply_position(&focus["heldUntilRequest"]["id"])
+        );
     }
     #[tokio::test]
     async fn replacement_acknowledged_substep_cancel_preserves_settled_prefix() {
@@ -6322,29 +6477,16 @@ mod tests {
             // window AND an original-authority, fully-ACKed preparation receipt.
             // A scroll may run page business logic; Completed is not no effects,
             // action success, rollback, or permission to replay this tap.
-            assert_eq!(
-                (
-                    evidence.failure.effects,
-                    delivered.effects,
-                    settled,
-                    health,
-                    next_error,
-                    evidence.original_authority,
-                    evidence.target_revision,
-                    evidence.before_deadline,
-                ),
-                (
-                    Effects::Completed,
-                    Effects::Completed,
-                    ScopeState::Usable,
-                    (1, ScopeState::Usable),
-                    None,
-                    Ok(()),
-                    Ok(()),
-                    true,
-                ),
-                "{mode}: a completed preparation-only refusal must settle honestly and permit reuse"
-            );
+            // Separate assertions preserve the conjunction while the closed
+            // harness receipt identifies a failing fact by its tracked line.
+            assert_eq!(evidence.failure.effects, Effects::Completed, "{mode}");
+            assert_eq!(delivered.effects, Effects::Completed, "{mode}");
+            assert_eq!(settled, ScopeState::Usable, "{mode}");
+            assert_eq!(health, (1, ScopeState::Usable), "{mode}");
+            assert_eq!(next_error, None, "{mode}");
+            assert_eq!(evidence.original_authority, Ok(()), "{mode}");
+            assert_eq!(evidence.target_revision, Ok(()), "{mode}");
+            assert!(evidence.before_deadline, "{mode}");
         } else {
             assert_eq!(evidence.failure.effects, Effects::Unknown, "{mode}");
             assert_eq!(delivered.effects, Effects::Unknown, "{mode}");
