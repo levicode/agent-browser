@@ -1528,6 +1528,7 @@ pub async fn resolve_element_object_id(
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ExactResolutionError {
     StaleReference,
+    Superseded,
     BackendFailure,
     CleanupFailed {
         primary: Option<Box<ExactResolutionError>>,
@@ -1537,6 +1538,7 @@ impl std::fmt::Display for ExactResolutionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::StaleReference => "Reference no longer belongs to its document",
+            Self::Superseded => "Observation capture was superseded",
             Self::BackendFailure => "Exact reference proof unavailable",
             Self::CleanupFailed { .. } => "Exact reference cleanup failed",
         })
@@ -1568,10 +1570,20 @@ pub async fn resolve_exact_object_typed(
     let context = create_exact_realm(client, binding).await?;
     resolve_exact_object_in_realm_typed(client, binding, backend, context).await
 }
+// Ordinary actions do not have this Observe-only task-local context. Stop
+// before new proof/acquisition commands, never inside mandatory handle release.
+fn check_capture_retirement() -> Result<(), ExactResolutionError> {
+    if super::client_observation::capture_superseded() {
+        Err(ExactResolutionError::Superseded)
+    } else {
+        Ok(())
+    }
+}
 pub async fn create_exact_realm(
     client: &CdpClient,
     binding: &ExactBinding,
 ) -> Result<i64, ExactResolutionError> {
+    check_capture_retirement()?;
     let world = client
         .send_command(
             "Page.createIsolatedWorld",
@@ -1592,6 +1604,7 @@ pub async fn resolve_exact_object_in_realm_typed(
     backend: i64,
     context: i64,
 ) -> Result<String, ExactResolutionError> {
+    check_capture_retirement()?;
     let result = client.send_command("DOM.resolveNode", Some(serde_json::json!({
         "backendNodeId": backend, "executionContextId": context, "objectGroup": "native-exact"
     })), Some(&binding.session)).await?;
@@ -1600,6 +1613,7 @@ pub async fn resolve_exact_object_in_realm_typed(
         .ok_or(ExactResolutionError::BackendFailure)?
         .to_string();
     let proof: Result<(), ExactResolutionError> = async {
+        check_capture_retirement()?;
         let result = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
             "objectId": object, "functionDeclaration": "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }", "returnByValue": true
         })), Some(&binding.session)).await?;
@@ -1658,6 +1672,7 @@ pub async fn validate_exact_binding_typed(
     if page_session != binding.page_session {
         return Err(ExactResolutionError::StaleReference);
     }
+    check_capture_retirement()?;
     let tree = client
         .send_command_no_params("Page.getFrameTree", Some(&binding.session))
         .await?;

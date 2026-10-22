@@ -10,6 +10,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtectedReadReason {
     Cancelled,
+    Superseded,
+    CleanupFailed,
     Deadline,
     StaleScope,
     IncompleteInventory,
@@ -37,6 +39,7 @@ pub struct ProtectedReadJournal<'a> {
     restored: bool,
     started: bool,
     stabilization_completed: bool,
+    command_cleanup_lost: std::sync::atomic::AtomicBool,
 }
 impl<'a> ProtectedReadJournal<'a> {
     pub fn begin(
@@ -82,6 +85,7 @@ impl<'a> ProtectedReadJournal<'a> {
             restored: false,
             started: false,
             stabilization_completed: false,
+            command_cleanup_lost: std::sync::atomic::AtomicBool::new(false),
         };
         journal.check().map_err(failure)?;
         Ok(journal)
@@ -99,6 +103,9 @@ impl<'a> ProtectedReadJournal<'a> {
         }
         if Instant::now() >= self.operation.deadline {
             return Err(ProtectedReadReason::Deadline);
+        }
+        if super::client_observation::capture_superseded() {
+            return Err(ProtectedReadReason::Superseded);
         }
         Ok(())
     }
@@ -126,12 +133,47 @@ impl<'a> ProtectedReadJournal<'a> {
         if !self.contains_session(session) {
             return Err(ProtectedReadReason::IncompleteInventory);
         }
-        let mut cancellation = self.operation.cancellation.clone();
-        tokio::select! {
-            result=self.page.client.send_command(method,Some(args),Some(session))=>{self.check()?;result.map_err(|_|ProtectedReadReason::BrowserFailure)},
-            _=cancellation.changed()=>Err(ProtectedReadReason::Cancelled),
-            _=tokio::time::sleep_until(self.operation.deadline.into())=>Err(ProtectedReadReason::Deadline),
+        if !super::client_observation::capture_retirement_active() {
+            let mut cancellation = self.operation.cancellation.clone();
+            return tokio::select! {
+                result = self.page.client.send_command(method, Some(args), Some(session)) => {
+                    self.check()?;
+                    result.map_err(|_| ProtectedReadReason::BrowserFailure)
+                }
+                _ = cancellation.changed() => Err(ProtectedReadReason::Cancelled),
+                _ = tokio::time::sleep_until(self.operation.deadline.into()) => Err(ProtectedReadReason::Deadline),
+            };
         }
+        let result = super::client_observation::retained_read_command(
+            &self.page.client,
+            session,
+            method,
+            args,
+            self.operation,
+        )
+        .await
+        .map_err(|error| match error {
+            super::client_observation::ObservationError::Cancelled => {
+                ProtectedReadReason::Cancelled
+            }
+            super::client_observation::ObservationError::DeadlineExceeded => {
+                ProtectedReadReason::Deadline
+            }
+            super::client_observation::ObservationError::Superseded => {
+                ProtectedReadReason::Superseded
+            }
+            super::client_observation::ObservationError::CleanupFailed { .. } => {
+                self.command_cleanup_lost
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                self.barrier.quarantine();
+                ProtectedReadReason::CleanupFailed
+            }
+            _ => ProtectedReadReason::BrowserFailure,
+        });
+        if result.is_ok() && !super::client_observation::produces_remote_objects(method) {
+            self.check()?;
+        }
+        result
     }
     pub async fn stabilize_animations(&mut self) -> Result<(), ProtectedReadReason> {
         if self.started || self.restored {
@@ -264,6 +306,9 @@ impl<'a> ProtectedReadJournal<'a> {
         );
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut complete = self.remove_source_masks_until(deadline).await.is_ok();
+        complete &= !self
+            .command_cleanup_lost
+            .load(std::sync::atomic::Ordering::SeqCst);
         for (session, rate) in self.touched.iter().rev() {
             let command_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
             if Instant::now() >= deadline {
@@ -413,6 +458,64 @@ mod tests {
         };
         (page, operation, sender, server, records)
     }
+    #[tokio::test]
+    async fn supersession_never_cancels_owned_source_or_animation_restore() {
+        use super::super::client_observation::{with_capture_retirement, CaptureRetirement};
+        for fail in [false, true] {
+            let (page, operation, cancel, server, records) = journal_fixture(fail, false).await;
+            let (stop, receiver) = tokio::sync::watch::channel(false);
+            with_capture_retirement(Some(CaptureRetirement::new(receiver)), async {
+                let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+                journal.stabilize_animations().await.unwrap();
+                journal
+                    .reserve_source_group("session".into(), "retired-source".into())
+                    .unwrap();
+                journal
+                    .bind_source_holder("session", "retired-source", "retired-holder".into())
+                    .unwrap();
+                stop.send_replace(true);
+                assert_eq!(journal.check(), Err(super::ProtectedReadReason::Superseded));
+                cancel.send_replace(super::super::client_session::CancelSignal::Requested);
+                assert_eq!(journal.check(), Err(super::ProtectedReadReason::Cancelled));
+                let restored = journal.restore().await;
+                assert_eq!(restored.is_err(), fail);
+                if let Err(failure) = restored {
+                    assert!(failure.cleanup_integrity_lost);
+                }
+                let commands = records.lock().unwrap();
+                assert_eq!(
+                    commands
+                        .iter()
+                        .filter(|r| r["method"] == "Runtime.callFunctionOn"
+                            && r["params"]["objectId"] == "retired-holder"
+                            && r["params"]["functionDeclaration"]
+                                == "function(){return this.remove()}")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    commands
+                        .iter()
+                        .filter(|r| r["method"] == "Runtime.releaseObjectGroup"
+                            && r["params"]["objectGroup"] == "retired-source")
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    commands
+                        .iter()
+                        .filter(|r| r["method"] == "Animation.setPlaybackRate"
+                            && r["params"]["playbackRate"].as_f64() == Some(1.0))
+                        .count(),
+                    1
+                );
+            })
+            .await;
+            assert_eq!(page.targets.inventory().is_err(), fail);
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn protected_journal_restores_before_releasing_barrier() {
         let (page, operation, _sender, server, _records) = journal_fixture(false, false).await;

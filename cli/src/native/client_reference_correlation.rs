@@ -658,6 +658,7 @@ mod tests {
                 DispatchContext {
                     #[cfg(feature = "acceptance-faults")]
                     faults: Arc::new(crate::native::client_test_faults::FaultController::default()),
+                    attachment: targets.owned_target("target").unwrap(),
                     page: BrowserExecutionLease {
                         client: client.clone(),
                         page_session_id: "page".into(),

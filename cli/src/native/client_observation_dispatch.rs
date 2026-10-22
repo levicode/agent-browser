@@ -3,7 +3,9 @@
 //! separately by browser conformance, not by this module's existence.
 use super::client_blobs::{BlobError, BlobScope, BlobStore};
 use super::client_browser::BrowserExecutionLease;
-use super::client_capture::{self, CaptureContext, CaptureReason, CaptureRequest};
+use super::client_capture::{
+    self, CaptureAttemptFailure, CaptureContext, CapturePhase, CaptureReason, CaptureRequest,
+};
 use super::client_geometry::GeometrySnapshot;
 use super::client_observation::{
     self as observation, ObservationError, ObservationFrame, ObservationOptions, QueryOptions,
@@ -19,7 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 #[cfg(test)]
@@ -27,7 +29,17 @@ use tokio::sync::oneshot;
 mod composition_tests;
 #[path = "client_reference_correlation.rs"]
 mod reference_correlation;
+#[cfg(test)]
+#[path = "client_capture_supersession_tests.rs"]
+mod supersession_tests;
 pub use reference_correlation::CorrelateRequest;
+
+#[cfg(test)]
+tokio::task_local! {
+    // Scoped to one retained dispatcher task, never shared between fixtures.
+    // This injects an observed-cleanup flag, not a real resource cleanup failure.
+    static FALLBACK_OBSERVED_CLEANUP_FOR_TEST: bool;
+}
 
 #[derive(Debug)]
 pub struct DispatchFailure {
@@ -76,6 +88,9 @@ pub struct DispatchContext {
     #[cfg(feature = "acceptance-faults")]
     pub faults: Arc<super::client_test_faults::FaultController>,
     pub page: BrowserExecutionLease,
+    /// Native attachment tenure captured with the page and policy, before any
+    /// retained-registration await. Never rebound from current registry state.
+    pub attachment: super::client_targets::OwnedTarget,
     pub ui: Arc<UiGate>,
     pub blobs: Arc<BlobStore>,
     pub scope: BlobScope,
@@ -127,9 +142,89 @@ impl Publication {
         }
     }
 }
+// Admission authority is separate from the one committed RefMap. Entries are
+// bounded, exact-owner tenures, never reference registries or published revisions.
+// Match the target registry's existing bound, rather than imposing a smaller
+// page-history limit. Dead or detached exact tenures are pruned at admission.
+const MAX_CAPTURE_OWNERS: usize = 1024;
+struct CaptureOwner {
+    scope: BlobScope,
+    page_session_id: String,
+    target_id: String,
+    attachment: super::client_targets::OwnedTarget,
+    client: Weak<super::cdp::client::CdpClient>,
+    targets: Weak<super::client_targets::ClientTargets>,
+}
+impl CaptureOwner {
+    fn new(context: &DispatchContext) -> Result<Self, ProtocolError> {
+        let attachment = context.attachment.clone();
+        let current = context.page.targets.owned_target(&context.page.target_id)?;
+        if !attachment.same_attachment(&current)
+            || context.page.targets.identity_scope != context.page.identity_scope
+            || attachment.session_id != context.page.page_session_id
+            || attachment.kind != "page"
+            || attachment.purpose != Some(TargetPurpose::Application)
+            || !attachment.configured
+            || !attachment.resumed
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(Self {
+            scope: context.scope.clone(),
+            page_session_id: context.page.page_session_id.clone(),
+            target_id: context.page.target_id.clone(),
+            attachment,
+            client: Arc::downgrade(&context.page.client),
+            targets: Arc::downgrade(&context.page.targets),
+        })
+    }
+    fn matches(&self, page: &BrowserExecutionLease, generation: u64) -> bool {
+        self.scope.generation == generation
+            && self.scope.identity_scope == page.identity_scope
+            && self.page_session_id == page.page_session_id
+            && self.target_id == page.target_id
+            && self.client.ptr_eq(&Arc::downgrade(&page.client))
+            && self.targets.ptr_eq(&Arc::downgrade(&page.targets))
+            && page
+                .targets
+                .owned_target(&self.target_id)
+                .is_ok_and(|current| self.attachment.same_attachment(&current))
+    }
+    fn live(&self) -> bool {
+        self.client.strong_count() != 0
+            && self.targets.upgrade().is_some_and(|targets| {
+                targets
+                    .owned_target(&self.target_id)
+                    .is_ok_and(|current| self.attachment.same_attachment(&current))
+            })
+    }
+}
+struct CaptureAdmission {
+    owner: CaptureOwner,
+    sequence: u64,
+    retired: tokio::sync::watch::Sender<bool>,
+}
+#[derive(Default)]
+struct CaptureAuthority {
+    latest: Vec<Arc<CaptureAdmission>>,
+}
+/// Created only by validated synchronous admission. Dropping an admitted
+/// request never restores its predecessor, even if this task never runs.
+pub(crate) struct PreparedDispatch {
+    context: DispatchContext,
+    request: DispatchRequest,
+    operation: OperationLease,
+    capture: Option<Arc<CaptureAdmission>>,
+}
 pub struct ObservationDispatch {
+    captures: Mutex<CaptureAuthority>,
     refs: Arc<Mutex<RefMap>>,
     publication: tokio::sync::Mutex<Publication>,
+    // Branch seam only: the semantic reader has no natural PolicyDenied producer.
+    #[cfg(test)]
+    semantic_failure_for_test: Mutex<Option<ObservationError>>,
+    #[cfg(test)]
+    observed_cleanup_for_test: AtomicBool,
 }
 struct Output {
     value: Value,
@@ -138,7 +233,12 @@ struct Output {
 impl ObservationDispatch {
     pub fn new(refs: Arc<Mutex<RefMap>>) -> Arc<Self> {
         Arc::new(Self {
+            #[cfg(test)]
+            semantic_failure_for_test: Mutex::new(None),
+            #[cfg(test)]
+            observed_cleanup_for_test: AtomicBool::new(false),
             refs,
+            captures: Mutex::new(CaptureAuthority::default()),
             publication: tokio::sync::Mutex::new(Publication {
                 revision: 0,
                 published_revision: 0,
@@ -189,18 +289,134 @@ impl ObservationDispatch {
             publication.observed_revision,
         ))
     }
-    pub fn start(
+    /// This is called by the retained registry's synchronous prepare closure,
+    /// never on raw RPC acceptance and never before capacity admission.
+    pub(crate) fn prepare(
+        &self,
+        context: DispatchContext,
+        request: DispatchRequest,
+        operation: OperationLease,
+    ) -> Result<PreparedDispatch, ProtocolError> {
+        if context.scope.identity_scope != context.page.identity_scope
+            || context.scope.generation != operation.generation
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        check(&context.page, &operation)?;
+        validate_policy(&context.policy, &request)?;
+        if let DispatchRequest::Query(query) = &request {
+            observation::validate_expression(&query.options.expression, 0)
+                .map_err(observation_error)?;
+        }
+        let protected =
+            !matches!(&request, DispatchRequest::Query(q) if q.purpose == QueryPurpose::Fixture);
+        if protected && operation.is_callback {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let capture = if matches!(&request, DispatchRequest::Observe(_)) {
+            let mut authority = self
+                .captures
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            // Recheck the captured permit and budget while holding the same
+            // short lock used by final publication. No await or UI lock here.
+            check(&context.page, &operation)?;
+            let owner = CaptureOwner::new(&context)?;
+            authority.latest.retain(|entry| entry.owner.live());
+            let prior = authority
+                .latest
+                .iter()
+                .position(|entry| entry.owner.matches(&context.page, operation.generation));
+            if let Some(index) = prior {
+                // Spawning does not establish trusted request order. An older
+                // request reaching validation late cannot displace a newer one.
+                if operation.sequence <= authority.latest[index].sequence {
+                    return Err(ProtocolError::StaleReference);
+                }
+            } else if authority.latest.len() >= MAX_CAPTURE_OWNERS {
+                return Err(ProtocolError::CapacityExceeded);
+            }
+            let (retired, _) = tokio::sync::watch::channel(false);
+            let capture = Arc::new(CaptureAdmission {
+                owner,
+                sequence: operation.sequence,
+                retired,
+            });
+            if let Some(index) = prior {
+                let prior = std::mem::replace(&mut authority.latest[index], capture.clone());
+                prior.retired.send_replace(true);
+            } else {
+                authority.latest.push(capture.clone());
+            }
+            Some(capture)
+        } else {
+            None
+        };
+        Ok(PreparedDispatch {
+            context,
+            request,
+            operation,
+            capture,
+        })
+    }
+    #[cfg(test)]
+    fn start(
         self: Arc<Self>,
         context: DispatchContext,
         request: DispatchRequest,
         operation: OperationLease,
     ) -> DispatchTask {
+        let identity_scope = context.scope.identity_scope.clone();
+        match self.prepare(context, request, operation) {
+            Ok(prepared) => self.start_prepared(prepared),
+            Err(error) => {
+                let (send, result) = oneshot::channel();
+                let join = tokio::spawn(async move {
+                    let _ = send.send(Err(DispatchFailure {
+                        error,
+                        identity_scope,
+                        cleanup_integrity_lost: false,
+                    }));
+                    Ok(())
+                });
+                DispatchTask { join, result }
+            }
+        }
+    }
+    pub(crate) fn start_prepared(self: Arc<Self>, prepared: PreparedDispatch) -> DispatchTask {
+        let PreparedDispatch {
+            context,
+            request,
+            operation,
+            capture,
+        } = prepared;
         let (send, result) = oneshot::channel();
         let join = tokio::spawn(async move {
             let scope = context.scope.clone();
             let blobs = context.blobs.clone();
             let targets = context.page.targets.clone();
-            let output = self.run(context, request, operation).await;
+            let cancellation = operation.cancellation.clone();
+            let retirement = capture
+                .as_ref()
+                .map(|ticket| observation::CaptureRetirement::new(ticket.retired.subscribe()));
+            // Task-local context is installed inside the spawned task. Neither
+            // the outer owner nor unrelated spawned work inherits it.
+            #[cfg(test)]
+            let observed_cleanup = self.observed_cleanup_for_test.load(Ordering::SeqCst);
+            let run = self.run(context, request, operation, capture);
+            #[cfg(test)]
+            let run = FALLBACK_OBSERVED_CLEANUP_FOR_TEST.scope(observed_cleanup, run);
+            let mut output = observation::with_capture_retirement(retirement, run).await;
+            if let Err(failure) = &mut output {
+                // A cancellation already visible at this unsettled boundary
+                // wins over clean supersession, never over cleanup uncertainty.
+                if !failure.cleanup_integrity_lost
+                    && failure.error == ProtocolError::StaleReference
+                    && *cancellation.borrow() != CancelSignal::None
+                {
+                    failure.error = ProtocolError::Cancelled;
+                }
+            }
             match output {
                 Ok(output) => {
                     if send.send(Ok(output.value)).is_err()
@@ -229,11 +445,53 @@ impl ObservationDispatch {
         });
         DispatchTask { join, result }
     }
+    /// Admission and final comparison/commit are one linearization domain.
+    /// The publication/UI guards are already held by the caller; this short
+    /// lock never spans asynchronous browser work or mandatory restoration.
+    // Keep the exact authority and staged publication inputs explicit at this boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn commit_staged(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+        capture: Option<&Arc<CaptureAdmission>>,
+        publication: &mut Publication,
+        kind: PublicationKind,
+        revision: u64,
+        staged: RefMap,
+    ) -> Result<(), ProtocolError> {
+        let authority = self
+            .captures
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check(page, operation)?;
+        if let Some(capture) = capture {
+            if !capture.owner.matches(page, operation.generation)
+                || capture.sequence != operation.sequence
+                || !authority
+                    .latest
+                    .iter()
+                    .any(|current| Arc::ptr_eq(current, capture))
+            {
+                return Err(ProtocolError::StaleReference);
+            }
+        } else if matches!(kind, PublicationKind::Snapshot) {
+            return Err(ProtocolError::StaleReference);
+        }
+        let mut refs = self
+            .refs
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check(page, operation)?;
+        publication.commit_refs(kind, revision, &mut refs, staged);
+        Ok(())
+    }
     async fn run(
         &self,
         context: DispatchContext,
         request: DispatchRequest,
         operation: OperationLease,
+        capture: Option<Arc<CaptureAdmission>>,
     ) -> Result<Output, DispatchFailure> {
         let identity = context.page.identity_scope.clone();
         let observation_cleanup = AtomicBool::new(false);
@@ -266,21 +524,23 @@ impl ObservationDispatch {
         // also hides the page; setting active does not undo that visibility.
         let stabilize_pixels = matches!(&request, DispatchRequest::Screenshot(_))
             || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
-        let _ui = context
-            .ui
-            .enter(
-                protected,
-                operation.is_callback,
-                operation.deadline,
-                operation.cancellation.clone(),
-            )
-            .await
-            .map_err(failure)?;
+        let _ui = tokio::select! {
+            result = context.ui.enter(protected, operation.is_callback,
+                operation.deadline, operation.cancellation.clone()) => result.map_err(failure)?,
+            _ = observation::capture_retired() => {
+                check(&context.page, &operation).map_err(failure)?;
+                return Err(failure(ProtocolError::StaleReference));
+            }
+        };
         // Acquire UI first: a queued protected writer must not hold this mutex
         // while a valid callback query needs it to finish the active parent.
         let mut cancellation = operation.cancellation.clone();
         let mut publication = tokio::select! {
             lock = self.publication.lock() => lock,
+            _ = observation::capture_retired() => {
+                check(&context.page, &operation).map_err(failure)?;
+                return Err(failure(ProtocolError::StaleReference));
+            },
             _ = cancellation.changed() => return Err(failure(ProtocolError::Cancelled)),
             _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(failure(ProtocolError::DeadlineExceeded)),
         };
@@ -379,18 +639,24 @@ impl ObservationDispatch {
                     let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     let mut output = observation::query(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &query.options, &operation).await.map_err(map_observation)?;
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut output.nodes, &operation).await.map_err(map_geometry)?;
-                    Ok((serde_json::to_value(output).map_err(|_| ProtocolError::BrowserFailure)?, None, false))
+                    Ok((serde_json::to_value(output).map_err(|_| ProtocolError::BrowserFailure)?, None, None))
                 }
                 DispatchRequest::Screenshot(request) => {
                     let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
-                    let pixels = client_capture::capture_under_journal(&capture_context, &request, &operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(capture_error)?;
-                    Ok((Value::Null, Some(pixels), false))
+                    let pixels = client_capture::capture_under_journal(&capture_context, &request, &operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(|error| capture_error(error.reason))?;
+                    Ok((Value::Null, Some(pixels), None))
                 }
                 DispatchRequest::Observe(request) => {
                     let options = ObservationOptions { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector.clone(), ..ObservationOptions::default() };
                     let observed_viewport = viewport(&capture_context.page, &operation).await?;
                     let semantic = semantic_lease(&operation, request.options.pixel_fallback);
                     let tree = async {
+                        #[cfg(test)]
+                        {
+                            let injected = self.semantic_failure_for_test.lock()
+                                .map_err(|_| ObservationError::BackendFailure)?.take();
+                            if let Some(error) = injected { return Err(error); }
+                        }
                         #[cfg(feature = "acceptance-faults")]
                         context.faults.checkpoint(&identity, super::client_test_faults::Phase::SemanticAcquire, vec![], &semantic).await.map_err(fault_observation_error)?;
                         #[cfg(feature = "acceptance-faults")]
@@ -419,7 +685,7 @@ impl ObservationDispatch {
                             check(&capture_context.page, &operation)?;
                             // Any previous pixel stabilization must restore before fresh
                             // fallback pixels can observe current application state.
-                            return Ok((Value::Null, None, true));
+                            return Ok((Value::Null, None, Some(SemanticDeadline)));
                         }
                         Err(error) => return Err(map_observation(error)),
                     };
@@ -430,7 +696,7 @@ impl ObservationDispatch {
                     let pixels = if request.options.pixels || fallback {
                         let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                         let pixel_operation = pixel_lease(&operation);
-                        let result = client_capture::capture_under_journal(&capture_context, &CaptureRequest { secure_field_selector: request.secure_field_selector }, &pixel_operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await;
+                        let result = client_capture::capture_under_journal(&capture_context, &CaptureRequest { secure_field_selector: request.secure_field_selector }, &pixel_operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(|error| error.reason);
                         match result {
                             Ok(pixels) => {
                                 if viewport(&capture_context.page, &operation).await? != value["viewport"] { return Err(ProtocolError::StaleScope); }
@@ -443,7 +709,7 @@ impl ObservationDispatch {
                             Err(reason) => return Err(capture_error(reason)),
                         }
                     } else { None };
-                    Ok((value, pixels, false))
+                    Ok((value, pixels, None))
                 }
             }
         }.await;
@@ -465,8 +731,8 @@ impl ObservationDispatch {
         }
         // A clean restore must not turn a policy failure into a timeout and
         // thereby accidentally authorize fallback at a higher layer.
-        let (mut value, mut pixels, needs_fresh_fallback) = result.map_err(failure)?;
-        if !needs_fresh_fallback {
+        let (mut value, mut pixels, fallback_cause) = result.map_err(failure)?;
+        if fallback_cause.is_none() {
             if let Some(geometry) = &geometry {
                 geometry
                     .revalidate(&capture_context.page.client, &operation)
@@ -475,7 +741,7 @@ impl ObservationDispatch {
                     .map_err(failure)?;
             }
         }
-        if needs_fresh_fallback {
+        if let Some(cause) = fallback_cause {
             if let Some(journal) = &journal {
                 journal.check().map_err(|e| failure(protected_error(e)))?;
             }
@@ -512,6 +778,7 @@ impl ObservationDispatch {
                 &mut staged,
                 revision,
                 &operation,
+                cause,
             )
             .await?;
             value = fresh_value;
@@ -558,12 +825,8 @@ impl ObservationDispatch {
             if let Some(journal) = &journal {
                 journal.check().map_err(protected_error)?;
             }
-            let mut refs = self
-                .refs
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?;
-            check(&capture_context.page, &operation)?;
-            publication.commit_refs(publication_kind, revision, &mut refs, staged);
+            self.commit_staged(&capture_context.page, &operation, capture.as_ref(),
+                &mut publication, publication_kind, revision, staged)?;
             Ok::<(), ProtocolError>(())
         })();
         if let Err(error) = publish {
@@ -649,7 +912,42 @@ fn fault_observation_error(error: ProtocolError) -> ObservationError {
         ProtocolError::DeadlineExceeded => ObservationError::DeadlineExceeded,
         ProtocolError::Cancelled => ObservationError::Cancelled,
         ProtocolError::StaleScope => ObservationError::StaleReference,
+        ProtocolError::StaleReference => ObservationError::Superseded,
         _ => ObservationError::BackendFailure,
+    }
+}
+/// Only the exact semantic DeadlineExceeded arm may authorize fresh fallback.
+struct SemanticDeadline;
+impl SemanticDeadline {
+    fn error(self) -> ProtocolError {
+        ProtocolError::DeadlineExceeded
+    }
+}
+
+enum FallbackFailure {
+    Protocol(ProtocolError),
+    Capture(CaptureAttemptFailure),
+}
+impl From<ProtocolError> for FallbackFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+impl FallbackFailure {
+    fn protocol_error(&self) -> ProtocolError {
+        match self {
+            Self::Protocol(error) => error.clone(),
+            Self::Capture(error) => capture_error(error.reason),
+        }
+    }
+    fn independent_coverage_unproven(&self) -> bool {
+        matches!(
+            self,
+            Self::Capture(CaptureAttemptFailure {
+                phase: CapturePhase::IndependentCoverage,
+                reason: CaptureReason::MaskingUnproven,
+            })
+        )
     }
 }
 /// A timed-out semantic transaction is already restored before entering here.
@@ -660,6 +958,7 @@ async fn fresh_fallback<'a>(
     refs: &mut RefMap,
     revision: u64,
     operation: &'a OperationLease,
+    cause: SemanticDeadline,
 ) -> Result<
     (
         Value,
@@ -669,6 +968,15 @@ async fn fresh_fallback<'a>(
     DispatchFailure,
 > {
     let observation_cleanup = AtomicBool::new(false);
+    #[cfg(test)]
+    if FALLBACK_OBSERVED_CLEANUP_FOR_TEST
+        .try_with(|flag| *flag)
+        .unwrap_or(false)
+    {
+        // Branch evidence only: the actual capture and journal still run, but
+        // this flag does not claim that a renderer cleanup failed naturally.
+        observation_cleanup.store(true, Ordering::SeqCst);
+    }
     let failure = |error: ProtocolError| DispatchFailure {
         cleanup_integrity_lost: error == ProtocolError::CleanupFailed
             || observation_cleanup.load(Ordering::SeqCst),
@@ -695,25 +1003,44 @@ async fn fresh_fallback<'a>(
             observation::NodeReference { id: format!("@{}", viewport.id), revision: viewport.issuance.revision.to_string() }
         };
         let viewport = viewport(&context.page, operation).await?;
-        let pixels = client_capture::capture_under_journal(context, &CaptureRequest { secure_field_selector: selector.to_owned() }, &pixel_lease(operation), &mut journal, geometry).await.map_err(capture_error)?;
+        let pixels = client_capture::capture_under_journal(context, &CaptureRequest { secure_field_selector: selector.to_owned() }, &pixel_lease(operation), &mut journal, geometry).await.map_err(FallbackFailure::Capture)?;
         let value = json!({"identityScope":context.page.identity_scope,"revision":revision.to_string(),"root":{"ref":root},
             "viewportRef":viewport_ref,"truncated":true,"treeUnavailable":true,
             "viewport":viewport,"location":main_frame(&frozen)?.url});
-        Ok::<_, ProtocolError>((value, pixels))
+        Ok::<_, FallbackFailure>((value, pixels))
     }.await;
     if let Err(error) = journal.restore().await {
         return Err(DispatchFailure {
             error: result
                 .as_ref()
                 .err()
-                .cloned()
+                .map(FallbackFailure::protocol_error)
                 .unwrap_or_else(|| protected_error(error.reason)),
             identity_scope: error.identity_scope,
             cleanup_integrity_lost: error.cleanup_integrity_lost
-                || observation_cleanup.load(Ordering::SeqCst),
+                || observation_cleanup.load(Ordering::SeqCst)
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.protocol_error() == ProtocolError::CleanupFailed),
         });
     }
-    let (value, pixels) = result.map_err(failure)?;
+    let (value, pixels) = match result {
+        Ok(value) => value,
+        Err(error)
+            if error.independent_coverage_unproven()
+                && !observation_cleanup.load(Ordering::SeqCst) =>
+        {
+            // Restore must settle first. Cancellation or authority loss during
+            // restoration still outranks this narrowly recoverable proof failure.
+            journal
+                .check()
+                .map_err(|error| failure(protected_error(error)))?;
+            check(&context.page, operation).map_err(failure)?;
+            return Err(failure(cause.error()));
+        }
+        Err(error) => return Err(failure(error.protocol_error())),
+    };
     if let Some(geometry) = &geometry {
         geometry
             .revalidate(&context.page.client, operation)
@@ -808,6 +1135,9 @@ fn check(page: &BrowserExecutionLease, operation: &OperationLease) -> Result<(),
     }
     if Instant::now() >= operation.deadline {
         return Err(ProtocolError::DeadlineExceeded);
+    }
+    if observation::capture_superseded() {
+        return Err(ProtocolError::StaleReference);
     }
     Ok(())
 }
@@ -1240,7 +1570,9 @@ fn observation_error(error: ObservationError) -> ProtocolError {
         ObservationError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
-        ObservationError::StaleReference => ProtocolError::StaleReference,
+        ObservationError::StaleReference | ObservationError::Superseded => {
+            ProtocolError::StaleReference
+        }
         ObservationError::Cancelled => ProtocolError::Cancelled,
         ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
         ObservationError::BackendFailure => ProtocolError::BrowserFailure,
@@ -1252,6 +1584,8 @@ fn protected_error(error: ProtectedReadReason) -> ProtocolError {
         ProtectedReadReason::Cancelled => ProtocolError::Cancelled,
         ProtectedReadReason::Deadline => ProtocolError::DeadlineExceeded,
         ProtectedReadReason::StaleScope => ProtocolError::StaleScope,
+        ProtectedReadReason::Superseded => ProtocolError::StaleReference,
+        ProtectedReadReason::CleanupFailed => ProtocolError::CleanupFailed,
         ProtectedReadReason::IncompleteInventory => ProtocolError::ScopeUnavailable,
         ProtectedReadReason::BrowserFailure => ProtocolError::BrowserFailure,
     }
@@ -1279,6 +1613,7 @@ fn capture_error(error: CaptureReason) -> ProtocolError {
         CaptureReason::Cancelled => ProtocolError::Cancelled,
         CaptureReason::Deadline => ProtocolError::DeadlineExceeded,
         CaptureReason::StaleScope => ProtocolError::StaleScope,
+        CaptureReason::Superseded => ProtocolError::StaleReference,
         CaptureReason::BrowserFailure => ProtocolError::BrowserFailure,
         CaptureReason::BoundsExceeded => ProtocolError::CapacityExceeded,
         CaptureReason::IncompleteFrames
@@ -1554,6 +1889,7 @@ mod tests {
                 DispatchContext {
                     #[cfg(feature = "acceptance-faults")]
                     faults: Arc::new(super::super::client_test_faults::FaultController::default()),
+                    attachment: page.targets.owned_target(&page.target_id).unwrap(),
                     page,
                     ui: ui.clone(),
                     blobs,
@@ -1609,26 +1945,171 @@ mod tests {
     #[tokio::test]
     async fn semantic_only_timeout_never_mutates_lifecycle_and_fallback_stabilizes_separately() {
         for (pixels, fallback) in [(false, false), (false, true), (true, true)] {
-            semantic_timeout_fallback_admission(pixels, fallback, "available").await;
+            semantic_timeout_fallback_admission(
+                pixels,
+                fallback,
+                FallbackTestMode::Available,
+                false,
+            )
+            .await;
         }
     }
     #[cfg(feature = "acceptance-faults")]
     #[tokio::test]
     async fn actual_semantic_timeout_requires_admission_before_fallback_capture() {
-        semantic_timeout_fallback_admission(false, true, "occupied").await;
+        semantic_timeout_fallback_admission(false, true, FallbackTestMode::Occupied, false).await;
     }
     #[cfg(feature = "acceptance-faults")]
     #[tokio::test]
     async fn fallback_capture_refusal_releases_admitted_producer_after_restore() {
-        semantic_timeout_fallback_admission(false, true, "capture-refused").await;
+        semantic_timeout_fallback_admission(false, true, FallbackTestMode::CaptureRefused, false)
+            .await;
     }
     #[cfg(feature = "acceptance-faults")]
     #[tokio::test]
     async fn fallback_dirty_restore_releases_admitted_producer_without_publishing() {
-        semantic_timeout_fallback_admission(false, true, "dirty-restore").await;
+        semantic_timeout_fallback_admission(false, true, FallbackTestMode::Available, true).await;
     }
     #[cfg(feature = "acceptance-faults")]
-    async fn semantic_timeout_fallback_admission(pixels: bool, fallback: bool, mode: &'static str) {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FallbackTestMode {
+        Available,
+        Occupied,
+        CaptureRefused,
+        CoverageUnproven,
+        CoverageCancelDuringRestore,
+        CoverageAuthorityRevokedDuringRestore,
+        CoverageObservedCleanupFlag,
+        CoverageBrowserFailure,
+        PostCapturePolicy,
+        SemanticPolicyBranch,
+        PolicyGate,
+        SemanticCancel,
+        CaptureCancel,
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_initial_coverage_unproven_preserves_semantic_deadline_after_restore() {
+        semantic_timeout_fallback_admission(false, true, FallbackTestMode::CoverageUnproven, false)
+            .await;
+        // A generic rejected probe remains BrowserFailure, not coverage fallback.
+        semantic_timeout_fallback_admission(
+            false,
+            true,
+            FallbackTestMode::CoverageBrowserFailure,
+            false,
+        )
+        .await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_post_capture_policy_failure_survives_clean_restore() {
+        semantic_timeout_fallback_admission(
+            false,
+            true,
+            FallbackTestMode::PostCapturePolicy,
+            false,
+        )
+        .await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn semantic_policy_and_cancellation_never_admit_fallback() {
+        // The typed branch seam is not a natural reader PolicyDenied producer.
+        for mode in [
+            FallbackTestMode::SemanticPolicyBranch,
+            FallbackTestMode::PolicyGate,
+            FallbackTestMode::SemanticCancel,
+        ] {
+            semantic_timeout_fallback_admission(false, true, mode, false).await;
+        }
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_inflight_capture_cancel_waits_for_restoration_without_publishing() {
+        semantic_timeout_fallback_admission(false, true, FallbackTestMode::CaptureCancel, false)
+            .await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_dirty_restore_dominates_coverage_policy_and_cancellation() {
+        for mode in [
+            FallbackTestMode::CoverageUnproven,
+            FallbackTestMode::PostCapturePolicy,
+            FallbackTestMode::CaptureCancel,
+        ] {
+            semantic_timeout_fallback_admission(false, true, mode, true).await;
+        }
+        // A semantic-only read owns no animation restore. Request initial pixels
+        // here so dirty restoration is a real owned effect, not a fabricated flag.
+        for mode in [
+            FallbackTestMode::SemanticPolicyBranch,
+            FallbackTestMode::SemanticCancel,
+        ] {
+            semantic_timeout_fallback_admission(true, true, mode, true).await;
+        }
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_coverage_restore_rechecks_cancellation_and_scope_authority() {
+        for mode in [
+            FallbackTestMode::CoverageCancelDuringRestore,
+            FallbackTestMode::CoverageAuthorityRevokedDuringRestore,
+        ] {
+            semantic_timeout_fallback_admission(false, true, mode, false).await;
+        }
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_coverage_observed_cleanup_flag_prevents_usable_deadline() {
+        // Injected flag propagation, not evidence of a natural cleanup failure.
+        semantic_timeout_fallback_admission(
+            false,
+            true,
+            FallbackTestMode::CoverageObservedCleanupFlag,
+            false,
+        )
+        .await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_failure_preserves_committed_refs_without_reviving_lost_authority() {
+        for (mode, dirty) in [
+            (FallbackTestMode::CoverageUnproven, false),
+            (FallbackTestMode::PostCapturePolicy, false),
+            (FallbackTestMode::SemanticPolicyBranch, false),
+            (FallbackTestMode::PolicyGate, false),
+            (FallbackTestMode::SemanticCancel, false),
+            (FallbackTestMode::CaptureCancel, false),
+            (FallbackTestMode::CoverageCancelDuringRestore, false),
+            (
+                FallbackTestMode::CoverageAuthorityRevokedDuringRestore,
+                false,
+            ),
+            (FallbackTestMode::CoverageObservedCleanupFlag, false),
+            (FallbackTestMode::CoverageUnproven, true),
+        ] {
+            semantic_timeout_fallback_admission_with_refs(false, true, mode, dirty, true).await;
+        }
+    }
+    #[cfg(feature = "acceptance-faults")]
+    async fn semantic_timeout_fallback_admission(
+        pixels: bool,
+        fallback: bool,
+        mode: FallbackTestMode,
+        dirty_restore: bool,
+    ) {
+        semantic_timeout_fallback_admission_with_refs(pixels, fallback, mode, dirty_restore, false)
+            .await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    async fn semantic_timeout_fallback_admission_with_refs(
+        pixels: bool,
+        fallback: bool,
+        mode: FallbackTestMode,
+        dirty_restore: bool,
+        seed_refs: bool,
+    ) {
         use super::super::cdp::client::CdpClient;
         use super::super::client_blobs::BlobLimits;
         use super::super::client_browser::ExecutionGate;
@@ -1636,6 +2117,16 @@ mod tests {
         use super::super::client_test_faults::{FaultController, Phase, State};
         use base64::Engine;
         use futures_util::{SinkExt, StreamExt};
+        let coverage_unproven = matches!(
+            mode,
+            FallbackTestMode::CoverageUnproven
+                | FallbackTestMode::CoverageCancelDuringRestore
+                | FallbackTestMode::CoverageAuthorityRevokedDuringRestore
+                | FallbackTestMode::CoverageObservedCleanupFlag
+        );
+        let observed_cleanup = mode == FallbackTestMode::CoverageObservedCleanupFlag;
+        let integrity_lost_expected = dirty_restore || observed_cleanup;
+        let authority_revoked = mode == FallbackTestMode::CoverageAuthorityRevokedDuringRestore;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let lifecycle = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -1646,6 +2137,24 @@ mod tests {
         let source_log = source_commands.clone();
         let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let capture_log = captures.clone();
+        let snapshots = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let snapshot_log = snapshots.clone();
+        let commands = Arc::new(Mutex::new(Vec::<String>::new()));
+        let command_log = commands.clone();
+        let hold_restore = dirty_restore
+            || coverage_unproven
+            || matches!(
+                mode,
+                FallbackTestMode::CoverageBrowserFailure
+                    | FallbackTestMode::PostCapturePolicy
+                    | FallbackTestMode::CaptureCancel
+                    | FallbackTestMode::CaptureRefused
+            );
+        let (capture_reached, capture_receipt) = oneshot::channel();
+        let (restore_reached, restore_receipt) = oneshot::channel();
+        let (restore_release, restore_release_receipt) = oneshot::channel();
+        let (late_release, late_release_receipt) = oneshot::channel();
+        let (late_sent, late_sent_receipt) = oneshot::channel();
         let blobs = Arc::new(
             BlobStore::new(BlobLimits {
                 max_blob_bytes: 4096,
@@ -1660,7 +2169,7 @@ mod tests {
         };
         blobs.activate_scope(scope.clone()).unwrap();
         let retained = blobs.insert_sealed(scope.clone(), b"r").unwrap();
-        let live_producer = if mode == "occupied" {
+        let live_producer = if mode == FallbackTestMode::Occupied {
             Some(blobs.reserve_producer(scope.clone()).unwrap())
         } else {
             None
@@ -1682,8 +2191,32 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            while let Some(Ok(message)) = socket.next().await {
+            let mut capture_reached = Some(capture_reached);
+            let mut restore_reached = Some(restore_reached);
+            let mut restore_release_receipt = Some(restore_release_receipt);
+            let mut late_release_receipt = late_release_receipt;
+            let mut late_sent = Some(late_sent);
+            let mut held_capture = None::<Value>;
+            let mut source_verifications = 0;
+            loop {
+                let message = tokio::select! {
+                    message = socket.next() => match message {
+                        Some(Ok(message)) => message,
+                        _ => break,
+                    },
+                    release = &mut late_release_receipt, if held_capture.is_some() => {
+                        release.unwrap();
+                        let response = held_capture.take().unwrap();
+                        socket.send(tokio_tungstenite::tungstenite::Message::Text(response.to_string())).await.unwrap();
+                        late_sent.take().unwrap().send(()).unwrap();
+                        continue;
+                    },
+                };
                 let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                command_log
+                    .lock()
+                    .unwrap()
+                    .push(request["method"].as_str().unwrap().to_owned());
                 if request["method"]
                     .as_str()
                     .is_some_and(|method| method.starts_with("Animation."))
@@ -1722,7 +2255,13 @@ mod tests {
                     }
                     "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":1}}),
                     "DOMSnapshot.captureSnapshot" => {
-                        json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[],"backendNodeId":[]}}]})
+                        let ordinal = snapshot_log.fetch_add(1, Ordering::SeqCst);
+                        if coverage_unproven && ordinal == 0 {
+                            // Actual initial coverage parser failure, before any source mask.
+                            json!({"documents":[]})
+                        } else {
+                            json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[],"backendNodeId":[]}}]})
+                        }
                     }
                     "Runtime.evaluate" => {
                         // This peer has an empty DOM inventory. Its only evaluate is
@@ -1749,7 +2288,15 @@ mod tests {
                             .unwrap()
                             .starts_with("capture-source-"));
                         source_log.lock().unwrap().push(phase);
-                        json!({"result":{"type":"boolean","value":true}})
+                        if phase == "verify" {
+                            source_verifications += 1;
+                        }
+                        // Same MaskingUnproven reason as initial coverage, but a
+                        // real post-screenshot source-protection policy failure.
+                        let verified = !(mode == FallbackTestMode::PostCapturePolicy
+                            && phase == "verify"
+                            && source_verifications == 2);
+                        json!({"result":{"type":"boolean","value":verified}})
                     }
                     "Runtime.releaseObjectGroup"
                         if request["params"]["objectGroup"]
@@ -1765,16 +2312,29 @@ mod tests {
                     }
                     _ => json!({}),
                 };
-                let refused = mode == "capture-refused"
+                let is_restore = request["method"] == "Animation.setPlaybackRate"
+                    && request["params"]["playbackRate"].as_f64() == Some(1.0);
+                if hold_restore && is_restore && restore_reached.is_some() {
+                    restore_reached.take().unwrap().send(()).unwrap();
+                    restore_release_receipt.take().unwrap().await.unwrap();
+                }
+                let refused = mode == FallbackTestMode::CaptureRefused
                     && request["method"] == "Page.captureScreenshot"
-                    || mode == "dirty-restore"
-                        && request["method"] == "Animation.setPlaybackRate"
-                        && request["params"]["playbackRate"].as_f64() == Some(1.0);
+                    || mode == FallbackTestMode::CoverageBrowserFailure
+                        && request["method"] == "DOMSnapshot.captureSnapshot"
+                    || dirty_restore && is_restore;
                 let response = if refused {
                     json!({"id":request["id"],"sessionId":request["sessionId"],"error":{"code":-32000,"message":"synthetic capture or restore refusal"}})
                 } else {
                     json!({"id":request["id"],"sessionId":request["sessionId"],"result":result})
                 };
+                if mode == FallbackTestMode::CaptureCancel
+                    && request["method"] == "Page.captureScreenshot"
+                {
+                    assert!(held_capture.replace(response).is_none());
+                    capture_reached.take().unwrap().send(()).unwrap();
+                    continue;
+                }
                 if socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
                         response.to_string(),
@@ -1802,7 +2362,7 @@ mod tests {
         targets.acknowledge_enrollment().unwrap();
         let gate = Arc::new(ExecutionGate::default());
         let page = BrowserExecutionLease {
-            client,
+            client: client.clone(),
             page_session_id: "session".into(),
             target_id: "target".into(),
             identity_scope: "scope".into(),
@@ -1811,7 +2371,7 @@ mod tests {
         };
         let faults = Arc::new(FaultController::default());
         let token = faults.arm("scope", Phase::SemanticAcquire).unwrap();
-        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
         let operation = OperationLease {
             is_callback: false,
             generation: 1,
@@ -1821,9 +2381,64 @@ mod tests {
         };
         let refs = Arc::new(Mutex::new(RefMap::new()));
         let dispatch = ObservationDispatch::new(refs.clone());
-        let task = dispatch.clone().start(
+        dispatch
+            .observed_cleanup_for_test
+            .store(observed_cleanup, Ordering::SeqCst);
+        let committed_revision = if seed_refs { 7 } else { 0 };
+        let prior_viewport = if seed_refs {
+            // Seed trusted observed and located issuance into the real stores.
+            // This is publication bookkeeping evidence, not renderer actions.
+            let binding = ExactBinding {
+                page_session: "session".into(),
+                session: "session".into(),
+                frame: "frame".into(),
+                loader: "loader".into(),
+                actionable: true,
+            };
+            let mut initial = refs.lock().unwrap();
+            initial.begin_observation("scope", 1, committed_revision);
+            initial
+                .try_bind_exact(10, "button", "Prior observed", binding.clone())
+                .unwrap();
+            initial
+                .try_bind_located(
+                    11,
+                    "button",
+                    binding,
+                    super::super::element::LocatedIssuance {
+                        identity_scope: "scope".into(),
+                        generation: 1,
+                        revision: 5,
+                    },
+                    None,
+                )
+                .unwrap();
+            Some(
+                initial
+                    .try_viewport_ref("scope", 1, "session", committed_revision)
+                    .unwrap()
+                    .clone(),
+            )
+        } else {
+            None
+        };
+        if seed_refs {
+            let mut publication = dispatch.publication.lock().await;
+            publication.revision = committed_revision;
+            publication.published_revision = committed_revision;
+            publication.observed_revision = committed_revision;
+        }
+        let prior_refs = refs.lock().unwrap().clone();
+        let prior_ref_ids = prior_refs.ref_ids();
+        if mode == FallbackTestMode::SemanticPolicyBranch {
+            *dispatch.semantic_failure_for_test.lock().unwrap() =
+                Some(ObservationError::PolicyDenied);
+        }
+        let original_deadline = operation.deadline;
+        let mut task = dispatch.clone().start(
             DispatchContext {
                 faults: faults.clone(),
+                attachment: page.targets.owned_target(&page.target_id).unwrap(),
                 page,
                 ui: Arc::new(UiGate::default()),
                 blobs: blobs.clone(),
@@ -1840,22 +2455,114 @@ mod tests {
                     comparable: false,
                 },
                 test_id_attribute: "data-testid".into(),
-                secure_field_selector: "input[type=password]".into(),
+                secure_field_selector: if mode == FallbackTestMode::PolicyGate {
+                    "input".into()
+                } else {
+                    "input[type=password]".into()
+                },
             }),
             operation,
         );
-        let output = task.result.await.unwrap();
-        task.join.await.unwrap().unwrap();
+        if mode == FallbackTestMode::SemanticCancel {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while faults.status("scope", &token).unwrap().state != State::Reached {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            cancel.send(CancelSignal::Requested).unwrap();
+        }
+        if mode == FallbackTestMode::CaptureCancel {
+            tokio::time::timeout(Duration::from_secs(5), capture_receipt)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(Instant::now() < original_deadline);
+            cancel.send(CancelSignal::Requested).unwrap();
+        }
+        if hold_restore {
+            tokio::time::timeout(Duration::from_secs(5), restore_receipt)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(matches!(
+                task.result.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(
+                !task.join.is_finished(),
+                "the retained task must wait for restore ACK"
+            );
+            assert!(
+                matches!(
+                    blobs.reserve_producer(scope.clone()),
+                    Err(BlobError::QuotaExceeded)
+                ),
+                "producer ownership must survive until restoration settles"
+            );
+            if mode == FallbackTestMode::CoverageCancelDuringRestore {
+                cancel.send(CancelSignal::Requested).unwrap();
+            }
+            if authority_revoked {
+                // Revoke the actual captured ExecutionGate permit while its
+                // mandatory restore still owns the journal. No fake error.
+                gate.seal();
+            }
+            restore_release.send(()).unwrap();
+        }
+        let output = task.result.await;
+        let cleanup = task.join.await;
+        assert!(matches!(&cleanup, Ok(Ok(()))));
+        if let Ok(Err(error)) = &output {
+            assert_eq!(error.identity_scope, "scope");
+            assert_eq!(error.cleanup_integrity_lost, integrity_lost_expected);
+        }
+        let (settled, integrity_lost) =
+            super::super::client_browser::settle_observation_dispatch(output, cleanup);
+        assert_eq!(integrity_lost, integrity_lost_expected);
+        assert_eq!(
+            settled.effects,
+            if integrity_lost_expected {
+                super::super::client_protocol::Effects::Unknown
+            } else if settled.result.is_ok() {
+                super::super::client_protocol::Effects::Completed
+            } else {
+                super::super::client_protocol::Effects::NotDispatched
+            }
+        );
+        let output = settled.result;
+        let semantic_policy = matches!(
+            mode,
+            FallbackTestMode::SemanticPolicyBranch | FallbackTestMode::PolicyGate
+        );
         assert_eq!(
             faults.status("scope", &token).unwrap().state,
-            State::Expired,
-            "the actual semantic deadline must expire before fallback admission"
+            if semantic_policy {
+                State::Armed
+            } else {
+                State::Expired
+            },
+            "only an expired semantic deadline may admit fresh fallback"
         );
+        if mode == FallbackTestMode::CaptureCancel {
+            let count_before_late = commands.lock().unwrap().len();
+            late_release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), late_sent_receipt)
+                .await
+                .unwrap()
+                .unwrap();
+            // One correlated command orders the late raw response through the
+            // same CDP reader; it must not revive a retired capture continuation.
+            client
+                .send_command("Browser.getVersion", None, None)
+                .await
+                .unwrap();
+            assert_eq!(commands.lock().unwrap().len(), count_before_late + 1);
+        }
         assert_eq!(blobs.read(&scope, &retained.handle, 0, 1).unwrap(), b"r");
-        if mode == "occupied" {
-            let error = output.unwrap_err();
-            assert_eq!(error.error, ProtocolError::CapacityExceeded);
-            assert!(!error.cleanup_integrity_lost);
+        if mode == FallbackTestMode::Occupied {
+            assert_eq!(output.unwrap_err(), ProtocolError::CapacityExceeded);
             assert!(refs.lock().unwrap().ref_ids().is_empty());
             assert_eq!(dispatch.publication.lock().await.published_revision, 0);
             assert_eq!(animation_commands.load(Ordering::SeqCst), 0);
@@ -1877,29 +2584,166 @@ mod tests {
             let _ = server.await;
             return;
         }
-        if matches!(mode, "capture-refused" | "dirty-restore") {
-            let error = output.unwrap_err();
-            assert_eq!(error.error, ProtocolError::BrowserFailure);
-            assert_eq!(error.cleanup_integrity_lost, mode == "dirty-restore");
-            assert!(refs.lock().unwrap().ref_ids().is_empty());
-            assert_eq!(dispatch.publication.lock().await.published_revision, 0);
-            assert_eq!(captures.load(Ordering::SeqCst), 1);
-            assert_eq!(animation_commands.load(Ordering::SeqCst), 4);
+        if mode != FallbackTestMode::Available || dirty_restore {
+            let expected_error = match mode {
+                FallbackTestMode::CoverageUnproven if !dirty_restore => {
+                    ProtocolError::DeadlineExceeded
+                }
+                FallbackTestMode::CoverageCancelDuringRestore => ProtocolError::Cancelled,
+                FallbackTestMode::CoverageAuthorityRevokedDuringRestore => {
+                    ProtocolError::StaleScope
+                }
+                FallbackTestMode::CoverageUnproven
+                | FallbackTestMode::CoverageObservedCleanupFlag
+                | FallbackTestMode::PostCapturePolicy
+                | FallbackTestMode::SemanticPolicyBranch
+                | FallbackTestMode::PolicyGate => ProtocolError::PolicyDenied,
+                FallbackTestMode::SemanticCancel | FallbackTestMode::CaptureCancel => {
+                    ProtocolError::Cancelled
+                }
+                _ => ProtocolError::BrowserFailure,
+            };
+            assert_eq!(
+                output.unwrap_err(),
+                expected_error,
+                "mode={mode:?}, dirty={dirty_restore}"
+            );
+            assert_eq!(refs.lock().unwrap().ref_ids(), prior_ref_ids);
+            {
+                let publication = dispatch.publication.lock().await;
+                assert_eq!(publication.published_revision, committed_revision);
+                assert_eq!(publication.observed_revision, committed_revision);
+            }
+            let pre_capture = coverage_unproven
+                || matches!(
+                    mode,
+                    FallbackTestMode::CoverageBrowserFailure
+                        | FallbackTestMode::SemanticPolicyBranch
+                        | FallbackTestMode::PolicyGate
+                        | FallbackTestMode::SemanticCancel
+                );
+            assert_eq!(captures.load(Ordering::SeqCst), usize::from(!pre_capture));
+            let semantic_failure = semantic_policy || mode == FallbackTestMode::SemanticCancel;
+            assert_eq!(
+                animation_commands.load(Ordering::SeqCst),
+                if semantic_failure && !pixels { 0 } else { 4 }
+            );
             assert!(lifecycle.lock().unwrap().is_empty());
-            let expected = if mode == "capture-refused" {
+            let expected_source = if pre_capture {
+                vec![]
+            } else if matches!(
+                mode,
+                FallbackTestMode::CaptureRefused | FallbackTestMode::CaptureCancel
+            ) {
                 vec!["holder", "verify", "remove", "release"]
             } else {
                 vec!["holder", "verify", "verify", "remove", "release"]
             };
-            assert_eq!(*source_commands.lock().unwrap(), expected);
-            assert_eq!(targets.inventory().is_err(), mode == "dirty-restore");
-            // Exact maximum reservations prove no unpublished pixel charge
-            // remains after clean refusal or dirty cleanup.
+            assert_eq!(*source_commands.lock().unwrap(), expected_source);
+            assert_eq!(
+                snapshots.load(Ordering::SeqCst),
+                if semantic_failure {
+                    0
+                } else if pre_capture {
+                    1
+                } else if mode == FallbackTestMode::Available {
+                    3
+                } else {
+                    2
+                }
+            );
+            assert_eq!(targets.inventory().is_err(), integrity_lost_expected);
+            assert_eq!(gate.enter(false).is_err(), authority_revoked);
+            if semantic_failure && !pixels {
+                assert!(!budget_changes.has_changed().unwrap());
+            }
+            if mode == FallbackTestMode::PolicyGate {
+                assert!(
+                    commands.lock().unwrap().is_empty(),
+                    "policy gate precedes all CDP work"
+                );
+            }
+            if seed_refs {
+                let preserved = refs.lock().unwrap().clone();
+                for id in &prior_ref_ids {
+                    let before = prior_refs.get(id).unwrap();
+                    let after = preserved.get(id).unwrap();
+                    assert_eq!(after.backend_node_id, before.backend_node_id);
+                    assert_eq!(after.exact_binding, before.exact_binding);
+                    assert_eq!(after.lifetime, before.lifetime);
+                    assert_eq!(after.kind, before.kind);
+                    assert_eq!(after.issued_revision(), before.issued_revision());
+                    assert_eq!(
+                        after.is_current_observed(committed_revision),
+                        before.is_current_observed(committed_revision)
+                    );
+                }
+                let viewport = prior_viewport.as_ref().unwrap();
+                assert!(preserved.matches_viewport_reference(
+                    "scope",
+                    1,
+                    "session",
+                    &format!("@{}", viewport.id),
+                    &viewport.issuance.revision.to_string()
+                ));
+                if !integrity_lost_expected && !authority_revoked {
+                    // Retained data is usable only while the original scope and
+                    // exact document remain authoritative. A fresh operation
+                    // avoids confusing operation cancellation with scope loss.
+                    gate.enter(false).unwrap().check().unwrap();
+                    targets.inventory().unwrap();
+                    let (_fresh_cancel, cancellation) =
+                        tokio::sync::watch::channel(CancelSignal::None);
+                    let fresh_operation = OperationLease {
+                        is_callback: false,
+                        generation: 1,
+                        sequence: 2,
+                        deadline: Instant::now() + Duration::from_secs(2),
+                        cancellation,
+                    };
+                    let (revision, actionable) = dispatch
+                        .snapshot_for_action(&fresh_operation)
+                        .await
+                        .unwrap();
+                    assert_eq!(revision, committed_revision);
+                    assert_eq!(actionable.ref_ids(), prior_ref_ids);
+                    for id in &prior_ref_ids {
+                        let entry = actionable.get(id).unwrap();
+                        assert!(entry.matches_reference(
+                            "scope",
+                            1,
+                            "session",
+                            &entry.issued_revision().unwrap().to_string()
+                        ));
+                        super::super::element::validate_exact_binding_typed(
+                            &client,
+                            "session",
+                            entry.exact_binding.as_ref().unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    }
+                } else {
+                    // Preserved metadata alone never revives a revoked or
+                    // quarantined scope; do not claim actionability in this arm.
+                    assert!(targets.inventory().is_err() || gate.enter(false).is_err());
+                }
+                // The shared allocator may burn staged IDs, but only the old
+                // committed set and issuance may remain publicly addressable.
+                assert_eq!(refs.lock().unwrap().ref_ids(), prior_ref_ids);
+            }
+            // Exact maximum reservations and checked accounting prove no
+            // unpublished charge survives or was returned twice after cleanup.
+            blobs.check_budget_integrity().unwrap();
             let released = blobs.reserve_producer(scope.clone()).unwrap();
             drop(released);
             blobs.release(&scope, &retained.handle).unwrap();
             let first = blobs.reserve_producer(scope.clone()).unwrap();
             let second = blobs.reserve_producer(scope.clone()).unwrap();
+            assert!(matches!(
+                blobs.reserve_producer(scope.clone()),
+                Err(BlobError::QuotaExceeded)
+            ));
             drop((first, second));
             blobs.check_budget_integrity().unwrap();
             server.abort();
@@ -1907,7 +2751,7 @@ mod tests {
             return;
         }
         if !fallback {
-            assert_eq!(output.unwrap_err().error, ProtocolError::DeadlineExceeded);
+            assert_eq!(output.unwrap_err(), ProtocolError::DeadlineExceeded);
             assert!(lifecycle.lock().unwrap().is_empty());
             assert_eq!(animation_commands.load(Ordering::SeqCst), 0);
             assert!(source_commands.lock().unwrap().is_empty());
@@ -2241,6 +3085,7 @@ mod tests {
         let task = dispatch.start(DispatchContext {
             #[cfg(feature="acceptance-faults")]
             faults:Arc::new(super::super::client_test_faults::FaultController::default()),
+            attachment: page.targets.owned_target(&page.target_id).unwrap(),
             page, ui:Arc::new(UiGate::default()), blobs, scope,
             policy:ReadPolicy { test_id_attribute:"data-testid".into(), secure_field_selector:"input[type=password]".into() },
         }, DispatchRequest::Query(QueryRequest {
@@ -2413,6 +3258,7 @@ mod tests {
             DispatchContext {
                 #[cfg(feature = "acceptance-faults")]
                 faults: Arc::new(super::super::client_test_faults::FaultController::default()),
+                attachment: page.targets.owned_target(&page.target_id).unwrap(),
                 page,
                 ui: Arc::new(UiGate::default()),
                 blobs: blobs.clone(),

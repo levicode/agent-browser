@@ -151,6 +151,9 @@ impl FaultController {
             if Instant::now() >= operation.deadline {
                 break Err(ProtocolError::DeadlineExceeded);
             }
+            if super::client_observation::capture_superseded() {
+                break Err(ProtocolError::StaleReference);
+            }
             if *wake.borrow() {
                 break match self.status(scope, &token)?.state {
                     State::Released => Ok(()),
@@ -161,6 +164,7 @@ impl FaultController {
                 biased;
                 changed=cancellation.changed()=>{ if changed.is_err() { break Err(ProtocolError::Cancelled); } },
                 _=tokio::time::sleep_until(operation.deadline.into())=>{},
+                _=super::client_observation::capture_retired()=>{},
                 _=wake.changed()=>{},
             }
         };

@@ -8,6 +8,134 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+/// A hold on an actual metadata reply, after node handles were acquired. This
+/// remains test-only and does not add a public fault command or raw identifiers.
+pub(crate) struct MetadataHold {
+    generation: u64,
+    sequence: u64,
+    cancellation: tokio::sync::watch::Receiver<CancelSignal>,
+    reached: tokio::sync::watch::Sender<bool>,
+    released: tokio::sync::watch::Sender<bool>,
+    handles: Mutex<Vec<String>>,
+    releases: AtomicUsize,
+    calls: AtomicUsize,
+}
+impl MetadataHold {
+    pub(crate) async fn reached(&self) {
+        let mut receiver = self.reached.subscribe();
+        while !*receiver.borrow_and_update() {
+            receiver
+                .changed()
+                .await
+                .expect("metadata hold owner dropped");
+        }
+    }
+    pub(crate) fn release(&self) {
+        self.released.send_replace(true);
+    }
+    pub(crate) fn handles(&self) -> Vec<String> {
+        self.handles.lock().unwrap().clone()
+    }
+    pub(crate) fn releases(&self) -> usize {
+        self.releases.load(Ordering::SeqCst)
+    }
+    pub(crate) fn metadata_calls(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+    fn owns(&self, lease: &OperationLease) -> bool {
+        self.generation == lease.generation
+            && self.sequence == lease.sequence
+            && self.cancellation.same_channel(&lease.cancellation)
+    }
+}
+static METADATA_HOLDS: OnceLock<Mutex<Vec<Arc<MetadataHold>>>> = OnceLock::new();
+pub(crate) struct MetadataHoldGuard(Arc<MetadataHold>);
+impl Drop for MetadataHoldGuard {
+    fn drop(&mut self) {
+        self.0.release();
+        if let Some(holds) = METADATA_HOLDS.get() {
+            holds
+                .lock()
+                .unwrap()
+                .retain(|value| !Arc::ptr_eq(value, &self.0));
+        }
+    }
+}
+pub(crate) fn hold_metadata(lease: &OperationLease) -> (MetadataHoldGuard, Arc<MetadataHold>) {
+    let (reached, _) = tokio::sync::watch::channel(false);
+    let (released, _) = tokio::sync::watch::channel(false);
+    let hold = Arc::new(MetadataHold {
+        generation: lease.generation,
+        sequence: lease.sequence,
+        cancellation: lease.cancellation.clone(),
+        reached,
+        released,
+        handles: Mutex::new(Vec::new()),
+        releases: AtomicUsize::new(0),
+        calls: AtomicUsize::new(0),
+    });
+    let mut holds = METADATA_HOLDS.get_or_init(Default::default).lock().unwrap();
+    assert!(!holds.iter().any(|value| value.owns(lease)));
+    holds.push(hold.clone());
+    (MetadataHoldGuard(hold.clone()), hold)
+}
+fn metadata_hold(lease: &OperationLease) -> Option<Arc<MetadataHold>> {
+    METADATA_HOLDS.get().and_then(|holds| {
+        holds
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|value| value.owns(lease))
+            .cloned()
+    })
+}
+pub(super) fn after_group_release(lease: &OperationLease, group: &str) {
+    if group == format!("native-metadata-{}", lease.sequence) {
+        if let Some(hold) = metadata_hold(lease) {
+            hold.releases.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+async fn metadata_checkpoint(
+    method: &str,
+    site: &str,
+    group: Option<&str>,
+    value: &Value,
+    lease: &OperationLease,
+) -> Result<(), ObservationError> {
+    let Some(hold) = metadata_hold(lease) else {
+        return Ok(());
+    };
+    let metadata_group = format!("native-metadata-{}", lease.sequence);
+    if method == "DOM.resolveNode" && group == Some(metadata_group.as_str()) {
+        if let Some(object) = value["object"]["objectId"].as_str() {
+            hold.handles.lock().unwrap().push(object.to_owned());
+        }
+    }
+    if site != "metadata-batch" || group != Some(metadata_group.as_str()) {
+        return Ok(());
+    }
+    if value.get("exceptionDetails").is_some() || !value["result"]["value"].is_array() {
+        return Err(ObservationError::BackendFailure);
+    }
+    hold.calls.fetch_add(1, Ordering::SeqCst);
+    hold.reached.send_replace(true);
+    let mut release = hold.released.subscribe();
+    let mut cancellation = lease.cancellation.clone();
+    loop {
+        check(lease)?;
+        if *release.borrow_and_update() {
+            return Ok(());
+        }
+        tokio::select! {
+            _ = release.changed() => {},
+            _ = cancellation.changed() => return Err(ObservationError::Cancelled),
+            _ = tokio::time::sleep_until(lease.deadline.into()) => return Err(ObservationError::DeadlineExceeded),
+            _ = capture_retired() => return check(lease),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Mode {
     Lifetime,
@@ -82,9 +210,11 @@ pub(super) async fn after_command(
     session: &str,
     method: &str,
     site: &str,
+    group: Option<&str>,
     value: &Value,
     lease: &OperationLease,
 ) -> Result<(), ObservationError> {
+    metadata_checkpoint(method, site, group, value, lease).await?;
     let Some(h) = hook(lease) else { return Ok(()) };
     if matches!(h.mode, Mode::Lifetime) && method == "DOM.resolveNode" {
         if let Some(id) = value["object"]["objectId"].as_str() {
@@ -386,4 +516,311 @@ async fn chromium_query_churn_bounds_durable_metadata_without_evicting_authority
     }.await;
     browser.close().await.unwrap();
     result.unwrap();
+}
+
+#[tokio::test]
+async fn capture_retirement_is_task_scoped_and_does_not_leak_to_spawned_work() {
+    assert!(!capture_superseded());
+    assert!(!capture_retirement_active());
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let (lease, cancel) = operation();
+    with_capture_retirement(Some(CaptureRetirement::new(receiver)), async {
+        assert!(capture_retirement_active());
+        assert_eq!(check(&lease), Ok(()));
+        stop.send_replace(true);
+        capture_retired().await;
+        assert_eq!(check(&lease), Err(ObservationError::Superseded));
+        assert!(!tokio::spawn(async { capture_superseded() }).await.unwrap());
+        with_capture_retirement(None, async {
+            assert!(!capture_retirement_active());
+            assert!(!capture_superseded());
+            assert_eq!(check(&lease), Ok(()));
+        })
+        .await;
+        assert!(capture_superseded());
+        cancel.send_replace(CancelSignal::Requested);
+        assert_eq!(check(&lease), Err(ObservationError::Cancelled));
+    })
+    .await;
+    assert!(!capture_superseded());
+}
+
+#[tokio::test]
+async fn closed_retirement_channel_does_not_manufacture_supersession() {
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    drop(stop);
+    with_capture_retirement(Some(CaptureRetirement::new(receiver)), async {
+        assert!(!capture_superseded());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), capture_retired())
+                .await
+                .is_err()
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn established_deadline_and_cleanup_failure_are_not_relabeled_superseded() {
+    let (stop, receiver) = tokio::sync::watch::channel(true);
+    let (mut lease, cancel) = operation();
+    lease.deadline = Instant::now();
+    with_capture_retirement(Some(CaptureRetirement::new(receiver)), async {
+        assert_eq!(check(&lease), Err(ObservationError::DeadlineExceeded));
+        cancel.send_replace(CancelSignal::Requested);
+        assert_eq!(check(&lease), Err(ObservationError::Cancelled));
+        assert_eq!(
+            settled_stop(ObservationError::DeadlineExceeded, &lease),
+            ObservationError::DeadlineExceeded
+        );
+        let dirty = ObservationError::CleanupFailed {
+            primary: Some(Box::new(ObservationError::Superseded)),
+        };
+        assert_eq!(settled_stop(dirty.clone(), &lease), dirty);
+    })
+    .await;
+    drop(stop);
+}
+
+#[tokio::test]
+async fn superseded_resource_reply_is_owned_before_exact_group_cleanup() {
+    use futures_util::{SinkExt, StreamExt};
+    for (late_reply, fail_cleanup) in [(true, false), (true, true), (false, false)] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (late_tx, late_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut started = Some(started_tx);
+            let mut late = Some(late_rx);
+            let mut methods = Vec::new();
+            while let Some(Ok(message)) = socket.next().await {
+                if !message.is_text() {
+                    continue;
+                }
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let method = request["method"].as_str().unwrap();
+                methods.push(method.to_owned());
+                let result = match method {
+                    "DOM.resolveNode" => {
+                        started.take().unwrap().send(()).unwrap();
+                        if !late_reply {
+                            continue;
+                        }
+                        late.take().unwrap().await.unwrap();
+                        json!({"object":{"type":"object","subtype":"node","objectId":"late-owned-node"}})
+                    }
+                    "Runtime.releaseObjectGroup" => {
+                        assert_eq!(request["params"]["objectGroup"], "owned-retirement-test");
+                        if fail_cleanup {
+                            socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic cleanup refusal"}}).to_string())).await.unwrap();
+                            break;
+                        }
+                        json!({})
+                    }
+                    other => panic!("retired work dispatched downstream command {other}"),
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                if method == "Runtime.releaseObjectGroup" {
+                    break;
+                }
+            }
+            methods
+        });
+        let client = CdpClient::connect(&url).await.unwrap();
+        let (mut lease, _cancel) = operation();
+        if !late_reply {
+            lease.deadline = Instant::now() + Duration::from_millis(50);
+        }
+        let (stop, receiver) = tokio::sync::watch::channel(false);
+        let owned = Arc::new(AtomicUsize::new(0));
+        let read = with_capture_retirement(Some(CaptureRetirement::new(receiver)), async {
+            let result = async {
+                let remote = command(
+                    &client,
+                    "session",
+                    "DOM.resolveNode",
+                    json!({"backendNodeId":42,"objectGroup":"owned-retirement-test"}),
+                    &lease,
+                )
+                .await?;
+                assert_eq!(remote["object"]["objectId"], "late-owned-node");
+                owned.fetch_add(1, Ordering::SeqCst);
+                check(&lease)?;
+                panic!("superseded acquisition resumed downstream work");
+                #[allow(unreachable_code)]
+                Ok::<(), ObservationError>(())
+            }
+            .await;
+            settle_object_group(&client, "session", "owned-retirement-test", result, &lease).await
+        });
+        let retire = async {
+            started_rx.await.unwrap();
+            stop.send_replace(true);
+            // Supersession must not truncate a resource command to the 250 ms
+            // caller-cancellation cleanup budget. Its original lease is live.
+            if late_reply {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+            let _ = late_tx.send(());
+        };
+        let (result, ()) = tokio::join!(read, retire);
+        assert_eq!(owned.load(Ordering::SeqCst), usize::from(late_reply));
+        if late_reply && !fail_cleanup {
+            assert_eq!(result, Err(ObservationError::Superseded));
+        } else {
+            assert!(matches!(
+                result,
+                Err(ObservationError::CleanupFailed { .. })
+            ));
+        }
+        assert_eq!(
+            server.await.unwrap(),
+            ["DOM.resolveNode", "Runtime.releaseObjectGroup"]
+        );
+    }
+}
+
+#[tokio::test]
+async fn metadata_hold_hook_retires_and_reports_only_its_acked_group() {
+    let (lease, _cancel) = operation();
+    let (other, _other_cancel) = operation();
+    let (_guard, hold) = hold_metadata(&lease);
+    let group = format!("native-metadata-{}", lease.sequence);
+    let (stop, receiver) = tokio::sync::watch::channel(false);
+    let held = with_capture_retirement(Some(CaptureRetirement::new(receiver)), async {
+        metadata_checkpoint(
+            "DOM.resolveNode",
+            "other-native-command",
+            Some(&group),
+            &json!({"object":{"objectId":"held-node"}}),
+            &lease,
+        )
+        .await
+        .unwrap();
+        metadata_checkpoint(
+            "Runtime.callFunctionOn",
+            "metadata-batch",
+            Some(&group),
+            &json!({"result":{"value":[]}}),
+            &lease,
+        )
+        .await
+    });
+    let retire = async {
+        hold.reached().await;
+        assert_eq!(hold.handles(), ["held-node"]);
+        assert_eq!(hold.metadata_calls(), 1);
+        assert_eq!(hold.releases(), 0);
+        stop.send_replace(true);
+    };
+    let (result, ()) = tokio::join!(held, retire);
+    assert_eq!(result, Err(ObservationError::Superseded));
+    after_group_release(&other, &group);
+    after_group_release(&lease, "native-security-not-metadata");
+    assert_eq!(hold.releases(), 0);
+    after_group_release(&lease, &group);
+    assert_eq!(hold.releases(), 1);
+    hold.release();
+    assert_eq!(hold.metadata_calls(), 1);
+}
+
+#[tokio::test]
+async fn metadata_acquisition_error_drains_started_sibling_before_group_release() {
+    use futures_util::{SinkExt, StreamExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut first = None;
+        let mut acquisitions = 0;
+        let mut late_ack = false;
+        while let Some(Ok(message)) = socket.next().await {
+            if !message.is_text() {
+                continue;
+            }
+            let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            let result = match request["method"].as_str().unwrap() {
+                "Page.createIsolatedWorld" => json!({"executionContextId":3}),
+                "DOM.resolveNode" => {
+                    acquisitions += 1;
+                    if first.is_none() {
+                        first = Some(request["id"].clone());
+                        continue;
+                    }
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":first.take().unwrap(),"error":{"code":-32000,"message":"synthetic first acquisition failure"}}).to_string())).await.unwrap();
+                    // The second acquisition is live. Early try_collect would
+                    // drop it and release its group before its reply arrives.
+                    tokio::select! {
+                        request = socket.next() => panic!("group cleanup ran before started sibling settled: {}", request.is_some()),
+                        _ = tokio::time::sleep(Duration::from_millis(30)) => {},
+                    }
+                    late_ack = true;
+                    json!({"object":{"type":"object","subtype":"node","objectId":"sibling-owned"}})
+                }
+                "Runtime.releaseObjectGroup" => {
+                    assert!(late_ack);
+                    assert_eq!(acquisitions, 2);
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":{}}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    return;
+                }
+                other => panic!("failed metadata acquisition dispatched {other}"),
+            };
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id":request["id"],"result":result}).to_string(),
+                ))
+                .await
+                .unwrap();
+        }
+        panic!("metadata group was never released");
+    });
+    let client = CdpClient::connect(&url).await.unwrap();
+    let (lease, _cancel) = operation();
+    let frame = ObservationFrame {
+        parent_frame_id: None,
+        owner_backend_id: None,
+        url: "https://synthetic.invalid/".into(),
+        binding: ExactBinding {
+            page_session: "session".into(),
+            session: "session".into(),
+            frame: "root".into(),
+            loader: "document".into(),
+            actionable: false,
+        },
+        offset_x: 0.,
+        offset_y: 0.,
+        frame_path: Vec::new(),
+    };
+    let first: AXNode =
+        serde_json::from_value(json!({"nodeId":"one","backendDOMNodeId":41})).unwrap();
+    let second: AXNode =
+        serde_json::from_value(json!({"nodeId":"two","backendDOMNodeId":42})).unwrap();
+    let result = read_batch_with_refs(
+        &client,
+        &frame,
+        &[&first, &second],
+        None,
+        1,
+        &ObservationOptions::default(),
+        &lease,
+        false,
+        &SecurityInventory::default(),
+    )
+    .await;
+    assert_eq!(result.unwrap_err(), ObservationError::BackendFailure);
+    server.await.unwrap();
 }

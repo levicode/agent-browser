@@ -52,6 +52,23 @@ impl RetainedTasks {
     where
         F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
     {
+        self.start_prepared(identity_scope, targets, || Ok(future))
+            .await
+    }
+
+    /// Validate and acquire operation-specific admission only after retained
+    /// capacity and shutdown checks, synchronously before spawning the owner.
+    /// The closure must not await or start work before returning its future.
+    pub async fn start_prepared<F, P>(
+        &self,
+        identity_scope: String,
+        targets: Arc<ClientTargets>,
+        prepare: P,
+    ) -> Result<oneshot::Receiver<NativeOutcome>, ProtocolError>
+    where
+        F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
+        P: FnOnce() -> Result<F, ProtocolError>,
+    {
         let mut tasks = self.inner.lock().await;
         while let Some(result) = tasks.tasks.try_join_next() {
             tasks.record(result);
@@ -62,6 +79,9 @@ impl RetainedTasks {
         if tasks.tasks.len() >= MAX_RETAINED {
             return Err(ProtocolError::CapacityExceeded);
         }
+        // No fallible admission remains after prepare returns. A validated
+        // capture stays admitted if its later task fails; it is never revived.
+        let future = prepare()?;
         let (send, receive) = oneshot::channel();
         // Registration and permanent shutdown linearize under this mutex.
         tasks.tasks.spawn(async move {

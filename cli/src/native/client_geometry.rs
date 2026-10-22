@@ -19,6 +19,7 @@ pub enum GeometryError {
     IncompleteInventory,
     StaleIdentity,
     Cancelled,
+    Superseded,
     DeadlineExceeded,
     BackendFailure,
     CleanupFailed { primary: Option<Box<GeometryError>> },
@@ -664,6 +665,9 @@ fn check(operation: &OperationLease) -> Result<(), GeometryError> {
     if Instant::now() >= operation.deadline {
         return Err(GeometryError::DeadlineExceeded);
     }
+    if super::client_observation::capture_superseded() {
+        return Err(GeometryError::Superseded);
+    }
     Ok(())
 }
 async fn command(
@@ -674,12 +678,9 @@ async fn command(
     operation: &OperationLease,
 ) -> Result<Value, GeometryError> {
     check(operation)?;
-    let mut cancel = operation.cancellation.clone();
-    tokio::select! {
-        result=client.send_command(method,Some(params),Some(session))=>{check(operation)?;result.map_err(|_|GeometryError::BackendFailure)},
-        _=cancel.changed()=>Err(GeometryError::Cancelled),
-        _=tokio::time::sleep_until(operation.deadline.into())=>Err(GeometryError::DeadlineExceeded),
-    }
+    super::client_observation::retained_read_command(client, session, method, params, operation)
+        .await
+        .map_err(hidden_proof_error)
 }
 fn quad_points(value: &Value) -> Result<[Point; 4], GeometryError> {
     let values = value
@@ -983,6 +984,7 @@ fn hidden_proof_error(error: ObservationError) -> GeometryError {
     match error {
         ObservationError::StaleReference => GeometryError::StaleIdentity,
         ObservationError::Cancelled => GeometryError::Cancelled,
+        ObservationError::Superseded => GeometryError::Superseded,
         ObservationError::DeadlineExceeded => GeometryError::DeadlineExceeded,
         ObservationError::CleanupFailed { primary } => GeometryError::CleanupFailed {
             primary: primary.map(|error| Box::new(hidden_proof_error(*error))),
@@ -1497,7 +1499,7 @@ async fn read_exact_box_impl(
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
     check(operation)?;
     let mut cancel = operation.cancellation.clone();
-    let resolution = element::resolve_exact_object(client, binding, backend);
+    let resolution = element::resolve_exact_object_typed(client, binding, backend);
     tokio::pin!(resolution);
     let (resolved, interrupted) = tokio::select! {
         result=&mut resolution=>(Some(result),None),
@@ -1515,10 +1517,17 @@ async fn read_exact_box_impl(
             }
         },
     };
-    let object = resolved.map_err(|_| GeometryError::CleanupFailed {
-        primary: Some(Box::new(
-            interrupted.clone().unwrap_or(GeometryError::StaleIdentity),
-        )),
+    let object = resolved.map_err(|error| match error {
+        // The typed resolver proves any acquired object was released before
+        // reporting retirement. Preserve a cancellation already observed here.
+        element::ExactResolutionError::Superseded => {
+            check(operation).err().unwrap_or(GeometryError::Superseded)
+        }
+        _ => GeometryError::CleanupFailed {
+            primary: Some(Box::new(
+                interrupted.clone().unwrap_or(GeometryError::StaleIdentity),
+            )),
+        },
     })?;
     if let Some(primary) = interrupted {
         let released = tokio::time::timeout(

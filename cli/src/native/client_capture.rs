@@ -6,7 +6,7 @@ use super::client_observation::ObservationFrame;
 use super::client_protected_read::{ProtectedReadJournal, ProtectedReadReason};
 use super::client_session::{CancelSignal, OperationLease};
 use base64::Engine;
-use futures_util::{StreamExt, TryStreamExt};
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +19,7 @@ const MAX_DOM_NODES: usize = 100_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureReason {
     Cancelled,
+    Superseded,
     Deadline,
     StaleScope,
     IncompleteFrames,
@@ -28,6 +29,29 @@ pub enum CaptureReason {
     BrowserFailure,
     BoundsExceeded,
     CleanupFailed,
+}
+/// Internal provenance, not a public error category. In particular, a failed
+/// initial coverage probe is not a failed source-mask or post-capture proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CapturePhase {
+    Admission,
+    IndependentCoverage,
+    SourceProtection,
+    RawCapture,
+    PostCaptureValidation,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CaptureAttemptFailure {
+    pub phase: CapturePhase,
+    pub reason: CaptureReason,
+}
+impl CapturePhase {
+    fn failure(self, reason: CaptureReason) -> CaptureAttemptFailure {
+        CaptureAttemptFailure {
+            phase: self,
+            reason,
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureFailure {
@@ -85,6 +109,9 @@ fn check(context: &CaptureContext, operation: &OperationLease) -> Result<(), Cap
     if std::time::Instant::now() >= operation.deadline {
         return Err(CaptureReason::Deadline);
     }
+    if super::client_observation::capture_superseded() {
+        return Err(CaptureReason::Superseded);
+    }
     Ok(())
 }
 async fn command(
@@ -95,12 +122,38 @@ async fn command(
     args: Value,
 ) -> Result<Value, CaptureReason> {
     check(context, operation)?;
-    let mut cancellation = operation.cancellation.clone();
-    tokio::select! {
-        result = context.page.client.send_command(method, Some(args), Some(session)) => { check(context, operation)?; result.map_err(|_| CaptureReason::BrowserFailure) },
-        _ = cancellation.changed() => Err(CaptureReason::Cancelled),
-        _ = tokio::time::sleep_until(operation.deadline.into()) => Err(CaptureReason::Deadline),
+    if !super::client_observation::capture_retirement_active() {
+        let mut cancellation = operation.cancellation.clone();
+        return tokio::select! {
+            result = context.page.client.send_command(method, Some(args), Some(session)) => {
+                check(context, operation)?;
+                result.map_err(|_| CaptureReason::BrowserFailure)
+            }
+            _ = cancellation.changed() => Err(CaptureReason::Cancelled),
+            _ = tokio::time::sleep_until(operation.deadline.into()) => Err(CaptureReason::Deadline),
+        };
     }
+    let result = super::client_observation::retained_read_command(
+        &context.page.client,
+        session,
+        method,
+        args,
+        operation,
+    )
+    .await
+    .map_err(|error| match error {
+        super::client_observation::ObservationError::Cancelled => CaptureReason::Cancelled,
+        super::client_observation::ObservationError::DeadlineExceeded => CaptureReason::Deadline,
+        super::client_observation::ObservationError::Superseded => CaptureReason::Superseded,
+        super::client_observation::ObservationError::CleanupFailed { .. } => {
+            CaptureReason::CleanupFailed
+        }
+        _ => CaptureReason::BrowserFailure,
+    });
+    if result.is_ok() && !super::client_observation::produces_remote_objects(method) {
+        check(context, operation)?;
+    }
+    result
 }
 /// Spawn supervision before the first page mutation. Dropping the RPC receiver
 /// does not drop this task; the owner joins it before releasing its scope.
@@ -149,6 +202,7 @@ async fn capture_transaction(
             geometry.as_ref().ok_or(CaptureReason::UnsafeGeometry)?,
         )
         .await
+        .map_err(|failure| failure.reason)
     }
     .await;
     let integrity = journal.check().map_err(protected_reason);
@@ -191,89 +245,125 @@ async fn capture_transaction(
 /// Capture within the caller's animation-stabilized protected transaction. The caller must
 /// retain the journal, restore it, and revalidate before publishing these bytes.
 /// This helper owns source masks through the same journal; no lifecycle mutation.
-pub async fn capture_under_journal(
+pub(crate) async fn capture_under_journal(
     context: &CaptureContext,
     request: &CaptureRequest,
     operation: &OperationLease,
     journal: &mut ProtectedReadJournal<'_>,
     geometry: &GeometrySnapshot,
-) -> Result<MaskedCapture, CaptureReason> {
-    journal.require_stabilized().map_err(protected_reason)?;
+) -> Result<MaskedCapture, CaptureAttemptFailure> {
+    let viewport_size = async {
+        journal.require_stabilized().map_err(protected_reason)?;
 
-    if !context.inventory_complete || context.frames.is_empty() {
-        return Err(CaptureReason::IncompleteFrames);
-    }
-    if request.secure_field_selector.is_empty() || request.secure_field_selector.len() > 8192 {
-        return Err(CaptureReason::MaskingUnproven);
-    }
-    for frame in &context.frames {
-        if frame.binding.page_session != context.page.page_session_id
-            || !journal.contains_session(&frame.binding.session)
-        {
+        if !context.inventory_complete || context.frames.is_empty() {
             return Err(CaptureReason::IncompleteFrames);
         }
+        if request.secure_field_selector.is_empty() || request.secure_field_selector.len() > 8192 {
+            return Err(CaptureReason::MaskingUnproven);
+        }
+        for frame in &context.frames {
+            if frame.binding.page_session != context.page.page_session_id
+                || !journal.contains_session(&frame.binding.session)
+            {
+                return Err(CaptureReason::IncompleteFrames);
+            }
+        }
+        validate_frames(context, operation).await?;
+        viewport(context, operation).await
     }
-    validate_frames(context, operation).await?;
-    let viewport_size = viewport(context, operation).await?;
-    let before = masks(context, request, operation, geometry).await?;
-    install_source_masks(context, request, operation, journal).await?;
-    journal
-        .verify_source_masks()
+    .await
+    .map_err(|reason| CapturePhase::Admission.failure(reason))?;
+    let before = masks(context, request, operation, geometry)
         .await
-        .map_err(source_mask_reason)?;
-    // Reuse canonical native screenshot capture, without annotations or IO.
-    let options = super::screenshot::ScreenshotOptions::default();
-    let refs = super::element::RefMap::new();
-    let iframe_sessions = HashMap::new();
-    let capture = super::screenshot::take_screenshot(
-        &context.page.client,
-        &context.page.page_session_id,
-        &refs,
-        &options,
-        &iframe_sessions,
-    );
-    let mut cancellation = operation.cancellation.clone();
-    let raw = tokio::select! {
-        result = capture => result.map_err(|_| CaptureReason::BrowserFailure)?,
-        _ = cancellation.changed() => return Err(CaptureReason::Cancelled),
-        _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(CaptureReason::Deadline),
-    };
-    if raw.base64.len() > MAX_PNG_BYTES * 4 / 3 + 4 {
-        return Err(CaptureReason::BoundsExceeded);
+        .map_err(|reason| CapturePhase::IndependentCoverage.failure(reason))?;
+    async {
+        install_source_masks(context, request, operation, journal).await?;
+        journal
+            .verify_source_masks()
+            .await
+            .map_err(source_mask_reason)
     }
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(raw.base64)
-        .map_err(|_| CaptureReason::BrowserFailure)?;
-    #[cfg(test)]
-    equivalence_tests::after_raw_capture(context, operation).await?;
-    validate_frames(context, operation).await?;
-    journal
-        .verify_source_masks()
-        .await
-        .map_err(source_mask_reason)?;
-    // Compare ordinary visible geometry only after our source rules are gone.
-    // Errors above still leave ownership in the outer retained cleanup journal.
-    journal
-        .remove_source_masks()
-        .await
-        .map_err(|_| CaptureReason::CleanupFailed)?;
-    validate_frames(context, operation).await?;
-    if viewport(context, operation).await? != viewport_size
-        || masks(context, request, operation, geometry).await? != before
-    {
-        return Err(CaptureReason::MaskingUnproven);
+    .await
+    .map_err(|reason| CapturePhase::SourceProtection.failure(reason))?;
+    let bytes = async {
+        // Reuse canonical native screenshot capture, without annotations or IO.
+        let options = super::screenshot::ScreenshotOptions::default();
+        let refs = super::element::RefMap::new();
+        let iframe_sessions = HashMap::new();
+        check(context, operation)?;
+        let capture = super::screenshot::take_screenshot(
+            &context.page.client,
+            &context.page.page_session_id,
+            &refs,
+            &options,
+            &iframe_sessions,
+        );
+        tokio::pin!(capture);
+        let mut cancellation = operation.cancellation.clone();
+        let (raw, interrupted) = tokio::select! {
+            result = &mut capture => (Some(result), None),
+            _ = cancellation.changed() => (None, Some(CaptureReason::Cancelled)),
+            _ = tokio::time::sleep_until(operation.deadline.into()) => (None, Some(CaptureReason::Deadline)),
+        };
+        if let Some(reason) = interrupted {
+            if !super::client_observation::capture_retirement_active() {
+                return Err(reason);
+            }
+            // Keep an already-started screenshot inside source-mask ownership.
+            let settled =
+                tokio::time::timeout(std::time::Duration::from_millis(250), &mut capture).await;
+            if !matches!(settled, Ok(Ok(_))) {
+                return Err(CaptureReason::CleanupFailed);
+            }
+            return Err(reason);
+        }
+        let raw = raw
+            .ok_or(CaptureReason::BrowserFailure)?
+            .map_err(|_| CaptureReason::BrowserFailure)?;
+        check(context, operation)?;
+        if raw.base64.len() > MAX_PNG_BYTES * 4 / 3 + 4 {
+            return Err(CaptureReason::BoundsExceeded);
+        }
+        base64::engine::general_purpose::STANDARD
+            .decode(raw.base64)
+            .map_err(|_| CaptureReason::BrowserFailure)
     }
-    check(context, operation)?;
-    geometry
-        .revalidate(&context.page.client, operation)
-        .await
-        .map_err(geometry_reason)?;
-    raster_mask(
-        &bytes,
-        geometry.viewport,
-        &before,
-        &context.page.identity_scope,
-    )
+    .await
+    .map_err(|reason| CapturePhase::RawCapture.failure(reason))?;
+    async {
+        #[cfg(test)]
+        equivalence_tests::after_raw_capture(context, operation).await?;
+        validate_frames(context, operation).await?;
+        journal
+            .verify_source_masks()
+            .await
+            .map_err(source_mask_reason)?;
+        // Compare ordinary visible geometry only after our source rules are gone.
+        // Errors above still leave ownership in the outer retained cleanup journal.
+        journal
+            .remove_source_masks()
+            .await
+            .map_err(|_| CaptureReason::CleanupFailed)?;
+        validate_frames(context, operation).await?;
+        if viewport(context, operation).await? != viewport_size
+            || masks(context, request, operation, geometry).await? != before
+        {
+            return Err(CaptureReason::MaskingUnproven);
+        }
+        check(context, operation)?;
+        geometry
+            .revalidate(&context.page.client, operation)
+            .await
+            .map_err(geometry_reason)?;
+        raster_mask(
+            &bytes,
+            geometry.viewport,
+            &before,
+            &context.page.identity_scope,
+        )
+    }
+    .await
+    .map_err(|reason| CapturePhase::PostCaptureValidation.failure(reason))
 }
 /// Source masks track the controls rather than an earlier raster rectangle.
 /// The retained holder is created and journaled before installing any rule.
@@ -377,6 +467,12 @@ async fn install_source_masks(
                     let handle=value["object"]["objectId"].as_str().ok_or(CaptureReason::MaskingUnproven)?;
                     Ok(json!({"objectId":handle}))
                 }})).buffered(16).collect().await;
+                if resolved
+                    .iter()
+                    .any(|result| result.as_ref().err() == Some(&CaptureReason::CleanupFailed))
+                {
+                    return Err(CaptureReason::CleanupFailed);
+                }
                 for value in resolved {
                     args.push(value?);
                 }
@@ -522,6 +618,7 @@ pub(crate) fn geometry_reason(reason: GeometryError) -> CaptureReason {
         GeometryError::IncompleteInventory => CaptureReason::IncompleteFrames,
         GeometryError::StaleIdentity => CaptureReason::StaleScope,
         GeometryError::Cancelled => CaptureReason::Cancelled,
+        GeometryError::Superseded => CaptureReason::Superseded,
         GeometryError::DeadlineExceeded => CaptureReason::Deadline,
         GeometryError::BackendFailure => CaptureReason::MaskingUnproven,
         GeometryError::CleanupFailed { .. } => CaptureReason::CleanupFailed,
@@ -530,6 +627,8 @@ pub(crate) fn geometry_reason(reason: GeometryError) -> CaptureReason {
 fn protected_reason(reason: ProtectedReadReason) -> CaptureReason {
     match reason {
         ProtectedReadReason::Cancelled => CaptureReason::Cancelled,
+        ProtectedReadReason::Superseded => CaptureReason::Superseded,
+        ProtectedReadReason::CleanupFailed => CaptureReason::CleanupFailed,
         ProtectedReadReason::Deadline => CaptureReason::Deadline,
         ProtectedReadReason::StaleScope => CaptureReason::StaleScope,
         ProtectedReadReason::IncompleteInventory => CaptureReason::IncompleteFrames,
@@ -685,12 +784,13 @@ async fn masks(
                 let mut owner_paint_checked = false;
                 for batch in ids.chunks(64) {
                     let mut args = vec![json!({"value":request.secure_field_selector})];
-                    let handles: Vec<Value> = futures_util::stream::iter(batch.iter().copied().map(|backend: i64| { let group = &group; async move {
+                    let handles: Vec<Result<Value,CaptureReason>> = futures_util::stream::iter(batch.iter().copied().map(|backend: i64| { let group = &group; async move {
                         let resolved = command(context, operation, &owned.binding.session, "DOM.resolveNode", json!({"backendNodeId":backend,"executionContextId":realm,"objectGroup":group})).await?;
                         let object = resolved["object"]["objectId"].as_str().ok_or(CaptureReason::MaskingUnproven)?;
                         Ok::<Value, CaptureReason>(json!({"objectId":object}))
-                    }})).buffered(16).try_collect().await?;
-                    args.extend(handles);
+                    }})).buffered(16).collect().await;
+                    if handles.iter().any(|result| result.as_ref().err() == Some(&CaptureReason::CleanupFailed)) { return Err(CaptureReason::CleanupFailed); }
+                    args.extend(handles.into_iter().collect::<Result<Vec<_>,_>>()?);
                     let response = command(context, operation, &owned.binding.session, "Runtime.callFunctionOn", json!({"executionContextId":realm,"functionDeclaration":MASK_READER,"arguments":args,"returnByValue":true,"objectGroup":group})).await?;
                     if response.get("exceptionDetails").is_some() { return Err(CaptureReason::MaskingUnproven); }
                     let result: FrameMasks = serde_json::from_value(response["result"]["value"].clone()).map_err(|_|CaptureReason::MaskingUnproven)?;
@@ -712,9 +812,10 @@ async fn masks(
                 }
                 Ok(())
             }.await;
-            // Object handles are private and best-effort released; cancelled
-            // remote resolution can finish late, so scope disposal is final GC.
-            let _ = tokio::time::timeout(
+            // Observe drains started acquisitions before exact group release.
+            // Its missing release ACK is cleanup loss, never clean stale.
+            // Standalone capture retains its existing best-effort behavior.
+            let released = tokio::time::timeout(
                 std::time::Duration::from_millis(500),
                 context.page.client.send_command(
                     "Runtime.releaseObjectGroup",
@@ -723,6 +824,11 @@ async fn masks(
                 ),
             )
             .await;
+            if super::client_observation::capture_retirement_active()
+                && !matches!(released, Ok(Ok(_)))
+            {
+                return Err(CaptureReason::CleanupFailed);
+            }
             gathered?;
         }
     }

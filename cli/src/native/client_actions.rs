@@ -580,7 +580,8 @@ async fn release_call_handles(
 }
 fn exact_resolution_error(d: &Dispatch, error: element::ExactResolutionError) -> ProtocolError {
     match error {
-        element::ExactResolutionError::StaleReference => ProtocolError::StaleReference,
+        element::ExactResolutionError::StaleReference
+        | element::ExactResolutionError::Superseded => ProtocolError::StaleReference,
         element::ExactResolutionError::BackendFailure => ProtocolError::BrowserFailure,
         element::ExactResolutionError::CleanupFailed { primary } => {
             d.cleanup.store(true, Ordering::SeqCst);
@@ -679,7 +680,9 @@ fn live_query_error(
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
-        ObservationError::StaleReference => ProtocolError::StaleReference,
+        ObservationError::StaleReference | ObservationError::Superseded => {
+            ProtocolError::StaleReference
+        }
         ObservationError::Cancelled => ProtocolError::Cancelled,
         ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
         ObservationError::BackendFailure => ProtocolError::BrowserFailure,
@@ -1269,7 +1272,7 @@ fn geometry_failure(d: &Dispatch, error: GeometryError) -> ProtocolError {
     match error {
         GeometryError::Cancelled => ProtocolError::Cancelled,
         GeometryError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
-        GeometryError::StaleIdentity => ProtocolError::StaleReference,
+        GeometryError::StaleIdentity | GeometryError::Superseded => ProtocolError::StaleReference,
         GeometryError::CleanupFailed { primary } => {
             d.cleanup.store(true, Ordering::SeqCst);
             primary
@@ -2634,7 +2637,9 @@ fn observation_action_error(
         }
         ObservationError::Cancelled => ProtocolError::Cancelled,
         ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
-        ObservationError::StaleReference => ProtocolError::StaleReference,
+        ObservationError::StaleReference | ObservationError::Superseded => {
+            ProtocolError::StaleReference
+        }
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,

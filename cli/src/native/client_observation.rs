@@ -24,6 +24,7 @@ pub enum ObservationError {
     InvalidArguments,
     UnsupportedCapability,
     StaleReference,
+    Superseded,
     Cancelled,
     DeadlineExceeded,
     BackendFailure,
@@ -190,6 +191,57 @@ impl Default for ObservationOptions {
         }
     }
 }
+/// Observe-only retirement authority. Tokio task locals are not inherited by
+/// spawned tasks; the dispatcher scopes this inside its retained Observe task.
+pub(crate) struct CaptureRetirement {
+    receiver: tokio::sync::watch::Receiver<bool>,
+}
+impl CaptureRetirement {
+    pub(crate) fn new(receiver: tokio::sync::watch::Receiver<bool>) -> Self {
+        Self { receiver }
+    }
+}
+tokio::task_local! {
+    static CAPTURE_RETIREMENT: Option<CaptureRetirement>;
+}
+pub(crate) async fn with_capture_retirement<T>(
+    retirement: Option<CaptureRetirement>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    CAPTURE_RETIREMENT.scope(retirement, future).await
+}
+pub(crate) fn capture_retirement_active() -> bool {
+    CAPTURE_RETIREMENT
+        .try_with(Option::is_some)
+        .unwrap_or(false)
+}
+pub(crate) fn capture_superseded() -> bool {
+    CAPTURE_RETIREMENT
+        .try_with(|context| {
+            context
+                .as_ref()
+                .is_some_and(|value| *value.receiver.borrow())
+        })
+        .unwrap_or(false)
+}
+pub(crate) async fn capture_retired() {
+    let receiver = CAPTURE_RETIREMENT
+        .try_with(|context| context.as_ref().map(|value| value.receiver.clone()))
+        .ok()
+        .flatten();
+    if let Some(mut receiver) = receiver {
+        loop {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+            if receiver.changed().await.is_err() {
+                break;
+            }
+        }
+    }
+    // Dropping an admission sender is not supersession. Only true retires work.
+    std::future::pending::<()>().await;
+}
 fn check(lease: &OperationLease) -> Result<(), ObservationError> {
     if *lease.cancellation.borrow() != CancelSignal::None {
         return Err(ObservationError::Cancelled);
@@ -197,7 +249,75 @@ fn check(lease: &OperationLease) -> Result<(), ObservationError> {
     if std::time::Instant::now() >= lease.deadline {
         return Err(ObservationError::DeadlineExceeded);
     }
+    if capture_superseded() {
+        return Err(ObservationError::Superseded);
+    }
     Ok(())
+}
+fn settled_stop(error: ObservationError, lease: &OperationLease) -> ObservationError {
+    if error == ObservationError::Superseded && *lease.cancellation.borrow() != CancelSignal::None {
+        ObservationError::Cancelled
+    } else {
+        error
+    }
+}
+pub(crate) fn produces_remote_objects(method: &str) -> bool {
+    matches!(
+        method,
+        "DOM.resolveNode" | "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.getProperties"
+    )
+}
+/// Supersession never interrupts a started command. Only the original caller
+/// cancellation/deadline starts bounded late settlement. Resource replies must
+/// reach their caller before a supersession check:
+/// the caller owns the group/object journal and must reclaim those handles.
+/// An unacknowledged resource or mutation is never a clean stale result.
+pub(crate) async fn retained_read_command(
+    client: &CdpClient,
+    session: &str,
+    method: &str,
+    args: Value,
+    lease: &OperationLease,
+) -> Result<Value, ObservationError> {
+    check(lease)?;
+    if !capture_retirement_active() {
+        // Query, correlation and action reads keep their original cancellation
+        // behavior. The retained late-reply path belongs only to Observe.
+        let mut cancellation = lease.cancellation.clone();
+        return tokio::select! {
+            result = client.send_command(method, Some(args), Some(session)) => {
+                check(lease)?;
+                result.map_err(|_| ObservationError::BackendFailure)
+            }
+            _ = cancellation.changed() => Err(ObservationError::Cancelled),
+            _ = tokio::time::sleep_until(lease.deadline.into()) => Err(ObservationError::DeadlineExceeded),
+        };
+    }
+    let owns_resources = produces_remote_objects(method);
+    let requires_settlement = owns_resources || method == "Animation.setPlaybackRate";
+    let mut cancellation = lease.cancellation.clone();
+    let command = client.send_command(method, Some(args), Some(session));
+    tokio::pin!(command);
+    let interrupted = tokio::select! {
+        biased;
+        result = &mut command => {
+            if !owns_resources { check(lease)?; }
+            return result.map_err(|_| ObservationError::BackendFailure);
+        }
+        _ = cancellation.changed() => ObservationError::Cancelled,
+        _ = tokio::time::sleep_until(lease.deadline.into()) => ObservationError::DeadlineExceeded,
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_millis(250), &mut command).await;
+    let primary = settled_stop(interrupted, lease);
+    match result {
+        // Do not lose a late object before its owning caller can record it.
+        Ok(Ok(value)) if owns_resources => Ok(value),
+        Ok(Ok(_)) => Err(primary),
+        Ok(Err(_)) | Err(_) if requires_settlement => Err(ObservationError::CleanupFailed {
+            primary: Some(Box::new(primary)),
+        }),
+        Ok(Err(_)) | Err(_) => Err(primary),
+    }
 }
 async fn command(
     client: &CdpClient,
@@ -206,29 +326,32 @@ async fn command(
     args: Value,
     lease: &OperationLease,
 ) -> Result<Value, ObservationError> {
-    check(lease)?;
     #[cfg(test)]
     let args = equivalence_tests::instrument(method, args, lease);
-    let mut cancellation = lease.cancellation.clone();
     #[cfg(test)]
     let diagnostic_site = diagnostic_site(&args);
-    tokio::select! {
-        result = client.send_command(method, Some(args), Some(session)) => {
-            check(lease)?;
-            #[cfg(test)]
-            match &result {
-                Ok(value) => diagnostic_exception(method, diagnostic_site, value),
-                Err(_) => eprintln!("native observation protocol failure at {method}; details omitted"),
-            }
-            #[cfg(test)]
-            if let Ok(value) = &result {
-                equivalence_tests::after_command(client, session, method, diagnostic_site, value, lease).await?;
-            }
-            result.map_err(|_|ObservationError::BackendFailure)
-        }
-        _ = cancellation.changed() => Err(ObservationError::Cancelled),
-        _ = tokio::time::sleep_until(lease.deadline.into()) => Err(ObservationError::DeadlineExceeded),
+    #[cfg(test)]
+    let diagnostic_group = args["objectGroup"].as_str().map(str::to_owned);
+    let result = retained_read_command(client, session, method, args, lease).await;
+    #[cfg(test)]
+    match &result {
+        Ok(value) => diagnostic_exception(method, diagnostic_site, value),
+        Err(_) => eprintln!("native observation protocol failure at {method}; details omitted"),
     }
+    #[cfg(test)]
+    if let Ok(value) = &result {
+        equivalence_tests::after_command(
+            client,
+            session,
+            method,
+            diagnostic_site,
+            diagnostic_group.as_deref(),
+            value,
+            lease,
+        )
+        .await?;
+    }
+    result
 }
 #[cfg(test)]
 fn diagnostic_site(args: &Value) -> &'static str {
@@ -306,6 +429,7 @@ async fn settle_object_group<T>(
     session: &str,
     group: &str,
     result: Result<T, ObservationError>,
+    lease: &OperationLease,
 ) -> Result<T, ObservationError> {
     let release = tokio::time::timeout(
         std::time::Duration::from_millis(250),
@@ -317,7 +441,9 @@ async fn settle_object_group<T>(
     )
     .await;
     if matches!(release, Ok(Ok(_))) {
-        result
+        #[cfg(test)]
+        equivalence_tests::after_group_release(lease, group);
+        result.map_err(|error| settled_stop(error, lease))
     } else {
         Err(ObservationError::CleanupFailed {
             primary: result.err().map(Box::new),
@@ -1351,7 +1477,7 @@ impl HiddenFrameProof {
                 validate_frame(client, parent, lease).await?;
                 validate_frame(client, child, lease).await
             }.await;
-            settle_object_group(client, session, &group, result).await?;
+            settle_object_group(client, session, &group, result, lease).await?;
         }
         Ok(())
     }
@@ -2406,18 +2532,19 @@ async fn evaluate_query(
         for (backend,node) in ids.iter().zip(&mut nodes){apply_security(node,*backend,&security);}
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing query realm")?;
-        use futures_util::{stream,StreamExt,TryStreamExt};
-        let objects:Vec<String>=stream::iter(ids.iter().copied().map(|backend: i64| {
+        use futures_util::{stream,StreamExt};
+        let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.iter().copied().map(|backend: i64| {
             let group=&group;
             async move {
                 let value=command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}),lease).await?;
                 value["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference)
             }
-        })).buffered(16).try_collect().await?;
+        })).buffered(16).collect().await;
+        let objects=collect_hint_results(objects)?;
         if objects.is_empty() { return Ok(QueryEvaluation { projection_count: 0, matches: Vec::new() }); }
         let mut arguments=vec![json!({"value":expression}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
         arguments.extend(objects.iter().map(|id|json!({"objectId":id})));
-        let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true}),lease).await?;
+        let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
         let value=&result["result"]["value"];
         match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
@@ -2437,7 +2564,7 @@ async fn evaluate_query(
         }).collect();
         Ok(QueryEvaluation { projection_count, matches })
     }.await;
-    let result = settle_object_group(client, session, &group, result).await;
+    let result = settle_object_group(client, session, &group, result, lease).await;
     let nodes = result?;
     validate_frame(client, frame, lease).await?;
     check(lease)?;
@@ -2720,7 +2847,7 @@ async fn main_onclick_hint(
         // Fixed diagnostic only: page exception descriptions/values are private.
         eprintln!("native observation onclick hint refused: side-effect-restricted exact receiver read unavailable");
     }
-    settle_object_group(client, session, &group, result).await
+    settle_object_group(client, session, &group, result, lease).await
 }
 
 #[allow(clippy::too_many_arguments)] // Same explicit ownership contract as the single-node reader.
@@ -2760,7 +2887,7 @@ async fn read_batch_with_refs(
     bounded: bool,
     acquisition_policy: &SecurityInventory,
 ) -> Result<Vec<SemanticNode>, ObservationError> {
-    use futures_util::{stream, StreamExt, TryStreamExt};
+    use futures_util::{stream, StreamExt};
     if nodes.is_empty() {
         return Ok(Vec::new());
     }
@@ -2770,12 +2897,13 @@ async fn read_batch_with_refs(
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing isolated realm")?;
         let backend_ids:Vec<Option<i64>>=nodes.iter().map(|ax|ax.backend_d_o_m_node_id).collect();
-        let resolved:Vec<Value>=stream::iter(backend_ids.into_iter().map(|backend| {
+        let resolved:Vec<Result<Value,ObservationError>>=stream::iter(backend_ids.into_iter().map(|backend| {
             let group=&group;
             async move {
                 command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}),lease).await
             }
-        })).buffered(16).try_collect().await?;
+        })).buffered(16).collect().await;
+        let resolved=collect_hint_results(resolved)?;
         let has_pseudo=resolved.iter().any(|value|value["object"]["subtype"]!="node");
         let origins=if has_pseudo{pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?}else{HashMap::new()};
         let mut objects=Vec::with_capacity(nodes.len());let mut pseudo=Vec::with_capacity(nodes.len());
@@ -2797,12 +2925,13 @@ async fn read_batch_with_refs(
         let protected_editors = serde_json::to_string(&protected_editors).map_err(|_| ObservationError::BackendFailure)?;
         let simple_name_inventory=acquisition_policy.simple_name_inventory;
         let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory})); }}");
-        let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true}),lease).await?;
+        let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){
             #[cfg(test)]
             diagnostic_receivers(client,session,&objects,lease).await;
             return Err(ObservationError::BackendFailure);
         }
+        check(lease)?;
         let mut values=result["result"]["value"].as_array().ok_or("Missing metadata batch")?.clone();
         if values.len()!=nodes.len(){return Err("Incomplete metadata batch".into());}
         // Own the bounded descriptors before entering the async stream. Nested
@@ -2846,7 +2975,7 @@ async fn read_batch_with_refs(
             Ok(node)
         }).collect()
     }.await;
-    let result = settle_object_group(client, session, &group, result).await;
+    let result = settle_object_group(client, session, &group, result, lease).await;
     result
 }
 
@@ -3510,7 +3639,7 @@ async fn security_inventory(
     options: &ObservationOptions,
     lease: &OperationLease,
 ) -> Result<SecurityInventory, ObservationError> {
-    use futures_util::{stream, StreamExt, TryStreamExt};
+    use futures_util::{stream, StreamExt};
     let dom = frame_dom(client, frame, lease).await?;
     let ids = security_root_ids(&dom["root"])?;
     let browser_internal = browser_internal_ids(&dom["root"])?;
@@ -3520,10 +3649,11 @@ async fn security_inventory(
     let result=async{
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?;
-        let objects:Vec<String>=stream::iter(ids.into_iter().map(|backend|{let group=&group;async move{
+        let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.into_iter().map(|backend|{let group=&group;async move{
             let object=command(client,session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}),lease).await?;
             object["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::BackendFailure)
-        }})).buffered(16).try_collect().await?;
+        }})).buffered(16).collect().await;
+        let objects=collect_hint_results(objects)?;
         let mut args=vec![json!({"value":options.secure_field_selector})];args.extend(objects.iter().map(|o|json!({"objectId":o})));
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"arguments":args,"objectGroup":group,"functionDeclaration":r#"function(selector,...roots){
             const result=new Set();const all='input[type="password" i],'+selector;
@@ -3535,7 +3665,8 @@ async fn security_inventory(
         let array=result["result"]["objectId"].as_str().ok_or(ObservationError::BackendFailure)?;
         let properties=command(client,session,"Runtime.getProperties",json!({"objectId":array,"ownProperties":true}),lease).await?;
         let handles:Vec<String>=properties["result"].as_array().ok_or(ObservationError::BackendFailure)?.iter().filter(|p|p["name"].as_str().is_some_and(|s|s.parse::<usize>().is_ok())).map(|p|p["value"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::BackendFailure)).collect::<Result<_,_>>()?;
-        let descriptions:Vec<Value>=stream::iter(handles.into_iter().map(|object|async move{command(client,session,"DOM.describeNode",json!({"objectId":object}),lease).await})).buffered(16).try_collect().await?;
+        let descriptions:Vec<Result<Value,ObservationError>>=stream::iter(handles.into_iter().map(|object|async move{command(client,session,"DOM.describeNode",json!({"objectId":object}),lease).await})).buffered(16).collect().await;
+        let descriptions=collect_hint_results(descriptions)?;
         let mut security=SecurityInventory { browser_internal, simple_name_inventory, ..Default::default() };
         for description in descriptions{
             let node=&description["node"];security.ancestors.insert(node["backendNodeId"].as_i64().ok_or(ObservationError::BackendFailure)?);
@@ -3543,7 +3674,7 @@ async fn security_inventory(
         }
         Ok(security)
     }.await;
-    let result = settle_object_group(client, session, &group, result).await;
+    let result = settle_object_group(client, session, &group, result, lease).await;
     result
 }
 
@@ -3559,7 +3690,7 @@ pub async fn project_geometry(
     lease: &OperationLease,
 ) -> Result<(), super::client_geometry::GeometryError> {
     use super::client_geometry::GeometryError;
-    use futures_util::{stream, StreamExt, TryStreamExt};
+    use futures_util::{stream, StreamExt};
     let mut pending = nodes.iter().map(|node| (node, 0usize)).collect::<Vec<_>>();
     let mut requests = Vec::new();
     let mut visited = 0usize;
@@ -3598,7 +3729,7 @@ pub async fn project_geometry(
             entry.backend_node_id.ok_or(GeometryError::StaleIdentity)?,
         ));
     }
-    let rectangles: HashMap<String, Rect> =
+    let rectangles: Vec<Result<(String, Rect), GeometryError>> =
         stream::iter(requests.into_iter().map(|(id, frame, backend)| async move {
             let b = geometry
                 .node_semantic_bounds(client, &frame, backend, lease)
@@ -3615,8 +3746,15 @@ pub async fn project_geometry(
             ))
         }))
         .buffered(16)
-        .try_collect()
-        .await?;
+        .collect()
+        .await;
+    if let Some(error) = rectangles.iter().find_map(|result| match result {
+        Err(error @ GeometryError::CleanupFailed { .. }) => Some(error.clone()),
+        _ => None,
+    }) {
+        return Err(error);
+    }
+    let rectangles: HashMap<String, Rect> = rectangles.into_iter().collect::<Result<_, _>>()?;
     fn apply(nodes: &mut [SemanticNode], rectangles: &HashMap<String, Rect>) {
         for node in nodes {
             if let Some(rect) = rectangles.get(&node.reference.id) {
@@ -6405,4 +6543,4 @@ mod tests {
 
 #[cfg(test)]
 #[path = "client_observation_equivalence_tests.rs"]
-mod equivalence_tests;
+pub(crate) mod equivalence_tests;

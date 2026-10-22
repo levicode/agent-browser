@@ -73,6 +73,7 @@ async fn unsupported_composition_never_dispatches_cdp_or_stages_references() {
                 DispatchContext {
                     #[cfg(feature = "acceptance-faults")]
                     faults: Arc::new(super::super::client_test_faults::FaultController::default()),
+                    attachment: targets.owned_target("target").unwrap(),
                     page: BrowserExecutionLease {
                         client: client.clone(),
                         page_session_id: "session".into(),

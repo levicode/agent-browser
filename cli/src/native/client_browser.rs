@@ -1454,7 +1454,7 @@ type ConnectionWatch =
 
 // This is the retained observation boundary used by ClientBrowser before the
 // transport settles the admitted operation in ClientSession.
-fn settle_observation_dispatch(
+pub(super) fn settle_observation_dispatch(
     output: Result<
         Result<serde_json::Value, super::client_observation_dispatch::DispatchFailure>,
         tokio::sync::oneshot::error::RecvError,
@@ -2331,15 +2331,16 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 }
             };
             let captured = async {
-                let page = self.page_lease(lease.is_callback).await?;
+                let permit = self.gate.enter(lease.is_callback)?;
+                let owner = self.owner.lock().await;
+                let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+                let page = owner.lease(permit)?;
                 if captured_scope.as_deref() != Some(page.identity_scope.as_str()) {
                     return Err(ProtocolError::StaleScope);
                 }
-                let owner = self.owner.lock().await;
-                let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
-                if owner.identity_scope != page.identity_scope {
-                    return Err(ProtocolError::StaleScope);
-                }
+                // Capture attachment tenure before yielding this owner snapshot.
+                // A queued context cannot rebind an identical reattachment later.
+                let attachment = page.targets.owned_target(&page.target_id)?;
                 let runtime = owner
                     .runtime
                     .as_ref()
@@ -2359,6 +2360,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     .ok_or(ProtocolError::ScopeUnavailable)?;
                 Ok(DispatchContext {
                     page,
+                    attachment,
                     ui: owner.ui.clone(),
                     blobs: runtime.blobs.clone(),
                     scope: runtime.scope.clone(),
@@ -2380,25 +2382,20 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let observation = self.observation.clone();
             let receive = self
                 .tasks
-                .start(
+                .start_prepared(
                     context.scope.identity_scope.clone(),
                     context.page.targets.clone(),
-                    async move {
-                        if let Err(error) = context.page.permit.check() {
-                            return (
-                                NativeOutcome {
-                                    result: Err(error),
-                                    effects: Effects::NotDispatched,
-                                },
-                                false,
-                            );
-                        }
-                        // The accepted outer task owns the inner retained transaction;
-                        // registry rejection cannot leave an already spawned journal.
-                        let task = observation.start(context, request, lease);
-                        let output = task.result.await;
-                        let cleanup = task.join.await;
-                        settle_observation_dispatch(output, cleanup)
+                    move || {
+                        // The registry has accepted capacity, but has not spawned
+                        // work. Exact-owner/policy validation and Observe ticket
+                        // admission are synchronous and precede any task reorder.
+                        let prepared = observation.prepare(context, request, lease)?;
+                        Ok(async move {
+                            let task = observation.start_prepared(prepared);
+                            let output = task.result.await;
+                            let cleanup = task.join.await;
+                            settle_observation_dispatch(output, cleanup)
+                        })
                     },
                 )
                 .await;
