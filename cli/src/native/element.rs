@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, OnceLock,
+    Arc,
 };
 
 use serde_json::Value;
@@ -27,15 +27,15 @@ pub enum NativeReferenceKind {
     ReadOnlyCssPseudo,
 }
 
-/// The original strict query is an additional constraint, never permission to
-/// rebind an exact backend. Keys hash a fixed fingerprint; equality still checks
-/// the source so even a hash collision cannot merge distinct query authority.
+/// Immutable full live-query source, distinct from its acquisition backend.
+/// Keys hash a fixed fingerprint; equality still checks the complete source so
+/// even a hash collision cannot merge different query authority.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct StrictQueryOrigin {
+pub struct LiveQueryOrigin {
     fingerprint: [u8; 32],
     pub source: Arc<str>,
 }
-impl StrictQueryOrigin {
+impl LiveQueryOrigin {
     pub fn new(source: String) -> Self {
         Self {
             fingerprint: Sha256::digest(source.as_bytes()).into(),
@@ -43,15 +43,32 @@ impl StrictQueryOrigin {
         }
     }
 }
-impl Hash for StrictQueryOrigin {
+impl Hash for LiveQueryOrigin {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.fingerprint.hash(state);
     }
 }
-type DurableRefKey = (i64, Option<StrictQueryOrigin>);
+type DurableRefKey = (i64, Option<LiveQueryOrigin>);
+
+/// Native issuance proof shared by located, observed, and viewport authorities.
+/// Its revision is immutable, independent of later snapshot publication revisions.
+/// Located references survive ordinary observations; observed membership does not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedIssuance {
+    pub identity_scope: String,
+    pub generation: u64,
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefLifetime {
+    Observed,
+    Located(LocatedIssuance),
+}
 
 #[derive(Debug, Clone)]
 pub struct RefEntry {
+    pub lifetime: RefLifetime,
     pub kind: NativeReferenceKind,
     pub backend_node_id: Option<i64>,
     pub role: String,
@@ -61,14 +78,88 @@ pub struct RefEntry {
     pub frame_id: Option<String>,
     allow_role_fallback: bool,
     pub exact_binding: Option<ExactBinding>,
-    pub strict_query: Option<StrictQueryOrigin>,
+    pub live_query: Option<LiveQueryOrigin>,
+    observed_issuance: Option<LocatedIssuance>,
+    observed_membership: Option<u64>,
+}
+
+impl RefEntry {
+    fn issuance(&self) -> Option<&LocatedIssuance> {
+        match &self.lifetime {
+            RefLifetime::Observed => self.observed_issuance.as_ref(),
+            RefLifetime::Located(issuance) => Some(issuance),
+        }
+    }
+
+    pub fn issued_revision(&self) -> Option<u64> {
+        self.issuance().map(|issuance| issuance.revision)
+    }
+
+    pub fn is_current_observed(&self, snapshot_revision: u64) -> bool {
+        matches!(self.lifetime, RefLifetime::Observed)
+            && snapshot_revision != 0
+            && self.observed_membership == Some(snapshot_revision)
+    }
+
+    /// Legacy unissued refs are never client-protocol authority. The caller
+    /// supplies its leased owner, not fields reported by the renderer.
+    pub fn matches_scope(&self, identity_scope: &str, generation: u64, page_session: &str) -> bool {
+        self.exact_binding
+            .as_ref()
+            .is_some_and(|binding| binding.page_session == page_session)
+            && self.issuance().is_some_and(|issuance| {
+                issuance.identity_scope == identity_scope
+                    && issuance.generation == generation
+                    && issuance.revision != 0
+            })
+    }
+
+    pub fn matches_reference(
+        &self,
+        identity_scope: &str,
+        generation: u64,
+        page_session: &str,
+        supplied_revision: &str,
+    ) -> bool {
+        self.matches_scope(identity_scope, generation, page_session)
+            && self
+                .issued_revision()
+                .is_some_and(|revision| supplied_revision == revision.to_string())
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct DurableRef {
+    id: String,
+    issuance: Option<LocatedIssuance>,
+    kind: NativeReferenceKind,
+}
+impl DurableRef {
+    fn compatible(&self, kind: NativeReferenceKind, publication: Option<&LocatedIssuance>) -> bool {
+        self.kind == kind
+            && match (publication, self.issuance.as_ref()) {
+                (Some(current), Some(issued)) => {
+                    current.identity_scope == issued.identity_scope
+                        && current.generation == issued.generation
+                }
+                (None, None) => true,
+                _ => false,
+            }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ViewportReference {
+    pub id: String,
+    pub issuance: LocatedIssuance,
+    pub page_session: String,
 }
 
 #[derive(Clone)]
 struct DocumentRefs {
     session: String,
     loader: String,
-    refs: HashMap<DurableRefKey, String>,
+    refs: HashMap<DurableRefKey, DurableRef>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,7 +182,53 @@ pub struct RefMap {
     query_origin_byte_limit: usize,
     documents: HashMap<(String, Option<String>), DocumentRefs>,
     next_ref: Arc<AtomicUsize>,
-    viewport_ref: Arc<OnceLock<Result<String, RefAllocationError>>>,
+    viewport_ref: Option<ViewportReference>,
+    observed_publication: Option<LocatedIssuance>,
+}
+
+/// Exclusive admission token for one staged locate publication. The complete
+/// batch is checked once; each insertion consumes only its reserved allowance.
+pub(crate) struct LocatedBatch<'a> {
+    refs: &'a mut RefMap,
+    remaining_entries: usize,
+    remaining_source_bytes: usize,
+}
+impl LocatedBatch<'_> {
+    pub(crate) fn try_bind(
+        &mut self,
+        backend_node_id: i64,
+        role: &str,
+        binding: ExactBinding,
+        issuance: LocatedIssuance,
+        live_query: Option<LiveQueryOrigin>,
+    ) -> Result<String, RefAllocationError> {
+        let bytes = live_query.as_ref().map_or(0, |origin| origin.source.len());
+        if self.remaining_entries == 0 || bytes > self.remaining_source_bytes {
+            return Err(RefAllocationError::Capacity);
+        }
+        let id = self.refs.try_allocate_ref()?;
+        self.remaining_entries -= 1;
+        self.remaining_source_bytes -= bytes;
+        self.refs.map.insert(
+            id.clone(),
+            RefEntry {
+                lifetime: RefLifetime::Located(issuance),
+                observed_issuance: None,
+                observed_membership: None,
+                kind: NativeReferenceKind::Dom,
+                backend_node_id: Some(backend_node_id),
+                role: role.into(),
+                name: String::new(),
+                nth: None,
+                selector: None,
+                frame_id: Some(binding.frame.clone()),
+                allow_role_fallback: false,
+                exact_binding: Some(binding),
+                live_query,
+            },
+        );
+        Ok(id)
+    }
 }
 
 impl RefMap {
@@ -102,7 +239,8 @@ impl RefMap {
             query_origin_byte_limit: MAX_RETAINED_QUERY_ORIGIN_BYTES,
             documents: HashMap::new(),
             next_ref: Arc::new(AtomicUsize::new(1)),
-            viewport_ref: Arc::new(OnceLock::new()),
+            viewport_ref: None,
+            observed_publication: None,
         }
     }
 
@@ -129,6 +267,9 @@ impl RefMap {
         self.map.insert(
             ref_id,
             RefEntry {
+                lifetime: RefLifetime::Observed,
+                observed_issuance: None,
+                observed_membership: None,
                 kind: NativeReferenceKind::Dom,
                 backend_node_id,
                 role: role.to_string(),
@@ -138,7 +279,7 @@ impl RefMap {
                 frame_id: frame_id.map(|s| s.to_string()),
                 allow_role_fallback: true,
                 exact_binding: None,
-                strict_query: None,
+                live_query: None,
             },
         );
     }
@@ -150,6 +291,9 @@ impl RefMap {
         self.map.insert(
             ref_id,
             RefEntry {
+                lifetime: RefLifetime::Observed,
+                observed_issuance: None,
+                observed_membership: None,
                 kind: NativeReferenceKind::Dom,
                 backend_node_id: Some(backend_node_id),
                 role: String::new(),
@@ -159,7 +303,7 @@ impl RefMap {
                 frame_id: None,
                 allow_role_fallback: false,
                 exact_binding: None,
-                strict_query: None,
+                live_query: None,
             },
         );
     }
@@ -191,12 +335,32 @@ impl RefMap {
         role: &str,
         name: &str,
         binding: ExactBinding,
-        strict_query: Option<StrictQueryOrigin>,
+        live_query: Option<LiveQueryOrigin>,
+    ) -> Result<String, RefAllocationError> {
+        self.try_bind_exact_kind(
+            backend_node_id,
+            role,
+            name,
+            binding,
+            live_query,
+            NativeReferenceKind::Dom,
+        )
+    }
+
+    fn try_bind_exact_kind(
+        &mut self,
+        backend_node_id: i64,
+        role: &str,
+        name: &str,
+        binding: ExactBinding,
+        live_query: Option<LiveQueryOrigin>,
+        kind: NativeReferenceKind,
     ) -> Result<String, RefAllocationError> {
         self.check_exact_admission_with_origin(
             &binding,
             &[backend_node_id],
-            strict_query.as_ref(),
+            live_query.as_ref(),
+            kind,
         )?;
         self.observe_document(
             &binding.page_session,
@@ -204,26 +368,41 @@ impl RefMap {
             &binding.session,
             Some(&binding.loader),
         );
-        let key = (backend_node_id, strict_query.clone());
+        let key = (backend_node_id, live_query.clone());
         let document_key = (binding.page_session.clone(), Some(binding.frame.clone()));
         let existing = self
             .documents
             .get(&document_key)
             .and_then(|document| document.refs.get_key_value(&key));
-        let (id, strict_query) = match existing {
-            Some(((_, origin), id)) => (id.clone(), origin.clone()),
-            None => (self.try_allocate_ref()?, strict_query),
+        let publication = self.observed_publication.as_ref();
+        let compatible = existing.filter(|(_, prior)| prior.compatible(kind, publication));
+        let (identity, live_query) = match compatible {
+            Some(((_, origin), identity)) => (identity.clone(), origin.clone()),
+            None => (
+                DurableRef {
+                    id: self.try_allocate_ref()?,
+                    issuance: publication.cloned(),
+                    kind,
+                },
+                live_query,
+            ),
         };
-        let key = (backend_node_id, strict_query.clone());
+        let id = identity.id.clone();
+        let observed_issuance = identity.issuance.clone();
+        let observed_membership = publication.map(|publication| publication.revision);
+        let key = (backend_node_id, live_query.clone());
         self.documents
             .get_mut(&document_key)
             .expect("observed document")
             .refs
-            .insert(key, id.clone());
+            .insert(key, identity);
         self.map.insert(
             id.clone(),
             RefEntry {
-                kind: NativeReferenceKind::Dom,
+                lifetime: RefLifetime::Observed,
+                observed_issuance,
+                observed_membership,
+                kind,
                 backend_node_id: Some(backend_node_id),
                 role: role.into(),
                 name: name.into(),
@@ -232,10 +411,71 @@ impl RefMap {
                 frame_id: Some(binding.frame.clone()),
                 allow_role_fallback: false,
                 exact_binding: Some(binding),
-                strict_query,
+                live_query,
             },
         );
         Ok(id)
+    }
+
+    /// Admit the entire locate acquisition before reserving any public IDs.
+    /// Located identities are fresh per acquisition, not durable backend aliases.
+    pub(crate) fn located_origin_budget(&self, count: usize) -> Result<usize, RefAllocationError> {
+        let (entries, durable) = self.retained_identity_counts();
+        if entries
+            .checked_add(count)
+            .is_none_or(|total| total > self.exact_ref_limit)
+            || durable > self.exact_ref_limit
+        {
+            return Err(RefAllocationError::Capacity);
+        }
+        self.query_origin_byte_limit
+            .checked_sub(self.retained_query_origin_bytes())
+            .ok_or(RefAllocationError::Capacity)
+    }
+
+    pub(crate) fn check_located_admission(
+        &self,
+        origins: &[Option<LiveQueryOrigin>],
+    ) -> Result<(), RefAllocationError> {
+        let remaining = self.located_origin_budget(origins.len())?;
+        let added_bytes = origins.iter().flatten().try_fold(0usize, |total, origin| {
+            total
+                .checked_add(origin.source.len())
+                .ok_or(RefAllocationError::Capacity)
+        })?;
+        if added_bytes > remaining {
+            return Err(RefAllocationError::Capacity);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn admit_located_batch(
+        &mut self,
+        origins: &[Option<LiveQueryOrigin>],
+    ) -> Result<LocatedBatch<'_>, RefAllocationError> {
+        self.check_located_admission(origins)?;
+        let remaining_source_bytes = origins
+            .iter()
+            .flatten()
+            .map(|origin| origin.source.len())
+            .sum();
+        Ok(LocatedBatch {
+            refs: self,
+            remaining_entries: origins.len(),
+            remaining_source_bytes,
+        })
+    }
+
+    pub(crate) fn try_bind_located(
+        &mut self,
+        backend_node_id: i64,
+        role: &str,
+        binding: ExactBinding,
+        issuance: LocatedIssuance,
+        live_query: Option<LiveQueryOrigin>,
+    ) -> Result<String, RefAllocationError> {
+        self.admit_located_batch(std::slice::from_ref(&live_query))?
+            .try_bind(backend_node_id, role, binding, issuance, live_query)
     }
 
     pub fn try_bind_readonly_pseudo(
@@ -246,12 +486,14 @@ impl RefMap {
     ) -> Result<String, RefAllocationError> {
         let mut binding = binding;
         binding.actionable = false;
-        let id = self.try_bind_exact(backend, role, "", binding)?;
-        self.map
-            .get_mut(&id)
-            .expect("just inserted native ref")
-            .kind = NativeReferenceKind::ReadOnlyCssPseudo;
-        Ok(id)
+        self.try_bind_exact_kind(
+            backend,
+            role,
+            "",
+            binding,
+            None,
+            NativeReferenceKind::ReadOnlyCssPseudo,
+        )
     }
 
     pub fn add_selector(
@@ -265,6 +507,9 @@ impl RefMap {
         self.map.insert(
             ref_id,
             RefEntry {
+                lifetime: RefLifetime::Observed,
+                observed_issuance: None,
+                observed_membership: None,
                 kind: NativeReferenceKind::Dom,
                 backend_node_id: None,
                 role: role.to_string(),
@@ -274,7 +519,7 @@ impl RefMap {
                 frame_id: None,
                 allow_role_fallback: true,
                 exact_binding: None,
-                strict_query: None,
+                live_query: None,
             },
         );
     }
@@ -319,7 +564,7 @@ impl RefMap {
         let entries = self
             .map
             .values()
-            .filter_map(|entry| entry.strict_query.as_ref())
+            .filter_map(|entry| entry.live_query.as_ref())
             .map(|origin| origin.source.len())
             .sum::<usize>();
         let durable = self
@@ -337,14 +582,15 @@ impl RefMap {
         binding: &ExactBinding,
         backends: &[i64],
     ) -> Result<(), RefAllocationError> {
-        self.check_exact_admission_with_origin(binding, backends, None)
+        self.check_exact_admission_with_origin(binding, backends, None, NativeReferenceKind::Dom)
     }
 
     fn check_exact_admission_with_origin(
         &self,
         binding: &ExactBinding,
         backends: &[i64],
-        origin: Option<&StrictQueryOrigin>,
+        origin: Option<&LiveQueryOrigin>,
+        kind: NativeReferenceKind,
     ) -> Result<(), RefAllocationError> {
         let previous = self
             .documents
@@ -360,7 +606,9 @@ impl RefMap {
             }
             match document.and_then(|d| d.refs.get(&(*backend, origin.cloned()))) {
                 Some(id) => {
-                    if !self.map.contains_key(id) {
+                    if !id.compatible(kind, self.observed_publication.as_ref())
+                        || !self.map.contains_key(&id.id)
+                    {
                         new_map += 1;
                     }
                 }
@@ -414,9 +662,23 @@ impl RefMap {
         for (key, document) in &mut self.documents {
             let previous = baseline.documents.get(key);
             document.refs.retain(|backend, id| {
-                matched.contains(id) || previous.and_then(|d| d.refs.get(backend)) == Some(id)
+                matched.contains(&id.id) || previous.and_then(|d| d.refs.get(backend)) == Some(id)
             });
         }
+    }
+
+    /// Snapshot membership is exact: rereading a previous durable observed ID
+    /// does not publish it if final projection omitted it. Located lifetimes are
+    /// independent; durable historical IDs retain their existing bounded policy.
+    pub(crate) fn retain_snapshot_entries(
+        &mut self,
+        baseline: &Self,
+        published: &std::collections::HashSet<String>,
+    ) {
+        self.retain_query_additions(baseline, published);
+        self.map.retain(|id, entry| {
+            matches!(&entry.lifetime, RefLifetime::Located(_)) || published.contains(id)
+        });
     }
 
     #[cfg(test)]
@@ -429,8 +691,34 @@ impl RefMap {
         self.query_origin_byte_limit = limit;
     }
 
+    /// A new semantic observation replaces only observed authority. Located
+    /// handles (including pinned exact ones) keep their original issuance.
     pub fn begin_snapshot(&mut self) {
-        self.map.clear();
+        self.observed_publication = None;
+        self.map
+            .retain(|_, entry| matches!(&entry.lifetime, RefLifetime::Located(_)));
+    }
+
+    /// Set trusted issuance and membership for a cloned observation transaction.
+    /// The caller publishes this clone atomically; failed captures discard it.
+    pub fn begin_observation(&mut self, identity_scope: &str, generation: u64, revision: u64) {
+        self.begin_snapshot();
+        self.observed_publication = Some(LocatedIssuance {
+            identity_scope: identity_scope.into(),
+            generation,
+            revision,
+        });
+    }
+
+    pub fn retire_owner_references(&mut self) {
+        self.invalidate_all_documents();
+        self.viewport_ref = None;
+    }
+
+    /// Semantic tree-unavailable recovery retires both populations. Standalone
+    /// screenshots must not call this. The shared allocator never rolls back.
+    pub fn retire_all_references(&mut self) {
+        self.invalidate_all_documents();
     }
 
     /// Observe the document behind a page/frame pair. Unknown documents never
@@ -488,7 +776,7 @@ impl RefMap {
             .get(&(page_session.to_string(), frame.map(str::to_string)))?
             .refs
             .get(&(backend_node_id, None))
-            .map(String::as_str)
+            .map(|identity| identity.id.as_str())
     }
 
     pub fn remember_durable_ref(
@@ -502,9 +790,14 @@ impl RefMap {
             .documents
             .get_mut(&(page_session.to_string(), frame.map(str::to_string)))
         {
-            document
-                .refs
-                .insert((backend_node_id, None), ref_id.to_string());
+            document.refs.insert(
+                (backend_node_id, None),
+                DurableRef {
+                    id: ref_id.to_string(),
+                    issuance: None,
+                    kind: NativeReferenceKind::Dom,
+                },
+            );
         }
     }
 
@@ -516,6 +809,7 @@ impl RefMap {
 
     /// Drop all document identities while preserving the monotonic ref counter.
     pub fn invalidate_all_documents(&mut self) {
+        self.observed_publication = None;
         self.documents.clear();
         self.map.clear();
     }
@@ -536,22 +830,56 @@ impl RefMap {
         Ok(format!("e{n}"))
     }
 
-    /// A client-lifetime viewport capability, not a DOM identity. It is allocated
-    /// lazily from the same counter, never enters the DOM registry, and survives
-    /// document invalidation. Only an explicit native viewport operation may use it.
-    pub fn try_viewport_ref(&self) -> Result<&str, RefAllocationError> {
-        self.viewport_ref
-            .get_or_init(|| self.try_allocate_ref())
-            .as_ref()
-            .map(String::as_str)
-            .map_err(|error| *error)
+    /// Clone-local Page capability. A failed staged first publication burns an
+    /// allocator ID but cannot install authority in the committed RefMap.
+    pub fn try_viewport_ref(
+        &mut self,
+        identity_scope: &str,
+        generation: u64,
+        page_session: &str,
+        revision: u64,
+    ) -> Result<&ViewportReference, RefAllocationError> {
+        let same_owner = self.viewport_ref.as_ref().is_some_and(|viewport| {
+            viewport.issuance.identity_scope == identity_scope
+                && viewport.issuance.generation == generation
+                && viewport.page_session == page_session
+        });
+        if !same_owner {
+            self.viewport_ref = Some(ViewportReference {
+                id: self.try_allocate_ref()?,
+                page_session: page_session.into(),
+                issuance: LocatedIssuance {
+                    identity_scope: identity_scope.into(),
+                    generation,
+                    revision,
+                },
+            });
+        }
+        Ok(self.viewport_ref.as_ref().expect("staged viewport"))
     }
 
     pub fn is_viewport_ref(&self, reference: &str) -> bool {
-        let Some(Ok(viewport)) = self.viewport_ref.get() else {
-            return false;
-        };
-        parse_ref(reference).as_deref() == Some(viewport.as_str())
+        self.viewport_ref
+            .as_ref()
+            .is_some_and(|viewport| parse_ref(reference).as_deref() == Some(viewport.id.as_str()))
+    }
+
+    pub fn matches_viewport_reference(
+        &self,
+        identity_scope: &str,
+        generation: u64,
+        page_session: &str,
+        reference: &str,
+        revision: &str,
+    ) -> bool {
+        self.viewport_ref.as_ref().is_some_and(|viewport| {
+            self.is_viewport_ref(reference)
+                && viewport.issuance.identity_scope == identity_scope
+                && viewport.issuance.generation == generation
+                && viewport.page_session == page_session
+                && viewport.issuance.revision != 0
+                && revision == viewport.issuance.revision.to_string()
+        })
     }
 
     pub fn next_ref_num(&self) -> usize {
@@ -2276,10 +2604,191 @@ mod tests {
         }
     }
 
+    fn located_issuance() -> LocatedIssuance {
+        LocatedIssuance {
+            identity_scope: "scope".into(),
+            generation: 7,
+            revision: 3,
+        }
+    }
+
+    #[test]
+    fn located_sources_have_fresh_issuance_and_survive_only_normal_observation() {
+        let mut refs = RefMap::new();
+        let observed = refs.bind_exact(42, "button", "", strict_binding("doc"));
+        let origin = LiveQueryOrigin::new("complete-query-source".into());
+        let first = refs
+            .try_bind_located(
+                42,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        let second = refs
+            .try_bind_located(
+                42,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        let pinned = refs
+            .try_bind_located(
+                42,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                None,
+            )
+            .unwrap();
+        assert_ne!(first, second);
+        assert_ne!(first, observed);
+        assert_ne!(pinned, observed);
+        let issued = refs.get(&first).unwrap().exact_binding.clone();
+        let before = refs.next_ref_num();
+        refs.begin_snapshot();
+        assert!(refs.get(&observed).is_none());
+        assert_eq!(refs.get(&first).unwrap().exact_binding, issued);
+        assert_eq!(refs.get(&first).unwrap().live_query.as_ref(), Some(&origin));
+        assert!(refs.get(&pinned).unwrap().live_query.is_none());
+        assert_eq!(refs.get(&first).unwrap().issued_revision(), Some(3));
+        assert!(refs
+            .get(&first)
+            .unwrap()
+            .matches_reference("scope", 7, "page", "3"));
+        for (scope, generation, page, revision) in [
+            ("other", 7, "page", "3"),
+            ("scope", 8, "page", "3"),
+            ("scope", 7, "foreign", "3"),
+            ("scope", 7, "page", "10"),
+            ("scope", 7, "page", "03"),
+        ] {
+            assert!(!refs
+                .get(&first)
+                .unwrap()
+                .matches_reference(scope, generation, page, revision));
+        }
+        refs.retire_all_references();
+        assert_eq!(refs.retained_identity_counts(), (0, 0));
+        assert_eq!(refs.next_ref_num(), before);
+        let next = refs
+            .try_bind_located(
+                42,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                None,
+            )
+            .unwrap();
+        assert_ne!(next, first);
+        assert_ne!(next, pinned);
+    }
+
+    #[test]
+    fn located_batch_token_consumes_reserved_entry_and_source_budgets_once() {
+        let mut refs = RefMap::new();
+        refs.set_exact_limit_for_test(2);
+        refs.set_query_origin_byte_limit_for_test(4);
+        let origin = LiveQueryOrigin::new("ab".into());
+        let mut batch = refs
+            .admit_located_batch(&[Some(origin.clone()), Some(origin.clone())])
+            .unwrap();
+        let first = batch
+            .try_bind(
+                1,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        let second = batch
+            .try_bind(
+                2,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                Some(origin),
+            )
+            .unwrap();
+        assert_eq!(
+            batch.try_bind(3, "button", strict_binding("doc"), located_issuance(), None),
+            Err(RefAllocationError::Capacity)
+        );
+        assert_ne!(first, second);
+        assert_eq!(refs.next_ref_num(), 3);
+        assert_eq!(refs.retained_identity_counts(), (2, 0));
+        assert_eq!(refs.retained_query_origin_bytes(), 4);
+    }
+
+    #[test]
+    fn located_batch_admission_and_abandoned_observation_preserve_all_authority() {
+        let mut refs = RefMap::new();
+        let observed = refs.bind_exact(42, "button", "", strict_binding("doc"));
+        let origin = LiveQueryOrigin::new("complete-query-source".into());
+        refs.set_query_origin_byte_limit_for_test(origin.source.len());
+        let before = refs.next_ref_num();
+        assert_eq!(
+            refs.check_located_admission(&[Some(origin.clone()), Some(origin.clone())]),
+            Err(RefAllocationError::Capacity)
+        );
+        assert_eq!(refs.next_ref_num(), before);
+        let live = refs
+            .try_bind_located(
+                42,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        let pinned = refs
+            .try_bind_located(
+                42,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                None,
+            )
+            .unwrap();
+        let original = refs.ref_ids();
+        let mut staged = refs.clone();
+        staged.begin_snapshot();
+        assert!(staged.get(&observed).is_none());
+        assert!(staged.get(&live).is_some());
+        assert!(staged.get(&pinned).is_some());
+        let skipped = staged
+            .try_bind_located(
+                43,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                None,
+            )
+            .unwrap();
+        drop(staged);
+        assert_eq!(refs.ref_ids(), original);
+        assert_eq!(refs.retained_query_origin_bytes(), origin.source.len());
+        let next = refs
+            .try_bind_located(
+                43,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                None,
+            )
+            .unwrap();
+        assert_ne!(next, skipped);
+        assert!(refs.get(&observed).is_some());
+    }
+
     #[test]
     fn strict_origins_never_overwrite_exact_or_other_query_authority() {
         let mut refs = RefMap::new();
-        let origin = StrictQueryOrigin::new("query-a".into());
+        let origin = LiveQueryOrigin::new("query-a".into());
         let observed = refs.bind_exact(42, "button", "", strict_binding("doc"));
         let strict = refs
             .try_bind_exact_with_origin(
@@ -2295,9 +2804,9 @@ mod tests {
             refs.bind_exact(42, "button", "", strict_binding("doc")),
             observed
         );
-        assert!(refs.get(&observed).unwrap().strict_query.is_none());
+        assert!(refs.get(&observed).unwrap().live_query.is_none());
         assert_eq!(
-            refs.get(&strict).unwrap().strict_query.as_ref(),
+            refs.get(&strict).unwrap().live_query.as_ref(),
             Some(&origin)
         );
         let before = refs.next_ref_num();
@@ -2307,14 +2816,14 @@ mod tests {
                 "button",
                 "",
                 strict_binding("doc"),
-                Some(StrictQueryOrigin::new("query-a".into())),
+                Some(LiveQueryOrigin::new("query-a".into())),
             )
             .unwrap();
         assert_eq!(repeat, strict);
         assert_eq!(refs.next_ref_num(), before);
         assert_eq!(refs.retained_query_origin_bytes(), 2 * origin.source.len());
         // Even an artificial digest collision cannot merge different sources.
-        let mut collision = StrictQueryOrigin::new("query-b".into());
+        let mut collision = LiveQueryOrigin::new("query-b".into());
         collision.fingerprint = origin.fingerprint;
         let different = refs
             .try_bind_exact_with_origin(42, "button", "", strict_binding("doc"), Some(collision))
@@ -2326,7 +2835,7 @@ mod tests {
     #[test]
     fn strict_origin_byte_admission_is_atomic_and_retirement_releases_budget() {
         let mut refs = RefMap::new();
-        let origin = StrictQueryOrigin::new("query-a".into());
+        let origin = LiveQueryOrigin::new("query-a".into());
         refs.set_query_origin_byte_limit_for_test(2 * origin.source.len());
         let first = refs
             .try_bind_exact_with_origin(
@@ -2403,7 +2912,7 @@ mod tests {
     #[test]
     fn strict_origin_staging_pruning_and_abandonment_keep_budget_and_no_id_reuse() {
         let mut baseline = RefMap::new();
-        let origin = StrictQueryOrigin::new("query-a".into());
+        let origin = LiveQueryOrigin::new("query-a".into());
         let first = baseline
             .try_bind_exact_with_origin(
                 42,
@@ -2584,35 +3093,256 @@ mod tests {
         );
     }
     #[test]
-    fn viewport_capability_is_shared_stable_and_never_a_dom_identity() {
+    fn viewport_publication_is_transactional_stable_and_not_dom_authority() {
         let mut refs = RefMap::new();
-        assert_eq!(refs.allocate_ref(), "e1", "legacy allocation is unchanged");
-        let clones: Vec<_> = (0..8)
-            .map(|_| {
-                let refs = refs.clone();
-                std::thread::spawn(move || refs.try_viewport_ref().unwrap().to_string())
-            })
-            .collect();
-        let ids: Vec<_> = clones
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect();
-        assert!(ids.iter().all(|id| id == "e2"));
-        assert_eq!(refs.next_ref_num(), 3);
-        assert!(refs.is_viewport_ref("@e2"));
-        assert!(refs.get("e2").is_none());
-        refs.add_exact_backend_node("e1".into(), 42);
+        let abandoned = {
+            let mut staged = refs.clone();
+            staged
+                .try_viewport_ref("scope", 7, "page", 1)
+                .unwrap()
+                .clone()
+        };
+        assert!(!refs.is_viewport_ref(&abandoned.id));
+        let first = refs
+            .try_viewport_ref("scope", 7, "page", 2)
+            .unwrap()
+            .clone();
+        assert_ne!(first.id, abandoned.id);
+        assert!(refs.get(&first.id).is_none());
         refs.invalidate_all_documents();
-        assert!(refs.get("e1").is_none());
-        assert_eq!(refs.try_viewport_ref().unwrap(), "e2");
-        assert_eq!(refs.allocate_ref(), "e3");
+        assert_eq!(
+            refs.try_viewport_ref("scope", 7, "page", 3).unwrap(),
+            &first
+        );
+        let mut staged = refs.clone();
+        staged.retire_all_references();
+        assert_eq!(
+            staged.try_viewport_ref("scope", 7, "page", 4).unwrap(),
+            &first
+        );
+        assert!(refs.matches_viewport_reference("scope", 7, "page", &first.id, "2"));
+        for (scope, generation, page, revision) in [
+            ("scope", 7, "page", "3"),
+            ("scope", 7, "page", "02"),
+            ("other", 7, "page", "2"),
+            ("scope", 8, "page", "2"),
+            ("scope", 7, "other", "2"),
+        ] {
+            assert!(!refs.matches_viewport_reference(scope, generation, page, &first.id, revision));
+        }
+        refs.retire_owner_references();
+        assert!(!refs.is_viewport_ref(&first.id));
+        let next = refs
+            .try_viewport_ref("new-scope", 8, "page", 5)
+            .unwrap()
+            .clone();
+        assert_ne!(next.id, first.id);
+        assert_ne!(next.id, abandoned.id);
+    }
+
+    #[test]
+    fn observed_issuance_survives_membership_refresh_not_forgery_or_retirement() {
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 7, 1);
+        let first = refs.bind_exact(42, "textbox", "", strict_binding("doc"));
+        let mut staged = refs.clone();
+        staged.begin_observation("scope", 7, 2);
+        assert_eq!(
+            staged.bind_exact(42, "textbox", "Changed", strict_binding("doc")),
+            first
+        );
+        let entry = staged.get(&first).unwrap();
+        assert_eq!(entry.issued_revision(), Some(1));
+        assert!(entry.is_current_observed(2));
+        assert!(!entry.is_current_observed(1));
+        assert!(entry.matches_reference("scope", 7, "page", "1"));
+        for revision in ["0", "2", "01", "999"] {
+            assert!(!entry.matches_reference("scope", 7, "page", revision));
+        }
+        for (scope, generation, page) in [
+            ("other", 7, "page"),
+            ("scope", 8, "page"),
+            ("scope", 7, "other"),
+        ] {
+            assert!(!entry.matches_reference(scope, generation, page, "1"));
+        }
+        refs = staged;
+        let baseline = refs.clone();
+        refs.begin_observation("scope", 7, 3);
+        // Even a metadata reread is not current authority when projection omits it.
+        assert_eq!(
+            refs.bind_exact(42, "textbox", "", strict_binding("doc")),
+            first
+        );
+        refs.retain_snapshot_entries(&baseline, &Default::default());
+        assert!(refs.get(&first).is_none());
+        refs.begin_observation("scope", 7, 4);
+        assert_eq!(
+            refs.bind_exact(42, "textbox", "", strict_binding("doc")),
+            first
+        );
+        assert_eq!(refs.get(&first).unwrap().issued_revision(), Some(1));
+        assert_ne!(
+            refs.bind_exact(43, "textbox", "", strict_binding("doc")),
+            first
+        );
+        refs.begin_observation("scope", 7, 5);
+        assert_ne!(
+            refs.bind_exact(42, "textbox", "", strict_binding("new-document")),
+            first
+        );
+        refs.retire_all_references();
+        refs.begin_observation("scope", 7, 6);
+        assert_ne!(
+            refs.bind_exact(42, "textbox", "", strict_binding("doc")),
+            first
+        );
+    }
+
+    #[test]
+    fn observed_durable_kind_never_upgrades_or_rebinds_a_pseudo_id() {
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 7, 1);
+        let pseudo = refs
+            .try_bind_readonly_pseudo(42, "text", strict_binding("doc"))
+            .unwrap();
+        let initial = refs.clone();
+        refs.begin_observation("scope", 7, 2);
+        assert_eq!(
+            refs.try_bind_readonly_pseudo(42, "text", strict_binding("doc"))
+                .unwrap(),
+            pseudo
+        );
+        assert_eq!(refs.get(&pseudo).unwrap().issued_revision(), Some(1));
+        refs.retain_snapshot_entries(&initial, &Default::default());
+        assert!(refs.get(&pseudo).is_none());
+        refs.begin_observation("scope", 7, 3);
+        assert_eq!(
+            refs.try_bind_readonly_pseudo(42, "text", strict_binding("doc"))
+                .unwrap(),
+            pseudo
+        );
+        // Same numeric backend and binding, different immutable authority kind.
+        let dom = refs.bind_exact(42, "button", "", strict_binding("doc"));
+        assert_ne!(dom, pseudo);
+        assert_eq!(
+            refs.get(&pseudo).unwrap().kind,
+            NativeReferenceKind::ReadOnlyCssPseudo
+        );
+        assert!(
+            !refs
+                .get(&pseudo)
+                .unwrap()
+                .exact_binding
+                .as_ref()
+                .unwrap()
+                .actionable
+        );
+        assert_eq!(refs.get(&dom).unwrap().kind, NativeReferenceKind::Dom);
+        let next_pseudo = refs
+            .try_bind_readonly_pseudo(42, "text", strict_binding("doc"))
+            .unwrap();
+        assert_ne!(next_pseudo, dom);
+        assert_ne!(
+            next_pseudo, pseudo,
+            "a retired durable kind is not resurrected"
+        );
+        assert_eq!(refs.get(&dom).unwrap().kind, NativeReferenceKind::Dom);
+        assert_eq!(
+            refs.get(&next_pseudo).unwrap().kind,
+            NativeReferenceKind::ReadOnlyCssPseudo
+        );
+        let source = LiveQueryOrigin::new("different-query-origin".into());
+        let other = refs
+            .try_bind_exact_with_origin(42, "button", "", strict_binding("doc"), Some(source))
+            .unwrap();
+        assert_ne!(other, next_pseudo);
+        assert_ne!(other, dom);
+        assert_eq!(
+            refs.try_bind_readonly_pseudo(42, "text", strict_binding("doc"))
+                .unwrap(),
+            next_pseudo
+        );
+        let abandoned = {
+            let mut staged = refs.clone();
+            staged.begin_observation("scope", 7, 4);
+            staged.bind_exact(42, "button", "", strict_binding("doc"))
+        };
+        assert_eq!(
+            refs.durable_ref("page", Some("frame"), 42),
+            Some(next_pseudo.as_str())
+        );
+        refs.begin_observation("scope", 7, 5);
+        assert_ne!(
+            refs.bind_exact(42, "button", "", strict_binding("doc")),
+            abandoned
+        );
+    }
+
+    #[test]
+    fn kind_mismatch_capacity_failure_is_atomic_before_allocating() {
+        let mut refs = RefMap::new();
+        refs.set_exact_limit_for_test(1);
+        refs.begin_observation("scope", 7, 1);
+        let pseudo = refs
+            .try_bind_readonly_pseudo(42, "text", strict_binding("doc"))
+            .unwrap();
+        let next = refs.next_ref_num();
+        assert_eq!(
+            refs.try_bind_exact(42, "button", "", strict_binding("doc")),
+            Err(RefAllocationError::Capacity)
+        );
+        assert_eq!(refs.next_ref_num(), next);
+        assert_eq!(
+            refs.durable_ref("page", Some("frame"), 42),
+            Some(pseudo.as_str())
+        );
+        assert_eq!(
+            refs.get(&pseudo).unwrap().kind,
+            NativeReferenceKind::ReadOnlyCssPseudo
+        );
+        refs.begin_observation("scope", 7, 2);
+        assert_ne!(
+            refs.bind_exact(42, "button", "", strict_binding("doc")),
+            pseudo
+        );
+    }
+
+    #[test]
+    fn abandoned_observed_records_cannot_resurrect_and_unissued_refs_have_no_authority() {
+        let mut refs = RefMap::new();
+        let legacy = refs.bind_exact(42, "textbox", "", strict_binding("doc"));
+        assert!(!refs
+            .get(&legacy)
+            .unwrap()
+            .matches_reference("scope", 7, "page", "1"));
+        let abandoned = {
+            let mut staged = refs.clone();
+            staged.begin_observation("scope", 7, 1);
+            staged.bind_exact(43, "textbox", "", strict_binding("doc"))
+        };
+        assert!(refs.get(&abandoned).is_none());
+        assert!(refs.durable_ref("page", Some("frame"), 43).is_none());
+        refs.begin_observation("scope", 7, 2);
+        let published = refs.bind_exact(43, "textbox", "", strict_binding("doc"));
+        assert_ne!(published, abandoned);
+        assert_eq!(refs.get(&published).unwrap().issued_revision(), Some(2));
+        let mut next = refs.clone();
+        next.begin_observation("new-scope", 8, 3);
+        assert_ne!(
+            next.bind_exact(43, "textbox", "", strict_binding("doc")),
+            published
+        );
     }
 
     #[test]
     fn viewport_allocation_exhaustion_is_typed_without_recycling() {
         let mut refs = RefMap::new();
         refs.set_next_ref_num(usize::MAX);
-        assert_eq!(refs.try_viewport_ref(), Err(RefAllocationError::Exhausted));
+        assert_eq!(
+            refs.try_viewport_ref("scope", 7, "page", 1),
+            Err(RefAllocationError::Exhausted)
+        );
         assert!(!refs.is_viewport_ref("@e1"));
         assert_eq!(refs.next_ref_num(), usize::MAX);
     }

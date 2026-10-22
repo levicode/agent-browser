@@ -767,7 +767,7 @@ impl ClientEnrollment {
                 step,
                 Some(target),
                 Some(session),
-                CaptureTargetKind::Missing,
+                None,
                 index.sessions.get(session),
                 &index,
                 index.applied_watermark,
@@ -3991,14 +3991,52 @@ fn capture_frame_fingerprint(
     Ok(())
 }
 // Test-only evidence for the existing hosted state-capture fixture. Private
-// lookup keys are never Debug/serialized. Only bounded ordinals and closed tags
-// reach output; unknown native types are never inferred from the old Other bin.
+// lookup keys are never Debug/serialized. Only bounded ordinals, closed tags,
+// and validated structural TargetInfo.type tokens reach output. Unknown native
+// types are never inferred from the old Other bin.
 // Negotiated BrowserManager::connect_owned_browser / launch_owned do not enable
 // Target discovery. This tap issues no setDiscoverTargets command: absence of
 // targetDestroyed is inconclusive, even though the separate fixture host client
 // enables discovery. A received destruction is evidence, never authority here.
 #[cfg(test)]
 const CAPTURE_TRACE_LIMIT: usize = 128;
+#[cfg(test)]
+const CAPTURE_TARGET_TYPE_LIMIT: usize = 32;
+/// This field is sourced only from TargetInfo.type (or its stored kind), never
+/// from URL, title, target/session IDs, or arbitrary event content. Accept only
+/// short lowercase ASCII protocol tokens; invalid values are never truncated or
+/// echoed. Classification remains diagnostic and grants no target authority.
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CaptureStructuralTargetType {
+    Token(String),
+    Missing,
+    Invalid,
+    Oversized,
+}
+#[cfg(test)]
+impl CaptureStructuralTargetType {
+    fn from_value(value: Option<&Value>) -> Self {
+        match value {
+            None => Self::Missing,
+            Some(Value::String(value)) => Self::from_str(value),
+            Some(_) => Self::Invalid,
+        }
+    }
+    fn from_str(value: &str) -> Self {
+        if value.len() > CAPTURE_TARGET_TYPE_LIMIT {
+            Self::Oversized
+        } else if value.is_empty()
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        {
+            Self::Invalid
+        } else {
+            Self::Token(value.to_owned())
+        }
+    }
+}
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CaptureTargetKind {
@@ -4067,7 +4105,9 @@ struct CaptureLifecycleRow {
     target: Option<u16>,
     session: Option<u16>,
     native_kind: CaptureTargetKind,
+    native_type: CaptureStructuralTargetType,
     registered_kind: CaptureTargetKind,
+    registered_type: CaptureStructuralTargetType,
     registry_binding: CaptureRegistryBinding,
     application: bool,
     observation_only: bool,
@@ -4125,7 +4165,7 @@ impl CaptureLifecycleTrace {
         step: CaptureLifecycleStep,
         target: Option<&str>,
         session: Option<&str>,
-        native_kind: CaptureTargetKind,
+        native_type: Option<&Value>,
         entry: Option<&Attribution>,
         index: &Index,
         watermark: u64,
@@ -4140,8 +4180,12 @@ impl CaptureLifecycleTrace {
             step,
             target,
             session,
-            native_kind,
+            native_kind: CaptureTargetKind::from_native(native_type.and_then(Value::as_str)),
+            native_type: CaptureStructuralTargetType::from_value(native_type),
             registered_kind: CaptureTargetKind::from_native(entry.map(|entry| entry.kind.as_str())),
+            registered_type: entry.map_or(CaptureStructuralTargetType::Missing, |entry| {
+                CaptureStructuralTargetType::from_str(&entry.kind)
+            }),
             registry_binding: match entry.and_then(|entry| {
                 index
                     .sessions
@@ -4196,10 +4240,7 @@ impl CaptureLifecycleTrace {
             step,
             target.or_else(|| entry.map(|entry| entry.target.as_str())),
             session.or_else(|| entry.map(|entry| entry.session.as_str())),
-            CaptureTargetKind::from_native(
-                info.and_then(|info| info.get("type"))
-                    .and_then(Value::as_str),
-            ),
+            info.and_then(|info| info.get("type")),
             entry,
             index,
             watermark,
@@ -4210,7 +4251,7 @@ impl CaptureLifecycleTrace {
             step,
             Some(&entry.target),
             Some(&entry.session),
-            CaptureTargetKind::Missing,
+            None,
             Some(entry),
             index,
             index.applied_watermark,
@@ -5028,26 +5069,24 @@ mod tests {
             let page = owner.lease(&entry).unwrap();
             let binding = realm_test_binding();
             let mut refs = RefMap::new();
+            refs.begin_observation(&page.identity_scope, op.generation, 1);
             let id = refs.bind_exact(42, "checkbox", "", binding.clone());
-            let geometry = GeometrySnapshot::capture(
-                &owner.client,
-                "initial",
-                &[ObservationFrame {
-                    parent_frame_id: None,
-                    owner_backend_id: None,
-                    url: "about:blank".into(),
-                    binding,
-                    offset_x: 0.,
-                    offset_y: 0.,
-                    frame_path: vec![],
-                }],
-                &op,
-            )
-            .await
-            .unwrap();
+            let observation_frames = [ObservationFrame {
+                parent_frame_id: None,
+                owner_backend_id: None,
+                url: "about:blank".into(),
+                binding,
+                offset_x: 0.,
+                offset_y: 0.,
+                frame_path: vec![],
+            }];
+            let geometry =
+                GeometrySnapshot::capture(&owner.client, "initial", &observation_frames, &op)
+                    .await
+                    .unwrap();
             let blobs = BlobStore::new(BlobLimits::default()).unwrap();
             let frames = HashMap::new();
-            let failure=ClientActions::default().execute(ActionContext { observation_after: None, observed_revision: 0,
+            let failure=ClientActions::default().execute(ActionContext { observation_after: None, observed_revision: 0, observation_frames: &observation_frames,
                 realm_authority:ActionRealmAuthority::Enrolled(&owner),page:&page,operation:&op,
                 page_state:&owner.page,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry,
             },"browser.perform",&json!({"identityScope":"owned-scope","ref":{"id":format!("@{id}"),"revision":"1"},"action":{"kind":"check"}})).await.unwrap_err();
@@ -5695,7 +5734,7 @@ mod tests {
     }
 
     #[test]
-    fn capture_lifecycle_trace_is_bounded_and_never_echoes_unknown_native_metadata() {
+    fn capture_lifecycle_trace_is_bounded_and_never_echoes_invalid_native_metadata() {
         let mut trace = CaptureLifecycleTrace::default();
         let index = Index::default();
         for (offset, kind) in ["tab", "browser", "other", "future-private-kind"]
@@ -5745,6 +5784,134 @@ mod tests {
         );
         assert_eq!(trace.sessions.len(), 1);
         assert!(!format!("{:?}", trace.rows).contains("private"));
+    }
+
+    #[test]
+    fn capture_structural_target_type_is_strictly_bounded() {
+        use CaptureStructuralTargetType::{Invalid, Missing, Oversized, Token};
+        assert_eq!(CaptureStructuralTargetType::from_value(None), Missing);
+        for value in [json!(null), json!(false), json!(42), json!([]), json!({})] {
+            assert_eq!(
+                CaptureStructuralTargetType::from_value(Some(&value)),
+                Invalid
+            );
+        }
+        for value in [
+            "",
+            "Page",
+            "kind1",
+            "private-kind",
+            "private/path",
+            "private:type",
+            "private title",
+            "private\nvalue",
+            "týpe",
+        ] {
+            assert_eq!(CaptureStructuralTargetType::from_str(value), Invalid);
+        }
+        for value in ["page", "service_worker", "future_worklet"] {
+            assert_eq!(
+                CaptureStructuralTargetType::from_str(value),
+                Token(value.into())
+            );
+        }
+        let exact = "a".repeat(CAPTURE_TARGET_TYPE_LIMIT);
+        assert_eq!(
+            CaptureStructuralTargetType::from_str(&exact),
+            Token(exact.clone())
+        );
+        assert_eq!(
+            CaptureStructuralTargetType::from_str(&(exact + "a")),
+            Oversized
+        );
+        assert_eq!(
+            CaptureStructuralTargetType::from_str(&"private".repeat(1024)),
+            Oversized
+        );
+    }
+
+    #[tokio::test]
+    async fn capture_lifecycle_trace_retains_structural_unknown_type_without_changing_admission() {
+        let (owner, _notices, log, emit, server) =
+            fixture("attestation-complete-missing-target").await;
+        owner
+            .enroll_existing("target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        realm_emit(
+            &owner,
+            &emit,
+            json!({
+                "method":"Target.attachedToTarget", "params":{
+                    "sessionId":"private-session", "waitingForDebugger":true,
+                    "targetInfo":{"targetId":"private-target", "type":"future_worklet",
+                        "browserContextId":"owned-context", "url":"https://private.invalid/secret",
+                        "title":"private-title"}
+                }
+            }),
+        )
+        .await;
+        let owned = owner.targets.owned_target("private-target").unwrap();
+        assert_eq!(owned.kind, "future_worklet");
+        assert_eq!(owned.purpose, Some(TargetPurpose::Application));
+        assert!(owned.configured && owned.resumed);
+        assert!(matches!(
+            owner.attest_capture(&owner.operation()).await,
+            Err(ProtocolError::StaleScope)
+        ));
+        let rows = owner.capture_lifecycle.lock().unwrap().rows.clone();
+        let attached = rows
+            .iter()
+            .find(|row| row.step == CaptureLifecycleStep::Attached)
+            .unwrap();
+        assert_eq!(attached.native_kind, CaptureTargetKind::Unrecognized);
+        assert_eq!(
+            attached.native_type,
+            CaptureStructuralTargetType::Token("future_worklet".into())
+        );
+        assert_eq!(
+            attached.registered_type,
+            CaptureStructuralTargetType::Missing
+        );
+        let relevant = rows
+            .iter()
+            .filter(|row| row.target == attached.target)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relevant.iter().map(|row| row.step).collect::<Vec<_>>(),
+            vec![
+                CaptureLifecycleStep::Attached,
+                CaptureLifecycleStep::RegisteringAttached,
+                CaptureLifecycleStep::Registered,
+                CaptureLifecycleStep::Resumed,
+                CaptureLifecycleStep::MissingInventory,
+            ]
+        );
+        for row in relevant.iter().skip(2) {
+            assert_eq!(row.registered_kind, CaptureTargetKind::Unrecognized);
+            assert_eq!(
+                row.registered_type,
+                CaptureStructuralTargetType::Token("future_worklet".into())
+            );
+            assert_eq!(
+                row.registry_binding,
+                CaptureRegistryBinding::MatchingIdsTenureUnknown
+            );
+        }
+        assert!(relevant.last().unwrap().application && relevant.last().unwrap().resumed);
+        let printed = format!("{rows:?}");
+        assert!(printed.contains("future_worklet"));
+        for secret in ["private", "owned-context", "https://"] {
+            assert!(!printed.contains(secret));
+        }
+        assert!(!log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "Target.setDiscoverTargets"));
+        owner.close().await.unwrap();
+        server.abort();
     }
 
     #[test]
@@ -8569,6 +8736,539 @@ mod tests {
         .unwrap();
         chrome.kill();
     }
+    #[derive(Default)]
+    struct ForeignDefaultContext {
+        current: Option<(i64, String)>,
+    }
+    impl ForeignDefaultContext {
+        fn apply(&mut self, event: &CdpEvent, session: &str, frame: &str) -> Result<(), String> {
+            if event.method == "Target.detachedFromTarget"
+                && event.params["sessionId"].as_str() == Some(session)
+            {
+                return Err("foreign session detached during readiness".into());
+            }
+            if event.session_id.as_deref() != Some(session) {
+                return Ok(());
+            }
+            match event.method.as_str() {
+                "Runtime.executionContextCreated" => {
+                    let context = &event.params["context"];
+                    if context["auxData"]["isDefault"] != true
+                        || context["auxData"]["frameId"].as_str() != Some(frame)
+                    {
+                        return Ok(());
+                    }
+                    let id = context["id"]
+                        .as_i64()
+                        .filter(|id| *id > 0)
+                        .ok_or("foreign default context omitted its numeric identity")?;
+                    let unique = context["uniqueId"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or("foreign default context omitted its unique identity")?;
+                    self.current = Some((id, unique.to_owned()));
+                }
+                "Runtime.executionContextDestroyed" => {
+                    if self.current.as_ref().is_some_and(|(id, unique)| {
+                        // An old destruction must not erase a new incarnation
+                        // reusing the numeric ID. Without a unique ID, discard
+                        // conservatively and await another authoritative event.
+                        match event.params["executionContextUniqueId"].as_str() {
+                            Some(destroyed) => destroyed == unique.as_str(),
+                            None => event.params["executionContextId"].as_i64() == Some(*id),
+                        }
+                    }) {
+                        self.current = None;
+                    }
+                }
+                "Runtime.executionContextsCleared" => self.current = None,
+                "Page.frameNavigated" if event.params["frame"]["id"].as_str() == Some(frame) => {
+                    return Err("foreign document changed during context readiness".into());
+                }
+                "Page.frameDetached" if event.params["frameId"].as_str() == Some(frame) => {
+                    return Err("foreign main frame detached during readiness".into());
+                }
+                _ => {}
+            }
+            Ok(())
+        }
+    }
+
+    struct ForeignDocument {
+        frame: String,
+        loader: String,
+        url: String,
+    }
+    impl ForeignDocument {
+        fn from_frame(frame: &Value) -> Result<Self, String> {
+            let required = |key: &str| {
+                frame[key]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| "foreign document identity was incomplete".to_owned())
+            };
+            Ok(Self {
+                frame: required("id")?,
+                loader: required("loaderId")?,
+                url: required("url")?,
+            })
+        }
+        fn reconcile(
+            &self,
+            context: &mut ForeignDefaultContext,
+            event: &CdpEvent,
+            session: &str,
+        ) -> Result<(), String> {
+            if event.session_id.as_deref() == Some(session) && event.method == "Page.frameNavigated"
+            {
+                let frame = &event.params["frame"];
+                if frame.get("parentId").is_none()
+                    || frame["id"].as_str() == Some(self.frame.as_str())
+                {
+                    if frame["id"].as_str() != Some(self.frame.as_str())
+                        || frame["loaderId"].as_str() != Some(self.loader.as_str())
+                        || frame["url"].as_str() != Some(self.url.as_str())
+                    {
+                        return Err("foreign document changed across readiness snapshot".into());
+                    }
+                    // A matching event received after the pre-query fence can
+                    // describe the very document returned by the snapshot.
+                    return Ok(());
+                }
+            }
+            context.apply(event, session, &self.frame)
+        }
+    }
+    type ForeignTreeAckHook = (
+        tokio::sync::oneshot::Sender<BoundedEventWatermark>,
+        tokio::sync::oneshot::Receiver<()>,
+    );
+
+    // A fresh foreign observer session has no Runtime domain enabled. Attach
+    // ACK alone proves neither navigation commit nor a default execution realm.
+    // This helper owns no enrollment/configuration and never resumes the target.
+    async fn foreign_first_script_after_document_ready(
+        client: &CdpClient,
+        session: &str,
+        expected_url: &str,
+    ) -> Result<Value, String> {
+        foreign_first_script_with_tree_ack_hook(client, session, expected_url, None).await
+    }
+    // The hook exists solely to force the response/event race in the TCP test.
+    async fn foreign_first_script_with_tree_ack_hook(
+        client: &CdpClient,
+        session: &str,
+        expected_url: &str,
+        tree_ack_hook: Option<ForeignTreeAckHook>,
+    ) -> Result<Value, String> {
+        let mut events = client.subscribe_bounded_methods(
+            &[
+                "Page.frameNavigated",
+                "Page.frameDetached",
+                "Target.detachedFromTarget",
+                "Runtime.executionContextCreated",
+                "Runtime.executionContextDestroyed",
+                "Runtime.executionContextsCleared",
+            ],
+            64,
+            65536,
+        )?;
+        let watermark = events.watermark();
+        client
+            .send_command("Page.enable", Some(json!({})), Some(session))
+            .await?;
+        // Fence BEFORE issuing the snapshot. Only earlier events can be
+        // superseded by that query. Events received after its ACK are never
+        // silently absorbed into the snapshot's document identity.
+        let mut committed_through = watermark.received()?;
+        let tree = client
+            .send_command("Page.getFrameTree", Some(json!({})), Some(session))
+            .await?;
+        if let Some((acknowledged, release)) = tree_ack_hook {
+            acknowledged
+                .send(watermark.clone())
+                .map_err(|_| "tree ACK observer ended")?;
+            release.await.map_err(|_| "tree ACK release ended")?;
+        }
+        let frame = tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .ok_or("foreign main frame was unavailable")?
+            .to_owned();
+        let mut consumed = 0;
+        let mut document = if tree["frameTree"]["frame"]["url"].as_str() == Some(expected_url) {
+            Some(ForeignDocument::from_frame(&tree["frameTree"]["frame"])?)
+        } else {
+            None
+        };
+        while document.is_none() {
+            let event = events.recv().await?;
+            consumed = event.sequence();
+            if consumed <= committed_through {
+                continue;
+            }
+            if event.method == "Target.detachedFromTarget"
+                && event.params["sessionId"].as_str() == Some(session)
+            {
+                return Err("foreign session detached before document commit".into());
+            }
+            if event.session_id.as_deref() != Some(session) {
+                continue;
+            }
+            if event.method == "Page.frameDetached"
+                && event.params["frameId"].as_str() == Some(frame.as_str())
+            {
+                return Err("foreign main frame detached before document commit".into());
+            }
+            if event.method == "Page.frameNavigated"
+                && event.params["frame"]["id"].as_str() == Some(frame.as_str())
+                && event.params["frame"].get("parentId").is_none()
+                && event.params["frame"]["url"].as_str() == Some(expected_url)
+            {
+                document = Some(ForeignDocument::from_frame(&event.params["frame"])?);
+                // This exact event, not a later sampled watermark, is the new
+                // document proof. Any queued successor still needs checking.
+                committed_through = consumed;
+            }
+        }
+        let document = document.ok_or("foreign document commit was unavailable")?;
+        // Runtime replay begins after document proof. Reconcile every later
+        // main-frame event against the exact frame/loader/URL tuple, including
+        // events queued between the frame-tree ACK and this task resuming.
+        client
+            .send_command("Runtime.enable", Some(json!({})), Some(session))
+            .await?;
+        let mut context = ForeignDefaultContext::default();
+        let unique = loop {
+            // Drain through reader admission after the enable ACK, including
+            // any queued destruction/replacement, before selecting a context.
+            let received = watermark.received()?;
+            while consumed < received {
+                let event = events.recv().await?;
+                consumed = event.sequence();
+                if consumed > committed_through {
+                    document.reconcile(&mut context, &event, session)?;
+                }
+            }
+            if let Some((_, unique)) = &context.current {
+                break unique.clone();
+            }
+            let event = events.recv().await?;
+            consumed = event.sequence();
+            if consumed > committed_through {
+                document.reconcile(&mut context, &event, session)?;
+            }
+        };
+        // DOMContentLoaded settles the first inline script without polling its
+        // value. Unique identity forbids silently evaluating in a replacement
+        // realm; destruction during evaluation remains an ordinary test failure.
+        client.send_command("Runtime.evaluate", Some(json!({
+            "expression":"(async () => { if (document.readyState === 'loading') await new Promise(resolve => document.addEventListener('DOMContentLoaded', resolve, {once: true})); return [window.foreignRan, typeof window.ownedSyntheticInit]; })()",
+            "uniqueContextId":unique, "returnByValue":true, "awaitPromise":true,
+        })), Some(session)).await
+    }
+
+    #[test]
+    fn foreign_context_readiness_requires_exact_identity_and_tracks_replacement() {
+        let created = |session: &str, frame: &str, is_default: bool, unique: &str| CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some(session.into()),
+            params: json!({"context":{"id":7,"uniqueId":unique,"auxData":{"frameId":frame,"isDefault":is_default}}}),
+        };
+        let mut state = ForeignDefaultContext::default();
+        for event in [
+            created("other", "main", true, "wrong-session"),
+            created("foreign", "child", true, "wrong-frame"),
+            created("foreign", "main", false, "isolated"),
+        ] {
+            state.apply(&event, "foreign", "main").unwrap();
+            assert!(state.current.is_none());
+        }
+        state
+            .apply(&created("foreign", "main", true, "old"), "foreign", "main")
+            .unwrap();
+        state
+            .apply(
+                &CdpEvent {
+                    method: "Runtime.executionContextsCleared".into(),
+                    session_id: Some("foreign".into()),
+                    params: json!({}),
+                },
+                "foreign",
+                "main",
+            )
+            .unwrap();
+        assert!(state.current.is_none());
+        state
+            .apply(&created("foreign", "main", true, "new"), "foreign", "main")
+            .unwrap();
+        let mut destroyed = CdpEvent {
+            method: "Runtime.executionContextDestroyed".into(),
+            session_id: Some("foreign".into()),
+            params: json!({"executionContextId":7,"executionContextUniqueId":"old"}),
+        };
+        state.apply(&destroyed, "foreign", "main").unwrap();
+        assert_eq!(state.current, Some((7, "new".into())));
+        destroyed.params["executionContextUniqueId"] = json!("new");
+        state.apply(&destroyed, "foreign", "main").unwrap();
+        assert!(state.current.is_none());
+        assert!(state
+            .apply(&created("foreign", "main", true, ""), "foreign", "main")
+            .is_err());
+        assert!(state
+            .apply(
+                &CdpEvent {
+                    method: "Page.frameNavigated".into(),
+                    session_id: Some("foreign".into()),
+                    params: json!({"frame":{"id":"main"}})
+                },
+                "foreign",
+                "main"
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn foreign_first_script_waits_for_document_and_exact_context_ack() {
+        for (committed_in_snapshot, mode) in [
+            (false, "replace-before-ack"),
+            (true, "replace-before-ack"),
+            (true, "replace-after-ack"),
+            (true, "destroyed"),
+            (true, "enable-error"),
+            (true, "evaluate-error"),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut methods = Vec::new();
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    assert_eq!(request["sessionId"], "foreign");
+                    methods.push(method.to_owned());
+                    if (mode == "enable-error" && method == "Runtime.enable")
+                        || (mode == "evaluate-error" && method == "Runtime.evaluate")
+                    {
+                        socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic readiness failure"}}).to_string())).await.unwrap();
+                        return methods;
+                    }
+                    let result = match method {
+                        "Page.enable" => json!({}),
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"main","loaderId":"expected-loader","url":if committed_in_snapshot {"data:text/html,synthetic"} else {"about:blank"}}}})
+                        }
+                        "Runtime.enable" => {
+                            for event in [
+                                json!({"method":"Runtime.executionContextCreated","sessionId":"foreign","params":{"context":{"id":7,"uniqueId":"old","auxData":{"frameId":"main","isDefault":true}}}}),
+                                json!({"method":"Runtime.executionContextDestroyed","sessionId":"foreign","params":{"executionContextId":7,"executionContextUniqueId":"old"}}),
+                            ] {
+                                socket.send(Message::Text(event.to_string())).await.unwrap();
+                            }
+                            if !matches!(mode, "replace-after-ack" | "destroyed") {
+                                socket.send(Message::Text(json!({"method":"Runtime.executionContextCreated","sessionId":"foreign","params":{"context":{"id":7,"uniqueId":"replacement","auxData":{"frameId":"main","isDefault":true}}}}).to_string())).await.unwrap();
+                            }
+                            json!({})
+                        }
+                        "Runtime.evaluate" => {
+                            assert_eq!(request["params"]["uniqueContextId"], "replacement");
+                            assert!(request["params"].get("contextId").is_none());
+                            assert_eq!(request["params"]["awaitPromise"], true);
+                            assert!(request["params"]["expression"]
+                                .as_str()
+                                .unwrap()
+                                .contains("DOMContentLoaded"));
+                            json!({"result":{"value":[73,"undefined"]}})
+                        }
+                        _ => panic!("unexpected foreign readiness method"),
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id":request["id"],"result":result}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    if method == "Runtime.enable" {
+                        if mode == "replace-after-ack" {
+                            socket.send(Message::Text(json!({"method":"Runtime.executionContextCreated","sessionId":"foreign","params":{"context":{"id":7,"uniqueId":"replacement","auxData":{"frameId":"main","isDefault":true}}}}).to_string())).await.unwrap();
+                        } else if mode == "destroyed" {
+                            socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"foreign"}}).to_string())).await.unwrap();
+                            return methods;
+                        }
+                    }
+                    if method == "Page.getFrameTree" && !committed_in_snapshot {
+                        for event in [
+                            json!({"method":"Page.frameNavigated","sessionId":"other","params":{"frame":{"id":"main","loaderId":"expected-loader","url":"data:text/html,synthetic"}}}),
+                            json!({"method":"Page.frameNavigated","sessionId":"foreign","params":{"frame":{"id":"child","parentId":"main","url":"data:text/html,synthetic"}}}),
+                            json!({"method":"Page.frameNavigated","sessionId":"foreign","params":{"frame":{"id":"main","loaderId":"expected-loader","url":"data:text/html,synthetic"}}}),
+                        ] {
+                            socket.send(Message::Text(event.to_string())).await.unwrap();
+                        }
+                    }
+                    if method == "Runtime.evaluate" {
+                        return methods;
+                    }
+                }
+                panic!("foreign readiness connection ended before evaluation");
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                foreign_first_script_after_document_ready(
+                    &client,
+                    "foreign",
+                    "data:text/html,synthetic",
+                ),
+            )
+            .await
+            .unwrap();
+            if matches!(mode, "enable-error" | "evaluate-error" | "destroyed") {
+                assert!(result.is_err(), "{mode}");
+            } else {
+                assert_eq!(result.unwrap()["result"]["value"], json!([73, "undefined"]));
+            }
+            let mut expected = vec!["Page.enable", "Page.getFrameTree", "Runtime.enable"];
+            if !matches!(mode, "enable-error" | "destroyed") {
+                expected.push("Runtime.evaluate");
+            }
+            assert_eq!(server.await.unwrap(), expected, "{mode}");
+            client.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn foreign_first_script_does_not_swallow_navigation_after_tree_ack() {
+        for mode in [
+            "same-document",
+            "different-url",
+            "same-url-new-loader",
+            "detached",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (inject, injected) = tokio::sync::oneshot::channel::<Value>();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut injection = Some(injected);
+                let mut methods = Vec::new();
+                while let Some(Ok(Message::Text(text))) = socket.next().await {
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    methods.push(method.to_owned());
+                    assert_eq!(request["sessionId"], "foreign");
+                    let result = match method {
+                        "Page.enable" => json!({}),
+                        "Page.getFrameTree" => json!({"frameTree":{"frame":{
+                            "id":"main", "loaderId":"original-loader", "url":"data:text/html,synthetic"
+                        }}}),
+                        "Runtime.enable" => {
+                            // This context has the same frame ID and could
+                            // return the original assertion even in a new loader.
+                            socket
+                                .send(Message::Text(
+                                    json!({"method":"Runtime.executionContextCreated",
+                                        "sessionId":"foreign", "params":{"context":{"id":7,
+                                            "uniqueId":"current-foreign-context",
+                                            "auxData":{"frameId":"main","isDefault":true}}}
+                                    })
+                                    .to_string(),
+                                ))
+                                .await
+                                .unwrap();
+                            json!({})
+                        }
+                        "Runtime.evaluate" => {
+                            assert_eq!(
+                                request["params"]["uniqueContextId"],
+                                "current-foreign-context"
+                            );
+                            json!({"result":{"value":[73,"undefined"]}})
+                        }
+                        _ => panic!("unexpected foreign readiness method"),
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id":request["id"],"result":result}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    if method == "Page.getFrameTree" {
+                        let event = injection.take().unwrap().await.unwrap();
+                        socket.send(Message::Text(event.to_string())).await.unwrap();
+                    }
+                    if method == "Runtime.evaluate" {
+                        break;
+                    }
+                }
+                methods
+            });
+            let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+            let (tree_acked, ack_observed) = tokio::sync::oneshot::channel();
+            let (release, released) = tokio::sync::oneshot::channel();
+            let observer = client.clone();
+            let readiness = tokio::spawn(async move {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    foreign_first_script_with_tree_ack_hook(
+                        &observer,
+                        "foreign",
+                        "data:text/html,synthetic",
+                        Some((tree_acked, released)),
+                    ),
+                )
+                .await
+                .unwrap()
+            });
+            // The helper has received the tree ACK but cannot progress. Force
+            // a later event into its own retained reader lane before releasing
+            // it. This deterministically exercises the old post-ACK watermark gap.
+            let watermark = ack_observed.await.unwrap();
+            let before = watermark.received().unwrap();
+            let event = if mode == "detached" {
+                json!({"method":"Page.frameDetached","sessionId":"foreign","params":{"frameId":"main"}})
+            } else {
+                json!({"method":"Page.frameNavigated","sessionId":"foreign","params":{"frame":{
+                    "id":"main", "loaderId":if mode == "same-document" {"original-loader"} else {"replacement-loader"},
+                    "url":if mode == "different-url" {"data:text/html,replacement"} else {"data:text/html,synthetic"}
+                }}})
+            };
+            inject.send(event).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while watermark.received().unwrap() == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            release.send(()).unwrap();
+            let result = readiness.await.unwrap();
+            if mode == "same-document" {
+                assert_eq!(result.unwrap()["result"]["value"], json!([73, "undefined"]));
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(
+                    error,
+                    if mode == "detached" {
+                        "foreign main frame detached during readiness"
+                    } else {
+                        "foreign document changed across readiness snapshot"
+                    },
+                    "{mode}"
+                );
+            }
+            client.close().await;
+            let mut expected = vec!["Page.enable", "Page.getFrameTree", "Runtime.enable"];
+            if mode == "same-document" {
+                expected.push("Runtime.evaluate");
+            }
+            assert_eq!(server.await.unwrap(), expected, "{mode}");
+        }
+    }
+
     // Run only on the hosted Chromium gate; never substitute mock success for
     // two real browser contexts sharing the same host process.
     #[tokio::test]
@@ -8672,7 +9372,18 @@ mod tests {
         owner.start(&op).await.unwrap();
         // This foreign target is created AFTER global pause-and-filter starts.
         // Its first inline script must still run, without our init/config.
-        let other_target=foreign.send_command("Target.createTarget",Some(json!({"browserContextId":other,"url":"data:text/html,<script>window.foreignRan=73</script>"})),None).await.unwrap()["targetId"].as_str().unwrap().to_owned();
+        let foreign_url = "data:text/html,<script>window.foreignRan=73</script>";
+        let other_target = foreign
+            .send_command(
+                "Target.createTarget",
+                Some(json!({"browserContextId":other,"url":foreign_url})),
+                None,
+            )
+            .await
+            .unwrap()["targetId"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let other_session = foreign
             .send_command(
                 "Target.attachToTarget",
@@ -8684,13 +9395,14 @@ mod tests {
             .as_str()
             .unwrap()
             .to_owned();
-        tokio::time::timeout(Duration::from_secs(10),async {
-            loop {
-                let value=foreign.send_command("Runtime.evaluate",Some(json!({"expression":"[window.foreignRan, typeof window.ownedSyntheticInit]","returnByValue":true})),Some(&other_session)).await.unwrap();
-                if value["result"]["value"]==json!([73,"undefined"]) {break;}
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }).await.unwrap();
+        let first_script = tokio::time::timeout(
+            Duration::from_secs(10),
+            foreign_first_script_after_document_ready(&foreign, &other_session, foreign_url),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(first_script["result"]["value"], json!([73, "undefined"]));
         // An HTTP popup's first script records whether init ran before it.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/popup", listener.local_addr().unwrap());

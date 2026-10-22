@@ -197,6 +197,7 @@ pub struct ActionContext<'a> {
     pub observation_after: Option<u64>,
     pub observed_revision: u64,
     pub iframe_sessions: &'a HashMap<String, String>,
+    pub observation_frames: &'a [super::client_observation::ObservationFrame],
     pub blobs: &'a BlobStore,
     pub geometry: &'a GeometrySnapshot,
 }
@@ -450,11 +451,16 @@ fn reference<'a>(
     ctx: &'a ActionContext<'_>,
     r: &NodeReference,
 ) -> Result<(&'a element::RefEntry, ExactBinding), ProtocolError> {
-    if r.revision != ctx.revision.to_string() {
-        return Err(ProtocolError::StaleReference);
-    }
     let id = element::parse_ref(&r.id).ok_or(ProtocolError::InvalidArguments)?;
     let entry = ctx.refs.get(&id).ok_or(ProtocolError::StaleReference)?;
+    if !entry.matches_reference(
+        &ctx.page.identity_scope,
+        ctx.operation.generation,
+        &ctx.page.page_session_id,
+        &r.revision,
+    ) {
+        return Err(ProtocolError::StaleReference);
+    }
     if entry.kind == element::NativeReferenceKind::ReadOnlyCssPseudo {
         return Err(ProtocolError::NotActionable);
     }
@@ -658,7 +664,7 @@ async fn resolve_action_object_in_realm(
     }
     Ok(object)
 }
-fn strict_query_error(
+fn live_query_error(
     d: &Dispatch,
     error: super::client_observation::ObservationError,
 ) -> ProtocolError {
@@ -667,7 +673,7 @@ fn strict_query_error(
         ObservationError::CleanupFailed { primary } => {
             d.cleanup.store(true, Ordering::SeqCst);
             primary.map_or(ProtocolError::CleanupFailed, |error| {
-                strict_query_error(d, *error)
+                live_query_error(d, *error)
             })
         }
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
@@ -684,8 +690,27 @@ async fn resolve(
     d: &Dispatch,
     r: &NodeReference,
 ) -> Result<Resolved, ProtocolError> {
-    let (entry, binding) = reference(ctx, r)?;
-    let backend = entry.backend_node_id.ok_or(ProtocolError::StaleReference)?;
+    let (entry, acquisition) = reference(ctx, r)?;
+    let (binding, backend) = if let Some(origin) = &entry.live_query {
+        // Keep the evaluator alive through cancellation so its object groups
+        // settle. Never validate or resolve the captured backend first.
+        let resolved = super::client_observation::resolve_live_query(
+            &ctx.page.client,
+            ctx.observation_frames,
+            origin,
+            &acquisition,
+            ctx.operation,
+        )
+        .await
+        .map_err(|error| live_query_error(d, error))?;
+        ctx.check()?;
+        (resolved.binding, resolved.backend_node_id)
+    } else {
+        (
+            acquisition,
+            entry.backend_node_id.ok_or(ProtocolError::StaleReference)?,
+        )
+    };
     ctx.bounded(async {
         Ok(element::validate_exact_binding_typed(
             &ctx.page.client,
@@ -696,20 +721,6 @@ async fn resolve(
     })
     .await?
     .map_err(|error| exact_resolution_error(d, error))?;
-    if let Some(origin) = &entry.strict_query {
-        // Await the evaluator itself: dropping its future in bounded() would
-        // bypass its mandatory object-group cleanup on cancellation.
-        super::client_observation::validate_strict_query(
-            &ctx.page.client,
-            &binding,
-            backend,
-            origin,
-            ctx.operation,
-        )
-        .await
-        .map_err(|error| strict_query_error(d, error))?;
-        ctx.check()?;
-    }
     let (context, realm) = match &ctx.realm_authority {
         ActionRealmAuthority::Enrolled(enrollment) => {
             let capture = enrollment.reserve_exact_realm(ctx.page, &binding, ctx.operation)?;
@@ -1192,8 +1203,7 @@ async fn action_target(
     r: &NodeReference,
 ) -> Result<Resolved, ProtocolError> {
     let resolved = resolve(ctx, d, r).await?;
-    let (_, binding) = reference(ctx, r)?;
-    if binding.actionable {
+    if resolved.binding.actionable {
         return Ok(resolved);
     }
     let result=ctx.command(d,false,&resolved.session,"Runtime.callFunctionOn",json!({"objectId":resolved.object,"functionDeclaration":"function(){if(this!==document||!this.isConnected)return null;return this.documentElement;}","returnByValue":false})).await;
@@ -1484,11 +1494,21 @@ impl ClientActions {
     ) -> Result<(), ProtocolError> {
         // Scope admission precedes the client-lifetime viewport exception.
         if ctx.refs.is_viewport_ref(&request.reference.id) {
+            if !ctx.refs.matches_viewport_reference(
+                &ctx.page.identity_scope,
+                ctx.operation.generation,
+                &ctx.page.page_session_id,
+                &request.reference.id,
+                &request.reference.revision,
+            ) {
+                return Err(ProtocolError::StaleReference);
+            }
             if let LocatorAction::Swipe {
                 direction,
                 momentum,
             } = request.action
             {
+                require_recovery_observation(ctx)?;
                 return scroll(ctx, d, None, direction, momentum, viewport(ctx, d).await?).await;
             }
             return Err(ProtocolError::NotActionable);
@@ -2980,6 +3000,7 @@ mod tests {
         refs: RefMap,
         blobs: BlobStore,
         frames: HashMap<String, String>,
+        observation_frames: Vec<super::super::client_observation::ObservationFrame>,
         geometry: GeometrySnapshot,
         log: Log,
         server: tokio::task::JoinHandle<()>,
@@ -2996,6 +3017,7 @@ mod tests {
                 refs: &self.refs,
                 revision: 1,
                 iframe_sessions: &self.frames,
+                observation_frames: &self.observation_frames,
                 blobs: &self.blobs,
                 geometry: &self.geometry,
             }
@@ -3115,13 +3137,18 @@ mod tests {
                         json!({"result":[]})
                     }
                     "Accessibility.getPartialAXTree" if mode.starts_with("strict-query") => {
-                        json!({"nodes":[{"nodeId":"a","backendDOMNodeId":42,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}]})
+                        json!({"nodes":[{"nodeId":"a","backendDOMNodeId":request["params"]["backendNodeId"],"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}]})
                     }
                     "Accessibility.getFullAXTree" => {
                         if mode.starts_with("strict-query") {
+                            let role = match mode {
+                                "strict-query-actionable-up" if query_reads == 0 => "RootWebArea",
+                                "strict-query-actionable-down" if query_reads > 0 => "RootWebArea",
+                                _ => "button",
+                            };
                             json!({"nodes":[
-                                {"nodeId":"a","backendDOMNodeId":42,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}},
-                                {"nodeId":"b","backendDOMNodeId":43,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}
+                                {"nodeId":"a","backendDOMNodeId":42,"role":{"type":"role","value":role},"name":{"type":"string","value":"Save"}},
+                                {"nodeId":"b","backendDOMNodeId":43,"role":{"type":"role","value":role},"name":{"type":"string","value":"Save"}}
                             ]})
                         } else if mode.starts_with("focus-root") {
                             let mut nodes = vec![
@@ -3148,6 +3175,21 @@ mod tests {
                             } else {
                                 let indices = if mode == "strict-query-multiple" {
                                     vec![0, 1]
+                                } else if matches!(
+                                    mode,
+                                    "strict-query-nth-shift" | "strict-query-output-filter"
+                                ) {
+                                    if query_reads == 1 {
+                                        vec![0, 1]
+                                    } else {
+                                        vec![1, 0]
+                                    }
+                                } else if mode == "strict-query-explicit-nth" {
+                                    if query_reads == 1 {
+                                        vec![1]
+                                    } else {
+                                        vec![0]
+                                    }
                                 } else if query_reads == 1 {
                                     vec![0]
                                 } else {
@@ -3170,7 +3212,17 @@ mod tests {
                             let count =
                                 request["params"]["arguments"].as_array().unwrap().len() - 2;
                             let metadata = json!({"author":{"tag":"button","nodeType":1,"action":true,"visible":true},"attributes":{},"labels":["Save"],"states":{"secure":false,"hidden":false},"text":"Save","value":"Save","rect":{"x":0,"y":0,"width":100,"height":50}});
-                            json!({"result":{"value":vec![metadata;count]}})
+                            let mut batch = vec![metadata; count];
+                            if mode == "strict-query-output-filter"
+                                && query_reads == 0
+                                && !batch.is_empty()
+                            {
+                                // Deliberately inconsistent projected match metadata exercises
+                                // the defensive output hold, not normal AST visible narrowing.
+                                batch[0]["states"]["hidden"] = json!(true);
+                                batch[0]["author"]["visible"] = json!(false);
+                            }
+                            json!({"result":{"value":batch}})
                         } else if mode.starts_with("focus-root")
                             && source.contains("return this.nodeType===1")
                         {
@@ -3291,6 +3343,7 @@ mod tests {
             cancellation,
         };
         let mut refs = RefMap::new();
+        refs.begin_observation(scope, op.generation, 1);
         refs.bind_exact(
             42,
             "textbox",
@@ -3327,6 +3380,15 @@ mod tests {
         .await
         .unwrap();
         log.lock().unwrap().clear();
+        let observation_frames = vec![super::super::client_observation::ObservationFrame {
+            parent_frame_id: None,
+            owner_backend_id: None,
+            url: "about:blank".into(),
+            binding: refs.get("e1").unwrap().exact_binding.clone().unwrap(),
+            offset_x: 0.,
+            offset_y: 0.,
+            frame_path: vec![],
+        }];
         Fixture {
             gate,
             geometry,
@@ -3337,11 +3399,12 @@ mod tests {
             refs,
             blobs,
             frames: HashMap::new(),
+            observation_frames,
             log,
             server,
         }
     }
-    fn strict_query_frame(f: &Fixture) -> super::super::client_observation::ObservationFrame {
+    fn live_query_frame(f: &Fixture) -> super::super::client_observation::ObservationFrame {
         super::super::client_observation::ObservationFrame {
             parent_frame_id: None,
             owner_backend_id: None,
@@ -3359,7 +3422,7 @@ mod tests {
         super::super::client_observation::QueryResult,
         super::super::client_observation::ObservationError,
     > {
-        let frame = strict_query_frame(f);
+        let frame = live_query_frame(f);
         let options = serde_json::from_value(json!({"expression":expression})).unwrap();
         super::super::client_observation::query(
             &f.page.client,
@@ -3386,7 +3449,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_query_publication_then_tap_refuses_ambiguity_without_input() {
+    async fn live_query_publication_then_tap_refuses_ambiguity_without_input() {
         for (mode, expected, cleanup) in [
             (
                 "strict-query-ambiguous",
@@ -3394,11 +3457,6 @@ mod tests {
                 false,
             ),
             ("strict-query-missing", ProtocolError::StaleReference, false),
-            (
-                "strict-query-replaced",
-                ProtocolError::StaleReference,
-                false,
-            ),
             ("strict-query-cancel", ProtocolError::Cancelled, false),
             ("strict-query-cleanup", ProtocolError::CleanupFailed, true),
             (
@@ -3458,7 +3516,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_query_unique_same_backend_taps_and_keeps_observed_authority() {
+    async fn live_query_unique_same_backend_taps_and_keeps_observed_authority() {
         let mut f = fixture("strict-query-one").await;
         let expression = json!({"kind":"selector","selector":"button"});
         let first = publish_fixture_query(&mut f, expression.clone())
@@ -3467,9 +3525,9 @@ mod tests {
         let reference = first.nodes[0].reference.clone();
         let allocated = f.refs.next_ref_num();
         let repeated = publish_fixture_query(&mut f, expression).await.unwrap();
-        assert_eq!(repeated.nodes[0].reference, reference);
-        assert_eq!(f.refs.next_ref_num(), allocated);
-        assert!(f.refs.get("e1").unwrap().strict_query.is_none());
+        assert_ne!(repeated.nodes[0].reference.id, reference.id);
+        assert_eq!(f.refs.next_ref_num(), allocated + 1);
+        assert!(f.refs.get("e1").unwrap().live_query.is_none());
         ClientActions::default()
             .execute(
                 f.context(),
@@ -3478,7 +3536,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(f.refs.next_ref_num(), allocated);
+        assert_eq!(f.refs.next_ref_num(), allocated + 1);
         assert_eq!(logged_query_matches(&f), 3);
         assert_eq!(
             f.log
@@ -3500,7 +3558,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_pinned_and_multiple_refs_skip_unique_revalidation() {
+    async fn query_pinned_refs_skip_live_revalidation() {
         for (mode, expression, expected_nodes) in [
             (
                 "strict-query-ambiguous",
@@ -3512,18 +3570,13 @@ mod tests {
                 json!({"kind":"filter","source":{"kind":"index","source":{"kind":"query","query":{"kind":"label","value":{"kind":"string","value":"Save","exact":true}}},"index":"first"},"hasText":{"kind":"string","value":"Save","exact":false}}),
                 1,
             ),
-            (
-                "strict-query-multiple",
-                json!({"kind":"selector","selector":"button"}),
-                2,
-            ),
         ] {
             let mut f = fixture(mode).await;
             let query = publish_fixture_query(&mut f, expression).await.unwrap();
             assert_eq!(query.nodes.len(), expected_nodes);
             for node in &query.nodes {
                 let id = element::parse_ref(&node.reference.id).unwrap();
-                assert!(f.refs.get(&id).unwrap().strict_query.is_none());
+                assert!(f.refs.get(&id).unwrap().live_query.is_none());
             }
             let allocated = f.refs.next_ref_num();
             ClientActions::default().execute(f.context(), "browser.perform", &json!({"identityScope":"scope","ref":query.nodes[0].reference,"action":{"kind":"tap"}})).await.unwrap();
@@ -3540,7 +3593,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strict_query_read_preserves_origin_and_reference_without_allocating() {
+    async fn live_query_read_preserves_origin_and_reference_without_allocating() {
         let mut f = fixture("strict-query-one").await;
         let query = publish_fixture_query(&mut f, json!({"kind":"selector","selector":"button"}))
             .await
@@ -3548,12 +3601,13 @@ mod tests {
         let reference = &query.nodes[0].reference;
         let allocated = f.refs.next_ref_num();
         let retained = f.refs.retained_identity_counts();
-        let frame = strict_query_frame(&f);
+        let frame = live_query_frame(&f);
         let options = serde_json::from_value(json!({"ref":reference.id})).unwrap();
         let result = super::super::client_observation::read(
             &f.page.client,
             &[frame],
             &mut f.refs,
+            "scope",
             1,
             &options,
             &f.op,
@@ -3567,8 +3621,233 @@ mod tests {
             .refs
             .get(&element::parse_ref(&reference.id).unwrap())
             .unwrap()
-            .strict_query
+            .live_query
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn live_query_replacement_and_nth_resolve_temporary_targets_without_new_refs() {
+        for (mode, expression, result_index, expected_backend) in [
+            (
+                "strict-query-replaced",
+                json!({"kind":"selector","selector":"button"}),
+                0,
+                43,
+            ),
+            (
+                "strict-query-nth-shift",
+                json!({"kind":"selector","selector":"button"}),
+                1,
+                42,
+            ),
+            (
+                "strict-query-explicit-nth",
+                json!({"kind":"index","source":{"kind":"selector","selector":"button"},"index":1}),
+                0,
+                42,
+            ),
+            (
+                "strict-query-output-filter",
+                json!({"kind":"query","query":{"kind":"placeholder","value":{"kind":"string","value":"Save"},"visible":true}}),
+                0,
+                42,
+            ),
+        ] {
+            let mut f = fixture(mode).await;
+            let found = publish_fixture_query(&mut f, expression).await.unwrap();
+            let reference = found.nodes[result_index].reference.clone();
+            let id = element::parse_ref(&reference.id).unwrap();
+            let acquisition = f.refs.get(&id).unwrap().backend_node_id;
+            let origin = f.refs.get(&id).unwrap().live_query.clone();
+            let before = (
+                f.refs.next_ref_num(),
+                f.refs.retained_identity_counts(),
+                f.refs.retained_query_origin_bytes(),
+            );
+            ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &json!({"identityScope":"scope","ref":reference,"action":{"kind":"tap"}}),
+                )
+                .await
+                .unwrap();
+            let exact_resolve = f
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|request| request["method"] == "DOM.resolveNode")
+                .cloned()
+                .unwrap();
+            assert_eq!(
+                exact_resolve["params"]["backendNodeId"], expected_backend,
+                "{mode}"
+            );
+            assert_ne!(acquisition, Some(expected_backend));
+            assert_eq!(f.refs.get(&id).unwrap().backend_node_id, acquisition);
+            assert_eq!(f.refs.get(&id).unwrap().live_query, origin);
+            assert_eq!(
+                (
+                    f.refs.next_ref_num(),
+                    f.refs.retained_identity_counts(),
+                    f.refs.retained_query_origin_bytes()
+                ),
+                before
+            );
+            let options = serde_json::from_value(json!({"ref":reference.id})).unwrap();
+            let fresh = super::super::client_observation::read(
+                &f.page.client,
+                &f.observation_frames,
+                &mut f.refs,
+                "scope",
+                9,
+                &options,
+                &f.op,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fresh["ref"], serde_json::to_value(&reference).unwrap());
+            assert_eq!(
+                f.log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|request| request["method"] == "Accessibility.getPartialAXTree")
+                    .unwrap()["params"]["backendNodeId"],
+                expected_backend
+            );
+            assert_eq!(
+                (
+                    f.refs.next_ref_num(),
+                    f.refs.retained_identity_counts(),
+                    f.refs.retained_query_origin_bytes()
+                ),
+                before
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn live_actionability_uses_the_current_temporary_binding_not_acquisition_evidence() {
+        for (mode, acquired_actionable, current_actionable) in [
+            ("strict-query-actionable-up", false, true),
+            ("strict-query-actionable-down", true, false),
+        ] {
+            let mut f = fixture(mode).await;
+            let found =
+                publish_fixture_query(&mut f, json!({"kind":"selector","selector":"#target"}))
+                    .await
+                    .unwrap();
+            let reference = found.nodes[0].reference.clone();
+            let id = element::parse_ref(&reference.id).unwrap();
+            assert_eq!(
+                f.refs
+                    .get(&id)
+                    .unwrap()
+                    .exact_binding
+                    .as_ref()
+                    .unwrap()
+                    .actionable,
+                acquired_actionable
+            );
+            let result = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &json!({"identityScope":"scope","ref":reference,"action":{"kind":"tap"}}),
+                )
+                .await;
+            if current_actionable {
+                assert!(result.is_ok(), "{mode}: {result:?}");
+            } else {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.error, ProtocolError::NotActionable);
+                assert_eq!(failure.effects, Effects::NotDispatched);
+            }
+            let document_conversion = f.log.lock().unwrap().iter().any(|request| {
+                request["params"]["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|source| source.contains("return this.documentElement"))
+            });
+            assert_eq!(document_conversion, !current_actionable);
+            assert_eq!(
+                f.refs
+                    .get(&id)
+                    .unwrap()
+                    .exact_binding
+                    .as_ref()
+                    .unwrap()
+                    .actionable,
+                acquired_actionable
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn located_live_and_pinned_issuance_survives_a_new_observation_revision() {
+        for expression in [
+            json!({"kind":"selector","selector":"button"}),
+            json!({"kind":"query","query":{"kind":"label","value":{"kind":"string","value":"Save","exact":true}}}),
+        ] {
+            let mut f = fixture("strict-query-one").await;
+            let first = publish_fixture_query(&mut f, expression.clone())
+                .await
+                .unwrap();
+            let second = publish_fixture_query(&mut f, expression).await.unwrap();
+            let reference = first.nodes[0].reference.clone();
+            assert_ne!(reference.id, second.nodes[0].reference.id);
+            let id = element::parse_ref(&reference.id).unwrap();
+            let source = f.refs.get(&id).unwrap().live_query.clone();
+            f.refs.begin_observation("scope", 1, 9);
+            assert!(f.refs.get("e1").is_none());
+            let observed =
+                f.refs
+                    .bind_exact(42, "button", "", f.observation_frames[0].binding.clone());
+            assert_ne!(format!("@{observed}"), reference.id);
+            let before = f.refs.next_ref_num();
+            let mut context = f.context();
+            context.revision = 9;
+            ClientActions::default()
+                .execute(
+                    context,
+                    "browser.perform",
+                    &json!({"identityScope":"scope","ref":reference,"action":{"kind":"tap"}}),
+                )
+                .await
+                .unwrap();
+            let mut forged = reference.clone();
+            forged.revision = "9".into();
+            let mut context = f.context();
+            context.revision = 9;
+            let failure = ClientActions::default()
+                .execute(
+                    context,
+                    "browser.perform",
+                    &json!({"identityScope":"scope","ref":forged,"action":{"kind":"tap"}}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, ProtocolError::StaleReference);
+            assert_eq!(failure.effects, Effects::NotDispatched);
+            let options = serde_json::from_value(json!({"ref":reference.id})).unwrap();
+            let fresh = super::super::client_observation::read(
+                &f.page.client,
+                &f.observation_frames,
+                &mut f.refs,
+                "scope",
+                9,
+                &options,
+                &f.op,
+            )
+            .await
+            .unwrap();
+            assert_eq!(fresh["ref"], serde_json::to_value(&reference).unwrap());
+            assert_eq!(f.refs.get(&id).unwrap().live_query, source);
+            assert_eq!(f.refs.next_ref_num(), before);
+        }
     }
 
     #[tokio::test]
@@ -3583,7 +3862,7 @@ mod tests {
             assert_eq!(result.unwrap_err(), ObservationError::ResourceLimit);
             assert_eq!(f.refs.next_ref_num(), before);
             assert_eq!(f.refs.retained_identity_counts(), (1, 1));
-            assert!(f.refs.get("e1").unwrap().strict_query.is_none());
+            assert!(f.refs.get("e1").unwrap().live_query.is_none());
         }
         let mut f = fixture("strict-query-one").await;
         f.refs.set_query_origin_byte_limit_for_test(0);
@@ -3896,9 +4175,136 @@ mod tests {
         assert!(duration(Some(60001), 500).is_err());
     }
     #[tokio::test]
+    async fn original_observed_issuance_fills_after_refresh_but_forgery_and_omission_refuse() {
+        let mut f = fixture("strict-query-one").await;
+        let first = NodeReference {
+            id: "@e1".into(),
+            revision: "1".into(),
+        };
+        let binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
+        f.refs.begin_observation("scope", 1, 2);
+        assert_eq!(f.refs.bind_exact(42, "textbox", "", binding.clone()), "e1");
+        let options = serde_json::from_value(json!({"ref":first.id})).unwrap();
+        let fresh = super::super::client_observation::read(
+            &f.page.client,
+            &f.observation_frames,
+            &mut f.refs,
+            "scope",
+            2,
+            &options,
+            &f.op,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fresh["ref"], serde_json::to_value(&first).unwrap());
+        let actions = ClientActions::default();
+        let mut context = f.context();
+        context.revision = 2;
+        context.observed_revision = 2;
+        actions.execute(context,"browser.perform",&json!({"identityScope":"scope","ref":first,"action":{"kind":"fill","value":"late"}})).await.unwrap();
+        assert!(f
+            .inputs()
+            .iter()
+            .any(|request| request["method"] == "Input.insertText"
+                && request["params"]["text"] == "late"));
+        f.log.lock().unwrap().clear();
+        for revision in ["2", "01", "999"] {
+            let failure=actions.execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":{"id":"@e1","revision":revision},"action":{"kind":"fill","value":"forged"}})).await.unwrap_err();
+            assert_eq!(failure.error, ProtocolError::StaleReference);
+            assert_eq!(failure.effects, Effects::NotDispatched);
+        }
+        let baseline = f.refs.clone();
+        f.refs.begin_observation("scope", 1, 3);
+        f.refs.bind_exact(42, "textbox", "", binding);
+        f.refs
+            .retain_snapshot_entries(&baseline, &Default::default());
+        let failure=actions.execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":first,"action":{"kind":"fill","value":"omitted"}})).await.unwrap_err();
+        assert_eq!(failure.error, ProtocolError::StaleReference);
+        assert_eq!(failure.effects, Effects::NotDispatched);
+        assert!(f.log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn viewport_stable_issuance_uses_current_geometry_and_recovery_publication_gate() {
+        let mut f = fixture("normal").await;
+        let first = f
+            .refs
+            .try_viewport_ref("scope", 1, "page", 1)
+            .unwrap()
+            .clone();
+        f.refs.retire_all_references();
+        f.refs.begin_observation("scope", 1, 2);
+        assert_eq!(
+            f.refs.try_viewport_ref("scope", 1, "page", 2).unwrap(),
+            &first
+        );
+        let actions = ClientActions::default();
+        let args = json!({"identityScope":"scope","ref":{"id":format!("@{}",first.id),"revision":"1"},"action":{"kind":"swipe","direction":"down"}});
+        for revision in ["0", "2", "01"] {
+            let mut forged = args.clone();
+            forged["ref"]["revision"] = json!(revision);
+            assert_eq!(
+                actions
+                    .execute(f.context(), "browser.perform", &forged)
+                    .await
+                    .unwrap_err()
+                    .error,
+                ProtocolError::StaleReference
+            );
+        }
+        let mut blocked = f.context();
+        blocked.observation_after = Some(2);
+        blocked.observed_revision = 2;
+        assert_eq!(
+            actions
+                .execute(blocked, "browser.perform", &args)
+                .await
+                .unwrap_err()
+                .error,
+            ProtocolError::StaleReference
+        );
+        assert!(f.inputs().is_empty());
+        let mut allowed = f.context();
+        allowed.revision = 3;
+        allowed.observation_after = Some(2);
+        allowed.observed_revision = 3;
+        actions
+            .execute(allowed, "browser.perform", &args)
+            .await
+            .unwrap();
+        assert!(f
+            .inputs()
+            .iter()
+            .any(|request| request["params"]["type"] == "mouseWheel"
+                && request["params"]["deltaY"] == 100.));
+        assert!(!f
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "DOM.resolveNode"));
+        f.refs.retire_owner_references();
+        f.log.lock().unwrap().clear();
+        assert_eq!(
+            actions
+                .execute(f.context(), "browser.perform", &args)
+                .await
+                .unwrap_err()
+                .error,
+            ProtocolError::StaleReference
+        );
+        assert!(f.log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn viewport_capability_still_rejects_old_scope_and_dom_actions() {
-        let f = fixture("normal").await;
-        let viewport = f.refs.try_viewport_ref().unwrap();
+        let mut f = fixture("normal").await;
+        let viewport = f
+            .refs
+            .try_viewport_ref("scope", 1, "page", 1)
+            .unwrap()
+            .id
+            .clone();
         let actions = ClientActions::default();
         for (scope, kind) in [("old-scope", "swipe"), ("scope", "tap")] {
             let action = if kind == "swipe" {
@@ -3906,7 +4312,7 @@ mod tests {
             } else {
                 json!({"kind":kind})
             };
-            let error=actions.execute(f.context(),"browser.perform",&json!({"identityScope":scope,"ref":{"id":format!("@{viewport}"),"revision":"0"},"action":action})).await.unwrap_err();
+            let error=actions.execute(f.context(),"browser.perform",&json!({"identityScope":scope,"ref":{"id":format!("@{viewport}"),"revision":"1"},"action":action})).await.unwrap_err();
             assert_eq!(error.effects, Effects::NotDispatched);
         }
         assert!(f.inputs().is_empty());
@@ -5565,14 +5971,44 @@ mod tests {
                 .result
                 .map_err(|error| format!("{command}: {error:?}"))
         }
-        fn find(node: &Value, id: &Value) -> Option<Value> {
-            if node["ref"]["id"] == *id {
-                return Some(node["ref"].clone());
+        fn flatten_refs(node: &Value, references: &mut Vec<Value>) {
+            if node["ref"].is_object() {
+                references.push(node["ref"].clone());
             }
-            node["children"]
-                .as_array()?
-                .iter()
-                .find_map(|child| find(child, id))
+            if let Some(children) = node["children"].as_array() {
+                for child in children {
+                    flatten_refs(child, references);
+                }
+            }
+        }
+        async fn correlated_observed_ref(
+            browser: &ClientBrowser,
+            operations: &mut FixtureOperations,
+            sink: &ClientEventSink,
+            scope: &str,
+            located: &Value,
+            snapshot: &Value,
+        ) -> Result<Value, String> {
+            let mut observed = Vec::new();
+            flatten_refs(&snapshot["root"], &mut observed);
+            let result = run(
+                browser,
+                operations,
+                sink,
+                "fixture.correlate",
+                json!({"identityScope":scope,"located":[located],"observed":observed}),
+                2,
+            )
+            .await?;
+            let matches = result["matches"]
+                .as_array()
+                .ok_or("missing acquisition correlations")?;
+            if matches.len() != 1 || matches[0].is_null() || !observed.contains(&matches[0]) {
+                return Err(
+                    "acquisition did not correlate uniquely to a committed observed ref".into(),
+                );
+            }
+            Ok(matches[0].clone())
         }
         let broker = Arc::new(ClientSession::new());
         let browser = ClientBrowser::new(broker.clone());
@@ -5605,7 +6041,7 @@ mod tests {
                 let after=run(&browser,&mut operations,&sink,"page.evaluate",json!({"identityScope":scope,"source":visibility_source,"argument":null}),2).await?;
                 eprintln!("native-observe-visibility after={}",after["value"]);
                 if before["value"]!=after["value"] {return Err("protected observation changed visibility, focus, active element or browser identity".into());}
-                find(&snapshot["root"], &nodes[0]["ref"]["id"]).ok_or("query identity missing from committed observation")?
+                correlated_observed_ref(&browser, &mut operations, &sink, scope, &nodes[0]["ref"], &snapshot).await?
             } else {nodes[0]["ref"].clone()};
             // Actual central dispatch acquires snapshot_for_action; no supplied
             // ref map, synthetic readiness ACK or protected-read bypass.
@@ -5617,7 +6053,7 @@ mod tests {
             run(&browser, &mut operations, &sink, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=radio type=radio>Navigate</label>';document.querySelector('#radio').addEventListener('click',()=>location.replace('about:blank?native-checked-navigation'));return true}","argument":null}), 2).await?;
             let query=run(&browser,&mut operations,&sink,"fixture.query",json!({"identityScope":scope,"expression":{"kind":"selector","selector":"#radio"}}),2).await?;
             let snapshot=run(&browser,&mut operations,&sink,"browser.observe",json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{"pixels":acquisition=="pixels"}}),2).await?;
-            let reference=find(&snapshot["root"],&query["nodes"][0]["ref"]["id"]).ok_or("radio missing from committed snapshot")?;
+            let reference=correlated_observed_ref(&browser,&mut operations,&sink,scope,&query["nodes"][0]["ref"],&snapshot).await?;
             run(&browser,&mut operations,&sink,"browser.perform",json!({"identityScope":scope,"ref":reference,"action":{"kind":"check"}}),2).await?;
             let location=run(&browser,&mut operations,&sink,"page.evaluate",json!({"identityScope":scope,"source":"()=>location.href","argument":null}),2).await?;
             if location["value"]!="about:blank?native-checked-navigation" {return Err("checked radio did not navigate".into());}
@@ -5650,6 +6086,7 @@ mod tests {
             let document = browser.client.send_command("DOM.getDocument",Some(json!({})),Some(&session)).await?;
             let root = document["root"]["nodeId"].as_i64().ok_or("missing document")?;
             let mut refs = RefMap::new();
+            refs.begin_observation(&page.identity_scope, operation.generation, 1);
             let mut ids = HashMap::new();
             for selector in ["#text", "#pick", "#check", "#button"] {
                 let node = browser.client.send_command("DOM.querySelector",Some(json!({"nodeId":root,"selector":selector})),Some(&session)).await?;
@@ -5671,13 +6108,56 @@ mod tests {
                 ("#check", json!({"kind":"check"})),
                 ("#button", json!({"kind":"doubleTap"})),
             ] {
-                actions.execute(ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
+                actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
             }
             let value = evaluate_on(&browser.client,&session,"[document.querySelector('#text').value,document.querySelector('#pick').value,document.querySelector('#check').checked,document.querySelector('#button').dataset.clicked]").await?;
             assert_eq!(value,json!(["native synthetic","b",true,"2"]));
-            actions.execute(ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
+            actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
+            // Exercise old observed handles against actual retained/reinserted
+            // DOM objects, not a selector or a current-ref substitution.
+            use super::super::client_observation::{enumerate_frames, observe, read, ObservationOptions, SemanticNode};
+            fn textbox(nodes: &[SemanticNode]) -> Option<NodeReference> {
+                for node in nodes {
+                    if node.role.as_deref()==Some("textbox") { return Some(node.reference.clone()); }
+                    if let Some(found)=textbox(&node.children) { return Some(found); }
+                }
+                None
+            }
+            let observation_frames=enumerate_frames(&browser.client,&session,&frames,&operation).await?;
+            let first=observe(&browser.client,&observation_frames,&mut refs,&page.identity_scope,2,&ObservationOptions::default(),&operation).await?;
+            let original=textbox(&first.roots).ok_or("Missing original observed textbox")?;
+            let second=observe(&browser.client,&observation_frames,&mut refs,&page.identity_scope,3,&ObservationOptions::default(),&operation).await?;
+            assert_eq!(textbox(&second.roots),Some(original.clone()));
+            assert_ne!(first.revision,second.revision);
+            macro_rules! observed_context { ($revision:expr) => { ActionContext {
+                observation_frames:&observation_frames, observation_after:None, observed_revision:$revision,
+                realm_authority:ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,
+                page_state:&state,refs:&refs,revision:$revision,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry
+            } } }
+            let fill_original=|value:&str|json!({"identityScope":page.identity_scope,"ref":original,"action":{"kind":"fill","value":value}});
+            actions.execute(observed_context!(3),"browser.perform",&fill_original("late")).await.map_err(|error|format!("Original observed fill failed: {:?}",error.error))?;
+            assert_eq!(evaluate_on(&browser.client,&session,"document.querySelector('#text').value").await?,json!("late"));
+            let read_options=serde_json::from_value(json!({"ref":original.id})).unwrap();
+            let fresh=read(&browser.client,&observation_frames,&mut refs,&page.identity_scope,3,&read_options,&operation).await?;
+            assert_eq!(fresh["ref"],serde_json::to_value(&original).unwrap());
+            evaluate_on(&browser.client,&session,"globalThis.savedObservedInput=document.querySelector('#text');savedObservedInput.remove();true").await?;
+            let detached=actions.execute(observed_context!(3),"browser.perform",&fill_original("detached")).await.unwrap_err();
+            assert_eq!(detached.error,ProtocolError::StaleReference);assert_eq!(detached.effects,Effects::NotDispatched);
+            observe(&browser.client,&observation_frames,&mut refs,&page.identity_scope,4,&ObservationOptions::default(),&operation).await?;
+            assert!(refs.get(original.id.trim_start_matches('@')).is_none());
+            evaluate_on(&browser.client,&session,"document.body.prepend(savedObservedInput);true").await?;
+            let reinserted=observe(&browser.client,&observation_frames,&mut refs,&page.identity_scope,5,&ObservationOptions::default(),&operation).await?;
+            assert_eq!(textbox(&reinserted.roots),Some(original.clone()));
+            actions.execute(observed_context!(5),"browser.perform",&fill_original("reinserted")).await.map_err(|error|format!("Reinserted original fill failed: {:?}",error.error))?;
+            assert_eq!(evaluate_on(&browser.client,&session,"savedObservedInput.value").await?,json!("reinserted"));
+            evaluate_on(&browser.client,&session,"savedObservedInput.replaceWith(savedObservedInput.cloneNode(true));true").await?;
+            let replaced=observe(&browser.client,&observation_frames,&mut refs,&page.identity_scope,6,&ObservationOptions::default(),&operation).await?;
+            assert_ne!(textbox(&replaced.roots),Some(original.clone()));
+            let stale=actions.execute(observed_context!(6),"browser.perform",&fill_original("wrong replacement")).await.unwrap_err();
+            assert_eq!(stale.error,ProtocolError::StaleReference);assert_eq!(stale.effects,Effects::NotDispatched);
+            assert_eq!(evaluate_on(&browser.client,&session,"document.querySelector('#text').value").await?,json!("reinserted"));
             evaluate_on(&browser.client,&session,"document.querySelector('#button').remove(); true").await?;
-            assert!(actions.execute(ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
+            assert!(actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
             actions.cleanup().await.map_err(|_|"cleanup failed")?;
             Ok::<(),String>(())
         }.await;
@@ -5714,18 +6194,18 @@ mod tests {
             let described=page.client.send_command("DOM.describeNode",Some(json!({"objectId":object_id})),Some(&frame.binding.session)).await?;
             page.client.send_command("Runtime.releaseObject",Some(json!({"objectId":object_id})),Some(&frame.binding.session)).await?;
             let backend=described["node"]["backendNodeId"].as_i64().ok_or("Button backend missing")?;
-            let mut refs=RefMap::new();let mut binding=frame.binding.clone();binding.actionable=true;
+            let mut refs=RefMap::new();refs.begin_observation(&page.identity_scope,operation.generation,1);let mut binding=frame.binding.clone();binding.actionable=true;
             let id=format!("@{}",refs.bind_exact(backend,"button","Nested",binding));
             let geometry=GeometrySnapshot::capture(&page.client,&session,&inventory,&operation).await.map_err(|_|"Geometry proof failed")?;
             let state=ClientPageState::new(page.identity_scope.clone(),"fixture".into());let blobs=BlobStore::new(BlobLimits::default()).unwrap();
             blobs.activate_scope(BlobScope{generation:1,identity_scope:page.identity_scope.clone()}).unwrap();
             let sessions=HashMap::new();let actions=ClientActions::default();
             let args=json!({"identityScope":page.identity_scope,"ref":{"id":id,"revision":"1"},"action":{"kind":"tap"}});
-            actions.execute(ActionContext{ observation_after: None, observed_revision: 0,realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.map_err(|e|format!("Nested action failed: {:?}",e.error))?;
+            actions.execute(ActionContext{ observation_frames: &[], observation_after: None, observed_revision: 0,realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.map_err(|e|format!("Nested action failed: {:?}",e.error))?;
             assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
             evaluate_on(&page.client,&session,"const cover=document.createElement('div');cover.style.cssText='position:fixed;inset:0;z-index:999;background:red';document.body.append(cover);true").await?;
             operation.deadline=Instant::now()+Duration::from_secs(2);
-            let error=actions.execute(ActionContext{ observation_after: None, observed_revision: 0,realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.unwrap_err();
+            let error=actions.execute(ActionContext{ observation_frames: &[], observation_after: None, observed_revision: 0,realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.unwrap_err();
             assert_eq!(error.error,ProtocolError::NotActionable);assert_eq!(error.reason,Some(ActionReason::InterceptedPointer));
             assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
             actions.cleanup().await.map_err(|_|"Action cleanup failed")?;Ok::<(),String>(())
@@ -5790,12 +6270,12 @@ mod tests {
             blobs.activate_scope(first_scope.clone()).unwrap();
             let first_geometry=action_fixture_geometry(&first_page,&operation).await?;
             let second_geometry=action_fixture_geometry(&second_page,&operation).await?;
-            let first_context = || ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&first_page,operation:&operation,page_state:&first_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&first_geometry};
+            let first_context = || ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&first_page,operation:&operation,page_state:&first_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&first_geometry};
             actions.execute(first_context(), "recording.start", &json!({"identityScope":first_page.identity_scope,"size":{"width":320,"height":200},"quality":70})).await.map_err(|e|format!("record start {:?}",e.error))?;
             actions.recording_page_closing(&first_page.identity_scope, &blobs).await.map_err(|e|format!("record close {e:?}"))?;
             blobs.revoke_scope(&first_scope).unwrap();
             blobs.activate_scope(second_scope.clone()).unwrap();
-            let second_context = || ActionContext { observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&second_page,operation:&operation,page_state:&second_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&second_geometry};
+            let second_context = || ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&second_page,operation:&operation,page_state:&second_state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&second_geometry};
             actions.recording_page_opened(second_context()).await.map_err(|e|format!("record reopen {:?}",e.error))?;
             let output = actions.execute(second_context(), "recording.stop", &json!({"identityScope":second_page.identity_scope})).await.map_err(|e|format!("record stop {:?}",e.error))?;
             let segments = output["segments"].as_array().ok_or("missing segments")?;

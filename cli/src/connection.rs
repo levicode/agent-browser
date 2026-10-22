@@ -1,4 +1,8 @@
 use crate::validation::sanitize_session_component;
+
+#[cfg(test)]
+#[path = "../tests/fixtures/client_proxy_trace.rs"]
+pub(crate) mod client_proxy_trace;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::env;
@@ -1176,7 +1180,15 @@ pub fn proxy_client_session(session: &str) -> Result<(), String> {
         ),
     };
     std::thread::spawn(move || {
+        #[cfg(not(test))]
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut input_socket);
+        #[cfg(test)]
+        let _ = client_proxy_trace::copy(
+            &mut std::io::stdin().lock(),
+            &mut input_socket,
+            client_proxy_trace::Leg::StdinRead,
+            client_proxy_trace::Leg::SocketWrite,
+        );
         match input_socket {
             #[cfg(unix)]
             Connection::Unix(stream) => {
@@ -1188,7 +1200,16 @@ pub fn proxy_client_session(session: &str) -> Result<(), String> {
         }
     });
     let mut output = std::io::stdout().lock();
-    std::io::copy(&mut socket, &mut output).map_err(|_| "Session transport closed".to_string())?;
+    #[cfg(not(test))]
+    let copied = std::io::copy(&mut socket, &mut output);
+    #[cfg(test)]
+    let copied = client_proxy_trace::copy(
+        &mut socket,
+        &mut output,
+        client_proxy_trace::Leg::SocketRead,
+        client_proxy_trace::Leg::StdoutWrite,
+    );
+    copied.map_err(|_| "Session transport closed".to_string())?;
     output
         .flush()
         .map_err(|_| "Session output closed".to_string())

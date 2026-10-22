@@ -15,6 +15,15 @@ default = []
 # Never enable in a distributed runtime or bundle.
 acceptance-faults = []
 
+# Explicit test-only child used by the TypeScript real-proxy contract suite.
+# No CLI entry point is added, and normal cargo test does not execute it.
+[[test]]
+name = "client-proxy-fixture"
+path = "tests/fixtures/client_proxy_fixture.rs"
+harness = false
+test = false
+required-features = ["acceptance-faults"]
+
 [dependencies]
 tempfile = "3"
 serde = { version = "1.0", features = ["derive"] }

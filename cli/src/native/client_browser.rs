@@ -1803,7 +1803,7 @@ impl ClientBrowser {
                 // A poisoned map must not drop a live browser manager.
                 refs.lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
-                    .invalidate_all_documents();
+                    .retire_owner_references();
                 let mut resource = owner.lock().await.take().ok_or(ProtocolError::StaleScope)?;
                 if let Err(error) = resource.dispose_context().await {
                     // Retain the resource for shutdown rather than dropping a
@@ -2055,7 +2055,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     .map(|_| None)
             }
             "scope.configure" | "browser.observe" | "browser.query" | "fixture.query"
-            | "capture.screenshot" => Ok(None),
+            | "fixture.correlate" | "capture.screenshot" => Ok(None),
             "page.navigate"
             | "page.reload"
             | "page.back"
@@ -2292,7 +2292,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         }
         if matches!(
             command.as_str(),
-            "browser.observe" | "browser.query" | "fixture.query" | "capture.screenshot"
+            "browser.observe"
+                | "browser.query"
+                | "fixture.query"
+                | "fixture.correlate"
+                | "capture.screenshot"
         ) {
             use super::client_observation_dispatch::{
                 DispatchContext, DispatchRequest, QueryPurpose, QueryRequest,
@@ -2300,6 +2304,9 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let value = serde_json::Value::Object(args);
             let request = match command.as_str() {
                 "browser.observe" => serde_json::from_value(value).map(DispatchRequest::Observe),
+                "fixture.correlate" => {
+                    serde_json::from_value(value).map(DispatchRequest::Correlate)
+                }
                 "capture.screenshot" => {
                     serde_json::from_value(value).map(DispatchRequest::Screenshot)
                 }
@@ -2495,15 +2502,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         }
                     })?;
                     let (revision, refs, observed_revision) = observation.snapshot_with_observation(&lease).await?;
-                    let sessions = frames.into_iter().filter(|frame| frame.parent_frame_id.is_some())
-                        .map(|frame| (frame.binding.frame, frame.binding.session)).collect::<std::collections::HashMap<_,_>>();
-                    Ok((ui_permit, input_permit, revision, refs, sessions, geometry, observed_revision))
+                    let sessions = frames.iter().filter(|frame| frame.parent_frame_id.is_some())
+                        .map(|frame| (frame.binding.frame.clone(), frame.binding.session.clone())).collect::<std::collections::HashMap<_,_>>();
+                    Ok((ui_permit, input_permit, revision, refs, frames, sessions, geometry, observed_revision))
                 }.await;
-                let (_ui, _input, revision, refs, sessions, geometry, observed_revision) = match preflight {
+                let (_ui, _input, revision, refs, frames, sessions, geometry, observed_revision) = match preflight {
                     Ok(value) => value,
                     Err(error) => { let cleanup_failed = error == ProtocolError::CleanupFailed; return (NativeOutcome { result: Err(error), effects: if activation_dispatched { Effects::Unknown } else { Effects::NotDispatched } }, cleanup_failed); },
                 };
-                match actions.execute(super::client_actions::ActionContext { observation_after, observed_revision, page:&page, operation:&lease, page_state:&page_state, refs:&refs, revision, iframe_sessions:&sessions, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }, &command, &serde_json::Value::Object(args)).await {
+                match actions.execute(super::client_actions::ActionContext { observation_after, observed_revision, page:&page, operation:&lease, page_state:&page_state, refs:&refs, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }, &command, &serde_json::Value::Object(args)).await {
                     Ok(value) => {
                         if command == "recording.start" { page_active.store(true, std::sync::atomic::Ordering::SeqCst); }
                         (NativeOutcome { result: Ok(value), effects: Effects::Completed }, false)
@@ -3195,7 +3202,7 @@ impl ClientBrowser {
                 effects = true;
                 page_state.release_input(&page).await.inspect_err(|_| { dirty = true; })?;
                 actions.recording_page_closing(&scope, &blobs).await.inspect_err(|_| { dirty = true; })?;
-                refs.lock().map_err(|_| ProtocolError::ScopeUnavailable)?.invalidate_all_documents();
+                refs.lock().map_err(|_| ProtocolError::ScopeUnavailable)?.retire_owner_references();
                 let replacement = super::client_restart::replace_pages(&context).await.map_err(|failure| {
                     dirty |= failure.cleanup_integrity_lost || failure.effects_started;
                     failure.error
@@ -3218,8 +3225,8 @@ impl ClientBrowser {
                     let frames = super::client_observation_dispatch::verified_frames(&next, &operation).await?;
                     let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
-                    let sessions = frames.into_iter().filter(|frame| frame.parent_frame_id.is_some()).map(|frame| (frame.binding.frame, frame.binding.session)).collect();
-                    actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
+                    let sessions = frames.iter().filter(|frame| frame.parent_frame_id.is_some()).map(|frame| (frame.binding.frame.clone(), frame.binding.session.clone())).collect();
+                    actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
                 }
                 if *operation.cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
                 if std::time::Instant::now() >= operation.deadline { return Err(ProtocolError::DeadlineExceeded); }
@@ -3395,7 +3402,7 @@ impl ClientBrowser {
                     .await?;
                 refs.lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
-                    .invalidate_all_documents();
+                    .retire_owner_references();
                 check_lifecycle_budget(&operation)?;
                 resource.replace_cleaned_context(&operation).await?;
                 let authority = resource
@@ -3482,9 +3489,11 @@ impl ClientBrowser {
                         let (revision, references) =
                             observation.snapshot_for_action(&operation).await?;
                         let sessions = frames
-                            .into_iter()
+                            .iter()
                             .filter(|frame| frame.parent_frame_id.is_some())
-                            .map(|frame| (frame.binding.frame, frame.binding.session))
+                            .map(|frame| {
+                                (frame.binding.frame.clone(), frame.binding.session.clone())
+                            })
                             .collect();
                         actions
                             .recording_page_opened(super::client_actions::ActionContext {
@@ -3496,6 +3505,7 @@ impl ClientBrowser {
                                 refs: &references,
                                 revision,
                                 iframe_sessions: &sessions,
+                                observation_frames: &frames,
                                 blobs: &blobs,
                                 geometry: &geometry,
                                 realm_authority:
@@ -3722,7 +3732,7 @@ impl ClientBrowser {
                     observation.snapshot_with_observation(&operation).await?.2;
                 refs.lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
-                    .invalidate_all_documents();
+                    .retire_owner_references();
                 // Exact terminal local cleanup has settled; this closes only the
                 // old socket. Host page/context ownership is never acquired.
                 resource.manager.client.close().await;
@@ -3798,9 +3808,9 @@ impl ClientBrowser {
                     let (revision, references) =
                         observation.snapshot_for_action(&operation).await?;
                     let sessions = frames
-                        .into_iter()
+                        .iter()
                         .filter(|frame| frame.parent_frame_id.is_some())
-                        .map(|frame| (frame.binding.frame, frame.binding.session))
+                        .map(|frame| (frame.binding.frame.clone(), frame.binding.session.clone()))
                         .collect();
                     actions
                         .recording_page_opened(super::client_actions::ActionContext {
@@ -3812,6 +3822,7 @@ impl ClientBrowser {
                             refs: &references,
                             revision,
                             iframe_sessions: &sessions,
+                            observation_frames: &frames,
                             blobs: &blobs,
                             geometry: &geometry,
                             realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(

@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+#[path = "client_reference_correlation.rs"]
+mod reference_correlation;
+pub use reference_correlation::CorrelateRequest;
 
 #[derive(Debug)]
 pub struct DispatchFailure {
@@ -56,6 +59,7 @@ pub struct QueryRequest {
     pub purpose: QueryPurpose,
 }
 pub enum DispatchRequest {
+    Correlate(CorrelateRequest),
     Observe(ObserveRequest),
     Query(QueryRequest),
     Screenshot(CaptureRequest),
@@ -271,7 +275,26 @@ impl ObservationDispatch {
             _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(failure(ProtocolError::DeadlineExceeded)),
         };
         check(&context.page, &operation).map_err(failure)?;
+        // Correlation reads committed authority only. It must return before any
+        // revision staging, clone publication, pixel reservation or journal.
+        if let DispatchRequest::Correlate(request) = &request {
+            let value = reference_correlation::run(
+                self,
+                &context,
+                request,
+                &operation,
+                publication.observed_revision,
+                &observation_cleanup,
+            )
+            .await
+            .map_err(failure)?;
+            return Ok(Output {
+                value,
+                handles: vec![],
+            });
+        }
         let publication_kind = match &request {
+            DispatchRequest::Correlate(_) => return Err(failure(ProtocolError::InvalidArguments)),
             DispatchRequest::Observe(_) => PublicationKind::Snapshot,
             DispatchRequest::Query(_) => PublicationKind::AdditiveQuery,
             DispatchRequest::Screenshot(_) => PublicationKind::PixelsOnly,
@@ -341,6 +364,7 @@ impl ObservationDispatch {
                 geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(map_geometry)?);
             }
             match request {
+                DispatchRequest::Correlate(_) => Err(ProtocolError::InvalidArguments),
                 DispatchRequest::Query(query) => {
                     let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     let mut output = observation::query(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &query.options, &operation).await.map_err(map_observation)?;
@@ -457,7 +481,10 @@ impl ObservationDispatch {
                 .lock()
                 .map_err(|_| failure(ProtocolError::ScopeUnavailable))?
                 .clone();
-            staged.begin_snapshot();
+            // A tree-unavailable semantic fallback retires located authority too.
+            // Standalone pixels-only publication does not take this branch.
+            staged.retire_all_references();
+            staged.begin_observation(&capture_context.page.identity_scope, operation.generation, revision);
             let selector = fallback_selector
                 .as_deref()
                 .ok_or_else(|| failure(ProtocolError::PolicyDenied))?;
@@ -651,12 +678,16 @@ async fn fresh_fallback<'a>(
         same_frames(&context.frames, &frozen)?;
         geometry = Some(GeometrySnapshot::capture(&context.page.client, &context.page.page_session_id, &frozen, operation).await.map_err(geometry_error)?);
         let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
-        let root = minimal_document(&context.page, &frozen, refs, revision, operation).await?;
-        let viewport_ref = refs.try_viewport_ref().map_err(|_| ProtocolError::IdentifierExhausted)?;
+        let root = minimal_document(&context.page, &frozen, refs, operation).await?;
+        let viewport_ref = {
+            let viewport = refs.try_viewport_ref(&context.page.identity_scope, operation.generation,
+                &context.page.page_session_id, revision).map_err(|_| ProtocolError::IdentifierExhausted)?;
+            observation::NodeReference { id: format!("@{}", viewport.id), revision: viewport.issuance.revision.to_string() }
+        };
         let viewport = viewport(&context.page, operation).await?;
         let pixels = client_capture::capture_under_journal(context, &CaptureRequest { secure_field_selector: selector.to_owned() }, &pixel_lease(operation), &mut journal, geometry).await.map_err(capture_error)?;
         let value = json!({"identityScope":context.page.identity_scope,"revision":revision.to_string(),"root":{"ref":root},
-            "viewportRef":{"id":format!("@{viewport_ref}"),"revision":revision.to_string()},"truncated":true,"treeUnavailable":true,
+            "viewportRef":viewport_ref,"truncated":true,"treeUnavailable":true,
             "viewport":viewport,"location":main_frame(&frozen)?.url});
         Ok::<_, ProtocolError>((value, pixels))
     }.await;
@@ -706,6 +737,7 @@ fn validate_policy(policy: &ReadPolicy, request: &DispatchRequest) -> Result<(),
         return Err(ProtocolError::PolicyDenied);
     }
     let matches = match request {
+        DispatchRequest::Correlate(_) => true,
         DispatchRequest::Observe(request) => {
             policy.test_id_attribute == request.test_id_attribute
                 && policy.secure_field_selector == request.secure_field_selector
@@ -1096,7 +1128,6 @@ async fn minimal_document(
     page: &BrowserExecutionLease,
     frames: &[ObservationFrame],
     refs: &mut RefMap,
-    revision: u64,
     operation: &OperationLease,
 ) -> Result<observation::NodeReference, ProtocolError> {
     let main = main_frame(frames)?;
@@ -1121,7 +1152,11 @@ async fn minimal_document(
         .map_err(|_| ProtocolError::IdentifierExhausted)?;
     Ok(observation::NodeReference {
         id: format!("@{reference}"),
-        revision: revision.to_string(),
+        revision: refs
+            .get(&reference)
+            .and_then(|entry| entry.issued_revision())
+            .ok_or(ProtocolError::StaleReference)?
+            .to_string(),
     })
 }
 async fn viewport(
@@ -2521,9 +2556,11 @@ mod tests {
         let mut foreign = frames.clone();
         foreign[0].binding.loader = "new".into();
         assert!(exact_root(vec![root.clone()], &refs, &foreign).is_err());
-        let viewport = refs.try_viewport_ref().unwrap();
+        let viewport = refs
+            .try_viewport_ref("scope", 1, &frames[0].binding.page_session, 1)
+            .unwrap();
         let mut fake = root;
-        fake.reference.id = format!("@{viewport}");
+        fake.reference.id = format!("@{}", viewport.id);
         assert!(exact_root(vec![fake], &refs, &frames).is_err());
     }
     #[test]

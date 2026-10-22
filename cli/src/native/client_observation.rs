@@ -6,7 +6,7 @@ use super::{
         types::{AXNode, GetFullAXTreeResult},
     },
     client_session::{CancelSignal, OperationLease},
-    element::{ExactBinding, RefMap, StrictQueryOrigin},
+    element::{ExactBinding, LiveQueryOrigin, LocatedIssuance, RefEntry, RefMap},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -914,23 +914,27 @@ fn project_node_with_refs(
         && !author
             .as_ref()
             .is_some_and(|facts| matches!(facts.node_type, 3 | 9));
-    let id = if let Some(refs) = refs {
+    let (id, issued_revision) = if let Some(refs) = refs {
         let id = if data["__nativeReadonlyPseudo"] == true {
             refs.try_bind_readonly_pseudo(backend, role.as_deref().unwrap_or(""), binding)
         } else {
             refs.try_bind_exact(backend, role.as_deref().unwrap_or(""), "", binding)
         }
         .map_err(reference_allocation_error)?;
-        format!("@{id}")
+        let issued = refs
+            .get(&id)
+            .and_then(RefEntry::issued_revision)
+            .ok_or(ObservationError::StaleReference)?;
+        (format!("@{id}"), issued)
     } else {
         // Internal candidates never carry public reference authority.
-        String::new()
+        (String::new(), revision)
     };
     let mut node = SemanticNode {
         author,
         reference: NodeReference {
             id,
-            revision: revision.to_string(),
+            revision: issued_revision.to_string(),
         },
         role,
         name: ax_string(&ax.name).filter(|name| !name.is_empty()),
@@ -1348,7 +1352,7 @@ pub async fn observe(
         return Err(ObservationError::InvalidArguments);
     }
     let mut staged = refs.clone();
-    staged.begin_snapshot();
+    staged.begin_observation(identity_scope, lease.generation, revision);
     let mut frame_roots: HashMap<String, Vec<SemanticNode>> = HashMap::new();
     let mut count = 0;
     let mut truncated = false;
@@ -1497,18 +1501,21 @@ pub async fn observe(
     for root in &mut roots {
         scrub_sensitive_ancestors(root);
     }
+    let viewport = staged
+        .try_viewport_ref(
+            identity_scope,
+            lease.generation,
+            &query_root(frames)?.binding.page_session,
+            revision,
+        )
+        .map_err(|_| ObservationError::BackendFailure)?;
     let viewport_ref = NodeReference {
-        id: format!(
-            "@{}",
-            staged
-                .try_viewport_ref()
-                .map_err(|_| ObservationError::BackendFailure)?
-        ),
-        revision: revision.to_string(),
+        id: format!("@{}", viewport.id),
+        revision: viewport.issuance.revision.to_string(),
     };
     // Acquiring metadata does not publish authority for hidden/compacted-away
-    // candidates. Preserve pre-existing authority and the emitted tree only;
-    // the shared monotonic allocator still burns every staged reservation.
+    // candidates. Preserve located authority and exactly the emitted observed
+    // tree; the shared monotonic allocator still burns every staged reservation.
     let mut published = std::collections::HashSet::new();
     let mut pending = roots.iter().collect::<Vec<_>>();
     while let Some(node) = pending.pop() {
@@ -1517,7 +1524,7 @@ pub async fn observe(
         published.insert(id);
         pending.extend(node.children.iter());
     }
-    staged.retain_query_additions(refs, &published);
+    staged.retain_snapshot_entries(refs, &published);
     let hidden_frame_proof =
         HiddenFrameProof::new(frames, &hidden_owners, skipped_frames, options)?;
     check(lease)?;
@@ -1658,13 +1665,14 @@ pub struct ReadOptions {
 /// A full read is unbounded. Field selection is a wire projection, never a way
 /// to bypass secure-field checks or native identity validation.
 /// Unlike the public engine session's cached locate read, this native primitive
-/// reads fresh exact-backend metadata. Strict origins constrain actions only;
-/// this read preserves the requested reference and its provenance unchanged.
+/// freshly resolves live sources or reads an exact acquisition. It preserves
+/// the requested ID and stored issuance revision without publication.
 pub async fn read(
     client: &CdpClient,
     frames: &[ObservationFrame],
     refs: &mut RefMap,
-    revision: u64,
+    identity_scope: &str,
+    _revision: u64,
     options: &ReadOptions,
     lease: &OperationLease,
 ) -> Result<Value, ObservationError> {
@@ -1677,23 +1685,40 @@ pub async fn read(
         .get(&id)
         .cloned()
         .ok_or(ObservationError::StaleReference)?;
-    let binding = entry
+    let root = query_root(frames)?;
+    if !entry.matches_scope(identity_scope, lease.generation, &root.binding.page_session) {
+        return Err(ObservationError::StaleReference);
+    }
+    let issued_revision = entry
+        .issued_revision()
+        .ok_or(ObservationError::StaleReference)?;
+    let acquired = entry
         .exact_binding
         .as_ref()
         .ok_or(ObservationError::InvalidArguments)?;
+    let resolved = match &entry.live_query {
+        Some(origin) => Some(resolve_live_query(client, frames, origin, acquired, lease).await?),
+        None => None,
+    };
+    let binding = resolved
+        .as_ref()
+        .map(|resolved| &resolved.binding)
+        .unwrap_or(acquired);
+    let backend = resolved
+        .as_ref()
+        .map(|resolved| resolved.backend_node_id)
+        .or(entry.backend_node_id)
+        .ok_or(ObservationError::StaleReference)?;
     let frame = frames
         .iter()
-        .find(|f| {
-            f.binding.page_session == binding.page_session
-                && f.binding.session == binding.session
-                && f.binding.frame == binding.frame
-                && f.binding.loader == binding.loader
+        .find(|frame| {
+            frame.binding.page_session == binding.page_session
+                && frame.binding.session == binding.session
+                && frame.binding.frame == binding.frame
+                && frame.binding.loader == binding.loader
         })
         .ok_or(ObservationError::StaleReference)?;
-    validate_frame(client, frame, lease).await?;
-    let backend = entry
-        .backend_node_id
-        .ok_or(ObservationError::StaleReference)?;
+    validate_frame_ancestry(client, frames, frame, lease).await?;
     let partial = command(
         client,
         &binding.session,
@@ -1714,7 +1739,7 @@ pub async fn read(
         frame,
         backend,
         ax,
-        revision,
+        issued_revision,
         &ObservationOptions {
             test_id_attribute: options.test_id_attribute.clone(),
             secure_field_selector: options.secure_field_selector.clone(),
@@ -1724,11 +1749,11 @@ pub async fn read(
         false,
     )
     .await?;
-    validate_frame(client, frame, lease).await?;
+    validate_frame_ancestry(client, frames, frame, lease).await?;
     check(lease)?;
     node.reference = NodeReference {
         id: format!("@{id}"),
-        revision: revision.to_string(),
+        revision: issued_revision.to_string(),
     };
     let result = project_read_fields(node, options.fields.as_deref())?;
     Ok(result)
@@ -1873,9 +1898,8 @@ const MATCH_QUERY: &str = r#"function(expression, data, labels, safeNames, secur
  try { return {indices:evaluate(expression),redacted}; } catch(error) { return {error:error===matcherLimit?"resource-limit":"invalid-arguments"}; }
 }"#;
 
-/// Query the browser's DOM/AX primitives, not a previously truncated observation.
-/// A failed query cannot change the action registry; successful queries add exact
-/// handles without retiring the last published observation.
+/// Query matching and publication are separate: each acquisition publishes fresh
+/// located IDs, while retained live sources later resolve without an allocator.
 pub async fn query(
     client: &CdpClient,
     frames: &[ObservationFrame],
@@ -1887,58 +1911,67 @@ pub async fn query(
 ) -> Result<QueryResult, ObservationError> {
     validate_expression(&options.expression, 0)?;
     let (path, expression) = split_frame_expression(&options.expression)?;
-    let mut candidates: Vec<&ObservationFrame> = frames
+    let frame = query_frame(client, frames, &path, options, lease, false).await?;
+    let evaluated = evaluate_query(client, frame, &expression, options, lease).await?;
+    let pinned = query_uses_pinned_handles(&expression);
+    let origin_budget = refs
+        .located_origin_budget(evaluated.matches.len())
+        .map_err(reference_allocation_error)?;
+    let mut origin_bytes = 0usize;
+    let origins = evaluated
+        .matches
         .iter()
-        .filter(|f| f.parent_frame_id.is_none())
-        .collect();
-    if candidates.len() != 1 {
-        return Err("Query requires exactly one document scope".into());
-    }
-    let mut frame = candidates.remove(0);
-    for selector in path {
-        frame = select_frame(client, frames, frame, &selector, lease).await?;
-    }
-    let matches = evaluate_query(client, frame, &expression, options, lease).await?;
-    let strict_query = if matches.len() == 1 && !query_uses_pinned_handles(&expression) {
-        let local_options = QueryOptions {
-            expression,
-            ..options.clone()
-        };
-        Some(StrictQueryOrigin::new(
-            serde_json::to_string(&local_options).map_err(|_| ObservationError::BackendFailure)?,
-        ))
-    } else {
-        None
-    };
+        .enumerate()
+        .map(|(index, matched)| {
+            if index % 32 == 0 {
+                check(lease)?;
+            }
+            if pinned {
+                return Ok(None);
+            }
+            let source = LiveQuerySource {
+                options: options.clone(),
+                selection: retained_query_selection(
+                    evaluated.projection_count,
+                    matched.projection_index,
+                ),
+            };
+            let source =
+                serde_json::to_string(&source).map_err(|_| ObservationError::BackendFailure)?;
+            origin_bytes = origin_bytes
+                .checked_add(source.len())
+                .ok_or(ObservationError::ResourceLimit)?;
+            if origin_bytes > origin_budget {
+                return Err(ObservationError::ResourceLimit);
+            }
+            Ok(Some(LiveQueryOrigin::new(source)))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    check(lease)?;
     let mut staged = refs.clone();
-    let mut nodes = Vec::with_capacity(matches.len());
-    if strict_query.is_none() {
-        staged
-            .check_exact_admission(
-                &frame.binding,
-                &matches
-                    .iter()
-                    .map(|(backend, _)| *backend)
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(reference_allocation_error)?;
-    }
-    for (backend, mut node) in matches {
-        let mut binding = frame.binding.clone();
-        binding.actionable = !matches!(
-            node.role.as_deref(),
-            Some("document" | "text" | "InlineTextBox")
-        ) && !node
-            .author
-            .as_ref()
-            .is_some_and(|facts| matches!(facts.node_type, 3 | 9));
-        let id = staged
-            .try_bind_exact_with_origin(
-                backend,
+    check(lease)?;
+    let mut nodes = Vec::with_capacity(evaluated.matches.len());
+    let issuance = LocatedIssuance {
+        identity_scope: identity_scope.into(),
+        generation: lease.generation,
+        revision,
+    };
+    let mut admitted = staged
+        .admit_located_batch(&origins)
+        .map_err(reference_allocation_error)?;
+    for (index, (matched, origin)) in evaluated.matches.into_iter().zip(origins).enumerate() {
+        if index % 32 == 0 {
+            check(lease)?;
+        }
+        let mut node = matched.node;
+        let binding = actionable_binding(frame, &node);
+        let id = admitted
+            .try_bind(
+                matched.backend_node_id,
                 node.role.as_deref().unwrap_or(""),
-                "",
                 binding,
-                strict_query.clone(),
+                issuance.clone(),
+                origin,
             )
             .map_err(reference_allocation_error)?;
         node.reference = NodeReference {
@@ -1947,7 +1980,7 @@ pub async fn query(
         };
         nodes.push(node);
     }
-    validate_frame(client, frame, lease).await?;
+    validate_frame_ancestry(client, frames, frame, lease).await?;
     check(lease)?;
     *refs = staged;
     Ok(QueryResult {
@@ -1955,6 +1988,65 @@ pub async fn query(
         revision,
         nodes,
     })
+}
+
+fn actionable_binding(frame: &ObservationFrame, node: &SemanticNode) -> ExactBinding {
+    let mut binding = frame.binding.clone();
+    binding.actionable = !matches!(
+        node.role.as_deref(),
+        Some("document" | "text" | "InlineTextBox")
+    ) && !node
+        .author
+        .as_ref()
+        .is_some_and(|facts| matches!(facts.node_type, 3 | 9));
+    binding
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    content = "index",
+    rename_all = "camelCase",
+    deny_unknown_fields
+)]
+enum LiveQuerySelection {
+    Strict,
+    Nth(usize),
+}
+
+fn retained_query_selection(projection_count: usize, original_index: usize) -> LiveQuerySelection {
+    if projection_count == 1 {
+        LiveQuerySelection::Strict
+    } else {
+        LiveQuerySelection::Nth(original_index)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LiveQuerySource {
+    options: QueryOptions,
+    selection: LiveQuerySelection,
+}
+
+struct QueryMatch {
+    backend_node_id: i64,
+    node: SemanticNode,
+    projection_index: usize,
+}
+
+struct QueryEvaluation {
+    projection_count: usize,
+    matches: Vec<QueryMatch>,
+}
+
+/// Selection evidence is temporary; it never replaces acquisition evidence on
+/// the RefEntry and never mints a public reference.
+pub(crate) struct ResolvedQuery {
+    pub backend_node_id: i64,
+    pub binding: ExactBinding,
+    pub frame: ObservationFrame,
+    pub node: SemanticNode,
 }
 
 // Mirrors the outer projected source: predicate-pinned queries stay pinned
@@ -1975,31 +2067,240 @@ fn query_uses_pinned_handles(expression: &LocatorExpression) -> bool {
     }
 }
 
-/// Revalidation allocates no references and adds only the original strict constraint. It
-/// never gives a new matching backend authority to replace the captured one.
-pub(crate) async fn validate_strict_query(
+/// Resolve the whole stored query against the current document of its original
+/// Page owner. Captured leaf loaders/backends are not live-query authority.
+pub(crate) async fn resolve_live_query(
     client: &CdpClient,
-    binding: &ExactBinding,
-    backend: i64,
-    origin: &StrictQueryOrigin,
+    frames: &[ObservationFrame],
+    origin: &LiveQueryOrigin,
+    acquisition_binding: &ExactBinding,
     lease: &OperationLease,
-) -> Result<(), ObservationError> {
-    let options: QueryOptions =
+) -> Result<ResolvedQuery, ObservationError> {
+    let source: LiveQuerySource =
         serde_json::from_str(&origin.source).map_err(|_| ObservationError::BackendFailure)?;
-    let frame = ObservationFrame {
-        parent_frame_id: None,
-        owner_backend_id: None,
-        url: String::new(),
-        binding: binding.clone(),
-        offset_x: 0.,
-        offset_y: 0.,
-        frame_path: Vec::new(),
-    };
-    let matches = evaluate_query(client, &frame, &options.expression, &options, lease).await?;
-    if matches.len() != 1 || matches[0].0 != backend {
+    validate_expression(&source.options.expression, 0)?;
+    let (path, expression) = split_frame_expression(&source.options.expression)?;
+    let root = query_root(frames)?;
+    if root.binding.page_session != acquisition_binding.page_session {
         return Err(ObservationError::StaleReference);
     }
+    let frame = query_frame(client, frames, &path, &source.options, lease, true).await?;
+    let evaluated = evaluate_query(client, frame, &expression, &source.options, lease).await?;
+    let selected_index = match source.selection {
+        LiveQuerySelection::Strict => {
+            if evaluated.projection_count != 1 {
+                return Err(ObservationError::StaleReference);
+            }
+            0
+        }
+        LiveQuerySelection::Nth(index) => index,
+    };
+    let matched = evaluated
+        .matches
+        .into_iter()
+        .find(|matched| matched.projection_index == selected_index)
+        .ok_or(ObservationError::StaleReference)?;
+    validate_frame_ancestry(client, frames, frame, lease).await?;
+    validate_frame(client, root, lease).await?;
+    check(lease)?;
+    Ok(ResolvedQuery {
+        backend_node_id: matched.backend_node_id,
+        binding: actionable_binding(frame, &matched.node),
+        frame: frame.clone(),
+        node: matched.node,
+    })
+}
+
+fn query_root(frames: &[ObservationFrame]) -> Result<&ObservationFrame, ObservationError> {
+    let mut roots = frames
+        .iter()
+        .filter(|frame| frame.parent_frame_id.is_none());
+    let root = roots.next().ok_or(ObservationError::StaleReference)?;
+    if roots.next().is_some() {
+        return Err(ObservationError::StaleReference);
+    }
+    Ok(root)
+}
+
+async fn query_frame<'a>(
+    client: &CdpClient,
+    frames: &'a [ObservationFrame],
+    path: &[String],
+    options: &QueryOptions,
+    lease: &OperationLease,
+    retained: bool,
+) -> Result<&'a ObservationFrame, ObservationError> {
+    let mut frame = query_root(frames)?;
+    for selector in path {
+        frame = select_frame(client, frames, frame, selector, options, lease)
+            .await
+            .map_err(|error| match error {
+                FrameSelectionError::Cardinality => {
+                    if retained {
+                        ObservationError::StaleReference
+                    } else {
+                        ObservationError::InvalidArguments
+                    }
+                }
+                FrameSelectionError::Observation(error) => error,
+            })?;
+    }
+    Ok(frame)
+}
+
+/// Recheck every native frame/owner edge of the selected document, rather than
+/// treating a same-looking leaf or numeric backend as ancestry proof.
+async fn validate_frame_ancestry(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    frame: &ObservationFrame,
+    lease: &OperationLease,
+) -> Result<(), ObservationError> {
+    let mut current = frame;
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(current.binding.frame.as_str()) {
+            return Err(ObservationError::StaleReference);
+        }
+        validate_frame(client, current, lease).await?;
+        let Some(parent_id) = &current.parent_frame_id else {
+            break;
+        };
+        let parent = frames
+            .iter()
+            .find(|candidate| &candidate.binding.frame == parent_id)
+            .ok_or(ObservationError::StaleReference)?;
+        if parent.binding.page_session != current.binding.page_session {
+            return Err(ObservationError::StaleReference);
+        }
+        let owner = command(
+            client,
+            &parent.binding.session,
+            "DOM.getFrameOwner",
+            json!({"frameId":current.binding.frame}),
+            lease,
+        )
+        .await?;
+        if owner["backendNodeId"].as_i64() != current.owner_backend_id {
+            return Err(ObservationError::StaleReference);
+        }
+        current = parent;
+    }
     Ok(())
+}
+
+/// Read-only correlation validates immutable acquisition evidence, never a live
+/// source. Native DOM inventory is acquired once per involved document, not once
+/// per candidate; it emits no metadata and does not allocate new native refs.
+pub(crate) async fn validate_acquisition_bindings(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    bindings: &[(ExactBinding, i64)],
+    lease: &OperationLease,
+) -> Result<(), ObservationError> {
+    check(lease)?;
+    if bindings.len() > 100_000 || frames.len() > 256 {
+        return Err(ObservationError::ResourceLimit);
+    }
+    let mut grouped: HashMap<(String, String, String, String), std::collections::HashSet<i64>> =
+        HashMap::new();
+    for (index, (binding, backend)) in bindings.iter().enumerate() {
+        if index % 256 == 0 {
+            check(lease)?;
+        }
+        grouped
+            .entry((
+                binding.page_session.clone(),
+                binding.session.clone(),
+                binding.frame.clone(),
+                binding.loader.clone(),
+            ))
+            .or_default()
+            .insert(*backend);
+    }
+    if grouped.len() > 256 {
+        return Err(ObservationError::ResourceLimit);
+    }
+    for ((page_session, session, frame_id, loader), expected) in grouped {
+        check(lease)?;
+        let frame = frames
+            .iter()
+            .find(|frame| {
+                frame.binding.page_session == page_session
+                    && frame.binding.session == session
+                    && frame.binding.frame == frame_id
+                    && frame.binding.loader == loader
+            })
+            .ok_or(ObservationError::StaleReference)?;
+        validate_frame_ancestry(client, frames, frame, lease).await?;
+        let dom = frame_dom(client, frame, lease).await?;
+        let present = acquisition_backend_inventory(&dom["root"], lease)?;
+        if !expected.is_subset(&present) {
+            return Err(ObservationError::StaleReference);
+        }
+        validate_frame_ancestry(client, frames, frame, lease).await?;
+        check(lease)?;
+    }
+    Ok(())
+}
+
+fn acquisition_backend_inventory(
+    root: &Value,
+    lease: &OperationLease,
+) -> Result<std::collections::HashSet<i64>, ObservationError> {
+    let mut present = std::collections::HashSet::new();
+    let mut pending = vec![(root, 0usize)];
+    let mut visited = 0usize;
+    while let Some((node, depth)) = pending.pop() {
+        visited += 1;
+        if visited.is_multiple_of(256) {
+            check(lease)?;
+        }
+        if visited > 100_000 || depth > 256 {
+            return Err(ObservationError::ResourceLimit);
+        }
+        if node["shadowRootType"] == "user-agent" || node.get("pseudoType").is_some() {
+            continue;
+        }
+        if matches!(node["nodeType"].as_i64(), Some(1 | 3 | 9)) {
+            present.insert(
+                node["backendNodeId"]
+                    .as_i64()
+                    .ok_or(ObservationError::BackendFailure)?,
+            );
+        }
+        // Do not descend through child contentDocument or pseudoElements. A
+        // child document is independently fenced and inventoried in its group.
+        for key in ["children", "shadowRoots"] {
+            if let Some(children) = node.get(key) {
+                let children = children
+                    .as_array()
+                    .ok_or(ObservationError::BackendFailure)?;
+                if pending.len().saturating_add(children.len()) > 100_000 {
+                    return Err(ObservationError::ResourceLimit);
+                }
+                pending.extend(children.iter().map(|child| (child, depth + 1)));
+            }
+        }
+    }
+    check(lease)?;
+    Ok(present)
+}
+
+pub(crate) async fn validate_acquisition_binding(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    entry: &RefEntry,
+    lease: &OperationLease,
+) -> Result<(), ObservationError> {
+    let binding = entry
+        .exact_binding
+        .clone()
+        .ok_or(ObservationError::StaleReference)?;
+    let backend = entry
+        .backend_node_id
+        .ok_or(ObservationError::StaleReference)?;
+    validate_acquisition_bindings(client, frames, &[(binding, backend)], lease).await
 }
 
 /// Public semantic serialization is sparse; matching must still distinguish
@@ -2018,14 +2319,14 @@ fn query_match_metadata(nodes: &[SemanticNode]) -> Result<Value, ObservationErro
 }
 
 /// Shared DOM/AX/security acquisition with no reference allocator or registry.
-/// Publication and strict action validation consume the same matching result.
+/// Publication and live resolution consume the same complete projection result.
 async fn evaluate_query(
     client: &CdpClient,
     frame: &ObservationFrame,
     expression: &LocatorExpression,
     options: &QueryOptions,
     lease: &OperationLease,
-) -> Result<Vec<(i64, SemanticNode)>, ObservationError> {
+) -> Result<QueryEvaluation, ObservationError> {
     let session = &frame.binding.session;
     validate_frame(client, frame, lease).await?;
     let ax_value = command(
@@ -2071,7 +2372,7 @@ async fn evaluate_query(
                 value["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference)
             }
         })).buffered(16).try_collect().await?;
-        if objects.is_empty() { return Ok(Vec::new()); }
+        if objects.is_empty() { return Ok(QueryEvaluation { projection_count: 0, matches: Vec::new() }); }
         let mut arguments=vec![json!({"value":expression}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
         arguments.extend(objects.iter().map(|id|json!({"objectId":id})));
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true}),lease).await?;
@@ -2081,13 +2382,37 @@ async fn evaluate_query(
         let indices:Vec<usize>=serde_json::from_value(value["indices"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         let redacted:Vec<usize>=serde_json::from_value(value["redacted"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         for index in redacted { let node=nodes.get_mut(index).ok_or(ObservationError::BackendFailure)?;scrub_ancestor_content(node); }
-        indices.into_iter().map(|i|nodes.get(i).cloned().zip(ids.get(i).copied()).map(|(node,backend)|(backend,node)).ok_or_else(||"Invalid query index".into())).collect::<Result<Vec<_>,ObservationError>>()
+        let projection_count = indices.len();
+        let matches = indices.into_iter().enumerate().map(|(projection_index, i)| {
+            nodes.get(i).cloned().zip(ids.get(i).copied()).map(|(node, backend_node_id)| {
+                QueryMatch { backend_node_id, node, projection_index }
+            }).ok_or(ObservationError::BackendFailure)
+        }).collect::<Result<Vec<_>, ObservationError>>()?;
+        // The projection count/index is captured before this final public-read
+        // visibility hold, matching the old surface's reads/candidates split.
+        let matches = matches.into_iter().filter(|matched| {
+            !projection_holds_visible(expression) || matched.node.states.get("hidden") != Some(&true)
+        }).collect();
+        Ok(QueryEvaluation { projection_count, matches })
     }.await;
     let result = settle_object_group(client, session, &group, result).await;
     let nodes = result?;
     validate_frame(client, frame, lease).await?;
     check(lease)?;
     Ok(nodes)
+}
+
+fn projection_holds_visible(expression: &LocatorExpression) -> bool {
+    match expression {
+        LocatorExpression::Query { query, .. } => query.visible == Some(true),
+        LocatorExpression::Filter { source, .. } | LocatorExpression::Frame { source, .. } => {
+            projection_holds_visible(source)
+        }
+        LocatorExpression::Index { source, .. } if query_uses_pinned_handles(source) => {
+            projection_holds_visible(source)
+        }
+        _ => false,
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -2966,64 +3291,46 @@ fn split_frame_expression(
         _ => Ok((Vec::new(), expression.clone())),
     }
 }
+enum FrameSelectionError {
+    Cardinality,
+    Observation(ObservationError),
+}
+impl From<ObservationError> for FrameSelectionError {
+    fn from(error: ObservationError) -> Self {
+        Self::Observation(error)
+    }
+}
+
 async fn select_frame<'a>(
     client: &CdpClient,
     frames: &'a [ObservationFrame],
     parent: &ObservationFrame,
     selector: &str,
+    options: &QueryOptions,
     lease: &OperationLease,
-) -> Result<&'a ObservationFrame, ObservationError> {
-    let session = &parent.binding.session;
-    validate_frame(client, parent, lease).await?;
-    let world = command(
-        client,
-        session,
-        "Page.createIsolatedWorld",
-        json!({"frameId":parent.binding.frame,"worldName":"agent-browser-native-observation"}),
-        lease,
-    )
-    .await?;
-    let mut matches = Vec::new();
-    for child in frames
-        .iter()
-        .filter(|f| f.parent_frame_id.as_deref() == Some(parent.binding.frame.as_str()))
-    {
-        let backend = child
-            .owner_backend_id
-            .ok_or("Frame owner identity missing")?;
-        let object = command(
-            client,
-            session,
-            "DOM.resolveNode",
-            json!({"backendNodeId":backend,"executionContextId":world["executionContextId"]}),
-            lease,
-        )
-        .await?;
-        let object = object["object"]["objectId"]
-            .as_str()
-            .ok_or(ObservationError::StaleReference)?;
-        let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":r#"function(selector){
-            if(!this.isConnected||this.ownerDocument!==document)throw new Error('Frame owner moved');
-            if(selector.startsWith('//')||selector.startsWith('xpath=')){const r=document.evaluate(selector.replace(/^xpath=/,''),document,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null);for(let i=0;i<r.snapshotLength;i++)if(r.snapshotItem(i)===this)return true;return false;}
-            return Element.prototype.matches.call(this,selector.replace(/^css=/,''));
-        }"#,"arguments":[{"value":selector}],"returnByValue":true}),lease).await;
-        let result = result.and_then(|result| {
-            if result.get("exceptionDetails").is_some() {
-                Err(ObservationError::InvalidArguments)
-            } else {
-                Ok(result)
-            }
-        });
-        let result = settle_owner_object(client, session, object, result).await?;
-        if result["result"]["value"] == true {
-            matches.push(child);
-        }
+) -> Result<&'a ObservationFrame, FrameSelectionError> {
+    // Count all matches in the parent DOM before consulting the owned frame
+    // inventory. A matching non-frame or pending/unowned iframe must not vanish
+    // and turn an ambiguous selector into apparent uniqueness.
+    let expression = LocatorExpression::Selector {
+        selector: selector.strip_prefix("css=").unwrap_or(selector).into(),
+    };
+    let evaluated = evaluate_query(client, parent, &expression, options, lease).await?;
+    if evaluated.projection_count != 1 || evaluated.matches.len() != 1 {
+        return Err(FrameSelectionError::Cardinality);
     }
-    if matches.len() != 1 {
-        return Err(ObservationError::InvalidArguments);
+    let backend = evaluated.matches[0].backend_node_id;
+    let mut children = frames.iter().filter(|child| {
+        child.parent_frame_id.as_deref() == Some(parent.binding.frame.as_str())
+            && child.owner_backend_id == Some(backend)
+            && child.binding.page_session == parent.binding.page_session
+    });
+    let child = children.next().ok_or(ObservationError::StaleReference)?;
+    if children.next().is_some() {
+        return Err(ObservationError::StaleReference.into());
     }
-    validate_frame(client, matches[0], lease).await?;
-    Ok(matches[0])
+    validate_frame_ancestry(client, frames, child, lease).await?;
+    Ok(child)
 }
 
 #[derive(Default)]
@@ -3319,7 +3626,7 @@ mod tests {
         ] {
             let mut ax = ax("control", 42, &[]);
             ax.role.as_mut().unwrap().value = Some(json!(native));
-            let mut refs = RefMap::new();
+            let mut refs = observed_refs();
             let node = project_node(&frame(), 42, &ax, &mut refs, 1, &metadata(), true).unwrap();
             assert_eq!(node.role.as_deref(), Some(public));
             assert_eq!(
@@ -3339,11 +3646,11 @@ mod tests {
             data["author"]["tag"] = json!(tag);
             data["pageLevelLandmark"] = json!(false);
             let projected =
-                project_node(&frame(), 42, &node, &mut RefMap::new(), 1, &data, true).unwrap();
+                project_node(&frame(), 42, &node, &mut observed_refs(), 1, &data, true).unwrap();
             assert_eq!(projected.role, None);
             data["attributes"]["role"] = json!(native);
             assert_eq!(
-                project_node(&frame(), 42, &node, &mut RefMap::new(), 1, &data, true)
+                project_node(&frame(), 42, &node, &mut observed_refs(), 1, &data, true)
                     .unwrap()
                     .role
                     .as_deref(),
@@ -3352,7 +3659,7 @@ mod tests {
             data["attributes"] = json!({});
             data["pageLevelLandmark"] = json!(true);
             assert_eq!(
-                project_node(&frame(), 42, &node, &mut RefMap::new(), 1, &data, true)
+                project_node(&frame(), 42, &node, &mut observed_refs(), 1, &data, true)
                     .unwrap()
                     .role
                     .as_deref(),
@@ -3389,7 +3696,7 @@ mod tests {
         data["attributes"]["title"] = json!("Must not restore");
         data["simpleAssociatedName"] = json!("Must not restore");
         let project = |data: &Value| {
-            project_node(&frame(), 42, &native, &mut RefMap::new(), 1, data, false)
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, data, false)
                 .unwrap()
                 .name
         };
@@ -3408,7 +3715,7 @@ mod tests {
         let mut data = metadata();
         data["simpleAssociatedName"] = json!("Name");
         let project = |native: &AXNode, data: &Value| {
-            project_node(&frame(), 42, native, &mut RefMap::new(), 1, data, false)
+            project_node(&frame(), 42, native, &mut observed_refs(), 1, data, false)
                 .unwrap()
                 .name
         };
@@ -3442,9 +3749,16 @@ mod tests {
                 data["completeButtonContentName"] = json!(complete);
                 data["attributes"]["title"] = json!("Must not restore");
                 data["simpleAssociatedName"] = json!("Must not restore");
-                let node =
-                    project_node(&frame(), 42, &native, &mut RefMap::new(), 1, &data, bounded)
-                        .unwrap();
+                let node = project_node(
+                    &frame(),
+                    42,
+                    &native,
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    bounded,
+                )
+                .unwrap();
                 assert_eq!(node.name.as_deref(), expected);
             }
         }
@@ -3456,7 +3770,7 @@ mod tests {
                     &frame(),
                     42,
                     &ax("button", 42, &[]),
-                    &mut RefMap::new(),
+                    &mut observed_refs(),
                     1,
                     &data,
                     true
@@ -3473,7 +3787,7 @@ mod tests {
         let mut data = metadata();
         data["completeButtonContentName"] = json!("Proof name");
         let project = |native: &AXNode, data: &Value| {
-            project_node(&frame(), 42, native, &mut RefMap::new(), 1, data, false)
+            project_node(&frame(), 42, native, &mut observed_refs(), 1, data, false)
                 .unwrap()
                 .name
         };
@@ -3518,8 +3832,16 @@ mod tests {
             json!([{"name":"disabled","value":{"type":"boolean","value":true}}]),
         )
         .unwrap();
-        let node =
-            project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &metadata(), true).unwrap();
+        let node = project_node(
+            &frame(),
+            42,
+            &ax,
+            &mut observed_refs(),
+            1,
+            &metadata(),
+            true,
+        )
+        .unwrap();
         assert_eq!(node.states.get("disabled"), Some(&true));
         ax.properties = serde_json::from_value(
             json!([{"name":"disabled","value":{"type":"boolean","value":false}}]),
@@ -3527,29 +3849,47 @@ mod tests {
         .unwrap();
         let mut data = metadata();
         data["states"]["disabled"] = json!(true);
-        let node = project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+        let node = project_node(&frame(), 42, &ax, &mut observed_refs(), 1, &data, true).unwrap();
         assert_eq!(node.states.get("disabled"), Some(&true));
     }
     #[test]
     fn observation_publication_retains_only_emitted_additions_without_resurrection() {
-        let mut baseline = RefMap::new();
-        baseline.set_exact_limit_for_test(3);
+        let mut baseline = observed_refs();
+        baseline.set_exact_limit_for_test(4);
         let old = baseline.bind_exact(1, "button", "", frame().binding);
+        let located = baseline
+            .try_bind_located(
+                1,
+                "button",
+                frame().binding,
+                LocatedIssuance {
+                    identity_scope: "scope".into(),
+                    generation: 1,
+                    revision: 1,
+                },
+                None,
+            )
+            .unwrap();
         let mut staged = baseline.clone();
-        staged.begin_snapshot();
+        staged.begin_observation("scope", 1, 2);
+        assert_eq!(staged.bind_exact(1, "button", "", frame().binding), old);
         let omitted = staged.bind_exact(2, "text", "", frame().binding);
         let emitted = staged.bind_exact(3, "button", "", frame().binding);
-        staged.retain_query_additions(
+        staged.retain_snapshot_entries(
             &baseline,
             &std::collections::HashSet::from([emitted.clone()]),
         );
         assert!(
             staged.get(&old).is_none(),
-            "begin_snapshot active removal must not be resurrected"
+            "reread but omitted old observed authority must not be published"
         );
         assert!(staged.get(&omitted).is_none());
         assert!(staged.get(&emitted).is_some());
-        assert_eq!(staged.retained_identity_counts(), (1, 2));
+        assert!(
+            staged.get(&located).is_some(),
+            "same-backend pinned issuance survives"
+        );
+        assert_eq!(staged.retained_identity_counts(), (2, 2));
         assert_eq!(
             staged.durable_ref(
                 &frame().binding.page_session,
@@ -3570,14 +3910,14 @@ mod tests {
             .try_bind_exact(2, "text", "", frame().binding)
             .unwrap();
         assert_ne!(reacquired, omitted, "discarded reservations never recycle");
-        assert_eq!(staged.retained_identity_counts(), (2, 3));
+        assert_eq!(staged.retained_identity_counts(), (3, 3));
     }
     #[test]
     fn author_formatting_role_is_omitted_without_changing_explicit_role_or_identity() {
         for native in ["generic", "none", "paragraph", "strong", "emphasis", "code"] {
             let mut ax = ax("formatting", 42, &[]);
             ax.role.as_mut().unwrap().value = Some(json!(native));
-            let mut refs = RefMap::new();
+            let mut refs = observed_refs();
             let node = project_node(&frame(), 42, &ax, &mut refs, 1, &metadata(), true).unwrap();
             assert!(node.role.is_none());
             let mut explicit = metadata();
@@ -3600,14 +3940,15 @@ mod tests {
             ax.role.as_mut().unwrap().value = Some(json!(native));
             let mut data = metadata();
             data["attributes"]["role"] = json!(authored);
-            let node = project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+            let node =
+                project_node(&frame(), 42, &ax, &mut observed_refs(), 1, &data, true).unwrap();
             assert!(node.role.is_none(), "{native} from {authored:?}");
         }
         let mut ax = ax("explicit", 42, &[]);
         ax.role.as_mut().unwrap().value = Some(json!("strong"));
         let mut data = metadata();
         data["attributes"]["role"] = json!("unknown\tstrong");
-        let node = project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+        let node = project_node(&frame(), 42, &ax, &mut observed_refs(), 1, &data, true).unwrap();
         assert_eq!(node.role.as_deref(), Some("strong"));
     }
 
@@ -3696,12 +4037,13 @@ mod tests {
                 );
                 let mut data = metadata();
                 data["controlStates"] = json!({name:expected});
-                let node = project_node(&frame(), 42, &native, &mut RefMap::new(), 1, &data, true)
-                    .unwrap();
+                let node =
+                    project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true)
+                        .unwrap();
                 assert_eq!(node.states.get(name), Some(&expected));
                 data["__nativeReadonlyPseudo"] = json!(true);
                 let pseudo =
-                    project_node(&frame(), 42, &native, &mut RefMap::new(), 1, &data, true)
+                    project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true)
                         .unwrap();
                 assert_eq!(pseudo.states.get(name), Some(&!expected));
             }
@@ -3719,7 +4061,7 @@ mod tests {
                     &frame(),
                     42,
                     &ax("control", 42, &[]),
-                    &mut RefMap::new(),
+                    &mut observed_refs(),
                     1,
                     &data,
                     true
@@ -3747,7 +4089,7 @@ mod tests {
                 &frame(),
                 42,
                 &ax("editor", 42, &[]),
-                &mut RefMap::new(),
+                &mut observed_refs(),
                 1,
                 &data,
                 true,
@@ -3792,10 +4134,10 @@ mod tests {
         let mut data = metadata();
         data["attributes"]["title"] = json!("Must not restore");
         data["redactName"] = json!(true);
-        let node = project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+        let node = project_node(&frame(), 42, &ax, &mut observed_refs(), 1, &data, true).unwrap();
         assert!(node.name.is_none());
         data["safePublicName"] = json!("\u{f090} Public");
-        let node = project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+        let node = project_node(&frame(), 42, &ax, &mut observed_refs(), 1, &data, true).unwrap();
         assert_eq!(node.name.as_deref(), Some("Public"));
         assert_eq!(node.safe_public_name.as_deref(), Some("Public"));
     }
@@ -3814,14 +4156,15 @@ mod tests {
             for authored in ["", "unknown widget"] {
                 data["attributes"]["role"] = json!(authored);
                 let node =
-                    project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+                    project_node(&frame(), 42, &ax, &mut observed_refs(), 1, &data, true).unwrap();
                 assert!(node.role.is_none());
             }
             // Preserve the effective AX role when an explicit recognized role
             // was selected. Do not infer roles from a malformed token string.
             ax.role.as_mut().unwrap().value = Some(json!("term"));
             data["attributes"]["role"] = json!("unknown term");
-            let node = project_node(&frame(), 42, &ax, &mut RefMap::new(), 1, &data, true).unwrap();
+            let node =
+                project_node(&frame(), 42, &ax, &mut observed_refs(), 1, &data, true).unwrap();
             assert_eq!(node.role.as_deref(), Some("term"));
         }
     }
@@ -3851,6 +4194,287 @@ mod tests {
         let unknown_parent = json!({"frame":{"id":"other-unowned"}});
         assert!(joined_frame_children(&unknown_parent, "other-unowned", &owned).is_empty());
     }
+    #[test]
+    fn live_source_retains_full_frames_and_original_projection_selection() {
+        assert_eq!(retained_query_selection(1, 0), LiveQuerySelection::Strict);
+        // One output surviving a three-entry projection is still nth(2).
+        assert_eq!(retained_query_selection(3, 2), LiveQuerySelection::Nth(2));
+        let options: QueryOptions = serde_json::from_value(json!({"expression":{
+            "kind":"frame","selector":"#outer","source":{"kind":"frame","selector":"#inner","source":{
+                "kind":"index","index":1,"source":{"kind":"selector","selector":"button"}
+            }}
+        }})).unwrap();
+        let source = LiveQuerySource {
+            options: options.clone(),
+            selection: LiveQuerySelection::Strict,
+        };
+        let stored: LiveQuerySource =
+            serde_json::from_str(&serde_json::to_string(&source).unwrap()).unwrap();
+        assert_eq!(
+            serde_json::to_value(&stored.options).unwrap(),
+            serde_json::to_value(&options).unwrap()
+        );
+        assert_eq!(
+            split_frame_expression(&stored.options.expression)
+                .unwrap()
+                .0,
+            vec!["#outer", "#inner"]
+        );
+        assert!(!query_uses_pinned_handles(&stored.options.expression));
+        for expression in [
+            json!({"kind":"query","query":{"kind":"displayValue","value":{"kind":"string","value":"x","exact":true}}}),
+            json!({"kind":"index","index":"first","source":{"kind":"query","query":{"kind":"label","value":{"kind":"string","value":"x","exact":true}}}}),
+        ] {
+            assert!(query_uses_pinned_handles(
+                &serde_json::from_value(expression).unwrap()
+            ));
+        }
+        let scoped: LocatorExpression = serde_json::from_value(json!({"kind":"query","query":{"kind":"role","value":{"kind":"string","value":"button","exact":true}},"scope":{"kind":"query","query":{"kind":"label","value":{"kind":"string","value":"x","exact":true}}}})).unwrap();
+        assert!(!query_uses_pinned_handles(&scoped));
+    }
+
+    #[test]
+    fn acquisition_inventory_excludes_foreign_documents_ua_and_pseudo_nodes() {
+        let (op, _sender) = lease();
+        let root = json!({"nodeType":9,"backendNodeId":1,"children":[
+            {"nodeType":1,"backendNodeId":2,"children":[{"nodeType":3,"backendNodeId":3}],
+             "shadowRoots":[{"nodeType":11,"shadowRootType":"closed","children":[{"nodeType":1,"backendNodeId":4}]},
+                {"nodeType":11,"shadowRootType":"user-agent","children":[{"nodeType":1,"backendNodeId":5}]}],
+             "pseudoElements":[{"nodeType":1,"backendNodeId":6,"pseudoType":"before"}],
+             "contentDocument":{"nodeType":9,"backendNodeId":7,"children":[{"nodeType":1,"backendNodeId":8}]}}
+        ]});
+        assert_eq!(
+            acquisition_backend_inventory(&root, &op).unwrap(),
+            std::collections::HashSet::from([1, 2, 3, 4])
+        );
+    }
+
+    #[tokio::test]
+    async fn retained_frame_sources_recheck_full_parent_dom_and_current_owned_documents() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            Arc,
+        };
+        for mode in [
+            "nested-replacement",
+            "css-prefix",
+            "ancestor-ambiguous",
+            "ancestor-missing",
+            "unowned-match",
+            "invalid-selector",
+            "frame-replacement",
+            "child-navigation",
+            "root-navigation",
+        ] {
+            let changed = Arc::new(AtomicBool::new(false));
+            let state = changed.clone();
+            let dom_reads = Arc::new(AtomicUsize::new(0));
+            let reads = dom_reads.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(text).unwrap();
+                    let session = request["sessionId"].as_str().unwrap();
+                    let mutated = state.load(Ordering::SeqCst);
+                    let is_root = session == "renderer";
+                    let is_outer = session == "outer-session";
+                    let frame_id = if is_root {
+                        "main"
+                    } else if is_outer {
+                        "outer"
+                    } else if session == "inner-new-session" {
+                        "inner-new"
+                    } else {
+                        "inner"
+                    };
+                    let loader = if is_root {
+                        if mutated && mode == "root-navigation" {
+                            "doc-new"
+                        } else {
+                            "doc"
+                        }
+                    } else if is_outer {
+                        "outer-doc"
+                    } else if mutated && mode == "child-navigation" {
+                        "inner-doc-new"
+                    } else {
+                        "inner-doc"
+                    };
+                    let ids = if is_root {
+                        [42, 43]
+                    } else if is_outer {
+                        [82, 83]
+                    } else if mutated {
+                        [143, 144]
+                    } else {
+                        [142, 143]
+                    };
+                    let method = request["method"].as_str().unwrap();
+                    let result = match method {
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":frame_id,"loaderId":loader}}})
+                        }
+                        "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                        "DOM.getFrameOwner" => {
+                            json!({"backendNodeId":match request["params"]["frameId"].as_str().unwrap() { "outer"=>42, "inner-new"=>83, _=>82 }})
+                        }
+                        "DOM.getDocument" => {
+                            reads.fetch_add(1, Ordering::SeqCst);
+                            json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":ids[0]},{"nodeType":1,"backendNodeId":ids[1]}]}})
+                        }
+                        "Accessibility.getFullAXTree" => {
+                            json!({"nodes":ids.iter().map(|id|json!({"nodeId":id.to_string(),"backendDOMNodeId":id,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}})).collect::<Vec<_>>()})
+                        }
+                        "DOM.resolveNode" => {
+                            json!({"object":{"objectId":format!("node-{}",request["params"]["backendNodeId"]),"subtype":"node"}})
+                        }
+                        "Runtime.getProperties" => json!({"result":[]}),
+                        "Runtime.callFunctionOn" => {
+                            let source = request["params"]["functionDeclaration"].as_str().unwrap();
+                            if source.contains("Array.from(result)") {
+                                json!({"result":{"objectId":"security"}})
+                            } else if source.starts_with("function(expression") {
+                                if mode == "css-prefix" && (is_root || is_outer) {
+                                    assert_eq!(
+                                        request["params"]["arguments"][0]["value"]["selector"],
+                                        if is_root { "#outer" } else { "#inner" }
+                                    );
+                                }
+                                if is_root && mutated && mode == "invalid-selector" {
+                                    json!({"result":{"value":{"error":"invalid-arguments"}}})
+                                } else {
+                                    let indices = if is_root && mutated {
+                                        match mode {
+                                            "ancestor-ambiguous" => vec![0, 1],
+                                            "ancestor-missing" => vec![],
+                                            "unowned-match" => vec![1],
+                                            _ => vec![0],
+                                        }
+                                    } else if is_outer && mutated && mode == "frame-replacement" {
+                                        vec![1]
+                                    } else {
+                                        vec![0]
+                                    };
+                                    json!({"result":{"value":{"indices":indices,"redacted":[]}}})
+                                }
+                            } else {
+                                let count =
+                                    request["params"]["arguments"].as_array().unwrap().len() - 2;
+                                json!({"result":{"value":vec![metadata();count]}})
+                            }
+                        }
+                        "Runtime.releaseObjectGroup" => json!({}),
+                        _ => panic!("unexpected live frame command {method}"),
+                    };
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":result}).to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let client = CdpClient::connect(&endpoint).await.unwrap();
+            let (op, _sender) = lease();
+            let root = frame();
+            let mut outer = root.clone();
+            outer.binding.session = "outer-session".into();
+            outer.binding.frame = "outer".into();
+            outer.binding.loader = "outer-doc".into();
+            outer.parent_frame_id = Some("main".into());
+            outer.owner_backend_id = Some(42);
+            let mut inner = root.clone();
+            inner.binding.session = "inner-session".into();
+            inner.binding.frame = "inner".into();
+            inner.binding.loader = "inner-doc".into();
+            inner.parent_frame_id = Some("outer".into());
+            inner.owner_backend_id = Some(82);
+            let mut frames = vec![root, outer, inner];
+            let options: QueryOptions = serde_json::from_value(json!({"expression":{"kind":"frame","selector":if mode == "css-prefix" { "css=#outer" } else { "#outer" },"source":{"kind":"frame","selector":if mode == "css-prefix" { "css=#inner" } else { "#inner" },"source":{"kind":"selector","selector":"button"}}}})).unwrap();
+            let mut refs = observed_refs();
+            let found = query(&client, &frames, &mut refs, "scope", 1, &options, &op)
+                .await
+                .unwrap();
+            let id = super::super::element::parse_ref(&found.nodes[0].reference.id).unwrap();
+            let acquired = refs.get(&id).unwrap().clone();
+            let before = refs.next_ref_num();
+            let count = dom_reads.load(Ordering::SeqCst);
+            validate_acquisition_bindings(
+                &client,
+                &frames,
+                &[
+                    (frames[0].binding.clone(), 99),
+                    (frames[0].binding.clone(), 42),
+                    (frames[0].binding.clone(), 43),
+                ],
+                &op,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                dom_reads.load(Ordering::SeqCst) - count,
+                1,
+                "one inventory per document, not candidate"
+            );
+            changed.store(true, Ordering::SeqCst);
+            if mode == "frame-replacement" {
+                frames[2].binding.frame = "inner-new".into();
+                frames[2].binding.session = "inner-new-session".into();
+                frames[2].owner_backend_id = Some(83);
+            }
+            if mode == "child-navigation" {
+                frames[2].binding.loader = "inner-doc-new".into();
+            }
+            if mode == "root-navigation" {
+                frames[0].binding.loader = "doc-new".into();
+            }
+            let result = resolve_live_query(
+                &client,
+                &frames,
+                acquired.live_query.as_ref().unwrap(),
+                acquired.exact_binding.as_ref().unwrap(),
+                &op,
+            )
+            .await;
+            match mode {
+                "ancestor-ambiguous" | "ancestor-missing" | "unowned-match" => assert!(
+                    matches!(result, Err(ObservationError::StaleReference)),
+                    "{mode}"
+                ),
+                "invalid-selector" => {
+                    assert!(matches!(result, Err(ObservationError::InvalidArguments)))
+                }
+                _ => {
+                    let selected = result.unwrap();
+                    assert_eq!(selected.backend_node_id, 143);
+                    assert_eq!(acquired.backend_node_id, Some(142));
+                }
+            }
+            assert_eq!(refs.next_ref_num(), before);
+            if matches!(
+                mode,
+                "nested-replacement" | "frame-replacement" | "child-navigation"
+            ) {
+                assert_eq!(
+                    validate_acquisition_binding(&client, &frames, &acquired, &op).await,
+                    Err(ObservationError::StaleReference)
+                );
+            }
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
     #[tokio::test]
     async fn query_group_cleanup_failure_preserves_primary_and_never_publishes() {
         use futures_util::{SinkExt, StreamExt};
@@ -3961,7 +4585,7 @@ mod tests {
                 });
                 let client = CdpClient::connect(&endpoint).await.unwrap();
                 let (op, _sender) = lease();
-                let mut refs = RefMap::new();
+                let mut refs = observed_refs();
                 let previous = refs.bind_exact(7, "button", "Previous", frame().binding);
                 let options: QueryOptions = serde_json::from_value(
                     json!({"secureFieldSelector":".secure","expression":{"kind":"filter","source":{"kind":"selector","selector":"button"},"hasText":{"kind":"string","value":"Save","exact":false}}}),
@@ -3987,10 +4611,10 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn frame_owner_cleanup_failure_and_timeout_preserve_read_primary() {
+    async fn frame_enumeration_owner_cleanup_failure_and_timeout_preserve_read_primary() {
         use futures_util::{SinkExt, StreamExt};
-        // Exercise both production callers, not just the cleanup helper.
-        for enumeration in [false, true] {
+        // Frame selection uses the whole-query cleanup matrix above.
+        for enumeration in [true] {
             for timeout in [false, true] {
                 for primary_failure in [false, true] {
                     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -4046,21 +4670,9 @@ mod tests {
                     });
                     let client = CdpClient::connect(&endpoint).await.unwrap();
                     let (op, _sender) = lease();
-                    let result = if enumeration {
-                        enumerate_frames(&client, "renderer", &HashMap::new(), &op)
-                            .await
-                            .map(|_| ())
-                    } else {
-                        let parent = frame();
-                        let mut child = parent.clone();
-                        child.binding.frame = "child".into();
-                        child.binding.loader = "child-doc".into();
-                        child.parent_frame_id = Some("main".into());
-                        child.owner_backend_id = Some(42);
-                        select_frame(&client, &[child], &parent, "iframe", &op)
-                            .await
-                            .map(|_| ())
-                    };
+                    let result = enumerate_frames(&client, "renderer", &HashMap::new(), &op)
+                        .await
+                        .map(|_| ());
                     assert_eq!(
                         result.unwrap_err(),
                         ObservationError::CleanupFailed {
@@ -4076,6 +4688,12 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn observed_refs() -> RefMap {
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 1, 1);
+        refs
     }
 
     fn frame() -> ObservationFrame {
@@ -4171,7 +4789,7 @@ mod tests {
     async fn late_document_failure_keeps_previous_generation_and_consumes_ids() {
         let (client, server) = mock_client(true).await;
         let (lease, _sender) = lease();
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let previous = refs.bind_exact(7, "button", "Previous", frame().binding);
         assert!(observe(
             &client,
@@ -4193,7 +4811,7 @@ mod tests {
     async fn successful_snapshot_publishes_once_and_stable_node_keeps_id() {
         let (client, server) = mock_client(false).await;
         let (lease, _sender) = lease();
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let a = observe(
             &client,
             &[frame()],
@@ -4217,7 +4835,9 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(a.roots[0].reference.id, b.roots[0].reference.id);
-        assert_eq!(b.roots[0].reference.revision, "2");
+        assert_eq!(a.roots[0].reference, b.roots[0].reference);
+        assert_eq!(b.revision, 2);
+        assert_eq!(a.viewport_ref, b.viewport_ref);
         server.abort();
     }
     #[tokio::test]
@@ -4225,7 +4845,7 @@ mod tests {
         let (client, server) = mock_client(false).await;
         let (lease, sender) = lease();
         sender.send_replace(CancelSignal::Requested);
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         assert!(observe(
             &client,
             &[frame()],
@@ -4279,7 +4899,7 @@ mod tests {
             let mgr=state.browser.as_ref().ok_or("Missing browser")?;
             let session=mgr.active_session_id()?;
             mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"document.body.innerHTML='<main><label for="account">Account</label><input id="account" value="synthetic-user"><input id="secret" type="password" value="synthetic-password"><ul><li>Alpha <button>Save</button></li><li>Beta <button>Save</button></li></ul><div id="shadow"></div></main>'; const root=document.querySelector('#shadow').attachShadow({mode:'closed'}); root.innerHTML='<button>Shadow save</button>'; true"#,"returnByValue":true})),Some(session)).await.map_err(|_| "native observation stage: fixture_cdp_1".to_string())?;
-            let (mut lease,_sender)=lease();lease.deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);let mut refs=RefMap::new();
+            let (mut lease,_sender)=lease();lease.deadline=std::time::Instant::now()+std::time::Duration::from_secs(30);let mut refs=observed_refs();
             let frames=enumerate_frames(&mgr.client,session,&HashMap::new(),&lease).await.map_err(|_| "native observation stage: enumerate_frames_1".to_string())?;
             let observation=observe(&mgr.client,&frames,&mut refs,"fixture",1,&ObservationOptions::default(),&lease).await.map_err(|_| "native observation stage: observe_1".to_string())?;
             let pseudo_refs:Vec<_>=refs.entries_sorted().into_iter().filter(|(_,entry)|entry.kind==super::super::element::NativeReferenceKind::ReadOnlyCssPseudo).collect();
@@ -4321,7 +4941,7 @@ mod tests {
             let unmarked:QueryOptions=serde_json::from_value(json!({"secureFieldSelector":".secure","expression":{"kind":"selector","selector":"#unmarked-host"}})).unwrap();
             let found=query(&mgr.client,&frames,&mut refs,"fixture",3,&unmarked,&lease).await.map_err(|_| "native observation stage: query_7".to_string())?;
             let read_options:ReadOptions=serde_json::from_value(json!({"ref":found.nodes[0].reference.id,"secureFieldSelector":".secure"})).unwrap();
-            let one=read(&mgr.client,&frames,&mut refs,3,&read_options,&lease).await.map_err(|_| "native observation stage: read_1".to_string())?;if one.to_string().contains("synthetic-closed-child"){return Err("Closed secure descendant leaked in full read".into());}
+            let one=read(&mgr.client,&frames,&mut refs,"fixture",3,&read_options,&lease).await.map_err(|_| "native observation stage: read_1".to_string())?;if one.to_string().contains("synthetic-closed-child"){return Err("Closed secure descendant leaked in full read".into());}
             // Author controls retain exact query identity, while Chromium's
             // implementation controls never become extra model actions.
             mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"document.body.innerHTML='<select id="choice"><option>One</option></select><input id="date" type="date"><input id="color" type="color"><div aria-disabled="true"><button id="blocked">Blocked</button><div aria-disabled="false"><button id="enabled">Enabled</button></div></div><ul><li>Item</li></ul>';true"#,"returnByValue":true})),Some(session)).await?;
@@ -4444,7 +5064,7 @@ mod tests {
             ax("first", 2, &[]),
             ax("root", 1, &["first", "second"]),
         ];
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let mut nodes = HashMap::new();
         for a in &order {
             nodes.insert(
@@ -4817,7 +5437,7 @@ mod tests {
         });
         let client = CdpClient::connect(&url).await.unwrap();
         let (lease, _sender) = lease();
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let one = ax("first", 42, &[]);
         let two = ax("second", 43, &[]);
         let nodes = read_batch(
@@ -4845,7 +5465,7 @@ mod tests {
         let mut data = metadata();
         data["attributes"]["href"] =
             json!("https://fixture.invalid/path?token=synthetic-token#secret");
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let observed =
             project_node(&frame(), 1, &ax("a", 1, &[]), &mut refs, 1, &data, true).unwrap();
         assert_eq!(observed.attributes["href"], "https://fixture.invalid/path");
@@ -4859,7 +5479,7 @@ mod tests {
         data["redactName"] = json!(true);
         let mut text = ax("secret", 2, &[]);
         text.name.as_mut().unwrap().value = Some(json!("synthetic-shadow-secret"));
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let child = project_node(&frame(), 2, &text, &mut refs, 1, &data, false).unwrap();
         assert!(child.name.is_none());
         let mut parent = SemanticNode {
@@ -4908,7 +5528,7 @@ mod tests {
         data["safePublicName"] = json!("Unlock now");
         data["secureDescendants"] = json!(true);
         data["text"] = json!("Unlock now");
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let mut node = project_node(
             &frame(),
             2,
@@ -4950,7 +5570,7 @@ mod tests {
         data["states"]["secure"] = json!(true);
         data["labels"] = json!(["Password"]);
         data["value"] = json!("synthetic-secret");
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let mut node = project_node(
             &frame(),
             2,
@@ -4979,7 +5599,7 @@ mod tests {
         let mut data = metadata();
         data["attributes"] =
             json!({"data-private":"synthetic-secret","aria-label":"Public","placeholder":"Public"});
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let observed =
             project_node(&frame(), 2, &ax("a", 2, &[]), &mut refs, 1, &data, true).unwrap();
         assert!(!observed.attributes.contains_key("data-private"));
@@ -4989,7 +5609,7 @@ mod tests {
     }
     #[test]
     fn exact_reference_exhaustion_returns_error_without_publishing() {
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         refs.set_next_ref_num(usize::MAX);
         assert!(project_node(
             &frame(),
@@ -5380,7 +6000,7 @@ mod tests {
             &frame(),
             42,
             &ax("a", 42, &[]),
-            &mut RefMap::new(),
+            &mut observed_refs(),
             1,
             &data,
             true,
@@ -5395,7 +6015,7 @@ mod tests {
     #[test]
     fn shuffled_tree_keeps_real_parent_and_children() {
         let order = vec![ax("child", 2, &[]), ax("root", 1, &["child"])];
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let mut nodes = HashMap::new();
         for a in &order {
             nodes.insert(
@@ -5420,7 +6040,7 @@ mod tests {
     }
     #[test]
     fn abandoned_staging_never_recycles_ids_or_publishes_nodes() {
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let id = refs.bind_exact(1, "button", "Save", frame().binding);
         let mut abandoned = refs.clone();
         let skipped = abandoned.bind_exact(2, "button", "Save", frame().binding);
@@ -5435,7 +6055,7 @@ mod tests {
     }
     #[test]
     fn frame_or_document_replacement_allocates_new_identity() {
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let a = refs.bind_exact(42, "button", "Save", frame().binding);
         let mut replacement = frame().binding;
         replacement.loader = "new".into();
@@ -5451,7 +6071,7 @@ mod tests {
     fn structural_refs_are_not_actionable() {
         let mut root = ax("root", 1, &[]);
         root.role.as_mut().unwrap().value = Some(json!("RootWebArea"));
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let node = project_node(&frame(), 1, &root, &mut refs, 1, &metadata(), true).unwrap();
         assert!(
             !refs
@@ -5501,7 +6121,7 @@ mod tests {
         let mut node = ax("marker", 3, &[]);
         node.role.as_mut().unwrap().value = Some(json!("ListMarker"));
         node.name.as_mut().unwrap().value = Some(json!("synthetic-marker"));
-        let mut refs = RefMap::new();
+        let mut refs = observed_refs();
         let owner = refs.bind_exact(2, "listitem", "", frame().binding);
         let data = readonly_pseudo_metadata(&metadata(), &node);
         let projected = project_node(&frame(), 3, &node, &mut refs, 1, &data, true).unwrap();
@@ -5612,7 +6232,7 @@ mod tests {
             });
             let client = CdpClient::connect(&endpoint).await.unwrap();
             let (op, _sender) = lease();
-            let mut refs = RefMap::new();
+            let mut refs = observed_refs();
             let node = ax("marker", 3, &[]);
             let result = read_batch(
                 &client,
