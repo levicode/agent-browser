@@ -24,6 +24,8 @@ const EVENTS: &[&str] = &[
     "Target.attachedToTarget",
     "Target.detachedFromTarget",
     "Target.targetInfoChanged",
+    #[cfg(test)]
+    "Target.targetDestroyed",
     "Runtime.consoleAPICalled",
     "Runtime.exceptionThrown",
     "Runtime.executionContextCreated",
@@ -705,6 +707,8 @@ pub struct ClientEnrollment {
     containment: tokio::sync::Mutex<ContainmentState>,
     retirement_events: Mutex<Option<BoundedMethodEvents>>,
     terminal_proof: Mutex<Option<NativeTerminalProof>>,
+    #[cfg(test)]
+    capture_lifecycle: Mutex<CaptureLifecycleTrace>,
 }
 impl ClientEnrollment {
     #[allow(clippy::too_many_arguments)]
@@ -744,7 +748,60 @@ impl ClientEnrollment {
             containment: tokio::sync::Mutex::new(ContainmentState::default()),
             retirement_events: Mutex::new(None),
             terminal_proof: Mutex::new(None),
+            #[cfg(test)]
+            capture_lifecycle: Mutex::new(CaptureLifecycleTrace::default()),
         })
+    }
+    // Diagnostics never grant authority or alter an error. Lock poisoning and
+    // capacity loss only reduce evidence; they cannot make capture succeed.
+    #[cfg(test)]
+    fn trace_capture_event(&self, event: &CdpEvent, watermark: u64) {
+        if let (Ok(index), Ok(mut trace)) = (self.index.lock(), self.capture_lifecycle.lock()) {
+            trace.event(event, watermark, &index);
+        }
+    }
+    #[cfg(test)]
+    fn trace_capture_admission(&self, step: CaptureLifecycleStep, target: &str, session: &str) {
+        if let (Ok(index), Ok(mut trace)) = (self.index.lock(), self.capture_lifecycle.lock()) {
+            trace.push(
+                step,
+                Some(target),
+                Some(session),
+                CaptureTargetKind::Missing,
+                index.sessions.get(session),
+                &index,
+                index.applied_watermark,
+            );
+        }
+    }
+    #[cfg(test)]
+    fn trace_capture_registry(
+        &self,
+        step: CaptureLifecycleStep,
+        entry: &Attribution,
+        index: &Index,
+    ) {
+        if let Ok(mut trace) = self.capture_lifecycle.lock() {
+            trace.registry(step, entry, index);
+        }
+    }
+    #[cfg(test)]
+    fn print_capture_lifecycle(&self, entries: &[Attribution], infos: &[Value]) {
+        if let (Ok(index), Ok(mut trace)) = (self.index.lock(), self.capture_lifecycle.lock()) {
+            for entry in entries.iter().filter(|entry| {
+                !infos.iter().any(|info| {
+                    info.get("targetId").and_then(Value::as_str) == Some(entry.target.as_str())
+                        && info.get("browserContextId").and_then(Value::as_str)
+                            == Some(self.targets.context_id.as_str())
+                })
+            }) {
+                trace.registry(CaptureLifecycleStep::MissingInventory, entry, &index);
+            }
+            eprintln!(
+                "state.capture lifecycle native_discovery=not-enabled destroyed_absence=inconclusive dropped={} ids_exhausted={} rows={:?}",
+                trace.dropped, trace.ids_exhausted, trace.rows
+            );
+        }
     }
     /// Capture before registry retirement. Repeated checks use the original
     /// immutable binding, never a replacement target or current gate epoch.
@@ -1086,6 +1143,8 @@ impl ClientEnrollment {
                 ProtocolError::StaleScope,
                 capture_inventory_diagnostic(&entries, infos, &self.targets.context_id),
             );
+            #[cfg(test)]
+            self.print_capture_lifecycle(&entries, infos);
             return Err(ProtocolError::StaleScope);
         }
         let mut frames = Vec::new();
@@ -1962,6 +2021,8 @@ impl ClientEnrollment {
             return Err(ProtocolError::PolicyDenied);
         }
         self.ensure_supervisor().await?;
+        #[cfg(test)]
+        self.trace_capture_admission(CaptureLifecycleStep::EnrollingExisting, target, session);
         let entry = self
             .register(&self.targets.context_id, target, session, kind, None)?
             .ok_or(ProtocolError::InvalidArguments)?;
@@ -2036,6 +2097,8 @@ impl ClientEnrollment {
             resumed: false,
         };
         index.sessions.insert(session.into(), entry.clone());
+        #[cfg(test)]
+        self.trace_capture_registry(CaptureLifecycleStep::Registered, &entry, &index);
         if kind == "iframe" {
             if index.frames.len() >= MAX_FRAMES && !index.frames.contains_key(target) {
                 return Err(ProtocolError::CapacityExceeded);
@@ -2222,6 +2285,12 @@ impl ClientEnrollment {
             .get_mut(&entry.session)
         {
             current.resumed = true;
+        }
+        #[cfg(test)]
+        if let Ok(index) = self.index.lock() {
+            if let Some(current) = index.sessions.get(&entry.session) {
+                self.trace_capture_registry(CaptureLifecycleStep::Resumed, current, &index);
+            }
         }
         self.changed.notify_waiters();
         Ok(())
@@ -2501,6 +2570,8 @@ impl ClientEnrollment {
                         Err(_) => break Err(ProtocolError::CapacityExceeded),
                     };
                     let sequence=event.sequence();
+                    #[cfg(test)]
+                    self.trace_capture_event(&event, sequence);
                     if event.method == "Target.attachedToTarget" {
                         if tasks.len() >= MAX_TASKS { break Err(ProtocolError::CapacityExceeded); }
                         let pending=match self.register_pending_event(&event) { Ok(pending)=>pending, Err(error)=>break Err(error) };
@@ -3230,6 +3301,8 @@ impl ClientEnrollment {
             super::client_targets::AuxiliaryDisposition::RecorderOwned => return Ok(()),
             super::client_targets::AuxiliaryDisposition::Ordinary => {}
         }
+        #[cfg(test)]
+        self.trace_capture_admission(CaptureLifecycleStep::RegisteringAttached, target, &session);
         match self.register(context, target, &session, kind, event.session_id.as_deref())? {
             Some(entry) => self.initialize(entry, &self.operation()).await,
             None => {
@@ -3295,6 +3368,8 @@ impl ClientEnrollment {
             resumed: false,
         };
         index.sessions.insert(session.into(), entry.clone());
+        #[cfg(test)]
+        self.trace_capture_registry(CaptureLifecycleStep::Registered, &entry, &index);
         index.application_epoch = index
             .application_epoch
             .checked_add(1)
@@ -3617,6 +3692,10 @@ impl ClientEnrollment {
                         .checked_add(1)
                         .ok_or(ProtocolError::IdentifierExhausted)?;
                 }
+                #[cfg(test)]
+                for entry in &removed {
+                    self.trace_capture_registry(CaptureLifecycleStep::Removed, entry, &index);
+                }
                 removed
             };
             for entry in entries {
@@ -3910,6 +3989,233 @@ fn capture_frame_fingerprint(
         }
     }
     Ok(())
+}
+// Test-only evidence for the existing hosted state-capture fixture. Private
+// lookup keys are never Debug/serialized. Only bounded ordinals and closed tags
+// reach output; unknown native types are never inferred from the old Other bin.
+// Negotiated BrowserManager::connect_owned_browser / launch_owned do not enable
+// Target discovery. This tap issues no setDiscoverTargets command: absence of
+// targetDestroyed is inconclusive, even though the separate fixture host client
+// enables discovery. A received destruction is evidence, never authority here.
+#[cfg(test)]
+const CAPTURE_TRACE_LIMIT: usize = 128;
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureTargetKind {
+    Page,
+    Iframe,
+    Worker,
+    ServiceWorker,
+    SharedWorker,
+    Tab,
+    Browser,
+    BackgroundPage,
+    WebView,
+    CdpOther,
+    Unrecognized,
+    Missing,
+}
+#[cfg(test)]
+impl CaptureTargetKind {
+    fn from_native(kind: Option<&str>) -> Self {
+        match kind {
+            Some("page") => Self::Page,
+            Some("iframe") => Self::Iframe,
+            Some("worker") => Self::Worker,
+            Some("service_worker") => Self::ServiceWorker,
+            Some("shared_worker") => Self::SharedWorker,
+            Some("tab") => Self::Tab,
+            Some("browser") => Self::Browser,
+            Some("background_page") => Self::BackgroundPage,
+            Some("webview") => Self::WebView,
+            Some("other") => Self::CdpOther,
+            Some(_) => Self::Unrecognized,
+            None => Self::Missing,
+        }
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureLifecycleStep {
+    EnrollingExisting,
+    RegisteringAttached,
+    Attached,
+    InfoChanged,
+    Detached,
+    Destroyed,
+    Registered,
+    Resumed,
+    Removed,
+    MissingInventory,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureRegistryBinding {
+    Absent,
+    ConflictingIds,
+    // A diagnostic snapshot has no insertion-generation credential. Even exact
+    // identifiers may have been reused; ordered trace rows expose that history.
+    MatchingIdsTenureUnknown,
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureLifecycleRow {
+    order: u64,
+    elapsed_ms: u64,
+    watermark: u64,
+    step: CaptureLifecycleStep,
+    target: Option<u16>,
+    session: Option<u16>,
+    native_kind: CaptureTargetKind,
+    registered_kind: CaptureTargetKind,
+    registry_binding: CaptureRegistryBinding,
+    application: bool,
+    observation_only: bool,
+    resumed: bool,
+    parent: bool,
+    application_epoch: u64,
+}
+#[cfg(test)]
+struct CaptureLifecycleTrace {
+    started: Instant,
+    order: u64,
+    dropped: usize,
+    ids_exhausted: bool,
+    targets: HashMap<String, u16>,
+    sessions: HashMap<String, u16>,
+    rows: std::collections::VecDeque<CaptureLifecycleRow>,
+}
+#[cfg(test)]
+impl Default for CaptureLifecycleTrace {
+    fn default() -> Self {
+        Self {
+            started: Instant::now(),
+            order: 0,
+            dropped: 0,
+            ids_exhausted: false,
+            targets: HashMap::new(),
+            sessions: HashMap::new(),
+            rows: std::collections::VecDeque::new(),
+        }
+    }
+}
+#[cfg(test)]
+impl CaptureLifecycleTrace {
+    fn token(
+        map: &mut HashMap<String, u16>,
+        value: Option<&str>,
+        exhausted: &mut bool,
+    ) -> Option<u16> {
+        let value = value?;
+        if let Some(token) = map.get(value) {
+            return Some(*token);
+        }
+        if value.is_empty() || value.len() > 1024 || map.len() >= CAPTURE_TRACE_LIMIT {
+            *exhausted = true;
+            return None;
+        }
+        let token = (map.len() + 1) as u16;
+        map.insert(value.to_owned(), token);
+        Some(token)
+    }
+    // Keep each closed diagnostic field explicit at test-only call sites.
+    #[allow(clippy::too_many_arguments)]
+    fn push(
+        &mut self,
+        step: CaptureLifecycleStep,
+        target: Option<&str>,
+        session: Option<&str>,
+        native_kind: CaptureTargetKind,
+        entry: Option<&Attribution>,
+        index: &Index,
+        watermark: u64,
+    ) {
+        self.order = self.order.saturating_add(1);
+        let target = Self::token(&mut self.targets, target, &mut self.ids_exhausted);
+        let session = Self::token(&mut self.sessions, session, &mut self.ids_exhausted);
+        let row = CaptureLifecycleRow {
+            order: self.order,
+            elapsed_ms: self.started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+            watermark,
+            step,
+            target,
+            session,
+            native_kind,
+            registered_kind: CaptureTargetKind::from_native(entry.map(|entry| entry.kind.as_str())),
+            registry_binding: match entry.and_then(|entry| {
+                index
+                    .sessions
+                    .get(&entry.session)
+                    .map(|current| (entry, current))
+            }) {
+                None => CaptureRegistryBinding::Absent,
+                Some((entry, current))
+                    if entry.target == current.target
+                        && entry.session == current.session
+                        && entry.root == current.root
+                        && entry.parent == current.parent
+                        && entry.kind == current.kind =>
+                {
+                    CaptureRegistryBinding::MatchingIdsTenureUnknown
+                }
+                Some(_) => CaptureRegistryBinding::ConflictingIds,
+            },
+            application: entry.is_some_and(|entry| entry.application),
+            observation_only: entry.is_some_and(|entry| entry.observation_only),
+            resumed: entry.is_some_and(|entry| entry.resumed),
+            parent: entry.is_some_and(|entry| entry.parent.is_some()),
+            application_epoch: index.application_epoch,
+        };
+        if self.rows.len() == CAPTURE_TRACE_LIMIT {
+            self.rows.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.rows.push_back(row);
+    }
+    fn event(&mut self, event: &CdpEvent, watermark: u64, index: &Index) {
+        let step = match event.method.as_str() {
+            "Target.attachedToTarget" => CaptureLifecycleStep::Attached,
+            "Target.targetInfoChanged" => CaptureLifecycleStep::InfoChanged,
+            "Target.detachedFromTarget" => CaptureLifecycleStep::Detached,
+            "Target.targetDestroyed" => CaptureLifecycleStep::Destroyed,
+            _ => return,
+        };
+        let info = event.params.get("targetInfo");
+        let target = info
+            .and_then(|info| info.get("targetId"))
+            .or_else(|| event.params.get("targetId"))
+            .and_then(Value::as_str);
+        let session = event.params.get("sessionId").and_then(Value::as_str);
+        let entry = session
+            .and_then(|session| index.sessions.get(session))
+            .or_else(|| {
+                target
+                    .and_then(|target| index.sessions.values().find(|entry| entry.target == target))
+            });
+        self.push(
+            step,
+            target.or_else(|| entry.map(|entry| entry.target.as_str())),
+            session.or_else(|| entry.map(|entry| entry.session.as_str())),
+            CaptureTargetKind::from_native(
+                info.and_then(|info| info.get("type"))
+                    .and_then(Value::as_str),
+            ),
+            entry,
+            index,
+            watermark,
+        );
+    }
+    fn registry(&mut self, step: CaptureLifecycleStep, entry: &Attribution, index: &Index) {
+        self.push(
+            step,
+            Some(&entry.target),
+            Some(&entry.session),
+            CaptureTargetKind::Missing,
+            Some(entry),
+            index,
+            index.applied_watermark,
+        );
+    }
 }
 /// Closed, count-only diagnostics. Never print target/session/context IDs, URLs,
 /// titles, or browser-provided type strings when capture refuses inventory.
@@ -4218,6 +4524,7 @@ mod tests {
                                 {"targetId":"foreign","browserContextId":"other-context","type":"page"}]}),
                             "Target.getTargets" if mode=="observer-detached-live"=>json!({"targetInfos":[{"targetId":"other-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="borrowed-capture"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"},{"targetId":"unadopted-host","type":"page","browserContextId":"owned-context"}]}),
+                            "Target.getTargets" if mode=="borrowed-initial"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode.starts_with("attestation-complete")=>complete_capture_inventory(mode, &request, inventory_reads),
                             "Target.getTargets" if mode=="attestation-missing-target" && inventory_reads>1=>json!({"targetInfos":[]}),
                             "Target.getTargets" if mode=="attestation-missing-context" && inventory_reads>1=>json!({"targetInfos":[{"targetId":"target","type":"page"}]}),
@@ -5217,6 +5524,229 @@ mod tests {
             server.abort();
         }
     }
+    #[tokio::test]
+    async fn capture_lifecycle_trace_correlates_native_type_and_exact_registry_tenure() {
+        let (owner, _notices, log, emit, server) =
+            fixture("attestation-complete-missing-target").await;
+        enroll_capture_tab(&owner, &emit).await;
+        realm_emit(
+            &owner,
+            &emit,
+            json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":{
+                "targetId":"tab-target", "type":"worker", "browserContextId":"owned-context",
+                "url":"https://private.invalid/secret", "title":"private-title"
+            }}}),
+        )
+        .await;
+        realm_emit(
+            &owner,
+            &emit,
+            json!({"method":"Target.targetDestroyed", "params":{"targetId":"tab-target"}}),
+        )
+        .await;
+        assert!(owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("tab-session"));
+        assert!(matches!(
+            owner.attest_capture(&owner.operation()).await,
+            Err(ProtocolError::StaleScope)
+        ));
+        realm_emit(&owner, &emit, json!({"method":"Target.detachedFromTarget", "params":{"sessionId":"tab-session", "targetId":"tab-target"}})).await;
+        assert!(!owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("tab-session"));
+        owner.attest_capture(&owner.operation()).await.unwrap();
+        let rows = owner.capture_lifecycle.lock().unwrap().rows.clone();
+        let attached = rows
+            .iter()
+            .find(|row| row.step == CaptureLifecycleStep::Attached)
+            .unwrap();
+        assert_eq!(attached.native_kind, CaptureTargetKind::Tab);
+        assert_eq!(attached.registry_binding, CaptureRegistryBinding::Absent);
+        let target = attached.target.unwrap();
+        let session = attached.session.unwrap();
+        let relevant = rows
+            .iter()
+            .filter(|row| row.target == Some(target))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            relevant.iter().map(|row| row.step).collect::<Vec<_>>(),
+            vec![
+                CaptureLifecycleStep::Attached,
+                CaptureLifecycleStep::RegisteringAttached,
+                CaptureLifecycleStep::Registered,
+                CaptureLifecycleStep::Resumed,
+                CaptureLifecycleStep::InfoChanged,
+                CaptureLifecycleStep::Destroyed,
+                CaptureLifecycleStep::MissingInventory,
+                CaptureLifecycleStep::Detached,
+                CaptureLifecycleStep::Removed,
+            ]
+        );
+        assert!(relevant
+            .iter()
+            .all(|row| row.session == Some(session) && !row.parent));
+        assert!(relevant
+            .windows(2)
+            .all(|pair| pair[0].order < pair[1].order && pair[0].elapsed_ms <= pair[1].elapsed_ms));
+        let changed = relevant
+            .iter()
+            .find(|row| row.step == CaptureLifecycleStep::InfoChanged)
+            .unwrap();
+        assert_eq!(changed.native_kind, CaptureTargetKind::Worker);
+        assert_eq!(changed.registered_kind, CaptureTargetKind::Tab);
+        assert_eq!(
+            changed.registry_binding,
+            CaptureRegistryBinding::MatchingIdsTenureUnknown
+        );
+        assert!(changed.application && changed.resumed);
+        assert_eq!(
+            relevant
+                .iter()
+                .find(|row| row.step == CaptureLifecycleStep::Destroyed)
+                .unwrap()
+                .registry_binding,
+            CaptureRegistryBinding::MatchingIdsTenureUnknown
+        );
+        assert_eq!(
+            relevant.last().unwrap().registry_binding,
+            CaptureRegistryBinding::Absent
+        );
+        assert!(rows
+            .iter()
+            .any(|row| row.step == CaptureLifecycleStep::EnrollingExisting
+                && row.target != Some(target)));
+        let printed = format!("{rows:?}");
+        for secret in [
+            "tab-target",
+            "tab-session",
+            "owned-context",
+            "private",
+            "https://",
+        ] {
+            assert!(!printed.contains(secret));
+        }
+        assert!(!log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "Target.setDiscoverTargets"));
+        owner.close().await.unwrap();
+        server.abort();
+    }
+
+    #[test]
+    fn capture_lifecycle_trace_does_not_confuse_session_membership_with_exact_tenure() {
+        let retained = Attribution {
+            target: "private-target".into(),
+            session: "private-session".into(),
+            root: "private-root".into(),
+            parent: Some("private-parent".into()),
+            kind: "page".into(),
+            application: true,
+            observation_only: false,
+            observer_paused: false,
+            resumed: true,
+        };
+        for mismatch in ["target", "root", "parent", "kind"] {
+            let mut current = retained.clone();
+            match mismatch {
+                "target" => current.target = "replacement-target".into(),
+                "root" => current.root = "replacement-root".into(),
+                "parent" => current.parent = None,
+                "kind" => current.kind = "tab".into(),
+                _ => unreachable!(),
+            }
+            let mut index = Index::default();
+            index.sessions.insert(current.session.clone(), current);
+            let mut trace = CaptureLifecycleTrace::default();
+            trace.registry(CaptureLifecycleStep::MissingInventory, &retained, &index);
+            assert_eq!(
+                trace.rows.back().unwrap().registry_binding,
+                CaptureRegistryBinding::ConflictingIds,
+                "{mismatch}"
+            );
+        }
+        let mut index = Index::default();
+        let mut trace = CaptureLifecycleTrace::default();
+        trace.registry(CaptureLifecycleStep::Removed, &retained, &index);
+        assert_eq!(
+            trace.rows.back().unwrap().registry_binding,
+            CaptureRegistryBinding::Absent
+        );
+        // Reusing every identifier is not enough to prove an old snapshot's
+        // insertion tenure. Keep the uncertainty explicit in closed output.
+        index
+            .sessions
+            .insert(retained.session.clone(), retained.clone());
+        trace.registry(CaptureLifecycleStep::Registered, &retained, &index);
+        trace.registry(CaptureLifecycleStep::MissingInventory, &retained, &index);
+        assert_eq!(
+            trace.rows.back().unwrap().registry_binding,
+            CaptureRegistryBinding::MatchingIdsTenureUnknown
+        );
+        assert!(!format!("{:?}", trace.rows).contains("private"));
+    }
+
+    #[test]
+    fn capture_lifecycle_trace_is_bounded_and_never_echoes_unknown_native_metadata() {
+        let mut trace = CaptureLifecycleTrace::default();
+        let index = Index::default();
+        for (offset, kind) in ["tab", "browser", "other", "future-private-kind"]
+            .into_iter()
+            .enumerate()
+        {
+            trace.event(&CdpEvent { method:"Target.attachedToTarget".into(), session_id:None,
+                params:json!({"sessionId":"private-session", "targetInfo":{"targetId":"private-target", "type":kind,
+                    "url":"https://private.invalid", "title":"private-title"}}) }, offset as u64, &index);
+        }
+        assert_eq!(
+            trace
+                .rows
+                .iter()
+                .map(|row| row.native_kind)
+                .collect::<Vec<_>>(),
+            vec![
+                CaptureTargetKind::Tab,
+                CaptureTargetKind::Browser,
+                CaptureTargetKind::CdpOther,
+                CaptureTargetKind::Unrecognized
+            ]
+        );
+        assert!(!format!("{:?}", trace.rows).contains("private"));
+        for offset in 0..CAPTURE_TRACE_LIMIT + 5 {
+            trace.event(
+                &CdpEvent {
+                    method: "Target.targetDestroyed".into(),
+                    session_id: None,
+                    params: json!({"targetId":format!("private-{offset}")}),
+                },
+                offset as u64,
+                &index,
+            );
+        }
+        assert_eq!(trace.rows.len(), CAPTURE_TRACE_LIMIT);
+        assert_eq!(trace.targets.len(), CAPTURE_TRACE_LIMIT);
+        assert_eq!(trace.dropped, 9);
+        assert!(trace.ids_exhausted);
+        assert_eq!(trace.rows.back().unwrap().target, None);
+        let oversized = "private".repeat(1024);
+        trace.event(&CdpEvent { method:"Target.attachedToTarget".into(), session_id:None,
+            params:json!({"sessionId":oversized, "targetInfo":{"targetId":oversized,"type":oversized}}) }, u64::MAX, &index);
+        assert_eq!(
+            trace.rows.back().unwrap().native_kind,
+            CaptureTargetKind::Unrecognized
+        );
+        assert_eq!(trace.sessions.len(), 1);
+        assert!(!format!("{:?}", trace.rows).contains("private"));
+    }
+
     #[test]
     fn capture_inventory_diagnostic_uses_only_closed_roles_and_counts() {
         let mut entry = Attribution {
@@ -7119,6 +7649,68 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn borrowed_initial_page_without_viewport_is_never_resized_during_enrollment() {
+        for viewport in [None, Some((390, 600))] {
+            let (mut owner, _notices, log, _emit, server) = fixture("borrowed-initial").await;
+            let settings = Arc::get_mut(&mut owner).unwrap();
+            settings.ownership = ScopeOwnership::BorrowedTargets(vec!["initial-target".into()]);
+            settings.config.viewport = viewport;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            // Execute the real reconciliation/readiness path, not a test-only
+            // ready flag. The TCP peer advertises this exact borrowed target.
+            owner.start(&owner.operation()).await.unwrap();
+            let inventory = owner.targets.inventory().unwrap().1;
+            assert_eq!(inventory.len(), 1);
+            assert_eq!(inventory[0].target_id, "initial-target");
+            assert_eq!(inventory[0].session_id, "initial");
+            assert!(inventory[0].configured && inventory[0].resumed);
+            let requests = log.lock().unwrap().clone();
+            let resized = requests
+                .iter()
+                .filter(|request| {
+                    matches!(
+                        request["method"].as_str(),
+                        Some(
+                            "Emulation.setDeviceMetricsOverride"
+                                | "Emulation.clearDeviceMetricsOverride"
+                        )
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Some((width, height)) = viewport {
+                assert_eq!(resized.len(), 1);
+                assert_eq!(resized[0]["method"], "Emulation.setDeviceMetricsOverride");
+                assert_eq!(resized[0]["sessionId"], "initial");
+                assert_eq!(
+                    resized[0]["params"],
+                    json!({"width":width,"height":height,"deviceScaleFactor":1,"mobile":false})
+                );
+            } else {
+                assert!(resized.is_empty());
+            }
+            for method in ["Page.enable", "Runtime.runIfWaitingForDebugger"] {
+                let routed = requests
+                    .iter()
+                    .filter(|request| request["method"] == method)
+                    .collect::<Vec<_>>();
+                assert_eq!(routed.len(), 1, "{method}");
+                assert_eq!(routed[0]["sessionId"], "initial", "{method}");
+            }
+            assert!(requests
+                .iter()
+                .any(|request| request["method"] == "Target.getTargets"));
+            assert!(requests.iter().all(|request| {
+                request["method"] != "Target.createTarget"
+                    && request["method"] != "Target.attachToTarget"
+            }));
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
     #[tokio::test]
     async fn config_and_first_request_handler_precede_resume_ack() {
         let (owner, mut notices, log, _emit, server) = fixture("first-request").await;

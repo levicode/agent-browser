@@ -564,14 +564,18 @@ impl ClientPageState {
         if let Some(value) = &config.reduced_motion {
             features.push(json!({"name":"prefers-reduced-motion","value":value}));
         }
-        command(
-            page,
-            op,
-            Some(session),
-            "Emulation.setEmulatedMedia",
-            json!({"features":features}),
-        )
-        .await?;
+        // Unspecified media must leave the browser's own preferences alone.
+        // Explicit no-preference values remain declarations and are applied.
+        if !features.is_empty() {
+            command(
+                page,
+                op,
+                Some(session),
+                "Emulation.setEmulatedMedia",
+                json!({"features":features}),
+            )
+            .await?;
+        }
         Ok(config.revision)
     }
     /// Lifecycle-only cleanup; the caller has drained operations and retains
@@ -835,7 +839,12 @@ impl ClientPageState {
                         s.config.reduced_motion = a.reduced_motion;
                     }
                 }
-                self.apply_existing(page, sessions, op).await?;
+                // The active page receives media first; retain inventory order
+                // for other sessions and the existing per-session deduplication.
+                let ordered = std::iter::once(page.page_session_id.clone())
+                    .chain(sessions.iter().cloned())
+                    .collect::<Vec<_>>();
+                self.apply_existing(page, &ordered, op).await?;
                 Ok(Value::Null)
             }
             "context.viewport" => {
@@ -2534,6 +2543,253 @@ mod tests {
         assert_eq!(requests[3]["params"]["deltaY"], 9.0);
         assert_eq!(requests[4]["params"]["buttons"], 0);
         assert_eq!(requests[4]["params"]["y"], 40.0);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn context_configuration_without_media_never_emulates_initial_or_child_sessions() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        for session in ["page", "popup"] {
+            assert_eq!(
+                state
+                    .apply_to_new_session(&page, session, &op)
+                    .await
+                    .unwrap(),
+                0
+            );
+        }
+        // This is an absence assertion on the production CDP client, not a
+        // renderer-default assertion that could hide an empty-features reset.
+        assert!(log.lock().unwrap().is_empty());
+        state
+            .execute(
+                &page,
+                &["page".into(), "popup".into()],
+                &op,
+                "context.init-script",
+                &json!({"source":"globalThis.syntheticInit=1"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.config_revision().unwrap(), 1);
+        state
+            .execute(
+                &page,
+                &["page".into(), "popup".into()],
+                &op,
+                "context.media",
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.config_revision().unwrap(), 2);
+        for _ in 0..2 {
+            assert_eq!(
+                state
+                    .apply_to_new_session(&page, "child", &op)
+                    .await
+                    .unwrap(),
+                2
+            );
+        }
+        let fresh = ClientPageState::from_config_snapshot(
+            "scope".into(),
+            "replacement-context".into(),
+            state.snapshot_config("scope").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            fresh
+                .apply_to_new_session(&page, "replacement-child", &op)
+                .await
+                .unwrap(),
+            0
+        );
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests.iter().all(|request| {
+            request["method"] == "Page.addScriptToEvaluateOnNewDocument"
+                && request["params"]["source"] == "globalThis.syntheticInit=1"
+        }));
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request["sessionId"].clone())
+                .collect::<Vec<_>>(),
+            vec![
+                json!("page"),
+                json!("popup"),
+                json!("child"),
+                json!("replacement-child")
+            ]
+        );
+        task.abort();
+    }
+    #[tokio::test]
+    async fn context_media_explicit_values_survive_empty_updates_and_snapshot_child_enrollment() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        for (index, (update, color_scheme, reduced_motion)) in [
+            (
+                json!({"colorScheme":"dark","reducedMotion":"reduce"}),
+                "dark",
+                "reduce",
+            ),
+            (
+                json!({"colorScheme":"no-preference"}),
+                "no-preference",
+                "reduce",
+            ),
+            (
+                json!({"reducedMotion":"no-preference"}),
+                "no-preference",
+                "no-preference",
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            log.lock().unwrap().clear();
+            state
+                .execute(
+                    &page,
+                    &["page".into(), "popup".into()],
+                    &op,
+                    "context.media",
+                    &update,
+                )
+                .await
+                .unwrap();
+            state
+                .execute(
+                    &page,
+                    &["page".into(), "popup".into()],
+                    &op,
+                    "context.media",
+                    &json!({}),
+                )
+                .await
+                .unwrap();
+            assert_eq!(state.config_revision().unwrap(), 2 * (index as u64 + 1));
+            let fresh = ClientPageState::from_config_snapshot(
+                "scope".into(),
+                "replacement-context".into(),
+                state.snapshot_config("scope").unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                fresh
+                    .apply_to_new_session(&page, "child", &op)
+                    .await
+                    .unwrap(),
+                0
+            );
+            let requests = log.lock().unwrap();
+            assert_eq!(requests.len(), 5);
+            assert!(requests.iter().all(|request| {
+                request["method"] == "Emulation.setEmulatedMedia"
+                    && request["params"]["features"]
+                        == json!([
+                            {"name":"prefers-color-scheme","value":color_scheme},
+                            {"name":"prefers-reduced-motion","value":reduced_motion},
+                        ])
+            }));
+            assert_eq!(
+                requests
+                    .iter()
+                    .map(|request| request["sessionId"].clone())
+                    .collect::<Vec<_>>(),
+                vec![
+                    json!("page"),
+                    json!("popup"),
+                    json!("page"),
+                    json!("popup"),
+                    json!("child")
+                ]
+            );
+        }
+        task.abort();
+    }
+    #[tokio::test]
+    async fn context_media_updates_active_page_before_popup_with_reversed_inventory() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        state
+            .execute(
+                &page,
+                &[],
+                &op,
+                "context.media",
+                &json!({"colorScheme":"dark"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .apply_to_new_session(&page, "popup", &op)
+                .await
+                .unwrap(),
+            1
+        );
+        // The native dispatcher forwards HashMap-backed target inventory.
+        // Its arbitrary order must not reverse the original active-then-popup
+        // media update contract. No order is required between sibling popups.
+        state
+            .execute(
+                &page,
+                &["popup".into(), "page".into()],
+                &op,
+                "context.media",
+                &json!({"reducedMotion":"reduce"}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.config_revision().unwrap(), 2);
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 4);
+        for (request, session) in requests.iter().zip(["page", "popup", "page", "popup"]) {
+            assert_eq!(request["method"], "Emulation.setEmulatedMedia");
+            assert_eq!(request["sessionId"], session);
+        }
+        let initial = json!([{"name":"prefers-color-scheme","value":"dark"}]);
+        let merged = json!([
+            {"name":"prefers-color-scheme","value":"dark"},
+            {"name":"prefers-reduced-motion","value":"reduce"},
+        ]);
+        assert_eq!(requests[0]["params"]["features"], initial);
+        assert_eq!(requests[1]["params"]["features"], initial);
+        assert_eq!(requests[2]["params"]["features"], merged);
+        assert_eq!(requests[3]["params"]["features"], merged);
+        task.abort();
+    }
+    #[tokio::test]
+    async fn context_media_updates_duplicate_active_session_only_once() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        state
+            .execute(
+                &page,
+                &["page".into(), "popup".into(), "page".into()],
+                &op,
+                "context.media",
+                &json!({"colorScheme":"dark"}),
+            )
+            .await
+            .unwrap();
+        let requests = log.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        for (request, session) in requests.iter().zip(["page", "popup"]) {
+            assert_eq!(request["method"], "Emulation.setEmulatedMedia");
+            assert_eq!(request["sessionId"], session);
+            assert_eq!(
+                request["params"]["features"],
+                json!([{"name":"prefers-color-scheme","value":"dark"}])
+            );
+        }
         task.abort();
     }
     #[tokio::test]

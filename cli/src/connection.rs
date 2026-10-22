@@ -862,6 +862,12 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     ensure_daemon_inner(session, opts)
 }
 
+fn isolated_client_env_allowed(key: &str) -> bool {
+    !key.starts_with("AGENT_BROWSER_")
+        || matches!(key, "AGENT_BROWSER_SOCKET_DIR" | "AGENT_BROWSER_NAMESPACE")
+        || (cfg!(feature = "acceptance-faults") && key == "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
+}
+
 /// New opt-in protocol mode never reuses/restarts another named daemon and
 /// never loads browser launch/plugin configuration before negotiation.
 pub fn run_isolated_client_session(session: &str, namespace: Option<&str>) -> Result<(), String> {
@@ -870,12 +876,7 @@ pub fn run_isolated_client_session(session: &str, namespace: Option<&str>) -> Re
     }
     for (key, _) in env::vars_os() {
         let key_text = key.to_string_lossy();
-        if key_text.starts_with("AGENT_BROWSER_")
-            && !matches!(
-                key_text.as_ref(),
-                "AGENT_BROWSER_SOCKET_DIR" | "AGENT_BROWSER_NAMESPACE"
-            )
-        {
+        if !isolated_client_env_allowed(&key_text) {
             env::remove_var(key);
         }
     }
@@ -906,6 +907,30 @@ pub fn run_isolated_client_session(session: &str, namespace: Option<&str>) -> Re
         thread::sleep(Duration::from_millis(100));
     }
     Err("Dedicated session teardown was not confirmed".into())
+}
+
+#[cfg(test)]
+#[test]
+fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
+    for preserved in [
+        "PATH",
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_NAMESPACE",
+    ] {
+        assert!(isolated_client_env_allowed(preserved));
+    }
+    assert_eq!(
+        isolated_client_env_allowed("AGENT_BROWSER_ACCEPTANCE_PHASE_FILE"),
+        cfg!(feature = "acceptance-faults")
+    );
+    for removed in [
+        "AGENT_BROWSER_DEBUG",
+        "AGENT_BROWSER_PLUGINS",
+        "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE_EXTRA",
+        "AGENT_BROWSER_ACCEPTANCE_OTHER",
+    ] {
+        assert!(!isolated_client_env_allowed(removed));
+    }
 }
 
 fn ensure_daemon_inner(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {

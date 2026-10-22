@@ -65,7 +65,7 @@ impl RetainedTasks {
         let (send, receive) = oneshot::channel();
         // Registration and permanent shutdown linearize under this mutex.
         tasks.tasks.spawn(async move {
-            let (outcome, cleanup_integrity_lost) =
+            let (mut outcome, cleanup_integrity_lost) =
                 match AssertUnwindSafe(future).catch_unwind().await {
                     Ok(result) => result,
                     Err(_) => (
@@ -76,7 +76,16 @@ impl RetainedTasks {
                         true,
                     ),
                 };
+            let cleanup_integrity_lost = cleanup_integrity_lost
+                || matches!(&outcome.result, Err(ProtocolError::CleanupFailed));
             if cleanup_integrity_lost {
+                // Dispatch disposition cannot certify scope reuse after cleanup
+                // loses integrity. Preserve any primary error, but never deliver
+                // success alongside a sealed registry and a failed drain.
+                outcome.effects = Effects::Unknown;
+                if outcome.result.is_ok() {
+                    outcome.result = Err(ProtocolError::CleanupFailed);
+                }
                 targets.seal();
             }
             // Any orphaned blob handles remain in the captured bounded BlobStore
@@ -113,6 +122,8 @@ impl RetainedTasks {
 #[cfg(test)]
 mod tests {
     use super::super::client_browser::ExecutionGate;
+    use super::super::client_protocol::ScopeState;
+    use super::super::client_session::ClientSession;
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
@@ -121,6 +132,159 @@ mod tests {
         NativeOutcome {
             result: Ok(serde_json::Value::Null),
             effects: Effects::Completed,
+        }
+    }
+
+    // Exercise the same retained result channel consumed by the transport. The
+    // broker must settle the delivered effects, not a separately classified copy.
+    async fn assert_retained_settlement(
+        result: Result<serde_json::Value, ProtocolError>,
+        effects: Effects,
+        cleanup_integrity_lost: bool,
+    ) {
+        let tasks = RetainedTasks::default();
+        let broker = ClientSession::new();
+        let lease = broker.admit(1, 1, 1_000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let captured = ClientTargets::new("captured-context".into(), "captured-scope".into());
+        let other = ClientTargets::new("other-context".into(), "other-scope".into());
+        let expected_integrity_lost =
+            cleanup_integrity_lost || matches!(&result, Err(ProtocolError::CleanupFailed));
+        let expected_result = if expected_integrity_lost && result.is_ok() {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            result.clone()
+        };
+        let expected_effects = if expected_integrity_lost {
+            Effects::Unknown
+        } else {
+            effects
+        };
+        let expected_state = if expected_integrity_lost {
+            ScopeState::Quarantined
+        } else {
+            ScopeState::Usable
+        };
+        let receive = tasks
+            .start("captured-scope".into(), captured.clone(), async move {
+                let _lease = lease;
+                (NativeOutcome { result, effects }, cleanup_integrity_lost)
+            })
+            .await
+            .unwrap();
+        let outcome = receive.await.unwrap();
+        let settled = broker.settle(1, 1, outcome.effects).unwrap();
+        let health = broker.health().unwrap();
+        let next_admission = broker.admit(1, 2, 1_000);
+        let drained = tasks.drain().await;
+
+        assert_eq!(
+            outcome.result, expected_result,
+            "primary error must survive; dirty success must not"
+        );
+        assert_eq!(
+            outcome.effects, expected_effects,
+            "retained delivery must reflect cleanup integrity"
+        );
+        assert_eq!(settled, expected_state);
+        assert_eq!(health, (1, expected_state));
+        assert_eq!(captured.inventory().is_err(), expected_integrity_lost);
+        assert!(
+            other.inventory().is_ok(),
+            "only captured targets may be sealed"
+        );
+        if expected_integrity_lost {
+            assert_eq!(next_admission.err(), Some(ProtocolError::ScopeUnavailable));
+            assert_eq!(drained, Err(ProtocolError::CleanupFailed));
+        } else {
+            let _next = next_admission.unwrap();
+            assert!(broker.start(1, 2).unwrap());
+            assert_eq!(
+                broker.settle(1, 2, Effects::NotDispatched).unwrap(),
+                ScopeState::Usable
+            );
+            assert_eq!(drained, Ok(()));
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_dirty_action_preflight_cleanup_failure_quarantines_broker() {
+        assert_retained_settlement(
+            Err(ProtocolError::CleanupFailed),
+            Effects::NotDispatched,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retained_dirty_strict_query_cancellation_quarantines_broker() {
+        assert_retained_settlement(Err(ProtocolError::Cancelled), Effects::NotDispatched, true)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retained_dirty_strict_query_browser_failure_quarantines_broker() {
+        assert_retained_settlement(
+            Err(ProtocolError::BrowserFailure),
+            Effects::NotDispatched,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retained_dirty_strict_query_stale_reference_quarantines_broker() {
+        assert_retained_settlement(
+            Err(ProtocolError::StaleReference),
+            Effects::NotDispatched,
+            true,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn retained_dirty_completed_error_quarantines_broker() {
+        assert_retained_settlement(Err(ProtocolError::BrowserFailure), Effects::Completed, true)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn retained_cleanup_failure_error_without_dirty_flag_quarantines_broker() {
+        for effects in [Effects::NotDispatched, Effects::Completed] {
+            assert_retained_settlement(Err(ProtocolError::CleanupFailed), effects, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_dirty_success_becomes_cleanup_failure_and_quarantines_broker() {
+        for effects in [Effects::NotDispatched, Effects::Completed] {
+            assert_retained_settlement(Ok(serde_json::json!({"accepted": true})), effects, true)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_clean_refusal_cancel_and_settled_prefix_errors_keep_broker_usable() {
+        for (error, effects) in [
+            (ProtocolError::PolicyDenied, Effects::NotDispatched),
+            (ProtocolError::NotActionable, Effects::NotDispatched),
+            (ProtocolError::Cancelled, Effects::NotDispatched),
+            (ProtocolError::BrowserFailure, Effects::NotDispatched),
+            (ProtocolError::StaleReference, Effects::NotDispatched),
+            (ProtocolError::Cancelled, Effects::Completed),
+            (ProtocolError::BrowserFailure, Effects::Completed),
+            (ProtocolError::StaleReference, Effects::Completed),
+        ] {
+            assert_retained_settlement(Err(error), effects, false).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_clean_success_keeps_payload_effects_and_broker_usable() {
+        for effects in [Effects::NotDispatched, Effects::Completed] {
+            assert_retained_settlement(Ok(serde_json::json!({"accepted": true})), effects, false)
+                .await;
         }
     }
 

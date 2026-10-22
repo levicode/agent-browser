@@ -5,6 +5,8 @@ use std::sync::{
 };
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::hash::{Hash, Hasher};
 
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
@@ -25,6 +27,29 @@ pub enum NativeReferenceKind {
     ReadOnlyCssPseudo,
 }
 
+/// The original strict query is an additional constraint, never permission to
+/// rebind an exact backend. Keys hash a fixed fingerprint; equality still checks
+/// the source so even a hash collision cannot merge distinct query authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StrictQueryOrigin {
+    fingerprint: [u8; 32],
+    pub source: Arc<str>,
+}
+impl StrictQueryOrigin {
+    pub fn new(source: String) -> Self {
+        Self {
+            fingerprint: Sha256::digest(source.as_bytes()).into(),
+            source: source.into(),
+        }
+    }
+}
+impl Hash for StrictQueryOrigin {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.fingerprint.hash(state);
+    }
+}
+type DurableRefKey = (i64, Option<StrictQueryOrigin>);
+
 #[derive(Debug, Clone)]
 pub struct RefEntry {
     pub kind: NativeReferenceKind,
@@ -36,13 +61,14 @@ pub struct RefEntry {
     pub frame_id: Option<String>,
     allow_role_fallback: bool,
     pub exact_binding: Option<ExactBinding>,
+    pub strict_query: Option<StrictQueryOrigin>,
 }
 
 #[derive(Clone)]
 struct DocumentRefs {
     session: String,
     loader: String,
-    refs: HashMap<i64, String>,
+    refs: HashMap<DurableRefKey, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,11 +79,16 @@ pub enum RefAllocationError {
 
 /// Exact metadata admission is bounded; exhaustion never evicts published authority.
 pub(crate) const MAX_EXACT_REFERENCES: usize = 100_000;
+/// Conservatively charge each retained source in both map and durable bucket,
+/// even when they share an Arc. Entry quota separately bounds key/Arc overhead.
+/// This retained-origin admission bound is not a performance guarantee.
+pub(crate) const MAX_RETAINED_QUERY_ORIGIN_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct RefMap {
     map: HashMap<String, RefEntry>,
     exact_ref_limit: usize,
+    query_origin_byte_limit: usize,
     documents: HashMap<(String, Option<String>), DocumentRefs>,
     next_ref: Arc<AtomicUsize>,
     viewport_ref: Arc<OnceLock<Result<String, RefAllocationError>>>,
@@ -68,6 +99,7 @@ impl RefMap {
         Self {
             map: HashMap::new(),
             exact_ref_limit: MAX_EXACT_REFERENCES,
+            query_origin_byte_limit: MAX_RETAINED_QUERY_ORIGIN_BYTES,
             documents: HashMap::new(),
             next_ref: Arc::new(AtomicUsize::new(1)),
             viewport_ref: Arc::new(OnceLock::new()),
@@ -106,6 +138,7 @@ impl RefMap {
                 frame_id: frame_id.map(|s| s.to_string()),
                 allow_role_fallback: true,
                 exact_binding: None,
+                strict_query: None,
             },
         );
     }
@@ -126,6 +159,7 @@ impl RefMap {
                 frame_id: None,
                 allow_role_fallback: false,
                 exact_binding: None,
+                strict_query: None,
             },
         );
     }
@@ -148,24 +182,44 @@ impl RefMap {
         name: &str,
         binding: ExactBinding,
     ) -> Result<String, RefAllocationError> {
-        self.check_exact_admission(&binding, &[backend_node_id])?;
+        self.try_bind_exact_with_origin(backend_node_id, role, name, binding, None)
+    }
+
+    pub fn try_bind_exact_with_origin(
+        &mut self,
+        backend_node_id: i64,
+        role: &str,
+        name: &str,
+        binding: ExactBinding,
+        strict_query: Option<StrictQueryOrigin>,
+    ) -> Result<String, RefAllocationError> {
+        self.check_exact_admission_with_origin(
+            &binding,
+            &[backend_node_id],
+            strict_query.as_ref(),
+        )?;
         self.observe_document(
             &binding.page_session,
             Some(&binding.frame),
             &binding.session,
             Some(&binding.loader),
         );
-        let id = self
-            .durable_ref(&binding.page_session, Some(&binding.frame), backend_node_id)
-            .map(str::to_owned)
-            .map(Ok)
-            .unwrap_or_else(|| self.try_allocate_ref())?;
-        self.remember_durable_ref(
-            &binding.page_session,
-            Some(&binding.frame),
-            backend_node_id,
-            &id,
-        );
+        let key = (backend_node_id, strict_query.clone());
+        let document_key = (binding.page_session.clone(), Some(binding.frame.clone()));
+        let existing = self
+            .documents
+            .get(&document_key)
+            .and_then(|document| document.refs.get_key_value(&key));
+        let (id, strict_query) = match existing {
+            Some(((_, origin), id)) => (id.clone(), origin.clone()),
+            None => (self.try_allocate_ref()?, strict_query),
+        };
+        let key = (backend_node_id, strict_query.clone());
+        self.documents
+            .get_mut(&document_key)
+            .expect("observed document")
+            .refs
+            .insert(key, id.clone());
         self.map.insert(
             id.clone(),
             RefEntry {
@@ -178,6 +232,7 @@ impl RefMap {
                 frame_id: Some(binding.frame.clone()),
                 allow_role_fallback: false,
                 exact_binding: Some(binding),
+                strict_query,
             },
         );
         Ok(id)
@@ -219,6 +274,7 @@ impl RefMap {
                 frame_id: None,
                 allow_role_fallback: true,
                 exact_binding: None,
+                strict_query: None,
             },
         );
     }
@@ -259,15 +315,42 @@ impl RefMap {
         )
     }
 
+    pub(crate) fn retained_query_origin_bytes(&self) -> usize {
+        let entries = self
+            .map
+            .values()
+            .filter_map(|entry| entry.strict_query.as_ref())
+            .map(|origin| origin.source.len())
+            .sum::<usize>();
+        let durable = self
+            .documents
+            .values()
+            .flat_map(|document| document.refs.keys())
+            .filter_map(|(_, origin)| origin.as_ref())
+            .map(|origin| origin.source.len())
+            .sum::<usize>();
+        entries.saturating_add(durable)
+    }
+
     pub(crate) fn check_exact_admission(
         &self,
         binding: &ExactBinding,
         backends: &[i64],
     ) -> Result<(), RefAllocationError> {
-        let document = self
+        self.check_exact_admission_with_origin(binding, backends, None)
+    }
+
+    fn check_exact_admission_with_origin(
+        &self,
+        binding: &ExactBinding,
+        backends: &[i64],
+        origin: Option<&StrictQueryOrigin>,
+    ) -> Result<(), RefAllocationError> {
+        let previous = self
             .documents
-            .get(&(binding.page_session.clone(), Some(binding.frame.clone())))
-            .filter(|d| d.session == binding.session && d.loader == binding.loader);
+            .get(&(binding.page_session.clone(), Some(binding.frame.clone())));
+        let document =
+            previous.filter(|d| d.session == binding.session && d.loader == binding.loader);
         let mut new_durable = 0usize;
         let mut new_map = 0usize;
         let mut seen = std::collections::HashSet::new();
@@ -275,7 +358,7 @@ impl RefMap {
             if !seen.insert(*backend) {
                 continue;
             }
-            match document.and_then(|d| d.refs.get(backend)) {
+            match document.and_then(|d| d.refs.get(&(*backend, origin.cloned()))) {
                 Some(id) => {
                     if !self.map.contains_key(id) {
                         new_map += 1;
@@ -288,14 +371,31 @@ impl RefMap {
             }
         }
         let (entries, durable) = self.retained_identity_counts();
-        let replaced = self
-            .documents
-            .get(&(binding.page_session.clone(), Some(binding.frame.clone())))
-            .filter(|d| d.session != binding.session || d.loader != binding.loader)
-            .map_or(0, |d| d.refs.len());
-        let durable = durable.saturating_sub(replaced);
+        let replaced =
+            previous.filter(|d| d.session != binding.session || d.loader != binding.loader);
+        let durable = durable.saturating_sub(replaced.map_or(0, |d| d.refs.len()));
+        // Default exact publication cannot add origin bytes. Avoid walking all
+        // sources for every ordinary observation candidate.
+        let origin_bytes = origin.map_or(0, |origin| {
+            let replaced_bytes = replaced.map_or(0, |d| {
+                d.refs
+                    .keys()
+                    .filter_map(|(_, origin)| origin.as_ref())
+                    .map(|origin| origin.source.len())
+                    .sum::<usize>()
+            });
+            self.retained_query_origin_bytes()
+                .saturating_sub(replaced_bytes)
+                .saturating_add(
+                    origin
+                        .source
+                        .len()
+                        .saturating_mul(new_map.saturating_add(new_durable)),
+                )
+        });
         if entries.saturating_add(new_map) > self.exact_ref_limit
             || durable.saturating_add(new_durable) > self.exact_ref_limit
+            || origin_bytes > self.query_origin_byte_limit
         {
             return Err(RefAllocationError::Capacity);
         }
@@ -322,6 +422,11 @@ impl RefMap {
     #[cfg(test)]
     pub(crate) fn set_exact_limit_for_test(&mut self, limit: usize) {
         self.exact_ref_limit = limit;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_query_origin_byte_limit_for_test(&mut self, limit: usize) {
+        self.query_origin_byte_limit = limit;
     }
 
     pub fn begin_snapshot(&mut self) {
@@ -382,7 +487,7 @@ impl RefMap {
         self.documents
             .get(&(page_session.to_string(), frame.map(str::to_string)))?
             .refs
-            .get(&backend_node_id)
+            .get(&(backend_node_id, None))
             .map(String::as_str)
     }
 
@@ -397,7 +502,9 @@ impl RefMap {
             .documents
             .get_mut(&(page_session.to_string(), frame.map(str::to_string)))
         {
-            document.refs.insert(backend_node_id, ref_id.to_string());
+            document
+                .refs
+                .insert((backend_node_id, None), ref_id.to_string());
         }
     }
 
@@ -2159,6 +2266,191 @@ pub async fn get_element_styles(
 
 #[cfg(test)]
 mod tests {
+    fn strict_binding(loader: &str) -> ExactBinding {
+        ExactBinding {
+            page_session: "page".into(),
+            session: "session".into(),
+            frame: "frame".into(),
+            loader: loader.into(),
+            actionable: true,
+        }
+    }
+
+    #[test]
+    fn strict_origins_never_overwrite_exact_or_other_query_authority() {
+        let mut refs = RefMap::new();
+        let origin = StrictQueryOrigin::new("query-a".into());
+        let observed = refs.bind_exact(42, "button", "", strict_binding("doc"));
+        let strict = refs
+            .try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        assert_ne!(observed, strict);
+        assert_eq!(
+            refs.bind_exact(42, "button", "", strict_binding("doc")),
+            observed
+        );
+        assert!(refs.get(&observed).unwrap().strict_query.is_none());
+        assert_eq!(
+            refs.get(&strict).unwrap().strict_query.as_ref(),
+            Some(&origin)
+        );
+        let before = refs.next_ref_num();
+        let repeat = refs
+            .try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(StrictQueryOrigin::new("query-a".into())),
+            )
+            .unwrap();
+        assert_eq!(repeat, strict);
+        assert_eq!(refs.next_ref_num(), before);
+        assert_eq!(refs.retained_query_origin_bytes(), 2 * origin.source.len());
+        // Even an artificial digest collision cannot merge different sources.
+        let mut collision = StrictQueryOrigin::new("query-b".into());
+        collision.fingerprint = origin.fingerprint;
+        let different = refs
+            .try_bind_exact_with_origin(42, "button", "", strict_binding("doc"), Some(collision))
+            .unwrap();
+        assert_ne!(different, strict);
+        assert_eq!(refs.retained_identity_counts(), (3, 3));
+    }
+
+    #[test]
+    fn strict_origin_byte_admission_is_atomic_and_retirement_releases_budget() {
+        let mut refs = RefMap::new();
+        let origin = StrictQueryOrigin::new("query-a".into());
+        refs.set_query_origin_byte_limit_for_test(2 * origin.source.len());
+        let first = refs
+            .try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        let before = refs.next_ref_num();
+        assert_eq!(
+            refs.try_bind_exact_with_origin(
+                43,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone())
+            ),
+            Err(RefAllocationError::Capacity)
+        );
+        assert_eq!(refs.next_ref_num(), before);
+        assert_eq!(refs.retained_identity_counts(), (1, 1));
+        assert_eq!(refs.retained_query_origin_bytes(), 2 * origin.source.len());
+        // Replacing only the durable bucket still retains the old map entry:
+        // admission must charge that source rather than dropping its accounting.
+        assert_eq!(
+            refs.try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("next"),
+                Some(origin.clone())
+            ),
+            Err(RefAllocationError::Capacity)
+        );
+        assert_eq!(refs.next_ref_num(), before);
+        assert_eq!(refs.documents.values().next().unwrap().loader, "doc");
+        refs.begin_snapshot();
+        assert_eq!(refs.retained_query_origin_bytes(), origin.source.len());
+        assert_eq!(
+            refs.try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone())
+            )
+            .unwrap(),
+            first
+        );
+        assert_eq!(refs.retained_query_origin_bytes(), 2 * origin.source.len());
+        refs.begin_snapshot();
+        let replacement = refs
+            .try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("next"),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        assert_ne!(replacement, first);
+        assert_eq!(refs.retained_query_origin_bytes(), 2 * origin.source.len());
+        refs.invalidate_all_documents();
+        assert_eq!(refs.retained_query_origin_bytes(), 0);
+        let after_retirement = refs
+            .try_bind_exact_with_origin(42, "button", "", strict_binding("next"), Some(origin))
+            .unwrap();
+        assert_ne!(after_retirement, first);
+        assert_ne!(after_retirement, replacement);
+    }
+
+    #[test]
+    fn strict_origin_staging_pruning_and_abandonment_keep_budget_and_no_id_reuse() {
+        let mut baseline = RefMap::new();
+        let origin = StrictQueryOrigin::new("query-a".into());
+        let first = baseline
+            .try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        let mut staged = baseline.clone();
+        let kept = staged
+            .try_bind_exact_with_origin(
+                43,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        let discarded = staged
+            .try_bind_exact_with_origin(
+                44,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        staged.retain_query_additions(&baseline, &std::collections::HashSet::from([kept.clone()]));
+        assert_eq!(
+            staged.retained_query_origin_bytes(),
+            4 * origin.source.len()
+        );
+        assert_eq!(
+            baseline.retained_query_origin_bytes(),
+            2 * origin.source.len()
+        );
+        assert!(staged.get(&first).is_some());
+        assert!(staged.get(&discarded).is_none());
+        drop(staged);
+        let later = baseline
+            .try_bind_exact_with_origin(43, "button", "", strict_binding("doc"), Some(origin))
+            .unwrap();
+        assert_ne!(later, kept);
+        assert_ne!(later, discarded);
+    }
+
     #[test]
     fn exact_document_stale_requires_well_formed_complete_native_tree() {
         let binding = ExactBinding {

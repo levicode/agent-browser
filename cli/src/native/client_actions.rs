@@ -658,6 +658,27 @@ async fn resolve_action_object_in_realm(
     }
     Ok(object)
 }
+fn strict_query_error(
+    d: &Dispatch,
+    error: super::client_observation::ObservationError,
+) -> ProtocolError {
+    use super::client_observation::ObservationError;
+    match error {
+        ObservationError::CleanupFailed { primary } => {
+            d.cleanup.store(true, Ordering::SeqCst);
+            primary.map_or(ProtocolError::CleanupFailed, |error| {
+                strict_query_error(d, *error)
+            })
+        }
+        ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
+        ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::StaleReference => ProtocolError::StaleReference,
+        ObservationError::Cancelled => ProtocolError::Cancelled,
+        ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
+        ObservationError::BackendFailure => ProtocolError::BrowserFailure,
+        ObservationError::PolicyDenied => ProtocolError::PolicyDenied,
+    }
+}
 async fn resolve(
     ctx: &ActionContext<'_>,
     d: &Dispatch,
@@ -675,6 +696,20 @@ async fn resolve(
     })
     .await?
     .map_err(|error| exact_resolution_error(d, error))?;
+    if let Some(origin) = &entry.strict_query {
+        // Await the evaluator itself: dropping its future in bounded() would
+        // bypass its mandatory object-group cleanup on cancellation.
+        super::client_observation::validate_strict_query(
+            &ctx.page.client,
+            &binding,
+            backend,
+            origin,
+            ctx.operation,
+        )
+        .await
+        .map_err(|error| strict_query_error(d, error))?;
+        ctx.check()?;
+    }
     let (context, realm) = match &ctx.realm_authority {
         ActionRealmAuthority::Enrolled(enrollment) => {
             let capture = enrollment.reserve_exact_realm(ctx.page, &binding, ctx.operation)?;
@@ -3000,6 +3035,7 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut checked_reads = 0;
+            let mut query_reads = 0;
             while let Some(Ok(message)) = socket.next().await {
                 let Ok(text) = message.to_text() else {
                     continue;
@@ -3072,8 +3108,22 @@ mod tests {
                         json!({"cssVisualViewport":{"clientWidth":100.,"clientHeight":200.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":100.,"clientHeight":200.}})
                     }
                     "Browser.getVersion" => json!({"userAgent":"Synthetic Linux"}),
+                    "DOM.getDocument" if mode.starts_with("strict-query") => {
+                        json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":42},{"nodeType":1,"backendNodeId":43}]}})
+                    }
+                    "Runtime.getProperties" if mode.starts_with("strict-query") => {
+                        json!({"result":[]})
+                    }
+                    "Accessibility.getPartialAXTree" if mode.starts_with("strict-query") => {
+                        json!({"nodes":[{"nodeId":"a","backendDOMNodeId":42,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}]})
+                    }
                     "Accessibility.getFullAXTree" => {
-                        if mode.starts_with("focus-root") {
+                        if mode.starts_with("strict-query") {
+                            json!({"nodes":[
+                                {"nodeId":"a","backendDOMNodeId":42,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}},
+                                {"nodeId":"b","backendDOMNodeId":43,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}
+                            ]})
+                        } else if mode.starts_with("focus-root") {
                             let mut nodes = vec![
                                 json!({"backendDOMNodeId":1,"role":{"value":"RootWebArea"},"properties":[{"name":"focused","value":{"value":true}}]}),
                             ];
@@ -3086,7 +3136,42 @@ mod tests {
                         }
                     }
                     "Runtime.callFunctionOn" => {
-                        if mode.starts_with("focus-root")
+                        if mode.starts_with("strict-query")
+                            && source.starts_with("function(expression")
+                        {
+                            query_reads += 1;
+                            if query_reads > 1 && mode == "strict-query-cancel" {
+                                server_cancel.send_replace(CancelSignal::Requested);
+                            }
+                            if query_reads > 1 && mode == "strict-query-cleanup-primary" {
+                                json!({"result":{"value":{"error":"stale-reference"}}})
+                            } else {
+                                let indices = if mode == "strict-query-multiple" {
+                                    vec![0, 1]
+                                } else if query_reads == 1 {
+                                    vec![0]
+                                } else {
+                                    match mode {
+                                        "strict-query-ambiguous" => vec![0, 1],
+                                        "strict-query-missing" => vec![],
+                                        "strict-query-replaced" => vec![1],
+                                        _ => vec![0],
+                                    }
+                                };
+                                json!({"result":{"value":{"indices":indices,"redacted":[]}}})
+                            }
+                        } else if mode.starts_with("strict-query")
+                            && source.contains("Array.from(result)")
+                        {
+                            json!({"result":{"objectId":"security"}})
+                        } else if mode.starts_with("strict-query")
+                            && source.starts_with("function(testId,secureSelector,...nodes)")
+                        {
+                            let count =
+                                request["params"]["arguments"].as_array().unwrap().len() - 2;
+                            let metadata = json!({"author":{"tag":"button","nodeType":1,"action":true,"visible":true},"attributes":{},"labels":["Save"],"states":{"secure":false,"hidden":false},"text":"Save","value":"Save","rect":{"x":0,"y":0,"width":100,"height":50}});
+                            json!({"result":{"value":vec![metadata;count]}})
+                        } else if mode.starts_with("focus-root")
                             && source.contains("return this.nodeType===1")
                         {
                             if request["params"]["objectId"] == "focused-document" {
@@ -3155,13 +3240,19 @@ mod tests {
                     "Runtime.evaluate" => json!({"result":{"value":true}}),
                     _ => json!({}),
                 };
-                let reply = if ((mode == "exact-cleanup-failed"
-                    || mode == "check-aux-cleanup-failed"
-                    || (mode == "focus-root-cleanup-failed"
-                        && request["params"]["objectId"] == "focused-document")
-                    || (mode == "exact-aux-cleanup-failed"
-                        && request["params"]["objectId"] == "result-handle"))
-                    && method == "Runtime.releaseObject")
+                let reply = if (mode.starts_with("strict-query-cleanup")
+                    && query_reads > 1
+                    && method == "Runtime.releaseObjectGroup"
+                    && request["params"]["objectGroup"]
+                        .as_str()
+                        .is_some_and(|group| group.starts_with("native-query-")))
+                    || ((mode == "exact-cleanup-failed"
+                        || mode == "check-aux-cleanup-failed"
+                        || (mode == "focus-root-cleanup-failed"
+                            && request["params"]["objectId"] == "focused-document")
+                        || (mode == "exact-aux-cleanup-failed"
+                            && request["params"]["objectId"] == "result-handle"))
+                        && method == "Runtime.releaseObject")
                     || (mode == "exact-protocol-error" && method == "DOM.resolveNode")
                     || (mode == "prefix-cleanup-failed"
                         && method == "Input.dispatchKeyEvent"
@@ -3250,6 +3341,264 @@ mod tests {
             server,
         }
     }
+    fn strict_query_frame(f: &Fixture) -> super::super::client_observation::ObservationFrame {
+        super::super::client_observation::ObservationFrame {
+            parent_frame_id: None,
+            owner_backend_id: None,
+            url: "about:blank".into(),
+            binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
+            offset_x: 0.,
+            offset_y: 0.,
+            frame_path: vec![],
+        }
+    }
+    async fn publish_fixture_query(
+        f: &mut Fixture,
+        expression: Value,
+    ) -> Result<
+        super::super::client_observation::QueryResult,
+        super::super::client_observation::ObservationError,
+    > {
+        let frame = strict_query_frame(f);
+        let options = serde_json::from_value(json!({"expression":expression})).unwrap();
+        super::super::client_observation::query(
+            &f.page.client,
+            &[frame],
+            &mut f.refs,
+            "scope",
+            1,
+            &options,
+            &f.op,
+        )
+        .await
+    }
+    fn logged_query_matches(f: &Fixture) -> usize {
+        f.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request["params"]["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|source| source.starts_with("function(expression"))
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn strict_query_publication_then_tap_refuses_ambiguity_without_input() {
+        for (mode, expected, cleanup) in [
+            (
+                "strict-query-ambiguous",
+                ProtocolError::StaleReference,
+                false,
+            ),
+            ("strict-query-missing", ProtocolError::StaleReference, false),
+            (
+                "strict-query-replaced",
+                ProtocolError::StaleReference,
+                false,
+            ),
+            ("strict-query-cancel", ProtocolError::Cancelled, false),
+            ("strict-query-cleanup", ProtocolError::CleanupFailed, true),
+            (
+                "strict-query-cleanup-primary",
+                ProtocolError::StaleReference,
+                true,
+            ),
+        ] {
+            let mut f = fixture(mode).await;
+            let query =
+                publish_fixture_query(&mut f, json!({"kind":"query","query":{"kind":"role","value":{"kind":"string","value":"button","exact":true},"name":{"kind":"string","value":"Save","exact":true}}}))
+                    .await
+                    .unwrap();
+            let reference = &query.nodes[0].reference;
+            assert_ne!(
+                reference.id, "@e1",
+                "Strict and observed authority must not alias"
+            );
+            let allocated = f.refs.next_ref_num();
+            let retained = f.refs.retained_identity_counts();
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &json!({"identityScope":"scope","ref":reference,"action":{"kind":"tap"}}),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, expected, "{mode}");
+            assert_eq!(failure.effects, Effects::NotDispatched, "{mode}");
+            assert_eq!(failure.cleanup_failed, cleanup, "{mode}");
+            assert_eq!(
+                f.refs.next_ref_num(),
+                allocated,
+                "Validation must not allocate refs"
+            );
+            assert_eq!(f.refs.retained_identity_counts(), retained);
+            assert_eq!(logged_query_matches(&f), 2);
+            let log = f.log.lock().unwrap();
+            assert!(
+                !log.iter().any(|request| request["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("Input.")
+                        || method == "DOM.scrollIntoViewIfNeeded")),
+                "{mode}: no input or action preparation"
+            );
+            assert!(
+                log.iter()
+                    .filter(|request| request["method"] == "Runtime.releaseObjectGroup"
+                        && request["params"]["objectGroup"]
+                            .as_str()
+                            .is_some_and(|group| group.starts_with("native-query-")))
+                    .count()
+                    >= 2
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_query_unique_same_backend_taps_and_keeps_observed_authority() {
+        let mut f = fixture("strict-query-one").await;
+        let expression = json!({"kind":"selector","selector":"button"});
+        let first = publish_fixture_query(&mut f, expression.clone())
+            .await
+            .unwrap();
+        let reference = first.nodes[0].reference.clone();
+        let allocated = f.refs.next_ref_num();
+        let repeated = publish_fixture_query(&mut f, expression).await.unwrap();
+        assert_eq!(repeated.nodes[0].reference, reference);
+        assert_eq!(f.refs.next_ref_num(), allocated);
+        assert!(f.refs.get("e1").unwrap().strict_query.is_none());
+        ClientActions::default()
+            .execute(
+                f.context(),
+                "browser.perform",
+                &json!({"identityScope":"scope","ref":reference,"action":{"kind":"tap"}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(f.refs.next_ref_num(), allocated);
+        assert_eq!(logged_query_matches(&f), 3);
+        assert_eq!(
+            f.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Input.dispatchMouseEvent"
+                    && request["params"]["type"] == "mousePressed")
+                .count(),
+            1
+        );
+        let before = logged_query_matches(&f);
+        ClientActions::default().execute(f.context(), "browser.perform", &json!({"identityScope":"scope","ref":{"id":"@e1","revision":"1"},"action":{"kind":"tap"}})).await.unwrap();
+        assert_eq!(
+            logged_query_matches(&f),
+            before,
+            "Observed refs must not inherit strict provenance"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_pinned_and_multiple_refs_skip_unique_revalidation() {
+        for (mode, expression, expected_nodes) in [
+            (
+                "strict-query-ambiguous",
+                json!({"kind":"query","query":{"kind":"displayValue","value":{"kind":"string","value":"Save","exact":true}}}),
+                1,
+            ),
+            (
+                "strict-query-ambiguous",
+                json!({"kind":"filter","source":{"kind":"index","source":{"kind":"query","query":{"kind":"label","value":{"kind":"string","value":"Save","exact":true}}},"index":"first"},"hasText":{"kind":"string","value":"Save","exact":false}}),
+                1,
+            ),
+            (
+                "strict-query-multiple",
+                json!({"kind":"selector","selector":"button"}),
+                2,
+            ),
+        ] {
+            let mut f = fixture(mode).await;
+            let query = publish_fixture_query(&mut f, expression).await.unwrap();
+            assert_eq!(query.nodes.len(), expected_nodes);
+            for node in &query.nodes {
+                let id = element::parse_ref(&node.reference.id).unwrap();
+                assert!(f.refs.get(&id).unwrap().strict_query.is_none());
+            }
+            let allocated = f.refs.next_ref_num();
+            ClientActions::default().execute(f.context(), "browser.perform", &json!({"identityScope":"scope","ref":query.nodes[0].reference,"action":{"kind":"tap"}})).await.unwrap();
+            assert_eq!(logged_query_matches(&f), 1);
+            assert_eq!(f.refs.next_ref_num(), allocated);
+            assert!(f
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["method"] == "Input.dispatchMouseEvent"
+                    && request["params"]["type"] == "mousePressed"));
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_query_read_preserves_origin_and_reference_without_allocating() {
+        let mut f = fixture("strict-query-one").await;
+        let query = publish_fixture_query(&mut f, json!({"kind":"selector","selector":"button"}))
+            .await
+            .unwrap();
+        let reference = &query.nodes[0].reference;
+        let allocated = f.refs.next_ref_num();
+        let retained = f.refs.retained_identity_counts();
+        let frame = strict_query_frame(&f);
+        let options = serde_json::from_value(json!({"ref":reference.id})).unwrap();
+        let result = super::super::client_observation::read(
+            &f.page.client,
+            &[frame],
+            &mut f.refs,
+            1,
+            &options,
+            &f.op,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["ref"], serde_json::to_value(reference).unwrap());
+        assert_eq!(f.refs.next_ref_num(), allocated);
+        assert_eq!(f.refs.retained_identity_counts(), retained);
+        assert!(f
+            .refs
+            .get(&element::parse_ref(&reference.id).unwrap())
+            .unwrap()
+            .strict_query
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn query_publication_capacity_refusal_is_atomic_before_ref_allocation() {
+        use super::super::client_observation::ObservationError;
+        for mode in ["strict-query-one", "strict-query-multiple"] {
+            let mut f = fixture(mode).await;
+            f.refs.set_exact_limit_for_test(1);
+            let before = f.refs.next_ref_num();
+            let result =
+                publish_fixture_query(&mut f, json!({"kind":"selector","selector":"button"})).await;
+            assert_eq!(result.unwrap_err(), ObservationError::ResourceLimit);
+            assert_eq!(f.refs.next_ref_num(), before);
+            assert_eq!(f.refs.retained_identity_counts(), (1, 1));
+            assert!(f.refs.get("e1").unwrap().strict_query.is_none());
+        }
+        let mut f = fixture("strict-query-one").await;
+        f.refs.set_query_origin_byte_limit_for_test(0);
+        let before = f.refs.next_ref_num();
+        assert_eq!(
+            publish_fixture_query(&mut f, json!({"kind":"selector","selector":"button"}))
+                .await
+                .unwrap_err(),
+            ObservationError::ResourceLimit
+        );
+        assert_eq!(f.refs.next_ref_num(), before);
+        assert_eq!(f.refs.retained_query_origin_bytes(), 0);
+        assert_eq!(f.refs.retained_identity_counts(), (1, 1));
+    }
+
     #[tokio::test]
     async fn exact_resolution_negative_proof_is_stale_but_unknown_is_not() {
         for (mode, expected, cleanup_failed) in [

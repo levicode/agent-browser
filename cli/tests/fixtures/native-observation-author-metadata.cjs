@@ -120,7 +120,7 @@ const target = new Element();
 const projected = [{ role: 'button', name: 'Log out', states: {}, attributes: {} }];
 for (const name of [{ kind: 'string', value: 'Log out', exact: true }, { kind: 'regexp', source: '^Log out$', flags: 'u' }]) {
   const expression = { kind: 'query', query: { kind: 'role', value: { kind: 'string', value: 'button', exact: true }, name } };
-  assert.deepEqual(matchQuery(expression, projected, [[]], [null], target).indices, [0]);
+  assert.deepEqual(matchQuery(expression, projected, [[]], [null], ".secure", [false], target).indices, [0]);
 }
 console.log('PASS: string and regexp role queries consume the same reported name');
 

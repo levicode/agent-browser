@@ -502,12 +502,6 @@ pub(super) fn compact(
             )?);
         }
         if keep {
-            // Public observation omits false flags, but preserves explicit
-            // false values for checkable/selection/expansion states. Keep the
-            // raw read and internal visibility facts untouched.
-            node.states.retain(|name, value| {
-                *value || !matches!(name.as_str(), "disabled" | "focused" | "hidden" | "secure")
-            });
             node.children = children;
             Ok(vec![node])
         } else {
@@ -628,7 +622,7 @@ mod tests {
         flat(nodes).into_iter().map(|n| n.text.as_deref()).collect()
     }
     #[test]
-    fn emitted_flags_omit_false_without_losing_explicit_control_states() {
+    fn emitted_flags_remain_raw_until_public_serialization() {
         let mut fixture = Fixture::default();
         let element = fixture.el("button", Some("button"), vec![]);
         let id = element["backendNodeId"].as_i64().unwrap();
@@ -639,11 +633,18 @@ mod tests {
             node.states.insert(name.into(), false);
         }
         let result = fixture.run(vec![element]);
-        assert_eq!(result[0].states.len(), 4);
-        for name in ["checked", "selected", "expanded", "pressed"] {
+        assert_eq!(result[0].states.len(), 8);
+        let encoded = serde_json::to_value(&result[0]).unwrap();
+        assert_eq!(
+            encoded["states"],
+            json!({"checked":false,"selected":false,"expanded":false,"pressed":false})
+        );
+        for name in [
+            "disabled", "focused", "hidden", "secure", "checked", "selected", "expanded", "pressed",
+        ] {
             assert_eq!(result[0].states.get(name), Some(&false));
         }
-        assert_eq!(result[0].reference.id, format!("@fixture{id}"));
+        assert_eq!(encoded["ref"]["id"], format!("@fixture{id}"));
     }
 
     fn reference(node: &Value) -> String {

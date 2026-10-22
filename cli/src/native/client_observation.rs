@@ -6,7 +6,7 @@ use super::{
         types::{AXNode, GetFullAXTreeResult},
     },
     client_session::{CancelSignal, OperationLease},
-    element::{ExactBinding, RefMap},
+    element::{ExactBinding, RefMap, StrictQueryOrigin},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -90,6 +90,7 @@ pub struct SemanticNode {
     pub test_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub input_purpose: Option<String>,
+    #[serde(serialize_with = "serialize_public_states")]
     pub states: BTreeMap<String, bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<i64>,
@@ -103,6 +104,18 @@ pub struct SemanticNode {
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub children: Vec<SemanticNode>,
 }
+// Match the public semantic-node contract at every wire boundary, not only
+// compact observations. Raw flags remain available to native visibility,
+// identity, action, and security checks; explicit false control states survive.
+fn serialize_public_states<S: serde::Serializer>(
+    states: &BTreeMap<String, bool>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_map(states.iter().filter(|(name, value)| {
+        **value || !matches!(name.as_str(), "disabled" | "focused" | "hidden" | "secure")
+    }))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Observation {
@@ -753,7 +766,6 @@ async fn read_backend(
     frame: &ObservationFrame,
     backend: i64,
     ax: &AXNode,
-    refs: &mut RefMap,
     revision: u64,
     options: &ObservationOptions,
     lease: &OperationLease,
@@ -765,11 +777,11 @@ async fn read_backend(
     validate_frame(client, frame, lease).await?;
     let acquisition_policy = security_inventory(client, frame, options, lease).await?;
     validate_frame(client, frame, lease).await?;
-    let mut node = read_batch(
+    let mut node = read_batch_with_refs(
         client,
         frame,
         &[ax],
-        refs,
+        None,
         revision,
         options,
         lease,
@@ -800,6 +812,18 @@ fn project_node(
     backend: i64,
     ax: &AXNode,
     refs: &mut RefMap,
+    revision: u64,
+    data: &Value,
+    bounded: bool,
+) -> Result<SemanticNode, ObservationError> {
+    project_node_with_refs(frame, backend, ax, Some(refs), revision, data, bounded)
+}
+#[allow(clippy::too_many_arguments)]
+fn project_node_with_refs(
+    frame: &ObservationFrame,
+    backend: i64,
+    ax: &AXNode,
+    refs: Option<&mut RefMap>,
     revision: u64,
     data: &Value,
     bounded: bool,
@@ -890,16 +914,22 @@ fn project_node(
         && !author
             .as_ref()
             .is_some_and(|facts| matches!(facts.node_type, 3 | 9));
-    let id = if data["__nativeReadonlyPseudo"] == true {
-        refs.try_bind_readonly_pseudo(backend, role.as_deref().unwrap_or(""), binding)
+    let id = if let Some(refs) = refs {
+        let id = if data["__nativeReadonlyPseudo"] == true {
+            refs.try_bind_readonly_pseudo(backend, role.as_deref().unwrap_or(""), binding)
+        } else {
+            refs.try_bind_exact(backend, role.as_deref().unwrap_or(""), "", binding)
+        }
+        .map_err(reference_allocation_error)?;
+        format!("@{id}")
     } else {
-        refs.try_bind_exact(backend, role.as_deref().unwrap_or(""), "", binding)
-    }
-    .map_err(reference_allocation_error)?;
+        // Internal candidates never carry public reference authority.
+        String::new()
+    };
     let mut node = SemanticNode {
         author,
         reference: NodeReference {
-            id: format!("@{id}"),
+            id,
             revision: revision.to_string(),
         },
         role,
@@ -1580,7 +1610,7 @@ pub enum LocatorExpression {
         source: Box<LocatorExpression>,
     },
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct QueryOptions {
     pub expression: LocatorExpression,
@@ -1627,6 +1657,9 @@ pub struct ReadOptions {
 }
 /// A full read is unbounded. Field selection is a wire projection, never a way
 /// to bypass secure-field checks or native identity validation.
+/// Unlike the public engine session's cached locate read, this native primitive
+/// reads fresh exact-backend metadata. Strict origins constrain actions only;
+/// this read preserves the requested reference and its provenance unchanged.
 pub async fn read(
     client: &CdpClient,
     frames: &[ObservationFrame],
@@ -1676,13 +1709,11 @@ pub async fn read(
         .iter()
         .find(|n| n.backend_d_o_m_node_id == Some(backend))
         .ok_or(ObservationError::StaleReference)?;
-    let mut staged = refs.clone();
-    let node = read_backend(
+    let mut node = read_backend(
         client,
         frame,
         backend,
         ax,
-        &mut staged,
         revision,
         &ObservationOptions {
             test_id_attribute: options.test_id_attribute.clone(),
@@ -1695,8 +1726,11 @@ pub async fn read(
     .await?;
     validate_frame(client, frame, lease).await?;
     check(lease)?;
+    node.reference = NodeReference {
+        id: format!("@{id}"),
+        revision: revision.to_string(),
+    };
     let result = project_read_fields(node, options.fields.as_deref())?;
-    *refs = staged;
     Ok(result)
 }
 
@@ -1738,11 +1772,63 @@ fn project_read_fields(
 
 // Matching runs in the browser JavaScript realm to preserve the caller's JS
 // RegExp semantics (including flags); no Rust-regex approximation is used.
-const MATCH_QUERY: &str = r#"function(expression, data, labels, safeNames, ...elements) {
+const MATCH_QUERY: &str = r#"function(expression, data, labels, safeNames, secureSelector, protectedAncestors, ...elements) {
  const norm=s=>String(s??'').replace(/[\u200b\u200c\u200d\ufeff]/g,'').replace(/\s+/g,' ').trim();
  function match(p,s,testId=false) { if(p.kind==='regexp') return new RegExp(p.source,p.flags).test(String(s??'')); if(testId)return String(s??'')===p.value; const a=norm(s),b=norm(p.value); return p.exact?a===b:a.toLowerCase().includes(b.toLowerCase()); }
  if(elements.some(e=>!e.isConnected||e.ownerDocument!==document))return {error:'stale-reference'};
  const all=elements.map((_,i)=>i);
+ // Filter text is a private matching fact, not rendered SemanticNode.text.
+ // Read authored text nodes in light DOM/open roots, never editable values,
+ // closed-root inventories, accessible names, or public display-text metadata.
+ const secureNodes=new Set(elements.filter((_,i)=>data[i].states.secure));
+ const protectedNodes=new Set(elements.filter((_,i)=>protectedAncestors[i]));
+ const secureSelectorAll='input[type="password" i],'+secureSelector;
+ const matcherCache=new Map(),matcherLimit={};let matcherWork=0,matcherChars=0;
+ function matcherStep(){if(++matcherWork>1000000)throw matcherLimit;}
+ function secureNode(node){return node.nodeType===1&&(secureNodes.has(node)||Element.prototype.matches.call(node,secureSelectorAll));}
+ function matcherText(root){
+  if(matcherCache.has(root))return matcherCache.get(root);
+  if(protectedNodes.has(root)){matcherCache.set(root,null);return null;}
+  // A directly resolved node can sit inside a secure closed shadow host.
+  const seen=new Set();let depth=0;
+  for(let node=root;node;node=node.parentElement||node.getRootNode()?.host){
+   matcherStep();if(++depth>256||seen.has(node))throw matcherLimit;seen.add(node);
+   if(secureNode(node)){matcherCache.set(root,null);return null;}
+  }
+  const pending=[[root,0]],parts=[];let length=0;
+  while(pending.length){
+   matcherStep();const [node,depth]=pending.pop();if(depth>256)throw matcherLimit;
+   if(node.nodeType===3){
+    const text=node.nodeValue||'';length+=text.length;matcherChars+=text.length;
+    if(length>1048576||matcherChars>8388608)throw matcherLimit;parts.push(text);continue;
+   }
+   if(node.nodeType!==1&&node.nodeType!==11)continue;
+   // Refuse, rather than concatenate around, a newly protected descendant.
+   if(secureNode(node)||protectedNodes.has(node)){matcherCache.set(root,null);return null;}
+   if(['SCRIPT','STYLE','NOSCRIPT'].includes(node.nodeName)||document.head?.contains(node))continue;
+   // Playwright treats only these non-editable input values as button labels.
+   if(node instanceof HTMLInputElement&&['submit','button','reset'].includes(node.type)){
+    if(node.isContentEditable){matcherCache.set(root,null);return null;}
+    const text=node.value;length+=text.length;matcherChars+=text.length;
+    if(length>1048576||matcherChars>8388608)throw matcherLimit;parts.push(text);continue;
+   }
+   // shadowRoot exposes open author roots only. A native handle within a
+   // closed root remains queryable, but its text never escapes through its host.
+   const shadow=node.shadowRoot,children=node.childNodes;
+   if(pending.length+children.length+(shadow?1:0)>100000)throw matcherLimit;
+   if(shadow)pending.push([shadow,depth+1]);
+   for(let i=children.length-1;i>=0;i--)pending.push([children[i],depth+1]);
+  }
+  const text=parts.join('');matcherCache.set(root,text);return text;
+ }
+ function matchFilterText(pattern,element){
+  const text=matcherText(element);if(text===null)return false;
+  if(pattern.kind==='regexp')return new RegExp(pattern.source,pattern.flags).test(text);
+  // Playwright's hasText string option is always a case-insensitive substring;
+  // its whitespace rules differ from the public semantic-text projection.
+  const normalize=s=>String(s).replace(/[\u200b\u00ad]/g,'').trim().replace(/\s+/g,' ');
+  return normalize(text).toLowerCase().includes(normalize(pattern.value).toLowerCase());
+ }
  const contains=(a,b)=>{if(a===b)return false;let node=elements[b];const seen=new Set();while(node&&!seen.has(node)){seen.add(node);node=node.parentNode||(node.getRootNode&&node.getRootNode().host);if(node===elements[a])return true;}return false;};
  const redacted=[];
  for(let i=0;i<data.length;i++)if(data.some((n,j)=>n.states.secure&&contains(i,j))){redacted.push(i);if(safeNames[i]!==null)data[i].name=safeNames[i];else delete data[i].name;delete data[i].text;delete data[i].selection;delete data[i].value;labels[i]=[];}
@@ -1778,13 +1864,13 @@ const MATCH_QUERY: &str = r#"function(expression, data, labels, safeNames, ...el
     if(x.query.kind==='text') candidates=candidates.filter(i=>!candidates.some(j=>contains(i,j)));
     return candidates;
    }
-   case 'filter': return evaluate(x.source,scope).filter(i=>(!x.hasText||match(x.hasText,data[i].text))&&(!x.has||evaluate(x.has,scope.filter(j=>contains(i,j))).length>0));
+   case 'filter': return evaluate(x.source,scope).filter(i=>(!x.hasText||matchFilterText(x.hasText,elements[i]))&&(!x.has||evaluate(x.has,scope.filter(j=>contains(i,j))).length>0));
    case 'index': {const a=evaluate(x.source,scope);const i=x.index==='first'?0:x.index==='last'?a.length-1:x.index;return i>=0&&i<a.length?[a[i]]:[];}
    case 'frame': throw new Error('Frame expression must be resolved by native frame scope');
    default: throw new Error('Unknown locator expression');
   }
  }
- try { return {indices:evaluate(expression),redacted}; } catch { return {error:"invalid-arguments"}; }
+ try { return {indices:evaluate(expression),redacted}; } catch(error) { return {error:error===matcherLimit?"resource-limit":"invalid-arguments"}; }
 }"#;
 
 /// Query the browser's DOM/AX primitives, not a previously truncated observation.
@@ -1812,6 +1898,134 @@ pub async fn query(
     for selector in path {
         frame = select_frame(client, frames, frame, &selector, lease).await?;
     }
+    let matches = evaluate_query(client, frame, &expression, options, lease).await?;
+    let strict_query = if matches.len() == 1 && !query_uses_pinned_handles(&expression) {
+        let local_options = QueryOptions {
+            expression,
+            ..options.clone()
+        };
+        Some(StrictQueryOrigin::new(
+            serde_json::to_string(&local_options).map_err(|_| ObservationError::BackendFailure)?,
+        ))
+    } else {
+        None
+    };
+    let mut staged = refs.clone();
+    let mut nodes = Vec::with_capacity(matches.len());
+    if strict_query.is_none() {
+        staged
+            .check_exact_admission(
+                &frame.binding,
+                &matches
+                    .iter()
+                    .map(|(backend, _)| *backend)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(reference_allocation_error)?;
+    }
+    for (backend, mut node) in matches {
+        let mut binding = frame.binding.clone();
+        binding.actionable = !matches!(
+            node.role.as_deref(),
+            Some("document" | "text" | "InlineTextBox")
+        ) && !node
+            .author
+            .as_ref()
+            .is_some_and(|facts| matches!(facts.node_type, 3 | 9));
+        let id = staged
+            .try_bind_exact_with_origin(
+                backend,
+                node.role.as_deref().unwrap_or(""),
+                "",
+                binding,
+                strict_query.clone(),
+            )
+            .map_err(reference_allocation_error)?;
+        node.reference = NodeReference {
+            id: format!("@{id}"),
+            revision: revision.to_string(),
+        };
+        nodes.push(node);
+    }
+    validate_frame(client, frame, lease).await?;
+    check(lease)?;
+    *refs = staged;
+    Ok(QueryResult {
+        identity_scope: identity_scope.into(),
+        revision,
+        nodes,
+    })
+}
+
+// Mirrors the outer projected source: predicate-pinned queries stay pinned
+// through filter/index, but an inner scope or has query does not pin its parent.
+fn query_uses_pinned_handles(expression: &LocatorExpression) -> bool {
+    match expression {
+        LocatorExpression::Query { query, .. } => {
+            matches!(query.kind, QueryKind::DisplayValue)
+                || matches!(
+                    (&query.kind, &query.value),
+                    (QueryKind::Label, TextPattern::String { exact: true, .. })
+                )
+        }
+        LocatorExpression::Filter { source, .. }
+        | LocatorExpression::Index { source, .. }
+        | LocatorExpression::Frame { source, .. } => query_uses_pinned_handles(source),
+        LocatorExpression::Selector { .. } => false,
+    }
+}
+
+/// Revalidation allocates no references and adds only the original strict constraint. It
+/// never gives a new matching backend authority to replace the captured one.
+pub(crate) async fn validate_strict_query(
+    client: &CdpClient,
+    binding: &ExactBinding,
+    backend: i64,
+    origin: &StrictQueryOrigin,
+    lease: &OperationLease,
+) -> Result<(), ObservationError> {
+    let options: QueryOptions =
+        serde_json::from_str(&origin.source).map_err(|_| ObservationError::BackendFailure)?;
+    let frame = ObservationFrame {
+        parent_frame_id: None,
+        owner_backend_id: None,
+        url: String::new(),
+        binding: binding.clone(),
+        offset_x: 0.,
+        offset_y: 0.,
+        frame_path: Vec::new(),
+    };
+    let matches = evaluate_query(client, &frame, &options.expression, &options, lease).await?;
+    if matches.len() != 1 || matches[0].0 != backend {
+        return Err(ObservationError::StaleReference);
+    }
+    Ok(())
+}
+
+/// Public semantic serialization is sparse; matching must still distinguish
+/// explicit false states from missing values. This payload stays in the query
+/// realm and is never returned as a public SemanticNode.
+fn query_match_metadata(nodes: &[SemanticNode]) -> Result<Value, ObservationError> {
+    let mut payload = serde_json::to_value(nodes).map_err(|_| ObservationError::BackendFailure)?;
+    let rows = payload
+        .as_array_mut()
+        .ok_or(ObservationError::BackendFailure)?;
+    for (row, node) in rows.iter_mut().zip(nodes) {
+        row["states"] =
+            serde_json::to_value(&node.states).map_err(|_| ObservationError::BackendFailure)?;
+    }
+    Ok(payload)
+}
+
+/// Shared DOM/AX/security acquisition with no reference allocator or registry.
+/// Publication and strict action validation consume the same matching result.
+async fn evaluate_query(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    expression: &LocatorExpression,
+    options: &QueryOptions,
+    lease: &OperationLease,
+) -> Result<Vec<(i64, SemanticNode)>, ObservationError> {
     let session = &frame.binding.session;
     validate_frame(client, frame, lease).await?;
     let ax_value = command(
@@ -1833,9 +2047,6 @@ pub async fn query(
     // including those omitted from the AX tree; semantic role comes from AX.
     let dom = frame_dom(client, frame, lease).await?;
     let ids = author_query_ids(&dom["root"])?;
-    refs.check_exact_admission(&frame.binding, &ids)
-        .map_err(reference_allocation_error)?;
-    let mut staged = refs.clone();
     let mut nodes = Vec::new();
     let metadata_options = ObservationOptions {
         test_id_attribute: options.test_id_attribute.clone(),
@@ -1847,7 +2058,7 @@ pub async fn query(
     let result=async {
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
         for chunk in ax_nodes.chunks(64) {
-            nodes.extend(read_batch(client,frame,&chunk.iter().collect::<Vec<_>>(),&mut staged,revision,&metadata_options,lease,false,&security).await?);
+            nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security).await?);
         }
         for (backend,node) in ids.iter().zip(&mut nodes){apply_security(node,*backend,&security);}
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
@@ -1861,32 +2072,22 @@ pub async fn query(
             }
         })).buffered(16).try_collect().await?;
         if objects.is_empty() { return Ok(Vec::new()); }
-        let mut arguments=vec![json!({"value":expression}),json!({"value":nodes}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()})];
+        let mut arguments=vec![json!({"value":expression}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
         arguments.extend(objects.iter().map(|id|json!({"objectId":id})));
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
         let value=&result["result"]["value"];
-        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
+        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
         let indices:Vec<usize>=serde_json::from_value(value["indices"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         let redacted:Vec<usize>=serde_json::from_value(value["redacted"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         for index in redacted { let node=nodes.get_mut(index).ok_or(ObservationError::BackendFailure)?;scrub_ancestor_content(node); }
-        indices.into_iter().map(|i|nodes.get(i).cloned().ok_or_else(||"Invalid query index".into())).collect::<Result<Vec<_>,ObservationError>>()
+        indices.into_iter().map(|i|nodes.get(i).cloned().zip(ids.get(i).copied()).map(|(node,backend)|(backend,node)).ok_or_else(||"Invalid query index".into())).collect::<Result<Vec<_>,ObservationError>>()
     }.await;
     let result = settle_object_group(client, session, &group, result).await;
     let nodes = result?;
-    let matched = nodes
-        .iter()
-        .filter_map(|node| super::element::parse_ref(&node.reference.id))
-        .collect();
-    staged.retain_query_additions(refs, &matched);
     validate_frame(client, frame, lease).await?;
     check(lease)?;
-    *refs = staged;
-    Ok(QueryResult {
-        identity_scope: identity_scope.into(),
-        revision,
-        nodes,
-    })
+    Ok(nodes)
 }
 
 #[derive(Debug, Clone)]
@@ -2167,6 +2368,31 @@ async fn read_batch(
     bounded: bool,
     acquisition_policy: &SecurityInventory,
 ) -> Result<Vec<SemanticNode>, ObservationError> {
+    read_batch_with_refs(
+        client,
+        frame,
+        nodes,
+        Some(refs),
+        revision,
+        options,
+        lease,
+        bounded,
+        acquisition_policy,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn read_batch_with_refs(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    nodes: &[&AXNode],
+    mut refs: Option<&mut RefMap>,
+    revision: u64,
+    options: &ObservationOptions,
+    lease: &OperationLease,
+    bounded: bool,
+    acquisition_policy: &SecurityInventory,
+) -> Result<Vec<SemanticNode>, ObservationError> {
     use futures_util::{stream, StreamExt, TryStreamExt};
     if nodes.is_empty() {
         return Ok(Vec::new());
@@ -2245,7 +2471,10 @@ async fn read_batch(
         // the native pseudo backend, never the origin's DOM reference.
         nodes.iter().zip(&values).zip(pseudo).map(|((ax,data),origin)|{
             let readonly=if origin.is_some(){readonly_pseudo_metadata(data,ax)}else{data.clone()};
-            let mut node=project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,&readonly,bounded)?;
+            let mut node=match refs.as_deref_mut() {
+                Some(refs)=>project_node(frame,ax.backend_d_o_m_node_id.unwrap(),ax,refs,revision,&readonly,bounded),
+                None=>project_node_with_refs(frame,ax.backend_d_o_m_node_id.unwrap(),ax,None,revision,&readonly,bounded),
+            }?;
             if let (Some(origin),Some(policy))=(origin,&policy){apply_security(&mut node,origin,policy);if node.states.get("secure")==Some(&true){scrub_content(&mut node);}}
             Ok(node)
         }).collect()
@@ -3047,6 +3276,22 @@ pub async fn project_geometry(
 mod tests {
     use super::*;
     #[test]
+    fn private_query_payload_preserves_false_states_independent_of_public_projection() {
+        let states = [
+            "disabled", "focused", "hidden", "secure", "checked", "selected", "expanded", "pressed",
+        ]
+        .into_iter()
+        .map(|state| (state.to_owned(), false))
+        .collect::<BTreeMap<_, _>>();
+        let node = SemanticNode {
+            states: states.clone(),
+            ..Default::default()
+        };
+        let payload = query_match_metadata(&[node]).unwrap();
+        assert_eq!(payload[0]["states"], serde_json::to_value(states).unwrap());
+    }
+
+    #[test]
     fn author_observation_excludes_only_browser_owned_shadow_identities() {
         let dom = json!({"nodeType":9,"backendNodeId":1,"children":[
             {"nodeType":1,"backendNodeId":2,"shadowRoots":[
@@ -3609,8 +3854,26 @@ mod tests {
     #[tokio::test]
     async fn query_group_cleanup_failure_preserves_primary_and_never_publishes() {
         use futures_util::{SinkExt, StreamExt};
-        for timeout in [false, true] {
-            for primary_failure in [false, true] {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for (cleanup_failure, timeout) in [(true, false), (true, true), (false, false)] {
+            for primary_failure in [
+                None,
+                Some(ObservationError::BackendFailure),
+                Some(ObservationError::ResourceLimit),
+            ] {
+                // Retain the existing cleanup-failure matrix, and prove the
+                // renderer's typed resource limit also survives clean release.
+                if !cleanup_failure && primary_failure != Some(ObservationError::ResourceLimit) {
+                    continue;
+                }
+                let query_releases = Arc::new(AtomicUsize::new(0));
+                let query_matches = Arc::new(AtomicUsize::new(0));
+                let released = query_releases.clone();
+                let matched = query_matches.clone();
+                let renderer_failure = primary_failure.clone();
                 let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let endpoint = format!("ws://{}", listener.local_addr().unwrap());
                 let server = tokio::spawn(async move {
@@ -3627,6 +3890,9 @@ mod tests {
                                 .as_str()
                                 .unwrap()
                                 .starts_with("native-query-");
+                        if query_release {
+                            released.fetch_add(1, Ordering::SeqCst);
+                        }
                         if query_release && timeout {
                             continue;
                         }
@@ -3651,10 +3917,24 @@ mod tests {
                                 if declaration.contains("Array.from(result)") {
                                     json!({"result":{"objectId":"security"}})
                                 } else if declaration.starts_with("function(expression") {
-                                    if primary_failure {
-                                        json!({"exceptionDetails":{}})
-                                    } else {
-                                        json!({"result":{"value":{"indices":[0],"redacted":[]}}})
+                                    matched.fetch_add(1, Ordering::SeqCst);
+                                    assert_eq!(declaration, MATCH_QUERY);
+                                    assert_eq!(
+                                        request["params"]["arguments"][4]["value"],
+                                        ".secure"
+                                    );
+                                    assert_eq!(
+                                        request["params"]["arguments"][5]["value"],
+                                        json!([false])
+                                    );
+                                    match renderer_failure.as_ref() {
+                                        Some(ObservationError::ResourceLimit) => {
+                                            json!({"result":{"value":{"error":"resource-limit"}}})
+                                        }
+                                        Some(_) => json!({"exceptionDetails":{}}),
+                                        None => {
+                                            json!({"result":{"value":{"indices":[0],"redacted":[]}}})
+                                        }
                                     }
                                 } else {
                                     json!({"result":{"value":[metadata()]}})
@@ -3663,7 +3943,7 @@ mod tests {
                             "Runtime.releaseObjectGroup" => json!({}),
                             _ => panic!("unexpected scoped query command"),
                         };
-                        let response = if query_release {
+                        let response = if query_release && cleanup_failure {
                             json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic cleanup failure"}})
                         } else {
                             json!({"id":request["id"],"result":result})
@@ -3682,19 +3962,25 @@ mod tests {
                 let client = CdpClient::connect(&endpoint).await.unwrap();
                 let (op, _sender) = lease();
                 let mut refs = RefMap::new();
+                let previous = refs.bind_exact(7, "button", "Previous", frame().binding);
                 let options: QueryOptions = serde_json::from_value(
-                    json!({"expression":{"kind":"selector","selector":"button"}}),
+                    json!({"secureFieldSelector":".secure","expression":{"kind":"filter","source":{"kind":"selector","selector":"button"},"hasText":{"kind":"string","value":"Save","exact":false}}}),
                 )
                 .unwrap();
                 let result = query(&client, &[frame()], &mut refs, "scope", 1, &options, &op).await;
-                assert_eq!(
-                    result.unwrap_err(),
+                let expected = if cleanup_failure {
                     ObservationError::CleanupFailed {
-                        primary: primary_failure
-                            .then(|| Box::new(ObservationError::BackendFailure))
+                        primary: primary_failure.map(Box::new),
                     }
-                );
-                assert_eq!(refs.retained_identity_counts(), (0, 0));
+                } else {
+                    primary_failure.unwrap()
+                };
+                assert_eq!(result.unwrap_err(), expected);
+                assert_eq!(query_matches.load(Ordering::SeqCst), 1);
+                assert_eq!(query_releases.load(Ordering::SeqCst), 1);
+                assert_eq!(refs.retained_identity_counts(), (1, 1));
+                assert!(refs.get(&previous).is_some());
+                assert!(refs.get("e2").is_none());
                 server.abort();
                 let _ = server.await;
             }
@@ -3954,6 +4240,30 @@ mod tests {
         assert!(refs.ref_ids().is_empty());
         server.abort();
     }
+    // Query and observation capabilities may intentionally use different IDs
+    // for one node. Join diagnostic views by backend plus every binding field,
+    // never by selector/name or by dropping frame/session/loader boundaries.
+    type FixtureExactIdentity = (i64, String, String, String, String, bool);
+    fn fixture_exact_identity(
+        refs: &RefMap,
+        reference: &str,
+    ) -> Result<FixtureExactIdentity, String> {
+        let id = super::super::element::parse_ref(reference).ok_or("Invalid fixture ref")?;
+        let entry = refs.get(&id).ok_or("Missing fixture exact identity")?;
+        let binding = entry
+            .exact_binding
+            .as_ref()
+            .ok_or("Missing fixture binding")?;
+        Ok((
+            entry.backend_node_id.ok_or("Missing fixture backend")?,
+            binding.page_session.clone(),
+            binding.session.clone(),
+            binding.frame.clone(),
+            binding.loader.clone(),
+            binding.actionable,
+        ))
+    }
+
     #[tokio::test]
     #[ignore = "requires a real installed Chromium; run in browser CI"]
     async fn chromium_native_observation_query_exact_and_secure_contract() {
@@ -4026,7 +4336,7 @@ mod tests {
                 let entry=refs.get(node.reference.id.trim_start_matches('@')).ok_or("Missing observed identity")?;
                 if entry.backend_node_id.is_some_and(|id|internal.contains(&id)){return Err("Browser-internal control exposed".into());}
                 if entry.kind==super::super::element::NativeReferenceKind::ReadOnlyCssPseudo && node.role.as_deref()!=Some("text"){return Err("List marker is not structural text".into());}
-                observed.insert(node.reference.id.clone(),node);
+                observed.insert(fixture_exact_identity(&refs,&node.reference.id)?,node);
             }
             let all:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"selector","selector":"*"}})).unwrap();
             for node in query(&mgr.client,&frames,&mut refs,"fixture",4,&all,&lease).await?.nodes {
@@ -4037,7 +4347,9 @@ mod tests {
                 let options:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"selector","selector":selector}})).unwrap();
                 let found=query(&mgr.client,&frames,&mut refs,"fixture",4,&options,&lease).await?;
                 if found.nodes.len()!=1{return Err("Author control query lost identity".into());}
-                let node=observed.get(&found.nodes[0].reference.id).ok_or("Query and observation identities differ")?;
+                let identity=fixture_exact_identity(&refs,&found.nodes[0].reference.id)?;
+                let node=observed.get(&identity).ok_or("Query and observation backend/binding identities differ")?;
+                if node.reference.id==found.nodes[0].reference.id{return Err("Strict query reused observed authority ID".into());}
                 if node.role.as_deref()!=Some(role)||node.states.get("disabled").copied().unwrap_or(false)!=disabled{return Err("Author control semantics differ".into());}
             }
             mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"document.body.innerHTML='<details><summary id="summary">Summary</summary><button id="folded">Folded</button></details><div id="contents" style="display:contents"><button>Child</button></div><div id="text" style="display:contents">Text</div><div id="hidden-text" style="display:contents;visibility:hidden">Text</div><div id="skip" style="content-visibility:hidden;width:20px;height:20px"><button id="skipped">Skipped</button></div><button id="transparent" style="opacity:0">Transparent</button><div id="zero" style="width:0;height:0"></div>';true"#,"returnByValue":true})),Some(session)).await?;
@@ -4053,13 +4365,16 @@ mod tests {
             mgr.client.send_command("Runtime.evaluate",Some(json!({"expression":r#"document.body.innerHTML='<p>Use <span id="attribute-endpoint" onclick="">attribute</span>, <span id="property-endpoint">property</span>, <span id="tabindex-endpoint" tabindex="-1">tabindex</span>, and <span id="listener-only">listener</span>.</p>'; document.getElementById('property-endpoint').onclick=()=>undefined; document.getElementById('listener-only').addEventListener('click',()=>undefined); true"#,"returnByValue":true})),Some(session)).await?;
             let tree=observe(&mgr.client,&frames,&mut refs,"fixture",6,&ObservationOptions::default(),&lease).await?;
             let mut pending=tree.roots.iter().collect::<Vec<_>>();
-            let mut emitted=std::collections::HashSet::new();
-            while let Some(node)=pending.pop(){emitted.insert(node.reference.id.clone());pending.extend(node.children.iter());}
+            let mut emitted=HashMap::new();
+            while let Some(node)=pending.pop(){emitted.insert(fixture_exact_identity(&refs,&node.reference.id)?,node.reference.id.clone());pending.extend(node.children.iter());}
             for (ordinal,selector,wanted) in [(0,"#attribute-endpoint",true),(1,"#property-endpoint",true),(2,"#tabindex-endpoint",true),(3,"#listener-only",false)] {
                 let options:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"selector","selector":selector}})).unwrap();
                 let found=query(&mgr.client,&frames,&mut refs,"fixture",6,&options,&lease).await?;
                 let node=found.nodes.first().ok_or("Inline endpoint exact query missing")?;
-                let included=emitted.contains(&node.reference.id);
+                let identity=fixture_exact_identity(&refs,&node.reference.id)?;
+                let observed_id=emitted.get(&identity);
+                let included=observed_id.is_some();
+                if observed_id==Some(&node.reference.id){return Err("Strict endpoint query reused observed authority ID".into());}
                 if included!=wanted{return Err(format!("Inline endpoint ordinal={ordinal} included={included} expected={wanted}"));}
             }
             Ok::<(),String>(())
@@ -4876,6 +5191,155 @@ mod tests {
             u64::MAX.to_string()
         );
     }
+    fn node_with_public_states(value: bool) -> SemanticNode {
+        SemanticNode {
+            reference: NodeReference {
+                id: "@e42".into(),
+                revision: u64::MAX.to_string(),
+            },
+            states: [
+                "disabled", "focused", "hidden", "secure", "checked", "selected", "expanded",
+                "pressed",
+            ]
+            .into_iter()
+            .map(|name| (name.into(), value))
+            .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn public_state_serialization_preserves_raw_flags_and_explicit_false_controls() {
+        let node = node_with_public_states(false);
+        let raw_states = node.states.clone();
+        let encoded = serde_json::to_value(&node).unwrap();
+        assert_eq!(
+            encoded["states"],
+            json!({"checked":false,"selected":false,"expanded":false,"pressed":false})
+        );
+        assert_eq!(
+            encoded["ref"],
+            serde_json::to_value(&node.reference).unwrap()
+        );
+        assert_eq!(node.states, raw_states);
+        for flag in ["disabled", "focused", "hidden", "secure"] {
+            assert_eq!(node.states.get(flag), Some(&false));
+        }
+        // Deserialization still accepts complete native facts; omission is
+        // exclusively a serialization choice, not a mutation of input data.
+        let mut complete = encoded;
+        complete["states"] = serde_json::to_value(&raw_states).unwrap();
+        assert_eq!(
+            serde_json::from_value::<SemanticNode>(complete)
+                .unwrap()
+                .states,
+            raw_states
+        );
+    }
+
+    #[test]
+    fn public_state_serialization_keeps_nonstandard_false_states() {
+        let mut node = SemanticNode::default();
+        node.states.insert("readonly".into(), false);
+        node.states.insert("required".into(), false);
+        node.states.insert("customFlag".into(), false);
+        assert_eq!(
+            serde_json::to_value(&node).unwrap()["states"],
+            serde_json::to_value(&node.states).unwrap()
+        );
+    }
+
+    #[test]
+    fn public_state_serialization_preserves_all_true_flags_and_empty_maps() {
+        let node = node_with_public_states(true);
+        assert_eq!(
+            serde_json::to_value(&node).unwrap()["states"],
+            serde_json::to_value(&node.states).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_value(SemanticNode::default()).unwrap()["states"],
+            json!({})
+        );
+    }
+
+    #[test]
+    fn observation_query_and_exact_read_share_public_state_serialization() {
+        let mut node = node_with_public_states(false);
+        node.children.push(node_with_public_states(false));
+        let expected = serde_json::to_value(&node).unwrap();
+        let observation = Observation {
+            hidden_frame_proof: HiddenFrameProof::default(),
+            identity_scope: "scope".into(),
+            revision: u64::MAX,
+            roots: vec![node.clone()],
+            viewport_ref: NodeReference {
+                id: "@viewport".into(),
+                revision: u64::MAX.to_string(),
+            },
+            truncated: false,
+        };
+        let query = QueryResult {
+            identity_scope: "scope".into(),
+            revision: u64::MAX,
+            nodes: vec![node.clone()],
+        };
+        assert_eq!(
+            serde_json::to_value(observation).unwrap()["roots"][0],
+            expected
+        );
+        assert_eq!(serde_json::to_value(query).unwrap()["nodes"][0], expected);
+        assert_eq!(project_read_fields(node, None).unwrap(), expected);
+        assert_eq!(expected["children"][0]["states"], expected["states"]);
+    }
+
+    #[test]
+    fn selected_read_states_share_public_projection_and_keep_exact_reference() {
+        let mut node = node_with_public_states(false);
+        node.name = Some("Save".into());
+        let expected_ref = serde_json::to_value(&node.reference).unwrap();
+        assert_eq!(
+            project_read_fields(node.clone(), Some(&[ReadField::States])).unwrap(),
+            json!({"ref":expected_ref,"states":{
+                "checked":false,"selected":false,"expanded":false,"pressed":false
+            }})
+        );
+        assert_eq!(
+            project_read_fields(node, Some(&[ReadField::Name])).unwrap(),
+            json!({"ref":expected_ref,"name":"Save"})
+        );
+    }
+
+    #[test]
+    fn selected_secure_read_states_preserve_policy_flags_and_redaction() {
+        let mut node = node_with_public_states(false);
+        node.states.insert("secure".into(), true);
+        node.states.insert("focused".into(), true);
+        node.value = Some("synthetic-secret".into());
+        node.text = Some("synthetic-secret".into());
+        node.selection = Some("synthetic-secret".into());
+        node.attributes
+            .insert("value".into(), "synthetic-secret".into());
+        let expected_ref = serde_json::to_value(&node.reference).unwrap();
+        let selected = project_read_fields(
+            node,
+            Some(&[
+                ReadField::States,
+                ReadField::Value,
+                ReadField::Text,
+                ReadField::Selection,
+                ReadField::Attributes,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            selected,
+            json!({"ref":expected_ref,"states":{
+                "secure":true,"focused":true,
+                "checked":false,"selected":false,"expanded":false,"pressed":false
+            },"attributes":{}})
+        );
+    }
+
     #[test]
     fn selected_secure_read_retains_policy_metadata_not_an_empty_value() {
         let node = SemanticNode {

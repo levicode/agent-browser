@@ -285,7 +285,7 @@ impl ObservationDispatch {
             .map_err(|_| failure(ProtocolError::ScopeUnavailable))?
             .clone();
         let wants_pixels = matches!(&request, DispatchRequest::Screenshot(_))
-            || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels || r.options.pixel_fallback);
+            || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
         // Charge the native producer before screenshot collection starts.
         let mut producer = if wants_pixels {
             Some(
@@ -461,6 +461,14 @@ impl ObservationDispatch {
             let selector = fallback_selector
                 .as_deref()
                 .ok_or_else(|| failure(ProtocolError::PolicyDenied))?;
+            // Permission to fall back does not itself request pixels. Admit
+            // fresh fallback only after the semantic deadline and restoration,
+            // under the same exact scope and unchanged operation budget.
+            check(&capture_context.page, &operation).map_err(failure)?;
+            if producer.is_none() {
+                producer = Some(context.blobs.reserve_producer(context.scope.clone())
+                    .map_err(|error| failure(blob_error(error)))?);
+            }
             let (fresh_value, fresh_pixels, fresh_journal) = fresh_fallback(
                 &capture_context,
                 selector,
@@ -1555,198 +1563,364 @@ mod tests {
     #[tokio::test]
     async fn semantic_only_timeout_never_mutates_lifecycle_and_fallback_stabilizes_separately() {
         for (pixels, fallback) in [(false, false), (false, true), (true, true)] {
-            use super::super::cdp::client::CdpClient;
-            use super::super::client_browser::ExecutionGate;
-            use super::super::client_targets::ClientTargets;
-            use super::super::client_test_faults::{FaultController, Phase, State};
-            use base64::Engine;
-            use futures_util::{SinkExt, StreamExt};
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("ws://{}", listener.local_addr().unwrap());
-            let lifecycle = Arc::new(Mutex::new(Vec::<String>::new()));
-            let log = lifecycle.clone();
-            let animation_commands = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let animation_log = animation_commands.clone();
-            let source_commands = Arc::new(Mutex::new(Vec::<&'static str>::new()));
-            let source_log = source_commands.clone();
-            let mut bytes = std::io::Cursor::new(Vec::new());
-            image::DynamicImage::new_rgba8(10, 10)
-                .write_to(&mut bytes, image::ImageFormat::Png)
-                .unwrap();
-            let png = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
-            let server = tokio::spawn(async move {
-                let (stream, _) = listener.accept().await.unwrap();
-                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                while let Some(Ok(message)) = socket.next().await {
-                    let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
-                    if request["method"]
-                        .as_str()
-                        .is_some_and(|method| method.starts_with("Animation."))
-                    {
-                        animation_log.fetch_add(1, Ordering::SeqCst);
-                    }
-                    if request["method"] == "Page.setWebLifecycleState" {
-                        log.lock()
-                            .unwrap()
-                            .push(request["params"]["state"].as_str().unwrap().into());
-                    }
-                    let result = match request["method"].as_str().unwrap() {
-                        "Page.getFrameTree" => {
-                            json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"}}})
-                        }
-                        "Page.createIsolatedWorld" => json!({"executionContextId":1}),
-                        "Animation.getPlaybackRate" => json!({"playbackRate":1}),
-                        "Page.getLayoutMetrics" => {
-                            json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}})
-                        }
-                        "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":1}}),
-                        "DOMSnapshot.captureSnapshot" => {
-                            json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[],"backendNodeId":[]}}]})
-                        }
-                        "Runtime.evaluate" => {
-                            // This peer has an empty DOM inventory. Its only evaluate is
-                            // the source-mask holder factory, never an arbitrary script.
-                            assert_eq!(request["params"]["contextId"], 1);
-                            assert!(request["params"]["objectGroup"]
-                                .as_str()
-                                .unwrap()
-                                .starts_with("capture-source-"));
-                            source_log.lock().unwrap().push("holder");
-                            json!({"result":{"type":"object","objectId":"source-holder"}})
-                        }
-                        "Runtime.callFunctionOn" => {
-                            assert_eq!(request["params"]["objectId"], "source-holder");
-                            let phase =
-                                match request["params"]["functionDeclaration"].as_str().unwrap() {
-                                    "function(){return this.verify()}" => "verify",
-                                    "function(){return this.remove()}" => "remove",
-                                    other => panic!("unexpected source holder method: {other}"),
-                                };
-                            assert_eq!(request["params"]["returnByValue"], true);
-                            assert!(request["params"]["objectGroup"]
-                                .as_str()
-                                .unwrap()
-                                .starts_with("capture-source-"));
-                            source_log.lock().unwrap().push(phase);
-                            json!({"result":{"type":"boolean","value":true}})
-                        }
-                        "Runtime.releaseObjectGroup"
-                            if request["params"]["objectGroup"]
-                                .as_str()
-                                .is_some_and(|group| group.starts_with("capture-source-")) =>
-                        {
-                            source_log.lock().unwrap().push("release");
-                            json!({})
-                        }
-                        "Page.captureScreenshot" => json!({"data":png}),
-                        _ => json!({}),
-                    };
-                    if socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"sessionId":request["sessionId"],"result":result}).to_string())).await.is_err() { break; }
+            semantic_timeout_fallback_admission(pixels, fallback, "available").await;
+        }
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn actual_semantic_timeout_requires_admission_before_fallback_capture() {
+        semantic_timeout_fallback_admission(false, true, "occupied").await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_capture_refusal_releases_admitted_producer_after_restore() {
+        semantic_timeout_fallback_admission(false, true, "capture-refused").await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_dirty_restore_releases_admitted_producer_without_publishing() {
+        semantic_timeout_fallback_admission(false, true, "dirty-restore").await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    async fn semantic_timeout_fallback_admission(pixels: bool, fallback: bool, mode: &'static str) {
+        use super::super::cdp::client::CdpClient;
+        use super::super::client_blobs::BlobLimits;
+        use super::super::client_browser::ExecutionGate;
+        use super::super::client_targets::ClientTargets;
+        use super::super::client_test_faults::{FaultController, Phase, State};
+        use base64::Engine;
+        use futures_util::{SinkExt, StreamExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let lifecycle = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = lifecycle.clone();
+        let animation_commands = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let animation_log = animation_commands.clone();
+        let source_commands = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let source_log = source_commands.clone();
+        let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let capture_log = captures.clone();
+        let blobs = Arc::new(
+            BlobStore::new(BlobLimits {
+                max_blob_bytes: 4096,
+                max_total_bytes: 8192,
+                max_handles: 8,
+            })
+            .unwrap(),
+        );
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "scope".into(),
+        };
+        blobs.activate_scope(scope.clone()).unwrap();
+        let retained = blobs.insert_sealed(scope.clone(), b"r").unwrap();
+        let live_producer = if mode == "occupied" {
+            Some(blobs.reserve_producer(scope.clone()).unwrap())
+        } else {
+            None
+        };
+        if live_producer.is_some() {
+            assert!(matches!(
+                blobs.reserve_producer(scope.clone()),
+                Err(BlobError::QuotaExceeded)
+            ));
+        }
+        let budget_changes = blobs.budget_changes().unwrap();
+        let capture_blobs = blobs.clone();
+        let capture_scope = scope.clone();
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(10, 10)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let png = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                if request["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("Animation."))
+                {
+                    animation_log.fetch_add(1, Ordering::SeqCst);
                 }
-            });
-            let client = Arc::new(CdpClient::connect(&url).await.unwrap());
-            let targets = ClientTargets::new("context".into(), "scope".into());
-            targets
-                .attached("context", "target".into(), "session".into(), "page".into())
-                .unwrap();
-            targets.configured("target").unwrap();
-            targets
-                .resume_permit("target")
-                .await
-                .unwrap()
-                .complete()
-                .unwrap();
-            targets.acknowledge_enrollment().unwrap(); // Synthetic complete single-page inventory only.
-            let gate = Arc::new(ExecutionGate::default());
-            let page = BrowserExecutionLease {
-                client,
-                page_session_id: "session".into(),
-                target_id: "target".into(),
-                identity_scope: "scope".into(),
-                permit: gate.enter(false).unwrap(),
-                targets,
-            };
-            let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
-            let scope = BlobScope {
-                generation: 1,
-                identity_scope: "scope".into(),
-            };
-            blobs.activate_scope(scope.clone()).unwrap();
-            let faults = Arc::new(FaultController::default());
-            let token = faults.arm("scope", Phase::SemanticAcquire).unwrap();
-            let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
-            let operation = OperationLease {
-                is_callback: false,
-                generation: 1,
-                sequence: 1,
-                deadline: Instant::now() + Duration::from_millis(2000),
-                cancellation,
-            };
-            let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
-            let task = dispatch.start(
-                DispatchContext {
-                    faults: faults.clone(),
-                    page,
-                    ui: Arc::new(UiGate::default()),
-                    blobs: blobs.clone(),
-                    scope: scope.clone(),
-                    policy: ReadPolicy {
-                        test_id_attribute: "data-testid".into(),
-                        secure_field_selector: "input[type=password]".into(),
-                    },
-                },
-                DispatchRequest::Observe(ObserveRequest {
-                    options: ObserveFlags {
-                        pixels,
-                        pixel_fallback: fallback,
-                        comparable: false,
-                    },
+                if request["method"] == "Page.setWebLifecycleState" {
+                    log.lock()
+                        .unwrap()
+                        .push(request["params"]["state"].as_str().unwrap().into());
+                }
+                if matches!(
+                    request["method"].as_str(),
+                    Some(
+                        "Animation.enable"
+                            | "DOMSnapshot.captureSnapshot"
+                            | "Page.captureScreenshot"
+                    )
+                ) {
+                    assert!(
+                        matches!(
+                            capture_blobs.reserve_producer(capture_scope.clone()),
+                            Err(BlobError::QuotaExceeded)
+                        ),
+                        "pixel stabilization and capture must follow producer admission"
+                    );
+                }
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.getFrameTree" => {
+                        json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"}}})
+                    }
+                    "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                    "Animation.getPlaybackRate" => json!({"playbackRate":1}),
+                    "Page.getLayoutMetrics" => {
+                        json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}})
+                    }
+                    "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":1}}),
+                    "DOMSnapshot.captureSnapshot" => {
+                        json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[],"backendNodeId":[]}}]})
+                    }
+                    "Runtime.evaluate" => {
+                        // This peer has an empty DOM inventory. Its only evaluate is
+                        // the source-mask holder factory, never an arbitrary script.
+                        assert_eq!(request["params"]["contextId"], 1);
+                        assert!(request["params"]["objectGroup"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("capture-source-"));
+                        source_log.lock().unwrap().push("holder");
+                        json!({"result":{"type":"object","objectId":"source-holder"}})
+                    }
+                    "Runtime.callFunctionOn" => {
+                        assert_eq!(request["params"]["objectId"], "source-holder");
+                        let phase = match request["params"]["functionDeclaration"].as_str().unwrap()
+                        {
+                            "function(){return this.verify()}" => "verify",
+                            "function(){return this.remove()}" => "remove",
+                            other => panic!("unexpected source holder method: {other}"),
+                        };
+                        assert_eq!(request["params"]["returnByValue"], true);
+                        assert!(request["params"]["objectGroup"]
+                            .as_str()
+                            .unwrap()
+                            .starts_with("capture-source-"));
+                        source_log.lock().unwrap().push(phase);
+                        json!({"result":{"type":"boolean","value":true}})
+                    }
+                    "Runtime.releaseObjectGroup"
+                        if request["params"]["objectGroup"]
+                            .as_str()
+                            .is_some_and(|group| group.starts_with("capture-source-")) =>
+                    {
+                        source_log.lock().unwrap().push("release");
+                        json!({})
+                    }
+                    "Page.captureScreenshot" => {
+                        capture_log.fetch_add(1, Ordering::SeqCst);
+                        json!({"data":png})
+                    }
+                    _ => json!({}),
+                };
+                let refused = mode == "capture-refused"
+                    && request["method"] == "Page.captureScreenshot"
+                    || mode == "dirty-restore"
+                        && request["method"] == "Animation.setPlaybackRate"
+                        && request["params"]["playbackRate"].as_f64() == Some(1.0);
+                let response = if refused {
+                    json!({"id":request["id"],"sessionId":request["sessionId"],"error":{"code":-32000,"message":"synthetic capture or restore refusal"}})
+                } else {
+                    json!({"id":request["id"],"sessionId":request["sessionId"],"result":result})
+                };
+                if socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        response.to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        targets
+            .attached("context", "target".into(), "session".into(), "page".into())
+            .unwrap();
+        targets.configured("target").unwrap();
+        targets
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        // The boundary under test is Dispatch.start, not enrollment startup.
+        targets.acknowledge_enrollment().unwrap();
+        let gate = Arc::new(ExecutionGate::default());
+        let page = BrowserExecutionLease {
+            client,
+            page_session_id: "session".into(),
+            target_id: "target".into(),
+            identity_scope: "scope".into(),
+            permit: gate.enter(false).unwrap(),
+            targets: targets.clone(),
+        };
+        let faults = Arc::new(FaultController::default());
+        let token = faults.arm("scope", Phase::SemanticAcquire).unwrap();
+        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 1,
+            deadline: Instant::now() + Duration::from_millis(2000),
+            cancellation,
+        };
+        let refs = Arc::new(Mutex::new(RefMap::new()));
+        let dispatch = ObservationDispatch::new(refs.clone());
+        let task = dispatch.clone().start(
+            DispatchContext {
+                faults: faults.clone(),
+                page,
+                ui: Arc::new(UiGate::default()),
+                blobs: blobs.clone(),
+                scope: scope.clone(),
+                policy: ReadPolicy {
                     test_id_attribute: "data-testid".into(),
                     secure_field_selector: "input[type=password]".into(),
-                }),
-                operation,
-            );
-            let output = task.result.await.unwrap();
-            task.join.await.unwrap().unwrap();
-            if !fallback {
-                assert_eq!(output.unwrap_err().error, ProtocolError::DeadlineExceeded);
-                assert!(lifecycle.lock().unwrap().is_empty());
-                assert_eq!(animation_commands.load(Ordering::SeqCst), 0);
-                assert!(source_commands.lock().unwrap().is_empty());
-                server.abort();
-                continue;
-            }
-            let output = output.unwrap();
-            assert_eq!(output["treeUnavailable"], true);
-            let root = output["root"].as_object().expect("fallback root object");
-            assert_eq!(
-                root.len(),
-                1,
-                "unavailable tree must serialize only the exact root reference"
-            );
-            assert!(root.contains_key("ref"));
-            assert!(root["ref"]["id"].as_str().unwrap().starts_with("@e"));
-            assert_eq!(output["truncated"], true);
-            assert_eq!(
-                faults.status("scope", &token).unwrap().state,
-                State::Expired
-            );
+                },
+            },
+            DispatchRequest::Observe(ObserveRequest {
+                options: ObserveFlags {
+                    pixels,
+                    pixel_fallback: fallback,
+                    comparable: false,
+                },
+                test_id_attribute: "data-testid".into(),
+                secure_field_selector: "input[type=password]".into(),
+            }),
+            operation,
+        );
+        let output = task.result.await.unwrap();
+        task.join.await.unwrap().unwrap();
+        assert_eq!(
+            faults.status("scope", &token).unwrap().state,
+            State::Expired,
+            "the actual semantic deadline must expire before fallback admission"
+        );
+        assert_eq!(blobs.read(&scope, &retained.handle, 0, 1).unwrap(), b"r");
+        if mode == "occupied" {
+            let error = output.unwrap_err();
+            assert_eq!(error.error, ProtocolError::CapacityExceeded);
+            assert!(!error.cleanup_integrity_lost);
+            assert!(refs.lock().unwrap().ref_ids().is_empty());
+            assert_eq!(dispatch.publication.lock().await.published_revision, 0);
+            assert_eq!(animation_commands.load(Ordering::SeqCst), 0);
+            assert!(source_commands.lock().unwrap().is_empty());
+            assert_eq!(captures.load(Ordering::SeqCst), 0);
             assert!(lifecycle.lock().unwrap().is_empty());
-            assert_eq!(
-                animation_commands.load(Ordering::SeqCst),
-                if pixels { 8 } else { 4 }
-            );
-            let expected_source_cycle = ["holder", "verify", "verify", "remove", "release"];
-            assert_eq!(
+            assert!(!budget_changes.has_changed().unwrap());
+            assert!(matches!(
+                blobs.reserve_producer(scope.clone()),
+                Err(BlobError::QuotaExceeded)
+            ));
+            drop(live_producer);
+            let released = blobs.reserve_producer(scope.clone()).unwrap();
+            drop(released);
+            blobs.release(&scope, &retained.handle).unwrap();
+            blobs.check_budget_integrity().unwrap();
+            assert!(targets.inventory().is_ok());
+            server.abort();
+            let _ = server.await;
+            return;
+        }
+        if matches!(mode, "capture-refused" | "dirty-restore") {
+            let error = output.unwrap_err();
+            assert_eq!(error.error, ProtocolError::BrowserFailure);
+            assert_eq!(error.cleanup_integrity_lost, mode == "dirty-restore");
+            assert!(refs.lock().unwrap().ref_ids().is_empty());
+            assert_eq!(dispatch.publication.lock().await.published_revision, 0);
+            assert_eq!(captures.load(Ordering::SeqCst), 1);
+            assert_eq!(animation_commands.load(Ordering::SeqCst), 4);
+            assert!(lifecycle.lock().unwrap().is_empty());
+            let expected = if mode == "capture-refused" {
+                vec!["holder", "verify", "remove", "release"]
+            } else {
+                vec!["holder", "verify", "verify", "remove", "release"]
+            };
+            assert_eq!(*source_commands.lock().unwrap(), expected);
+            assert_eq!(targets.inventory().is_err(), mode == "dirty-restore");
+            // Exact maximum reservations prove no unpublished pixel charge
+            // remains after clean refusal or dirty cleanup.
+            let released = blobs.reserve_producer(scope.clone()).unwrap();
+            drop(released);
+            blobs.release(&scope, &retained.handle).unwrap();
+            let first = blobs.reserve_producer(scope.clone()).unwrap();
+            let second = blobs.reserve_producer(scope.clone()).unwrap();
+            drop((first, second));
+            blobs.check_budget_integrity().unwrap();
+            server.abort();
+            let _ = server.await;
+            return;
+        }
+        if !fallback {
+            assert_eq!(output.unwrap_err().error, ProtocolError::DeadlineExceeded);
+            assert!(lifecycle.lock().unwrap().is_empty());
+            assert_eq!(animation_commands.load(Ordering::SeqCst), 0);
+            assert!(source_commands.lock().unwrap().is_empty());
+            assert!(!budget_changes.has_changed().unwrap());
+            server.abort();
+            let _ = server.await;
+            return;
+        }
+        let output = output.unwrap();
+        assert_eq!(output["treeUnavailable"], true);
+        let root = output["root"].as_object().expect("fallback root object");
+        assert_eq!(
+            root.len(),
+            1,
+            "unavailable tree must serialize only the exact root reference"
+        );
+        assert!(root.contains_key("ref"));
+        assert!(root["ref"]["id"].as_str().unwrap().starts_with("@e"));
+        assert_eq!(output["truncated"], true);
+        assert_eq!(
+            faults.status("scope", &token).unwrap().state,
+            State::Expired
+        );
+        assert!(lifecycle.lock().unwrap().is_empty());
+        assert_eq!(
+            animation_commands.load(Ordering::SeqCst),
+            if pixels { 8 } else { 4 }
+        );
+        let expected_source_cycle = ["holder", "verify", "verify", "remove", "release"];
+        assert_eq!(
                 *source_commands.lock().unwrap(),
                 expected_source_cycle,
                 "the timed-out semantic phase never captures; fresh fallback owns one settled source holder"
             );
-            blobs
-                .release(&scope, output["pixels"]["handle"].as_str().unwrap())
-                .unwrap();
-            server.abort();
-        }
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert_eq!(output["viewport"], json!({"width":10.0,"height":10.0}));
+        assert_eq!(output["pixels"]["width"], 10);
+        assert_eq!(output["pixels"]["height"], 10);
+        assert_eq!(output["pixels"]["maskedRegionCount"], 0);
+        assert_eq!(dispatch.publication.lock().await.published_revision, 1);
+        let root_id = root["ref"]["id"].as_str().unwrap();
+        assert_eq!(
+            refs.lock()
+                .unwrap()
+                .get(root_id.trim_start_matches('@'))
+                .unwrap()
+                .backend_node_id,
+            Some(1)
+        );
+        blobs
+            .release(&scope, output["pixels"]["handle"].as_str().unwrap())
+            .unwrap();
+        blobs.release(&scope, &retained.handle).unwrap();
+        let first = blobs.reserve_producer(scope.clone()).unwrap();
+        let second = blobs.reserve_producer(scope.clone()).unwrap();
+        drop((first, second));
+        blobs.check_budget_integrity().unwrap();
+        server.abort();
+        let _ = server.await;
     }
     #[tokio::test]
     async fn action_snapshot_uses_committed_revision_not_failed_staging_counter() {
@@ -2048,7 +2222,15 @@ mod tests {
     }
     #[tokio::test]
     async fn tree_observe_skips_positive_hidden_iframe_before_spatial_proof() {
+        tree_observe_with_hidden_iframe(false).await;
+    }
+    #[tokio::test]
+    async fn tree_only_fallback_does_not_reserve_unused_pixels_under_live_blob_pressure() {
+        tree_observe_with_hidden_iframe(true).await;
+    }
+    async fn tree_observe_with_hidden_iframe(pixel_fallback: bool) {
         use super::super::cdp::client::CdpClient;
+        use super::super::client_blobs::BlobLimits;
         use super::super::client_browser::ExecutionGate;
         use super::super::client_targets::ClientTargets;
         use futures_util::{SinkExt, StreamExt};
@@ -2139,7 +2321,9 @@ mod tests {
             .unwrap()
             .complete()
             .unwrap();
-        targets.acknowledge_enrollment().unwrap(); // Synthetic complete inventory only.
+        // This synthetic peer tests production Dispatch.start admission, not
+        // browser startup or enrollment readiness.
+        targets.acknowledge_enrollment().unwrap();
         let gate = Arc::new(ExecutionGate::default());
         let page = BrowserExecutionLease {
             client,
@@ -2149,12 +2333,26 @@ mod tests {
             permit: gate.enter(false).unwrap(),
             targets,
         };
-        let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
+        let blobs = Arc::new(
+            BlobStore::new(BlobLimits {
+                max_blob_bytes: 4096,
+                max_total_bytes: 8192,
+                max_handles: 8,
+            })
+            .unwrap(),
+        );
         let scope = BlobScope {
             generation: 1,
             identity_scope: "scope".into(),
         };
         blobs.activate_scope(scope.clone()).unwrap();
+        let retained = blobs.insert_sealed(scope.clone(), b"r").unwrap();
+        let live_producer = blobs.reserve_producer(scope.clone()).unwrap();
+        assert!(matches!(
+            blobs.reserve_producer(scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        let budget_changes = blobs.budget_changes().unwrap();
         let refs = Arc::new(Mutex::new(RefMap::new()));
         let dispatch = ObservationDispatch::new(refs.clone());
         let (_sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
@@ -2171,15 +2369,19 @@ mod tests {
                 faults: Arc::new(super::super::client_test_faults::FaultController::default()),
                 page,
                 ui: Arc::new(UiGate::default()),
-                blobs,
-                scope,
+                blobs: blobs.clone(),
+                scope: scope.clone(),
                 policy: ReadPolicy {
                     test_id_attribute: "data-testid".into(),
                     secure_field_selector: "input[type=password]".into(),
                 },
             },
             DispatchRequest::Observe(ObserveRequest {
-                options: serde_json::from_value(json!({})).unwrap(),
+                options: ObserveFlags {
+                    pixels: false,
+                    pixel_fallback,
+                    comparable: false,
+                },
                 test_id_attribute: "data-testid".into(),
                 secure_field_selector: "input[type=password]".into(),
             }),
@@ -2193,6 +2395,18 @@ mod tests {
             .is_none_or(Vec::is_empty));
         assert!(result.get("hidden_frame_proof").is_none());
         assert!(result.get("hiddenFrameProof").is_none());
+        assert!(result.get("pixels").is_none());
+        assert!(result.get("treeUnavailable").is_none());
+        assert_eq!(result["viewport"], json!({"width":100.0,"height":80.0}));
+        assert_eq!(result["location"], "https://fixture.invalid/");
+        // The strict peer rejects screenshots, source-mask commands, animation
+        // changes, and spatial reads of the positively hidden iframe.
+        assert!(!budget_changes.has_changed().unwrap());
+        assert_eq!(blobs.read(&scope, &retained.handle, 0, 1).unwrap(), b"r");
+        assert!(matches!(
+            blobs.reserve_producer(scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
         assert_eq!(
             dispatch
                 .snapshot_for_action(&OperationLease {
@@ -2207,6 +2421,18 @@ mod tests {
                 .0,
             1
         );
+        let root = result["root"]["ref"]["id"].as_str().unwrap();
+        assert_eq!(
+            refs.lock()
+                .unwrap()
+                .get(root.trim_start_matches('@'))
+                .unwrap()
+                .backend_node_id,
+            Some(1)
+        );
+        drop(live_producer);
+        blobs.release(&scope, &retained.handle).unwrap();
+        blobs.check_budget_integrity().unwrap();
         server.abort();
         let _ = server.await;
     }

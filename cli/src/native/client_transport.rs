@@ -9,8 +9,8 @@ use super::client_session::{ClientSession, OperationLease};
 // Acceptance-only diagnostics: closed phases and native operation sequence only.
 // Never serialize requests, IDs, browser values, or error descriptions.
 #[cfg(feature = "acceptance-faults")]
-#[derive(Debug)]
-enum SettlementPhase {
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+pub(super) enum SettlementPhase {
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -39,14 +39,15 @@ enum SettlementPhase {
     ShutdownProven,
     ShutdownUnproven,
     PendingResultQueued,
+    CaptureLimitReached,
 }
 macro_rules! settlement_trace {
     ($sequence:expr, $phase:ident) => {
         #[cfg(feature = "acceptance-faults")]
-        eprintln!(
-            "native-settlement sequence={} phase={:?}",
+        super::client_settlement_trace::record(
             $sequence,
-            SettlementPhase::$phase
+            SettlementPhase::$phase,
+            Default::default(),
         );
     };
 }
@@ -772,11 +773,44 @@ where
             }
             #[cfg(feature = "acceptance-faults")]
             match &message {
-                ServerMessage::Result { operation_seq, .. } => {
-                    settlement_trace!(*operation_seq, ResultFlushed);
+                ServerMessage::Result {
+                    operation_seq,
+                    generation,
+                    effects,
+                    scope_state,
+                    error,
+                    ..
+                } => {
+                    super::client_settlement_trace::record(
+                        *operation_seq,
+                        SettlementPhase::ResultFlushed,
+                        super::client_settlement_trace::Facts {
+                            generation: Some(*generation),
+                            effects: Some(*effects),
+                            scope_state: Some(*scope_state),
+                            error: error.as_ref().map(|error| error.code.clone()),
+                            accepted: None,
+                        },
+                    );
                 }
-                ServerMessage::ControlResult { .. } => {
-                    settlement_trace!(0, ControlFlushed);
+                ServerMessage::ControlResult {
+                    generation,
+                    accepted,
+                    scope_state,
+                    error,
+                    ..
+                } => {
+                    super::client_settlement_trace::record(
+                        0,
+                        SettlementPhase::ControlFlushed,
+                        super::client_settlement_trace::Facts {
+                            generation: Some(*generation),
+                            effects: None,
+                            scope_state: Some(*scope_state),
+                            error: error.as_ref().map(|error| error.code.clone()),
+                            accepted: Some(*accepted),
+                        },
+                    );
                 }
                 _ => {}
             }
@@ -1227,11 +1261,21 @@ fn respond<E: ClientExecutor>(
             settlement_trace!(operation_seq, CancelReceived);
             let result = broker.cancel(requested_generation, operation_seq);
             #[cfg(feature = "acceptance-faults")]
-            if result.is_ok() {
-                settlement_trace!(operation_seq, CancelAccepted);
-            } else {
-                settlement_trace!(operation_seq, CancelRejected);
-            }
+            super::client_settlement_trace::record(
+                operation_seq,
+                if result.is_ok() {
+                    SettlementPhase::CancelAccepted
+                } else {
+                    SettlementPhase::CancelRejected
+                },
+                super::client_settlement_trace::Facts {
+                    generation: Some(generation),
+                    effects: None,
+                    scope_state: Some(scope_state),
+                    error: result.as_ref().err().cloned(),
+                    accepted: Some(result.is_ok()),
+                },
+            );
             (
                 ServerMessage::ControlResult {
                     id,
@@ -2292,6 +2336,272 @@ mod tests {
         assert_eq!(reply["id"], "c");
         assert_eq!(reply["accepted"], false);
         assert_eq!(reply["error"]["code"], "operation-missing");
+    }
+
+    // These tests use the production reader, admission, execute_bounded,
+    // completion, control lane, and result writer. The executable proxy's
+    // process-global stdin/stdout are not injectable here, so they deliberately
+    // do not claim coverage of the proxy or the TypeScript client.
+    struct DeadlineSettlementExecutor {
+        broker: std::sync::Arc<ClientSession>,
+        started: tokio::sync::watch::Sender<Option<std::time::Instant>>,
+        responsive: bool,
+        shutdown_release: Option<tokio::sync::Notify>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+    impl ClientExecutor for DeadlineSettlementExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        async fn execute(
+            &self,
+            command: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            lease: OperationLease,
+        ) -> NativeOutcome {
+            assert!(self.broker.start(lease.generation, lease.sequence).unwrap());
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if command == "fresh" {
+                return NativeOutcome {
+                    result: Ok(serde_json::json!({"fresh": true})),
+                    effects: Effects::Completed,
+                };
+            }
+            assert_eq!(command, "wait-for-native-stop");
+            self.started.send_replace(Some(lease.deadline));
+            if !self.responsive {
+                return std::future::pending().await;
+            }
+            // Only the production deadline/cancel path wakes this executor.
+            // It has no independent timeout that could substitute for the
+            // native 250 ms cleanup grace or produce its own settlement.
+            let mut cancellation = lease.cancellation.clone();
+            while *cancellation.borrow() == super::super::client_session::CancelSignal::None {
+                cancellation.changed().await.unwrap();
+            }
+            NativeOutcome {
+                result: Err(if std::time::Instant::now() >= lease.deadline {
+                    ProtocolError::DeadlineExceeded
+                } else {
+                    ProtocolError::Cancelled
+                }),
+                effects: Effects::NotDispatched,
+            }
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            if let Some(release) = &self.shutdown_release {
+                release.notified().await;
+            }
+            Ok(())
+        }
+    }
+
+    async fn settlement_frame<R: AsyncBufRead + Unpin>(reader: &mut R) -> serde_json::Value {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(reader))
+            .await
+            .expect("settlement frame must arrive within the bounded test wait")
+            .unwrap()
+            .expect("settlement must not be replaced by EOF");
+        serde_json::from_slice(&frame).unwrap()
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum DeadlineCancelOrder {
+        CancelFirst,
+        ResultFirst,
+        PartialCancelAcrossResult,
+    }
+
+    async fn exercise_deadline_cancel_order(order: DeadlineCancelOrder) {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let (started, mut running) = tokio::sync::watch::channel(None);
+        let executor = std::sync::Arc::new(DeadlineSettlementExecutor {
+            broker: broker.clone(),
+            started,
+            responsive: true,
+            shutdown_release: None,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let (count, mut consumed) = tokio::sync::watch::channel(0usize);
+        let serving = tokio::spawn(serve_with_executor(
+            CountedReader {
+                inner: tokio::io::BufReader::new(reader),
+                consumed: count,
+            },
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker.clone(),
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        assert_eq!(settlement_frame(&mut peer).await["type"], "ready");
+        let request = b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":1,\"timeoutMs\":1000,\"command\":\"wait-for-native-stop\",\"args\":{}}\n";
+        let prefix = b"{\"type\":\"cancel\",\"id\":\"c\",";
+        let suffix = b"\"generation\":1,\"operationSeq\":1}\n";
+        peer.get_mut().write_all(request).await.unwrap();
+        let deadline = *tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            running.wait_for(Option::is_some),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        if matches!(order, DeadlineCancelOrder::PartialCancelAcrossResult) {
+            peer.get_mut().write_all(prefix).await.unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                consumed.wait_for(|count| *count >= request.len() + prefix.len()),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(std::time::Instant::now() < deadline.unwrap());
+        }
+        let (result, ack) = if matches!(order, DeadlineCancelOrder::CancelFirst) {
+            assert!(std::time::Instant::now() < deadline.unwrap());
+            peer.get_mut().write_all(prefix).await.unwrap();
+            peer.get_mut().write_all(suffix).await.unwrap();
+            let ack = settlement_frame(&mut peer).await;
+            let result = settlement_frame(&mut peer).await;
+            (result, ack)
+        } else {
+            // The complete original response proves the native completion and
+            // writer ran before the control suffix is made readable.
+            let result = settlement_frame(&mut peer).await;
+            if matches!(order, DeadlineCancelOrder::ResultFirst) {
+                peer.get_mut().write_all(prefix).await.unwrap();
+            }
+            peer.get_mut().write_all(suffix).await.unwrap();
+            (result, settlement_frame(&mut peer).await)
+        };
+        let cancelled = matches!(order, DeadlineCancelOrder::CancelFirst);
+        assert_eq!(result["type"], "result", "{order:?}: {result}");
+        assert_eq!(result["id"], "r");
+        assert_eq!(result["operationSeq"], 1);
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["effects"], "not-dispatched");
+        assert_eq!(result["scopeState"], "usable");
+        assert_eq!(
+            result["error"]["code"],
+            if cancelled {
+                "cancelled"
+            } else {
+                "deadline-exceeded"
+            }
+        );
+        assert_eq!(ack["type"], "control-result", "{order:?}: {ack}");
+        assert_eq!(ack["id"], "c");
+        assert_eq!(ack["generation"], 1);
+        assert_eq!(ack["accepted"], cancelled);
+        assert_eq!(ack["scopeState"], "usable");
+        if !cancelled {
+            assert_eq!(ack["error"]["code"], "operation-missing");
+        }
+        peer.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"fresh\",\"generation\":1,\"operationSeq\":2,\"timeoutMs\":1000,\"command\":\"fresh\",\"args\":{}}\n").await.unwrap();
+        let fresh = settlement_frame(&mut peer).await;
+        assert_eq!(fresh["type"], "result");
+        assert_eq!(fresh["id"], "fresh");
+        assert_eq!(fresh["operationSeq"], 2);
+        assert_eq!(fresh["ok"], true);
+        assert_eq!(fresh["effects"], "completed");
+        assert_eq!(fresh["scopeState"], "usable");
+        assert_eq!(fresh["data"]["fresh"], true);
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        assert_eq!(settlement_frame(&mut peer).await["type"], "closed");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), serving)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(broker.health().unwrap().1, ScopeState::Closed);
+    }
+
+    #[tokio::test]
+    async fn settlement_deadline_acknowledges_late_complete_cancel_before_reuse() {
+        exercise_deadline_cancel_order(DeadlineCancelOrder::ResultFirst).await;
+    }
+
+    #[tokio::test]
+    async fn settlement_deadline_preserves_partial_cancel_until_late_ack_before_reuse() {
+        exercise_deadline_cancel_order(DeadlineCancelOrder::PartialCancelAcrossResult).await;
+    }
+
+    #[tokio::test]
+    async fn settlement_deadline_early_cancel_ack_precedes_clean_result_and_reuse() {
+        exercise_deadline_cancel_order(DeadlineCancelOrder::CancelFirst).await;
+    }
+
+    #[tokio::test]
+    async fn settlement_deadline_unknown_flushes_before_shutdown_without_fabricated_late_ack() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let (started, _running) = tokio::sync::watch::channel(None);
+        let executor = std::sync::Arc::new(DeadlineSettlementExecutor {
+            broker: broker.clone(),
+            started,
+            responsive: false,
+            shutdown_release: Some(tokio::sync::Notify::new()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker.clone(),
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        assert_eq!(settlement_frame(&mut peer).await["type"], "ready");
+        peer.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":1,\"timeoutMs\":100,\"command\":\"wait-for-native-stop\",\"args\":{}}\n").await.unwrap();
+        let result = settlement_frame(&mut peer).await;
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["id"], "r");
+        assert_eq!(result["operationSeq"], 1);
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "deadline-exceeded");
+        assert_eq!(result["effects"], "unknown");
+        assert_eq!(result["scopeState"], "quarantined");
+        assert_eq!(broker.health().unwrap().1, ScopeState::Quarantined);
+        // Shutdown is held after the truthful Unknown result. A late control
+        // write must not invent receipt, successful cancellation, or reuse.
+        peer.get_mut()
+            .write_all(b"{\"type\":\"cancel\",\"id\":\"c\",\"generation\":1,\"operationSeq\":1}\n")
+            .await
+            .unwrap();
+        executor.shutdown_release.as_ref().unwrap().notify_one();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut peer))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), serving)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(broker.health().unwrap().1, ScopeState::Closed);
+        assert!(broker.admit(1, 2, 1000).is_err());
     }
 
     #[tokio::test]

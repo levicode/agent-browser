@@ -1452,6 +1452,48 @@ impl RetirementJournal {
 type ConnectionWatch =
     Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), ProtocolError>>>>>;
 
+// This is the retained observation boundary used by ClientBrowser before the
+// transport settles the admitted operation in ClientSession.
+fn settle_observation_dispatch(
+    output: Result<
+        Result<serde_json::Value, super::client_observation_dispatch::DispatchFailure>,
+        tokio::sync::oneshot::error::RecvError,
+    >,
+    cleanup: Result<
+        Result<(), super::client_observation_dispatch::DispatchFailure>,
+        tokio::task::JoinError,
+    >,
+) -> (super::client_transport::NativeOutcome, bool) {
+    use super::client_protocol::Effects;
+    use super::client_transport::NativeOutcome;
+    let cleanup_failed = !matches!(cleanup, Ok(Ok(())))
+        || matches!(&output, Ok(Err(failure)) if failure.cleanup_integrity_lost);
+    let outcome = match output {
+        Ok(Ok(value)) if !cleanup_failed => NativeOutcome {
+            result: Ok(value),
+            effects: Effects::Completed,
+        },
+        Ok(Err(failure)) => {
+            let effects = if cleanup_failed || failure.error == ProtocolError::CleanupFailed {
+                Effects::Unknown
+            } else {
+                Effects::NotDispatched
+            };
+            NativeOutcome {
+                result: Err(failure.error),
+                effects,
+            }
+        }
+        _ => NativeOutcome {
+            result: Err(ProtocolError::CleanupFailed),
+            effects: Effects::Unknown,
+        },
+    };
+    let cleanup_failed =
+        cleanup_failed || matches!(outcome.result, Err(ProtocolError::CleanupFailed));
+    (outcome, cleanup_failed)
+}
+
 pub struct ClientBrowser {
     broker: Arc<super::client_session::ClientSession>,
     event_sink: std::sync::OnceLock<super::client_transport::ClientEventSink>,
@@ -2349,25 +2391,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let task = observation.start(context, request, lease);
                         let output = task.result.await;
                         let cleanup = task.join.await;
-                        let cleanup_failed = !matches!(cleanup, Ok(Ok(())))
-                            || matches!(&output, Ok(Err(failure)) if failure.cleanup_integrity_lost);
-                        let outcome = match output {
-                            Ok(Ok(value)) if !cleanup_failed => NativeOutcome {
-                                result: Ok(value),
-                                effects: Effects::Completed,
-                            },
-                            Ok(Err(failure)) => NativeOutcome {
-                                result: Err(failure.error),
-                                effects: Effects::NotDispatched,
-                            },
-                            _ => NativeOutcome {
-                                result: Err(ProtocolError::CleanupFailed),
-                                effects: Effects::Unknown,
-                            },
-                        };
-                        let cleanup_failed = cleanup_failed
-                            || matches!(outcome.result, Err(ProtocolError::CleanupFailed));
-                        (outcome, cleanup_failed)
+                        settle_observation_dispatch(output, cleanup)
                     },
                 )
                 .await;
@@ -3872,6 +3896,98 @@ impl ClientBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observation_cleanup_integrity_settles_quarantined_without_losing_primary() {
+        use super::super::client_observation_dispatch::DispatchFailure;
+        use super::super::client_protocol::{Effects, ScopeState};
+        use super::super::client_session::ClientSession;
+        for (error, dirty_dispatch, dirty_join, expected) in [
+            (
+                ProtocolError::DeadlineExceeded,
+                false,
+                false,
+                Effects::NotDispatched,
+            ),
+            (
+                ProtocolError::Cancelled,
+                false,
+                false,
+                Effects::NotDispatched,
+            ),
+            (
+                ProtocolError::BrowserFailure,
+                false,
+                false,
+                Effects::NotDispatched,
+            ),
+            (
+                ProtocolError::DeadlineExceeded,
+                true,
+                false,
+                Effects::Unknown,
+            ),
+            (ProtocolError::Cancelled, true, false, Effects::Unknown),
+            (ProtocolError::PolicyDenied, true, false, Effects::Unknown),
+            (
+                ProtocolError::DeadlineExceeded,
+                false,
+                true,
+                Effects::Unknown,
+            ),
+            (ProtocolError::CleanupFailed, false, false, Effects::Unknown),
+        ] {
+            let broker = ClientSession::new();
+            let _lease = broker.admit(1, 1, 1_000).unwrap();
+            assert!(broker.start(1, 1).unwrap());
+            let failure = |error, cleanup_integrity_lost| DispatchFailure {
+                error,
+                identity_scope: "synthetic-scope".into(),
+                cleanup_integrity_lost,
+            };
+            let (outcome, dirty) = settle_observation_dispatch(
+                Ok(Err(failure(error.clone(), dirty_dispatch))),
+                Ok(if dirty_join {
+                    Err(failure(ProtocolError::CleanupFailed, true))
+                } else {
+                    Ok(())
+                }),
+            );
+            assert_eq!(
+                outcome.result,
+                Err(error.clone()),
+                "primary error must survive"
+            );
+            assert_eq!(
+                outcome.effects, expected,
+                "{error:?}, dispatch={dirty_dispatch}, join={dirty_join}"
+            );
+            let expected_state = if expected == Effects::Unknown {
+                ScopeState::Quarantined
+            } else {
+                ScopeState::Usable
+            };
+            assert_eq!(dirty, expected == Effects::Unknown);
+            assert_eq!(
+                broker.settle(1, 1, outcome.effects).unwrap(),
+                expected_state
+            );
+            assert_eq!(broker.health().unwrap(), (1, expected_state));
+            if expected_state == ScopeState::Usable {
+                let _next = broker.admit(1, 2, 1_000).unwrap();
+                assert!(broker.start(1, 2).unwrap());
+                assert_eq!(
+                    broker.settle(1, 2, Effects::NotDispatched).unwrap(),
+                    ScopeState::Usable
+                );
+            } else {
+                assert_eq!(
+                    broker.admit(1, 2, 1_000).err(),
+                    Some(ProtocolError::ScopeUnavailable)
+                );
+            }
+        }
+    }
 
     #[test]
     fn actual_public_startup_hostname_payload_is_valid_native_configuration() {
