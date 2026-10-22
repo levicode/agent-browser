@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
+#[cfg(test)]
+#[path = "client_observation_composition_dispatch_tests.rs"]
+mod composition_tests;
 #[path = "client_reference_correlation.rs"]
 mod reference_correlation;
 pub use reference_correlation::CorrelateRequest;
@@ -249,6 +252,13 @@ impl ObservationDispatch {
         }
         check(&context.page, &operation).map_err(failure)?;
         validate_policy(&context.policy, &request).map_err(failure)?;
+        // The same validator used by query() refuses unsupported composition
+        // before UI admission, revision staging, frame acquisition, or CDP.
+        if let DispatchRequest::Query(query) = &request {
+            observation::validate_expression(&query.options.expression, 0)
+                .map_err(map_observation)
+                .map_err(failure)?;
+        }
         let protected =
             !matches!(&request, DispatchRequest::Query(q) if q.purpose == QueryPurpose::Fixture);
         // Semantic-only reads need exclusive admission and exact target/frame
@@ -1229,6 +1239,7 @@ fn observation_error(error: ObservationError) -> ProtocolError {
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::StaleReference => ProtocolError::StaleReference,
         ObservationError::Cancelled => ProtocolError::Cancelled,
         ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,

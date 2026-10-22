@@ -678,6 +678,7 @@ fn live_query_error(
         }
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::StaleReference => ProtocolError::StaleReference,
         ObservationError::Cancelled => ProtocolError::Cancelled,
         ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
@@ -2636,6 +2637,7 @@ fn observation_action_error(
         ObservationError::StaleReference => ProtocolError::StaleReference,
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::PolicyDenied => ProtocolError::PolicyDenied,
         ObservationError::BackendFailure => ProtocolError::BrowserFailure,
     }

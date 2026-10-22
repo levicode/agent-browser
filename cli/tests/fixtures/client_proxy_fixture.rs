@@ -8,8 +8,11 @@
 
 #[path = "../../src/native/client_protocol.rs"]
 pub mod client_protocol;
+#[path = "../../src/native/client_settlement_trace.rs"]
+mod client_settlement_trace;
 mod native {
     pub use crate::client_protocol;
+    pub(crate) use crate::client_settlement_trace;
 }
 #[path = "../../src/color.rs"]
 mod color;

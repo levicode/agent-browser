@@ -20,6 +20,29 @@ pub struct OwnedTarget {
     pub configured: bool,
     pub resumed: bool,
     resume_pending: bool,
+    // Minted only by authoritative insertion. Retaining the Arc prevents an
+    // identical target/session reattachment from reusing an earlier tenure.
+    tenure: Arc<AttachmentTenure>,
+}
+#[derive(Debug)]
+struct AttachmentTenure;
+impl OwnedTarget {
+    pub(crate) fn same_attachment(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.tenure, &other.tenure)
+            && self.target_id == other.target_id
+            && self.session_id == other.session_id
+            && self.kind == other.kind
+            && self.purpose == other.purpose
+            && self.configured == other.configured
+            && self.resumed == other.resumed
+            && self.resume_pending == other.resume_pending
+    }
+    fn capture_ready(&self) -> bool {
+        self.purpose == Some(TargetPurpose::Application)
+            && self.configured
+            && self.resumed
+            && !self.resume_pending
+    }
 }
 #[derive(Default)]
 struct Registry {
@@ -612,6 +635,7 @@ impl ClientTargets {
                 configured: false,
                 resumed: false,
                 resume_pending: false,
+                tenure: Arc::new(AttachmentTenure),
             },
         );
         drop(state);
@@ -681,6 +705,75 @@ impl ClientTargets {
             return Err(ProtocolError::ScopeUnavailable);
         }
         Ok(target.clone())
+    }
+    /// Snapshot the already-owned Application set, never mint capture authority.
+    /// Callers hold their enrollment index before this registry (no await).
+    pub(crate) fn capture_application_tickets(
+        &self,
+        target_ids: &[&str],
+    ) -> Result<Vec<OwnedTarget>, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut seen = HashSet::new();
+        let mut tickets = Vec::with_capacity(target_ids.len());
+        for target_id in target_ids {
+            let target = state
+                .targets
+                .get(*target_id)
+                .ok_or(ProtocolError::StaleScope)?;
+            if !seen.insert(*target_id) || !target.capture_ready() {
+                return Err(ProtocolError::StaleScope);
+            }
+            tickets.push(target.clone());
+        }
+        if state
+            .targets
+            .values()
+            .filter(|target| target.purpose == Some(TargetPurpose::Application))
+            .count()
+            != tickets.len()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(tickets)
+    }
+    /// No registry-wide revision fence: unrelated StateBootstrap churn is valid.
+    pub(crate) fn check_capture_tickets(
+        &self,
+        tickets: &[OwnedTarget],
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || state
+                .targets
+                .values()
+                .filter(|target| target.purpose == Some(TargetPurpose::Application))
+                .count()
+                != tickets.len()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut seen = HashSet::new();
+        for ticket in tickets {
+            if !seen.insert(&ticket.target_id)
+                || !ticket.capture_ready()
+                || !state
+                    .targets
+                    .get(&ticket.target_id)
+                    .is_some_and(|current| current.same_attachment(ticket))
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+        }
+        Ok(())
     }
     pub fn configured(&self, target_id: &str) -> Result<(), ProtocolError> {
         let mut state = self
@@ -1119,6 +1212,105 @@ impl Drop for CreationReservation {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn capture_ticket_is_insertion_only_and_rejects_same_id_aba_without_epoch() {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        registry
+            .attached(
+                "ctx",
+                "target".into(),
+                "session".into(),
+                "browser_ui".into(),
+            )
+            .unwrap();
+        registry.configured("target").unwrap();
+        registry
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        let original = registry.capture_application_tickets(&["target"]).unwrap();
+        let clone = registry.owned_target("target").unwrap();
+        assert!(clone.same_attachment(&original[0]));
+        registry.check_capture_tickets(&original).unwrap();
+        registry.detach("target").unwrap();
+        registry
+            .attached(
+                "ctx",
+                "target".into(),
+                "session".into(),
+                "browser_ui".into(),
+            )
+            .unwrap();
+        registry.configured("target").unwrap();
+        registry
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        let replacement = registry.capture_application_tickets(&["target"]).unwrap();
+        assert!(!replacement[0].same_attachment(&original[0]));
+        assert_eq!(
+            registry.check_capture_tickets(&original),
+            Err(super::ProtocolError::StaleScope)
+        );
+        registry.check_capture_tickets(&replacement).unwrap();
+    }
+    #[tokio::test]
+    async fn capture_ticket_checks_entire_exact_binding_and_rejects_duplicates() {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        for target in ["a", "b"] {
+            registry
+                .attached(
+                    "ctx",
+                    target.into(),
+                    format!("{target}-session"),
+                    "browser_ui".into(),
+                )
+                .unwrap();
+            registry.configured(target).unwrap();
+            registry
+                .resume_permit(target)
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+        }
+        let original = registry.capture_application_tickets(&["a", "b"]).unwrap();
+        assert!(registry.capture_application_tickets(&["a", "a"]).is_err());
+        assert!(registry
+            .check_capture_tickets(&[original[0].clone(), original[0].clone()])
+            .is_err());
+        for field in [
+            "target",
+            "session",
+            "kind",
+            "purpose",
+            "configured",
+            "resumed",
+            "pending",
+        ] {
+            let mut changed = original.clone();
+            match field {
+                "target" => changed[0].target_id = "b".into(),
+                "session" => changed[0].session_id = "b-session".into(),
+                "kind" => changed[0].kind = "worker".into(),
+                "purpose" => changed[0].purpose = Some(super::TargetPurpose::StateBootstrap),
+                "configured" => changed[0].configured = false,
+                "resumed" => changed[0].resumed = false,
+                "pending" => changed[0].resume_pending = true,
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                registry.check_capture_tickets(&changed),
+                Err(super::ProtocolError::StaleScope),
+                "{field}"
+            );
+        }
+    }
+
     #[test]
     fn unknown_bootstrap_ack_cannot_be_certified_by_empty_cleanup_inventory() {
         let registry = super::ClientTargets::new("ctx".into(), "scope".into());

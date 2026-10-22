@@ -11,7 +11,7 @@ use super::client_network::{ApplicationSession, ClientNetwork};
 use super::client_page::ClientPageState;
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
-use super::client_targets::{ClientTargets, TargetPurpose};
+use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -154,7 +154,7 @@ pub struct ScopeConfig {
     pub timezone_id: Option<String>,
     pub block_service_workers: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Attribution {
     target: String,
     session: String,
@@ -632,6 +632,51 @@ pub struct EnrollmentAttestation {
     application_epoch: u64,
     frames: Vec<(String, String, String, String)>,
     watermark: BoundedEventWatermark,
+    snapshot: CaptureSnapshot,
+}
+struct CaptureSnapshot {
+    epoch: u64,
+    entries: Vec<Attribution>,
+    // All original Application insertions, including initially enumerable ones.
+    // A second inventory must never replace these tickets with matching strings.
+    owned: Vec<OwnedTarget>,
+}
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum CaptureTestPoint {
+    AfterInitialDrain,
+    BeforeInfo,
+    AfterInfoAck,
+    AfterFenceDrain,
+    DrainWaiting,
+    AfterFreshAttestation,
+    BeforeReturn,
+    BeforeVerifyReturn,
+    BeforeEventApply,
+}
+#[cfg(test)]
+struct CaptureTestGate {
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+#[cfg(test)]
+impl CaptureTestGate {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        })
+    }
+    async fn wait_entered(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
+    fn release(&self) {
+        self.release.add_permits(1);
+    }
 }
 
 /// Read-only, operation-bound application authority for an acknowledged input
@@ -709,6 +754,8 @@ pub struct ClientEnrollment {
     terminal_proof: Mutex<Option<NativeTerminalProof>>,
     #[cfg(test)]
     capture_lifecycle: Mutex<CaptureLifecycleTrace>,
+    #[cfg(test)]
+    capture_test_gates: Mutex<HashMap<CaptureTestPoint, Arc<CaptureTestGate>>>,
 }
 impl ClientEnrollment {
     #[allow(clippy::too_many_arguments)]
@@ -750,6 +797,8 @@ impl ClientEnrollment {
             terminal_proof: Mutex::new(None),
             #[cfg(test)]
             capture_lifecycle: Mutex::new(CaptureLifecycleTrace::default()),
+            #[cfg(test)]
+            capture_test_gates: Mutex::new(HashMap::new()),
         })
     }
     // Diagnostics never grant authority or alter an error. Lock poisoning and
@@ -1160,19 +1209,190 @@ impl ClientEnrollment {
                         return Ok(());
                     }
                 }
+                #[cfg(test)]
+                if let Some(waiting) = self
+                    .capture_test_gates
+                    .lock()
+                    .unwrap()
+                    .remove(&CaptureTestPoint::DrainWaiting)
+                {
+                    waiting.entered.add_permits(1);
+                }
                 changed.await;
             }
         })
         .await
     }
+    fn check_capture_snapshot_locked(
+        &self,
+        index: &Index,
+        watermark: &BoundedEventWatermark,
+        snapshot: &CaptureSnapshot,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        if op.generation != self.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if *op.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= op.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if let Some(error) = &index.failure {
+            return Err(error.clone());
+        }
+        let received = watermark
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if self.sealed.load(Ordering::Acquire)
+            || !index.reconciled
+            || !capture_admission_ready(index, received)
+            || index.application_epoch != snapshot.epoch
+            || index.borrowed_restart.is_some()
+            || index
+                .sessions
+                .values()
+                .filter(|entry| entry.application || entry.observation_only)
+                .count()
+                != snapshot.entries.len()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        for entry in &snapshot.entries {
+            if !entry.resumed
+                || entry.application == entry.observation_only
+                || index.sessions.get(&entry.session) != Some(entry)
+                || index.retiring_pages.iter().any(|(target, session)| {
+                    target == &entry.target || session == &entry.session || session == &entry.root
+                })
+                || index.retired_page_sessions.contains(&entry.session)
+                || index.retired_page_sessions.contains(&entry.root)
+                || index.retired_observer_sessions.contains(&entry.session)
+                || index.retired_observer_sessions.contains(&entry.root)
+                || index.retired_observer_targets.contains(&entry.target)
+                || index.borrowed_retired_targets.contains(&entry.target)
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+        }
+        // The caller holds index. Keep the established index -> targets order;
+        // no mutex survives a protocol read, drain, or other await.
+        self.targets.check_capture_tickets(&snapshot.owned)
+    }
+    fn check_capture_snapshot(
+        &self,
+        watermark: &BoundedEventWatermark,
+        snapshot: &CaptureSnapshot,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.check_capture_snapshot_locked(&index, watermark, snapshot, op)
+    }
+    fn capture_snapshot(
+        &self,
+        watermark: &BoundedEventWatermark,
+        op: &OperationLease,
+    ) -> Result<CaptureSnapshot, ProtocolError> {
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !index.reconciled {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let mut entries = index
+            .sessions
+            .values()
+            .filter(|entry| entry.application || entry.observation_only)
+            .cloned()
+            .collect::<Vec<_>>();
+        if entries.len() > MAX_SESSIONS {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        entries.sort_by(|a, b| (&a.target, &a.session).cmp(&(&b.target, &b.session)));
+        let mut targets = HashSet::new();
+        let mut sessions = HashSet::new();
+        for entry in &entries {
+            for value in [&entry.target, &entry.session, &entry.root, &entry.kind] {
+                valid_id(value)?;
+            }
+            if let Some(parent) = &entry.parent {
+                valid_id(parent)?;
+            }
+            if !targets.insert(&entry.target) || !sessions.insert(&entry.session) {
+                return Err(ProtocolError::StaleScope);
+            }
+        }
+        let owned_ids = entries
+            .iter()
+            .filter(|entry| entry.application)
+            .map(|entry| entry.target.as_str())
+            .collect::<Vec<_>>();
+        let owned = self.targets.capture_application_tickets(&owned_ids)?;
+        for ticket in &owned {
+            if !entries.iter().any(|entry| {
+                entry.application
+                    && !entry.observation_only
+                    && entry.target == ticket.target_id
+                    && entry.session == ticket.session_id
+                    && entry.kind == ticket.kind
+                    && entry.resumed
+            }) {
+                return Err(ProtocolError::StaleScope);
+            }
+        }
+        let snapshot = CaptureSnapshot {
+            epoch: index.application_epoch,
+            entries,
+            owned,
+        };
+        self.check_capture_snapshot_locked(&index, watermark, &snapshot, op)?;
+        Ok(snapshot)
+    }
+    async fn fence_capture_snapshot(
+        &self,
+        watermark: &BoundedEventWatermark,
+        snapshot: &CaptureSnapshot,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.drain_capture_watermark(watermark, op).await?;
+        #[cfg(test)]
+        self.pause_capture_at(CaptureTestPoint::AfterFenceDrain, op)
+            .await?;
+        // received() is sampled again under index, not reused from the drain.
+        // If admission advanced in between, conservatively refuse this capture.
+        self.check_capture_snapshot(watermark, snapshot, op)
+    }
+    #[cfg(test)]
+    async fn pause_capture_at(
+        &self,
+        point: CaptureTestPoint,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let gate = self.capture_test_gates.lock().unwrap().remove(&point);
+        if let Some(gate) = gate {
+            gate.entered.add_permits(1);
+            bounded(op, async {
+                gate.release
+                    .acquire()
+                    .await
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    .forget();
+                Ok(())
+            })
+            .await?;
+        }
+        Ok(())
+    }
     pub async fn attest_capture(
         self: &Arc<Self>,
         op: &OperationLease,
     ) -> Result<EnrollmentAttestation, ProtocolError> {
-        self.check()?;
-        if op.generation != self.generation {
-            return Err(ProtocolError::StaleGeneration);
-        }
+        self.check_restart_operation(op)?;
         if matches!(self.ownership, ScopeOwnership::TrackedTargets(_)) {
             return Err(ProtocolError::UnsupportedCapability);
         }
@@ -1183,35 +1403,13 @@ impl ClientEnrollment {
             .clone()
             .ok_or(ProtocolError::ScopeUnavailable)?;
         self.drain_capture_watermark(&watermark, op).await?;
-        let (epoch, entries) = {
-            let index = self
-                .index
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?;
-            if !index.reconciled
-                || !index.pending_enrollment.is_empty()
-                || index
-                    .sessions
-                    .values()
-                    .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
-            {
-                return Err(ProtocolError::ScopeUnavailable);
-            }
-            (
-                index.application_epoch,
-                index
-                    .sessions
-                    .values()
-                    .filter(|entry| entry.application || entry.observation_only)
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            )
-        };
-        // Attest every enrolled native kind. CDP's omitted filter excludes
-        // browser/tab targets (or inherits a discovery filter); that subset
-        // cannot prove an enrolled target absent. This query grants no ownership.
-        // Browser inventory alone is not a renderer flush. Reconcile each
-        // exact application session's frame/loader tree as well.
+        #[cfg(test)]
+        self.pause_capture_at(CaptureTestPoint::AfterInitialDrain, op)
+            .await?;
+        let snapshot = self.capture_snapshot(&watermark, op)?;
+        let entries = &snapshot.entries;
+        // Include all native kinds; an omitted browser/tab default filter cannot
+        // prove absence. Enumeration grants no ownership and is still mandatory.
         let inventory = self
             .command(op, None, "Target.getTargets", json!({"filter":[{}]}))
             .await?;
@@ -1222,7 +1420,13 @@ impl ClientEnrollment {
         if infos.len() > 8192 {
             return Err(ProtocolError::CapacityExceeded);
         }
+        let mut enumerated = HashMap::new();
         for info in infos {
+            let target = field(info, "targetId")?;
+            field(info, "type")?;
+            if enumerated.insert(target, info).is_some() {
+                return Err(ProtocolError::StaleScope);
+            }
             if info.get("browserContextId").and_then(Value::as_str)
                 != Some(self.targets.context_id.as_str())
                 || matches!(
@@ -1232,7 +1436,6 @@ impl ClientEnrollment {
             {
                 continue;
             }
-            let target = field(info, "targetId")?;
             if matches!(self.ownership, ScopeOwnership::BorrowedTargets(_))
                 && !self.authorized(target, None, info.get("openerId").and_then(Value::as_str))?
             {
@@ -1245,55 +1448,65 @@ impl ClientEnrollment {
                 }
                 continue;
             }
-            let owned = self.targets.owned_target(target);
-            #[cfg(test)]
-            if let Err(error) = &owned {
-                eprintln!("state.capture refusal=inventory-unowned error={error:?}");
-            }
-            let owned = owned?;
+            let owned = self.targets.owned_target(target)?;
             if owned.purpose == Some(TargetPurpose::Application)
                 && !entries.iter().any(|entry| entry.target == owned.target_id)
             {
-                #[cfg(test)]
-                eprintln!(
-                    "state.capture refusal=inventory-entry error={:?}",
-                    ProtocolError::StaleScope
-                );
                 return Err(ProtocolError::StaleScope);
             }
             if owned.purpose.is_none() {
                 return Err(ProtocolError::ScopeUnavailable);
             }
         }
-        if entries.iter().any(|entry| {
-            !infos.iter().any(|info| {
-                info.get("targetId").and_then(Value::as_str) == Some(entry.target.as_str())
-                    && info.get("browserContextId").and_then(Value::as_str)
-                        == Some(self.targets.context_id.as_str())
-            })
-        }) {
-            #[cfg(test)]
-            eprintln!(
-                "state.capture refusal=missing-target error={:?} inventory={:?}",
-                ProtocolError::StaleScope,
-                capture_inventory_diagnostic(&entries, infos, &self.targets.context_id),
-            );
-            #[cfg(test)]
-            self.print_capture_lifecycle(&entries, infos);
-            #[cfg(test)]
-            if let Some(diagnostic) = self
-                .diagnose_missing_capture_target(&entries, infos, &watermark, op)
-                .await
+        // Finish checking every contradiction before querying any missing target.
+        // Missing observer-only targets are required but never eligible to adopt.
+        let mut missing = Vec::new();
+        for entry in entries {
+            if let Some(info) = enumerated.get(entry.target.as_str()) {
+                validate_capture_target_info(entry, info, &self.targets.context_id, false)?;
+            } else if entry.application
+                && !entry.observation_only
+                && snapshot.owned.iter().any(|ticket| {
+                    ticket.target_id == entry.target && ticket.session_id == entry.session
+                })
             {
-                self.print_missing_capture_target(diagnostic);
+                missing.push(entry);
+            } else {
+                return Err(ProtocolError::StaleScope);
             }
-            return Err(ProtocolError::StaleScope);
+        }
+        if !missing.is_empty() {
+            #[cfg(test)]
+            self.print_capture_lifecycle(entries, infos);
+        }
+        // The fixed, sorted missing set is a subset of the original <=128 entries.
+        // One read per entry, no browser-global retry, URL policy, or new subscriber.
+        for entry in missing {
+            self.fence_capture_snapshot(&watermark, &snapshot, op)
+                .await?;
+            #[cfg(test)]
+            self.pause_capture_at(CaptureTestPoint::BeforeInfo, op)
+                .await?;
+            self.check_capture_snapshot(&watermark, &snapshot, op)?;
+            let reply = self
+                .command(op, Some(&entry.session), "Target.getTargetInfo", json!({}))
+                .await?;
+            #[cfg(test)]
+            self.pause_capture_at(CaptureTestPoint::AfterInfoAck, op)
+                .await?;
+            let info = reply.get("targetInfo").ok_or(ProtocolError::InvalidFrame)?;
+            validate_capture_target_info(entry, info, &self.targets.context_id, true)?;
+            // An ACK is not an event-application fence. Count this entry covered
+            // only after the retained live watermark and original tickets agree.
+            self.fence_capture_snapshot(&watermark, &snapshot, op)
+                .await?;
         }
         let mut frames = Vec::new();
-        for entry in &entries {
+        for entry in entries {
             if !matches!(entry.kind.as_str(), "page" | "iframe") {
                 continue;
             }
+            self.check_restart_operation(op)?;
             let tree = self
                 .command(op, Some(&entry.session), "Page.getFrameTree", json!({}))
                 .await?;
@@ -1304,43 +1517,22 @@ impl ClientEnrollment {
                 &mut frames,
             )?;
         }
-        self.drain_capture_watermark(&watermark, op).await?;
-        let index = self
-            .index
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        let received = watermark
-            .received()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if index.application_epoch != epoch
-            || !capture_admission_ready(&index, received)
-            || index
-                .sessions
-                .values()
-                .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
-        {
-            #[cfg(test)]
-            eprintln!(
-                "state.capture refusal={} error={:?}",
-                if index.application_epoch != epoch {
-                    "epoch-during-read"
-                } else {
-                    "admission-during-read"
-                },
-                ProtocolError::StaleScope
-            );
-            return Err(ProtocolError::StaleScope);
-        }
-        drop(index);
-        self.check()?;
+        self.fence_capture_snapshot(&watermark, &snapshot, op)
+            .await?;
+        #[cfg(test)]
+        self.pause_capture_at(CaptureTestPoint::BeforeReturn, op)
+            .await?;
+        self.check_capture_snapshot(&watermark, &snapshot, op)?;
+        self.check_restart_operation(op)?;
         frames.sort();
         Ok(EnrollmentAttestation {
             coordinator: Arc::downgrade(self),
             targets: self.targets.clone(),
             generation: self.generation,
-            application_epoch: epoch,
+            application_epoch: snapshot.epoch,
             frames,
             watermark,
+            snapshot,
         })
     }
     pub async fn verify_capture_attestation(
@@ -1355,34 +1547,36 @@ impl ClientEnrollment {
                 .upgrade()
                 .is_some_and(|owner| Arc::ptr_eq(&owner, self))
         {
-            #[cfg(test)]
-            eprintln!(
-                "state.capture refusal=tenure-binding error={:?}",
-                ProtocolError::StaleScope
-            );
             return Err(ProtocolError::StaleScope);
         }
-        previous
-            .watermark
-            .received()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.fence_capture_snapshot(&previous.watermark, &previous.snapshot, op)
+            .await?;
         let current = self.attest_capture(op).await?;
+        #[cfg(test)]
+        self.pause_capture_at(CaptureTestPoint::AfterFreshAttestation, op)
+            .await?;
+        // Retain and recheck ORIGINAL tickets, even when a replacement has become
+        // enumerable and the fresh attestation could prove only its newer tenure.
+        self.fence_capture_snapshot(&previous.watermark, &previous.snapshot, op)
+            .await?;
         if current.application_epoch != previous.application_epoch
             || current.frames != previous.frames
+            || current.snapshot.entries != previous.snapshot.entries
+            || current.snapshot.owned.len() != previous.snapshot.owned.len()
+            || !current
+                .snapshot
+                .owned
+                .iter()
+                .zip(&previous.snapshot.owned)
+                .all(|(current, previous)| current.same_attachment(previous))
         {
-            #[cfg(test)]
-            eprintln!(
-                "state.capture refusal={} error={:?}",
-                if current.application_epoch != previous.application_epoch {
-                    "epoch-after-export"
-                } else {
-                    "frame-after-export"
-                },
-                ProtocolError::StaleScope
-            );
             return Err(ProtocolError::StaleScope);
         }
-        Ok(())
+        #[cfg(test)]
+        self.pause_capture_at(CaptureTestPoint::BeforeVerifyReturn, op)
+            .await?;
+        self.check_capture_snapshot(&previous.watermark, &previous.snapshot, op)?;
+        self.check_restart_operation(op)
     }
     fn check_restart_operation(&self, op: &OperationLease) -> Result<(), ProtocolError> {
         self.check()?;
@@ -2714,6 +2908,8 @@ impl ClientEnrollment {
                     let sequence=event.sequence();
                     #[cfg(test)]
                     self.trace_capture_event(&event, sequence);
+                    #[cfg(test)]
+                    if let Err(error) = self.pause_capture_at(CaptureTestPoint::BeforeEventApply, &self.operation()).await { break Err(error); }
                     if event.method == "Target.attachedToTarget" {
                         if tasks.len() >= MAX_TASKS { break Err(ProtocolError::CapacityExceeded); }
                         let pending=match self.register_pending_event(&event) { Ok(pending)=>pending, Err(error)=>break Err(error) };
@@ -4085,6 +4281,27 @@ fn observer_retirement_snapshot(
                 .any(|entry| entry.target == target || session == Some(entry.session.as_str()))
     }))
 }
+fn validate_capture_target_info(
+    entry: &Attribution,
+    info: &Value,
+    context: &str,
+    require_attached: bool,
+) -> Result<(), ProtocolError> {
+    let target = field(info, "targetId")?;
+    let actual_context = field(info, "browserContextId")?;
+    let kind = field(info, "type")?;
+    if require_attached {
+        match info.get("attached").and_then(Value::as_bool) {
+            Some(true) => {}
+            Some(false) => return Err(ProtocolError::StaleScope),
+            None => return Err(ProtocolError::InvalidFrame),
+        }
+    }
+    if target != entry.target || actual_context != context || kind != entry.kind {
+        return Err(ProtocolError::StaleScope);
+    }
+    Ok(())
+}
 fn capture_admission_ready(index: &Index, received: u64) -> bool {
     index.applied_watermark >= received && index.pending_enrollment.is_empty()
 }
@@ -4835,6 +5052,7 @@ mod tests {
                             "Runtime.callFunctionOn" if mode.starts_with("realm-resolve-reuse")=>json!({"result":{"value":true}}),
                             "Page.getLayoutMetrics"=>json!({"cssVisualViewport":{"clientWidth":800.,"clientHeight":600.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":800.,"clientHeight":600.}}),
                             "Target.getTargetInfo" if mode=="observer-context" => json!({"targetInfo":{"targetId":request["params"]["targetId"],"type":"iframe","browserContextId":"owned-context"}}),
+                            "Target.getTargetInfo" if mode.starts_with("attestation-") => json!({"targetInfo":{"targetId":"unavailable", "type":"unavailable", "browserContextId":"owned-context", "attached":false}}),
                             "Page.getFrameTree"=>json!({"frameTree":{"frame":{"id":format!("frame-{}",request["sessionId"].as_str().unwrap()),"loaderId":realm_loader,"url":if mode=="borrowed-capture" {"https://initial.test/"} else {"about:blank"}}}}),
                             "Target.getTargets" if mode=="tracked" || mode=="late-popup"=>json!({"targetInfos":[
                                 {"targetId":"initial-target","browserContextId":"owned-context","type":"page"},
@@ -5561,6 +5779,1282 @@ mod tests {
             }
         }
     }
+    // A production-path fixture: initial enrollment/start and every later attach
+    // pass through the same reader, supervisor, configuration and resume code.
+    // Only CDP replies and explicit scheduler gates are controlled by tests.
+    struct CaptureWireFixture {
+        owner: Arc<ClientEnrollment>,
+        _notices: Notices,
+        log: Log,
+        emit: tokio::sync::mpsc::Sender<Value>,
+        inventory: Arc<Mutex<Vec<Value>>>,
+        held: Arc<Mutex<HashSet<(String, String)>>>,
+        server: JoinHandle<()>,
+    }
+    fn capture_info(target: &str, kind: &str) -> Value {
+        json!({"targetId":target, "type":kind, "browserContextId":"owned-context", "attached":true})
+    }
+    fn capture_attach_event(target: &str, session: &str, kind: &str) -> Value {
+        json!({"method":"Target.attachedToTarget", "params":{
+            "sessionId":session, "waitingForDebugger":true, "targetInfo":capture_info(target, kind)
+        }})
+    }
+    impl CaptureWireFixture {
+        async fn new(borrowed: bool) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let log: Log = Arc::default();
+            let inventory = Arc::new(Mutex::new(vec![capture_info("target", "page")]));
+            let held: Arc<Mutex<HashSet<(String, String)>>> = Arc::default();
+            let (emit, mut emitted) = tokio::sync::mpsc::channel::<Value>(512);
+            let (recorded, native_inventory, native_held) =
+                (log.clone(), inventory.clone(), held.clone());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                loop {
+                    tokio::select! {
+                        message = emitted.recv() => {
+                            let Some(message) = message else { break; };
+                            if message.get("fixtureClose").is_some() { break; }
+                            if socket.send(Message::Text(message.to_string())).await.is_err() { break; }
+                        }
+                        message = socket.next() => {
+                            let Some(Ok(Message::Text(text))) = message else { break; };
+                            let request: Value = serde_json::from_str(&text).unwrap();
+                            recorded.lock().unwrap().push(request.clone());
+                            let method = request["method"].as_str().unwrap();
+                            let session = request["sessionId"].as_str().unwrap_or("");
+                            if method == "Target.getTargetInfo" || native_held.lock().unwrap().contains(&(method.to_owned(), session.to_owned())) { continue; }
+                            let result = match method {
+                                "Target.getTargets" => json!({"targetInfos":native_inventory.lock().unwrap().clone()}),
+                                "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":format!("frame-{session}"), "loaderId":"capture-loader", "url":"about:blank"}}}),
+                                "Page.getLayoutMetrics" => json!({"cssVisualViewport":{"clientWidth":800., "clientHeight":600., "offsetX":0., "offsetY":0., "scale":1.}, "cssLayoutViewport":{"clientWidth":800., "clientHeight":600.}}),
+                                "Page.addScriptToEvaluateOnNewDocument" => json!({"identifier":"capture-script"}),
+                                "Browser.getVersion" => json!({"userAgent":"Synthetic Chromium"}),
+                                "Target.closeTarget" => json!({"success":true}),
+                                _ => json!({}),
+                            };
+                            if socket.send(Message::Text(json!({"id":request["id"], "result":result}).to_string())).await.is_err() { break; }
+                        }
+                    }
+                }
+            });
+            let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+            let (mut owner, notices, _broker) =
+                coordinator(client, "owned-context", "owned-scope", "initial");
+            if borrowed {
+                Arc::get_mut(&mut owner).unwrap().ownership =
+                    ScopeOwnership::BorrowedTargets(vec!["target".into()]);
+            }
+            owner
+                .enroll_existing("target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            Self {
+                owner,
+                _notices: notices,
+                log,
+                emit,
+                inventory,
+                held,
+                server,
+            }
+        }
+        async fn attach(&self, target: &str, session: &str, kind: &str) {
+            realm_emit(
+                &self.owner,
+                &self.emit,
+                capture_attach_event(target, session, kind),
+            )
+            .await;
+        }
+        fn gate(&self, point: CaptureTestPoint) -> Arc<CaptureTestGate> {
+            let gate = CaptureTestGate::new();
+            assert!(self
+                .owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(point, gate.clone())
+                .is_none());
+            gate
+        }
+        fn requests(&self, method: &str) -> Vec<Value> {
+            self.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == method)
+                .cloned()
+                .collect()
+        }
+        async fn request(&self, method: &str, count: usize) -> Value {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let requests = self.requests(method);
+                    if requests.len() >= count {
+                        return requests[count - 1].clone();
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap()
+        }
+        fn capture(
+            &self,
+            op: OperationLease,
+        ) -> JoinHandle<Result<EnrollmentAttestation, ProtocolError>> {
+            let owner = self.owner.clone();
+            tokio::spawn(async move { owner.attest_capture(&op).await })
+        }
+        async fn reply(&self, request: &Value, info: Value) {
+            self.emit
+                .send(json!({"id":request["id"], "result":{"targetInfo":info}}))
+                .await
+                .unwrap();
+        }
+        async fn server_barrier(&self) {
+            // A read-only fixture barrier on the same command writer and server.
+            // Its ACK proves prior dispatched commands reached the server log;
+            // it is never used as capture authority or as an operation renewal.
+            self.owner
+                .command(
+                    &self.owner.operation(),
+                    None,
+                    "Browser.getVersion",
+                    json!({}),
+                )
+                .await
+                .unwrap();
+        }
+        async fn finish(self) {
+            let _ = self.owner.close().await;
+            self.server.abort();
+        }
+        fn assert_no_capture_mutations(&self, before: usize) {
+            for request in &self.log.lock().unwrap()[before..] {
+                assert!(
+                    matches!(
+                        request["method"].as_str(),
+                        Some("Target.getTargets" | "Target.getTargetInfo" | "Page.getFrameTree")
+                    ),
+                    "capture dispatched a mutating command"
+                );
+            }
+        }
+    }
+
+    // 1. Ordinary and native-tab inventories retain their zero-lookup budget.
+    #[tokio::test]
+    async fn capture_owned_inventory_complete_needs_no_supplement() {
+        let f = CaptureWireFixture::new(false).await;
+        f.attach("tab", "tab-session", "tab").await;
+        f.inventory.lock().unwrap().push(capture_info("tab", "tab"));
+        let before = f.log.lock().unwrap().len();
+        let revision = f.owner.targets.inventory().unwrap().0;
+        let proof = f.owner.attest_capture(&f.owner.operation()).await.unwrap();
+        f.owner
+            .verify_capture_attestation(&proof, &f.owner.operation())
+            .await
+            .unwrap();
+        assert!(f.requests("Target.getTargetInfo").is_empty());
+        assert_eq!(revision, f.owner.targets.inventory().unwrap().0);
+        assert!(!f
+            .requests("Page.getFrameTree")
+            .iter()
+            .any(|request| request["sessionId"] == "tab-session"));
+        f.assert_no_capture_mutations(before);
+        f.finish().await;
+    }
+
+    // 2. Both sides of export require the same original session and tenure.
+    #[tokio::test]
+    async fn capture_owned_inventory_omitted_ui_is_exact_and_read_only() {
+        let f = CaptureWireFixture::new(false).await;
+        f.attach("missing-a", "missing-session-a", "browser_ui")
+            .await;
+        let before = f.log.lock().unwrap().len();
+        let revision = f.owner.targets.inventory().unwrap().0;
+        let original = f.owner.targets.owned_target("missing-a").unwrap();
+        let first = f.capture(f.owner.operation());
+        let request = f.request("Target.getTargetInfo", 1).await;
+        assert_eq!(request["params"], json!({}));
+        assert_eq!(request["sessionId"], "missing-session-a");
+        f.reply(&request, capture_info("missing-a", "browser_ui"))
+            .await;
+        let proof = first.await.unwrap().unwrap();
+        let owner = f.owner.clone();
+        let verify = tokio::spawn(async move {
+            owner
+                .verify_capture_attestation(&proof, &owner.operation())
+                .await
+        });
+        let request = f.request("Target.getTargetInfo", 2).await;
+        assert_eq!(request["params"], json!({}));
+        assert_eq!(request["sessionId"], "missing-session-a");
+        f.reply(&request, capture_info("missing-a", "browser_ui"))
+            .await;
+        verify.await.unwrap().unwrap();
+        assert_eq!(f.requests("Target.getTargetInfo").len(), 2);
+        assert!(f
+            .owner
+            .targets
+            .owned_target("missing-a")
+            .unwrap()
+            .same_attachment(&original));
+        assert_eq!(f.owner.targets.inventory().unwrap().0, revision);
+        assert_eq!(f.owner.targets.inventory().unwrap().1.len(), 2);
+        assert!(!f
+            .requests("Page.getFrameTree")
+            .iter()
+            .any(|request| request["sessionId"] == "missing-session-a"));
+        f.assert_no_capture_mutations(before);
+        f.finish().await;
+    }
+
+    // 3. Native identity, not URL telemetry or a display-token whitelist.
+    #[tokio::test]
+    async fn capture_owned_inventory_url_and_native_kind_are_not_exemptions() {
+        for (kind, url) in [
+            (
+                "browser_ui",
+                Some("chrome://webui-toolbar.top-chrome/?private-url-marker"),
+            ),
+            (
+                "browser_ui",
+                Some("https://private-url-marker.invalid/secret"),
+            ),
+            ("browser_ui", None),
+            ("worker", None),
+            ("future_native_kind_longer_than_32_bytes", None),
+        ] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", kind).await;
+            let task = f.capture(f.owner.operation());
+            let request = f.request("Target.getTargetInfo", 1).await;
+            let mut info = capture_info("missing-a", kind);
+            if let Some(url) = url {
+                info["url"] = json!(url);
+            }
+            info["title"] = json!("private-title-marker");
+            f.reply(&request, info).await;
+            task.await.unwrap().unwrap();
+            assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+            f.finish().await;
+        }
+    }
+
+    // 4. Present-but-contradictory records cannot be healed by exact lookup.
+    #[tokio::test]
+    async fn capture_owned_inventory_rejects_all_enumerated_contradictions_first() {
+        for case in [
+            "foreign-context",
+            "missing-context",
+            "kind",
+            "null-kind",
+            "null-id",
+            "duplicate",
+            "duplicate-conflict",
+        ] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", "browser_ui")
+                .await;
+            // An earlier omission must not trigger a read before a later conflict.
+            f.attach("zz-conflict", "conflict-session", "browser_ui")
+                .await;
+            let mut info = capture_info("zz-conflict", "browser_ui");
+            match case {
+                "foreign-context" => info["browserContextId"] = json!("foreign"),
+                "missing-context" => {
+                    info.as_object_mut().unwrap().remove("browserContextId");
+                }
+                "kind" => info["type"] = json!("worker"),
+                "null-kind" => info["type"] = Value::Null,
+                "null-id" => info["targetId"] = Value::Null,
+                _ => {}
+            }
+            f.inventory.lock().unwrap().push(info.clone());
+            if case.starts_with("duplicate") {
+                if case == "duplicate-conflict" {
+                    info["browserContextId"] = json!("foreign");
+                }
+                f.inventory.lock().unwrap().push(info);
+            }
+            let frames = f.requests("Page.getFrameTree").len();
+            assert!(f.owner.attest_capture(&f.owner.operation()).await.is_err());
+            assert!(f.requests("Target.getTargetInfo").is_empty());
+            assert_eq!(f.requests("Page.getFrameTree").len(), frames);
+            f.finish().await;
+        }
+    }
+
+    // 5. Malformed or failed exact-session replies provide no inventory proof.
+    #[tokio::test]
+    async fn capture_owned_inventory_exact_info_negative_matrix() {
+        for case in [
+            "target",
+            "context",
+            "kind",
+            "missing-target",
+            "missing-context",
+            "missing-kind",
+            "null-info",
+            "missing-info",
+            "false-attached",
+            "missing-attached",
+            "string-attached",
+            "long-id",
+            "protocol",
+            "unsupported",
+            "transport",
+        ] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", "browser_ui")
+                .await;
+            let revision = f.owner.targets.inventory().unwrap().0;
+            let frames = f.requests("Page.getFrameTree").len();
+            let task = f.capture(f.owner.operation());
+            let request = f.request("Target.getTargetInfo", 1).await;
+            let mut info = capture_info("missing-a", "browser_ui");
+            let expected = match case {
+                "target" => {
+                    info["targetId"] = json!("wrong");
+                    ProtocolError::StaleScope
+                }
+                "context" => {
+                    info["browserContextId"] = json!("foreign");
+                    ProtocolError::StaleScope
+                }
+                "kind" => {
+                    info["type"] = json!("worker");
+                    ProtocolError::StaleScope
+                }
+                "false-attached" => {
+                    info["attached"] = json!(false);
+                    ProtocolError::StaleScope
+                }
+                "string-attached" => {
+                    info["attached"] = json!("true");
+                    ProtocolError::InvalidFrame
+                }
+                "missing-target" => {
+                    info.as_object_mut().unwrap().remove("targetId");
+                    ProtocolError::InvalidFrame
+                }
+                "missing-context" => {
+                    info.as_object_mut().unwrap().remove("browserContextId");
+                    ProtocolError::InvalidFrame
+                }
+                "missing-kind" => {
+                    info.as_object_mut().unwrap().remove("type");
+                    ProtocolError::InvalidFrame
+                }
+                "missing-attached" => {
+                    info.as_object_mut().unwrap().remove("attached");
+                    ProtocolError::InvalidFrame
+                }
+                "null-info" => {
+                    info = Value::Null;
+                    ProtocolError::InvalidFrame
+                }
+                "long-id" => {
+                    info["targetId"] = json!("x".repeat(1025));
+                    ProtocolError::InvalidFrame
+                }
+                "protocol" | "unsupported" | "transport" => ProtocolError::BrowserFailure,
+                _ => ProtocolError::InvalidFrame,
+            };
+            match case {
+                "protocol" | "unsupported" => f.emit.send(json!({"id":request["id"], "error":{"code":if case == "unsupported" {-32601} else {-32000}, "message":"private-error-marker https://secret.invalid"}})).await.unwrap(),
+                "transport" => f.emit.send(json!({"fixtureClose":true})).await.unwrap(),
+                "missing-info" => f.emit.send(json!({"id":request["id"], "result":{}})).await.unwrap(),
+                _ => f.reply(&request, info).await,
+            }
+            let result = task.await.unwrap().map(|_| ());
+            if case == "transport" {
+                // Connection retirement can win the bounded command cancellation.
+                assert!(matches!(
+                    result,
+                    Err(ProtocolError::BrowserFailure | ProtocolError::Cancelled)
+                ));
+            } else {
+                assert_eq!(result, Err(expected), "{case}");
+            }
+            assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+            assert_eq!(f.requests("Page.getFrameTree").len(), frames);
+            assert!(f
+                .requests("Target.getTargetInfo")
+                .iter()
+                .all(|r| r["params"] == json!({}) && r["sessionId"] == "missing-session-a"));
+            if case != "transport" {
+                assert_eq!(f.owner.targets.inventory().unwrap().0, revision);
+            }
+            f.finish().await;
+        }
+    }
+
+    // 6. Coverage and the lookup budget are per original omitted attachment.
+    #[tokio::test]
+    async fn capture_owned_inventory_multiple_omissions_require_every_reply() {
+        for fail_second in [false, true] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", "browser_ui")
+                .await;
+            f.attach("missing-b", "missing-session-b", "worker").await;
+            let frames = f.requests("Page.getFrameTree").len();
+            let task = f.capture(f.owner.operation());
+            let first = f.request("Target.getTargetInfo", 1).await;
+            assert_eq!(first["sessionId"], "missing-session-a");
+            f.reply(&first, capture_info("missing-a", "browser_ui"))
+                .await;
+            let second = f.request("Target.getTargetInfo", 2).await;
+            assert_eq!(second["sessionId"], "missing-session-b");
+            assert_eq!(f.requests("Page.getFrameTree").len(), frames);
+            f.reply(
+                &second,
+                capture_info(
+                    if fail_second {
+                        "unrelated"
+                    } else {
+                        "missing-b"
+                    },
+                    "worker",
+                ),
+            )
+            .await;
+            assert_eq!(task.await.unwrap().is_err(), fail_second);
+            assert_eq!(f.requests("Target.getTargetInfo").len(), 2);
+            if fail_second {
+                assert_eq!(f.requests("Page.getFrameTree").len(), frames);
+            }
+            f.finish().await;
+        }
+    }
+
+    // Deliberately malformed local indexes exercise the explicit snapshot bound
+    // and duplicate invariant; these are not claimed as valid enrollment races.
+    #[tokio::test]
+    async fn capture_owned_inventory_snapshot_cap_and_duplicate_guards() {
+        for overflow in [false, true] {
+            let f = CaptureWireFixture::new(false).await;
+            let original = f.owner.index.lock().unwrap().sessions["initial"].clone();
+            {
+                let mut index = f.owner.index.lock().unwrap();
+                for number in 0..if overflow { MAX_SESSIONS } else { 1 } {
+                    let mut entry = original.clone();
+                    entry.session = format!("extra-session-{number}");
+                    if overflow {
+                        entry.target = format!("extra-target-{number}");
+                    }
+                    index.sessions.insert(entry.session.clone(), entry);
+                }
+            }
+            let before = f.log.lock().unwrap().len();
+            assert_eq!(
+                f.owner
+                    .attest_capture(&f.owner.operation())
+                    .await
+                    .map(|_| ()),
+                Err(if overflow {
+                    ProtocolError::CapacityExceeded
+                } else {
+                    ProtocolError::StaleScope
+                })
+            );
+            assert_eq!(f.log.lock().unwrap().len(), before);
+            f.owner
+                .index
+                .lock()
+                .unwrap()
+                .sessions
+                .retain(|session, _| session == "initial");
+            f.finish().await;
+        }
+    }
+
+    // 7. Detach is reconciled before an old positive ACK can count as coverage.
+    #[tokio::test]
+    async fn capture_owned_inventory_detach_before_ack_and_dead_session_refuse() {
+        for protocol_failure in [false, true] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", "browser_ui")
+                .await;
+            let task = f.capture(f.owner.operation());
+            let request = f.request("Target.getTargetInfo", 1).await;
+            realm_emit(&f.owner, &f.emit, json!({"method":"Target.detachedFromTarget", "params":{"sessionId":"missing-session-a", "targetId":"missing-a"}})).await;
+            if protocol_failure {
+                // A browser-global target may survive; its dead session is not replaced.
+                f.inventory
+                    .lock()
+                    .unwrap()
+                    .push(capture_info("missing-a", "browser_ui"));
+                f.emit.send(json!({"id":request["id"], "error":{"code":-32000, "message":"session not found"}})).await.unwrap();
+            } else {
+                f.reply(&request, capture_info("missing-a", "browser_ui"))
+                    .await;
+            }
+            assert_eq!(
+                task.await.unwrap().map(|_| ()),
+                Err(if protocol_failure {
+                    ProtocolError::BrowserFailure
+                } else {
+                    ProtocolError::StaleScope
+                })
+            );
+            assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+            assert_eq!(request["sessionId"], "missing-session-a");
+            f.finish().await;
+        }
+    }
+
+    // 8. Production detach/re-enrollment changes tenure even with identical IDs.
+    #[tokio::test]
+    async fn capture_owned_inventory_same_id_aba_and_new_session_never_redirect() {
+        for replacement_session in ["missing-session-a", "replacement-session"] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", "browser_ui")
+                .await;
+            let original = f.owner.targets.owned_target("missing-a").unwrap();
+            let task = f.capture(f.owner.operation());
+            let request = f.request("Target.getTargetInfo", 1).await;
+            realm_emit(&f.owner, &f.emit, json!({"method":"Target.detachedFromTarget", "params":{"sessionId":"missing-session-a", "targetId":"missing-a"}})).await;
+            f.attach("missing-a", replacement_session, "browser_ui")
+                .await;
+            let replacement = f.owner.targets.owned_target("missing-a").unwrap();
+            assert!(!replacement.same_attachment(&original));
+            f.reply(&request, capture_info("missing-a", "browser_ui"))
+                .await;
+            assert_eq!(
+                task.await.unwrap().map(|_| ()),
+                Err(ProtocolError::StaleScope)
+            );
+            assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+            assert_eq!(request["sessionId"], "missing-session-a");
+            f.finish().await;
+        }
+    }
+
+    // 9. Neither an old matching nor a changed reply heals an event epoch change.
+    #[tokio::test]
+    async fn capture_owned_inventory_context_and_kind_events_invalidate_held_reply() {
+        for changed_field in ["browserContextId", "type"] {
+            for changed_reply in [false, true] {
+                let f = CaptureWireFixture::new(false).await;
+                f.attach("missing-a", "missing-session-a", "browser_ui")
+                    .await;
+                let task = f.capture(f.owner.operation());
+                let request = f.request("Target.getTargetInfo", 1).await;
+                let mut changed = capture_info("missing-a", "browser_ui");
+                changed[changed_field] = json!(if changed_field == "type" {
+                    "worker"
+                } else {
+                    "foreign"
+                });
+                realm_emit(
+                    &f.owner,
+                    &f.emit,
+                    json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":changed}}),
+                )
+                .await;
+                f.reply(
+                    &request,
+                    if changed_reply {
+                        changed
+                    } else {
+                        capture_info("missing-a", "browser_ui")
+                    },
+                )
+                .await;
+                assert_eq!(
+                    task.await.unwrap().map(|_| ()),
+                    Err(ProtocolError::StaleScope)
+                );
+                f.finish().await;
+            }
+        }
+    }
+
+    // 10. Observe the real post-ACK not-ready drain branch while application is
+    // gated, then ACK a server barrier before checking for renderer commands.
+    #[tokio::test]
+    async fn capture_owned_inventory_ack_waits_for_current_reader_watermark() {
+        let f = CaptureWireFixture::new(false).await;
+        f.attach("missing-a", "missing-session-a", "browser_ui")
+            .await;
+        let frames = f.requests("Page.getFrameTree").len();
+        let ack = f.gate(CaptureTestPoint::AfterInfoAck);
+        let event = f.gate(CaptureTestPoint::BeforeEventApply);
+        let op = f.owner.operation();
+        let capture = f.owner.attest_capture(&op);
+        tokio::pin!(capture);
+        let request = tokio::select! {
+            request = f.request("Target.getTargetInfo", 1) => request,
+            _ = &mut capture => panic!("capture completed before the held info request"),
+        };
+        f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("missing-a", "browser_ui")}})).await.unwrap();
+        event.wait_entered().await;
+        f.reply(&request, capture_info("missing-a", "browser_ui"))
+            .await;
+        tokio::select! {
+            _ = ack.wait_entered() => {},
+            _ = &mut capture => panic!("capture completed before the ACK gate"),
+        }
+        let watermark = f.owner.realm_watermark().unwrap();
+        assert!(watermark.received().unwrap() > f.owner.index.lock().unwrap().applied_watermark);
+        let draining = f.gate(CaptureTestPoint::DrainWaiting);
+        ack.release();
+        tokio::select! {
+            _ = draining.wait_entered() => {},
+            _ = &mut capture => panic!("capture completed before entering its post-ACK drain wait"),
+        }
+        f.server_barrier().await;
+        assert_eq!(f.requests("Page.getFrameTree").len(), frames);
+        event.release();
+        assert_eq!(capture.await.map(|_| ()), Err(ProtocolError::StaleScope));
+        // The pinned future borrows f, so settle the fixture without moving it.
+        let _ = f.owner.close().await;
+        f.server.abort();
+    }
+
+    // 11. A first completion cannot make a later admitted attach disappear.
+    #[tokio::test]
+    async fn capture_owned_inventory_new_attach_after_drain_is_not_old_readiness() {
+        for hold_before_apply in [false, true] {
+            let f = CaptureWireFixture::new(false).await;
+            let runtime_before = f.requests("Runtime.enable").len();
+            f.held
+                .lock()
+                .unwrap()
+                .insert(("Runtime.enable".into(), "first-session".into()));
+            f.emit
+                .send(capture_attach_event("first", "first-session", "browser_ui"))
+                .await
+                .unwrap();
+            let first = f.request("Runtime.enable", runtime_before + 1).await;
+            let drained = f.gate(CaptureTestPoint::AfterInitialDrain);
+            let inventory_before = f.requests("Target.getTargets").len();
+            let task = f.capture(f.owner.operation());
+            f.emit
+                .send(json!({"id":first["id"], "result":{}}))
+                .await
+                .unwrap();
+            drained.wait_entered().await;
+            let event_gate = hold_before_apply.then(|| f.gate(CaptureTestPoint::BeforeEventApply));
+            f.held
+                .lock()
+                .unwrap()
+                .insert(("Runtime.enable".into(), "second-session".into()));
+            f.emit
+                .send(capture_attach_event(
+                    "second",
+                    "second-session",
+                    "browser_ui",
+                ))
+                .await
+                .unwrap();
+            let second = if let Some(gate) = &event_gate {
+                gate.wait_entered().await;
+                None
+            } else {
+                Some(f.request("Runtime.enable", runtime_before + 2).await)
+            };
+            if !hold_before_apply {
+                assert!(f
+                    .owner
+                    .index
+                    .lock()
+                    .unwrap()
+                    .pending_enrollment
+                    .contains("second-session"));
+            }
+            drained.release();
+            assert_eq!(
+                task.await.unwrap().map(|_| ()),
+                Err(ProtocolError::StaleScope)
+            );
+            assert_eq!(f.requests("Target.getTargets").len(), inventory_before);
+            assert!(f.requests("Target.getTargetInfo").is_empty());
+            if let Some(gate) = event_gate {
+                gate.release();
+            }
+            let second = match second {
+                Some(request) => request,
+                None => f.request("Runtime.enable", runtime_before + 2).await,
+            };
+            f.emit
+                .send(json!({"id":second["id"], "result":{}}))
+                .await
+                .unwrap();
+            f.owner
+                .drain_capture_watermark(&f.owner.realm_watermark().unwrap(), &f.owner.operation())
+                .await
+                .unwrap();
+            f.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_owned_inventory_admission_after_fence_drain_refuses_before_dispatch() {
+        let f = CaptureWireFixture::new(false).await;
+        f.attach("missing-a", "missing-session-a", "browser_ui")
+            .await;
+        let drained = f.gate(CaptureTestPoint::AfterFenceDrain);
+        let event = f.gate(CaptureTestPoint::BeforeEventApply);
+        let task = f.capture(f.owner.operation());
+        drained.wait_entered().await;
+        f.emit
+            .send(capture_attach_event(
+                "new-target",
+                "new-session",
+                "browser_ui",
+            ))
+            .await
+            .unwrap();
+        event.wait_entered().await;
+        assert!(
+            f.owner.realm_watermark().unwrap().received().unwrap()
+                > f.owner.index.lock().unwrap().applied_watermark
+        );
+        drained.release();
+        assert_eq!(
+            task.await.unwrap().map(|_| ()),
+            Err(ProtocolError::StaleScope)
+        );
+        assert!(f.requests("Target.getTargetInfo").is_empty());
+        event.release();
+        f.owner
+            .drain_capture_watermark(&f.owner.realm_watermark().unwrap(), &f.owner.operation())
+            .await
+            .unwrap();
+        f.finish().await;
+    }
+
+    #[tokio::test]
+    async fn capture_owned_inventory_cancel_or_deadline_during_post_ack_drain() {
+        for cancel in [false, true] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", "browser_ui")
+                .await;
+            let frames = f.requests("Page.getFrameTree").len();
+            let event = f.gate(CaptureTestPoint::BeforeEventApply);
+            let ack = f.gate(CaptureTestPoint::AfterInfoAck);
+            let (sender, cancellation) = watch::channel(CancelSignal::None);
+            let mut op = f.owner.operation();
+            op.cancellation = cancellation;
+            op.deadline = Instant::now() + Duration::from_secs(3);
+            let capture = f.owner.attest_capture(&op);
+            tokio::pin!(capture);
+            let request = tokio::select! {
+                request = f.request("Target.getTargetInfo", 1) => request,
+                _ = &mut capture => panic!("capture completed before info dispatch"),
+            };
+            f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("missing-a", "browser_ui")}})).await.unwrap();
+            event.wait_entered().await;
+            f.reply(&request, capture_info("missing-a", "browser_ui"))
+                .await;
+            tokio::select! {
+                _ = ack.wait_entered() => {},
+                _ = &mut capture => panic!("capture completed before the ACK gate"),
+            }
+            let draining = f.gate(CaptureTestPoint::DrainWaiting);
+            ack.release();
+            tokio::select! {
+                _ = draining.wait_entered() => {},
+                _ = &mut capture => panic!("capture completed before entering its post-ACK drain wait"),
+            }
+            f.server_barrier().await;
+            assert_eq!(f.requests("Page.getFrameTree").len(), frames);
+            if cancel {
+                sender.send_replace(CancelSignal::Requested);
+            } else {
+                tokio::time::sleep_until(op.deadline.into()).await;
+            }
+            assert_eq!(
+                capture.await.map(|_| ()),
+                Err(if cancel {
+                    ProtocolError::Cancelled
+                } else {
+                    ProtocolError::DeadlineExceeded
+                })
+            );
+            assert_eq!(f.requests("Page.getFrameTree").len(), frames);
+            assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+            event.release();
+            let _ = f.owner.close().await;
+            f.server.abort();
+        }
+    }
+
+    // 12. Only relevant retirement fails; historical unrelated tombstones and
+    // StateBootstrap churn do not become a registry-global revision fence.
+    #[tokio::test]
+    async fn capture_owned_inventory_retirement_health_and_original_stream() {
+        for case in [
+            "target-retirement",
+            "root-retirement",
+            "retired-session",
+            "borrowed-restart",
+            "sealed",
+            "poisoned",
+            "dropped-stream",
+            "replaced-stream",
+            "overflow",
+            "unrelated-retirement",
+            "bootstrap",
+        ] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", "browser_ui")
+                .await;
+            let task = f.capture(f.owner.operation());
+            let request = f.request("Target.getTargetInfo", 1).await;
+            let mut event_gate = None;
+            let mut replacement_stream = None;
+            let original_watermark = f.owner.realm_watermark().unwrap();
+            match case {
+                "target-retirement" => {
+                    f.owner
+                        .index
+                        .lock()
+                        .unwrap()
+                        .retiring_pages
+                        .insert("missing-a".into(), "missing-session-a".into());
+                }
+                "root-retirement" => {
+                    f.owner
+                        .index
+                        .lock()
+                        .unwrap()
+                        .retiring_pages
+                        .insert("other".into(), "missing-session-a".into());
+                }
+                "retired-session" => {
+                    f.owner
+                        .index
+                        .lock()
+                        .unwrap()
+                        .retired_page_sessions
+                        .insert("missing-session-a".into());
+                }
+                "borrowed-restart" => f.owner.index.lock().unwrap().borrowed_restart = Some(1),
+                "sealed" => f.owner.sealed.store(true, Ordering::Release),
+                "poisoned" => f.owner.poison(ProtocolError::BrowserFailure),
+                "dropped-stream" | "replaced-stream" => {
+                    let supervisor = f.owner.supervisor.lock().await.take().unwrap();
+                    supervisor.abort();
+                    let _ = supervisor.await;
+                    assert!(original_watermark.received().is_err());
+                    if case == "replaced-stream" {
+                        let events = f
+                            .owner
+                            .client
+                            .subscribe_bounded_methods(EVENTS, 256, 128 * 1024 * 1024)
+                            .unwrap();
+                        *f.owner.event_watermark.lock().unwrap() = Some(events.watermark());
+                        assert!(f.owner.realm_watermark().unwrap().received().is_ok());
+                        replacement_stream = Some(events);
+                    }
+                }
+                "overflow" => {
+                    let gate = f.gate(CaptureTestPoint::BeforeEventApply);
+                    f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("unrelated", "browser_ui")}})).await.unwrap();
+                    gate.wait_entered().await;
+                    for _ in 0..257 {
+                        f.emit.send(json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":capture_info("unrelated", "browser_ui")}})).await.unwrap();
+                    }
+                    let watermark = f.owner.realm_watermark().unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while watermark.received().is_ok() {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                    event_gate = Some(gate);
+                }
+                "unrelated-retirement" => {
+                    let mut index = f.owner.index.lock().unwrap();
+                    index
+                        .retiring_pages
+                        .insert("old-target".into(), "old-session".into());
+                    index.retired_page_sessions.insert("old-session".into());
+                }
+                "bootstrap" => {
+                    let mut reservation = f
+                        .owner
+                        .targets
+                        .reserve_creation(TargetPurpose::StateBootstrap)
+                        .unwrap();
+                    f.owner
+                        .targets
+                        .attached(
+                            "owned-context",
+                            "bootstrap".into(),
+                            "bootstrap-session".into(),
+                            "page".into(),
+                        )
+                        .unwrap();
+                    reservation.claim("bootstrap").unwrap();
+                    drop(reservation);
+                    f.owner.targets.configured("bootstrap").unwrap();
+                    f.owner.targets.detach("bootstrap").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            f.reply(&request, capture_info("missing-a", "browser_ui"))
+                .await;
+            let result = task.await.unwrap();
+            assert_eq!(
+                result.is_ok(),
+                matches!(case, "unrelated-retirement" | "bootstrap"),
+                "{case}"
+            );
+            if let Some(gate) = event_gate {
+                gate.release();
+            }
+            drop(replacement_stream);
+            f.finish().await;
+        }
+    }
+
+    // 13. The same operation deadline and cancellation gate every boundary.
+    #[tokio::test]
+    async fn capture_owned_inventory_original_lease_bounds_every_stage() {
+        for cancel in [false, true] {
+            for stage in [
+                "before-inventory",
+                "before-info",
+                "held-info",
+                "after-ack",
+                "before-return",
+                "before-verify-return",
+            ] {
+                let f = CaptureWireFixture::new(false).await;
+                f.attach("missing-a", "missing-session-a", "browser_ui")
+                    .await;
+                let (sender, cancellation) = watch::channel(CancelSignal::None);
+                let mut op = f.owner.operation();
+                op.cancellation = cancellation;
+                op.deadline = if stage == "before-inventory" && !cancel {
+                    Instant::now()
+                } else {
+                    Instant::now() + Duration::from_secs(3)
+                };
+                let deadline = op.deadline;
+                let before = f.log.lock().unwrap().len();
+                if stage == "before-inventory" {
+                    if cancel {
+                        sender.send_replace(CancelSignal::Requested);
+                    }
+                    assert_eq!(
+                        f.owner.attest_capture(&op).await.map(|_| ()),
+                        Err(if cancel {
+                            ProtocolError::Cancelled
+                        } else {
+                            ProtocolError::DeadlineExceeded
+                        })
+                    );
+                    assert_eq!(f.log.lock().unwrap().len(), before);
+                    f.finish().await;
+                    continue;
+                }
+                let point = match stage {
+                    "before-info" => Some(CaptureTestPoint::BeforeInfo),
+                    "after-ack" => Some(CaptureTestPoint::AfterInfoAck),
+                    "before-return" => Some(CaptureTestPoint::BeforeReturn),
+                    "before-verify-return" => Some(CaptureTestPoint::BeforeVerifyReturn),
+                    _ => None,
+                };
+                let gate = point.map(|point| f.gate(point));
+                let task = if stage == "before-verify-return" {
+                    let first = f.capture(f.owner.operation());
+                    let request = f.request("Target.getTargetInfo", 1).await;
+                    f.reply(&request, capture_info("missing-a", "browser_ui"))
+                        .await;
+                    let proof = first.await.unwrap().unwrap();
+                    f.inventory
+                        .lock()
+                        .unwrap()
+                        .push(capture_info("missing-a", "browser_ui"));
+                    let owner = f.owner.clone();
+                    tokio::spawn(async move { owner.verify_capture_attestation(&proof, &op).await })
+                } else {
+                    let capture = f.capture(op);
+                    tokio::spawn(async move { capture.await.unwrap().map(|_| ()) })
+                };
+                if stage != "before-info" && stage != "before-verify-return" {
+                    let request = f.request("Target.getTargetInfo", 1).await;
+                    if stage != "held-info" {
+                        f.reply(&request, capture_info("missing-a", "browser_ui"))
+                            .await;
+                    }
+                }
+                if let Some(gate) = &gate {
+                    gate.wait_entered().await;
+                }
+                let at_invalidation = f.log.lock().unwrap().len();
+                if cancel {
+                    sender.send_replace(CancelSignal::Requested);
+                } else {
+                    tokio::time::sleep_until(deadline.into()).await;
+                }
+                if let Some(gate) = &gate {
+                    gate.release();
+                }
+                assert_eq!(
+                    task.await.unwrap(),
+                    Err(if cancel {
+                        ProtocolError::Cancelled
+                    } else {
+                        ProtocolError::DeadlineExceeded
+                    }),
+                    "{stage}"
+                );
+                assert_eq!(f.log.lock().unwrap().len(), at_invalidation);
+                f.finish().await;
+            }
+        }
+    }
+
+    // 14. Post-export proof compares the original tickets even if enumeration
+    // now includes the same string IDs. Include an epoch-independent ABA case.
+    #[tokio::test]
+    async fn capture_owned_inventory_post_export_keeps_original_owner_when_enumerable() {
+        for case in ["unchanged", "event-aba", "registry-aba", "context-event"] {
+            let f = CaptureWireFixture::new(false).await;
+            f.attach("missing-a", "missing-session-a", "browser_ui")
+                .await;
+            let task = f.capture(f.owner.operation());
+            let request = f.request("Target.getTargetInfo", 1).await;
+            f.reply(&request, capture_info("missing-a", "browser_ui"))
+                .await;
+            let proof = task.await.unwrap().unwrap();
+            let epoch = f.owner.index.lock().unwrap().application_epoch;
+            match case {
+                "event-aba" => {
+                    realm_emit(&f.owner, &f.emit, json!({"method":"Target.detachedFromTarget", "params":{"sessionId":"missing-session-a", "targetId":"missing-a"}})).await;
+                    f.attach("missing-a", "missing-session-a", "browser_ui")
+                        .await;
+                }
+                "registry-aba" => {
+                    // Authoritative insertion only, no epoch edits: isolate tenure.
+                    f.owner.targets.detach("missing-a").unwrap();
+                    f.owner
+                        .targets
+                        .attached(
+                            "owned-context",
+                            "missing-a".into(),
+                            "missing-session-a".into(),
+                            "browser_ui".into(),
+                        )
+                        .unwrap();
+                    f.owner.targets.configured("missing-a").unwrap();
+                    f.owner
+                        .targets
+                        .resume_permit("missing-a")
+                        .await
+                        .unwrap()
+                        .complete()
+                        .unwrap();
+                    assert_eq!(f.owner.index.lock().unwrap().application_epoch, epoch);
+                }
+                "context-event" => {
+                    let mut info = capture_info("missing-a", "browser_ui");
+                    info["browserContextId"] = json!("foreign");
+                    realm_emit(
+                        &f.owner,
+                        &f.emit,
+                        json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":info}}),
+                    )
+                    .await;
+                }
+                _ => {}
+            }
+            f.inventory
+                .lock()
+                .unwrap()
+                .push(capture_info("missing-a", "browser_ui"));
+            let result = f
+                .owner
+                .verify_capture_attestation(&proof, &f.owner.operation())
+                .await;
+            assert_eq!(result.is_ok(), case == "unchanged", "{case}");
+            assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+            f.finish().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_owned_inventory_fresh_second_attestation_cannot_replace_original_ticket() {
+        let f = CaptureWireFixture::new(false).await;
+        f.attach("missing-a", "missing-session-a", "browser_ui")
+            .await;
+        let first = f.capture(f.owner.operation());
+        let request = f.request("Target.getTargetInfo", 1).await;
+        f.reply(&request, capture_info("missing-a", "browser_ui"))
+            .await;
+        let proof = first.await.unwrap().unwrap();
+        let original = f.owner.targets.owned_target("missing-a").unwrap();
+        let original_epoch = f.owner.index.lock().unwrap().application_epoch;
+        let frames_before_verify = f.requests("Page.getFrameTree").len();
+        let before_fresh_snapshot = f.gate(CaptureTestPoint::AfterInitialDrain);
+        let fresh_completed = f.gate(CaptureTestPoint::AfterFreshAttestation);
+        let owner = f.owner.clone();
+        let verify = tokio::spawn(async move {
+            owner
+                .verify_capture_attestation(&proof, &owner.operation())
+                .await
+        });
+        before_fresh_snapshot.wait_entered().await;
+        // Verify's first original-ticket fence has passed. Replace only through
+        // authoritative registry insertion during the second attestation, before
+        // it snapshots the new tenure. No hand-edited epoch can cause rejection.
+        f.owner.targets.detach("missing-a").unwrap();
+        f.owner
+            .targets
+            .attached(
+                "owned-context",
+                "missing-a".into(),
+                "missing-session-a".into(),
+                "browser_ui".into(),
+            )
+            .unwrap();
+        f.owner.targets.configured("missing-a").unwrap();
+        f.owner
+            .targets
+            .resume_permit("missing-a")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        assert!(!f
+            .owner
+            .targets
+            .owned_target("missing-a")
+            .unwrap()
+            .same_attachment(&original));
+        assert_eq!(
+            f.owner.index.lock().unwrap().application_epoch,
+            original_epoch
+        );
+        f.inventory
+            .lock()
+            .unwrap()
+            .push(capture_info("missing-a", "browser_ui"));
+        before_fresh_snapshot.release();
+        fresh_completed.wait_entered().await;
+        // The fresh attestation succeeded with a new, now-enumerable ticket.
+        // Its own final checks therefore cannot be the source of this refusal.
+        f.server_barrier().await;
+        assert_eq!(
+            f.requests("Page.getFrameTree").len(),
+            frames_before_verify + 1
+        );
+        assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+        assert_eq!(
+            f.owner.index.lock().unwrap().application_epoch,
+            original_epoch
+        );
+        fresh_completed.release();
+        assert_eq!(verify.await.unwrap(), Err(ProtocolError::StaleScope));
+        f.finish().await;
+    }
+
+    // 15. Unknown same-context and observer-only omissions never gain ownership.
+    #[tokio::test]
+    async fn capture_owned_inventory_never_expands_authority() {
+        for case in [
+            "unowned-page",
+            "unowned-kind",
+            "missing-observer",
+            "foreign-tab-browser",
+        ] {
+            let f = CaptureWireFixture::new(case == "missing-observer").await;
+            if case == "missing-observer" {
+                f.attach("other-host", "observer-session", "page").await;
+                assert!(
+                    f.owner.index.lock().unwrap().sessions["observer-session"].observation_only
+                );
+            } else if case == "foreign-tab-browser" {
+                let mut foreign = capture_info("foreign", "page");
+                foreign["browserContextId"] = json!("foreign-context");
+                f.inventory.lock().unwrap().extend([
+                    foreign,
+                    capture_info("unowned-tab", "tab"),
+                    json!({"targetId":"browser", "type":"browser"}),
+                ]);
+            } else {
+                f.inventory.lock().unwrap().push(capture_info(
+                    "unowned",
+                    if case == "unowned-page" {
+                        "page"
+                    } else {
+                        "future-kind"
+                    },
+                ));
+            }
+            let before = f.log.lock().unwrap().len();
+            let revision = f.owner.targets.inventory().unwrap().0;
+            let result = f.owner.attest_capture(&f.owner.operation()).await;
+            assert_eq!(result.is_ok(), case == "foreign-tab-browser", "{case}");
+            assert!(f.requests("Target.getTargetInfo").is_empty());
+            assert_eq!(f.owner.targets.inventory().unwrap().0, revision);
+            assert_eq!(f.owner.targets.inventory().unwrap().1.len(), 1);
+            f.assert_no_capture_mutations(before);
+            f.finish().await;
+        }
+    }
+
+    // 16. Production reads do not invoke the historical global diagnostic read.
+    #[tokio::test]
+    async fn capture_owned_inventory_reports_are_private_and_budget_is_exact() {
+        let f = CaptureWireFixture::new(false).await;
+        f.attach("missing-a", "missing-session-a", "browser_ui")
+            .await;
+        let before = f.log.lock().unwrap().len();
+        let task = f.capture(f.owner.operation());
+        let request = f.request("Target.getTargetInfo", 1).await;
+        let mut info = capture_info("missing-a", "browser_ui");
+        info["url"] = json!("https://private-url-marker.invalid/secret");
+        info["title"] = json!("private-title-marker");
+        f.reply(&request, info).await;
+        task.await.unwrap().unwrap();
+        let printed = format!("{:?}", f.owner.capture_lifecycle.lock().unwrap().rows);
+        for secret in [
+            "private-url-marker",
+            "private-title-marker",
+            "missing-a",
+            "missing-session-a",
+            "owned-context",
+            "https://",
+        ] {
+            assert!(!printed.contains(secret));
+        }
+        assert!(f
+            .owner
+            .capture_lifecycle
+            .lock()
+            .unwrap()
+            .missing_lookup
+            .is_none());
+        assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+        assert_eq!(
+            f.log.lock().unwrap()[before..]
+                .iter()
+                .map(|r| r["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec![
+                "Target.getTargets",
+                "Target.getTargetInfo",
+                "Page.getFrameTree"
+            ]
+        );
+        f.assert_no_capture_mutations(before);
+        f.finish().await;
+    }
+
     #[tokio::test]
     async fn capture_attestation_requires_reconciliation_and_exact_healthy_tenure() {
         let (owner, _notices, _log, _emit, server) = fixture("attestation").await;
@@ -5713,7 +7207,7 @@ mod tests {
             ),
             (
                 "attestation-complete-missing-context",
-                ProtocolError::StaleScope,
+                ProtocolError::InvalidFrame,
             ),
             (
                 "attestation-complete-foreign-context",
@@ -5793,7 +7287,7 @@ mod tests {
             assert!(
                 matches!(
                     owner.attest_capture(&owner.operation()).await,
-                    Err(ProtocolError::StaleScope)
+                    Err(error) if error == if missing_context != 0 { ProtocolError::InvalidFrame } else { ProtocolError::StaleScope }
                 ),
                 "accepted {mode}"
             );
@@ -5883,6 +7377,35 @@ mod tests {
             "url":"chrome://webui-toolbar.top-chrome/?private-url-marker",
             "title":"private-title-marker"
         }})
+    }
+    // Historical CI11 diagnostic tests are deliberately not acceptance tests.
+    // Keep their browser-global diagnostic seam separate from production capture;
+    // it cannot add an extra RPC to the supplementation command budget.
+    impl ClientEnrollment {
+        async fn diagnostic_capture_only(&self, op: &OperationLease) -> Result<(), ProtocolError> {
+            let entries = self
+                .index
+                .lock()
+                .unwrap()
+                .sessions
+                .values()
+                .filter(|entry| entry.application || entry.observation_only)
+                .cloned()
+                .collect::<Vec<_>>();
+            let watermark = self.realm_watermark()?;
+            let inventory = self
+                .command(op, None, "Target.getTargets", json!({"filter":[{}]}))
+                .await?;
+            let infos = inventory["targetInfos"].as_array().unwrap();
+            self.print_capture_lifecycle(&entries, infos);
+            if let Some(diagnostic) = self
+                .diagnose_missing_capture_target(&entries, infos, &watermark, op)
+                .await
+            {
+                self.print_missing_capture_target(diagnostic);
+            }
+            Err(ProtocolError::StaleScope)
+        }
     }
     fn last_capture_lookup(owner: &ClientEnrollment) -> CaptureMissingTargetDiagnostic {
         owner
@@ -5979,7 +7502,7 @@ mod tests {
             let task_owner = owner.clone();
             let task = tokio::spawn(async move {
                 task_owner
-                    .attest_capture(&task_owner.operation())
+                    .diagnostic_capture_only(&task_owner.operation())
                     .await
                     .map(|_| ())
             });
@@ -6120,7 +7643,7 @@ mod tests {
             let task_owner = owner.clone();
             let task = tokio::spawn(async move {
                 task_owner
-                    .attest_capture(&task_owner.operation())
+                    .diagnostic_capture_only(&task_owner.operation())
                     .await
                     .map(|_| ())
             });
@@ -6188,7 +7711,7 @@ mod tests {
         let task_owner = owner.clone();
         let task = tokio::spawn(async move {
             task_owner
-                .attest_capture(&task_owner.operation())
+                .diagnostic_capture_only(&task_owner.operation())
                 .await
                 .map(|_| ())
         });
@@ -6308,7 +7831,9 @@ mod tests {
             let deadline = op.deadline;
             let task_owner = owner.clone();
             let task =
-                tokio::spawn(async move { task_owner.attest_capture(&op).await.map(|_| ()) });
+                tokio::spawn(
+                    async move { task_owner.diagnostic_capture_only(&op).await.map(|_| ()) },
+                );
             wait_capture_lookup(&log, 1).await;
             if cancel_during {
                 cancel.send_replace(CancelSignal::Requested);
@@ -6356,7 +7881,7 @@ mod tests {
         let task_owner = owner.clone();
         let task = tokio::spawn(async move {
             task_owner
-                .attest_capture(&task_owner.operation())
+                .diagnostic_capture_only(&task_owner.operation())
                 .await
                 .map(|_| ())
         });

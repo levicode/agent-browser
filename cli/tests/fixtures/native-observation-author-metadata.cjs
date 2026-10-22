@@ -538,3 +538,34 @@ const queryOptionFacts = [{ ...rawOptionFacts, role: 'option', name: 'Poland' }]
 assert.deepEqual(matchQuery({ kind: 'selector', selector: 'option' }, queryOptionFacts, [[]], [null], '.secure', [false], directOption).indices, [0]);
 assert.deepEqual(matchQuery({ kind: 'query', query: { kind: 'role', value: { kind: 'string', value: 'option', exact: true } } }, queryOptionFacts, [[]], [null], '.secure', [false], directOption).indices, []);
 console.log('PASS: hidden select/option exact metadata, raw value, and selector-versus-role query contracts stay unchanged');
+
+// Public landmark naming is attribute presence, not resolved-name computation.
+for (const bounded of [false, true]) {
+  for (const name of ['aria-label', 'aria-labelledby', 'title']) {
+    for (const [value, expected] of [[null, false], ['', false], [' \t\n', false], ['\u00a0\ufeff', false], ['missing-reference', true], ['\u0085', true]]) {
+      const form = new Element(); form.localName = 'form'; form.innerText = '';
+      form.getAttribute = key => key === name ? value : null;
+      assert.equal(read.call(form, 'data-testid', '.secure', bounded).formOwnName, expected, `${bounded}/${name}/${expected}`);
+    }
+  }
+  assert.equal(read.call(new Element(), 'data-testid', '.secure', bounded).formOwnName, null);
+  for (const scope of [null, '', 'auto', 'invalid', 'ROW', 'rowgroup', 'Col', 'colgroup', ' row ']) {
+    for (const rows of [0, 1, 2]) {
+      for (const sibling of [false, true]) {
+        const table = { rows: Array(rows) };
+        const th = new Element(); th.localName = 'th'; th.innerText = 'Item';
+        th.parentElement = new Element(); th.parentElement.localName = 'tr'; th.parentElement.closest = () => table;
+        th.previousElementSibling = sibling ? new Element() : null; th.nextElementSibling = null;
+        th.getAttribute = name => name === 'scope' ? scope : null;
+        const scoped = ['row', 'rowgroup', 'col', 'colgroup'].includes((scope || '').toLowerCase());
+        assert.equal(read.call(th, 'data-testid', '.secure', bounded).singleCellHeader, !scoped && !sibling && rows <= 1, `${bounded}/${scope}/${rows}/${sibling}`);
+      }
+    }
+  }
+  const detachedHeader = new Element(); detachedHeader.localName = 'th'; detachedHeader.innerText = 'Item';
+  detachedHeader.previousElementSibling = null; detachedHeader.nextElementSibling = null;
+  assert.equal(read.call(detachedHeader, 'data-testid', '.secure', bounded).singleCellHeader, false);
+  const nonRow = new Element(); nonRow.localName = 'div'; detachedHeader.parentElement = nonRow;
+  assert.equal(read.call(detachedHeader, 'data-testid', '.secure', bounded).singleCellHeader, false);
+}
+console.log('PASS: original form own-name presence and sole-cell header facts preserve whitespace, scope and multirow boundaries');

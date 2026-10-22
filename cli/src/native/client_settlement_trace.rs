@@ -11,7 +11,67 @@ use std::sync::{Mutex, OnceLock};
 use serde::Serialize;
 
 use super::client_protocol::{ClientMessage, Effects, ProtocolError, ScopeState};
-pub(crate) use super::client_transport::SettlementPhase as Phase;
+// Acceptance-only diagnostics: closed phases and native operation sequence only.
+// Never serialize requests, IDs, browser values, or error descriptions.
+#[cfg(feature = "acceptance-faults")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum SettlementPhase {
+    ExecuteStarted,
+    ExecuteReturned,
+    CancelObserved,
+    DeadlineObserved,
+    GraceReturned,
+    GraceExpired,
+    CompletionJoined,
+    ResultQueued,
+    ResultFlushed,
+    ControlFlushed,
+    CancelReceived,
+    CancelAccepted,
+    CancelRejected,
+    CancelQueued,
+    ReaderEnded,
+    ReaderRefused,
+    WriterFailed,
+    PublicationExpired,
+    HealthFailed,
+    CompletionLost,
+    ResultQueueFailed,
+    UnknownOutcome,
+    CloseReceived,
+    ControlQueueFailed,
+    ShutdownStarted,
+    ShutdownProven,
+    ShutdownUnproven,
+    PendingResultQueued,
+    CaptureLimitReached,
+    CaptureStarted,
+    ProxyDaemonSpawned,
+    PrefaceReturned,
+    CopyStarted,
+    CopyReturned,
+    SocketWriteEntered,
+    SocketWriteReturned,
+    SocketReadEntered,
+    SocketReadReturned,
+    InputHalfCloseEntered,
+    InputHalfCloseReturned,
+    OutputFlushEntered,
+    OutputFlushReturned,
+    ProxySummary,
+    FrameComplete,
+    FrameCleanEof,
+    FramePartialEof,
+    FrameIoError,
+    FrameOversize,
+    FrameParseRefused,
+    FrameDecoded,
+    FrameAdmissionRefused,
+    FrameSummary,
+    DetailLimit,
+}
+
+pub(crate) use SettlementPhase as Phase;
 
 const PATH_ENV: &str = "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE";
 const MAX_RECORDS: usize = 2048;

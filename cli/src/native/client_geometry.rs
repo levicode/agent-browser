@@ -987,7 +987,9 @@ fn hidden_proof_error(error: ObservationError) -> GeometryError {
         ObservationError::CleanupFailed { primary } => GeometryError::CleanupFailed {
             primary: primary.map(|error| Box::new(hidden_proof_error(*error))),
         },
-        ObservationError::BackendFailure => GeometryError::BackendFailure,
+        ObservationError::BackendFailure | ObservationError::UnsupportedCapability => {
+            GeometryError::BackendFailure
+        }
         ObservationError::InvalidArguments
         | ObservationError::PolicyDenied
         | ObservationError::ResourceLimit => GeometryError::IncompleteInventory,
@@ -2332,6 +2334,10 @@ mod tests {
     }
     #[test]
     fn hidden_proof_cleanup_keeps_original_failure() {
+        assert_eq!(
+            hidden_proof_error(ObservationError::UnsupportedCapability),
+            GeometryError::BackendFailure
+        );
         assert_eq!(
             hidden_proof_error(ObservationError::CleanupFailed {
                 primary: Some(Box::new(ObservationError::Cancelled))

@@ -13,12 +13,16 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 #[path = "client_observation/author_projection.rs"]
 mod author_projection;
+#[cfg(test)]
+#[path = "client_observation/composition_tests.rs"]
+pub(crate) mod composition_tests;
 
 /// Public failures are semantic categories, never raw CDP text or string heuristics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObservationError {
     InvalidArguments,
+    UnsupportedCapability,
     StaleReference,
     Cancelled,
     DeadlineExceeded,
@@ -733,6 +737,15 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    }
  }
 
+ // Original public role facts, not a second accessible-name reader. A name
+ // attribute's nonblank presence is sufficient even when its IDREF is unresolved.
+ const formOwnName=tag==='form'?['aria-label','aria-labelledby','title'].some(name=>(e.getAttribute(name)||'').trim()!==''):null;
+ let singleCellHeader=false;
+ if(tag==='th'&&!['row','rowgroup','col','colgroup'].includes((e.getAttribute('scope')||'').toLowerCase())&&e.previousElementSibling===null&&e.nextElementSibling===null){
+   const row=e.parentElement,table=row&&row.localName==='tr'?row.closest('table'):null;
+   singleCellHeader=!!table&&typeof table.rows?.length==='number'&&table.rows.length<=1;
+ }
+
  const editingHost=!!e&&e instanceof HTMLElement&&e.isContentEditable&&
    !['svg','math','canvas','video','audio','iframe','img','hr','br','wbr','area','a','button','input','textarea','select'].includes(tag)&&
    !(e.parentElement instanceof HTMLElement&&e.parentElement.isContentEditable);
@@ -776,7 +789,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  if(nativeOption)controlStates.selected=e.selected;
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
  const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
- return {author,controlStates,pageLevelLandmark,completeButtonContentName,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
+ return {author,controlStates,pageLevelLandmark,formOwnName,singleCellHeader,completeButtonContentName,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure||(boundedObservation&&checkable)?null:editingHost?editorValue:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
@@ -919,6 +932,15 @@ fn project_node_with_refs(
         && authored_role(&data["attributes"]).is_none()
     {
         role = None;
+    }
+    if data["__nativeReadonlyPseudo"] != true && authored_role(&data["attributes"]).is_none() {
+        match author.as_ref().map(|facts| facts.tag.as_str()) {
+            Some("form") if data["formOwnName"] == false => role = None,
+            Some("form") if data["formOwnName"] == true => role = Some("form".into()),
+            Some("thead" | "tbody" | "tfoot") => role = Some("rowgroup".into()),
+            Some("th") if data["singleCellHeader"] == true => role = None,
+            _ => {}
+        }
     }
     if data["editingHost"] == true {
         role = Some(
@@ -3221,10 +3243,12 @@ pub async fn enumerate_frames(
     Ok(frames)
 }
 
-fn validate_expression(
+/// Validate natively before acquisition and return the effective display-value
+/// provenance. Child queries reset provenance; refinements preserve it.
+pub(crate) fn validate_expression(
     expression: &LocatorExpression,
     depth: usize,
-) -> Result<(), ObservationError> {
+) -> Result<bool, ObservationError> {
     if depth > 64 {
         return Err(ObservationError::InvalidArguments);
     }
@@ -3236,25 +3260,31 @@ fn validate_expression(
                 return Err(ObservationError::InvalidArguments);
             }
             if let Some(scope) = scope {
-                validate_expression(scope, depth + 1)?;
+                if validate_expression(scope, depth + 1)? {
+                    return Err(ObservationError::UnsupportedCapability);
+                }
             }
+            Ok(matches!(query.kind, QueryKind::DisplayValue))
         }
         LocatorExpression::Filter { source, has, .. } => {
-            validate_expression(source, depth + 1)?;
+            let display_value = validate_expression(source, depth + 1)?;
             if let Some(has) = has {
-                validate_expression(has, depth + 1)?;
+                if validate_expression(has, depth + 1)? {
+                    return Err(ObservationError::UnsupportedCapability);
+                }
             }
+            Ok(display_value)
         }
         LocatorExpression::Index { source, .. } | LocatorExpression::Frame { source, .. } => {
-            validate_expression(source, depth + 1)?
+            validate_expression(source, depth + 1)
         }
         LocatorExpression::Selector { selector } => {
             if selector.is_empty() {
                 return Err(ObservationError::InvalidArguments);
             }
+            Ok(false)
         }
     }
-    Ok(())
 }
 fn split_frame_expression(
     expression: &LocatorExpression,
@@ -4089,6 +4119,80 @@ mod tests {
                 .unwrap_err(),
                 ObservationError::BackendFailure
             );
+        }
+    }
+
+    #[test]
+    fn public_table_and_form_role_facts_preserve_authored_precedence() {
+        for bounded in [false, true] {
+            for (tag, own_name, single, native_role, expected) in [
+                ("form", Some(false), false, "form", None),
+                ("form", Some(true), false, "generic", Some("form")),
+                ("form", None, false, "form", Some("form")),
+                ("thead", None, false, "generic", Some("rowgroup")),
+                ("tbody", None, false, "generic", Some("rowgroup")),
+                ("tfoot", None, false, "generic", Some("rowgroup")),
+                ("th", None, true, "columnheader", None),
+                ("th", None, false, "rowheader", Some("rowheader")),
+                ("th", None, false, "columnheader", Some("columnheader")),
+                ("div", Some(false), true, "button", Some("button")),
+            ] {
+                for authored in ["", "widget", "region"] {
+                    let mut data = metadata();
+                    data["author"]["tag"] = json!(tag);
+                    data["formOwnName"] = json!(own_name);
+                    data["singleCellHeader"] = json!(single);
+                    data["attributes"]["role"] = json!(authored);
+                    let mut native = ax("role", 42, &[]);
+                    native.role.as_mut().unwrap().value = Some(json!(if authored == "region" {
+                        "region"
+                    } else {
+                        native_role
+                    }));
+                    let node = project_node(
+                        &frame(),
+                        42,
+                        &native,
+                        &mut observed_refs(),
+                        1,
+                        &data,
+                        bounded,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        node.role.as_deref(),
+                        if authored == "region" {
+                            Some("region")
+                        } else {
+                            expected
+                        },
+                        "{tag} {bounded} {authored}"
+                    );
+                    assert_eq!(node.reference.id, "@e1");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn role_facts_from_pseudo_origin_do_not_change_pseudo_role() {
+        for tag in ["form", "th", "thead", "tbody", "tfoot"] {
+            let mut data = metadata();
+            data["author"]["tag"] = json!(tag);
+            data["formOwnName"] = json!(false);
+            data["singleCellHeader"] = json!(true);
+            data["__nativeReadonlyPseudo"] = json!(true);
+            let node = project_node(
+                &frame(),
+                42,
+                &ax("pseudo", 42, &[]),
+                &mut observed_refs(),
+                1,
+                &data,
+                true,
+            )
+            .unwrap();
+            assert_eq!(node.role.as_deref(), Some("button"));
         }
     }
 
