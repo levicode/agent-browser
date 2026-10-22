@@ -1,3 +1,5 @@
+#[cfg(feature = "acceptance-faults")]
+use crate::native::client_settlement_trace as settlement_capture;
 use crate::validation::sanitize_session_component;
 
 #[cfg(test)]
@@ -56,21 +58,33 @@ pub enum Connection {
 
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        match self {
+        #[cfg(feature = "acceptance-faults")]
+        let observation =
+            settlement_capture::socket_enter(settlement_capture::Leg::FromNative, buf.len());
+        let result = match self {
             #[cfg(unix)]
             Connection::Unix(s) => s.read(buf),
             Connection::Tcp(s) => s.read(buf),
-        }
+        };
+        #[cfg(feature = "acceptance-faults")]
+        settlement_capture::socket_return(observation, &result);
+        result
     }
 }
 
 impl Write for Connection {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        match self {
+        #[cfg(feature = "acceptance-faults")]
+        let observation =
+            settlement_capture::socket_enter(settlement_capture::Leg::ToNative, buf.len());
+        let result = match self {
             #[cfg(unix)]
             Connection::Unix(s) => s.write(buf),
             Connection::Tcp(s) => s.write(buf),
-        }
+        };
+        #[cfg(feature = "acceptance-faults")]
+        settlement_capture::socket_return(observation, &result);
+        result
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -875,6 +889,8 @@ fn isolated_client_env_allowed(key: &str) -> bool {
 /// New opt-in protocol mode never reuses/restarts another named daemon and
 /// never loads browser launch/plugin configuration before negotiation.
 pub fn run_isolated_client_session(session: &str, namespace: Option<&str>) -> Result<(), String> {
+    #[cfg(feature = "acceptance-faults")]
+    settlement_capture::initialize_proxy();
     if !crate::validation::is_valid_session_name(session) {
         return Err("Invalid dedicated session name".into());
     }
@@ -1064,6 +1080,16 @@ fn ensure_daemon_inner(session: &str, opts: &DaemonOptions) -> Result<DaemonResu
     }
 
     let spawned_pid = daemon_child.as_ref().map(|child| child.id());
+    #[cfg(feature = "acceptance-faults")]
+    if let Some(daemon_pid) = spawned_pid {
+        settlement_capture::proxy_record(
+            settlement_capture::Phase::ProxyDaemonSpawned,
+            settlement_capture::Facts {
+                daemon_pid: Some(daemon_pid),
+                ..Default::default()
+            },
+        );
+    }
 
     for _ in 0..50 {
         if daemon_ready(session) {
@@ -1163,9 +1189,17 @@ fn connect(session: &str) -> Result<Connection, String> {
 pub fn proxy_client_session(session: &str) -> Result<(), String> {
     use std::net::Shutdown;
     let mut socket = connect(session).map_err(|_| "Session connection failed".to_string())?;
-    socket
-        .write_all(crate::native::client_protocol::SOCKET_PREFACE)
-        .map_err(|_| "Session connection failed".to_string())?;
+    let preface = socket.write_all(crate::native::client_protocol::SOCKET_PREFACE);
+    #[cfg(feature = "acceptance-faults")]
+    settlement_capture::proxy_record(
+        settlement_capture::Phase::PrefaceReturned,
+        settlement_capture::Facts {
+            length: Some(crate::native::client_protocol::SOCKET_PREFACE.len() as u64),
+            io: Some(settlement_capture::IoClass::result(&preface)),
+            ..Default::default()
+        },
+    );
+    preface.map_err(|_| "Session connection failed".to_string())?;
     let mut input_socket = match &socket {
         #[cfg(unix)]
         Connection::Unix(stream) => Connection::Unix(
@@ -1180,26 +1214,44 @@ pub fn proxy_client_session(session: &str) -> Result<(), String> {
         ),
     };
     std::thread::spawn(move || {
+        #[cfg(feature = "acceptance-faults")]
+        let copy_trace = settlement_capture::CopyGuard::start(settlement_capture::Leg::ToNative);
         #[cfg(not(test))]
-        let _ = std::io::copy(&mut std::io::stdin().lock(), &mut input_socket);
+        let _copied = std::io::copy(&mut std::io::stdin().lock(), &mut input_socket);
         #[cfg(test)]
-        let _ = client_proxy_trace::copy(
+        let _copied = client_proxy_trace::copy(
             &mut std::io::stdin().lock(),
             &mut input_socket,
             client_proxy_trace::Leg::StdinRead,
             client_proxy_trace::Leg::SocketWrite,
         );
-        match input_socket {
-            #[cfg(unix)]
-            Connection::Unix(stream) => {
-                let _ = stream.shutdown(Shutdown::Write);
-            }
-            Connection::Tcp(stream) => {
-                let _ = stream.shutdown(Shutdown::Write);
-            }
+        #[cfg(feature = "acceptance-faults")]
+        {
+            copy_trace.returned(&_copied);
+            drop(copy_trace);
         }
+        #[cfg(feature = "acceptance-faults")]
+        settlement_capture::proxy_record(
+            settlement_capture::Phase::InputHalfCloseEntered,
+            Default::default(),
+        );
+        let _half_closed = match input_socket {
+            #[cfg(unix)]
+            Connection::Unix(stream) => stream.shutdown(Shutdown::Write),
+            Connection::Tcp(stream) => stream.shutdown(Shutdown::Write),
+        };
+        #[cfg(feature = "acceptance-faults")]
+        settlement_capture::proxy_record(
+            settlement_capture::Phase::InputHalfCloseReturned,
+            settlement_capture::Facts {
+                io: Some(settlement_capture::IoClass::result(&_half_closed)),
+                ..Default::default()
+            },
+        );
     });
     let mut output = std::io::stdout().lock();
+    #[cfg(feature = "acceptance-faults")]
+    let copy_trace = settlement_capture::CopyGuard::start(settlement_capture::Leg::FromNative);
     #[cfg(not(test))]
     let copied = std::io::copy(&mut socket, &mut output);
     #[cfg(test)]
@@ -1209,10 +1261,27 @@ pub fn proxy_client_session(session: &str) -> Result<(), String> {
         client_proxy_trace::Leg::SocketRead,
         client_proxy_trace::Leg::StdoutWrite,
     );
+    #[cfg(feature = "acceptance-faults")]
+    {
+        copy_trace.returned(&copied);
+        drop(copy_trace);
+    }
     copied.map_err(|_| "Session transport closed".to_string())?;
-    output
-        .flush()
-        .map_err(|_| "Session output closed".to_string())
+    #[cfg(feature = "acceptance-faults")]
+    settlement_capture::proxy_record(
+        settlement_capture::Phase::OutputFlushEntered,
+        Default::default(),
+    );
+    let flushed = output.flush();
+    #[cfg(feature = "acceptance-faults")]
+    settlement_capture::proxy_record(
+        settlement_capture::Phase::OutputFlushReturned,
+        settlement_capture::Facts {
+            io: Some(settlement_capture::IoClass::result(&flushed)),
+            ..Default::default()
+        },
+    );
+    flushed.map_err(|_| "Session output closed".to_string())
 }
 
 /// Failure of a single request attempt, split by whether the daemon may have

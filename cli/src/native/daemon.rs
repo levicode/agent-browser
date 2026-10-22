@@ -659,6 +659,10 @@ async fn handle_connection<S>(
             }
             drop(existing);
             idle_activity.mark();
+            #[cfg(feature = "acceptance-faults")]
+            let teardown_proven =
+                super::client_transport::serve(buf_reader, writer, message, bytes.len() + 1).await;
+            #[cfg(not(feature = "acceptance-faults"))]
             let teardown_proven = super::client_transport::serve(buf_reader, writer, message).await;
             if !teardown_proven {
                 // Do not release the ownership guard while native cleanup is

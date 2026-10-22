@@ -409,3 +409,132 @@ let nested = wrapper(); for (let i = 0; i < 65; i++) nested = wrapper([nested]);
 button.childNodes = [nested]; assert.equal(buttonName(), null);
 document.defaultView.getComputedStyle = nameStyle;
 console.log('PASS: native button name proofs preserve inert/title/raw-space precedence and reject unsupported, secure, shadow, and oversized content');
+
+// Original public 11-href fixture, exercised through actual shared METADATA.
+// These are scalar inputs, not a second observation/DOM reader or a decoder.
+const hrefDocument = document;
+hrefDocument.baseURI = 'http://app.test/dashboard/';
+const projectPath = '/dashboard/e2e-dc3cf837/projects/404b2532-9fab-44dc-b3d0-f0a1b2c3d4e5/runs/7d0c3b52-2f7e-4c55-9a51-6f1e0c9b8a77';
+const publicHrefs = [
+  [projectPath, `http://app.test${projectPath}`],
+  ['https://user:pass@docs.example.test/guides/setup', 'https://docs.example.test/guides/setup'],
+  ['search?q=token&page=2', 'http://app.test/dashboard/search?…'],
+  ['settings#billing', 'http://app.test/dashboard/settings#…'],
+  ['mailto:team@example.test?subject=hi', 'mailto:team@example.test?…'],
+  ['tel:+48123456789', 'tel:+48123456789'],
+  [`data:text/csv,${'id,name%0A1,Ada%0A'.repeat(200)}`, 'data:…'],
+  ["javascript:void(document.body.dataset.clicked = 'yes')", 'javascript:…'],
+  ['blob:http://app.test/0b7c4c1e-8d9a-4f2e-9c1b-2a3d4e5f6a7b', 'blob:http://app.test/0b7c4c1e-8d9a-4f2e-9c1b-2a3d4e5f6a7b'],
+  ['blob:https://user:pass@files.example.test/0b7c4c1e?token=abc', 'blob:https://files.example.test/0b7c4c1e?…'],
+  ['blob:null/0b7c4c1e', 'blob:…'],
+];
+function hrefNode(value) {
+  const node = attributes(new Element(), { href: value }); node.localName = 'a'; return node;
+}
+function checkHref(raw, expected, forbidden = []) {
+  const node = hrefNode(raw);
+  const protectedMetadata = read.call(node, 'data-testid', '.secure', true);
+  assert.equal(protectedMetadata.attributes.href, expected);
+  assert.equal(read.call(node, 'data-testid', '.secure', false).attributes.href, raw);
+  for (const token of forbidden) assert.equal(JSON.stringify(protectedMetadata).includes(token), false);
+  return node;
+}
+for (const [raw, expected] of publicHrefs) checkHref(raw, expected);
+console.log('PASS: actual METADATA matches all 11 original protected href fixtures and preserves exact raw reads');
+
+// Full paths survive; credentials and nonempty query/fragment payloads do not.
+const longPath = `/${'404b2532-9fab-44dc-b3d0-f0a1b2c3d4e5/'.repeat(100)}end`;
+for (const [raw, expected, forbidden] of [
+  [`https://synthetic-user:synthetic-password@files.test${longPath}?synthetic-query#synthetic-fragment`, `https://files.test${longPath}?…#…`, ['synthetic-user', 'synthetic-password', 'synthetic-query', 'synthetic-fragment']],
+  ['blob:https://blob-user:blob-password@files.test/item?blob-query#blob-fragment', 'blob:https://files.test/item?…#…', ['blob-user', 'blob-password', 'blob-query', 'blob-fragment']],
+  ['mailto:team@example.test?mail-query#mail-fragment', 'mailto:team@example.test?…#…', ['mail-query', 'mail-fragment']],
+  ['tel:+48123456789?call-query#call-fragment', 'tel:+48123456789?…#…', ['call-query', 'call-fragment']],
+  ['blob:null/blob-payload?blob-query#blob-fragment', 'blob:…', ['blob-payload', 'blob-query', 'blob-fragment']],
+  ['blob:not-a-url-payload', 'blob:…', ['not-a-url-payload']],
+  ['blob:mailto:private@example.test', 'blob:…', ['private@example.test']],
+  ['data:text/plain,opaque-payload?opaque-query#opaque-fragment', 'data:…', ['opaque-payload', 'opaque-query', 'opaque-fragment']],
+  ['javascript:script-payload?script-query#script-fragment', 'javascript:…', ['script-payload', 'script-query', 'script-fragment']],
+  ['custom:opaque-payload', 'custom:…', ['opaque-payload']],
+  ['file:///private/path?file-query#file-fragment', 'file:…', ['private/path', 'file-query', 'file-fragment']],
+]) checkHref(raw, expected, forbidden);
+for (const [suffix, tail] of [['?', ''], ['#', ''], ['?#', ''], ['?q#', '?…'], ['?#f', '#…'], ['??##', '?…#…']]) {
+  checkHref(`https://files.test/path${suffix}`, `https://files.test/path${tail}`);
+  checkHref(`blob:https://files.test/path${suffix}`, `blob:https://files.test/path${tail}`);
+  // Deliberately retain the original malformed-target fallback, not a new policy.
+  checkHref(`http://[invalid${suffix}`, `http://[invalid${tail}`);
+}
+checkHref('http://[invalid?fallback-query#fallback-fragment', 'http://[invalid?…#…', ['fallback-query', 'fallback-fragment']);
+checkHref('https://files.test/a/../b/…?query#fragment', 'https://files.test/b/%E2%80%A6?…#…', ['query', 'fragment']);
+console.log('PASS: protected hrefs preserve full paths and exact empty-tail/invalid/opaque rules without payload leakage');
+
+// Resolution must use the receiver's live document base, not page location,
+// stale navigation state, a sibling frame, or the top document.
+const relativeNode = hrefNode('../target?base-query#base-fragment');
+for (const [base, expected] of [
+  ['https://one.test/a/b/', 'https://one.test/a/target?…#…'],
+  ['https://two.test/changed/', 'https://two.test/target?…#…'],
+]) {
+  hrefDocument.baseURI = base;
+  assert.equal(read.call(relativeNode, 'data-testid', '.secure', true).attributes.href, expected);
+  assert.equal(read.call(relativeNode, 'data-testid', '.secure', false).attributes.href, '../target?base-query#base-fragment');
+}
+checkHref('/root/path', 'https://two.test/root/path');
+checkHref('//network.test/path?private', 'https://network.test/path?…', ['private']);
+const originalOwner = Object.getOwnPropertyDescriptor(Node.prototype, 'ownerDocument');
+Object.defineProperty(Node.prototype, 'ownerDocument', { configurable: true, get() { return this.fixtureDocument || document; } });
+const frameDocument = { ...hrefDocument, baseURI: 'https://frame.test/frame/base/', URL: 'about:blank' };
+const frameLink = hrefNode('asset?frame-token'); frameLink.fixtureDocument = frameDocument;
+// A frame receiver in the wrong isolated document must still fail identity validation.
+assert.equal(read.call(frameLink, 'data-testid', '.secure', true).__nativeStatus, 'stale-reference');
+document = global.document = frameDocument;
+assert.equal(read.call(frameLink, 'data-testid', '.secure', true).attributes.href, 'https://frame.test/frame/base/asset?…');
+// about:blank/srcdoc can inherit an effective base without changing document URL.
+frameDocument.baseURI = 'https://inherited.test/parent/';
+assert.equal(read.call(frameLink, 'data-testid', '.secure', true).attributes.href, 'https://inherited.test/parent/asset?…');
+frameDocument.baseURI = 'about:blank';
+assert.equal(read.call(frameLink, 'data-testid', '.secure', true).attributes.href, 'asset?…');
+Object.defineProperty(frameDocument, 'baseURI', { get() { throw Error('Direct read must not resolve href'); } });
+assert.equal(read.call(frameLink, 'data-testid', '.secure', false).attributes.href, 'asset?frame-token');
+document = global.document = hrefDocument;
+Object.defineProperty(Node.prototype, 'ownerDocument', originalOwner);
+hrefDocument.baseURI = 'http://app.test/dashboard/';
+console.log('PASS: live base changes, frame isolation, inherited bases, and raw-read nonresolution remain distinct');
+
+const secureLink = hrefNode('https://secure-user:secure-password@files.test/path?secure-query#secure-fragment');
+secureLink.secure = true; secureLink.value = 'secure-value';
+attributes(secureLink, { href: secureLink.getAttribute('href'), value: 'secure-value' });
+const secureHref = read.call(secureLink, 'data-testid', '.secure', true);
+assert.equal(secureHref.attributes.href, 'https://files.test/path?…#…');
+assert.equal(secureHref.states.secure, true);
+assert.equal(secureHref.value, null);
+assert.equal(secureHref.attributes.value, undefined);
+for (const token of ['secure-user', 'secure-password', 'secure-query', 'secure-fragment', 'secure-value']) {
+  assert.equal(JSON.stringify(secureHref).includes(token), false);
+}
+const secureRaw = read.call(secureLink, 'data-testid', '.secure', false);
+assert.equal(secureRaw.attributes.href, secureLink.getAttribute('href'));
+assert.equal(secureRaw.value, null);
+assert.equal(secureRaw.attributes.value, undefined);
+assert.equal(read.call(new Element(), 'data-testid', '.secure', true).attributes.href, undefined);
+console.log('PASS: href reduction preserves secure-value exclusion and absence without changing direct attribute access');
+
+// Option listing is an observation graph exception, never a raw metadata or
+// locator visibility rewrite, even when the exact option has a hidden owner.
+const hiddenSelect = new Element(); hiddenSelect.localName = 'select';
+hiddenSelect.getBoundingClientRect = () => ({ x: 0, y: 0, width: 0, height: 0 });
+const directOption = new OptionControl(true); directOption.parentElement = hiddenSelect;
+directOption.checkVisibility = () => false;
+directOption.matches = selector => selector === 'option';
+for (const bounded of [false, true]) {
+  const optionFacts = read.call(directOption, 'data-testid', '.secure', bounded);
+  assert.equal(optionFacts.states.hidden, true);
+  assert.equal(optionFacts.author.visible, false);
+  assert.equal(optionFacts.value, 'Poland');
+  assert.equal(optionFacts.controlStates.selected, true);
+}
+assert.equal(read.call(hiddenSelect, 'data-testid', '.secure', false).states.hidden, true);
+const rawOptionFacts = read.call(directOption, 'data-testid', '.secure', false);
+const queryOptionFacts = [{ ...rawOptionFacts, role: 'option', name: 'Poland' }];
+assert.deepEqual(matchQuery({ kind: 'selector', selector: 'option' }, queryOptionFacts, [[]], [null], '.secure', [false], directOption).indices, [0]);
+assert.deepEqual(matchQuery({ kind: 'query', query: { kind: 'role', value: { kind: 'string', value: 'option', exact: true } } }, queryOptionFacts, [[]], [null], '.secure', [false], directOption).indices, []);
+console.log('PASS: hidden select/option exact metadata, raw value, and selector-versus-role query contracts stay unchanged');

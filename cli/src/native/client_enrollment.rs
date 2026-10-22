@@ -803,6 +803,141 @@ impl ClientEnrollment {
             );
         }
     }
+    // This extra read is test-only evidence after capture has already refused.
+    // Never reconcile/adopt inventory, renew the operation, or drain events here.
+    #[cfg(test)]
+    async fn diagnose_missing_capture_target(
+        &self,
+        entries: &[Attribution],
+        infos: &[Value],
+        watermark: &BoundedEventWatermark,
+        op: &OperationLease,
+    ) -> Option<CaptureMissingTargetDiagnostic> {
+        let missing = entries.iter().filter(|entry| {
+            !infos.iter().any(|info| {
+                info.get("targetId").and_then(Value::as_str) == Some(entry.target.as_str())
+                    && info.get("browserContextId").and_then(Value::as_str)
+                        == Some(self.targets.context_id.as_str())
+            })
+        });
+        let missing_count = missing.clone().count();
+        // Stable selection of one already-retained pair, not arbitrary discovery.
+        let entry = missing.min_by(|left, right| {
+            (&left.target, &left.session).cmp(&(&right.target, &right.session))
+        })?;
+        let (target, session, dropped, ids_exhausted) = {
+            let mut trace = match self.capture_lifecycle.lock() {
+                Ok(trace) => trace,
+                Err(poisoned) => {
+                    let mut trace = poisoned.into_inner();
+                    trace.dropped = trace.dropped.saturating_add(1);
+                    trace
+                }
+            };
+            // Reuse lifecycle ordinals only; missing evidence is not an identity.
+            let target = trace.targets.get(&entry.target).copied();
+            let session = trace.sessions.get(&entry.session).copied();
+            if target.is_none() || session.is_none() {
+                trace.dropped = trace.dropped.saturating_add(1);
+            }
+            (target, session, trace.dropped, trace.ids_exhausted)
+        };
+        let before = self.capture_lookup_snapshot(entry, watermark);
+        let lookup = if *op.cancellation.borrow() != CancelSignal::None {
+            CaptureTargetLookup::Cancelled
+        } else if Instant::now() >= op.deadline {
+            CaptureTargetLookup::Deadline
+        } else if op.generation != self.generation
+            || before.sealed
+            || before.coordinator_failed != Some(false)
+        {
+            CaptureTargetLookup::SkippedCoordinatorUnavailable
+        } else if before.binding != Some(CaptureRegistryBinding::MatchingIdsTenureUnknown) {
+            CaptureTargetLookup::SkippedBindingUnavailable
+        } else {
+            // Preserve the existing command/lease path. BrowserFailure combines
+            // backend refusal and transport failure; do not parse arbitrary text
+            // into a stronger claim that the target no longer exists.
+            match self
+                .command(
+                    op,
+                    None,
+                    "Target.getTargetInfo",
+                    json!({"targetId":entry.target}),
+                )
+                .await
+            {
+                Ok(value) => capture_target_lookup(&value, entry, &self.targets.context_id),
+                Err(ProtocolError::Cancelled) => CaptureTargetLookup::Cancelled,
+                Err(ProtocolError::DeadlineExceeded) => CaptureTargetLookup::Deadline,
+                Err(_) => CaptureTargetLookup::CommandFailure,
+            }
+        };
+        let after = self.capture_lookup_snapshot(entry, watermark);
+        Some(CaptureMissingTargetDiagnostic {
+            target,
+            session,
+            missing_count,
+            truncated: missing_count > 1,
+            dropped,
+            ids_exhausted,
+            lookup,
+            before,
+            after,
+        })
+    }
+    #[cfg(test)]
+    fn capture_lookup_snapshot(
+        &self,
+        entry: &Attribution,
+        watermark: &BoundedEventWatermark,
+    ) -> CaptureLookupSnapshot {
+        let index = self.index.lock().ok();
+        let received = watermark.received().ok();
+        let applied = index.as_ref().map(|index| index.applied_watermark);
+        CaptureLookupSnapshot {
+            received,
+            applied,
+            event_state: match (received, applied) {
+                (Some(received), Some(applied)) if received > applied => {
+                    CaptureLookupEventState::ReceivedPending
+                }
+                (Some(_), Some(_)) => CaptureLookupEventState::NoReceivedPendingUnreceivedUnknown,
+                _ => CaptureLookupEventState::Unavailable,
+            },
+            application_epoch: index.as_ref().map(|index| index.application_epoch),
+            binding: index
+                .as_ref()
+                .map(|index| capture_registry_binding(entry, index)),
+            pending_enrollment: index
+                .as_ref()
+                .map(|index| !index.pending_enrollment.is_empty()),
+            retirement_pending: index
+                .as_ref()
+                .map(|index| !index.retiring_pages.is_empty() || index.borrowed_restart.is_some()),
+            retired_binding: index.as_ref().map(|index| {
+                index.retired_page_sessions.contains(&entry.session)
+                    || index.retired_observer_sessions.contains(&entry.session)
+                    || index.retired_observer_targets.contains(&entry.target)
+                    || index.borrowed_retired_targets.contains(&entry.target)
+            }),
+            reconciled: index.as_ref().map(|index| index.reconciled),
+            coordinator_failed: index.as_ref().map(|index| index.failure.is_some()),
+            sealed: self.sealed.load(Ordering::Acquire),
+        }
+    }
+    #[cfg(test)]
+    fn print_missing_capture_target(&self, diagnostic: CaptureMissingTargetDiagnostic) {
+        let mut trace = match self.capture_lifecycle.lock() {
+            Ok(trace) => trace,
+            Err(poisoned) => {
+                let mut trace = poisoned.into_inner();
+                trace.dropped = trace.dropped.saturating_add(1);
+                trace
+            }
+        };
+        trace.record_missing_lookup(diagnostic, &mut std::io::stderr().lock());
+    }
     /// Capture before registry retirement. Repeated checks use the original
     /// immutable binding, never a replacement target or current gate epoch.
     pub(crate) fn terminal_connection_proof(&self) -> Result<NativeTerminalProof, ProtocolError> {
@@ -1145,6 +1280,13 @@ impl ClientEnrollment {
             );
             #[cfg(test)]
             self.print_capture_lifecycle(&entries, infos);
+            #[cfg(test)]
+            if let Some(diagnostic) = self
+                .diagnose_missing_capture_target(&entries, infos, &watermark, op)
+                .await
+            {
+                self.print_missing_capture_target(diagnostic);
+            }
             return Err(ProtocolError::StaleScope);
         }
         let mut frames = Vec::new();
@@ -4096,6 +4238,135 @@ enum CaptureRegistryBinding {
     MatchingIdsTenureUnknown,
 }
 #[cfg(test)]
+fn capture_registry_binding(entry: &Attribution, index: &Index) -> CaptureRegistryBinding {
+    match index.sessions.get(&entry.session) {
+        None => CaptureRegistryBinding::Absent,
+        Some(current)
+            if entry.target == current.target
+                && entry.session == current.session
+                && entry.root == current.root
+                && entry.parent == current.parent
+                && entry.kind == current.kind =>
+        {
+            CaptureRegistryBinding::MatchingIdsTenureUnknown
+        }
+        Some(_) => CaptureRegistryBinding::ConflictingIds,
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureInitialToolbarShape {
+    InitialToolbarShape,
+    Other,
+    Missing,
+    Invalid,
+}
+#[cfg(test)]
+impl CaptureInitialToolbarShape {
+    fn from_value(value: Option<&Value>) -> Self {
+        let Some(value) = value else {
+            return Self::Missing;
+        };
+        let Some(value) = value.as_str() else {
+            return Self::Invalid;
+        };
+        if value.len() > 65536 || value.chars().any(char::is_control) {
+            return Self::Invalid;
+        }
+        let Ok(url) = url::Url::parse(value) else {
+            return Self::Invalid;
+        };
+        // Chromium 156.0.8078.47 waap::IsForInitialWebUI also requires effective
+        // InitialWebUI and WebUIReloadButton flags. Shape is not that predicate,
+        // not proof of the GetTargets exclusion branch, and never authority.
+        if url.scheme() == "chrome"
+            && url
+                .host_str()
+                .is_some_and(|host| host.eq_ignore_ascii_case("webui-toolbar.top-chrome"))
+        {
+            Self::InitialToolbarShape
+        } else {
+            Self::Other
+        }
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CaptureTargetLookup {
+    Found {
+        target_matches: bool,
+        context_matches: bool,
+        kind_matches: bool,
+        native_type: CaptureStructuralTargetType,
+        url_shape: CaptureInitialToolbarShape,
+    },
+    CommandFailure,
+    InvalidShape,
+    Cancelled,
+    Deadline,
+    SkippedBindingUnavailable,
+    SkippedCoordinatorUnavailable,
+}
+#[cfg(test)]
+fn capture_target_lookup(value: &Value, entry: &Attribution, context: &str) -> CaptureTargetLookup {
+    let Some(info) = value.get("targetInfo").filter(|info| info.is_object()) else {
+        return CaptureTargetLookup::InvalidShape;
+    };
+    let (Ok(target), Ok(returned_context), Ok(kind)) = (
+        field(info, "targetId"),
+        field(info, "browserContextId"),
+        field(info, "type"),
+    ) else {
+        return CaptureTargetLookup::InvalidShape;
+    };
+    let native_type = CaptureStructuralTargetType::from_str(kind);
+    if !matches!(native_type, CaptureStructuralTargetType::Token(_)) {
+        return CaptureTargetLookup::InvalidShape;
+    }
+    CaptureTargetLookup::Found {
+        target_matches: target == entry.target,
+        context_matches: returned_context == context,
+        kind_matches: kind == entry.kind,
+        native_type,
+        url_shape: CaptureInitialToolbarShape::from_value(info.get("url")),
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureLookupEventState {
+    ReceivedPending,
+    NoReceivedPendingUnreceivedUnknown,
+    Unavailable,
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureLookupSnapshot {
+    application_epoch: Option<u64>,
+    received: Option<u64>,
+    applied: Option<u64>,
+    event_state: CaptureLookupEventState,
+    binding: Option<CaptureRegistryBinding>,
+    pending_enrollment: Option<bool>,
+    retirement_pending: Option<bool>,
+    retired_binding: Option<bool>,
+    reconciled: Option<bool>,
+    coordinator_failed: Option<bool>,
+    sealed: bool,
+}
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CaptureMissingTargetDiagnostic {
+    target: Option<u16>,
+    session: Option<u16>,
+    missing_count: usize,
+    truncated: bool,
+    dropped: usize,
+    ids_exhausted: bool,
+    lookup: CaptureTargetLookup,
+    before: CaptureLookupSnapshot,
+    after: CaptureLookupSnapshot,
+}
+#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct CaptureLifecycleRow {
     order: u64,
@@ -4124,6 +4395,7 @@ struct CaptureLifecycleTrace {
     targets: HashMap<String, u16>,
     sessions: HashMap<String, u16>,
     rows: std::collections::VecDeque<CaptureLifecycleRow>,
+    missing_lookup: Option<CaptureMissingTargetDiagnostic>,
 }
 #[cfg(test)]
 impl Default for CaptureLifecycleTrace {
@@ -4136,11 +4408,29 @@ impl Default for CaptureLifecycleTrace {
             targets: HashMap::new(),
             sessions: HashMap::new(),
             rows: std::collections::VecDeque::new(),
+            missing_lookup: None,
         }
     }
 }
 #[cfg(test)]
 impl CaptureLifecycleTrace {
+    fn record_missing_lookup(
+        &mut self,
+        mut diagnostic: CaptureMissingTargetDiagnostic,
+        output: &mut impl std::io::Write,
+    ) {
+        if self.missing_lookup.is_some() {
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        diagnostic.dropped = self.dropped;
+        diagnostic.ids_exhausted = self.ids_exhausted;
+        // Unlike eprintln!, a failed diagnostic write cannot replace StaleScope.
+        if writeln!(output, "state.capture missing_target_lookup={diagnostic:?}").is_err() {
+            self.dropped = self.dropped.saturating_add(1);
+            diagnostic.dropped = self.dropped;
+        }
+        self.missing_lookup = Some(diagnostic);
+    }
     fn token(
         map: &mut HashMap<String, u16>,
         value: Option<&str>,
@@ -4186,24 +4476,9 @@ impl CaptureLifecycleTrace {
             registered_type: entry.map_or(CaptureStructuralTargetType::Missing, |entry| {
                 CaptureStructuralTargetType::from_str(&entry.kind)
             }),
-            registry_binding: match entry.and_then(|entry| {
-                index
-                    .sessions
-                    .get(&entry.session)
-                    .map(|current| (entry, current))
-            }) {
-                None => CaptureRegistryBinding::Absent,
-                Some((entry, current))
-                    if entry.target == current.target
-                        && entry.session == current.session
-                        && entry.root == current.root
-                        && entry.parent == current.parent
-                        && entry.kind == current.kind =>
-                {
-                    CaptureRegistryBinding::MatchingIdsTenureUnknown
-                }
-                Some(_) => CaptureRegistryBinding::ConflictingIds,
-            },
+            registry_binding: entry.map_or(CaptureRegistryBinding::Absent, |entry| {
+                capture_registry_binding(entry, index)
+            }),
             application: entry.is_some_and(|entry| entry.application),
             observation_only: entry.is_some_and(|entry| entry.observation_only),
             resumed: entry.is_some_and(|entry| entry.resumed),
@@ -4501,6 +4776,9 @@ mod tests {
                         recorded.lock().unwrap().push(request.clone());
                         let method=request["method"].as_str().unwrap();
                         if method=="Target.getTargets" { inventory_reads += 1; }
+                        // Test-controlled ACK: tests can apply exact lifecycle
+                        // events, cancellation, or a deadline before the reply.
+                        if mode=="attestation-diagnostic-held" && method=="Target.getTargetInfo" { continue; }
                         if matches!(mode,"observer-close"|"observer-unknown-error"|"observer-detached-live") && method=="Page.enable" && request["sessionId"]=="observer" {
                             if mode!="observer-unknown-error" { socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"observer","targetId":"other-host"}}).to_string())).await.unwrap(); }
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"target closed"}}).to_string())).await.unwrap();continue;
@@ -5563,6 +5841,567 @@ mod tests {
             server.abort();
         }
     }
+    async fn enroll_capture_browser_ui(
+        owner: &Arc<ClientEnrollment>,
+        emit: &tokio::sync::mpsc::Sender<Value>,
+    ) {
+        owner
+            .enroll_existing("target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        realm_emit(owner, emit, json!({"method":"Target.attachedToTarget", "params":{
+            "sessionId":"browser-ui-session", "waitingForDebugger":true,
+            "targetInfo":{"targetId":"browser-ui-target", "type":"browser_ui", "browserContextId":"owned-context"}
+        }})).await;
+        let entry = owner.index.lock().unwrap().sessions["browser-ui-session"].clone();
+        assert!(entry.application && entry.resumed);
+        assert_eq!(entry.kind, "browser_ui");
+    }
+    async fn wait_capture_lookup(log: &Log, count: usize) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let requests = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == "Target.getTargetInfo")
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if requests.len() >= count {
+                    return requests[count - 1].clone();
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+    fn capture_lookup_reply() -> Value {
+        json!({"targetInfo":{
+            "targetId":"browser-ui-target", "type":"browser_ui", "browserContextId":"owned-context",
+            "url":"chrome://webui-toolbar.top-chrome/?private-url-marker",
+            "title":"private-title-marker"
+        }})
+    }
+    fn last_capture_lookup(owner: &ClientEnrollment) -> CaptureMissingTargetDiagnostic {
+        owner
+            .capture_lifecycle
+            .lock()
+            .unwrap()
+            .missing_lookup
+            .clone()
+            .unwrap()
+    }
+    fn assert_capture_lookup_private(diagnostic: &CaptureMissingTargetDiagnostic) {
+        let printed = format!("{diagnostic:?}");
+        for secret in [
+            "browser-ui-target",
+            "browser-ui-session",
+            "owned-context",
+            "foreign-context",
+            "wrong-target",
+            "chrome://",
+            "https://",
+            "webui-toolbar.top-chrome",
+            "private-",
+        ] {
+            assert!(
+                !printed.contains(secret),
+                "diagnostic leaked a private field"
+            );
+        }
+        assert!(
+            printed.len() < 2048,
+            "diagnostic is not fixed-shape bounded output"
+        );
+    }
+    #[test]
+    fn capture_missing_lookup_shape_is_not_a_kind_exemption_or_feature_flag_claim() {
+        assert_eq!(
+            CaptureInitialToolbarShape::from_value(None),
+            CaptureInitialToolbarShape::Missing
+        );
+        for value in [
+            json!(null),
+            json!(false),
+            json!({}),
+            json!("not a URL"),
+            json!("chrome://webui-toolbar.top-chrome/\nprivate-marker"),
+            json!("a".repeat(65537)),
+        ] {
+            assert_eq!(
+                CaptureInitialToolbarShape::from_value(Some(&value)),
+                CaptureInitialToolbarShape::Invalid
+            );
+        }
+        for value in [
+            "chrome://webui-toolbar.top-chrome/",
+            "chrome://webui-toolbar.top-chrome/?private-marker",
+        ] {
+            assert_eq!(
+                CaptureInitialToolbarShape::from_value(Some(&json!(value))),
+                CaptureInitialToolbarShape::InitialToolbarShape
+            );
+        }
+        for value in [
+            "https://webui-toolbar.top-chrome/",
+            "chrome://webui-toolbar.top-chrome.evil.invalid/",
+            "chrome://other/",
+        ] {
+            assert_eq!(
+                CaptureInitialToolbarShape::from_value(Some(&json!(value))),
+                CaptureInitialToolbarShape::Other
+            );
+        }
+    }
+    #[tokio::test]
+    async fn capture_missing_lookup_is_one_exact_read_and_never_releases_refusal() {
+        for case in [
+            "initial-toolbar",
+            "ordinary-url",
+            "missing-url",
+            "invalid-url",
+            "absent",
+            "malformed",
+            "null-info",
+            "missing-context",
+            "invalid-type",
+            "wrong-target",
+            "foreign-context",
+            "different-type",
+        ] {
+            let (owner, _notices, log, emit, server) = fixture("attestation-diagnostic-held").await;
+            enroll_capture_browser_ui(&owner, &emit).await;
+            let revision = owner.targets.inventory().unwrap().0;
+            let epoch = owner.index.lock().unwrap().application_epoch;
+            let before = log.lock().unwrap().len();
+            let task_owner = owner.clone();
+            let task = tokio::spawn(async move {
+                task_owner
+                    .attest_capture(&task_owner.operation())
+                    .await
+                    .map(|_| ())
+            });
+            let request = wait_capture_lookup(&log, 1).await;
+            assert_eq!(request["params"], json!({"targetId":"browser-ui-target"}));
+            assert!(request.get("sessionId").is_none());
+            let mut result = capture_lookup_reply();
+            let expected = match case {
+                "absent" => CaptureTargetLookup::CommandFailure,
+                "malformed" => {
+                    result = json!({"private-error-marker":true});
+                    CaptureTargetLookup::InvalidShape
+                }
+                "null-info" => {
+                    result["targetInfo"] = Value::Null;
+                    CaptureTargetLookup::InvalidShape
+                }
+                "missing-context" => {
+                    result["targetInfo"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("browserContextId");
+                    CaptureTargetLookup::InvalidShape
+                }
+                "invalid-type" => {
+                    result["targetInfo"]["type"] = json!("private-type-marker/invalid");
+                    CaptureTargetLookup::InvalidShape
+                }
+                _ => {
+                    let mut target_matches = true;
+                    let mut context_matches = true;
+                    let mut kind_matches = true;
+                    let mut kind = "browser_ui";
+                    let url_shape = match case {
+                        "ordinary-url" => {
+                            result["targetInfo"]["url"] =
+                                json!("https://private-url-marker.invalid/secret");
+                            CaptureInitialToolbarShape::Other
+                        }
+                        "missing-url" => {
+                            result["targetInfo"].as_object_mut().unwrap().remove("url");
+                            CaptureInitialToolbarShape::Missing
+                        }
+                        "invalid-url" => {
+                            result["targetInfo"]["url"] = json!({"private-url-marker":true});
+                            CaptureInitialToolbarShape::Invalid
+                        }
+                        _ => CaptureInitialToolbarShape::InitialToolbarShape,
+                    };
+                    match case {
+                        "wrong-target" => {
+                            result["targetInfo"]["targetId"] = json!("wrong-target");
+                            target_matches = false;
+                        }
+                        "foreign-context" => {
+                            result["targetInfo"]["browserContextId"] = json!("foreign-context");
+                            context_matches = false;
+                        }
+                        "different-type" => {
+                            result["targetInfo"]["type"] = json!("worker");
+                            kind_matches = false;
+                            kind = "worker";
+                        }
+                        _ => {}
+                    }
+                    CaptureTargetLookup::Found {
+                        target_matches,
+                        context_matches,
+                        kind_matches,
+                        native_type: CaptureStructuralTargetType::Token(kind.into()),
+                        url_shape,
+                    }
+                }
+            };
+            let response = if case == "absent" {
+                json!({"id":request["id"], "error":{"code":-32000,"message":"private-error-marker target not found https://private-url-marker.invalid"}})
+            } else {
+                json!({"id":request["id"], "result":result})
+            };
+            emit.send(response).await.unwrap();
+            assert_eq!(
+                task.await.unwrap(),
+                Err(ProtocolError::StaleScope),
+                "{case}"
+            );
+            let diagnostic = last_capture_lookup(&owner);
+            assert_eq!(diagnostic.lookup, expected, "{case}");
+            assert_eq!(diagnostic.missing_count, 1);
+            assert!(!diagnostic.truncated);
+            assert_eq!(diagnostic.before, diagnostic.after);
+            assert_eq!(
+                diagnostic.after.binding,
+                Some(CaptureRegistryBinding::MatchingIdsTenureUnknown)
+            );
+            assert_eq!(
+                diagnostic.after.event_state,
+                CaptureLookupEventState::NoReceivedPendingUnreceivedUnknown
+            );
+            assert_capture_lookup_private(&diagnostic);
+            {
+                let trace = owner.capture_lifecycle.lock().unwrap();
+                assert_eq!(
+                    diagnostic.target,
+                    trace.targets.get("browser-ui-target").copied()
+                );
+                assert_eq!(
+                    diagnostic.session,
+                    trace.sessions.get("browser-ui-session").copied()
+                );
+            }
+            assert_eq!(owner.targets.inventory().unwrap().0, revision);
+            assert_eq!(owner.targets.inventory().unwrap().1.len(), 2);
+            assert_eq!(owner.index.lock().unwrap().application_epoch, epoch);
+            assert_eq!(owner.index.lock().unwrap().sessions.len(), 2);
+            {
+                let log = log.lock().unwrap();
+                assert_eq!(
+                    log[before..]
+                        .iter()
+                        .map(|request| request["method"].as_str().unwrap())
+                        .collect::<Vec<_>>(),
+                    vec!["Target.getTargets", "Target.getTargetInfo"]
+                );
+                assert_eq!(log[before]["params"], json!({"filter":[{}]}));
+                assert!(!log
+                    .iter()
+                    .any(|request| request["method"] == "Target.setDiscoverTargets"));
+            }
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn capture_missing_lookup_preserves_detach_reregistration_and_replacement_uncertainty() {
+        for case in ["detach", "same-ids", "replacement-session"] {
+            let (owner, _notices, log, emit, server) = fixture("attestation-diagnostic-held").await;
+            enroll_capture_browser_ui(&owner, &emit).await;
+            let task_owner = owner.clone();
+            let task = tokio::spawn(async move {
+                task_owner
+                    .attest_capture(&task_owner.operation())
+                    .await
+                    .map(|_| ())
+            });
+            let request = wait_capture_lookup(&log, 1).await;
+            realm_emit(
+                &owner,
+                &emit,
+                json!({"method":"Target.detachedFromTarget", "params":{
+                    "sessionId":"browser-ui-session", "targetId":"browser-ui-target"
+                }}),
+            )
+            .await;
+            if case != "detach" {
+                realm_emit(&owner, &emit, json!({"method":"Target.attachedToTarget", "params":{
+                    "sessionId":if case == "same-ids" {"browser-ui-session"} else {"replacement-session"},
+                    "waitingForDebugger":true,
+                    "targetInfo":{"targetId":"browser-ui-target", "type":"browser_ui", "browserContextId":"owned-context"}
+                }})).await;
+            }
+            emit.send(json!({"id":request["id"], "result":capture_lookup_reply()}))
+                .await
+                .unwrap();
+            assert_eq!(task.await.unwrap(), Err(ProtocolError::StaleScope));
+            let diagnostic = last_capture_lookup(&owner);
+            assert_eq!(
+                diagnostic.before.binding,
+                Some(CaptureRegistryBinding::MatchingIdsTenureUnknown)
+            );
+            assert_eq!(
+                diagnostic.after.binding,
+                Some(if case == "same-ids" {
+                    CaptureRegistryBinding::MatchingIdsTenureUnknown
+                } else {
+                    CaptureRegistryBinding::Absent
+                })
+            );
+            assert!(diagnostic.after.application_epoch > diagnostic.before.application_epoch);
+            assert!(diagnostic.after.received > diagnostic.before.received);
+            assert!(matches!(
+                diagnostic.lookup,
+                CaptureTargetLookup::Found {
+                    target_matches: true,
+                    context_matches: true,
+                    kind_matches: true,
+                    ..
+                }
+            ));
+            assert_capture_lookup_private(&diagnostic);
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == "Target.getTargetInfo")
+                    .count(),
+                1
+            );
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn capture_missing_lookup_reports_pending_events_and_retirement_without_draining() {
+        let (owner, _notices, log, emit, server) = fixture("attestation-diagnostic-held").await;
+        enroll_capture_browser_ui(&owner, &emit).await;
+        let task_owner = owner.clone();
+        let task = tokio::spawn(async move {
+            task_owner
+                .attest_capture(&task_owner.operation())
+                .await
+                .map(|_| ())
+        });
+        let request = wait_capture_lookup(&log, 1).await;
+        realm_emit(&owner, &emit, json!({"method":"Target.targetInfoChanged", "params":{"targetInfo":{
+            "targetId":"browser-ui-target", "type":"browser_ui", "browserContextId":"owned-context"
+        }}})).await;
+        // Model the already-received but unapplied boundary deterministically,
+        // using the existing coordinator counter (no second subscriber). Real
+        // TCP lifecycle delivery above establishes the received watermark.
+        let applied = {
+            let mut index = owner.index.lock().unwrap();
+            let applied = index.applied_watermark;
+            assert!(applied > 0);
+            index.applied_watermark -= 1;
+            index
+                .pending_enrollment
+                .insert("private-pending-session".into());
+            index
+                .retiring_pages
+                .insert("browser-ui-target".into(), "browser-ui-session".into());
+            applied
+        };
+        emit.send(json!({"id":request["id"], "result":capture_lookup_reply()}))
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap(),
+            Err(ProtocolError::StaleScope)
+        );
+        let diagnostic = last_capture_lookup(&owner);
+        assert_eq!(
+            diagnostic.before.event_state,
+            CaptureLookupEventState::NoReceivedPendingUnreceivedUnknown
+        );
+        assert_eq!(
+            diagnostic.after.event_state,
+            CaptureLookupEventState::ReceivedPending
+        );
+        assert_eq!(diagnostic.after.pending_enrollment, Some(true));
+        assert_eq!(diagnostic.after.retirement_pending, Some(true));
+        assert_eq!(owner.index.lock().unwrap().applied_watermark, applied - 1);
+        assert_capture_lookup_private(&diagnostic);
+        {
+            let mut index = owner.index.lock().unwrap();
+            index.applied_watermark = applied;
+            index.pending_enrollment.clear();
+            index.retiring_pages.clear();
+        }
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn capture_missing_lookup_pre_refused_leases_and_absent_binding_send_nothing() {
+        let (owner, _notices, log, emit, server) = fixture("attestation-diagnostic-held").await;
+        enroll_capture_browser_ui(&owner, &emit).await;
+        let entries = vec![owner.index.lock().unwrap().sessions["browser-ui-session"].clone()];
+        let watermark = owner.realm_watermark().unwrap();
+        for case in ["cancelled", "deadline", "generation", "absent-binding"] {
+            let (cancel, cancellation) = watch::channel(CancelSignal::None);
+            let mut op = owner.operation();
+            op.cancellation = cancellation;
+            let expected = match case {
+                "cancelled" => {
+                    cancel.send_replace(CancelSignal::Requested);
+                    CaptureTargetLookup::Cancelled
+                }
+                "deadline" => {
+                    op.deadline = Instant::now();
+                    CaptureTargetLookup::Deadline
+                }
+                "generation" => {
+                    op.generation += 1;
+                    CaptureTargetLookup::SkippedCoordinatorUnavailable
+                }
+                _ => {
+                    realm_emit(
+                        &owner,
+                        &emit,
+                        json!({"method":"Target.detachedFromTarget", "params":{
+                            "sessionId":"browser-ui-session", "targetId":"browser-ui-target"
+                        }}),
+                    )
+                    .await;
+                    CaptureTargetLookup::SkippedBindingUnavailable
+                }
+            };
+            // Exercise only the diagnostic seam after a missing-target decision;
+            // ordinary attestation may refuse an expired lease even earlier.
+            let diagnostic = owner
+                .diagnose_missing_capture_target(&entries, &[], &watermark, &op)
+                .await
+                .unwrap();
+            assert_eq!(diagnostic.lookup, expected);
+            assert_capture_lookup_private(&diagnostic);
+        }
+        assert!(!log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "Target.getTargetInfo"));
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
+    async fn capture_missing_lookup_inflight_cancel_and_deadline_keep_original_stale_scope() {
+        for cancel_during in [true, false] {
+            let (owner, _notices, log, emit, server) = fixture("attestation-diagnostic-held").await;
+            enroll_capture_browser_ui(&owner, &emit).await;
+            let (cancel, cancellation) = watch::channel(CancelSignal::None);
+            let mut op = owner.operation();
+            op.cancellation = cancellation;
+            op.deadline = Instant::now() + Duration::from_secs(3);
+            let deadline = op.deadline;
+            let task_owner = owner.clone();
+            let task =
+                tokio::spawn(async move { task_owner.attest_capture(&op).await.map(|_| ()) });
+            wait_capture_lookup(&log, 1).await;
+            if cancel_during {
+                cancel.send_replace(CancelSignal::Requested);
+            }
+            // The server withholds ACK. Completion must use the original lease,
+            // not a retry, fresh initialization operation, or renewed budget.
+            assert_eq!(
+                tokio::time::timeout_at((deadline + Duration::from_secs(1)).into(), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(ProtocolError::StaleScope)
+            );
+            let diagnostic = last_capture_lookup(&owner);
+            assert_eq!(
+                diagnostic.lookup,
+                if cancel_during {
+                    CaptureTargetLookup::Cancelled
+                } else {
+                    CaptureTargetLookup::Deadline
+                }
+            );
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["method"] == "Target.getTargetInfo")
+                    .count(),
+                1
+            );
+            assert_capture_lookup_private(&diagnostic);
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn capture_missing_lookup_caps_multiple_missing_entries_and_reuses_ordinals() {
+        let (owner, _notices, log, emit, server) = fixture("attestation-diagnostic-held").await;
+        enroll_capture_browser_ui(&owner, &emit).await;
+        realm_emit(&owner, &emit, json!({"method":"Target.attachedToTarget", "params":{
+            "sessionId":"second-session", "waitingForDebugger":true,
+            "targetInfo":{"targetId":"second-target", "type":"browser_ui", "browserContextId":"owned-context"}
+        }})).await;
+        let revision = owner.targets.inventory().unwrap().0;
+        let task_owner = owner.clone();
+        let task = tokio::spawn(async move {
+            task_owner
+                .attest_capture(&task_owner.operation())
+                .await
+                .map(|_| ())
+        });
+        let request = wait_capture_lookup(&log, 1).await;
+        assert_eq!(request["params"], json!({"targetId":"browser-ui-target"}));
+        emit.send(json!({"id":request["id"], "result":capture_lookup_reply()}))
+            .await
+            .unwrap();
+        assert_eq!(task.await.unwrap(), Err(ProtocolError::StaleScope));
+        let diagnostic = last_capture_lookup(&owner);
+        assert_eq!(diagnostic.missing_count, 2);
+        assert!(diagnostic.truncated);
+        struct FailedWriter;
+        impl std::io::Write for FailedWriter {
+            fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::other("private-write-error-marker"))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut trace = CaptureLifecycleTrace::default();
+        trace.record_missing_lookup(diagnostic.clone(), &mut FailedWriter);
+        assert_eq!(trace.dropped, 1);
+        assert_eq!(trace.missing_lookup.as_ref().unwrap().dropped, 1);
+        let mut output = Vec::new();
+        trace.record_missing_lookup(diagnostic.clone(), &mut output);
+        assert_eq!(trace.dropped, 2);
+        assert!(String::from_utf8(output).unwrap().contains("dropped: 2"));
+        assert_capture_lookup_private(trace.missing_lookup.as_ref().unwrap());
+        assert_eq!(owner.targets.inventory().unwrap().0, revision);
+        assert_eq!(owner.targets.inventory().unwrap().1.len(), 3);
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Target.getTargetInfo")
+                .count(),
+            1
+        );
+        assert_capture_lookup_private(&diagnostic);
+        owner.close().await.unwrap();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn capture_lifecycle_trace_correlates_native_type_and_exact_registry_tenure() {
         let (owner, _notices, log, emit, server) =

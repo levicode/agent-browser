@@ -1,8 +1,9 @@
-//! Hosted attempt-retirement equivalent for located native references.
+//! Hosted attempt retirement for located and committed observed references.
 //! Included as a child of client_browser so inspection remains test-only.
 use super::super::client_actions::{
     fixture_configuration, fixture_scope_open, FixtureOperations, FIXTURE_SECURE_SELECTOR,
 };
+use super::super::client_protocol::Effects;
 use super::super::client_transport::ClientExecutor;
 use super::*;
 use serde_json::{json, Value};
@@ -87,7 +88,7 @@ async fn seed_and_query(
     browser: &ClientBrowser,
     ops: &mut FixtureOperations,
     scope: &str,
-) -> Result<Value, String> {
+) -> Result<[(&'static str, Value); 2], String> {
     {
         let page = browser
             .page_lease(false)
@@ -114,7 +115,46 @@ async fn seed_and_query(
     if reference["id"].as_str().is_none() || reference["revision"].as_str().is_none() {
         return Err("query did not return canonical exact reference".into());
     }
-    Ok(reference)
+    // Located publication does not populate durable observed identities. Commit
+    // a real protected observation, then correlate its published provenance with
+    // the located acquisition through the same admitted production command path.
+    let snapshot = command(
+        browser,
+        ops,
+        "browser.observe",
+        json!({"identityScope":scope,"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{"pixels":false}}),
+    )
+    .await?;
+    let mut observed = Vec::new();
+    let mut pending = vec![&snapshot["root"]];
+    while let Some(node) = pending.pop() {
+        if node["ref"].is_object() {
+            observed.push(node["ref"].clone());
+        }
+        if let Some(children) = node["children"].as_array() {
+            pending.extend(children);
+        }
+    }
+    let correlated = command(
+        browser,
+        ops,
+        "fixture.correlate",
+        json!({"identityScope":scope,"located":[reference],"observed":observed}),
+    )
+    .await?;
+    let matches = correlated["matches"]
+        .as_array()
+        .ok_or("missing reference correlations")?;
+    if matches.len() != 1 || matches[0].is_null() || !observed.contains(&matches[0]) {
+        return Err(
+            "located acquisition did not correlate to a committed observed reference".into(),
+        );
+    }
+    let observed = matches[0].clone();
+    if observed["id"] == reference["id"] {
+        return Err("located and observed provenance unexpectedly share an ID".into());
+    }
+    Ok([("located", reference), ("observed", observed)])
 }
 async fn clicks(browser: &ClientBrowser) -> Result<Value, String> {
     let page = browser
@@ -130,7 +170,7 @@ async fn clicks(browser: &ClientBrowser) -> Result<Value, String> {
 }
 
 #[tokio::test]
-#[ignore = "requires hosted Chromium: located references retire through real scope end/reopen"]
+#[ignore = "requires hosted Chromium: located and observed references retire through real scope end/reopen"]
 async fn chromium_located_reference_retirement_across_owned_attempts() {
     let mut host = super::super::browser::BrowserManager::launch(Default::default(), None)
         .await
@@ -144,16 +184,21 @@ async fn chromium_located_reference_retirement_across_owned_attempts() {
         let opened=command(&browser,&mut ops,"scope.open",fixture_scope_open("connect",Some(host.get_cdp_url()))).await?;
         let first_scope=opened["identityScope"].as_str().ok_or("missing first scope")?.to_owned();
         configure(&browser,&mut ops,&first_scope).await?;
-        let old_reference=seed_and_query(&browser,&mut ops,&first_scope).await?;
-        let old_id=old_reference["id"].as_str().unwrap().to_owned();
-        let old_key=super::super::element::parse_ref(&old_id).ok_or("invalid old canonical ref")?;
+        let old_references=seed_and_query(&browser,&mut ops,&first_scope).await?;
         {
             let refs=browser.refs.lock().map_err(|_|"reference lock poisoned")?;
             let counts=refs.retained_identity_counts();
-            if refs.get(&old_key).is_none() || counts.0==0 || counts.1==0 { return Err("actual query was not committed to both native identity populations".into()); }
+            if counts.0<2 || counts.1==0 { return Err("query and observation did not commit both native identity populations".into()); }
+            for (kind,reference) in &old_references {
+                let key=super::super::element::parse_ref(reference["id"].as_str().ok_or("missing old reference ID")?).ok_or("invalid old canonical ref")?;
+                let entry=refs.get(&key).ok_or("old published reference missing from native map")?;
+                if (*kind=="observed")!=matches!(entry.lifetime,super::super::element::RefLifetime::Observed) { return Err(format!("{kind} reference has incorrect native provenance")); }
+            }
         }
-        command(&browser,&mut ops,"browser.perform",json!({"identityScope":first_scope,"ref":old_reference,"action":{"kind":"tap"}})).await?;
-        if clicks(&browser).await?!=json!(1) { return Err("old admitted exact reference was not actionable".into()); }
+        for (index,(kind,reference)) in old_references.iter().enumerate() {
+            command(&browser,&mut ops,"browser.perform",json!({"identityScope":first_scope,"ref":reference,"action":{"kind":"tap"}})).await?;
+            if clicks(&browser).await?!=json!(index+1) { return Err(format!("old admitted {kind} reference did not act exactly once")); }
+        }
         let (old_context,old_targets,old_blob_scope)={
             let owner=browser.owner.lock().await;
             let owner=owner.as_ref().ok_or("missing first owner")?;
@@ -174,15 +219,21 @@ async fn chromium_located_reference_retirement_across_owned_attempts() {
         if scope==first_scope { return Err("replacement reused old identity scope".into()); }
         configure(&browser,&mut ops,&scope).await?;
         let current=seed_and_query(&browser,&mut ops,&scope).await?;
-        if current["id"]==old_id { return Err("replacement reused canonical located ID".into()); }
-        if browser.refs.lock().map_err(|_|"reference lock poisoned")?.get(&old_key).is_some() { return Err("old exact ID aliased replacement native map".into()); }
-        // Use the NEW revision and NEW scope deliberately: rejection must be
-        // stale located identity, not merely a mismatched revision or scope.
-        let stale=ops.execute_written(&browser,browser.event_sink.get().ok_or("fixture event sink missing")?,"browser.perform",json!({"identityScope":scope,"ref":{"id":old_id,"revision":current["revision"]},"action":{"kind":"tap"}}),30).await.map_err(|e|format!("stale action admission/settlement: {e:?}"))?;
-        if stale.result!=Err(ProtocolError::StaleReference) { return Err(format!("old ID under replacement was not stale: {:?}",stale.result)); }
-        if clicks(&browser).await?!=json!(0) { return Err("stale old ID mutated replacement element".into()); }
-        command(&browser,&mut ops,"browser.perform",json!({"identityScope":scope,"ref":current,"action":{"kind":"tap"}})).await?;
-        if clicks(&browser).await?!=json!(1) { return Err("current replacement ID did not act exactly once".into()); }
+        for (index,(kind,reference)) in old_references.iter().enumerate() {
+            let old_id=reference["id"].as_str().ok_or("missing old reference ID")?;
+            if current.iter().any(|(_,replacement)|replacement["id"]==old_id) { return Err(format!("replacement reused canonical {kind} ID")); }
+            let old_key=super::super::element::parse_ref(old_id).ok_or("invalid old canonical ref")?;
+            if browser.refs.lock().map_err(|_|"reference lock poisoned")?.get(&old_key).is_some() { return Err(format!("old {kind} ID aliased replacement native map")); }
+            // Use the NEW revision and NEW scope deliberately: neither old
+            // provenance may regain authority in the replacement attempt.
+            let stale=ops.execute_written(&browser,browser.event_sink.get().ok_or("fixture event sink missing")?,"browser.perform",json!({"identityScope":scope,"ref":{"id":old_id,"revision":current[index].1["revision"]},"action":{"kind":"tap"}}),30).await.map_err(|e|format!("stale action admission/settlement: {e:?}"))?;
+            if stale.result!=Err(ProtocolError::StaleReference) || stale.effects!=Effects::NotDispatched { return Err(format!("old {kind} ID under replacement was not refused before dispatch: {:?}, {:?}",stale.result,stale.effects)); }
+            if clicks(&browser).await?!=json!(0) { return Err(format!("stale old {kind} ID mutated replacement element")); }
+        }
+        for (index,(kind,reference)) in current.iter().enumerate() {
+            command(&browser,&mut ops,"browser.perform",json!({"identityScope":scope,"ref":reference,"action":{"kind":"tap"}})).await?;
+            if clicks(&browser).await?!=json!(index+1) { return Err(format!("current replacement {kind} ID did not act exactly once")); }
+        }
         Ok(())
     }.await;
     // Retain cleanup even when the behavioral body returns a failure.

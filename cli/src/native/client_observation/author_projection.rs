@@ -289,6 +289,19 @@ pub(super) fn compact(
                 .suppress = true;
         }
     }
+    // A hidden select offers no visible options. Suppress its entire native
+    // ownership branch before line projection/child promotion, including any
+    // optgroup descendants. Ordinary zero-box wrappers still promote children.
+    // These are observation-local facts; exact query/read nodes stay unchanged.
+    for node in nodes.values_mut() {
+        let f = node
+            .author
+            .as_mut()
+            .ok_or(ObservationError::BackendFailure)?;
+        if f.tag == "select" && !f.visible {
+            f.suppress = true;
+        }
+    }
     let mut runs: HashMap<i64, String> = HashMap::new();
     let mut direct = HashSet::new();
     let mut visiting = HashSet::new();
@@ -414,7 +427,7 @@ pub(super) fn compact(
             nodes
                 .get(&entry.id)
                 .and_then(|node| node.author.as_ref())
-                .is_some_and(|f| f.tag == "select")
+                .is_some_and(|f| f.tag == "select" && f.visible && !f.suppress)
         })
         .flat_map(|entry| entry.children.iter().copied())
         .collect();
@@ -649,6 +662,165 @@ mod tests {
 
     fn reference(node: &Value) -> String {
         format!("@fixture{}", node["backendNodeId"])
+    }
+
+    #[test]
+    fn hidden_select_prunes_direct_and_optgroup_branches_but_not_visible_siblings() {
+        let mut f = Fixture::default();
+        let plain = f.el("option", Some("option"), vec![]);
+        let warm = f.el("option", Some("option"), vec![]);
+        let warm_group = f.el("optgroup", Some("group"), vec![warm.clone()]);
+        let folded = f.el("select", Some("combobox"), vec![plain.clone(), warm_group]);
+        f.facts_mut(&folded).visible = false;
+        let cool = f.el("option", Some("option"), vec![]);
+        f.facts_mut(&cool).visible = false;
+        let cool_id = cool["backendNodeId"].as_i64().unwrap();
+        let raw_option = f.nodes.get_mut(&cool_id).unwrap();
+        raw_option.value = Some("internal-cool-token".into());
+        raw_option.states.insert("hidden".into(), true);
+        raw_option.states.insert("selected".into(), true);
+        raw_option.states.insert("disabled".into(), true);
+        let shown = f.el("select", Some("combobox"), vec![cool.clone()]);
+        let button = f.el("button", Some("button"), vec![]);
+        let wrapper = f.el(
+            "div",
+            None,
+            vec![folded.clone(), shown.clone(), button.clone()],
+        );
+        f.facts_mut(&wrapper).visible = false;
+        let raw_nodes = f.nodes.clone();
+        let nodes = f.run(vec![wrapper]);
+        let emitted = flat(&nodes);
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|node| node.reference.id.clone())
+                .collect::<Vec<_>>(),
+            vec![reference(&shown), reference(&cool), reference(&button)]
+        );
+        assert_eq!(emitted[1].states.get("hidden"), Some(&false));
+        assert_eq!(emitted[1].states.get("selected"), Some(&true));
+        assert_eq!(emitted[1].states.get("disabled"), Some(&true));
+        assert_eq!(emitted[1].value, None);
+        // Compaction changes the observed copy, not exact-query/read facts.
+        assert_eq!(raw_nodes[&cool_id].states.get("hidden"), Some(&true));
+        assert_eq!(
+            raw_nodes[&cool_id].value.as_deref(),
+            Some("internal-cool-token")
+        );
+        assert!(!facts(&raw_nodes[&cool_id]).unwrap().visible);
+        assert!(
+            !facts(&raw_nodes[&folded["backendNodeId"].as_i64().unwrap()])
+                .unwrap()
+                .suppress
+        );
+        for absent in [folded, plain, warm] {
+            assert!(!emitted
+                .iter()
+                .any(|node| node.reference.id == reference(&absent)));
+        }
+    }
+
+    #[test]
+    fn select_option_exception_does_not_escape_suppressed_native_owners() {
+        // aria-hidden, inert and display:none share the renderer's suppress
+        // fact; content-visibility has its separate rendered-ownership gate.
+        for suppression in ["aria-hidden", "inert", "display-none", "content-visibility"] {
+            let mut f = Fixture::default();
+            let option = f.el("option", Some("option"), vec![]);
+            f.facts_mut(&option).visible = false;
+            let select = f.el("select", Some("combobox"), vec![option]);
+            let ancestor = f.el("div", None, vec![select]);
+            if suppression == "content-visibility" {
+                f.facts_mut(&ancestor).skips_content = true;
+            } else {
+                f.facts_mut(&ancestor).suppress = true;
+            }
+            let separate_option = f.el("option", Some("option"), vec![]);
+            f.facts_mut(&separate_option).visible = false;
+            let separate = f.el("select", Some("combobox"), vec![separate_option.clone()]);
+            let nodes = f.run(vec![ancestor, separate.clone()]);
+            assert_eq!(
+                flat(&nodes)
+                    .iter()
+                    .map(|node| node.reference.id.clone())
+                    .collect::<Vec<_>>(),
+                vec![reference(&separate), reference(&separate_option)],
+                "{suppression}"
+            );
+        }
+        // A select that skips its own content cannot re-enable child options.
+        let mut f = Fixture::default();
+        let option = f.el("option", Some("option"), vec![]);
+        let select = f.el("select", Some("combobox"), vec![option]);
+        f.facts_mut(&select).skips_content = true;
+        let nodes = f.run(vec![select.clone()]);
+        assert_eq!(flat(&nodes).len(), 1);
+        assert_eq!(nodes[0].reference.id, reference(&select));
+    }
+
+    #[test]
+    fn option_exception_does_not_rebind_optgroup_or_unowned_nodes() {
+        let mut f = Fixture::default();
+        let unowned = f.el("option", Some("option"), vec![]);
+        f.facts_mut(&unowned).visible = false;
+        let grouped = f.el("option", Some("option"), vec![]);
+        let group = f.el("optgroup", Some("group"), vec![grouped.clone()]);
+        let select = f.el("select", Some("combobox"), vec![group.clone()]);
+        let nodes = f.run(vec![unowned, select.clone()]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].reference.id, reference(&select));
+        assert_eq!(nodes[0].children[0].reference.id, reference(&group));
+        assert_eq!(
+            nodes[0].children[0].children[0].reference.id,
+            reference(&grouped)
+        );
+        // This correction does not flatten optgroups or broaden the existing
+        // direct-option exception to unrelated native ownership branches.
+    }
+
+    #[test]
+    fn hidden_select_branch_uses_no_publication_budget_or_omitted_references() {
+        let mut f = Fixture::default();
+        let hidden_options = (0..4)
+            .map(|_| f.el("option", Some("option"), vec![]))
+            .collect();
+        let hidden = f.el("select", Some("combobox"), hidden_options);
+        f.facts_mut(&hidden).visible = false;
+        let first = f.el("option", Some("option"), vec![]);
+        let second = f.el("option", Some("option"), vec![]);
+        f.facts_mut(&first).visible = false;
+        f.facts_mut(&second).visible = false;
+        let shown = f.el(
+            "select",
+            Some("combobox"),
+            vec![first.clone(), second.clone()],
+        );
+        let root = f.node(
+            9,
+            Facts {
+                visible: true,
+                ..Default::default()
+            },
+            Some("document"),
+            vec![hidden.clone(), shown.clone()],
+        );
+        let graph = Graph::read(&root).unwrap();
+        let (nodes, truncated) = compact(&graph, f.nodes, 3).unwrap();
+        assert!(truncated);
+        let emitted = flat(&nodes);
+        assert_eq!(
+            emitted
+                .iter()
+                .map(|node| node.reference.id.clone())
+                .collect::<Vec<_>>(),
+            vec![reference(&root), reference(&shown), reference(&first)]
+        );
+        for omitted in [hidden, second] {
+            assert!(!emitted
+                .iter()
+                .any(|node| node.reference.id == reference(&omitted)));
+        }
     }
 
     #[test]

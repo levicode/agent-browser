@@ -9,8 +9,8 @@ use super::client_session::{ClientSession, OperationLease};
 // Acceptance-only diagnostics: closed phases and native operation sequence only.
 // Never serialize requests, IDs, browser values, or error descriptions.
 #[cfg(feature = "acceptance-faults")]
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-pub(super) enum SettlementPhase {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum SettlementPhase {
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -40,6 +40,30 @@ pub(super) enum SettlementPhase {
     ShutdownUnproven,
     PendingResultQueued,
     CaptureLimitReached,
+    CaptureStarted,
+    ProxyDaemonSpawned,
+    PrefaceReturned,
+    CopyStarted,
+    CopyReturned,
+    SocketWriteEntered,
+    SocketWriteReturned,
+    SocketReadEntered,
+    SocketReadReturned,
+    InputHalfCloseEntered,
+    InputHalfCloseReturned,
+    OutputFlushEntered,
+    OutputFlushReturned,
+    ProxySummary,
+    FrameComplete,
+    FrameCleanEof,
+    FramePartialEof,
+    FrameIoError,
+    FrameOversize,
+    FrameParseRefused,
+    FrameDecoded,
+    FrameAdmissionRefused,
+    FrameSummary,
+    DetailLimit,
 }
 macro_rules! settlement_trace {
     ($sequence:expr, $phase:ident) => {
@@ -619,7 +643,14 @@ impl ClientEventSink {
 pub async fn read_frame<R: AsyncBufRead + Unpin>(
     reader: &mut R,
 ) -> Result<Option<Vec<u8>>, ProtocolError> {
-    read_frame_retained(reader, &mut Vec::new()).await
+    #[cfg(feature = "acceptance-faults")]
+    {
+        read_frame_retained(reader, &mut Vec::new(), None).await
+    }
+    #[cfg(not(feature = "acceptance-faults"))]
+    {
+        read_frame_retained(reader, &mut Vec::new()).await
+    }
 }
 
 // The transport select loop owns this buffer across timer/control/completion
@@ -628,13 +659,38 @@ pub async fn read_frame<R: AsyncBufRead + Unpin>(
 async fn read_frame_retained<R: AsyncBufRead + Unpin>(
     reader: &mut R,
     frame: &mut Vec<u8>,
+    #[cfg(feature = "acceptance-faults")] mut trace: Option<
+        &mut super::client_settlement_trace::FrameTrace,
+    >,
 ) -> Result<Option<Vec<u8>>, ProtocolError> {
     loop {
-        let available = reader
-            .fill_buf()
-            .await
-            .map_err(|_| ProtocolError::InvalidFrame)?;
+        let available = match reader.fill_buf().await {
+            Ok(available) => available,
+            Err(_error) => {
+                #[cfg(feature = "acceptance-faults")]
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.observe(
+                        SettlementPhase::FrameIoError,
+                        None,
+                        Some(super::client_settlement_trace::IoClass::error(&_error)),
+                    );
+                }
+                return Err(ProtocolError::InvalidFrame);
+            }
+        };
         if available.is_empty() {
+            #[cfg(feature = "acceptance-faults")]
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.observe(
+                    if frame.is_empty() {
+                        SettlementPhase::FrameCleanEof
+                    } else {
+                        SettlementPhase::FramePartialEof
+                    },
+                    None,
+                    None,
+                );
+            }
             return if frame.is_empty() {
                 Ok(None)
             } else {
@@ -644,11 +700,30 @@ async fn read_frame_retained<R: AsyncBufRead + Unpin>(
         let newline = available.iter().position(|b| *b == b'\n');
         let length = newline.unwrap_or(available.len());
         if frame.len() + length > MAX_FRAME_BYTES {
+            #[cfg(feature = "acceptance-faults")]
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.observe(
+                    SettlementPhase::FrameOversize,
+                    Some(frame.len() + length),
+                    None,
+                );
+            }
             return Err(ProtocolError::InvalidFrame);
         }
         frame.extend_from_slice(&available[..length]);
         reader.consume(length + usize::from(newline.is_some()));
+        #[cfg(feature = "acceptance-faults")]
+        if let Some(trace) = trace.as_deref_mut() {
+            trace.consumed(
+                length + usize::from(newline.is_some()),
+                if newline.is_some() { 0 } else { frame.len() },
+            );
+        }
         if newline.is_some() {
+            #[cfg(feature = "acceptance-faults")]
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.observe(SettlementPhase::FrameComplete, Some(frame.len() + 1), None);
+            }
             return Ok(Some(std::mem::take(frame)));
         }
     }
@@ -695,21 +770,41 @@ pub async fn refuse<W: AsyncWrite + Unpin>(
     }
 }
 
-pub async fn serve<R, W>(reader: R, writer: W, hello: ClientMessage) -> bool
+pub async fn serve<R, W>(
+    reader: R,
+    writer: W,
+    hello: ClientMessage,
+    #[cfg(feature = "acceptance-faults")] hello_frame_bytes: usize,
+) -> bool
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let broker = std::sync::Arc::new(ClientSession::new());
     let executor = std::sync::Arc::new(super::client_browser::ClientBrowser::new(broker.clone()));
-    serve_with_executor(reader, writer, hello, broker, executor).await
+    #[cfg(feature = "acceptance-faults")]
+    {
+        serve_with_executor_inner(
+            reader,
+            writer,
+            hello,
+            broker,
+            executor,
+            Some(hello_frame_bytes),
+        )
+        .await
+    }
+    #[cfg(not(feature = "acceptance-faults"))]
+    {
+        serve_with_executor_inner(reader, writer, hello, broker, executor).await
+    }
 }
 
 /// Reader/control work never takes the executor's browser lock. False means
 /// cleanup is unproven and the daemon MUST retain its exclusive ownership gate.
 pub async fn serve_with_executor<R, W, E>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     hello: ClientMessage,
     broker: std::sync::Arc<ClientSession>,
     executor: std::sync::Arc<E>,
@@ -719,6 +814,31 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
     E: ClientExecutor,
 {
+    #[cfg(feature = "acceptance-faults")]
+    {
+        serve_with_executor_inner(reader, writer, hello, broker, executor, None).await
+    }
+    #[cfg(not(feature = "acceptance-faults"))]
+    {
+        serve_with_executor_inner(reader, writer, hello, broker, executor).await
+    }
+}
+
+async fn serve_with_executor_inner<R, W, E>(
+    mut reader: R,
+    mut writer: W,
+    hello: ClientMessage,
+    broker: std::sync::Arc<ClientSession>,
+    executor: std::sync::Arc<E>,
+    #[cfg(feature = "acceptance-faults")] hello_frame_bytes: Option<usize>,
+) -> bool
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+    E: ClientExecutor,
+{
+    #[cfg(feature = "acceptance-faults")]
+    let mut frame_trace = super::client_settlement_trace::FrameTrace::new(hello_frame_bytes);
     let outstanding = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
         String,
         bool,
@@ -790,6 +910,7 @@ where
                             scope_state: Some(*scope_state),
                             error: error.as_ref().map(|error| error.code.clone()),
                             accepted: None,
+                            ..Default::default()
                         },
                     );
                 }
@@ -809,6 +930,7 @@ where
                             scope_state: Some(*scope_state),
                             error: error.as_ref().map(|error| error.code.clone()),
                             accepted: Some(*accepted),
+                            ..Default::default()
                         },
                     );
                 }
@@ -885,8 +1007,13 @@ where
     if valid && ready_queued {
         let mut incoming_frame = Vec::new();
         loop {
+            #[cfg(feature = "acceptance-faults")]
+            let reading =
+                read_frame_retained(&mut reader, &mut incoming_frame, Some(&mut frame_trace));
+            #[cfg(not(feature = "acceptance-faults"))]
+            let reading = read_frame_retained(&mut reader, &mut incoming_frame);
             let frame = tokio::select! {
-                frame = read_frame_retained(&mut reader, &mut incoming_frame) => frame,
+                frame = reading => frame,
                 _ = &mut failure => { settlement_trace!(0, WriterFailed); break; },
                 _ = timer.tick() => {
                     let _ = broker.expire_decisions();
@@ -913,7 +1040,18 @@ where
                 },
             };
             let message = match frame {
-                Ok(Some(bytes)) => parse_frame(&bytes),
+                Ok(Some(bytes)) => {
+                    let parsed = parse_frame(&bytes);
+                    #[cfg(feature = "acceptance-faults")]
+                    if parsed.is_err() {
+                        frame_trace.observe(
+                            SettlementPhase::FrameParseRefused,
+                            Some(bytes.len() + 1),
+                            None,
+                        );
+                    }
+                    parsed
+                }
                 Ok(None) => {
                     settlement_trace!(0, ReaderEnded);
                     break;
@@ -937,6 +1075,8 @@ where
                     break;
                 }
             };
+            #[cfg(feature = "acceptance-faults")]
+            frame_trace.message(SettlementPhase::FrameDecoded, &message);
             let id = match &message {
                 ClientMessage::Hello { id, .. }
                 | ClientMessage::Request { id, .. }
@@ -958,6 +1098,8 @@ where
                 })
                 .unwrap_or(false);
             if !admitted {
+                #[cfg(feature = "acceptance-faults")]
+                frame_trace.message(SettlementPhase::FrameAdmissionRefused, &message);
                 let _ = broker.quarantine();
                 enqueue(
                     &sender,
@@ -1274,6 +1416,7 @@ fn respond<E: ClientExecutor>(
                     scope_state: Some(scope_state),
                     error: result.as_ref().err().cloned(),
                     accepted: Some(result.is_ok()),
+                    ..Default::default()
                 },
             );
             (
@@ -2604,31 +2747,205 @@ mod tests {
         assert!(broker.admit(1, 2, 1000).is_err());
     }
 
+    async fn read_unobserved_retained_frame<R: AsyncBufRead + Unpin>(
+        reader: &mut R,
+        frame: &mut Vec<u8>,
+    ) -> Result<Option<Vec<u8>>, ProtocolError> {
+        #[cfg(feature = "acceptance-faults")]
+        {
+            read_frame_retained(reader, frame, None).await
+        }
+        #[cfg(not(feature = "acceptance-faults"))]
+        {
+            read_frame_retained(reader, frame).await
+        }
+    }
+
     #[tokio::test]
     async fn retained_frame_state_preserves_bounds_and_resets_only_at_newline() {
         let mut frame = b"prefix".to_vec();
         let mut bytes = &b"-suffix\nnext\n"[..];
         assert_eq!(
-            read_frame_retained(&mut bytes, &mut frame).await.unwrap(),
+            read_unobserved_retained_frame(&mut bytes, &mut frame)
+                .await
+                .unwrap(),
             Some(b"prefix-suffix".to_vec())
         );
         assert!(frame.is_empty());
         assert_eq!(
-            read_frame_retained(&mut bytes, &mut frame).await.unwrap(),
+            read_unobserved_retained_frame(&mut bytes, &mut frame)
+                .await
+                .unwrap(),
             Some(b"next".to_vec())
         );
         assert_eq!(
-            read_frame_retained(&mut bytes, &mut frame).await.unwrap(),
+            read_unobserved_retained_frame(&mut bytes, &mut frame)
+                .await
+                .unwrap(),
             None
         );
         frame = vec![b'a'; MAX_FRAME_BYTES];
-        assert!(read_frame_retained(&mut &b"b\n"[..], &mut frame)
+        assert!(read_unobserved_retained_frame(&mut &b"b\n"[..], &mut frame)
             .await
             .is_err());
         frame = b"incomplete".to_vec();
-        assert!(read_frame_retained(&mut &b""[..], &mut frame)
+        assert!(read_unobserved_retained_frame(&mut &b""[..], &mut frame)
             .await
             .is_err());
+    }
+
+    #[cfg(feature = "acceptance-faults")]
+    struct TraceMemoryReader {
+        bytes: Vec<u8>,
+        offset: usize,
+        pending: bool,
+        error: Option<std::io::ErrorKind>,
+    }
+    #[cfg(feature = "acceptance-faults")]
+    impl tokio::io::AsyncRead for TraceMemoryReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Err(std::io::Error::other("unused read seam")))
+        }
+    }
+    #[cfg(feature = "acceptance-faults")]
+    impl AsyncBufRead for TraceMemoryReader {
+        fn poll_fill_buf(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<&[u8]>> {
+            let reader = self.get_mut();
+            if reader.offset < reader.bytes.len() {
+                return std::task::Poll::Ready(Ok(&reader.bytes[reader.offset..]));
+            }
+            if reader.pending {
+                return std::task::Poll::Pending;
+            }
+            if let Some(kind) = reader.error {
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    kind,
+                    "https://do-not-capture.invalid/?token=private-error",
+                )));
+            }
+            std::task::Poll::Ready(Ok(&[]))
+        }
+        fn consume(self: std::pin::Pin<&mut Self>, amount: usize) {
+            self.get_mut().offset += amount;
+        }
+    }
+
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn acceptance_phase_retained_frame_counts_survive_cancelled_future() {
+        use super::super::client_settlement_trace::FrameTrace;
+        use std::future::Future;
+        let mut reader = TraceMemoryReader {
+            bytes: b"prefix".to_vec(),
+            offset: 0,
+            pending: true,
+            error: None,
+        };
+        let mut frame = Vec::new();
+        let mut trace = FrameTrace::new(Some(7));
+        let mut waiting = Box::pin(read_frame_retained(
+            &mut reader,
+            &mut frame,
+            Some(&mut trace),
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(waiting.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(waiting);
+        assert_eq!(frame, b"prefix");
+        assert_eq!(trace.test_state(), (13, 6, 0, None));
+        reader.bytes.extend_from_slice(b"-suffix\nnext\n");
+        reader.pending = false;
+        assert_eq!(
+            read_frame_retained(&mut reader, &mut frame, Some(&mut trace))
+                .await
+                .unwrap(),
+            Some(b"prefix-suffix".to_vec())
+        );
+        assert_eq!(
+            trace.test_state(),
+            (21, 0, 1, Some(SettlementPhase::FrameComplete))
+        );
+        assert_eq!(
+            read_frame_retained(&mut reader, &mut frame, Some(&mut trace))
+                .await
+                .unwrap(),
+            Some(b"next".to_vec())
+        );
+        assert_eq!(
+            trace.test_state(),
+            (26, 0, 2, Some(SettlementPhase::FrameComplete))
+        );
+        assert_eq!(
+            read_frame_retained(&mut reader, &mut frame, Some(&mut trace))
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            trace.test_state(),
+            (26, 0, 2, Some(SettlementPhase::FrameCleanEof))
+        );
+    }
+
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn acceptance_phase_retained_frame_eof_io_and_oversize_preserve_errors() {
+        use super::super::client_settlement_trace::FrameTrace;
+        for (bytes, error, phase, consumed) in [
+            (
+                b"partial".to_vec(),
+                None,
+                SettlementPhase::FramePartialEof,
+                7,
+            ),
+            (
+                b"part".to_vec(),
+                Some(std::io::ErrorKind::Interrupted),
+                SettlementPhase::FrameIoError,
+                4,
+            ),
+            (
+                vec![b'x'; MAX_FRAME_BYTES + 1],
+                None,
+                SettlementPhase::FrameOversize,
+                0,
+            ),
+        ] {
+            let mut reader = TraceMemoryReader {
+                bytes,
+                offset: 0,
+                pending: false,
+                error,
+            };
+            let mut frame = Vec::new();
+            let mut trace = FrameTrace::new(Some(9));
+            assert_eq!(
+                read_frame_retained(&mut reader, &mut frame, Some(&mut trace)).await,
+                Err(ProtocolError::InvalidFrame)
+            );
+            assert_eq!(trace.test_state(), (9 + consumed, consumed, 0, Some(phase)));
+            assert_eq!(reader.offset as u64, consumed);
+        }
+        let mut bytes = &b"invalid-complete-frame\n"[..];
+        let mut frame = Vec::new();
+        let mut trace = FrameTrace::new(Some(9));
+        let complete = read_frame_retained(&mut bytes, &mut frame, Some(&mut trace))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(trace.test_state().3, Some(SettlementPhase::FrameComplete));
+        assert!(parse_frame(&complete).is_err());
+        assert!(frame.is_empty());
     }
 
     #[tokio::test]

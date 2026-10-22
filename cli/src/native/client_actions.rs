@@ -3625,6 +3625,43 @@ mod tests {
             .is_some());
     }
 
+    fn output_filter_query_expression() -> Value {
+        json!({"kind":"query","query":{"kind":"placeholder","value":{"kind":"string","value":"Save","exact":false},"visible":true}})
+    }
+
+    fn observed_fill_request(scope: &str, reference: &NodeReference, value: &str) -> Value {
+        json!({"identityScope":scope,"ref":reference,"action":{"kind":"fill","value":value,"sensitive":false}})
+    }
+
+    #[test]
+    fn observed_fill_and_output_filter_fixture_requests_obey_strict_schemas() {
+        use super::super::client_observation::QueryOptions;
+        let mut query = json!({"expression":output_filter_query_expression()});
+        assert!(serde_json::from_value::<QueryOptions>(query.clone()).is_ok());
+        query["expression"]["query"]["value"]
+            .as_object_mut()
+            .unwrap()
+            .remove("exact");
+        assert!(serde_json::from_value::<QueryOptions>(query).is_err());
+
+        let reference = NodeReference {
+            id: "@e1".into(),
+            revision: "1".into(),
+        };
+        let mut fill = observed_fill_request("scope", &reference, "late");
+        let parsed = decode::<Perform>(&fill).unwrap();
+        assert_eq!(parsed.identity_scope, "scope");
+        assert_eq!(parsed.reference, reference);
+        assert!(
+            matches!(parsed.action, LocatorAction::Fill { value, sensitive: false } if value == "late")
+        );
+        fill["action"].as_object_mut().unwrap().remove("sensitive");
+        assert_eq!(
+            decode::<Perform>(&fill).err(),
+            Some(ProtocolError::InvalidArguments)
+        );
+    }
+
     #[tokio::test]
     async fn live_query_replacement_and_nth_resolve_temporary_targets_without_new_refs() {
         for (mode, expression, result_index, expected_backend) in [
@@ -3648,7 +3685,7 @@ mod tests {
             ),
             (
                 "strict-query-output-filter",
-                json!({"kind":"query","query":{"kind":"placeholder","value":{"kind":"string","value":"Save"},"visible":true}}),
+                output_filter_query_expression(),
                 0,
                 42,
             ),
@@ -4201,7 +4238,14 @@ mod tests {
         let mut context = f.context();
         context.revision = 2;
         context.observed_revision = 2;
-        actions.execute(context,"browser.perform",&json!({"identityScope":"scope","ref":first,"action":{"kind":"fill","value":"late"}})).await.unwrap();
+        actions
+            .execute(
+                context,
+                "browser.perform",
+                &observed_fill_request("scope", &first, "late"),
+            )
+            .await
+            .unwrap();
         assert!(f
             .inputs()
             .iter()
@@ -4209,7 +4253,21 @@ mod tests {
                 && request["params"]["text"] == "late"));
         f.log.lock().unwrap().clear();
         for revision in ["2", "01", "999"] {
-            let failure=actions.execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":{"id":"@e1","revision":revision},"action":{"kind":"fill","value":"forged"}})).await.unwrap_err();
+            let failure = actions
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &observed_fill_request(
+                        "scope",
+                        &NodeReference {
+                            id: first.id.clone(),
+                            revision: revision.into(),
+                        },
+                        "forged",
+                    ),
+                )
+                .await
+                .unwrap_err();
             assert_eq!(failure.error, ProtocolError::StaleReference);
             assert_eq!(failure.effects, Effects::NotDispatched);
         }
@@ -4218,7 +4276,14 @@ mod tests {
         f.refs.bind_exact(42, "textbox", "", binding);
         f.refs
             .retain_snapshot_entries(&baseline, &Default::default());
-        let failure=actions.execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":first,"action":{"kind":"fill","value":"omitted"}})).await.unwrap_err();
+        let failure = actions
+            .execute(
+                f.context(),
+                "browser.perform",
+                &observed_fill_request("scope", &first, "omitted"),
+            )
+            .await
+            .unwrap_err();
         assert_eq!(failure.error, ProtocolError::StaleReference);
         assert_eq!(failure.effects, Effects::NotDispatched);
         assert!(f.log.lock().unwrap().is_empty());
@@ -6134,7 +6199,7 @@ mod tests {
                 realm_authority:ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,
                 page_state:&state,refs:&refs,revision:$revision,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry
             } } }
-            let fill_original=|value:&str|json!({"identityScope":page.identity_scope,"ref":original,"action":{"kind":"fill","value":value}});
+            let fill_original=|value:&str|observed_fill_request(&page.identity_scope, &original, value);
             actions.execute(observed_context!(3),"browser.perform",&fill_original("late")).await.map_err(|error|format!("Original observed fill failed: {:?}",error.error))?;
             assert_eq!(evaluate_on(&browser.client,&session,"document.querySelector('#text').value").await?,json!("late"));
             let read_options=serde_json::from_value(json!({"ref":original.id})).unwrap();

@@ -979,6 +979,85 @@ mod tests {
         )
         .is_err());
     }
+    // Only closed diagnostic values leave this helper; equality stays on raw JSON.
+    fn background_page_state_diagnostic(before: &Value, after: &Value) -> Value {
+        let state = |value: &Value| {
+            let visibility = match value.get("visibility").and_then(Value::as_str) {
+                Some("visible") => "Visible",
+                Some("hidden") => "Hidden",
+                _ => "Unknown",
+            };
+            let focus = match value.get("focus").and_then(Value::as_bool) {
+                Some(focus) => json!(focus),
+                None => json!("Unknown"),
+            };
+            json!({"visibility": visibility, "focus": focus})
+        };
+        json!({
+            "before": state(before),
+            "after": state(after),
+            "visibility_changed": before.get("visibility") != after.get("visibility"),
+            "focus_changed": before.get("focus") != after.get("focus"),
+            "record_changed": before != after,
+        })
+    }
+    #[test]
+    fn background_page_diagnostic_is_closed_and_preserves_exact_change_detection() {
+        let sentinel = "secret-looking-sentinel://private.example/token?value=never-log";
+        let cases = [
+            Value::Null,
+            json!(true),
+            json!(7),
+            json!(sentinel),
+            json!([sentinel]),
+            json!({}),
+            json!({"visibility": null, "focus": null}),
+            json!({"visibility": sentinel, "focus": sentinel}),
+            json!({"visibility": [sentinel], "focus": {"secret": sentinel}}),
+            json!({"visibility": "visible", "focus": true}),
+            json!({"visibility": "hidden", "focus": false}),
+            json!({"visibility": "visible", "focus": true, "extra": sentinel}),
+        ];
+        for before in &cases {
+            for after in &cases {
+                let diagnostic = background_page_state_diagnostic(before, after);
+                assert!(!diagnostic.to_string().contains(sentinel));
+                for state in [&diagnostic["before"], &diagnostic["after"]] {
+                    assert!(matches!(
+                        state["visibility"].as_str(),
+                        Some("Visible" | "Hidden" | "Unknown")
+                    ));
+                    assert!(state["focus"].is_boolean() || state["focus"] == "Unknown");
+                }
+                assert_eq!(diagnostic["record_changed"], json!(before != after));
+                assert_eq!(
+                    diagnostic["visibility_changed"],
+                    json!(before.get("visibility") != after.get("visibility"))
+                );
+                assert_eq!(
+                    diagnostic["focus_changed"],
+                    json!(before.get("focus") != after.get("focus"))
+                );
+            }
+        }
+        for malformed in &cases[..9] {
+            let diagnostic = background_page_state_diagnostic(malformed, malformed);
+            assert_eq!(
+                diagnostic["before"],
+                json!({"visibility": "Unknown", "focus": "Unknown"})
+            );
+        }
+        assert_eq!(
+            background_page_state_diagnostic(&cases[9], &cases[10]),
+            json!({
+                "before": {"visibility": "Visible", "focus": true},
+                "after": {"visibility": "Hidden", "focus": false},
+                "visibility_changed": true,
+                "focus_changed": true,
+                "record_changed": true,
+            })
+        );
+    }
     /// Static one-page masking and cleanup proof only. This does not establish
     /// recursive target enrollment, OOPIF projection, or dynamic paint fidelity.
     #[tokio::test]
@@ -1038,7 +1117,11 @@ mod tests {
             restore.map_err(|e|format!("Source cleanup: {e:?}"))?;masked?;
             let after=client.send_command("Runtime.evaluate",Some(read.clone()),Some(&session)).await?["result"]["value"].clone();
             let peer_after=client.send_command("Runtime.evaluate",Some(read),Some(&peer_session)).await?["result"]["value"].clone();
-            if after!=before||peer_after!=peer_before{return Err("Source capture changed host visibility/focus".into());}
+            if after!=before||peer_after!=peer_before{
+                eprintln!("CapturedPage {}", background_page_state_diagnostic(&before, &after));
+                eprintln!("PeerPage {}", background_page_state_diagnostic(&peer_before, &peer_after));
+                return Err("Source capture changed host visibility/focus".into());
+            }
             let clean=client.send_command("Runtime.evaluate",Some(json!({"expression":"(()=>{const f=window.__sourceMaskFixture;return f.root.querySelectorAll('style').length===0&&document.querySelectorAll('style').length===0&&getComputedStyle(f.input).opacity==='1'&&getComputedStyle(f.newInput).opacity==='1'&&f.input.style.left==='100px'&&f.input.value==='synthetic-only'})()","returnByValue":true})),Some(&session)).await?;
             if clean["result"]["value"]!=true{return Err("Source cleanup left a rule or overwrote concurrent author state".into());}
             for id in [&target,&peer]{let info=client.send_command("Target.getTargetInfo",Some(json!({"targetId":id})),None).await?;if info["targetInfo"]["targetId"]!=*id{return Err("Capture closed a host page".into());}}

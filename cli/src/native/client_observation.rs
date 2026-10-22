@@ -595,7 +595,28 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    if(!node)return null;if(node.nodeType===3)return composedSecure(node.parentElement||node.getRootNode()?.host)?null:node.textContent;
    return secureDescendants?safeLabelText(node):node.innerText;
  }
- const attrs={}; if(e) for(const a of e.attributes) if(!(secure&&a.name.toLowerCase()==='value')) attrs[a.name]=a.value;
+ // Reduce only the protected href scalar, before renderer metadata crosses
+ // the boundary. Exact reads keep authored attributes; resolution uses this
+ // receiver's current owner document, including base elements and frame bases.
+ function protectedHref(value){
+   const markers=(query,fragment)=>(query?'?…':'')+(fragment?'#…':'');
+   try {
+     const url=new URL(value,doc.baseURI),tail=markers(url.search!=='',url.hash!=='');
+     if(url.protocol==='blob:'){
+       let inner;try{inner=new URL(url.pathname);}catch{return 'blob:…';}
+       return inner.origin==='null'?'blob:…':'blob:'+inner.origin+inner.pathname+tail;
+     }
+     if(url.origin!=='null')return url.origin+url.pathname+tail;
+     if(url.protocol==='mailto:'||url.protocol==='tel:')return url.protocol+url.pathname+tail;
+     return url.protocol+'…';
+   } catch {
+     // Preserve the public malformed-target fallback and empty-tail distinction.
+     // Never include parser exceptions, which can contain the original target.
+     const fragment=value.indexOf('#'),before=fragment<0?value:value.slice(0,fragment),query=before.indexOf('?');
+     return (query<0?before:before.slice(0,query))+markers(query>=0&&query+1<before.length,fragment>=0&&fragment+1<value.length);
+   }
+ }
+ const attrs={}; if(e) for(const a of e.attributes) if(!(secure&&a.name.toLowerCase()==='value')) attrs[a.name]=boundedObservation&&a.name==='href'?protectedHref(a.value):a.value;
  const style=e?doc.defaultView.getComputedStyle(e):null;
  // Geometry and visibility are separate: a zero-area layout box is still
  // a box, and display:contents can paint descendants without having one.
@@ -1086,9 +1107,8 @@ fn project_node_with_refs(
                 "type" | "autocomplete" | "href" | "role" | "placeholder"
             ) || name.starts_with("aria-")
         });
-        if let Some(href) = node.attributes.get_mut("href") {
-            *href = href.split(['?', '#']).next().unwrap_or("").to_string();
-        }
+        // Bounded METADATA already reduced href against its exact document.
+        // Preserve its explicit query/fragment elision markers and whole path.
         for (field, limit) in [
             (&mut node.name, 256),
             (&mut node.text, 512),
@@ -5461,16 +5481,23 @@ mod tests {
         server.await.unwrap();
     }
     #[test]
-    fn observation_href_omits_tokens_but_full_read_preserves_requested_attribute() {
+    fn observation_preserves_href_elision_markers_but_full_read_keeps_raw_attribute() {
         let mut data = metadata();
-        data["attributes"]["href"] =
-            json!("https://fixture.invalid/path?token=synthetic-token#secret");
+        // The former markerless expectation contradicted the original public
+        // href contract. Shared JS tests exercise actual METADATA reduction;
+        // this unit checks that Rust preserves its already-protected result.
+        data["attributes"]["href"] = json!("https://fixture.invalid/path?…#…");
         let mut refs = observed_refs();
         let observed =
             project_node(&frame(), 1, &ax("a", 1, &[]), &mut refs, 1, &data, true).unwrap();
-        assert_eq!(observed.attributes["href"], "https://fixture.invalid/path");
+        assert_eq!(
+            observed.attributes["href"],
+            "https://fixture.invalid/path?…#…"
+        );
+        let raw = "https://fixture.invalid/path?token=synthetic-token#secret";
+        data["attributes"]["href"] = json!(raw);
         let full = project_node(&frame(), 1, &ax("a", 1, &[]), &mut refs, 1, &data, false).unwrap();
-        assert!(full.attributes["href"].contains("?token="));
+        assert_eq!(full.attributes["href"], raw);
     }
     #[test]
     fn secure_shadow_text_and_ancestor_names_never_serialize() {
