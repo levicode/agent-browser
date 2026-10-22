@@ -651,26 +651,32 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  }
  // A deliberately incomplete naming proof, not an alternate accname reader.
  // Native inventory must first rule out author shadow roots, including closed.
- function completeSimpleLabel(root,named){
-   const pending=[root];let text='',count=0;
+ function completeSimpleLabel(root,named,maxDepth=512,rejectHiddenDescendants=false){
+   const pending=[[root,0]];let text='',count=0;
    while(pending.length){
-     const n=pending.pop();if(++count>512)return null;
+     const [n,depth]=pending.pop();if(++count>512||depth>maxDepth)return null;
      if(n===' '){text+=' ';if(text.length>512)return null;continue;}
      if(n===named)continue;
      if(n.nodeType===3){const value=n.nodeValue||'';if(value.length>512-text.length)return null;text+=value;continue;}
      if(n.nodeType!==1)return null;
      if(composedSecure(n))return null;
      const css=doc.defaultView.getComputedStyle(n);
-     if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')continue;
+     if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden'){
+       // A hidden caption root is proven empty. Hidden descendants can still
+       // contribute block/BR separators in the original name computation;
+       // caption completion conservatively declines without reading them.
+       if(rejectHiddenDescendants&&n!==root)return null;
+       continue;
+     }
      if(n.shadowRoot||Element.prototype.matches.call(n,'input,textarea,select,button,meter,progress,output,img,svg,math,canvas,video,audio,iframe,slot,script,style')||
        ['aria-label','aria-labelledby','title','alt','role','contenteditable'].some(a=>n.hasAttribute(a)))return null;
      for(const pseudo of ['::before','::after']){
        const content=doc.defaultView.getComputedStyle(n,pseudo).content;
        if(content!=='none'&&content!=='normal'&&content!=='')return null;
      }
-     if(n!==root&&(n.localName==='br'||css.display!=='inline')){text+=' ';pending.push(' ');}
+     if(n!==root&&(n.localName==='br'||css.display!=='inline')){text+=' ';pending.push([' ',depth]);}
      if(text.length>512||n.childNodes.length>512-count||pending.length+n.childNodes.length>512)return null;
-     for(let i=n.childNodes.length-1;i>=0;i--)pending.push(n.childNodes[i]);
+     for(let i=n.childNodes.length-1;i>=0;i--)pending.push([n.childNodes[i],depth+1]);
    }
    return normalize(text);
  }
@@ -720,6 +726,90 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    // content and preserves internal whitespace, as the original reader does.
    const title=root.getAttribute('title')||'';
    return title.length<=512?title.trim():null;
+ }
+ // One explicit content shape only: an ordinary link, whitespace, and one
+ // SVG whose sole element child is a plain direct title. Do not relax the SVG
+ // rejection in either general simple-label or native-button proofs.
+ function completeRestrictedSvgLink(root){
+   function attributesOnly(node,allowed){
+     if(node.attributes.length>16)return false;
+     for(const attr of node.attributes)if(!allowed.includes(attr.name)||attr.value.length>512)return false;
+     return true;
+   }
+   function publicShape(node){
+     if(composedSecure(node)||node.shadowRoot)return false;
+     const css=doc.defaultView.getComputedStyle(node);
+     if((node.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')return false;
+     for(const pseudo of ['::before','::after']){
+       const content=doc.defaultView.getComputedStyle(node,pseudo).content;
+       if(content!=='none'&&content!=='normal'&&content!=='')return false;
+     }
+     return true;
+   }
+   let chars=0;
+   function soleElement(node){
+     if(node.childNodes.length>32)return null;
+     let element=null;
+     for(const child of node.childNodes){
+       if(child.nodeType===1){if(element)return null;element=child;}
+       else if(child.nodeType===3){const text=child.nodeValue||'';chars+=text.length;if(chars>512||text.trim())return null;}
+       else return null;
+     }
+     return element;
+   }
+   if(!publicShape(root)||root.isContentEditable||
+     !attributesOnly(root,['href','id','class','style','title','role','aria-hidden',testId]))return null;
+   const svg=soleElement(root);
+   if(!(svg instanceof SVGSVGElement)||!publicShape(svg)||
+     !attributesOnly(svg,['id','class','style','width','height','viewBox','x','y','xmlns','role','aria-hidden'])||
+     ![null,'none','presentation'].includes(svg.getAttribute('role')))return null;
+   const title=soleElement(svg);
+   if(!(title instanceof SVGTitleElement)||composedSecure(title)||title.shadowRoot||
+     !attributesOnly(title,['id'])||title.childNodes.length>32)return null;
+   let text='';
+   for(const child of title.childNodes){
+     if(child.nodeType!==3)return null;
+     const value=child.nodeValue||'';chars+=value.length;if(chars>512)return null;text+=value;
+   }
+   const name=normalize(text);
+   return name?{source:'svg-title',name}:null;
+ }
+ // A bounded editor-hint fact, not a text/value reader. Own hints persist
+ // with content. Descendant hints require the first nonblank hint on a proven
+ // trim-empty block, in DOM order; unsupported/hidden/secure trees decline.
+ function completeEditorPlaceholder(root){
+   const own=root.getAttribute('data-placeholder')||'';
+   if(own.length>512)return null;
+   if(own.trim())return {source:'host',name:own.trim()};
+   const candidates=[];let count=0,chars=0;
+   function empty(n,depth){
+     if(++count>512||depth>64)return null;
+     if(n.nodeType===3){
+       const value=n.nodeValue||'';chars+=value.length;
+       return chars<=512?value.trim()==='':null;
+     }
+     if(n.nodeType!==1||composedSecure(n)||n.shadowRoot)return null;
+     const css=doc.defaultView.getComputedStyle(n);
+     if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')return null;
+     if(n!==root&&(!(n instanceof HTMLElement)||!['div','p','span','br','abbr','b','strong','em','i','small'].includes(n.localName)||
+       ['contenteditable','role','aria-label','aria-labelledby','alt'].some(a=>n.hasAttribute(a))))return null;
+     for(const pseudo of ['::before','::after']){
+       const content=doc.defaultView.getComputedStyle(n,pseudo).content;
+       if(content!=='none'&&content!=='normal'&&content!=='')return null;
+     }
+     const hint=n===root?'':n.getAttribute('data-placeholder')||'';
+     if(hint.length>512||n.childNodes.length>512-count)return null;
+     const candidate={name:hint.trim(),empty:true};
+     if(candidate.name)candidates.push(candidate);
+     for(const child of n.childNodes){
+       const result=empty(child,depth+1);if(result===null)return null;
+       candidate.empty=candidate.empty&&result;
+     }
+     return candidate.empty;
+   }
+   if(empty(root,0)===null)return null;
+   const first=candidates.find(candidate=>candidate.empty);
+   return first?{source:'empty-descendant',name:first.name}:{source:'none',name:''};
  }
  function safeText(node){
    if(!node)return null;if(node.nodeType===3)return composedSecure(node.parentElement||node.getRootNode()?.host)?null:node.textContent;
@@ -850,6 +940,24 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const secureText=secure&&(!e||!Element.prototype.matches.call(e,'input,textarea,select'));
  const unsafeLabel=!!e&&(e.getAttribute('aria-labelledby')||'').split(/\s+/).some(id=>composedSecure(doc.getElementById(id)));
  const tag=e?e.localName:'';
+ let restrictedSvgLinkName=null;
+ if(simpleNameInventory&&tag==='a'&&e instanceof HTMLElement&&e.hasAttribute('href')&&!hidden&&!secure&&!secureDescendants&&!protectedEditor&&
+   associated.length===0&&!e.hasAttribute('aria-label')&&!e.hasAttribute('aria-labelledby')&&
+   (!e.hasAttribute('role')||e.getAttribute('role')==='link'))restrictedSvgLinkName=completeRestrictedSvgLink(e);
+ // Only the first matching direct child contributes. A proven empty caption
+ // falls through; null is unavailable, never evidence to clear an AX name.
+ let directCaptionName=null;
+ const captionTag={fieldset:'legend',figure:'figcaption',table:'caption'}[tag];
+ if(captionTag&&simpleNameInventory&&e instanceof HTMLElement&&!hidden&&!secure&&!secureDescendants&&!protectedEditor&&
+   associated.length===0&&!(e.getAttribute('aria-label')||'').trim()&&!(e.getAttribute('aria-labelledby')||'').trim()&&
+   !e.shadowRoot&&e.childNodes.length<=512){
+   for(const child of e.childNodes){
+     if(child.nodeType!==1||child.localName!==captionTag)continue;
+     const name=completeSimpleLabel(child,e,64,true);
+     if(name!==null)directCaptionName={source:captionTag,name};
+     break;
+   }
+ }
  let pageLevelLandmark=null;
  if(tag==='header'||tag==='footer'){
    pageLevelLandmark=true;
@@ -875,6 +983,11 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const editingHost=!!e&&e instanceof HTMLElement&&e.isContentEditable&&
    !['svg','math','canvas','video','audio','iframe','img','hr','br','wbr','area','a','button','input','textarea','select'].includes(tag)&&
    !(e.parentElement instanceof HTMLElement&&e.parentElement.isContentEditable);
+ let editorPlaceholder=null;
+ if(editingHost&&simpleNameInventory&&!hidden&&!secure&&!secureDescendants&&!protectedEditor&&associated.length===0&&
+   ['aria-label','aria-labelledby','title','placeholder','aria-placeholder'].every(a=>!(e.getAttribute(a)||'').trim())&&
+   (!e.hasAttribute('role')||['','textbox','searchbox'].includes(e.getAttribute('role').trim()))&& !e.shadowRoot)
+   editorPlaceholder=completeEditorPlaceholder(e);
  let editorValue=null;
  if(editingHost&&!secure&&!secureDescendants&&!protectedEditor){
    // innerText supplies browser-rendered spaces/newlines, not a second DOM reader.
@@ -915,7 +1028,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  if(nativeOption)controlStates.selected=e.selected;
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
  const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
- return {author,controlStates,pageLevelLandmark,formOwnName,singleCellHeader,completeButtonContentName,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
+ return {author,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,formOwnName,singleCellHeader,completeButtonContentName,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure||(boundedObservation&&checkable)?null:editingHost?editorValue:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
@@ -967,6 +1080,31 @@ async fn read_backend(
     apply_security(&mut node, backend, &security);
     Ok(node)
 }
+// Renderer naming contributions carry a bounded, closed source kind. Missing
+// or null is unavailable; an empty name is proven empty with source-specific
+// fallthrough semantics, never a generic instruction to clear native naming.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceNameFact {
+    source: String,
+    name: String,
+}
+fn source_name_fact(
+    data: &Value,
+    field: &str,
+    sources: &[&str],
+) -> Result<Option<SourceNameFact>, ObservationError> {
+    let Some(value) = data.get(field).filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let fact: SourceNameFact =
+        serde_json::from_value(value.clone()).map_err(|_| ObservationError::BackendFailure)?;
+    if !sources.contains(&fact.source.as_str()) || fact.name.encode_utf16().count() > 512 {
+        return Err(ObservationError::BackendFailure);
+    }
+    Ok(Some(fact))
+}
+
 fn project_node(
     frame: &ObservationFrame,
     backend: i64,
@@ -1155,6 +1293,131 @@ fn project_node_with_refs(
                 .is_none_or(|role| role == "button")
         {
             node.name = (!name.is_empty()).then(|| name.to_owned());
+        }
+    }
+    if let Some(fact) = source_name_fact(
+        data,
+        "directCaptionName",
+        &["legend", "figcaption", "caption"],
+    )? {
+        let expected = match node.author.as_ref().map(|facts| facts.tag.as_str()) {
+            Some("fieldset") => Some("legend"),
+            Some("figure") => Some("figcaption"),
+            Some("table") => Some("caption"),
+            _ => None,
+        };
+        if expected != Some(fact.source.as_str()) {
+            return Err(ObservationError::BackendFailure);
+        }
+        // Captions precede title/content fallback, but not IDREF, aria-label,
+        // associated labels, or security selection. Empty captions do not clear.
+        if !fact.name.is_empty()
+            && data["__nativeReadonlyPseudo"] != true
+            && data["states"]["secure"] != true
+            && data["secureDescendants"] != true
+            && data["redactName"] != true
+            && data["labels"].as_array().is_some_and(Vec::is_empty)
+            && ["aria-label", "aria-labelledby"].iter().all(|attribute| {
+                data["attributes"][*attribute]
+                    .as_str()
+                    .is_none_or(|value| value.trim_matches(ecmascript_whitespace).is_empty())
+            })
+        {
+            node.name = Some(fact.name);
+        }
+    }
+    if let Some(fact) = source_name_fact(
+        data,
+        "editorPlaceholder",
+        &["host", "empty-descendant", "none"],
+    )? {
+        let own = data["attributes"]["data-placeholder"]
+            .as_str()
+            .unwrap_or("")
+            .trim_matches(ecmascript_whitespace);
+        if (fact.source == "none") != fact.name.is_empty()
+            || (fact.source == "host" && (own.is_empty() || own != fact.name))
+            || (fact.source != "host" && !own.is_empty())
+            || fact.name.trim_matches(ecmascript_whitespace) != fact.name
+        {
+            return Err(ObservationError::BackendFailure);
+        }
+        // This final fallback only fills missing naming, after all earlier
+        // sources. A complete absence is not a generic instruction to clear AX.
+        if node.name.is_none()
+            && !fact.name.is_empty()
+            && data["editingHost"] == true
+            && matches!(node.role.as_deref(), Some("textbox" | "searchbox"))
+            && node.author.as_ref().is_some_and(|facts| {
+                !matches!(
+                    facts.tag.as_str(),
+                    "svg"
+                        | "math"
+                        | "canvas"
+                        | "video"
+                        | "audio"
+                        | "iframe"
+                        | "img"
+                        | "hr"
+                        | "br"
+                        | "wbr"
+                        | "area"
+                        | "a"
+                        | "button"
+                        | "input"
+                        | "textarea"
+                        | "select"
+                )
+            })
+            && data["__nativeReadonlyPseudo"] != true
+            && data["states"]["secure"] != true
+            && data["secureDescendants"] != true
+            && data["redactName"] != true
+            && data["labels"].as_array().is_some_and(Vec::is_empty)
+            && [
+                "aria-label",
+                "aria-labelledby",
+                "title",
+                "placeholder",
+                "aria-placeholder",
+            ]
+            .iter()
+            .all(|attribute| {
+                data["attributes"][*attribute]
+                    .as_str()
+                    .is_none_or(|value| value.trim_matches(ecmascript_whitespace).is_empty())
+            })
+        {
+            node.name = Some(fact.name);
+        }
+    }
+    if let Some(fact) = source_name_fact(data, "restrictedSvgLinkName", &["svg-title"])? {
+        if fact.name.is_empty()
+            || fact
+                .name
+                .split(ecmascript_whitespace)
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join(" ")
+                != fact.name
+            || !node.author.as_ref().is_some_and(|facts| facts.tag == "a")
+        {
+            return Err(ObservationError::BackendFailure);
+        }
+        if node.role.as_deref() == Some("link")
+            && data["attributes"]["href"].is_string()
+            && data["__nativeReadonlyPseudo"] != true
+            && data["states"]["secure"] != true
+            && data["secureDescendants"] != true
+            && data["redactName"] != true
+            && data["labels"].as_array().is_some_and(Vec::is_empty)
+            && data["attributes"]["aria-label"].is_null()
+            && data["attributes"]["aria-labelledby"].is_null()
+            && data["attributes"]["role"]
+                .as_str()
+                .is_none_or(|role| role == "link")
+        {
+            node.name = Some(fact.name);
         }
     }
     node.safe_public_name = data["safePublicName"]
@@ -4011,6 +4274,571 @@ mod tests {
         }
         data["safePublicName"] = json!("Safe public name");
         assert_eq!(project(&native, &data).as_deref(), Some("Safe public name"));
+    }
+
+    #[test]
+    fn direct_caption_facts_share_exact_query_and_bounded_projection() {
+        for (tag, source) in [
+            ("fieldset", "legend"),
+            ("figure", "figcaption"),
+            ("table", "caption"),
+        ] {
+            for bounded in [false, true] {
+                let mut data = metadata();
+                data["author"]["tag"] = json!(tag);
+                data["attributes"]["title"] = json!("Lower priority");
+                let native = ax("caption-parent", 42, &[]);
+                for (fact, expected) in [
+                    (
+                        json!({"source":source,"name":"Caption name"}),
+                        "Caption name",
+                    ),
+                    (json!({"source":source,"name":""}), "Save"),
+                    (Value::Null, "Save"),
+                ] {
+                    data["directCaptionName"] = fact;
+                    let exact = project_node(
+                        &frame(),
+                        42,
+                        &native,
+                        &mut observed_refs(),
+                        1,
+                        &data,
+                        bounded,
+                    )
+                    .unwrap();
+                    let candidate =
+                        project_node_with_refs(&frame(), 42, &native, None, 1, &data, bounded)
+                            .unwrap();
+                    assert_eq!(exact.name.as_deref(), Some(expected));
+                    assert_eq!(candidate.name, exact.name);
+                    assert_eq!(
+                        query_match_metadata(&[candidate]).unwrap()[0]["name"],
+                        expected
+                    );
+                }
+                data["directCaptionName"] = json!({"source":source,"name":"x".repeat(512)});
+                let node = project_node(
+                    &frame(),
+                    42,
+                    &native,
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    bounded,
+                )
+                .unwrap();
+                assert_eq!(node.name.unwrap().len(), if bounded { 256 } else { 512 });
+            }
+        }
+    }
+
+    #[test]
+    fn unavailable_hidden_caption_shape_preserves_native_separators() {
+        let mut native = ax("figure", 42, &[]);
+        native.name.as_mut().unwrap().value = Some(json!("A C"));
+        let mut data = metadata();
+        data["author"]["tag"] = json!("figure");
+        // Hidden descendant shapes have no complete proof. This is not a
+        // proven-empty caption and cannot overwrite the native name as "AC".
+        data["directCaptionName"] = Value::Null;
+        for bounded in [false, true] {
+            let node = project_node(
+                &frame(),
+                42,
+                &native,
+                &mut observed_refs(),
+                1,
+                &data,
+                bounded,
+            )
+            .unwrap();
+            assert_eq!(node.name.as_deref(), Some("A C"));
+        }
+    }
+
+    #[test]
+    fn direct_caption_facts_preserve_higher_priority_and_security_clears() {
+        let native = ax("figure", 42, &[]);
+        let mut data = metadata();
+        data["author"]["tag"] = json!("figure");
+        data["directCaptionName"] = json!({"source":"figcaption","name":"Caption"});
+        let project = |data: &Value| {
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, data, false)
+                .unwrap()
+                .name
+        };
+        for attribute in ["aria-label", "aria-labelledby"] {
+            data["attributes"][attribute] = json!("Higher priority");
+            assert_eq!(project(&data).as_deref(), Some("Save"));
+            data["attributes"][attribute] = json!(" \t\u{feff}");
+            assert_eq!(project(&data).as_deref(), Some("Caption"));
+            data["attributes"] = json!({});
+        }
+        data["labels"] = json!(["Associated label"]);
+        assert_eq!(project(&data).as_deref(), Some("Save"));
+        data["labels"] = json!([]);
+        for flag in ["__nativeReadonlyPseudo", "states.secure"] {
+            if flag == "states.secure" {
+                data["states"]["secure"] = json!(true);
+            } else {
+                data[flag] = json!(true);
+            }
+            assert_eq!(project(&data).as_deref(), Some("Save"));
+            if flag == "states.secure" {
+                data["states"]["secure"] = json!(false);
+            } else {
+                data[flag] = json!(false);
+            }
+        }
+        for flag in ["secureDescendants", "redactName", "completeEmptyReference"] {
+            data[flag] = json!(true);
+            assert_eq!(project(&data), None);
+            data[flag] = json!(false);
+        }
+        data["safePublicName"] = json!("Approved public name");
+        assert_eq!(project(&data).as_deref(), Some("Approved public name"));
+        data["safePublicName"] = json!("");
+        data["redactName"] = json!(true);
+        assert_eq!(project(&data), None);
+    }
+
+    #[test]
+    fn direct_caption_facts_reject_malformed_or_mismatched_sources() {
+        for invalid in [
+            json!(true),
+            json!("caption"),
+            json!({}),
+            json!({"source":"figcaption","name":false}),
+            json!({"source":"legend","name":"Wrong parent"}),
+            json!({"source":"unknown","name":"Unsupported source"}),
+            json!({"source":"figcaption","name":"Name","extra":true}),
+            json!({"source":"figcaption","name":"x".repeat(513)}),
+            json!({"source":"figcaption","name":"😀".repeat(257)}),
+        ] {
+            let mut data = metadata();
+            data["author"]["tag"] = json!("figure");
+            data["directCaptionName"] = invalid;
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &ax("figure", 42, &[]),
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    true
+                )
+                .unwrap_err(),
+                ObservationError::BackendFailure
+            );
+        }
+        let mut data = metadata();
+        data["directCaptionName"] = json!({"source":"figcaption","name":"Not a figure"});
+        assert_eq!(
+            project_node(
+                &frame(),
+                42,
+                &ax("button", 42, &[]),
+                &mut observed_refs(),
+                1,
+                &data,
+                false
+            )
+            .unwrap_err(),
+            ObservationError::BackendFailure
+        );
+    }
+
+    #[test]
+    fn editor_placeholder_facts_share_projection_without_using_editor_value() {
+        let mut native = ax("editor", 42, &[]);
+        native.name = None;
+        for role in ["textbox", "searchbox"] {
+            for bounded in [false, true] {
+                for source in ["host", "empty-descendant"] {
+                    for value in ["", "Hello"] {
+                        let mut data = metadata();
+                        data["author"]["tag"] = json!("div");
+                        data["editingHost"] = json!(true);
+                        data["attributes"]["role"] = json!(role);
+                        data["value"] = json!(value);
+                        data["editorPlaceholder"] = json!({"source":source,"name":"Write  here"});
+                        if source == "host" {
+                            data["attributes"]["data-placeholder"] = json!(" Write  here ");
+                        }
+                        let exact = project_node(
+                            &frame(),
+                            42,
+                            &native,
+                            &mut observed_refs(),
+                            1,
+                            &data,
+                            bounded,
+                        )
+                        .unwrap();
+                        let candidate =
+                            project_node_with_refs(&frame(), 42, &native, None, 1, &data, bounded)
+                                .unwrap();
+                        assert_eq!(exact.name.as_deref(), Some("Write  here"));
+                        assert_eq!(exact.role.as_deref(), Some(role));
+                        assert_eq!(exact.value.as_deref(), Some(value));
+                        assert_eq!(candidate.name, exact.name);
+                        assert_eq!(
+                            query_match_metadata(&[candidate]).unwrap()[0]["name"],
+                            "Write  here"
+                        );
+                        data["attributes"]
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("data-placeholder");
+                        for fact in [Value::Null, json!({"source":"none","name":""})] {
+                            data["editorPlaceholder"] = fact;
+                            assert_eq!(
+                                project_node(
+                                    &frame(),
+                                    42,
+                                    &native,
+                                    &mut observed_refs(),
+                                    1,
+                                    &data,
+                                    bounded
+                                )
+                                .unwrap()
+                                .name,
+                                None
+                            );
+                        }
+                    }
+                }
+                let mut data = metadata();
+                data["author"]["tag"] = json!("div");
+                data["editingHost"] = json!(true);
+                data["editorPlaceholder"] =
+                    json!({"source":"empty-descendant","name":"x".repeat(512)});
+                assert_eq!(
+                    project_node(
+                        &frame(),
+                        42,
+                        &native,
+                        &mut observed_refs(),
+                        1,
+                        &data,
+                        bounded
+                    )
+                    .unwrap()
+                    .name
+                    .unwrap()
+                    .len(),
+                    if bounded { 256 } else { 512 }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn editor_placeholder_facts_preserve_priority_role_and_security_selection() {
+        let mut native = ax("editor", 42, &[]);
+        native.name = None;
+        let mut data = metadata();
+        data["author"]["tag"] = json!("div");
+        data["editingHost"] = json!(true);
+        data["editorPlaceholder"] = json!({"source":"empty-descendant","name":"Editor hint"});
+        let project = |native: &AXNode, data: &Value| {
+            project_node(&frame(), 42, native, &mut observed_refs(), 1, data, false)
+                .unwrap()
+                .name
+        };
+        assert_eq!(project(&native, &data).as_deref(), Some("Editor hint"));
+        for attribute in [
+            "aria-label",
+            "aria-labelledby",
+            "title",
+            "placeholder",
+            "aria-placeholder",
+        ] {
+            data["attributes"][attribute] = json!("Higher priority");
+            assert_eq!(project(&native, &data), None);
+            data["attributes"][attribute] = json!(" \t\u{feff}");
+            assert_eq!(project(&native, &data).as_deref(), Some("Editor hint"));
+            data["attributes"] = json!({});
+        }
+        data["labels"] = json!(["Associated"]);
+        assert_eq!(project(&native, &data), None);
+        data["labels"] = json!([]);
+        for role in ["button", "link", "none", "checkbox"] {
+            data["attributes"]["role"] = json!(role);
+            assert_eq!(project(&native, &data), None);
+        }
+        data["attributes"] = json!({});
+        for tag in [
+            "input", "button", "textarea", "svg", "canvas", "iframe", "a",
+        ] {
+            data["author"]["tag"] = json!(tag);
+            assert_eq!(project(&native, &data), None);
+        }
+        data["author"]["tag"] = json!("div");
+        data["editingHost"] = json!(false);
+        assert_eq!(project(&native, &data), None);
+        data["editingHost"] = json!(true);
+        for flag in [
+            "__nativeReadonlyPseudo",
+            "secureDescendants",
+            "redactName",
+            "completeEmptyReference",
+        ] {
+            data[flag] = json!(true);
+            assert_eq!(project(&native, &data), None);
+            data[flag] = json!(false);
+        }
+        data["states"]["secure"] = json!(true);
+        assert_eq!(project(&native, &data), None);
+        data["states"]["secure"] = json!(false);
+        data["safePublicName"] = json!("Approved name");
+        assert_eq!(project(&native, &data).as_deref(), Some("Approved name"));
+        data["safePublicName"] = Value::Null;
+        native.name = ax("named", 42, &[]).name;
+        for fact in [
+            json!({"source":"empty-descendant","name":"Editor hint"}),
+            json!({"source":"none","name":""}),
+            Value::Null,
+        ] {
+            data["editorPlaceholder"] = fact;
+            assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        }
+    }
+
+    #[test]
+    fn editor_placeholder_facts_reject_malformed_and_inconsistent_sources() {
+        for fact in [
+            json!(true),
+            json!("hint"),
+            json!({}),
+            json!({"source":"empty-descendant","name":false}),
+            json!({"source":"unknown","name":"Hint"}),
+            json!({"source":"none","name":"Not empty"}),
+            json!({"source":"empty-descendant","name":""}),
+            json!({"source":"empty-descendant","name":"  "}),
+            json!({"source":"empty-descendant","name":"Hint "}),
+            json!({"source":"host","name":"Missing own attribute"}),
+            json!({"source":"empty-descendant","name":"Hint","extra":true}),
+            json!({"source":"empty-descendant","name":"x".repeat(513)}),
+            json!({"source":"empty-descendant","name":"😀".repeat(257)}),
+        ] {
+            let mut data = metadata();
+            data["editorPlaceholder"] = fact;
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &ax("editor", 42, &[]),
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    true
+                )
+                .unwrap_err(),
+                ObservationError::BackendFailure
+            );
+        }
+        for source in ["none", "empty-descendant", "host"] {
+            let mut data = metadata();
+            data["attributes"]["data-placeholder"] = json!("Host wins");
+            data["editorPlaceholder"] = json!({"source":source,"name":if source == "none" { "" } else { "Different hint" }});
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &ax("editor", 42, &[]),
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    false
+                )
+                .unwrap_err(),
+                ObservationError::BackendFailure
+            );
+        }
+    }
+
+    #[test]
+    fn restricted_svg_link_facts_share_projection_and_preserve_independent_svg() {
+        let mut native = ax("link", 42, &[]);
+        native.role.as_mut().unwrap().value = Some(json!("link"));
+        for bounded in [false, true] {
+            let mut data = metadata();
+            data["author"]["tag"] = json!("a");
+            data["attributes"] = json!({"href":"/home","title":"Lower priority"});
+            data["restrictedSvgLinkName"] = json!({"source":"svg-title","name":"Home"});
+            let exact = project_node(
+                &frame(),
+                42,
+                &native,
+                &mut observed_refs(),
+                1,
+                &data,
+                bounded,
+            )
+            .unwrap();
+            let candidate =
+                project_node_with_refs(&frame(), 42, &native, None, 1, &data, bounded).unwrap();
+            assert_eq!(exact.role.as_deref(), Some("link"));
+            assert_eq!(exact.name.as_deref(), Some("Home"));
+            assert_eq!(candidate.name, exact.name);
+            assert_eq!(
+                query_match_metadata(&[candidate]).unwrap()[0]["name"],
+                "Home"
+            );
+            data["restrictedSvgLinkName"] = json!({"source":"svg-title","name":"x".repeat(512)});
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &native,
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    bounded
+                )
+                .unwrap()
+                .name
+                .unwrap()
+                .len(),
+                if bounded { 256 } else { 512 }
+            );
+            data["restrictedSvgLinkName"] = Value::Null;
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &native,
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    bounded
+                )
+                .unwrap()
+                .name
+                .as_deref(),
+                Some("Save")
+            );
+            data["author"]["tag"] = json!("svg");
+            data["attributes"] = json!({});
+            native.role.as_mut().unwrap().value = Some(json!("img"));
+            let svg = project_node(
+                &frame(),
+                42,
+                &native,
+                &mut observed_refs(),
+                1,
+                &data,
+                bounded,
+            )
+            .unwrap();
+            assert_eq!(svg.role.as_deref(), Some("image"));
+            assert_eq!(svg.name.as_deref(), Some("Save"));
+            native.role.as_mut().unwrap().value = Some(json!("link"));
+        }
+    }
+
+    #[test]
+    fn restricted_svg_link_facts_preserve_priority_and_security() {
+        let mut native = ax("link", 42, &[]);
+        native.role.as_mut().unwrap().value = Some(json!("link"));
+        let mut data = metadata();
+        data["author"]["tag"] = json!("a");
+        data["attributes"] = json!({"href":"/home"});
+        data["restrictedSvgLinkName"] = json!({"source":"svg-title","name":"Home"});
+        let project = |native: &AXNode, data: &Value| {
+            project_node(&frame(), 42, native, &mut observed_refs(), 1, data, false)
+                .unwrap()
+                .name
+        };
+        for attr in ["aria-label", "aria-labelledby"] {
+            for value in ["", "Higher priority"] {
+                data["attributes"][attr] = json!(value);
+                assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+            }
+            data["attributes"] = json!({"href":"/home"});
+        }
+        for role in ["none", "button", "unknown link"] {
+            data["attributes"]["role"] = json!(role);
+            assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        }
+        data["attributes"] = json!({"href":"/home"});
+        data["labels"] = json!(["Associated"]);
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        data["labels"] = json!([]);
+        native.role.as_mut().unwrap().value = Some(json!("button"));
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        native.role.as_mut().unwrap().value = Some(json!("link"));
+        data["attributes"] = json!({});
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        data["attributes"] = json!({"href":"/home"});
+        data["__nativeReadonlyPseudo"] = json!(true);
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        data["__nativeReadonlyPseudo"] = json!(false);
+        data["states"]["secure"] = json!(true);
+        assert_eq!(project(&native, &data).as_deref(), Some("Save"));
+        data["states"]["secure"] = json!(false);
+        for flag in ["secureDescendants", "redactName", "completeEmptyReference"] {
+            data[flag] = json!(true);
+            assert_eq!(project(&native, &data), None);
+            data[flag] = json!(false);
+        }
+        data["safePublicName"] = json!("Approved public name");
+        assert_eq!(
+            project(&native, &data).as_deref(),
+            Some("Approved public name")
+        );
+    }
+
+    #[test]
+    fn restricted_svg_link_facts_reject_malformed_and_wrong_receiver() {
+        for fact in [
+            json!(true),
+            json!({}),
+            json!({"source":"other","name":"Home"}),
+            json!({"source":"svg-title","name":""}),
+            json!({"source":"svg-title","name":" Home"}),
+            json!({"source":"svg-title","name":"Home  page"}),
+            json!({"source":"svg-title","name":false}),
+            json!({"source":"svg-title","name":"Home","extra":true}),
+            json!({"source":"svg-title","name":"x".repeat(513)}),
+        ] {
+            let mut data = metadata();
+            data["author"]["tag"] = json!("a");
+            data["restrictedSvgLinkName"] = fact;
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &ax("link", 42, &[]),
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    true
+                )
+                .unwrap_err(),
+                ObservationError::BackendFailure
+            );
+        }
+        let mut data = metadata();
+        data["author"]["tag"] = json!("svg");
+        data["restrictedSvgLinkName"] = json!({"source":"svg-title","name":"Must not name SVG"});
+        assert_eq!(
+            project_node(
+                &frame(),
+                42,
+                &ax("svg", 42, &[]),
+                &mut observed_refs(),
+                1,
+                &data,
+                false
+            )
+            .unwrap_err(),
+            ObservationError::BackendFailure
+        );
     }
 
     #[test]

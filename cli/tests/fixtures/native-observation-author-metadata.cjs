@@ -569,3 +569,267 @@ for (const bounded of [false, true]) {
   assert.equal(read.call(detachedHeader, 'data-testid', '.secure', bounded).singleCellHeader, false);
 }
 console.log('PASS: original form own-name presence and sole-cell header facts preserve whitespace, scope and multirow boundaries');
+
+// First direct caption names its parent before title/content fallback. These
+// exercise the actual shared metadata, not a replacement naming algorithm.
+const captionStyle = document.defaultView.getComputedStyle;
+const captionMatches = Element.prototype.matches;
+document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+Element.prototype.matches = function(selector) {
+  return selector.split(',').includes(this.localName) || captionMatches.call(this, selector);
+};
+function namingElement(tag, children = [], attrs = {}) {
+  const node = attributes(new Element(), attrs);
+  node.localName = tag; node.childNodes = children; node.innerText = ''; node.textContent = '';
+  for (const child of children) child.parentElement = node;
+  return node;
+}
+const captionFacts = (node, bounded = false, protectedEditor = false, inventory = true) => read.call(node, 'data-testid', '.secure', bounded, protectedEditor, inventory).directCaptionName;
+for (const [tag, source, name] of [['fieldset', 'legend', 'Notifications'], ['figure', 'figcaption', 'Figure one'], ['table', 'caption', 'Scores']]) {
+  const first = namingElement(source, [new Text(`  ${name}\n`, null)]);
+  const second = namingElement(source, [new Text('Never selected', null)]);
+  const parent = namingElement(tag, [new Text('Body ignored', null), first, second], { title: 'Lower priority' });
+  for (const bounded of [false, true]) assert.deepEqual(captionFacts(parent, bounded), { source, name });
+  first.childNodes = [new Text(' \t\ufeff', first)];
+  assert.deepEqual(captionFacts(parent), { source, name: '' });
+  first.childNodes = [namingElement('span', [new Text('Nested plain', null)])];
+  assert.deepEqual(captionFacts(parent), { source, name: 'Nested plain' });
+  for (const attr of ['aria-label', 'aria-labelledby']) {
+    attributes(parent, { [attr]: 'Higher priority' }); assert.equal(captionFacts(parent), null);
+    attributes(parent, { [attr]: ' \t' }); assert.equal(captionFacts(parent).name, 'Nested plain');
+  }
+  attributes(parent, {});
+  parent.labels = [namingElement('label')]; assert.equal(captionFacts(parent), null); parent.labels = [];
+  assert.equal(captionFacts(parent, false, false, false), null);
+  assert.equal(captionFacts(parent, false, true), null);
+  parent.secure = true; assert.equal(captionFacts(parent), null); parent.secure = false;
+  parent.shadowRoot = {}; assert.equal(captionFacts(parent), null); delete parent.shadowRoot;
+  parent.checkVisibility = () => false; assert.equal(captionFacts(parent), null); parent.checkVisibility = () => true;
+  first.nameDisplay = 'none'; assert.deepEqual(captionFacts(parent), { source, name: '' }); delete first.nameDisplay;
+  first.nameVisibility = 'hidden'; assert.deepEqual(captionFacts(parent), { source, name: '' }); delete first.nameVisibility;
+  attributes(first, { 'aria-hidden': 'true' }); assert.deepEqual(captionFacts(parent), { source, name: '' }); attributes(first, {});
+  for (const attrs of [{ title: 'Rich' }, { 'aria-label': 'Rich' }, { 'aria-labelledby': 'other' }, { role: 'button' }, { contenteditable: 'true' }]) {
+    attributes(first, attrs); assert.equal(captionFacts(parent), null);
+  }
+  attributes(first, {}); first.generated = '"generated"'; assert.equal(captionFacts(parent), null); delete first.generated;
+  for (const rich of ['input', 'svg', 'img', 'button', 'canvas', 'slot']) {
+    first.childNodes = [namingElement(rich)]; assert.equal(captionFacts(parent), null);
+  }
+  first.childNodes = [new Text('x'.repeat(513), first)]; assert.equal(captionFacts(parent), null);
+  first.childNodes = Array.from({ length: 513 }, () => new Text('', first)); assert.equal(captionFacts(parent), null);
+  let deep = namingElement('span'); for (let i = 0; i < 65; i++) deep = namingElement('span', [deep]);
+  first.childNodes = [deep]; assert.equal(captionFacts(parent), null);
+  first.secure = true;
+  Object.defineProperty(first, 'childNodes', { get() { throw Error('Secure caption content acquired'); } });
+  assert.equal(captionFacts(parent), null);
+  const nestedOnly = namingElement(tag, [namingElement('div', [second])]); assert.equal(captionFacts(nestedOnly), null);
+  const tooMany = namingElement(tag, Array.from({ length: 513 }, () => namingElement('span'))); assert.equal(captionFacts(tooMany), null);
+}
+assert.equal(captionFacts(namingElement('div', [namingElement('figcaption', [new Text('Not a figure', null)])])), null);
+document.defaultView.getComputedStyle = captionStyle;
+Element.prototype.matches = captionMatches;
+console.log('PASS: first direct-caption source facts preserve priority, empty fallthrough, native inventory, security, complexity and resource bounds');
+
+// Editing-host hint provenance keeps host and first empty descendant separate.
+// Empty testing reads only bounded, proven public text nodes, never block values.
+const editorHintStyle = document.defaultView.getComputedStyle;
+document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'block', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+function hintHost(children = [], attrs = {}) {
+  const node = namingElement('div', children, attrs); node.isContentEditable = true; return node;
+}
+const hintBlock = (name, children = []) => namingElement('p', children, { 'data-placeholder': name });
+const editorHint = (node, bounded = false, protectedEditor = false, inventory = true) => read.call(node, 'data-testid', '.secure', bounded, protectedEditor, inventory).editorPlaceholder;
+const emptyHint = hintBlock('  Write something  ', [namingElement('br')]);
+const tiptap = hintHost([emptyHint]);
+for (const bounded of [false, true]) assert.deepEqual(editorHint(tiptap, bounded), { source: 'empty-descendant', name: 'Write something' });
+emptyHint.childNodes = [new Text('Hello', emptyHint)];
+assert.deepEqual(editorHint(tiptap), { source: 'none', name: '' });
+emptyHint.childNodes = [new Text(' \t\ufeff', emptyHint)];
+assert.equal(editorHint(tiptap).name, 'Write something');
+tiptap.childNodes = [];
+assert.deepEqual(editorHint(tiptap), { source: 'none', name: '' });
+const quill = hintHost([hintBlock('Child hint')], { 'data-placeholder': '  Compose  a message  ' });
+for (const text of ['', 'Hello', 'x'.repeat(1000)]) {
+  quill.textContent = text; quill.innerText = text;
+  quill.childNodes = [new Text(text, quill)];
+  assert.deepEqual(editorHint(quill), { source: 'host', name: 'Compose  a message' });
+  assert.deepEqual(editorHint(quill, true), { source: 'host', name: 'Compose  a message' });
+}
+quill.childNodes = [hintBlock('Child hint')];
+assert.equal(editorHint(quill).name, 'Compose  a message');
+const later = hintBlock('Later hint');
+const order = hintHost([hintBlock('  '), hintBlock('Typed first', [new Text('Content', null)]), later, hintBlock('Last')]);
+assert.equal(editorHint(order).name, 'Later hint');
+const nestedHint = hintHost([namingElement('div', [hintBlock('Nested')])]);
+assert.equal(editorHint(nestedHint).name, 'Nested');
+const parentHint = hintBlock('Parent', [hintBlock('Nested')]);
+assert.equal(editorHint(hintHost([parentHint])).name, 'Parent');
+assert.equal(editorHint(order, false, false, false), null);
+assert.equal(editorHint(order, false, true), null);
+for (const attr of ['aria-label', 'aria-labelledby', 'title', 'placeholder', 'aria-placeholder']) {
+  attributes(order, { [attr]: 'Higher priority' }); assert.equal(editorHint(order), null);
+  attributes(order, { [attr]: ' \t\ufeff' }); assert.equal(editorHint(order).name, 'Later hint');
+}
+attributes(order, {});
+for (const role of ['textbox', 'searchbox', '', ' textbox ']) {
+  attributes(order, { role }); assert.equal(editorHint(order).name, 'Later hint');
+}
+for (const role of ['button', 'link', 'none', 'unknown textbox']) {
+  attributes(order, { role }); assert.equal(editorHint(order), null);
+}
+attributes(order, {});
+for (const tag of ['button', 'input', 'textarea', 'canvas', 'svg', 'iframe', 'a']) {
+  order.localName = tag; assert.equal(editorHint(order), null);
+}
+order.localName = 'div'; order.isContentEditable = false; assert.equal(editorHint(order), null); order.isContentEditable = true;
+order.parentElement = hintHost(); assert.equal(editorHint(order), null); order.parentElement = null;
+order.labels = [namingElement('label')]; assert.equal(editorHint(order), null); order.labels = [];
+order.secure = true; assert.equal(editorHint(order), null); order.secure = false;
+order.shadowRoot = {}; assert.equal(editorHint(order), null); delete order.shadowRoot;
+order.checkVisibility = () => false; assert.equal(editorHint(order), null); order.checkVisibility = () => true;
+for (const hidden of ['display', 'visibility', 'aria']) {
+  const block = hintBlock('Hidden hint');
+  if (hidden === 'display') block.nameDisplay = 'none';
+  if (hidden === 'visibility') block.nameVisibility = 'hidden';
+  if (hidden === 'aria') attributes(block, { 'data-placeholder': 'Hidden hint', 'aria-hidden': 'true' });
+  Object.defineProperty(block, 'childNodes', { get() { throw Error('Hidden hint content acquired'); } });
+  assert.equal(editorHint(hintHost([block, later])), null);
+}
+for (const tag of ['input', 'svg', 'canvas', 'slot', 'button', 'custom-editor']) {
+  const unsupported = namingElement(tag);
+  Object.defineProperty(unsupported, 'childNodes', { get() { throw Error('Unsupported hint content acquired'); } });
+  assert.equal(editorHint(hintHost([unsupported, later])), null);
+}
+for (const attrs of [{ contenteditable: 'false' }, { role: 'button' }, { 'aria-label': 'Named' }, { 'aria-labelledby': 'label' }, { alt: 'Alternative' }]) {
+  const block = hintBlock('Unsupported'); attributes(block, { 'data-placeholder': 'Unsupported', ...attrs });
+  assert.equal(editorHint(hintHost([block])), null);
+}
+const generatedHint = hintBlock('Generated'); generatedHint.generated = '"extra"';
+assert.equal(editorHint(hintHost([generatedHint])), null);
+const secureHint = hintBlock('Never expose hint'); secureHint.secure = true;
+Object.defineProperty(secureHint, 'childNodes', { get() { throw Error('Secure hint content acquired'); } });
+const secretHost = hintHost([secureHint]);
+const hintQuerySelector = Element.prototype.querySelector;
+Element.prototype.querySelector = function(selector) { return this === secretHost ? secureHint : hintQuerySelector.call(this, selector); };
+Object.defineProperty(secretHost, 'innerText', { get() { throw Error('Secure editor value acquired for hint'); } });
+Object.defineProperty(secretHost, 'textContent', { get() { throw Error('Secure editor text acquired for hint'); } });
+for (const bounded of [false, true]) {
+  const result = read.call(secretHost, 'data-testid', '.secure', bounded, false, true);
+  assert.equal(result.editorPlaceholder, null); assert.equal(result.value, null);
+  assert.equal(JSON.stringify(result).includes('Never expose hint'), false);
+}
+Element.prototype.querySelector = hintQuerySelector;
+const nativeSecretHost = hintHost([hintBlock('Native protected hint')]);
+Object.defineProperty(nativeSecretHost, 'innerText', { get() { throw Error('Native protected editor value acquired'); } });
+Object.defineProperty(nativeSecretHost, 'textContent', { get() { throw Error('Native protected editor text acquired'); } });
+for (const bounded of [false, true]) assert.equal(editorHint(nativeSecretHost, bounded, true), null);
+for (const oversized of [hintHost([], { 'data-placeholder': 'x'.repeat(513) }), hintHost([hintBlock('x'.repeat(513))]), hintHost([hintBlock('Long content', [new Text('x'.repeat(513), null)])]), hintHost(Array.from({ length: 513 }, () => namingElement('br')))]) {
+  assert.equal(editorHint(oversized), null);
+}
+let deepHint = hintBlock('Too deep'); for (let i = 0; i < 65; i++) deepHint = namingElement('div', [deepHint]);
+assert.equal(editorHint(hintHost([deepHint])), null);
+// Candidate emptiness must not call textContent, innerText, or value getters.
+const scalarTrap = hintBlock('Public hint', [namingElement('br')]);
+for (const field of ['textContent', 'innerText', 'value']) Object.defineProperty(scalarTrap, field, { get() { throw Error(`Hint proof read ${field}`); } });
+assert.equal(editorHint(hintHost([scalarTrap])).name, 'Public hint');
+document.defaultView.getComputedStyle = editorHintStyle;
+console.log('PASS: editor hints preserve host persistence, first empty descendant order, priority and role gates without acquiring hidden or secret emptiness/value data');
+
+// The SVG exception is one closed link-content shape, not removal of any
+// existing SVG rejection or permission to name an SVG's independent role.
+class PlainSvgTitle extends Element { constructor() { super(); this.localName = 'title'; } }
+global.SVGTitleElement = PlainSvgTitle;
+const restrictedSvgStyle = document.defaultView.getComputedStyle;
+document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+function svgTitleLink(svgAttrs = { width: '10', height: '10', role: 'none' }, linkAttrs = { href: '/home', 'data-testid': 'home' }) {
+  const title = attributes(new PlainSvgTitle(), {}); title.childNodes = [new Text('  Home\n', title)];
+  const svg = attributes(new EmptySvg(), svgAttrs); svg.childNodes = [title]; title.parentElement = svg;
+  const link = namingElement('a', [svg], linkAttrs); return { link, svg, title };
+}
+const svgLinkFact = (node, bounded = false, protectedEditor = false, inventory = true) => read.call(node, 'data-testid', '.secure', bounded, protectedEditor, inventory).restrictedSvgLinkName;
+for (const role of [null, 'none', 'presentation']) {
+  const { link, svg, title } = svgTitleLink(role === null ? {} : { role });
+  for (const bounded of [false, true]) assert.deepEqual(svgLinkFact(link, bounded), { source: 'svg-title', name: 'Home' });
+  assert.equal(svgLinkFact(svg), null); assert.equal(svgLinkFact(title), null);
+  link.childNodes = [new Text('\n ', link), svg, new Text('\t', link)];
+  svg.childNodes = [new Text(' ', svg), title, new Text('\n', svg)];
+  assert.equal(svgLinkFact(link).name, 'Home');
+  attributes(link, { href: '/home', title: 'Lower priority', role: 'link' }); assert.equal(svgLinkFact(link).name, 'Home');
+}
+const originalSvgShape = svgTitleLink();
+assert.equal(svgLinkFact(originalSvgShape.link, false, false, false), null);
+assert.equal(svgLinkFact(originalSvgShape.link, false, true), null);
+for (const attrs of [{ 'aria-label': '' }, { 'aria-label': 'Own name' }, { 'aria-labelledby': 'label' }, { role: 'button' }, { role: 'none' }, { 'aria-hidden': 'true' }, { 'aria-describedby': 'description' }, { onclick: '' }]) {
+  const { link } = svgTitleLink(undefined, { href: '/home', ...attrs }); assert.equal(svgLinkFact(link), null);
+}
+const noHref = svgTitleLink(undefined, {}); assert.equal(svgLinkFact(noHref.link), null);
+for (const attr of ['title', 'alt', 'aria-label', 'aria-labelledby', 'aria-describedby', 'tabindex', 'unknown']) {
+  const { link, svg } = svgTitleLink(); attributes(svg, { [attr]: 'Unsupported' }); assert.equal(svgLinkFact(link), null);
+}
+for (const role of ['img', 'button', 'none presentation']) {
+  const { link } = svgTitleLink({ role }); assert.equal(svgLinkFact(link), null);
+}
+for (const target of ['link', 'svg']) {
+  for (const flag of ['secure', 'shadow', 'display', 'visibility', 'generated', 'aria']) {
+    const shape = svgTitleLink(); const node = shape[target];
+    if (flag === 'secure') node.secure = true;
+    if (flag === 'shadow') node.shadowRoot = {};
+    if (flag === 'display') node.nameDisplay = 'none';
+    if (flag === 'visibility') node.nameVisibility = 'hidden';
+    if (flag === 'generated') node.generated = '"extra"';
+    if (flag === 'aria') attributes(node, { ...(target === 'link' ? { href: '/home' } : {}), 'aria-hidden': 'true' });
+    assert.equal(svgLinkFact(shape.link), null);
+  }
+}
+const secureTitleShape = svgTitleLink(); secureTitleShape.title.secure = true;
+Object.defineProperty(secureTitleShape.title, 'childNodes', { get() { throw Error('Secure SVG title acquired'); } });
+assert.equal(svgLinkFact(secureTitleShape.link), null);
+for (const target of ['link', 'svg']) {
+  const shape = svgTitleLink(); shape[target].childNodes.push(namingElement('path')); assert.equal(svgLinkFact(shape.link), null);
+  const mixed = svgTitleLink(); mixed[target].childNodes.unshift(new Text('Extra', mixed[target])); assert.equal(svgLinkFact(mixed.link), null);
+  const overflow = svgTitleLink(); overflow[target].childNodes = Array.from({ length: 33 }, () => new Text(' ', overflow[target])); assert.equal(svgLinkFact(overflow.link), null);
+}
+const nestedTitleShape = svgTitleLink(); nestedTitleShape.svg.childNodes = [namingElement('g', [nestedTitleShape.title])];
+assert.equal(svgLinkFact(nestedTitleShape.link), null);
+const nestedTitleText = svgTitleLink(); nestedTitleText.title.childNodes = [namingElement('span', [new Text('Home', null)])];
+assert.equal(svgLinkFact(nestedTitleText.link), null);
+for (const text of ['', ' \t', 'x'.repeat(513)]) {
+  const shape = svgTitleLink(); shape.title.childNodes = [new Text(text, shape.title)]; assert.equal(svgLinkFact(shape.link), null);
+}
+for (const attrs of [{ style: 'display:none' }, { 'aria-label': 'Alternative' }, { role: 'none' }]) {
+  const shape = svgTitleLink(); attributes(shape.title, attrs); assert.equal(svgLinkFact(shape.link), null);
+}
+const hugeAttrs = svgTitleLink(); attributes(hugeAttrs.svg, Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`attr${i}`, ''])));
+assert.equal(svgLinkFact(hugeAttrs.link), null);
+const oversizedAttribute = svgTitleLink({ width: 'x'.repeat(513) }); assert.equal(svgLinkFact(oversizedAttribute.link), null);
+const noContentRead = svgTitleLink();
+for (const node of [noContentRead.svg, noContentRead.title]) for (const field of ['textContent', 'innerText']) Object.defineProperty(node, field, { get() { throw Error(`SVG proof read ${field}`); } });
+assert.equal(svgLinkFact(noContentRead.link).name, 'Home');
+document.defaultView.getComputedStyle = restrictedSvgStyle;
+console.log('PASS: restricted SVG-title link facts accept only the whitelisted complete shape and preserve label, security, hidden, shadow, geometry and budget exclusions');
+
+
+// Original name-content traversal preserves block/BR separators even when the
+// child's content is hidden. Caption completion must not misprove A + C as AC.
+const hiddenCaptionStyle = document.defaultView.getComputedStyle;
+document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: 'none' });
+for (const [tag, source] of [['fieldset', 'legend'], ['figure', 'figcaption'], ['table', 'caption']]) {
+  for (const hiddenTag of ['div', 'br', 'span']) {
+    for (const hidden of ['aria', 'display', 'visibility']) {
+      const skipped = namingElement(hiddenTag); skipped.nameDisplay = hiddenTag === 'div' ? 'block' : 'inline';
+      if (hidden === 'aria') attributes(skipped, { 'aria-hidden': 'true' });
+      if (hidden === 'display') skipped.nameDisplay = 'none';
+      if (hidden === 'visibility') skipped.nameVisibility = 'hidden';
+      Object.defineProperty(skipped, 'childNodes', { get() { throw Error('Hidden caption descendant acquired'); } });
+      const caption = namingElement(source, [new Text('A', null), skipped, new Text('C', null)]);
+      const parent = namingElement(tag, [caption]);
+      for (const bounded of [false, true]) assert.equal(captionFacts(parent, bounded), null, `${tag}/${hiddenTag}/${hidden}`);
+      // Root-hidden is a different, complete empty contribution and still
+      // falls through without traversing any of these hidden descendants.
+      caption.nameDisplay = 'none';
+      assert.deepEqual(captionFacts(parent), { source, name: '' });
+    }
+  }
+}
+document.defaultView.getComputedStyle = hiddenCaptionStyle;
+console.log('PASS: caption-only hidden descendants are unavailable, not false AC/empty proofs; hidden roots remain proven empty without content acquisition');

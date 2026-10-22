@@ -3010,6 +3010,7 @@ mod tests {
         observation_frames: Vec<super::super::client_observation::ObservationFrame>,
         geometry: GeometrySnapshot,
         log: Log,
+        replies: Log,
         server: tokio::task::JoinHandle<()>,
     }
     impl Fixture {
@@ -3056,6 +3057,8 @@ mod tests {
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let log: Log = Arc::default();
         let captured = log.clone();
+        let replies: Log = Arc::default();
+        let sent_replies = replies.clone();
         let gate = Arc::new(ExecutionGate::default());
         let server_gate = gate.clone();
         let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
@@ -3065,6 +3068,7 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut checked_reads = 0;
             let mut query_reads = 0;
+            let mut preparation_scrolls = 0;
             while let Some(Ok(message)) = socket.next().await {
                 let Ok(text) = message.to_text() else {
                     continue;
@@ -3075,6 +3079,46 @@ mod tests {
                 let source = request["params"]["functionDeclaration"]
                     .as_str()
                     .unwrap_or("");
+                // Preparation settlement cases withhold an exact reply, not the
+                // entire peer. Owned-handle cleanup must remain serviceable.
+                if mode.starts_with("preparation-") {
+                    if method == "DOM.scrollIntoViewIfNeeded" {
+                        preparation_scrolls += 1;
+                        if mode == "preparation-scroll-unacked"
+                            || (mode == "preparation-later-scroll-unacked"
+                                && preparation_scrolls == 2)
+                        {
+                            continue;
+                        }
+                    }
+                    if (mode == "preparation-control-unacked"
+                        && preparation_scrolls > 0
+                        && method == "Page.getLayoutMetrics")
+                        || (mode == "preparation-input-unacked"
+                            && method == "Input.dispatchMouseEvent"
+                            && request["params"]["type"] == "mouseReleased")
+                    {
+                        continue;
+                    }
+                    if method == "Page.createIsolatedWorld" {
+                        // Supply native lifecycle evidence to the real enrollment
+                        // supervisor before its exact-realm resolver ACK.
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                json!({"method":"Runtime.executionContextCreated",
+                                "sessionId":"page","params":{"context":{"id":1,
+                                "uniqueId":"preparation-realm",
+                                "name":"agent-browser-native-observation",
+                                "auxData":{"frameId":"main","isDefault":false}}}})
+                                .to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
+                    if mode == "preparation-authority-lost" && source.contains("const blocker=") {
+                        server_gate.seal();
+                    }
+                }
                 if source.contains("return this.nodeType===1") {
                     if mode == "focus-cancel"
                         || (mode == "focus-root-cancel"
@@ -3116,6 +3160,9 @@ mod tests {
                 let result = match method {
                     "Page.getFrameTree" => {
                         json!({"frameTree":{"frame":{"id":"main","loaderId":"doc","url":"about:blank"}}})
+                    }
+                    "Target.getTargets" if mode.starts_with("preparation-") => {
+                        json!({"targetInfos":[{"targetId":"target","browserContextId":"context","type":"page"}]})
                     }
                     "Page.createIsolatedWorld" => json!({"executionContextId":1}),
                     "DOM.resolveNode" => {
@@ -3255,8 +3302,17 @@ mod tests {
                                 json!({"result":{"value":true}})
                             }
                         } else if source.contains("const blocker=") {
-                            if mode == "intercepted" {
+                            if matches!(
+                                mode,
+                                "intercepted"
+                                    | "preparation-intercepted"
+                                    | "preparation-later-scroll-unacked"
+                                    | "preparation-handle-cleanup-failed"
+                                    | "preparation-authority-lost"
+                            ) {
                                 json!({"result":{"value":{"status":"intercepted-pointer"}}})
+                            } else if mode == "preparation-not-actionable" {
+                                json!({"result":{"value":{"status":"not-actionable"}}})
                             } else {
                                 json!({"result":{"value":{"width":100,"height":50}}})
                             }
@@ -3312,6 +3368,9 @@ mod tests {
                         || (mode == "exact-aux-cleanup-failed"
                             && request["params"]["objectId"] == "result-handle"))
                         && method == "Runtime.releaseObject")
+                    || (mode == "preparation-handle-cleanup-failed"
+                        && method == "Runtime.releaseObject"
+                        && request["params"]["objectId"] == "exact-node")
                     || (mode == "exact-protocol-error" && method == "DOM.resolveNode")
                     || (mode == "prefix-cleanup-failed"
                         && method == "Input.dispatchKeyEvent"
@@ -3331,6 +3390,10 @@ mod tests {
                 {
                     break;
                 }
+                sent_replies
+                    .lock()
+                    .unwrap()
+                    .push(json!({"request":request,"reply":reply}));
             }
         });
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
@@ -3408,6 +3471,7 @@ mod tests {
             frames: HashMap::new(),
             observation_frames,
             log,
+            replies,
             server,
         }
     }
@@ -5804,6 +5868,432 @@ mod tests {
         assert_eq!(error.reason, Some(ActionReason::InterceptedPointer));
         assert!(f.inputs().is_empty());
     }
+    #[derive(Debug)]
+    struct PreparationSettlementEvidence {
+        failure: ActionFailure,
+        original_authority: Result<(), ProtocolError>,
+        target_revision: Result<(), ProtocolError>,
+        before_deadline: bool,
+    }
+
+    // These cases deliberately use the real enrolled realm path. The ordinary
+    // action peer's UntrackedFixture shortcut cannot certify reusable settlement.
+    async fn preparation_settlement_owner(
+        f: &Fixture,
+        broker: Arc<super::super::client_session::ClientSession>,
+    ) -> (
+        Arc<super::super::client_enrollment::ClientEnrollment>,
+        Arc<ClientPageState>,
+        tokio::sync::mpsc::Receiver<super::super::client_protocol::ServerMessage>,
+    ) {
+        use super::super::{
+            client_enrollment::{ClientEnrollment, ScopeConfig, ScopeOwnership},
+            client_network::{ClientNetwork, NetworkPolicy},
+            client_protocol::{ScopeState, ServerMessage},
+            client_transport::ClientEventSink,
+            client_ui::UiGate,
+        };
+        let (sink, notices) = ClientEventSink::test_channel(broker.clone());
+        let scoped_sink = sink
+            .stage_until_result(&f.op, &f.page.identity_scope)
+            .unwrap();
+        sink.acknowledge_result_for_test(&ServerMessage::Result {
+            id: "preparation-fixture-initialized".into(),
+            generation: f.op.generation,
+            operation_seq: f.op.sequence,
+            ok: true,
+            data: Some(json!({"identityScope":f.page.identity_scope})),
+            error: None,
+            effects: Effects::Completed,
+            scope_state: ScopeState::Usable,
+        })
+        .unwrap();
+        let blobs = Arc::new(BlobStore::new(BlobLimits::default()).unwrap());
+        let blob_scope = BlobScope {
+            generation: 1,
+            identity_scope: f.page.identity_scope.clone(),
+        };
+        blobs.activate_scope(blob_scope.clone()).unwrap();
+        let state = Arc::new(ClientPageState::new(
+            f.page.identity_scope.clone(),
+            "context".into(),
+        ));
+        let network = Arc::new(ClientNetwork::new(
+            f.page.client.clone(),
+            broker,
+            scoped_sink,
+            blob_scope,
+            blobs,
+            Arc::new(UiGate::default()),
+            NetworkPolicy::default(),
+        ));
+        let owner = ClientEnrollment::new(
+            f.page.client.clone(),
+            f.page.targets.clone(),
+            state.clone(),
+            network,
+            f.gate.clone(),
+            1,
+            "page".into(),
+            ScopeConfig::default(),
+            ScopeOwnership::IsolatedContext,
+            None,
+        );
+        owner
+            .enroll_existing("target", "page", "page", &f.op)
+            .await
+            .unwrap();
+        owner.start(&f.op).await.unwrap();
+        let (_, targets) = f.page.targets.inventory().unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].target_id, "target");
+        assert_eq!(targets[0].session_id, "page");
+        assert_eq!(
+            targets[0].purpose,
+            Some(super::super::client_targets::TargetPurpose::Application)
+        );
+        assert!(targets[0].configured && targets[0].resumed);
+        assert!(f.page.permit.check().is_ok());
+        (owner, state, notices)
+    }
+
+    async fn assert_preparation_effect_settlement(mode: &'static str) {
+        use super::super::{
+            client_protocol::ScopeState, client_session::ClientSession,
+            client_tasks::RetainedTasks, client_transport::NativeOutcome,
+        };
+        let expected_completed = matches!(
+            mode,
+            "preparation-intercepted" | "preparation-not-actionable"
+        );
+        let dirty = mode == "preparation-handle-cleanup-failed";
+        let expected_reason = matches!(
+            mode,
+            "preparation-intercepted"
+                | "preparation-later-scroll-unacked"
+                | "preparation-handle-cleanup-failed"
+        )
+        .then_some(ActionReason::InterceptedPointer);
+        let expected_primary = match mode {
+            "preparation-input-unacked" => ProtocolError::DeadlineExceeded,
+            "preparation-authority-lost" => ProtocolError::StaleScope,
+            _ => ProtocolError::NotActionable,
+        };
+        let expected_wire = if expected_reason.is_some() {
+            ProtocolError::InterceptedPointer
+        } else {
+            expected_primary.clone()
+        };
+        let broker = Arc::new(ClientSession::new());
+        let mut f = fixture_scoped(mode, mode).await;
+        let (owner, state, _notices) = preparation_settlement_owner(&f, broker.clone()).await;
+        // Setup is outside the measured action. This is the actual admitted
+        // lease, not a copy with a deadline or cancellation channel rewritten.
+        f.op = broker.admit(1, 1, 800).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let original_authority = owner
+            .capture_settled_input_authority(&f.page, &f.op)
+            .unwrap();
+        original_authority.check(&owner, &f.page, &f.op).unwrap();
+        let revision = f.page.targets.inventory().unwrap().0;
+        assert_eq!(state.held_modifiers().unwrap(), 0);
+        assert_eq!(state.mouse_state().unwrap().buttons, 0);
+        f.log.lock().unwrap().clear();
+        f.replies.lock().unwrap().clear();
+        let f = Arc::new(f);
+        let evidence = Arc::new(Mutex::new(None));
+        let tasks = RetainedTasks::default();
+        let captured_targets = f.page.targets.clone();
+        let unrelated_targets = ClientTargets::new("other-context".into(), "other-scope".into());
+        let action_fixture = f.clone();
+        let action_owner = owner.clone();
+        let action_state = state.clone();
+        let action_evidence = evidence.clone();
+        let receive = tasks
+            .start(mode.into(), captured_targets.clone(), async move {
+                let ctx = ActionContext {
+                    realm_authority: ActionRealmAuthority::Enrolled(&action_owner),
+                    page_state: &action_state,
+                    ..action_fixture.context()
+                };
+                let failure = ClientActions::default()
+                    .execute(
+                        ctx,
+                        "browser.perform",
+                        &json!({"identityScope":mode,"ref":{"id":"@e1","revision":"1"},
+                            "action":{"kind":"tap"}}),
+                    )
+                    .await
+                    .expect_err("the exact synthetic action must refuse or remain uncertain");
+                // Match ClientBrowser's reason projection, but never manufacture
+                // a settled prefix or rewrite the action's effects in this bridge.
+                let error = match failure.reason {
+                    Some(ActionReason::InterceptedPointer) => ProtocolError::InterceptedPointer,
+                    Some(ActionReason::CheckedStateUnchanged) => {
+                        ProtocolError::CheckedStateUnchanged
+                    }
+                    Some(ActionReason::ControlReplacedAfterClick) => {
+                        ProtocolError::CheckedControlReplaced
+                    }
+                    None => failure.error.clone(),
+                };
+                let outcome = NativeOutcome {
+                    result: Err(error),
+                    effects: failure.effects,
+                };
+                let cleanup_failed = failure.cleanup_failed;
+                *action_evidence.lock().unwrap() = Some(PreparationSettlementEvidence {
+                    failure,
+                    original_authority: original_authority.check(
+                        &action_owner,
+                        &action_fixture.page,
+                        &action_fixture.op,
+                    ),
+                    target_revision: action_fixture.page.targets.check_revision(revision),
+                    before_deadline: Instant::now() < action_fixture.op.deadline,
+                });
+                (outcome, cleanup_failed)
+            })
+            .await
+            .unwrap();
+        let delivered = receive.await.unwrap();
+        // These are the real settlement and next-admission calls, reached even
+        // when the desired positive currently returns Unknown. No helper outcome
+        // is substituted for the value delivered by retained execution.
+        let settled = broker.settle(1, 1, delivered.effects).unwrap();
+        let health = broker.health().unwrap();
+        let next = broker.admit(1, 2, 1_000);
+        let next_error = next.as_ref().err().cloned();
+        if next.is_ok() {
+            assert!(broker.start(1, 2).unwrap());
+            assert_eq!(
+                broker.settle(1, 2, Effects::NotDispatched).unwrap(),
+                ScopeState::Usable
+            );
+        }
+        let drained = tasks.drain().await;
+        let targets_sealed = captured_targets.inventory().is_err();
+        let other_usable = unrelated_targets.inventory().is_ok();
+        let requests = f.log.lock().unwrap().clone();
+        let replies = f.replies.lock().unwrap().clone();
+        let evidence = evidence.lock().unwrap().take().unwrap();
+        let held_modifiers = state.held_modifiers().unwrap();
+        let held_buttons = state.mouse_state().unwrap().buttons;
+        // Shut down the enrolled lifecycle task and exact peer before assertions
+        // can panic. Missing command ACKs are never supplied during teardown.
+        let owner_closed = owner.close().await;
+        let mut f = match Arc::try_unwrap(f) {
+            Ok(fixture) => fixture,
+            Err(_) => panic!("retained execution must release its fixture before peer teardown"),
+        };
+        f.server.abort();
+        let peer_stopped = (&mut f.server).await;
+
+        let method_requests = |method: &str| {
+            requests
+                .iter()
+                .filter(|request| request["method"] == method)
+                .collect::<Vec<_>>()
+        };
+        let acknowledged = |request: &Value| {
+            replies.iter().any(|entry| {
+                entry["request"]["id"] == request["id"]
+                    && entry["reply"].get("result").is_some()
+                    && entry["reply"].get("error").is_none()
+            })
+        };
+        let scrolls = method_requests("DOM.scrollIntoViewIfNeeded");
+        let inputs = requests
+            .iter()
+            .filter(|request| {
+                request["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("Input."))
+            })
+            .collect::<Vec<_>>();
+        let releases = method_requests("Runtime.releaseObject");
+        assert!(
+            !scrolls.is_empty(),
+            "{mode}: preparation must really dispatch"
+        );
+        assert_eq!(
+            releases.len(),
+            1,
+            "{mode}: exactly the owned node is released"
+        );
+        assert_eq!(releases[0]["params"]["objectId"], "exact-node");
+        assert_eq!(
+            acknowledged(releases[0]),
+            !dirty,
+            "{mode}: cleanup ACK evidence"
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "DOM.resolveNode")
+                .all(|request| request["params"]["backendNodeId"] == 42
+                    && request["params"]["executionContextId"] == 1),
+            "{mode}: never re-resolve another identity or bypass enrolled realm"
+        );
+        assert_eq!(method_requests("DOM.resolveNode").len(), 1);
+        match mode {
+            "preparation-scroll-unacked" => {
+                assert_eq!(scrolls.len(), 1);
+                assert!(!acknowledged(scrolls[0]));
+            }
+            "preparation-later-scroll-unacked" => {
+                assert_eq!(scrolls.len(), 2);
+                assert!(acknowledged(scrolls[0]));
+                assert!(
+                    !acknowledged(scrolls[1]),
+                    "an earlier receipt cannot cover a later scroll"
+                );
+            }
+            _ => assert!(scrolls.iter().all(|request| acknowledged(request))),
+        }
+        if mode == "preparation-input-unacked" {
+            assert_eq!(inputs.len(), 3, "no replay after uncertain release");
+            assert_eq!(inputs[0]["params"]["type"], "mouseMoved");
+            assert_eq!(inputs[1]["params"]["type"], "mousePressed");
+            assert_eq!(inputs[2]["params"]["type"], "mouseReleased");
+            assert!(acknowledged(inputs[0]) && acknowledged(inputs[1]));
+            assert!(!acknowledged(inputs[2]));
+        } else {
+            assert!(
+                inputs.is_empty(),
+                "{mode}: no mouse, keyboard, wheel or other Input request"
+            );
+        }
+        if mode == "preparation-control-unacked" {
+            let controls = method_requests("Page.getLayoutMetrics");
+            assert_eq!(controls.len(), 1);
+            assert!(!acknowledged(controls[0]));
+        }
+        if dirty {
+            assert!(replies
+                .iter()
+                .any(|entry| entry["request"]["id"] == releases[0]["id"]
+                    && entry["reply"].get("error").is_some()));
+        }
+        assert_eq!(evidence.failure.error, expected_primary, "{mode}");
+        assert_eq!(evidence.failure.reason, expected_reason, "{mode}");
+        assert_eq!(evidence.failure.cleanup_failed, dirty, "{mode}");
+        assert_eq!(
+            delivered.result,
+            Err(expected_wire),
+            "{mode}: preserve primary wire reason"
+        );
+        assert_eq!(
+            targets_sealed, dirty,
+            "{mode}: retained cleanup seals only dirty targets"
+        );
+        assert!(other_usable, "{mode}: unrelated scope remains untouched");
+        assert_eq!(held_modifiers, 0, "{mode}");
+        assert_eq!(held_buttons, 0, "{mode}");
+        assert_eq!(owner_closed, Ok(()), "{mode}: lifecycle task is joined");
+        assert!(
+            peer_stopped.is_err_and(|error| error.is_cancelled()),
+            "{mode}: exact withheld-ACK peer is cancelled and joined"
+        );
+        assert_eq!(
+            drained,
+            if dirty {
+                Err(ProtocolError::CleanupFailed)
+            } else {
+                Ok(())
+            },
+            "{mode}"
+        );
+        if expected_completed {
+            // Authored RED on the frozen base: center currently consumes the
+            // exact operation deadline, and Dispatch remembers only `sent`.
+            // The desired result requires a genuine predeadline classification
+            // window AND an original-authority, fully-ACKed preparation receipt.
+            // A scroll may run page business logic; Completed is not no effects,
+            // action success, rollback, or permission to replay this tap.
+            assert_eq!(
+                (
+                    evidence.failure.effects,
+                    delivered.effects,
+                    settled,
+                    health,
+                    next_error,
+                    evidence.original_authority,
+                    evidence.target_revision,
+                    evidence.before_deadline,
+                ),
+                (
+                    Effects::Completed,
+                    Effects::Completed,
+                    ScopeState::Usable,
+                    (1, ScopeState::Usable),
+                    None,
+                    Ok(()),
+                    Ok(()),
+                    true,
+                ),
+                "{mode}: a completed preparation-only refusal must settle honestly and permit reuse"
+            );
+        } else {
+            assert_eq!(evidence.failure.effects, Effects::Unknown, "{mode}");
+            assert_eq!(delivered.effects, Effects::Unknown, "{mode}");
+            assert_eq!(settled, ScopeState::Quarantined, "{mode}");
+            assert_eq!(health, (1, ScopeState::Quarantined), "{mode}");
+            assert_eq!(next_error, Some(ProtocolError::ScopeUnavailable), "{mode}");
+            if mode == "preparation-authority-lost" {
+                assert_eq!(evidence.original_authority, Err(ProtocolError::StaleScope));
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
+    async fn preparation_effect_settlement_acked_interception_is_completed_and_reusable() {
+        assert_preparation_effect_settlement("preparation-intercepted").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
+    async fn preparation_effect_settlement_acked_not_actionable_is_completed_and_reusable() {
+        assert_preparation_effect_settlement("preparation-not-actionable").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
+    async fn preparation_effect_settlement_unacked_first_scroll_remains_unknown() {
+        assert_preparation_effect_settlement("preparation-scroll-unacked").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
+    async fn preparation_effect_settlement_unacked_later_scroll_invalidates_earlier_prefix() {
+        assert_preparation_effect_settlement("preparation-later-scroll-unacked").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
+    async fn preparation_effect_settlement_unacked_input_release_remains_unknown() {
+        assert_preparation_effect_settlement("preparation-input-unacked").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
+    async fn preparation_effect_settlement_dirty_handle_cleanup_quarantines() {
+        assert_preparation_effect_settlement("preparation-handle-cleanup-failed").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
+    async fn preparation_effect_settlement_unacked_geometry_control_remains_unknown() {
+        assert_preparation_effect_settlement("preparation-control-unacked").await;
+    }
+
+    #[tokio::test]
+    #[ignore = "separate preparation settlement diagnostic; restore mandatory after production fix"]
+    async fn preparation_effect_settlement_lost_original_authority_remains_unknown() {
+        assert_preparation_effect_settlement("preparation-authority-lost").await;
+    }
+
     #[tokio::test]
     async fn readonly_pseudo_action_never_resolves_or_retargets_origin() {
         let mut f = fixture("normal").await;
