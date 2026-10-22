@@ -3067,7 +3067,9 @@ mod tests {
                     }
                     "DOM.resolveNode" => json!({"object":{"objectId":"owner","subtype":"node"}}),
                     "DOM.getBoxModel" => json!({"model":{"border":[10,20,10,20,10,20,10,20]}}),
-                    "Runtime.getProperties" => json!({"result":[]}),
+                    "Runtime.getProperties" => {
+                        json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
+                    }
                     "Runtime.callFunctionOn" => {
                         let declaration =
                             request["params"]["functionDeclaration"].as_str().unwrap();
@@ -3208,7 +3210,9 @@ mod tests {
                     }
                     "DOM.getFrameOwner" => json!({"backendNodeId":7}),
                     "DOM.getBoxModel" => panic!("hidden frame spatial proof must not run"),
-                    "Runtime.getProperties" => json!({"result":[]}),
+                    "Runtime.getProperties" => {
+                        json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
+                    }
                     "Runtime.callFunctionOn" => {
                         let declaration =
                             request["params"]["functionDeclaration"].as_str().unwrap();

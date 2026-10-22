@@ -360,7 +360,9 @@ fn diagnostic_site(args: &Value) -> &'static str {
             "metadata-batch"
         }
         Some(value) if value == METADATA => "metadata-single",
-        Some(value) if value.starts_with("function(selector,...roots)") => "security-inventory",
+        Some(value) if value.starts_with("function(selector,authorRoots,...roots)") => {
+            "security-inventory"
+        }
         Some(value) if value == MATCH_QUERY => "query-match",
         _ => "other-native-command",
     }
@@ -615,7 +617,7 @@ fn ax_string(value: &Option<super::cdp::types::AXValue>) -> Option<String> {
 // Targeted metadata on an already-resolved native DOM handle. It neither walks
 // the DOM nor creates identities. Password text/value/selection/attribute values
 // are excluded in the renderer before any data is transferred to the client.
-const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=false,protectedEditor=false,simpleNameInventory=false) {
+const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=false,protectedEditor=false,simpleNameInventory=false,focusedReceiver=false) {
  const nodeProto=Node.prototype;
  if (!Object.getOwnPropertyDescriptor(nodeProto,'isConnected').get.call(this) || (this!==document && Object.getOwnPropertyDescriptor(nodeProto,'ownerDocument').get.call(this)!==document)) return {__nativeStatus:'stale-reference'};
  const e=this.nodeType===1?this:null, doc=this.ownerDocument||this;
@@ -874,10 +876,11 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    return false;
  }
  const hidden=!!e&&!renderVisible(e);
- const focused=!!e&&doc.activeElement===e;
+ // The native acquisition resolves the single author focus leaf, including
+ // closed roots. This flag is exact backend identity, not a retargeted host.
+ const focused=!!e&&focusedReceiver===true;
  let selection=null;
  if(!secure&&focused&&typeof e.selectionStart==='number'&&e.selectionEnd>e.selectionStart) selection=e.value.slice(e.selectionStart,e.selectionEnd);
- else if(!secure&&focused&&e.isContentEditable) selection=String(doc.getSelection()||'')||null;
  const ac=(e&&e.getAttribute('autocomplete')||'').toLowerCase().split(/\s+/);
  const purpose=((e&&Element.prototype.matches.call(e,'input[type="password" i]'))||ac.includes('current-password')||ac.includes('new-password'))?'password':secure?'generic-secret':ac.includes('one-time-code')?'one-time-code':ac.includes('username')?'username':'none';
  const associated=e&&e.labels?Array.from(e.labels):[];
@@ -983,6 +986,11 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const editingHost=!!e&&e instanceof HTMLElement&&e.isContentEditable&&
    !['svg','math','canvas','video','audio','iframe','img','hr','br','wbr','area','a','button','input','textarea','select'].includes(tag)&&
    !(e.parentElement instanceof HTMLElement&&e.parentElement.isContentEditable);
+ if(!secure&&focused&&editingHost&&!secureDescendants&&!protectedEditor){
+   const selected=doc.getSelection();
+   if(selected&&selected.rangeCount>0&&!selected.isCollapsed&&Node.prototype.contains.call(e,selected.getRangeAt(0).commonAncestorContainer))
+     selection=String(selected)||null;
+ }
  let editorPlaceholder=null;
  if(editingHost&&simpleNameInventory&&!hidden&&!secure&&!secureDescendants&&!protectedEditor&&associated.length===0&&
    ['aria-label','aria-labelledby','title','placeholder','aria-placeholder'].every(a=>!(e.getAttribute(a)||'').trim())&&
@@ -2951,6 +2959,28 @@ fn metadata_receiver_protection(
         .collect()
 }
 
+// Focus is a semantic fact for this acquisition, never action authority. Pseudo
+// metadata borrows its origin's receiver but must not borrow its focus identity.
+fn metadata_receiver_focus(
+    nodes: &[&AXNode],
+    origins: &[Option<i64>],
+    policy: &SecurityInventory,
+) -> Result<Vec<bool>, ObservationError> {
+    if nodes.len() != origins.len() {
+        return Err(ObservationError::BackendFailure);
+    }
+    nodes
+        .iter()
+        .zip(origins)
+        .map(|(node, origin)| {
+            let backend = node
+                .backend_d_o_m_node_id
+                .ok_or(ObservationError::BackendFailure)?;
+            Ok(origin.is_none() && policy.focused_backend == Some(backend))
+        })
+        .collect()
+}
+
 // This is untrusted page semantics only, never identity or security authority.
 // Omitting executionContextId selects the native node document's MAIN world:
 // Blink core/inspector/resolve_node.cc ResolveNode, ToScriptStateForMainWorld.
@@ -3186,8 +3216,10 @@ async fn read_batch_with_refs(
         arguments.extend(objects.iter().map(|o|json!({"objectId":o})));
         let protected_editors = metadata_receiver_protection(nodes, &pseudo, acquisition_policy)?;
         let protected_editors = serde_json::to_string(&protected_editors).map_err(|_| ObservationError::BackendFailure)?;
+        let focused_receivers = metadata_receiver_focus(nodes, &pseudo, acquisition_policy)?;
+        let focused_receivers = serde_json::to_string(&focused_receivers).map_err(|_| ObservationError::BackendFailure)?;
         let simple_name_inventory=acquisition_policy.simple_name_inventory;
-        let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory})); }}");
+        let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; const focusedReceivers={focused_receivers}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory},focusedReceivers[index])); }}");
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){
             #[cfg(test)]
@@ -3783,6 +3815,9 @@ struct SecurityInventory {
     // Conservative: simple-name completion is declined for an entire frame
     // containing any author shadow root, even when this receiver is unrelated.
     simple_name_inventory: bool,
+    // A document-local semantic anchor from the same native root acquisition.
+    // Reacquired for each query/read; shared only by one observation's chunks.
+    focused_backend: Option<i64>,
 }
 /// Browser implementation shadow trees are not author controls. Keep their
 /// native identities out of the author observation without rebinding them to
@@ -3887,13 +3922,118 @@ fn bounded_dom_ids(
 }
 /// Enumerate native shadow-root handles, not every element. CSS matching stays
 /// in Chromium, including closed roots supplied by DOM.getDocument(pierce).
-/// Only sensitive ancestors' identities are returned; no field values are read.
+/// The acquisition returns native identities only, never field values.
 fn simple_name_inventory(
     root: &Value,
     roots: &[i64],
     internal: &std::collections::HashSet<i64>,
 ) -> bool {
     root["nodeType"] == 9 && roots.iter().filter(|id| !internal.contains(id)).count() == 1
+}
+
+// Both facts use the already-resolved native root inventory. The temporary
+// host map does not discover roots, stamp elements, or outlive this call.
+// Browser implementation roots still participate in security, not author focus.
+const SECURITY_INVENTORY: &str = r#"function(selector,authorRoots,...roots){
+ const refuse=status=>{const out=[];out.__nativeStatus=status;return out;};
+ if(roots.length!==authorRoots.length)return refuse('invalid-native-metadata');
+ if(roots.length>10000)return refuse('resource-limit');
+ const connected=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected').get;
+ const owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
+ const getRoot=Node.prototype.getRootNode;
+ const documentActive=Object.getOwnPropertyDescriptor(Document.prototype,'activeElement').get;
+ const shadowActive=Object.getOwnPropertyDescriptor(ShadowRoot.prototype,'activeElement').get;
+ const shadowHost=Object.getOwnPropertyDescriptor(ShadowRoot.prototype,'host').get;
+ const byHost=new Map(),seenRoots=new Set();let documents=0;
+ for(let index=0;index<roots.length;index++){
+   const root=roots[index];
+   if(seenRoots.has(root))return refuse('invalid-native-metadata');
+   seenRoots.add(root);
+   if(!connected.call(root)||(root!==document&&owner.call(root)!==document))return refuse('stale-reference');
+   if(root===document){documents++;continue;}
+   if(!(root instanceof ShadowRoot))return refuse('invalid-native-metadata');
+   if(authorRoots[index]){
+     const host=shadowHost.call(root);
+     if(!connected.call(host)||owner.call(host)!==document)return refuse('stale-reference');
+     if(byHost.has(host))return refuse('invalid-native-metadata');
+     byHost.set(host,root);
+   }
+ }
+ if(documents!==1)return refuse('invalid-native-metadata');
+ let active=documentActive.call(document),scope=document,hops=0;const seen=new Set();
+ while(active!==null){
+   if(++hops>256)return refuse('resource-limit');
+   if(seen.has(active)||active.nodeType!==1)return refuse('invalid-native-metadata');
+   seen.add(active);
+   if(!connected.call(active)||owner.call(active)!==document||getRoot.call(active)!==scope)return refuse('stale-reference');
+   const root=byHost.get(active);if(!root)break;
+   const next=shadowActive.call(root);if(next===null)break;
+   scope=root;active=next;
+ }
+ const result=new Set();const all='input[type="password" i],'+selector;
+ for(const root of roots){
+   for(const secure of root.querySelectorAll(all)){const seen=new Set();for(let p=secure;p&&!seen.has(p);p=p.parentElement||(p.getRootNode&&p.getRootNode().host)){seen.add(p);result.add(p);}}
+ }
+ const out=Array.from(result);out.focused=active;return out;
+}"#;
+
+// Own-property inspection returns node handles, not author strings or values.
+// A missing focus slot is incomplete proof, distinct from a proven null leaf.
+fn security_handles(properties: &Value) -> Result<(Option<String>, Vec<String>), ObservationError> {
+    let rows = properties["result"]
+        .as_array()
+        .ok_or(ObservationError::BackendFailure)?;
+    let mut focus = None;
+    let mut ancestors = Vec::new();
+    let mut indices = std::collections::HashSet::new();
+    for property in rows {
+        let name = property["name"]
+            .as_str()
+            .ok_or(ObservationError::BackendFailure)?;
+        if name == "__nativeStatus" {
+            return Err(match property["value"]["value"].as_str() {
+                Some("stale-reference") => ObservationError::StaleReference,
+                Some("resource-limit") => ObservationError::ResourceLimit,
+                _ => ObservationError::BackendFailure,
+            });
+        }
+        if name == "focused" {
+            if focus.is_some() {
+                return Err(ObservationError::BackendFailure);
+            }
+            let remote = &property["value"];
+            let object = if remote["type"] == "object" && remote["subtype"] == "null" {
+                if remote.get("objectId").is_some() || remote.get("value") != Some(&Value::Null) {
+                    return Err(ObservationError::BackendFailure);
+                }
+                None
+            } else {
+                if remote["type"] != "object" || remote["subtype"] != "node" {
+                    return Err(ObservationError::BackendFailure);
+                }
+                Some(
+                    remote["objectId"]
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .ok_or(ObservationError::BackendFailure)?
+                        .to_owned(),
+                )
+            };
+            focus = Some(object);
+        } else if let Ok(index) = name.parse::<usize>() {
+            if !indices.insert(index) || indices.len() > 100_000 {
+                return Err(ObservationError::BackendFailure);
+            }
+            ancestors.push(
+                property["value"]["objectId"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .ok_or(ObservationError::BackendFailure)?
+                    .to_owned(),
+            );
+        }
+    }
+    Ok((focus.ok_or(ObservationError::BackendFailure)?, ancestors))
 }
 
 async fn security_inventory(
@@ -3907,6 +4047,10 @@ async fn security_inventory(
     let ids = security_root_ids(&dom["root"])?;
     let browser_internal = browser_internal_ids(&dom["root"])?;
     let simple_name_inventory = simple_name_inventory(&dom["root"], &ids, &browser_internal);
+    let author_roots: Vec<bool> = ids
+        .iter()
+        .map(|id| !browser_internal.contains(id))
+        .collect();
     let session = &frame.binding.session;
     let group = format!("native-security-{}", lease.sequence);
     let result=async{
@@ -3917,22 +4061,24 @@ async fn security_inventory(
             object["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::BackendFailure)
         }})).buffered(16).collect().await;
         let objects=collect_hint_results(objects)?;
-        let mut args=vec![json!({"value":options.secure_field_selector})];args.extend(objects.iter().map(|o|json!({"objectId":o})));
-        let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"arguments":args,"objectGroup":group,"functionDeclaration":r#"function(selector,...roots){
-            const result=new Set();const all='input[type="password" i],'+selector;
-            for(const root of roots){if(root!==document&&root.ownerDocument!==document)throw new Error('stale root');
-                for(const secure of root.querySelectorAll(all)){const seen=new Set();for(let p=secure;p&&!seen.has(p);p=p.parentElement||(p.getRootNode&&p.getRootNode().host)){seen.add(p);result.add(p);}}
-            }return Array.from(result);
-        }"#,"returnByValue":false}),lease).await?;
+        let mut args=vec![json!({"value":options.secure_field_selector}),json!({"value":author_roots})];args.extend(objects.iter().map(|o|json!({"objectId":o})));
+        let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"arguments":args,"objectGroup":group,"functionDeclaration":SECURITY_INVENTORY,"returnByValue":false}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
         let array=result["result"]["objectId"].as_str().ok_or(ObservationError::BackendFailure)?;
         let properties=command(client,session,"Runtime.getProperties",json!({"objectId":array,"ownProperties":true}),lease).await?;
-        let handles:Vec<String>=properties["result"].as_array().ok_or(ObservationError::BackendFailure)?.iter().filter(|p|p["name"].as_str().is_some_and(|s|s.parse::<usize>().is_ok())).map(|p|p["value"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::BackendFailure)).collect::<Result<_,_>>()?;
-        let descriptions:Vec<Result<Value,ObservationError>>=stream::iter(handles.into_iter().map(|object|async move{command(client,session,"DOM.describeNode",json!({"objectId":object}),lease).await})).buffered(16).collect().await;
+        let (focused,ancestors)=security_handles(&properties)?;
+        let handles=focused.into_iter().map(|object|(true,object)).chain(ancestors.into_iter().map(|object|(false,object)));
+        let descriptions:Vec<Result<(bool,Value),ObservationError>>=stream::iter(handles.map(|(focused,object)|async move{Ok((focused,command(client,session,"DOM.describeNode",json!({"objectId":object}),lease).await?))})).buffered(16).collect().await;
         let descriptions=collect_hint_results(descriptions)?;
         let mut security=SecurityInventory { browser_internal, simple_name_inventory, ..Default::default() };
-        for description in descriptions{
-            let node=&description["node"];security.ancestors.insert(node["backendNodeId"].as_i64().ok_or(ObservationError::BackendFailure)?);
+        for (focused,description) in descriptions{
+            let node=&description["node"];
+            let backend=node["backendNodeId"].as_i64().filter(|id|*id>0).ok_or(ObservationError::BackendFailure)?;
+            if focused {
+                if node["nodeType"]!=1||node.get("pseudoType").is_some()||security.browser_internal.contains(&backend){return Err(ObservationError::BackendFailure);}
+                security.focused_backend=Some(backend);continue;
+            }
+            security.ancestors.insert(backend);
             if let Some(attributes)=node["attributes"].as_array(){for pair in attributes.as_chunks::<2>().0{if pair[0]=="id"{if let Some(id)=pair[1].as_str(){security.label_ids.insert(id.to_string());}}}}
         }
         Ok(security)
@@ -5425,7 +5571,9 @@ mod tests {
                         "DOM.resolveNode" => {
                             json!({"object":{"objectId":format!("node-{}",request["params"]["backendNodeId"]),"subtype":"node"}})
                         }
-                        "Runtime.getProperties" => json!({"result":[]}),
+                        "Runtime.getProperties" => {
+                            json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
+                        }
                         "Runtime.callFunctionOn" => {
                             let source = request["params"]["functionDeclaration"].as_str().unwrap();
                             if source.contains("Array.from(result)") {
@@ -5624,7 +5772,9 @@ mod tests {
                             "DOM.resolveNode" => {
                                 json!({"object":{"objectId":"owned","subtype":"node"}})
                             }
-                            "Runtime.getProperties" => json!({"result":[]}),
+                            "Runtime.getProperties" => {
+                                json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
+                            }
                             "Runtime.callFunctionOn" => {
                                 let declaration =
                                     request["params"]["functionDeclaration"].as_str().unwrap();
@@ -5832,7 +5982,9 @@ mod tests {
                     "DOM.getDocument" => {
                         json!({"root":{"nodeType":9,"backendNodeId":99,"children":[]}})
                     }
-                    "Runtime.getProperties" => json!({"result":[]}),
+                    "Runtime.getProperties" => {
+                        json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
+                    }
                     "Page.createIsolatedWorld" => json!({"executionContextId":1}),
                     "DOM.resolveNode" => json!({"object":{"objectId":"node-42","subtype":"node"}}),
                     "Runtime.callFunctionOn" => {
@@ -6199,7 +6351,7 @@ mod tests {
         );
         assert_eq!(
             diagnostic_site(
-                &json!({"functionDeclaration":"function(selector,...roots){ synthetic-private-data }"})
+                &json!({"functionDeclaration":"function(selector,authorRoots,...roots){ synthetic-private-data }"})
             ),
             "security-inventory"
         );
@@ -6231,6 +6383,366 @@ mod tests {
             vec![Some(42), Some(3), Some(4)]
         );
         assert!(metadata_receiver_protection(&nodes, &origins[..2], &policy).is_err());
+    }
+
+    #[test]
+    fn focus_anchor_matches_only_exact_author_identity_across_metadata_chunks() {
+        let nodes: Vec<_> = (1..=130).map(|id| ax("candidate", id, &[])).collect();
+        let policy = SecurityInventory {
+            focused_backend: Some(129),
+            ..Default::default()
+        };
+        let mut focused = Vec::new();
+        for chunk in nodes.chunks(64) {
+            let origins = vec![None; chunk.len()];
+            let flags =
+                metadata_receiver_focus(&chunk.iter().collect::<Vec<_>>(), &origins, &policy)
+                    .unwrap();
+            focused.extend(chunk.iter().zip(flags).filter_map(|(node, active)| {
+                active.then_some(node.backend_d_o_m_node_id.unwrap())
+            }));
+        }
+        assert_eq!(focused, vec![129]);
+        let leaf = ax("leaf", 129, &[]);
+        let pseudo = ax("pseudo", 130, &[]);
+        assert_eq!(
+            metadata_receiver_focus(&[&leaf, &pseudo], &[None, Some(129)], &policy).unwrap(),
+            vec![true, false]
+        );
+        let next_read = SecurityInventory {
+            focused_backend: Some(130),
+            ..Default::default()
+        };
+        assert_eq!(
+            metadata_receiver_focus(&[&leaf, &pseudo], &[None, None], &next_read).unwrap(),
+            vec![false, true]
+        );
+        assert!(metadata_receiver_focus(&[&leaf], &[], &policy).is_err());
+    }
+
+    #[test]
+    fn security_handles_require_explicit_null_or_exact_focus_node() {
+        let null_focus =
+            json!({"name":"focused","value":{"type":"object","subtype":"null","value":null}});
+        let leaf =
+            json!({"name":"focused","value":{"type":"object","subtype":"node","objectId":"leaf"}});
+        assert_eq!(
+            security_handles(&json!({"result":[null_focus]})).unwrap(),
+            (None, vec![])
+        );
+        assert_eq!(
+            security_handles(&json!({"result":[
+                {"name":"0","value":{"objectId":"ancestor"}},leaf,
+                {"name":"length","value":{"type":"number","value":1}}
+            ]}))
+            .unwrap(),
+            (Some("leaf".into()), vec!["ancestor".into()])
+        );
+        for malformed in [
+            json!({"result":[]}),
+            json!({"result":[null_focus,null_focus]}),
+            json!({"result":[{"name":"focused","get":{"objectId":"getter"}}]}),
+            json!({"result":[{"name":"focused","value":{"type":"boolean","value":false}}]}),
+            json!({"result":[{"name":"focused","value":{"type":"object","subtype":"node","objectId":""}}]}),
+            json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null"}}]}),
+            json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","objectId":"unexpected"}}]}),
+            json!({"result":[leaf,{"name":"0","value":{"objectId":"one"}},{"name":"0","value":{"objectId":"two"}}]}),
+        ] {
+            assert_eq!(
+                security_handles(&malformed),
+                Err(ObservationError::BackendFailure)
+            );
+        }
+        for (status, error) in [
+            ("stale-reference", ObservationError::StaleReference),
+            ("resource-limit", ObservationError::ResourceLimit),
+            ("unknown", ObservationError::BackendFailure),
+        ] {
+            assert_eq!(
+                security_handles(
+                    &json!({"result":[{"name":"__nativeStatus","value":{"type":"string","value":status}}]})
+                ),
+                Err(error)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn security_focus_reuses_root_acquisition_and_always_settles_its_group() {
+        use futures_util::{SinkExt, StreamExt};
+        for mode in [
+            "leaf",
+            "null",
+            "missing",
+            "stale",
+            "resource",
+            "describe",
+            "describe-sibling",
+            "pseudo",
+            "non-element",
+            "cleanup",
+            "cleanup-primary",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut inventories = 0;
+                let mut resolves = 0;
+                let mut descriptions = 0;
+                let mut calls = 0;
+                while let Some(Ok(message)) = socket.next().await {
+                    let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let result = match method {
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}})
+                        }
+                        "DOM.getDocument" => {
+                            inventories += 1;
+                            json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":42}]}})
+                        }
+                        "Page.createIsolatedWorld" => json!({"executionContextId":17}),
+                        "DOM.resolveNode" => {
+                            resolves += 1;
+                            assert_eq!(request["params"]["backendNodeId"], 99);
+                            assert_eq!(request["params"]["executionContextId"], 17);
+                            assert_eq!(request["params"]["objectGroup"], "native-security-1");
+                            json!({"object":{"type":"object","subtype":"node","objectId":"document"}})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            calls += 1;
+                            assert_eq!(
+                                request["params"]["functionDeclaration"],
+                                SECURITY_INVENTORY
+                            );
+                            assert_eq!(
+                                request["params"]["arguments"],
+                                json!([
+                                    {"value":"input[type=\"password\" i]"},{"value":[true]},{"objectId":"document"}
+                                ])
+                            );
+                            json!({"result":{"type":"object","subtype":"array","objectId":"security-result"}})
+                        }
+                        "Runtime.getProperties" => match mode {
+                            "missing" => json!({"result":[]}),
+                            "null" => {
+                                json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
+                            }
+                            "stale" | "cleanup-primary" => {
+                                json!({"result":[{"name":"__nativeStatus","value":{"type":"string","value":"stale-reference"}}]})
+                            }
+                            "resource" => {
+                                json!({"result":[{"name":"__nativeStatus","value":{"type":"string","value":"resource-limit"}}]})
+                            }
+                            "describe-sibling" => {
+                                json!({"result":[{"name":"focused","value":{"type":"object","subtype":"node","objectId":"leaf"}},{"name":"0","value":{"objectId":"ancestor"}}]})
+                            }
+                            _ => {
+                                json!({"result":[{"name":"focused","value":{"type":"object","subtype":"node","objectId":"leaf"}}]})
+                            }
+                        },
+                        "DOM.describeNode" => {
+                            descriptions += 1;
+                            assert!(
+                                request["params"]["objectId"] == "leaf"
+                                    || mode == "describe-sibling"
+                                        && request["params"]["objectId"] == "ancestor"
+                            );
+                            match mode {
+                                "pseudo" => {
+                                    json!({"node":{"nodeType":1,"backendNodeId":42,"pseudoType":"before"}})
+                                }
+                                "non-element" => json!({"node":{"nodeType":9,"backendNodeId":99}}),
+                                _ => json!({"node":{"nodeType":1,"backendNodeId":42}}),
+                            }
+                        }
+                        "Runtime.releaseObjectGroup" => {
+                            assert_eq!(request["params"]["objectGroup"], "native-security-1");
+                            json!({})
+                        }
+                        _ => panic!("focus acquisition dispatched unexpected command {method}"),
+                    };
+                    let response = if (method == "DOM.describeNode"
+                        && matches!(mode, "describe" | "describe-sibling")
+                        && request["params"]["objectId"] == "leaf")
+                        || (method == "Runtime.releaseObjectGroup"
+                            && matches!(mode, "cleanup" | "cleanup-primary"))
+                    {
+                        json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic failure"}})
+                    } else {
+                        json!({"id":request["id"],"result":result})
+                    };
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            response.to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    if method == "Runtime.releaseObjectGroup" {
+                        break;
+                    }
+                }
+                assert_eq!((inventories, resolves, calls), (1, 1, 1));
+                assert_eq!(
+                    descriptions,
+                    if mode == "describe-sibling" {
+                        2
+                    } else {
+                        usize::from(matches!(
+                            mode,
+                            "leaf" | "describe" | "pseudo" | "non-element" | "cleanup"
+                        ))
+                    }
+                );
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let (lease, _sender) = lease();
+            let result =
+                security_inventory(&client, &frame(), &ObservationOptions::default(), &lease).await;
+            match mode {
+                "leaf" => assert_eq!(result.unwrap().focused_backend, Some(42)),
+                "null" => assert_eq!(result.unwrap().focused_backend, None),
+                "stale" => assert_eq!(result.err(), Some(ObservationError::StaleReference)),
+                "resource" => assert_eq!(result.err(), Some(ObservationError::ResourceLimit)),
+                "cleanup" => assert_eq!(
+                    result.err(),
+                    Some(ObservationError::CleanupFailed { primary: None })
+                ),
+                "cleanup-primary" => assert_eq!(
+                    result.err(),
+                    Some(ObservationError::CleanupFailed {
+                        primary: Some(Box::new(ObservationError::StaleReference))
+                    })
+                ),
+                _ => assert_eq!(result.err(), Some(ObservationError::BackendFailure)),
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_focus_description_never_publishes_and_releases_the_acquisition_group() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::time::{Duration, Instant};
+        for retained in [false, true] {
+            for (cancelled, late_reply, fail_cleanup) in [
+                (true, true, false),
+                (false, true, false),
+                (true, false, false),
+                (false, false, true),
+            ] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("ws://{}", listener.local_addr().unwrap());
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (late_tx, late_rx) = tokio::sync::oneshot::channel();
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let mut started = Some(started_tx);
+                    let mut late = Some(late_rx);
+                    let mut descriptions = 0;
+                    let mut releases = 0;
+                    while let Some(Ok(message)) = socket.next().await {
+                        let request: Value =
+                            serde_json::from_str(message.to_text().unwrap()).unwrap();
+                        let method = request["method"].as_str().unwrap();
+                        let result = match method {
+                            "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}}),
+                            "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":99}}),
+                            "Page.createIsolatedWorld" => json!({"executionContextId":17}),
+                            "DOM.resolveNode" => {
+                                assert_eq!(request["params"]["objectGroup"], "native-security-1");
+                                json!({"object":{"type":"object","subtype":"node","objectId":"document"}})
+                            }
+                            "Runtime.callFunctionOn" => {
+                                assert_eq!(request["params"]["functionDeclaration"], SECURITY_INVENTORY);
+                                assert_eq!(request["params"]["objectGroup"], "native-security-1");
+                                json!({"result":{"type":"object","subtype":"array","objectId":"security-result"}})
+                            }
+                            "Runtime.getProperties" => json!({"result":[{"name":"focused","value":{"type":"object","subtype":"node","objectId":"focus-leaf"}}]}),
+                            "DOM.describeNode" => {
+                                descriptions += 1;
+                                assert_eq!(request["params"]["objectId"], "focus-leaf");
+                                started.take().unwrap().send(()).unwrap();
+                                late.take().unwrap().await.unwrap();
+                                if !late_reply { continue; }
+                                json!({"node":{"nodeType":1,"backendNodeId":42}})
+                            }
+                            "Runtime.releaseObjectGroup" => {
+                                releases += 1;
+                                assert_eq!(descriptions, 1, "Interruption must occur after the named focus handle is acquired");
+                                assert_eq!(request["params"]["objectGroup"], "native-security-1");
+                                json!({})
+                            }
+                            other => panic!("Interrupted focus acquisition dispatched downstream command {other}"),
+                        };
+                        let response = if method == "Runtime.releaseObjectGroup" && fail_cleanup {
+                            json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic cleanup refusal"}})
+                        } else {
+                            json!({"id":request["id"],"result":result})
+                        };
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                response.to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        if method == "Runtime.releaseObjectGroup" {
+                            break;
+                        }
+                    }
+                    assert_eq!((descriptions, releases), (1, 1));
+                });
+                let client = CdpClient::connect(&url).await.unwrap();
+                let (mut lease, cancellation) = lease();
+                lease.deadline = Instant::now() + Duration::from_secs(1);
+                let (_retirement, receiver) = tokio::sync::watch::channel(false);
+                let read = with_capture_retirement(
+                    retained.then(|| CaptureRetirement::new(receiver)),
+                    async {
+                        security_inventory(
+                            &client,
+                            &frame(),
+                            &ObservationOptions::default(),
+                            &lease,
+                        )
+                        .await
+                    },
+                );
+                let interrupt = async {
+                    started_rx.await.unwrap();
+                    if cancelled {
+                        cancellation.send_replace(CancelSignal::Requested);
+                    } else {
+                        tokio::time::sleep_until(lease.deadline.into()).await;
+                    }
+                    // The reply, when present, arrives after interruption, not
+                    // as a substitute for the missing named focus property.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    late_tx.send(()).unwrap();
+                };
+                let (result, ()) = tokio::join!(read, interrupt);
+                let primary = if cancelled {
+                    ObservationError::Cancelled
+                } else {
+                    ObservationError::DeadlineExceeded
+                };
+                assert_eq!(
+                    result.err(),
+                    Some(if fail_cleanup {
+                        ObservationError::CleanupFailed {
+                            primary: Some(Box::new(primary)),
+                        }
+                    } else {
+                        primary
+                    }),
+                    "retained={retained}, late_reply={late_reply}",
+                );
+                server.await.unwrap();
+            }
+        }
     }
 
     #[test]
@@ -6509,6 +7021,10 @@ mod tests {
                             .as_str()
                             .unwrap()
                             .contains("const protectedEditors=[true,false]"));
+                        assert!(request["params"]["functionDeclaration"]
+                            .as_str()
+                            .unwrap()
+                            .contains("const focusedReceivers=[false,true]"));
                         json!({"result":{"type":"object","value":[metadata(),metadata()]}})
                     }
                     "Runtime.releaseObjectGroup" => json!({}),
@@ -6541,6 +7057,7 @@ mod tests {
             true,
             &SecurityInventory {
                 ancestors: std::collections::HashSet::from([42]),
+                focused_backend: Some(43),
                 ..Default::default()
             },
         )
@@ -6599,6 +7116,7 @@ mod tests {
             simple_name_inventory: false,
             ancestors: Default::default(),
             label_ids: std::collections::HashSet::from(["closed-host".into()]),
+            focused_backend: None,
         };
         apply_security(&mut labelled, 9, &security);
         assert!(labelled.name.is_none());
@@ -6644,6 +7162,7 @@ mod tests {
                 simple_name_inventory: false,
                 ancestors: std::collections::HashSet::from([2]),
                 label_ids: Default::default(),
+                focused_backend: None,
             },
         );
         assert_eq!(node.name.as_deref(), Some("Unlock now"));
@@ -6686,6 +7205,7 @@ mod tests {
                 simple_name_inventory: false,
                 ancestors: std::collections::HashSet::from([2]),
                 label_ids: Default::default(),
+                focused_backend: None,
             },
         );
         assert_eq!(node.labels, vec!["Password"]);
@@ -7312,7 +7832,9 @@ mod tests {
                                 json!({"result":{"value":[data]}})
                             }
                         }
-                        "Runtime.getProperties" => json!({"result":[]}),
+                        "Runtime.getProperties" => {
+                            json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
+                        }
                         "Runtime.releaseObjectGroup" => json!({}),
                         _ => panic!("unexpected native pseudo command"),
                     };

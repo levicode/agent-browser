@@ -833,3 +833,138 @@ for (const [tag, source] of [['fieldset', 'legend'], ['figure', 'figcaption'], [
 }
 document.defaultView.getComputedStyle = hiddenCaptionStyle;
 console.log('PASS: caption-only hidden descendants are unavailable, not false AC/empty proofs; hidden roots remain proven empty without content acquisition');
+
+// Execute the production acquisition function, with native-shaped handles.
+// The inventory supplies closed roots; the function must not rediscover them
+// through author properties or descend into browser implementation roots.
+{
+  const vm = require('node:vm');
+  const inventorySource = source.match(/const SECURITY_INVENTORY: &str = r#"([\s\S]*?)"#;/)[1];
+  class NativeNode {
+    constructor(doc, root) { this.doc = doc; this.root = root; this.connected = true; this.parentElement = null; this.secureNodes = []; }
+    get isConnected() { return this.connected; }
+    get ownerDocument() { return this.doc; }
+    getRootNode() { return this.root; }
+    querySelectorAll() { return this.secureNodes; }
+  }
+  class NativeDocument extends NativeNode {
+    constructor() { super(null, null); this.nodeType = 9; this.root = this; this.active = null; }
+    get activeElement() { return this.active; }
+  }
+  class NativeElement extends NativeNode {
+    constructor(doc, root) { super(doc, root); this.nodeType = 1; }
+  }
+  class NativeShadowRoot extends NativeNode {
+    constructor(host, mode) { super(host.doc, null); this.nodeType = 11; this.root = this; this.nativeHost = host; this.mode = mode; this.active = null; }
+    get activeElement() { return this.active; }
+    get host() { return this.nativeHost; }
+  }
+  const doc = new NativeDocument();
+  const inventory = vm.runInNewContext(`(${inventorySource})`, {
+    Node: NativeNode, Document: NativeDocument, ShadowRoot: NativeShadowRoot, document: doc,
+  });
+  for (const outerMode of ['open', 'closed']) for (const innerMode of ['open', 'closed']) {
+    const outerHost = new NativeElement(doc, doc);
+    const outerRoot = new NativeShadowRoot(outerHost, outerMode);
+    const innerHost = new NativeElement(doc, outerRoot);
+    const innerRoot = new NativeShadowRoot(innerHost, innerMode);
+    const leaf = new NativeElement(doc, innerRoot);
+    const pin = new NativeElement(doc, outerRoot);
+    doc.active = outerHost; outerRoot.active = innerHost; innerRoot.active = leaf;
+    // Own author getters must not shadow the isolated intrinsic accessors.
+    for (const [target, key] of [[doc, 'activeElement'], [outerRoot, 'activeElement'], [innerRoot, 'host'], [outerHost, 'shadowRoot']]) {
+      Object.defineProperty(target, key, { configurable: true, get() { throw Error('Author getter executed'); } });
+    }
+    const roots = [innerRoot, doc, outerRoot];
+    let facts = inventory('.secure', roots.map(() => true), ...roots);
+    assert.equal(facts.focused, leaf, `${outerMode}/${innerMode}`);
+    assert.equal([outerHost, innerHost, pin, leaf].filter(node => node === facts.focused).length, 1);
+    outerRoot.active = pin;
+    assert.equal(inventory('.secure', roots.map(() => true), ...roots).focused, pin);
+    outerRoot.active = null;
+    assert.equal(inventory('.secure', roots.map(() => true), ...roots).focused, outerHost);
+    outerRoot.active = innerHost; innerRoot.active = leaf;
+    leaf.connected = false;
+    assert.equal(inventory('.secure', roots.map(() => true), ...roots).__nativeStatus, 'stale-reference');
+    leaf.connected = true; innerRoot.connected = false;
+    assert.equal(inventory('.secure', roots.map(() => true), ...roots).__nativeStatus, 'stale-reference');
+    innerRoot.connected = true; leaf.doc = new NativeDocument();
+    assert.equal(inventory('.secure', roots.map(() => true), ...roots).__nativeStatus, 'stale-reference');
+    leaf.doc = doc; leaf.root = outerRoot;
+    assert.equal(inventory('.secure', roots.map(() => true), ...roots).__nativeStatus, 'stale-reference');
+    delete doc.activeElement;
+  }
+  const control = new NativeElement(doc, doc);
+  const internal = new NativeShadowRoot(control, 'user-agent');
+  const implementationLeaf = new NativeElement(doc, internal);
+  internal.active = implementationLeaf; doc.active = control;
+  // Internal roots keep their security contribution, but cannot steal focus.
+  internal.secureNodes = [implementationLeaf];
+  let facts = inventory('.secure', [true, false], doc, internal);
+  assert.equal(facts.focused, control);
+  assert.equal(facts.includes(implementationLeaf), true);
+  assert.equal(facts.includes(control), true);
+  doc.active = null;
+  assert.equal(inventory('.secure', [true], doc).focused, null);
+  assert.equal(inventory('.secure', [], doc).__nativeStatus, 'invalid-native-metadata');
+  assert.equal(inventory('.secure', [true, true], doc, doc).__nativeStatus, 'invalid-native-metadata');
+  assert.equal(inventory('.secure', [true], internal).__nativeStatus, 'invalid-native-metadata');
+  const duplicateHostRoot = new NativeShadowRoot(control, 'closed');
+  assert.equal(inventory('.secure', [true, true, true], doc, internal, duplicateHostRoot).__nativeStatus, 'invalid-native-metadata');
+  const foreignRoot = new NativeShadowRoot(new NativeElement(new NativeDocument(), null), 'closed');
+  assert.equal(inventory('.secure', [true, true], doc, foreignRoot).__nativeStatus, 'stale-reference');
+  assert.equal(inventory('.secure', Array(10001).fill(true), ...Array(10001).fill(doc)).__nativeStatus, 'resource-limit');
+  for (const length of [256, 257]) {
+    let scope = doc; const roots = [doc]; let leaf;
+    for (let index = 0; index < length; index++) {
+      leaf = new NativeElement(doc, scope); scope.active = leaf;
+      if (index + 1 < length) { scope = new NativeShadowRoot(leaf, 'closed'); roots.push(scope); }
+    }
+    const facts = inventory('.secure', roots.map(() => true), ...roots);
+    if (length === 256) assert.equal(facts.focused, leaf);
+    else assert.equal(facts.__nativeStatus, 'resource-limit');
+  }
+}
+console.log('PASS: shared native root acquisition follows one bounded author focus leaf across open/closed roots, excludes UA focus, and refuses invalid native handles');
+
+// Focus flags are supplied by native backend equality for this acquisition.
+// Both full reads and bounded observations gate selection on that same flag.
+{
+  Node.prototype.contains = function (node) { return node === this || this.childNodes.includes(node); };
+  const selected = new InputControl('text', false);
+  selected.value = 'release approved'; selected.selectionStart = 8; selected.selectionEnd = 16;
+  for (const bounded of [false, true]) {
+    let facts = read.call(selected, 'data-testid', '.secure', bounded, false, false, true);
+    assert.equal(facts.states.focused, true); assert.equal(facts.selection, 'approved');
+    facts = read.call(selected, 'data-testid', '.secure', bounded, false, false, false);
+    assert.equal(facts.states.focused, false); assert.equal(facts.selection, null);
+    selected.selectionEnd = 8;
+    assert.equal(read.call(selected, 'data-testid', '.secure', bounded, false, false, true).selection, null);
+    selected.selectionEnd = 16; selected.secure = true;
+    facts = read.call(selected, 'data-testid', '.secure', bounded, false, false, true);
+    assert.equal(facts.states.focused, true); assert.equal(facts.states.secure, true);
+    assert.equal(facts.selection, null); assert.equal(facts.value, null);
+    selected.secure = false;
+  }
+  const host = new Element(); host.isContentEditable = true; host.innerText = 'release approved'; host.textContent = host.innerText;
+  const inside = new Text('release approved', null); host.childNodes = [inside]; inside.parentElement = host;
+  let common = inside; let collapsed = false; let ranges = 1;
+  document.getSelection = () => ({ rangeCount: ranges, isCollapsed: collapsed, getRangeAt: () => ({ commonAncestorContainer: common }), toString: () => 'approved' });
+  for (const bounded of [false, true]) {
+    const facts = () => read.call(host, 'data-testid', '.secure', bounded, false, false, true);
+    assert.equal(facts().selection, 'approved');
+    common = new Text('unrelated private selection', null);
+    assert.equal(facts().selection, null);
+    common = inside; collapsed = true;
+    assert.equal(facts().selection, null);
+    collapsed = false; ranges = 0;
+    assert.equal(facts().selection, null);
+    ranges = 1;
+    assert.equal(read.call(host, 'data-testid', '.secure', bounded, false, false, false).selection, null);
+    assert.equal(read.call(host, 'data-testid', '.secure', bounded, true, false, true).selection, null);
+    host.secure = true;
+    assert.equal(facts().selection, null);
+    host.secure = false;
+  }
+}
+console.log('PASS: shared metadata keeps focus and selection aligned, withholding secure, collapsed, unfocused, and outside-editor selections');

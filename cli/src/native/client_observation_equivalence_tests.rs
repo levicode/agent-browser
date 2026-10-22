@@ -310,6 +310,132 @@ async fn query_testid(
     assert_eq!(result.nodes.len(), 1);
     result.nodes.into_iter().next().unwrap()
 }
+
+#[tokio::test]
+#[ignore = "hosted Chromium: unique native author focus, selection, closed roots, UA controls and stale cleanup"]
+async fn chromium_closed_shadow_unique_focus_and_selection_contract() {
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let session = browser.active_session_id()?;
+        for (outer, inner) in [("open", "open"), ("open", "closed"), ("closed", "open"), ("closed", "closed")] {
+            let (op, _tx) = operation();
+            // These fixture-only references control focus; native acquisition
+            // never reads them or needs an author shadow-root registry.
+            let fixture = format!(r#"(() => {{
+                document.body.innerHTML=Array.from({{length:80}},(_,i)=>'<button>Padding '+i+'</button>').join('')+'<input type="date" data-testid="native-date"><div tabindex="0" role="group" aria-label="Outer host" data-testid="outer-host"></div>';
+                const host=document.querySelector('[data-testid="outer-host"]');
+                const root=host.attachShadow({{mode:'{outer}'}});
+                root.innerHTML='<input aria-label="Pin" data-testid="pin" value="release approved"><div tabindex="0" role="group" aria-label="Inner host" data-testid="inner-host"></div>';
+                const nestedHost=root.querySelector('[data-testid="inner-host"]');
+                const nested=nestedHost.attachShadow({{mode:'{inner}'}});
+                nested.innerHTML='<input aria-label="Tone" data-testid="tone" value="release approved"><input type="password" aria-label="Secret" data-testid="secret" value="synthetic-focus-secret"><div contenteditable="true" role="textbox" aria-label="Editor" data-testid="editor">release approved</div><span data-testid="outside">unrelated selection</span>';
+                globalThis.nativeFocusFixture={{host,root,nestedHost,nested,pin:root.querySelector('input'),tone:nested.querySelector('[data-testid="tone"]'),secret:nested.querySelector('[data-testid="secret"]'),editor:nested.querySelector('[data-testid="editor"]'),outside:nested.querySelector('[data-testid="outside"]')}};
+                nativeFocusFixture.pin.focus();nativeFocusFixture.pin.setSelectionRange(8,16);return true;
+            }})()"#);
+            evaluate_on(&browser.client, session, &fixture).await?;
+            let inventory = frames(&browser, &op).await;
+            let mut refs = RefMap::new();
+            let pin = query_testid(&browser, &inventory, &mut refs, &op, "pin").await;
+            assert_eq!(pin.states.get("focused"), Some(&true));
+            assert_eq!(pin.selection.as_deref(), Some("approved"));
+            let observed = observe(&browser.client, &inventory, &mut refs, "equivalence", 1, &ObservationOptions::default(), &op).await?;
+            let focused: Vec<_> = flatten(&observed.roots).into_iter().filter(|node| node.states.get("focused") == Some(&true)).collect();
+            assert_eq!(focused.len(), 1, "{outer}/{inner}");
+            assert_eq!(focused[0].test_id.as_deref(), Some("pin"));
+            let pin_read: ReadOptions = serde_json::from_value(json!({"ref":focused[0].reference.id,"fields":["states","selection"]})).unwrap();
+            let fresh = read(&browser.client, &inventory, &mut refs, "equivalence", 1, &pin_read, &op).await?;
+            assert_eq!(fresh["states"]["focused"], true);
+            assert_eq!(fresh["selection"], "approved");
+
+            evaluate_on(&browser.client, session, "nativeFocusFixture.tone.focus();nativeFocusFixture.tone.setSelectionRange(8,16);true").await?;
+            let fresh = read(&browser.client, &inventory, &mut refs, "equivalence", 1, &pin_read, &op).await?;
+            assert!(fresh["states"].get("focused").is_none(), "False focus is omitted at the public boundary");
+            assert!(fresh["selection"].is_null());
+            let tone = query_testid(&browser, &inventory, &mut refs, &op, "tone").await;
+            assert_eq!(tone.states.get("focused"), Some(&true));
+            assert_eq!(tone.selection.as_deref(), Some("approved"));
+            let pin = query_testid(&browser, &inventory, &mut refs, &op, "pin").await;
+            assert_ne!(pin.states.get("focused"), Some(&true));
+            assert!(pin.selection.is_none());
+            let observed = observe(&browser.client, &inventory, &mut refs, "equivalence", 2, &ObservationOptions::default(), &op).await?;
+            let focused: Vec<_> = flatten(&observed.roots).into_iter().filter(|node| node.states.get("focused") == Some(&true)).collect();
+            assert_eq!(focused.len(), 1);
+            assert_eq!(focused[0].test_id.as_deref(), Some("tone"));
+
+            let selected = evaluate_on(&browser.client, session, r#"(() => {
+                const {editor,nested}=nativeFocusFixture;editor.focus();
+                const range=document.createRange();range.setStart(editor.firstChild,8);range.setEnd(editor.firstChild,16);
+                const selection=document.getSelection();selection.removeAllRanges();selection.addRange(range);
+                return {focused:nested.activeElement===editor,contains:editor.contains(selection.getRangeAt(0).commonAncestorContainer),text:selection.toString()};
+            })()"#).await?;
+            assert_eq!(selected, json!({"focused":true,"contains":true,"text":"approved"}), "Native closed-root range fixture must establish containment, not replace selection getters");
+            let editor = query_testid(&browser, &inventory, &mut refs, &op, "editor").await;
+            assert_eq!(editor.states.get("focused"), Some(&true));
+            assert_eq!(editor.selection.as_deref(), Some("approved"));
+            let observed = observe(&browser.client, &inventory, &mut refs, "equivalence", 3, &ObservationOptions::default(), &op).await?;
+            let focused: Vec<_> = flatten(&observed.roots).into_iter().filter(|node| node.states.get("focused") == Some(&true)).collect();
+            assert_eq!(focused.len(), 1);
+            assert_eq!(focused[0].test_id.as_deref(), Some("editor"));
+            assert_eq!(focused[0].selection.as_deref(), Some("approved"));
+            let editor_read: ReadOptions = serde_json::from_value(json!({"ref":focused[0].reference.id,"fields":["states","selection"]})).unwrap();
+            let fresh = read(&browser.client, &inventory, &mut refs, "equivalence", 3, &editor_read, &op).await?;
+            assert_eq!(fresh["states"]["focused"], true);
+            assert_eq!(fresh["selection"], "approved");
+            let outside = evaluate_on(&browser.client, session, r#"(() => {
+                const {editor,outside,nested}=nativeFocusFixture;
+                const range=document.createRange();range.selectNodeContents(outside);
+                const selection=document.getSelection();selection.removeAllRanges();selection.addRange(range);
+                return {focused:nested.activeElement===editor,contains:editor.contains(selection.getRangeAt(0).commonAncestorContainer),text:selection.toString()};
+            })()"#).await?;
+            assert_eq!(outside, json!({"focused":true,"contains":false,"text":"unrelated selection"}), "Outside-selection proof must keep the editor focused");
+            let fresh = read(&browser.client, &inventory, &mut refs, "equivalence", 3, &editor_read, &op).await?;
+            assert_eq!(fresh["states"]["focused"], true);
+            assert!(fresh["selection"].is_null());
+            let editor = query_testid(&browser, &inventory, &mut refs, &op, "editor").await;
+            assert_eq!(editor.states.get("focused"), Some(&true));
+            assert!(editor.selection.is_none());
+
+            evaluate_on(&browser.client, session, "nativeFocusFixture.host.focus();nativeFocusFixture.root.activeElement===null").await?.as_bool().filter(|value| *value).expect("Fixture host must be the active leaf");
+            let host = query_testid(&browser, &inventory, &mut refs, &op, "outer-host").await;
+            assert_eq!(host.states.get("focused"), Some(&true));
+            assert_ne!(query_testid(&browser, &inventory, &mut refs, &op, "tone").await.states.get("focused"), Some(&true));
+            evaluate_on(&browser.client, session, "document.querySelector('[data-testid=native-date]').focus();true").await?;
+            let native = query_testid(&browser, &inventory, &mut refs, &op, "native-date").await;
+            assert_eq!(native.states.get("focused"), Some(&true), "UA implementation focus belongs to the author control");
+            evaluate_on(&browser.client, session, "nativeFocusFixture.secret.focus();nativeFocusFixture.secret.setSelectionRange(0,9);true").await?;
+            let secret = query_testid(&browser, &inventory, &mut refs, &op, "secret").await;
+            assert_eq!(secret.states.get("focused"), Some(&true));
+            assert_eq!(secret.states.get("secure"), Some(&true));
+            assert!(secret.selection.is_none());
+            assert!(secret.value.is_none());
+            let observed = observe(&browser.client, &inventory, &mut refs, "equivalence", 4, &ObservationOptions::default(), &op).await?;
+            assert!(!serde_json::to_string(&observed).unwrap().contains("synthetic-focus-secret"));
+
+            evaluate_on(&browser.client, session, "nativeFocusFixture.tone.focus();true").await?;
+            let observed = observe(&browser.client, &inventory, &mut refs, "equivalence", 5, &ObservationOptions::default(), &op).await?;
+            let tone = flatten(&observed.roots).into_iter().find(|node| node.test_id.as_deref() == Some("tone")).unwrap();
+            let tone_read: ReadOptions = serde_json::from_value(json!({"ref":tone.reference.id})).unwrap();
+            let before = refs.ref_ids();
+            if outer == "closed" && inner == "closed" {
+                // Existing exact-operation navigation hook retires the loader
+                // after metadata, not a new focus lifecycle subsystem.
+                let (_guard, hook) = install(&op, Mode::Navigate, 1);
+                assert_eq!(read(&browser.client, &inventory, &mut refs, "equivalence", 5, &tone_read, &op).await.unwrap_err(), ObservationError::StaleReference);
+                assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+            } else {
+                evaluate_on(&browser.client, session, "nativeFocusFixture.host.remove();true").await?;
+                assert_eq!(read(&browser.client, &inventory, &mut refs, "equivalence", 5, &tone_read, &op).await.unwrap_err(), ObservationError::StaleReference);
+            }
+            assert_eq!(refs.ref_ids(), before, "Refusal must not publish a focus identity");
+        }
+        Ok::<(), String>(())
+    }.await;
+    browser.close().await.unwrap();
+    result.unwrap();
+}
+
 #[tokio::test]
 #[ignore = "hosted Chromium: real AX controls, exact labels and native budget accounting"]
 async fn chromium_twenty_controls_budget_and_frame_truncation_contract() {
