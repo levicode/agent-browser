@@ -1197,10 +1197,34 @@ mod tests {
             let peer=client.send_command("Target.createTarget",Some(json!({"url":"about:blank","browserContextId":owner.context_id,"background":false})),None).await?["targetId"].as_str().ok_or("Missing peer target")?.to_owned();
             let peer_session=client.send_command("Target.attachToTarget",Some(json!({"targetId":peer,"flatten":true})),None).await?["sessionId"].as_str().ok_or("Missing peer session")?.to_owned();
             client.send_command("Target.activateTarget",Some(json!({"targetId":peer})),None).await?;
+            // Fixture readiness, not a capture repair: activation ACK can precede
+            // the renderer's focus event. Wait under the ORIGINAL operation deadline,
+            // without another activation, sleep, focus override, or lifecycle command.
+            let ready_budget = operation.deadline.saturating_duration_since(Instant::now()).as_millis();
+            if ready_budget == 0 { return Err("Background fixture readiness budget expired".into()); }
+            let readiness_script = format!(r#"new Promise(resolve=>{{
+                const ready=()=>document.visibilityState==='visible'&&document.hasFocus();
+                const initiallyReady=ready();let settled=false;let timer;
+                const finish=value=>{{if(settled)return;settled=true;clearTimeout(timer);
+                    window.removeEventListener('focus',check);document.removeEventListener('visibilitychange',check);
+                    resolve({{initiallyReady,ready:value,listenersRemoved:true}});}};
+                const check=()=>{{if(ready())finish(true);}};
+                window.addEventListener('focus',check);document.addEventListener('visibilitychange',check);
+                timer=setTimeout(()=>finish(false),{ready_budget});check();
+            }})"#);
+            let readiness=tokio::time::timeout_at(tokio::time::Instant::from_std(operation.deadline),
+                client.send_command("Runtime.evaluate",Some(json!({"expression":readiness_script,"awaitPromise":true,"returnByValue":true})),Some(&peer_session)))
+                .await.map_err(|_|"Background fixture readiness deadline")??;
+            let ready=&readiness["result"]["value"];
+            let initially_ready=ready["initiallyReady"].as_bool().ok_or("Invalid background fixture readiness proof")?;
+            let ready_now=ready["ready"].as_bool().ok_or("Invalid background fixture readiness proof")?;
+            let listeners_removed=ready["listenersRemoved"].as_bool().ok_or("Invalid background fixture readiness proof")?;
+            eprintln!("BackgroundFixtureReadiness initially_ready={initially_ready} ready={ready_now} listeners_removed={listeners_removed}");
+            if !ready_now||!listeners_removed{return Err("Fixture did not establish renderer foreground readiness".into());}
             let read=json!({"expression":"({visibility:document.visibilityState,focus:document.hasFocus()})","returnByValue":true});
             let before=client.send_command("Runtime.evaluate",Some(read.clone()),Some(&session)).await?["result"]["value"].clone();
             let peer_before=client.send_command("Runtime.evaluate",Some(read.clone()),Some(&peer_session)).await?["result"]["value"].clone();
-            if before["visibility"]!="hidden"||peer_before["visibility"]!="visible"{return Err("Fixture did not establish exact background and foreground pages".into());}
+            if before["visibility"]!="hidden"||peer_before["visibility"]!="visible"||peer_before["focus"]!=true{return Err("Fixture did not establish exact background and foreground pages".into());}
             let frames=super::super::client_observation::enumerate_frames(&client,&session,&HashMap::new(),&operation).await.map_err(|e|format!("Frame inventory: {e:?}"))?;
             page.targets.acknowledge_enrollment().map_err(|e|format!("Primitive fixture inventory: {e:?}"))?;
             let context=CaptureContext{page,frames,inventory_complete:true};

@@ -1262,6 +1262,8 @@ async fn center(
         let started = Instant::now();
         let attempt = center_once(ctx, d, node, enabled).await;
         longest_attempt = longest_attempt.max(started.elapsed());
+        #[cfg(test)]
+        tests::preparation_classification_gate(ctx, d, &attempt, longest_attempt).await;
         match attempt {
             Ok(current) => {
                 if previous.as_ref().is_some_and(|old| {
@@ -3041,11 +3043,13 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     type Log = Arc<std::sync::Mutex<Vec<Value>>>;
     // Hooks are keyed to one exact scope/generation/sequence, never a process-
-    // wide next-action callback. They run only after the real keyboard future
-    // has ACKed every event; the hook cannot manufacture a prefix receipt.
+    // wide next-action callback. Replacement hooks follow real keyboard ACKs;
+    // preparation gates follow real refusal/revalidation ACKs. Neither can
+    // manufacture a prefix receipt.
     type BoundaryKey = (String, u64, u64, String);
-    struct ReplacementHook {
-        run: Box<dyn FnOnce() + Send>,
+    enum ReplacementHook {
+        Run(Box<dyn FnOnce() + Send>),
+        Preparation(Option<PreparationClassificationHook>),
     }
     fn replacement_hooks() -> &'static Mutex<HashMap<BoundaryKey, ReplacementHook>> {
         static HOOKS: std::sync::OnceLock<Mutex<HashMap<BoundaryKey, ReplacementHook>>> =
@@ -3065,7 +3069,7 @@ mod tests {
             assert!(replacement_hooks()
                 .lock()
                 .unwrap()
-                .insert(binding.clone(), ReplacementHook { run: Box::new(run) })
+                .insert(binding.clone(), ReplacementHook::Run(Box::new(run)))
                 .is_none());
             Self(binding)
         }
@@ -3083,9 +3087,149 @@ mod tests {
             key.to_owned(),
         );
         let hook = replacement_hooks().lock().unwrap().remove(&binding);
-        if let Some(hook) = hook {
-            (hook.run)();
+        if let Some(ReplacementHook::Run(run)) = hook {
+            run();
         }
+    }
+
+    const PREPARATION_CLASSIFICATION_BOUNDARY: &str = "preparation-classification";
+    #[derive(Clone, Copy)]
+    struct PreparationGateEntered {
+        deadline: Instant,
+        remaining: Duration,
+        longest_attempt: Duration,
+        authority_valid: bool,
+    }
+    #[derive(Clone, Copy)]
+    struct PreparationGateReleased {
+        remaining: Duration,
+        authority_valid: bool,
+        release_received: bool,
+    }
+    struct PreparationClassificationHook {
+        authority: Arc<super::super::client_enrollment::SettledInputAuthority>,
+        entered: tokio::sync::oneshot::Sender<PreparationGateEntered>,
+        release: tokio::sync::oneshot::Receiver<()>,
+        released: tokio::sync::oneshot::Sender<PreparationGateReleased>,
+    }
+    struct PreparationClassificationBoundary {
+        _registration: ReplacementBoundary,
+        entered: tokio::sync::oneshot::Receiver<PreparationGateEntered>,
+        release: tokio::sync::oneshot::Sender<()>,
+        released: tokio::sync::oneshot::Receiver<PreparationGateReleased>,
+    }
+    impl PreparationClassificationBoundary {
+        fn install(
+            fixture: &Fixture,
+            authority: Arc<super::super::client_enrollment::SettledInputAuthority>,
+        ) -> Self {
+            // Only these synthetic, ordinary taps may install the async gate.
+            assert!(matches!(
+                fixture.page.identity_scope.as_str(),
+                "preparation-controlled-inside-window" | "preparation-controlled-below-floor"
+            ));
+            assert!(!fixture.op.is_callback);
+            let binding = (
+                fixture.page.identity_scope.clone(),
+                fixture.op.generation,
+                fixture.op.sequence,
+                PREPARATION_CLASSIFICATION_BOUNDARY.to_owned(),
+            );
+            let (entered, entered_receive) = tokio::sync::oneshot::channel();
+            let (release, release_receive) = tokio::sync::oneshot::channel();
+            let (released, released_receive) = tokio::sync::oneshot::channel();
+            // Reuse the existing exact-owner test-hook map, not a second
+            // operation/reference registry or a process-wide next-action hook.
+            {
+                let mut hooks = replacement_hooks().lock().unwrap();
+                let std::collections::hash_map::Entry::Vacant(entry) = hooks.entry(binding.clone())
+                else {
+                    panic!("controlled preparation gate is already registered");
+                };
+                entry.insert(ReplacementHook::Preparation(Some(
+                    PreparationClassificationHook {
+                        authority,
+                        entered,
+                        release: release_receive,
+                        released,
+                    },
+                )));
+            }
+            Self {
+                _registration: ReplacementBoundary(binding),
+                entered: entered_receive,
+                release,
+                released: released_receive,
+            }
+        }
+    }
+    pub(super) async fn preparation_classification_gate(
+        ctx: &ActionContext<'_>,
+        dispatch: &Dispatch,
+        attempt: &Result<(Point, (f64, f64)), ProtocolError>,
+        longest_attempt: Duration,
+    ) {
+        if !matches!(
+            ctx.page.identity_scope.as_str(),
+            "preparation-controlled-inside-window" | "preparation-controlled-below-floor"
+        ) || !matches!(attempt, Err(ProtocolError::NotActionable))
+            || !dispatch.preparation_enabled.load(Ordering::SeqCst)
+            || !dispatch.preparation_refusal.load(Ordering::SeqCst)
+            || dispatch.preparation_disqualified.load(Ordering::SeqCst)
+            || ctx.operation.is_callback
+        {
+            return;
+        }
+        let binding = (
+            ctx.page.identity_scope.clone(),
+            ctx.operation.generation,
+            ctx.operation.sequence,
+            PREPARATION_CLASSIFICATION_BOUNDARY.to_owned(),
+        );
+        let hook = {
+            let mut hooks = replacement_hooks().lock().unwrap();
+            match hooks.get_mut(&binding) {
+                Some(ReplacementHook::Preparation(hook)) => hook.take(),
+                _ => None,
+            }
+        };
+        let Some(hook) = hook else { return };
+        // Keep the consumed registration until its exact owner drops it, so a
+        // duplicate installation cannot replace another live gate's channels.
+        // The ACKed refusal and measured attempt are real production facts.
+        // Do not change Dispatch, the result, the lease, or longest_attempt.
+        let original_authority = hook.authority;
+        let authority_valid = || {
+            ctx.check().is_ok()
+                && match ctx.realm_authority {
+                    ActionRealmAuthority::Enrolled(owner) => original_authority
+                        .check(owner, ctx.page, ctx.operation)
+                        .is_ok(),
+                    ActionRealmAuthority::UntrackedFixture => false,
+                }
+        };
+        let _ = hook.entered.send(PreparationGateEntered {
+            deadline: ctx.operation.deadline,
+            remaining: ctx
+                .operation
+                .deadline
+                .saturating_duration_since(Instant::now()),
+            longest_attempt,
+            authority_valid: authority_valid(),
+        });
+        // A missing controller must not create an unbounded test-only wait.
+        // Timeout/channel loss is an inconclusive schedule, never a receipt.
+        let release_received = tokio::time::timeout_at(ctx.operation.deadline.into(), hook.release)
+            .await
+            .is_ok_and(|result| result.is_ok());
+        let _ = hook.released.send(PreparationGateReleased {
+            remaining: ctx
+                .operation
+                .deadline
+                .saturating_duration_since(Instant::now()),
+            authority_valid: authority_valid(),
+            release_received,
+        });
     }
     struct Fixture {
         gate: Arc<ExecutionGate>,
@@ -3426,6 +3570,8 @@ mod tests {
                                     | "preparation-slack-exhausted"
                                     | "preparation-latency-spike"
                                     | "preparation-estimate-overrun"
+                                    | "preparation-controlled-inside-window"
+                                    | "preparation-controlled-below-floor"
                             ) || (mode == "preparation-retry-success"
                                 && preparation_scrolls == 1)
                             {
@@ -6497,6 +6643,407 @@ mod tests {
                 assert_eq!(evidence.original_authority, Err(ProtocolError::StaleScope));
             }
         }
+    }
+
+    #[derive(Clone, Copy)]
+    enum ControlledPreparationSchedule {
+        InsideWindow,
+        BelowFloor,
+    }
+    impl ControlledPreparationSchedule {
+        fn mode(self) -> &'static str {
+            match self {
+                Self::InsideWindow => "preparation-controlled-inside-window",
+                Self::BelowFloor => "preparation-controlled-below-floor",
+            }
+        }
+        fn case_id(self) -> &'static str {
+            match self {
+                Self::InsideWindow => "preparation-positive-window",
+                Self::BelowFloor => "preparation-lower-floor",
+            }
+        }
+    }
+
+    // This is a diagnostic schedule, not a replacement for any of the original
+    // eight mandatory cases or six Unknown controls. All action/settlement
+    // results still come from the actual execute -> RetainedTasks -> broker path.
+    async fn assert_controlled_preparation_schedule(schedule: ControlledPreparationSchedule) {
+        use super::super::{
+            client_protocol::ScopeState, client_session::ClientSession,
+            client_tasks::RetainedTasks, client_transport::NativeOutcome,
+        };
+        let mode = schedule.mode();
+        let positive = matches!(schedule, ControlledPreparationSchedule::InsideWindow);
+        let broker = Arc::new(ClientSession::new());
+        let mut f = fixture_scoped(mode, mode).await;
+        let (owner, state, _notices) = preparation_settlement_owner(&f, broker.clone()).await;
+        f.op = broker.admit(1, 1, 800).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let deadline = f.op.deadline;
+        let original_authority = Arc::new(
+            owner
+                .capture_settled_input_authority(&f.page, &f.op)
+                .unwrap(),
+        );
+        let revision = f.page.targets.inventory().unwrap().0;
+        let gate = PreparationClassificationBoundary::install(&f, original_authority.clone());
+        f.log.lock().unwrap().clear();
+        f.replies.lock().unwrap().clear();
+        let f = Arc::new(f);
+        let evidence = Arc::new(Mutex::new(None));
+        let tasks = RetainedTasks::default();
+        let captured_targets = f.page.targets.clone();
+        let unrelated_targets = ClientTargets::new("other-context".into(), "other-scope".into());
+        let action_fixture = f.clone();
+        let action_owner = owner.clone();
+        let action_state = state.clone();
+        let action_evidence = evidence.clone();
+        let receive = tasks
+            .start(mode.into(), captured_targets.clone(), async move {
+                let ctx = ActionContext {
+                    realm_authority: ActionRealmAuthority::Enrolled(&action_owner),
+                    page_state: &action_state,
+                    ..action_fixture.context()
+                };
+                let result = ClientActions::default()
+                    .execute(
+                        ctx,
+                        "browser.perform",
+                        &json!({"identityScope":mode,"ref":{"id":"@e1","revision":"1"},
+                            "action":{"kind":"tap"}}),
+                    )
+                    .await;
+                let failure = match result {
+                    Err(failure) => failure,
+                    // RetainedTasks observes this failure normally. Never print
+                    // an unexpected successful payload in diagnostic output.
+                    Ok(_) => panic!("controlled preparation unexpectedly succeeded"),
+                };
+                let error = match failure.reason {
+                    Some(ActionReason::InterceptedPointer) => ProtocolError::InterceptedPointer,
+                    Some(ActionReason::CheckedStateUnchanged) => {
+                        ProtocolError::CheckedStateUnchanged
+                    }
+                    Some(ActionReason::ControlReplacedAfterClick) => {
+                        ProtocolError::CheckedControlReplaced
+                    }
+                    None => failure.error.clone(),
+                };
+                let outcome = NativeOutcome {
+                    result: Err(error),
+                    effects: failure.effects,
+                };
+                let cleanup_failed = failure.cleanup_failed;
+                *action_evidence.lock().unwrap() = Some(PreparationSettlementEvidence {
+                    failure,
+                    original_authority: original_authority.check(
+                        &action_owner,
+                        &action_fixture.page,
+                        &action_fixture.op,
+                    ),
+                    target_revision: action_fixture.page.targets.check_revision(revision),
+                    before_deadline: Instant::now() < deadline,
+                });
+                (outcome, cleanup_failed)
+            })
+            .await
+            .unwrap();
+        let PreparationClassificationBoundary {
+            _registration,
+            entered,
+            release,
+            released,
+        } = gate;
+        let entered = tokio::time::timeout_at(deadline.into(), entered)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        // The entered signal is issued only after the real ACKed semantic
+        // refusal and geometry revalidation return. Independently witness the
+        // exact peer replies before choosing any scheduling delay.
+        let entry_requests = f.log.lock().unwrap().clone();
+        let entry_replies = f.replies.lock().unwrap().clone();
+        let acked = |request: &Value, replies: &[Value]| {
+            replies.iter().any(|entry| {
+                entry["request"]["id"] == request["id"]
+                    && entry["reply"].get("result").is_some()
+                    && entry["reply"].get("error").is_none()
+            })
+        };
+        let entry_scrolls = entry_requests
+            .iter()
+            .filter(|request| request["method"] == "DOM.scrollIntoViewIfNeeded")
+            .collect::<Vec<_>>();
+        let entry_refusals = entry_replies
+            .iter()
+            .filter(|entry| {
+                entry["request"]["method"] == "Runtime.callFunctionOn"
+                    && entry["request"]["params"]["objectId"] == "exact-node"
+                    && entry["request"]["params"]["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|source| source.contains("const blocker="))
+                    && entry["reply"]["result"]["result"]["value"]["status"]
+                        == "intercepted-pointer"
+                    && entry["reply"].get("error").is_none()
+            })
+            .count();
+        let entry_ack_receipt = entry_scrolls.len() == 1
+            && acked(entry_scrolls[0], &entry_replies)
+            && entry_refusals == 1
+            && entry_requests
+                .iter()
+                .all(|request| acked(request, &entry_replies));
+        let entry_above_upper = entered.is_some_and(|entry| {
+            entry.deadline == deadline
+                && entry.authority_valid
+                && entry.remaining
+                    > Duration::from_millis(282).saturating_add(entry.longest_attempt)
+        });
+        let entry_preconditions = entry_ack_receipt && entry_above_upper;
+        if let Some(entry) = entered.filter(|_| entry_preconditions) {
+            let target_remaining = if positive {
+                // Midpoint of the original window, not a widened interval.
+                // Gate residence is deliberately excluded from longest_attempt.
+                Duration::from_millis(266) + (Duration::from_millis(16) + entry.longest_attempt) / 2
+            } else {
+                Duration::from_millis(240)
+            };
+            tokio::time::sleep_until((deadline - target_remaining).into()).await;
+        }
+        // A missed entered/ACK/precondition releases promptly, then fails as
+        // inconclusive after real cleanup. It is never retried or silently skipped.
+        let release_sent = release.send(()).is_ok();
+        let released = tokio::time::timeout_at(deadline.into(), released)
+            .await
+            .ok()
+            .and_then(Result::ok);
+        let release_preconditions = entered.zip(released).is_some_and(|(entry, receipt)| {
+            receipt.release_received
+                && receipt.authority_valid
+                && if positive {
+                    preparation_classification_window(receipt.remaining, entry.longest_attempt)
+                } else {
+                    // A late wake is not proof of the requested 240ms
+                    // schedule. Admit at most 8ms of timer/poll latency;
+                    // anything later is explicitly inconclusive, not retried.
+                    receipt.remaining >= Duration::from_millis(232)
+                        && receipt.remaining <= Duration::from_millis(240)
+                        && receipt.remaining < Duration::from_millis(266)
+                }
+        });
+        let schedule_valid = entry_preconditions && release_sent && release_preconditions;
+        let delivered = receive.await.unwrap();
+        let settled = broker.settle(1, 1, delivered.effects).unwrap();
+        let broker_settled_before_deadline = Instant::now() < deadline;
+        let health = broker.health().unwrap();
+        let next = broker.admit(1, 2, 1_000);
+        let next_error = next.as_ref().err().cloned();
+        if next.is_ok() {
+            assert!(broker.start(1, 2).unwrap());
+            assert_eq!(
+                broker.settle(1, 2, Effects::NotDispatched).unwrap(),
+                ScopeState::Usable
+            );
+        }
+        let drained = tasks.drain().await;
+        let retained_drained_before_deadline = Instant::now() < deadline;
+        let targets_unsealed = captured_targets.inventory().is_ok();
+        let unrelated_usable = unrelated_targets.inventory().is_ok();
+        let evidence = evidence.lock().unwrap().take();
+        let requests = f.log.lock().unwrap().clone();
+        let replies = f.replies.lock().unwrap().clone();
+        let no_held_input =
+            state.held_modifiers().unwrap() == 0 && state.mouse_state().unwrap().buttons == 0;
+        let owner_closed = owner.close().await.is_ok();
+        let mut f = match Arc::try_unwrap(f) {
+            Ok(fixture) => fixture,
+            Err(_) => panic!("controlled retained execution did not release its fixture"),
+        };
+        f.server.abort();
+        let peer_joined = (&mut f.server)
+            .await
+            .is_err_and(|error| error.is_cancelled());
+        drop(_registration);
+
+        let scrolls = requests
+            .iter()
+            .filter(|request| request["method"] == "DOM.scrollIntoViewIfNeeded")
+            .collect::<Vec<_>>();
+        let releases = requests
+            .iter()
+            .filter(|request| request["method"] == "Runtime.releaseObject")
+            .collect::<Vec<_>>();
+        let resolutions = requests
+            .iter()
+            .filter(|request| request["method"] == "DOM.resolveNode")
+            .collect::<Vec<_>>();
+        let inputs = requests
+            .iter()
+            .filter(|request| {
+                request["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("Input."))
+            })
+            .count();
+        let exact_release_acked = releases.len() == 1
+            && releases[0]["params"]["objectId"] == "exact-node"
+            && releases[0]["sessionId"] == "page"
+            && acked(releases[0], &replies);
+        let exact_resolution = resolutions.len() == 1
+            && resolutions[0]["params"]["backendNodeId"] == 42
+            && resolutions[0]["params"]["executionContextId"] == 1;
+        let scrolls_acked =
+            !scrolls.is_empty() && scrolls.iter().all(|request| acked(request, &replies));
+        let expected_effects = if positive {
+            Effects::Completed
+        } else {
+            Effects::Unknown
+        };
+        let expected_state = if positive {
+            ScopeState::Usable
+        } else {
+            ScopeState::Quarantined
+        };
+        let original_authority_valid = evidence.as_ref().is_some_and(|evidence| {
+            // At gate release the original authority must still be valid. If
+            // the unfixed lower-floor loop runs to expiry, the final receipt
+            // must honestly report expiry rather than manufacture authority.
+            evidence.target_revision.is_ok()
+                && if evidence.before_deadline {
+                    evidence.original_authority.is_ok()
+                } else {
+                    !positive && evidence.original_authority == Err(ProtocolError::DeadlineExceeded)
+                }
+        });
+        let action_refusal_valid = evidence.as_ref().is_some_and(|evidence| {
+            evidence.failure.error == ProtocolError::NotActionable
+                && evidence.failure.reason == Some(ActionReason::InterceptedPointer)
+                && !evidence.failure.cleanup_failed
+                && evidence.failure.effects == expected_effects
+        });
+        let actual_settlement_valid = delivered.result == Err(ProtocolError::InterceptedPointer)
+            && delivered.effects == expected_effects
+            && settled == expected_state
+            && health == (1, expected_state)
+            && next_error
+                == if positive {
+                    None
+                } else {
+                    Some(ProtocolError::ScopeUnavailable)
+                };
+        let clean_retirement = exact_release_acked
+            && drained.is_ok()
+            && targets_unsealed
+            && unrelated_usable
+            && no_held_input
+            && owner_closed
+            && peer_joined;
+        let retired_before_deadline = evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.before_deadline)
+            && broker_settled_before_deadline
+            && retained_drained_before_deadline;
+        let counts_bounded = scrolls.len() <= 128 && inputs <= 128 && releases.len() <= 128;
+        let contract_valid = action_refusal_valid
+            && actual_settlement_valid
+            && clean_retirement
+            && exact_resolution
+            && scrolls_acked
+            && original_authority_valid
+            && inputs == 0
+            && counts_bounded;
+        let desired_early_retirement = retired_before_deadline && scrolls.len() == 1;
+        // One bounded, closed record. Source/harness hashes and exact-name run
+        // completion belong to the external diagnostic receipt, not this process.
+        // Missing this footer is incomplete, never evidence of pass or expected RED.
+        eprintln!(
+            "native-preparation-controlled {}",
+            json!({
+                "schema": 1,
+                "case": schedule.case_id(),
+                "status": if !schedule_valid || !counts_bounded { "incomplete" }
+                    else if contract_valid && desired_early_retirement { "pass" } else { "fail" },
+                "entry_ack": entry_ack_receipt,
+                "entry_above_upper": entry_above_upper,
+                "release_valid": release_preconditions,
+                "entry_remaining_ms": entered.map(|entry| entry.remaining.as_millis().min(800) as u64),
+                "longest_attempt_ms": entered.map(|entry| entry.longest_attempt.as_millis().min(800) as u64),
+                "release_remaining_ms": released.map(|receipt| receipt.remaining.as_millis().min(800) as u64),
+                "scrolls": scrolls.len().min(128),
+                "inputs": inputs.min(128),
+                "releases": releases.len().min(128),
+                "counts_bounded": counts_bounded,
+                "exact_release_acked": exact_release_acked,
+                "authority_expired_at_retirement": evidence.as_ref().is_some_and(|evidence|
+                    evidence.original_authority == Err(ProtocolError::DeadlineExceeded)),
+                "action_finished_before_deadline": evidence.as_ref().is_some_and(|evidence| evidence.before_deadline),
+                "broker_settled_before_deadline": broker_settled_before_deadline,
+                "retained_drained_before_deadline": retained_drained_before_deadline,
+                "contract_valid": contract_valid,
+                "retired_before_deadline": retired_before_deadline,
+                "complete": true
+            })
+        );
+        assert!(
+            entry_ack_receipt,
+            "controlled preparation schedule inconclusive: entered ACK receipt"
+        );
+        assert!(
+            entry_above_upper,
+            "controlled preparation schedule inconclusive: entry above original upper bound"
+        );
+        assert!(
+            release_sent && release_preconditions,
+            "controlled preparation schedule inconclusive: original release interval"
+        );
+        assert!(
+            counts_bounded,
+            "controlled preparation receipt exceeded closed count bounds"
+        );
+        assert!(
+            action_refusal_valid,
+            "controlled preparation actual refusal/effects mismatch"
+        );
+        assert!(
+            actual_settlement_valid,
+            "controlled preparation actual broker settlement mismatch"
+        );
+        assert!(
+            clean_retirement,
+            "controlled preparation exact release or teardown mismatch"
+        );
+        assert!(
+            exact_resolution && scrolls_acked && original_authority_valid,
+            "controlled preparation exact authority/ACK mismatch"
+        );
+        assert!(
+            inputs == 0,
+            "controlled preparation must not dispatch any Input or replay tap"
+        );
+        // In the lower-floor diagnostic, current production is expected RED at
+        // this exact assertion after Unknown/quarantine and real cleanup pass.
+        // Expected RED is evidence of the gap, never an acceptance exemption.
+        assert!(
+            retired_before_deadline,
+            "controlled preparation did not retire before original deadline"
+        );
+        assert!(
+            scrolls.len() == 1,
+            "controlled preparation retried after the controlled refusal"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "controlled preparation diagnostic; separate exact-name receipt required"]
+    async fn preparation_controlled_inside_window_acked_refusal_is_completed_and_reusable() {
+        assert_controlled_preparation_schedule(ControlledPreparationSchedule::InsideWindow).await;
+    }
+
+    #[tokio::test]
+    #[ignore = "diagnostic expected RED: below-floor refusal must retire before original deadline"]
+    async fn preparation_controlled_below_floor_unknown_retires_before_original_deadline() {
+        assert_controlled_preparation_schedule(ControlledPreparationSchedule::BelowFloor).await;
     }
 
     #[tokio::test]
