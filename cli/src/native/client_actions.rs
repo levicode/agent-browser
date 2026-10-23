@@ -48,6 +48,11 @@ struct Dispatch {
     preparation_refusal: AtomicBool,
     preparation_stopped: AtomicBool,
     preparation_disqualified: AtomicBool,
+    // A read-only Swipe refusal is never the Tap's settled mutation prefix.
+    readonly_preparation_enabled: AtomicBool,
+    readonly_preparation_refusal: AtomicBool,
+    readonly_preparation_stopped: AtomicBool,
+    readonly_preparation_disqualified: AtomicBool,
     #[cfg(test)]
     preparation_trace: Mutex<tests::PreparationTrace>,
 }
@@ -55,11 +60,17 @@ impl Dispatch {
     fn begin_preparation_attempt(&self) {
         // Even a read invalidates the previous attempt's refusal receipt.
         self.preparation_refusal.store(false, Ordering::SeqCst);
+        self.readonly_preparation_refusal
+            .store(false, Ordering::SeqCst);
     }
     fn mark(&self) {
         self.mark_mutation(false);
     }
     fn mark_mutation(&self, preparation: bool) {
+        self.readonly_preparation_refusal
+            .store(false, Ordering::SeqCst);
+        self.readonly_preparation_disqualified
+            .store(true, Ordering::SeqCst);
         self.preparation_refusal.store(false, Ordering::SeqCst);
         if !preparation {
             self.preparation_disqualified.store(true, Ordering::SeqCst);
@@ -547,12 +558,42 @@ pub(crate) async fn release_group_accounted(
     )
     .await
 }
+#[derive(Clone, Copy, Default)]
+struct ObjectReleaseOutcome {
+    // Preserve the existing ownership-transfer contract for every old caller.
+    accepted: bool,
+    // New refusal evidence requires an exact settled command, not retained debt.
+    settled: bool,
+}
+async fn release_object_outcome(
+    client: &super::cdp::client::CdpClient,
+    session: &str,
+    object: &str,
+) -> ObjectReleaseOutcome {
+    release_outcome(
+        client,
+        session,
+        "Runtime.releaseObject",
+        json!({"objectId":object}),
+    )
+    .await
+}
 async fn release_accounted(
     client: &super::cdp::client::CdpClient,
     session: &str,
     method: &str,
     params: Value,
 ) -> bool {
+    release_outcome(client, session, method, params)
+        .await
+        .accepted
+}
+async fn release_outcome(
+    client: &super::cdp::client::CdpClient,
+    session: &str,
+    method: &str,
+    params: Value,
+) -> ObjectReleaseOutcome {
     client_debt::command_scope(
         CommandCategory::CleanupObject,
         false,
@@ -565,10 +606,10 @@ async fn release_accounted_inner(
     session: &str,
     method: &str,
     params: Value,
-) -> bool {
+) -> ObjectReleaseOutcome {
     let reservation = match client.reserve_tracked_command(method, Some(&params), Some(session)) {
         Ok(reservation) => reservation,
-        Err(_) => return false,
+        Err(_) => return ObjectReleaseOutcome::default(),
     };
     let status = reservation.as_ref().map(|reservation| reservation.status());
     let result = tokio::time::timeout(
@@ -576,11 +617,21 @@ async fn release_accounted_inner(
         client.send_reserved_command(method, Some(params), Some(session), reservation),
     )
     .await;
-    matches!(result, Ok(Ok(_)))
-        || (status.is_some_and(|status| status.settled() || status.accountably_retained())
+    ObjectReleaseOutcome {
+        accepted: matches!(result, Ok(Ok(_)))
+            || (status
+                .as_ref()
+                .is_some_and(|status| status.settled() || status.accountably_retained())
+                && client
+                    .debt_ledger()
+                    .is_some_and(|ledger| !ledger.snapshot().integrity_lost)),
+        // The transport may deliver a successful envelope even after rejecting
+        // its session identity. Neither that value nor absent tracking is proof.
+        settled: status.as_ref().is_some_and(|status| status.settled())
             && client
                 .debt_ledger()
-                .is_some_and(|ledger| !ledger.snapshot().integrity_lost))
+                .is_some_and(|ledger| !ledger.snapshot().integrity_lost),
+    }
 }
 struct Resolved {
     realm: Option<super::client_enrollment::ExactRealmTicket>,
@@ -589,6 +640,27 @@ struct Resolved {
     binding: ExactBinding,
 }
 impl Resolved {
+    async fn release_settled(&self, ctx: &ActionContext<'_>) -> Result<(), ProtocolError> {
+        if self
+            .realm
+            .as_ref()
+            .is_some_and(|realm| realm.destroyed() == Ok(true))
+        {
+            return Ok(());
+        }
+        if release_object_outcome(&ctx.page.client, &self.session, &self.object)
+            .await
+            .settled
+            || self
+                .realm
+                .as_ref()
+                .is_some_and(|realm| realm.destroyed() == Ok(true))
+        {
+            Ok(())
+        } else {
+            Err(ProtocolError::CleanupFailed)
+        }
+    }
     async fn release(&self, ctx: &ActionContext<'_>) -> Result<(), ProtocolError> {
         if self
             .realm
@@ -663,7 +735,16 @@ async fn release_call_handles(
         if Some(object) == retained || !seen.insert(object) {
             continue;
         }
-        failed |= !release_object_accounted(&ctx.page.client, session, object).await;
+        let release = release_object_outcome(&ctx.page.client, session, object).await;
+        failed |= !release.accepted;
+        if !release.settled && d.readonly_preparation_enabled.load(Ordering::SeqCst) {
+            // An earlier retained auxiliary object cannot be washed out by a
+            // later probe which happens to return no object handles.
+            d.readonly_preparation_disqualified
+                .store(true, Ordering::SeqCst);
+            d.readonly_preparation_refusal
+                .store(false, Ordering::SeqCst);
+        }
     }
     if failed {
         d.cleanup.store(true, Ordering::SeqCst);
@@ -1666,12 +1747,32 @@ async fn center(
                     || ctx.check(),
                 )?;
             }
-            Err(ProtocolError::DeadlineExceeded) => return Err(ProtocolError::NotActionable),
+            Err(ProtocolError::DeadlineExceeded) => {
+                return Err(
+                    if d.readonly_preparation_enabled.load(Ordering::SeqCst)
+                        && !d.sent.load(Ordering::SeqCst)
+                    {
+                        ProtocolError::DeadlineExceeded
+                    } else {
+                        ProtocolError::NotActionable
+                    },
+                );
+            }
             Err(error) => return Err(error),
         }
         match ctx.pause(Duration::from_millis(16)).await {
             Ok(()) => (),
-            Err(ProtocolError::DeadlineExceeded) => return Err(ProtocolError::NotActionable),
+            Err(ProtocolError::DeadlineExceeded) => {
+                return Err(
+                    if d.readonly_preparation_enabled.load(Ordering::SeqCst)
+                        && !d.sent.load(Ordering::SeqCst)
+                    {
+                        ProtocolError::DeadlineExceeded
+                    } else {
+                        ProtocolError::NotActionable
+                    },
+                );
+            }
             Err(error) => return Err(error),
         }
     }
@@ -1685,6 +1786,21 @@ fn preparation_refusal_checkpoint(
     longest_attempt: Duration,
     check: impl FnOnce() -> Result<(), ProtocolError>,
 ) -> Result<(), ProtocolError> {
+    if d.readonly_preparation_enabled.load(Ordering::SeqCst)
+        && d.readonly_preparation_refusal.load(Ordering::SeqCst)
+        && !d.readonly_preparation_disqualified.load(Ordering::SeqCst)
+        && !d.sent.load(Ordering::SeqCst)
+    {
+        // Below the existing cleanup floor, keep waiting for the original
+        // deadline/cancellation. Tap's early retirement mapping is not proof
+        // of this unmutated Swipe's safe semantic refusal.
+        if preparation_classification_window(remaining, longest_attempt) {
+            check()?;
+            d.readonly_preparation_stopped.store(true, Ordering::SeqCst);
+            return Err(ProtocolError::NotActionable);
+        }
+        return Ok(());
+    }
     if !d.preparation_enabled.load(Ordering::SeqCst)
         || !d.preparation_refusal.load(Ordering::SeqCst)
         || d.preparation_disqualified.load(Ordering::SeqCst)
@@ -1750,7 +1866,18 @@ async fn center_once(
     node: &Resolved,
     enabled: bool,
 ) -> Result<(Point, (f64, f64)), ProtocolError> {
-    node.call(ctx,d,false,r#"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};const rect=this.getBoundingClientRect();const style=getComputedStyle(this);if(rect.width<=0||rect.height<=0||style.visibility==='hidden'||style.visibility==='collapse')return {status:'not-actionable'};return true;}"#,vec![]).await?;
+    let probe = node.call(ctx,d,false,r#"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};const rect=this.getBoundingClientRect();const style=getComputedStyle(this);if(rect.width<=0||rect.height<=0||style.visibility==='hidden'||style.visibility==='collapse')return {status:'not-actionable'};return true;}"#,vec![]).await;
+    if matches!(&probe, Err(ProtocolError::NotActionable))
+        && d.readonly_preparation_enabled.load(Ordering::SeqCst)
+        && !d.readonly_preparation_disqualified.load(Ordering::SeqCst)
+        && !d.sent.load(Ordering::SeqCst)
+    {
+        // Resolved.call has already interpreted the exact semantic ACK only
+        // after auxiliary release accounting and the original authority check.
+        ctx.check()?;
+        d.readonly_preparation_refusal.store(true, Ordering::SeqCst);
+    }
+    probe?;
     action_stage("scroll.dispatch");
     ctx.command(
         d,
@@ -2005,6 +2132,25 @@ impl ClientActions {
             } else {
                 None
             };
+        let readonly_preparation = if matches!(&request.action, LocatorAction::Swipe { .. })
+            && !ctx.operation.is_callback
+            && matches!(&ctx.realm_authority, ActionRealmAuthority::Enrolled(_))
+            && OperationJournalHandle::current().is_some_and(|journal| {
+                journal.key().generation == ctx.operation.generation
+                    && journal.key().operation_seq == ctx.operation.sequence
+                    && ctx.page.client.debt_ledger().is_some_and(|ledger| {
+                        ledger.matches_owner(ctx.operation.generation, &ctx.page.identity_scope)
+                            && Arc::ptr_eq(&journal.ledger(), &ledger)
+                    })
+            }) {
+            SettledReplacementPrefix::capture(ctx).ok()
+        } else {
+            // Legacy untracked seams retain their old behavior and cannot
+            // manufacture the new exact settlement receipt.
+            None
+        };
+        d.readonly_preparation_enabled
+            .store(readonly_preparation.is_some(), Ordering::SeqCst);
         action_stage("exact.resolve.dispatch");
         let node = action_target(ctx, d, &request.reference).await?;
         action_stage("exact.resolve.ack");
@@ -2018,7 +2164,16 @@ impl ClientActions {
             tests::PreparationTracePhase::BeforeRelease,
             Duration::ZERO,
         );
-        let released = node.release(ctx).await;
+        let readonly_refusal = matches!(&result, Err(ProtocolError::NotActionable))
+            && d.readonly_preparation_stopped.load(Ordering::SeqCst)
+            && d.readonly_preparation_refusal.load(Ordering::SeqCst)
+            && !d.readonly_preparation_disqualified.load(Ordering::SeqCst)
+            && !d.sent.load(Ordering::SeqCst);
+        let released = if readonly_refusal {
+            node.release_settled(ctx).await
+        } else {
+            node.release(ctx).await
+        };
         #[cfg(test)]
         tests::preparation_trace(
             ctx,
@@ -2028,7 +2183,40 @@ impl ClientActions {
         );
         if released.is_err() {
             d.cleanup.store(true, Ordering::SeqCst);
+            if readonly_refusal {
+                return Err(ProtocolError::CleanupFailed);
+            }
             return result.and(Err(ProtocolError::CleanupFailed));
+        }
+        if readonly_refusal {
+            // Every failing final fence is the actual result; a boolean guard
+            // would otherwise fall through to NotActionable/NotDispatched.
+            ctx.check()?;
+            readonly_preparation
+                .as_ref()
+                .ok_or(ProtocolError::ScopeUnavailable)?
+                .check(ctx)?;
+            reference(ctx, &request.reference)?;
+            if node
+                .realm
+                .as_ref()
+                .ok_or(ProtocolError::ScopeUnavailable)?
+                .destroyed()?
+            {
+                return Err(ProtocolError::StaleReference);
+            }
+            let journal =
+                OperationJournalHandle::current().ok_or(ProtocolError::ScopeUnavailable)?;
+            let settled = journal.snapshot();
+            if settled.integrity_lost
+                || settled.mutation_dispatched
+                || settled.input_debt != 0
+                || settled.object_debt != 0
+            {
+                d.cleanup.store(true, Ordering::SeqCst);
+                return Err(ProtocolError::CleanupFailed);
+            }
+            ctx.check()?;
         }
         if matches!(&result, Err(ProtocolError::NotActionable))
             && d.preparation_stopped.load(Ordering::SeqCst)
@@ -3538,6 +3726,186 @@ mod tests {
     use super::*;
     use futures_util::{SinkExt, StreamExt};
     #[test]
+    fn readonly_preparation_refusal_uses_current_ack_without_completed_mutation() {
+        let d = Dispatch::default();
+        d.readonly_preparation_enabled.store(true, Ordering::SeqCst);
+        d.begin_preparation_attempt();
+        d.readonly_preparation_refusal.store(true, Ordering::SeqCst);
+        assert_eq!(
+            preparation_refusal_checkpoint(
+                &d,
+                Duration::from_millis(280),
+                Duration::from_millis(20),
+                || Ok(())
+            ),
+            Err(ProtocolError::NotActionable)
+        );
+        assert!(d.readonly_preparation_stopped.load(Ordering::SeqCst));
+        assert!(!d.acknowledged_postcondition.load(Ordering::SeqCst));
+        assert!(!d.preparation_enabled.load(Ordering::SeqCst));
+        assert_eq!(
+            d.failure(ProtocolError::NotActionable).effects,
+            Effects::NotDispatched
+        );
+    }
+
+    #[test]
+    fn readonly_preparation_never_uses_missing_stale_mutated_or_below_floor_receipt() {
+        for mode in [
+            "missing",
+            "new-attempt",
+            "mutation",
+            "retained",
+            "below-floor",
+        ] {
+            let d = Dispatch::default();
+            d.readonly_preparation_enabled.store(true, Ordering::SeqCst);
+            d.readonly_preparation_refusal
+                .store(mode != "missing", Ordering::SeqCst);
+            match mode {
+                "new-attempt" => d.begin_preparation_attempt(),
+                "mutation" => d.mark_mutation(true),
+                "retained" => {
+                    d.readonly_preparation_disqualified
+                        .store(true, Ordering::SeqCst);
+                }
+                _ => {}
+            }
+            let remaining = if mode == "below-floor" { 265 } else { 280 };
+            assert_eq!(
+                preparation_refusal_checkpoint(
+                    &d,
+                    Duration::from_millis(remaining),
+                    Duration::from_millis(20),
+                    || panic!("uncertified receipt must not check/classify")
+                ),
+                Ok(()),
+                "{mode}"
+            );
+            assert!(
+                !d.readonly_preparation_stopped.load(Ordering::SeqCst),
+                "{mode}"
+            );
+            assert!(!d.acknowledged_postcondition.load(Ordering::SeqCst));
+        }
+    }
+
+    #[test]
+    fn readonly_preparation_preserves_original_authority_errors() {
+        for error in [
+            ProtocolError::Cancelled,
+            ProtocolError::DeadlineExceeded,
+            ProtocolError::StaleScope,
+            ProtocolError::StaleReference,
+        ] {
+            let d = Dispatch::default();
+            d.readonly_preparation_enabled.store(true, Ordering::SeqCst);
+            d.readonly_preparation_refusal.store(true, Ordering::SeqCst);
+            assert_eq!(
+                preparation_refusal_checkpoint(
+                    &d,
+                    Duration::from_millis(280),
+                    Duration::from_millis(20),
+                    || Err(error.clone())
+                ),
+                Err(error)
+            );
+            assert!(!d.readonly_preparation_stopped.load(Ordering::SeqCst));
+        }
+    }
+
+    #[tokio::test]
+    async fn readonly_release_requires_exact_settled_ack_not_legacy_acceptance() {
+        use tokio_tungstenite::tungstenite::Message;
+        for mode in ["settled", "held", "rejected", "wrong-session", "untracked"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(message) = socket.next().await {
+                    let text = match message.unwrap() {
+                        Message::Text(text) => text,
+                        Message::Close(_) => break,
+                        other => panic!("unexpected synthetic frame: {other:?}"),
+                    };
+                    let request: Value = serde_json::from_str(&text).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    let mut reply = match method {
+                        "DOM.resolveNode" => {
+                            json!({"id":request["id"],"sessionId":"page","result":{"object":{"objectId":"owned-object"}}})
+                        }
+                        "Runtime.releaseObject" if mode == "held" => continue,
+                        "Runtime.releaseObject" if mode == "rejected" => {
+                            json!({"id":request["id"],"sessionId":"page","error":{"code":-32000,"message":"synthetic release rejection"}})
+                        }
+                        "Runtime.releaseObject" => {
+                            json!({"id":request["id"],"sessionId":"page","result":{}})
+                        }
+                        _ => panic!("unexpected synthetic command"),
+                    };
+                    if mode == "wrong-session" && method == "Runtime.releaseObject" {
+                        reply["sessionId"] = json!("foreign-page");
+                    }
+                    socket.send(Message::Text(reply.to_string())).await.unwrap();
+                }
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let ledger = client_debt::OwnerDebtLedger::new(1, "release-fixture".into());
+            let journal = ledger
+                .operation(
+                    client_debt::OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: Instant::now() + Duration::from_secs(3),
+                cancellation,
+            };
+            journal.bind_operation(&operation).unwrap();
+            if mode != "untracked" {
+                client.install_debt_ledger(ledger.clone()).unwrap();
+            }
+            journal
+                .scope(client.send_command(
+                    "DOM.resolveNode",
+                    Some(json!({"backendNodeId":42})),
+                    Some("page"),
+                ))
+                .await
+                .unwrap();
+            let outcome = journal
+                .scope(release_object_outcome(&client, "page", "owned-object"))
+                .await;
+            assert!(
+                outcome.accepted,
+                "legacy accountable release acceptance changed for {mode}"
+            );
+            assert_eq!(outcome.settled, mode == "settled", "{mode}");
+            if mode == "settled" {
+                assert_eq!(ledger.snapshot().object_debt, 0);
+            }
+            if matches!(mode, "held" | "rejected") {
+                assert!(ledger.snapshot().object_debt > 0);
+            }
+            if mode == "wrong-session" {
+                assert!(ledger.snapshot().integrity_lost);
+            }
+            client.close().await;
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[test]
     fn fresh_frame_facts_cannot_authorize_retained_actions() {
         use super::super::client_observation::ObservationError;
         use super::super::client_protocol::{FrameAmbiguity, FrameSelectionIndex};
@@ -3892,6 +4260,13 @@ mod tests {
         fixture_scoped(mode, "scope").await
     }
     async fn fixture_scoped(mode: &'static str, scope: &str) -> Fixture {
+        fixture_scoped_with_action_broker(mode, scope, None).await
+    }
+    async fn fixture_scoped_with_action_broker(
+        mode: &'static str,
+        scope: &str,
+        action_broker: Option<Arc<super::super::client_session::ClientSession>>,
+    ) -> Fixture {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let log: Log = Arc::default();
@@ -3910,12 +4285,16 @@ mod tests {
             let mut drag_pressed = false;
             let mut drag_objects = 0;
             let mut preparation_scrolls = 0;
+            let mut readonly_probes = 0;
             let mut held_focus_probe: Option<Value> = None;
             let mut held_focus_release: Option<Value> = None;
             let mut held_debt_release: Option<Value> = None;
             let mut held_direct_press: Option<Value> = None;
             let mut held_drag_releases: Vec<Value> = Vec::new();
             while let Some(Ok(message)) = socket.next().await {
+                if mode.starts_with("preparation-readonly-") && message.is_close() {
+                    break;
+                }
                 let Ok(text) = message.to_text() else {
                     continue;
                 };
@@ -4025,6 +4404,33 @@ mod tests {
                 // Preparation settlement cases withhold an exact reply, not the
                 // entire peer. Owned-handle cleanup must remain serviceable.
                 if mode.starts_with("preparation-") {
+                    if mode.starts_with("preparation-readonly-")
+                        && source.contains("const rect=this.getBoundingClientRect();const style=getComputedStyle(this);")
+                        && source.ends_with("return true;}")
+                    {
+                        readonly_probes += 1;
+                        if mode == "preparation-readonly-stale" {
+                            server_gate.seal();
+                        }
+                        if mode == "preparation-readonly-cancel-second"
+                            && readonly_probes == 2
+                        {
+                            // Cancel the actual admitted operation only once a
+                            // newer pure probe has really been dispatched.
+                            action_broker.as_ref().unwrap().cancel(1, 1).unwrap();
+                            continue;
+                        }
+                    }
+                    if (mode == "preparation-readonly-release-held"
+                        && request["params"]["objectId"] == "exact-node"
+                        || mode == "preparation-readonly-aux-held"
+                            && request["params"]["objectId"] == "readonly-auxiliary")
+                        && method == "Runtime.releaseObject"
+                    {
+                        // Withhold only the original exact release ACK. Other
+                        // cleanup and the enrollment supervisor remain live.
+                        continue;
+                    }
                     if method == "DOM.scrollIntoViewIfNeeded" {
                         preparation_scrolls += 1;
                         if (mode == "preparation-slack-exhausted" && preparation_scrolls == 1)
@@ -4331,13 +4737,19 @@ mod tests {
                             && source == "function(){return 'owned-call-revalidation'}"
                         {
                             json!({"result":{"objectId":"call-auxiliary","value":{"status":"intercepted-pointer"}}})
-                        } else if mode == "no-box-swipe"
+                        } else if (mode == "no-box-swipe"
+                            || (mode.starts_with("preparation-readonly-")
+                                && (mode != "preparation-readonly-dynamic" || readonly_probes == 1)))
                             && source.contains("const rect=this.getBoundingClientRect();const style=getComputedStyle(this);")
                             && source.ends_with("return true;}")
                         {
                             // The initial bbox check rejects before any scroll,
                             // while the real action keeps its ordinary retry loop.
-                            json!({"result":{"value":{"status":"not-actionable"}}})
+                            if mode == "preparation-readonly-aux-held" && readonly_probes == 1 {
+                                json!({"result":{"objectId":"readonly-auxiliary","value":{"status":"not-actionable"}}})
+                            } else {
+                                json!({"result":{"value":{"status":"not-actionable"}}})
+                            }
                         } else if drag_pressed
                             && request["params"]["objectId"].as_str().is_some_and(|object| {
                                 (mode == "strict-query-drag-observed-detached"
@@ -4444,7 +4856,10 @@ mod tests {
                 } else {
                     json!({"id":request["id"],"result":result})
                 };
-                if mode.starts_with("direct-point") || mode == "strict-query-drag-cleanup-debt" {
+                if mode.starts_with("direct-point")
+                    || mode == "strict-query-drag-cleanup-debt"
+                    || mode.starts_with("preparation-readonly-")
+                {
                     reply["sessionId"] = request["sessionId"].clone();
                 }
                 if method == "Runtime.releaseObject" {
@@ -8930,6 +9345,306 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    async fn assert_readonly_swipe_settlement(mode: &'static str) {
+        use super::super::{
+            client_protocol::ScopeState, client_session::ClientSession,
+            client_tasks::RetainedTasks, client_transport::NativeOutcome,
+        };
+        let broker = Arc::new(ClientSession::new());
+        let mut f = fixture_scoped_with_action_broker(mode, mode, Some(broker.clone())).await;
+        let ledger = client_debt::OwnerDebtLedger::new(1, mode.into());
+        ledger.bind_context("context").unwrap();
+        f.page.client.install_debt_ledger(ledger.clone()).unwrap();
+        // All enrollment services capture this exact bound client. Installing
+        // tracking after owner creation would leave them on an ambient handle.
+        f.page.client = f.page.client.owner_view(ledger.clone()).unwrap();
+        let (owner, state, _notices) = preparation_settlement_owner(&f, broker.clone()).await;
+        f.op = broker.admit(1, 1, 1_000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        owner
+            .capture_settled_input_authority(&f.page, &f.op)
+            .unwrap();
+        let journal = ledger
+            .operation(
+                client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&f.op).unwrap();
+        f.log.lock().unwrap().clear();
+        f.replies.lock().unwrap().clear();
+        let f = Arc::new(f);
+        let tasks = RetainedTasks::default();
+        let action_fixture = f.clone();
+        let action_owner = owner.clone();
+        let action_state = state.clone();
+        let before_deadline = Arc::new(AtomicBool::new(false));
+        let action_before_deadline = before_deadline.clone();
+        let receive = tasks
+            .start_operation(
+                mode.into(),
+                f.page.targets.clone(),
+                broker.clone(),
+                journal.clone(),
+                f.op.cancellation.clone(),
+                async move {
+                    let result = ClientActions::default()
+                        .execute(
+                            ActionContext {
+                                realm_authority: ActionRealmAuthority::Enrolled(&action_owner),
+                                page_state: &action_state,
+                                ..action_fixture.context()
+                            },
+                            "browser.perform",
+                            &json!({"identityScope":mode,"ref":{"id":"@e1","revision":"1"},
+                                "action":{"kind":"swipe","direction":"down"}}),
+                        )
+                        .await;
+                    action_before_deadline.store(
+                        Instant::now() < action_fixture.op.deadline,
+                        Ordering::SeqCst,
+                    );
+                    // This is ClientBrowser's ordinary action result projection,
+                    // independent of mode. RetainedTasks owns final normalization.
+                    match result {
+                        Ok(value) => (
+                            NativeOutcome {
+                                result: Ok(value),
+                                effects: Effects::Completed,
+                                retention: None,
+                            },
+                            false,
+                        ),
+                        Err(failure) => (
+                            NativeOutcome {
+                                result: Err(match failure.reason {
+                                    Some(ActionReason::InterceptedPointer) => {
+                                        ProtocolError::InterceptedPointer
+                                    }
+                                    Some(ActionReason::CheckedStateUnchanged) => {
+                                        ProtocolError::CheckedStateUnchanged
+                                    }
+                                    Some(ActionReason::ControlReplacedAfterClick) => {
+                                        ProtocolError::CheckedControlReplaced
+                                    }
+                                    None => failure.error,
+                                }),
+                                effects: failure.effects,
+                                retention: None,
+                            },
+                            failure.cleanup_failed,
+                        ),
+                    }
+                },
+            )
+            .await
+            .unwrap();
+        let delivered = tokio::time::timeout(Duration::from_secs(3), receive)
+            .await
+            .expect("the original Swipe and its bounded cleanup must settle")
+            .unwrap();
+        let debt = journal.snapshot();
+        let original_permit = f.page.permit.check();
+        let scope = broker
+            .settle_with_retention(1, 1, delivered.effects, delivered.retention.as_ref())
+            .unwrap();
+        tasks.fix_operation_result(journal.key());
+        let next = broker.admit(1, 2, 1_000);
+        if next.is_ok() {
+            assert!(broker.start(1, 2).unwrap());
+            broker.settle(1, 2, Effects::NotDispatched).unwrap();
+        }
+        let drained = tasks.drain().await;
+        let requests = f.log.lock().unwrap().clone();
+        let replies = f.replies.lock().unwrap().clone();
+        let closed = owner.close().await;
+        f.page.client.close().await;
+        f.server.abort();
+        let acknowledged = |request: &Value| {
+            replies.iter().any(|entry| {
+                entry["request"] == *request
+                    && entry["reply"]["sessionId"] == request["sessionId"]
+                    && entry["reply"].get("error").is_none()
+            })
+        };
+        let probes: Vec<_> = requests.iter().filter(|request| {
+            request["method"] == "Runtime.callFunctionOn"
+                && request["params"]["functionDeclaration"].as_str().is_some_and(|source| {
+                    source.contains("const rect=this.getBoundingClientRect();const style=getComputedStyle(this);")
+                        && source.ends_with("return true;}")
+                })
+        }).collect();
+        let scrolls: Vec<_> = requests
+            .iter()
+            .filter(|request| request["method"] == "DOM.scrollIntoViewIfNeeded")
+            .collect();
+        let inputs: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request["method"]
+                    .as_str()
+                    .is_some_and(|method| method.starts_with("Input."))
+            })
+            .collect();
+        let releases: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request["method"] == "Runtime.releaseObject"
+                    && request["params"]["objectId"] == "exact-node"
+            })
+            .collect();
+        if mode == "preparation-readonly-stale" {
+            assert_eq!(probes.len(), 1, "stale authority prohibits another probe");
+        } else {
+            assert!(probes.len() >= 2, "{mode}: refusal must still retry");
+        }
+        if mode == "preparation-readonly-cancel-second" {
+            assert_eq!(probes.len(), 2);
+            assert!(acknowledged(probes[0]));
+            assert!(!acknowledged(probes[1]));
+        } else {
+            assert!(probes.iter().all(|request| acknowledged(request)), "{mode}");
+        }
+        assert_eq!(releases.len(), 1, "{mode}: no duplicate exact release");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "DOM.resolveNode"
+                    && request["params"]["backendNodeId"] == 42
+                    && request["params"]["executionContextId"] == 1)
+                .count(),
+            1
+        );
+        assert_eq!(debt.input_debt, 0, "{mode}");
+        if matches!(
+            mode,
+            "preparation-readonly-release-held" | "preparation-readonly-stale"
+        ) {
+            assert_eq!(delivered.effects, Effects::Unknown);
+            assert_eq!(scope, ScopeState::Quarantined);
+            assert!(next.is_err(), "failed cleanup must prohibit new business");
+            assert_eq!(drained, Err(ProtocolError::CleanupFailed));
+            if mode == "preparation-readonly-release-held" {
+                assert_eq!(delivered.result, Err(ProtocolError::CleanupFailed));
+                assert!(!acknowledged(releases[0]));
+                assert!(debt.object_debt > 0);
+            } else {
+                // ScopePermit::check returns StaleScope, and execute's required
+                // release_input sees the same retired permit. Cleanup makes the
+                // real retained outcome Unknown without replacing that primary.
+                assert_eq!(original_permit, Err(ProtocolError::StaleScope));
+                assert_eq!(delivered.result, Err(ProtocolError::StaleScope));
+                assert!(acknowledged(releases[0]));
+                assert_eq!(debt.object_debt, 0);
+            }
+        } else {
+            assert_eq!(scope, ScopeState::Usable);
+            assert!(next.is_ok());
+            assert_eq!(drained, Ok(()));
+            assert_eq!(closed, Ok(()));
+            assert!(!debt.integrity_lost);
+            assert!(acknowledged(releases[0]));
+            if matches!(
+                mode,
+                "preparation-readonly-aux-held" | "preparation-readonly-cancel-second"
+            ) {
+                // Accounted object debt keeps its existing ownership semantics;
+                // it must not be relabeled a clean semantic-refusal receipt.
+                assert!(debt.object_debt > 0);
+                assert_eq!(delivered.effects, Effects::NotDispatched);
+                if mode == "preparation-readonly-cancel-second" {
+                    assert_eq!(delivered.result, Err(ProtocolError::Cancelled));
+                } else {
+                    // The original deadline can be observed by pause's timer or
+                    // the journal submission fence, which reports Cancelled.
+                    assert!(matches!(
+                        delivered.result,
+                        Err(ProtocolError::DeadlineExceeded | ProtocolError::Cancelled)
+                    ));
+                    assert!(!before_deadline.load(Ordering::SeqCst));
+                    let auxiliary_releases: Vec<_> = requests
+                        .iter()
+                        .filter(|request| {
+                            request["method"] == "Runtime.releaseObject"
+                                && request["params"]["objectId"] == "readonly-auxiliary"
+                        })
+                        .collect();
+                    assert_eq!(auxiliary_releases.len(), 1);
+                    assert!(!acknowledged(auxiliary_releases[0]));
+                    assert!(replies.iter().any(|entry| entry["request"] == *probes[0]
+                        && entry["reply"]["result"]["result"]["objectId"] == "readonly-auxiliary"));
+                    assert!(probes.iter().skip(1).all(|probe| replies
+                        .iter()
+                        .any(|entry| entry["request"] == **probe
+                            && entry["reply"]["result"]["result"].get("objectId").is_none())));
+                }
+            } else {
+                assert_eq!(debt.object_debt, 0);
+                assert!(
+                    before_deadline.load(Ordering::SeqCst),
+                    "{mode}: reusable classification must precede the original deadline"
+                );
+            }
+        }
+        if mode == "preparation-readonly-dynamic" {
+            assert!(delivered.result.is_ok());
+            assert_eq!(delivered.effects, Effects::Completed);
+            assert!(debt.mutation_dispatched);
+            assert_eq!(scrolls.len(), 2);
+            assert!(scrolls.iter().all(|request| acknowledged(request)));
+            assert_eq!(inputs.len(), 2);
+            assert_eq!(
+                inputs
+                    .iter()
+                    .filter(|request| request["params"]["type"] == "mouseWheel")
+                    .count(),
+                1
+            );
+            assert!(inputs.iter().all(|request| acknowledged(request)));
+        } else {
+            assert!(scrolls.is_empty() && inputs.is_empty(), "{mode}");
+            assert!(!debt.mutation_dispatched);
+            if mode == "preparation-readonly-no-box" {
+                assert_eq!(delivered.result, Err(ProtocolError::NotActionable));
+                assert_eq!(delivered.effects, Effects::NotDispatched);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn tracked_no_box_swipe_settles_refusal_before_deadline_and_keeps_scope_usable() {
+        assert_readonly_swipe_settlement("preparation-readonly-no-box").await;
+    }
+
+    #[tokio::test]
+    async fn tracked_no_box_swipe_retries_into_the_original_wheel_action() {
+        assert_readonly_swipe_settlement("preparation-readonly-dynamic").await;
+    }
+
+    #[tokio::test]
+    async fn tracked_no_box_swipe_unsettled_exact_release_is_unknown_and_not_reusable() {
+        assert_readonly_swipe_settlement("preparation-readonly-release-held").await;
+    }
+
+    #[tokio::test]
+    async fn tracked_no_box_swipe_never_reuses_old_ack_after_new_probe_is_cancelled() {
+        assert_readonly_swipe_settlement("preparation-readonly-cancel-second").await;
+    }
+
+    #[tokio::test]
+    async fn tracked_no_box_swipe_preserves_stale_original_permit_and_cleanup_failure() {
+        assert_readonly_swipe_settlement("preparation-readonly-stale").await;
+    }
+
+    #[tokio::test]
+    async fn tracked_no_box_swipe_later_empty_probes_cannot_erase_retained_auxiliary() {
+        assert_readonly_swipe_settlement("preparation-readonly-aux-held").await;
     }
 
     #[tokio::test]
