@@ -311,7 +311,10 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
         .await
         .unwrap()
         .unwrap();
-    fence(&client).await;
+    // The operation journal scope has ended. Bind this harness-only fence to
+    // the exact owner without reviving the retired operation's authority.
+    let fence_client = client.owner_view(ledger.clone()).unwrap();
+    fence(&fence_client).await;
     let cleared = ledger.snapshot();
     assert_eq!(
         (
