@@ -772,6 +772,7 @@ where
 
 /// Reader/control work never takes the executor's browser lock. False means
 /// cleanup is unproven and the daemon MUST retain its exclusive ownership gate.
+#[cfg(test)]
 pub async fn serve_with_executor<R, W, E>(
     reader: R,
     writer: W,
