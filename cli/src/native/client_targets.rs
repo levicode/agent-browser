@@ -2331,11 +2331,11 @@ mod tests {
 
 #[cfg(test)]
 mod atomic_revision_diagnostic_tests {
-    use super::*;
-    use diagnostic::{
+    use super::diagnostic::{
         FrameInventoryPass as Pass, InventoryRevisionEvent as Event,
         InventoryRevisionTarget as Target,
     };
+    use super::*;
     fn selected() -> OwnedTarget {
         OwnedTarget {
             target_id: "private-target".into(),
