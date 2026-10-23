@@ -596,7 +596,7 @@ impl ClientSession {
             // Scope-owned tokens are not descendants of the child operation.
             // Discard any selected decision and cancel sibling child authority.
             Self::cancel_token_children(inner, &token);
-            Self::revoke_decision_eval(&inner, &token);
+            Self::revoke_decision_eval(inner, &token);
             if let Some(pending) = inner.decisions.remove(&token) {
                 Self::release_registry(inner, pending.registry);
                 let _ = pending.sender.send(DecisionOutcome::Cancelled);
@@ -1104,6 +1104,7 @@ impl ClientSession {
             None,
         )
     }
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn decision_scoped_with_eval(
         &self,
         generation: u64,
@@ -1321,7 +1322,7 @@ impl ClientSession {
                 })
                 .is_err()
             {
-                Self::revoke_decision_eval(&inner, &next_token);
+                Self::revoke_decision_eval(inner, &next_token);
                 inner.decisions.remove(&next_token);
                 Self::release_registry(inner, pending.registry);
                 return Err(ProtocolError::DecisionMissing);
@@ -1395,7 +1396,7 @@ impl ClientSession {
             .map(|(t, _)| t.clone())
             .collect();
         for token in tokens {
-            Self::revoke_decision_eval(&inner, &token);
+            Self::revoke_decision_eval(inner, &token);
             if let Some(pending) = inner.decisions.remove(&token) {
                 Self::release_registry(inner, pending.registry);
                 let _ = pending.sender.send(DecisionOutcome::Cancelled);
