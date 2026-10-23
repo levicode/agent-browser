@@ -2001,6 +2001,14 @@ impl ClientEnrollment {
         if !matches!(self.ownership, ScopeOwnership::IsolatedContext) {
             return Err(ProtocolError::UnsupportedCapability);
         }
+        if super::client_settlement_trace::inventory_enabled() {
+            super::client_settlement_trace::inventory_snapshot(
+                op.generation,
+                op.sequence,
+                super::client_settlement_trace::InventoryPoint::RestartBegin,
+                self.targets.try_inventory_diagnostic(),
+            );
+        }
         let mut index = self
             .index
             .lock()
@@ -2029,6 +2037,15 @@ impl ClientEnrollment {
             return Err(ProtocolError::StaleReference);
         }
         index.retiring_pages.insert(target.into(), session.into());
+        if super::client_settlement_trace::inventory_enabled() {
+            drop(index);
+            self.targets.diagnostic_step(
+                target,
+                (op.generation, op.sequence),
+                super::client_settlement_trace::DiagnosticTargetStage::RestartRetiring,
+                None,
+            );
+        }
         Ok(())
     }
     pub(crate) async fn wait_restart_page_detached(
@@ -2521,11 +2538,44 @@ impl ClientEnrollment {
         let entry = self
             .register(&self.targets.context_id, target, session, kind, None)?
             .ok_or(ProtocolError::InvalidArguments)?;
+        self.diagnostic_registration(
+            &entry,
+            super::client_settlement_trace::DiagnosticTargetOrigin::InitialDiscovery,
+            op.sequence,
+        );
         let result = self.initialize(entry, op).await;
         if let Err(error) = &result {
             self.poison(error.clone());
         }
         result
+    }
+    fn diagnostic_registration(
+        &self,
+        entry: &Attribution,
+        origin: super::client_settlement_trace::DiagnosticTargetOrigin,
+        sequence: u64,
+    ) {
+        if !super::client_settlement_trace::inventory_enabled() {
+            return;
+        }
+        let Ok(index) = self.index.try_lock() else {
+            super::client_settlement_trace::target_observation_lost(self.generation, sequence);
+            return;
+        };
+        let parent = entry
+            .parent
+            .as_ref()
+            .and_then(|id| index.sessions.get(id))
+            .map(|e| e.target.clone());
+        let root = index.sessions.get(&entry.root).map(|e| e.target.clone());
+        drop(index);
+        self.targets.diagnostic_register(
+            &entry.target,
+            parent.as_deref(),
+            root.as_deref(),
+            origin,
+            (self.generation, sequence),
+        );
     }
     fn register(
         &self,
@@ -2628,6 +2678,12 @@ impl ClientEnrollment {
         let Err(error) = result else {
             return Ok(());
         };
+        self.targets.diagnostic_step(
+            &entry.target,
+            (op.generation, op.sequence),
+            super::client_settlement_trace::DiagnosticTargetStage::ConfigureFailed,
+            Some(error.clone()),
+        );
         if !matches!(
             error,
             ProtocolError::BrowserFailure | ProtocolError::StaleReference
@@ -2677,6 +2733,12 @@ impl ClientEnrollment {
         mut entry: Attribution,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
+        self.targets.diagnostic_step(
+            &entry.target,
+            (op.generation, op.sequence),
+            super::client_settlement_trace::DiagnosticTargetStage::ConfigureStarted,
+            None,
+        );
         let purpose = bounded(op, self.targets.purpose(&entry.target)).await?;
         if purpose == TargetPurpose::StateBootstrap {
             return Ok(());
@@ -3918,7 +3980,14 @@ impl ClientEnrollment {
         #[cfg(test)]
         self.trace_capture_admission(CaptureLifecycleStep::RegisteringAttached, target, &session);
         match self.register(context, target, &session, kind, event.session_id.as_deref())? {
-            Some(entry) => self.initialize(entry, &self.operation()).await,
+            Some(entry) => {
+                self.diagnostic_registration(
+                    &entry,
+                    super::client_settlement_trace::DiagnosticTargetOrigin::AutoAttach,
+                    0,
+                );
+                self.initialize(entry, &self.operation()).await
+            }
             None => {
                 let same = self
                     .index

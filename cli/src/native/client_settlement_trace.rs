@@ -21,6 +21,11 @@ pub(crate) enum SettlementPhase {
     CleanupFirstFailure,
     CleanupResult,
     InventorySnapshot,
+    TargetAttribution,
+    TargetLifecycle,
+    TargetInventory,
+    TargetInventorySummary,
+    TargetObservationLost,
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -156,6 +161,36 @@ pub(crate) enum MessageKind {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<DiagnosticTargetKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_origin: Option<DiagnosticTargetOrigin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_stage: Option<DiagnosticTargetStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_purpose: Option<DiagnosticTargetPurpose>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_classification: Option<DiagnosticTargetClassification>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_configured: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_resumed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_sampled: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_observed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_point: Option<InventoryPoint>,
@@ -217,6 +252,11 @@ impl Facts {
     fn clamp(&mut self, overflow: &mut bool) {
         for value in [
             &mut self.generation,
+            &mut self.attachment_ordinal,
+            &mut self.inventory_ordinal,
+            &mut self.target_ordinal,
+            &mut self.parent_attachment_ordinal,
+            &mut self.root_attachment_ordinal,
             &mut self.cleanup_owner,
             &mut self.cleanup_attempt,
             &mut self.length,
@@ -450,6 +490,7 @@ fn cleanup_capture(path: Option<&Path>) -> Option<Capture> {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum InventoryPoint {
+    RestartBegin,
     RestartReady,
     SettlementRefused,
 }
@@ -460,6 +501,196 @@ pub(crate) struct InventorySnapshot {
     pub integrity_lost: bool,
     pub reservations: usize,
     pub unconfigured: usize,
+    pub attachments: Option<DiagnosticTargetInventory>,
+}
+
+pub(crate) const TARGET_SAMPLE_LIMIT: usize = 16;
+pub(crate) const TARGET_ORDINAL_LIMIT: u64 = 65_535;
+static TARGET_ORDINALS: AtomicU64 = AtomicU64::new(0);
+static ATTACHMENT_ORDINALS: AtomicU64 = AtomicU64::new(0);
+static INVENTORY_ORDINALS: AtomicU64 = AtomicU64::new(0);
+
+macro_rules! diagnostic_enum {
+    ($name:ident { $first:ident $(, $other:ident)* $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        pub(crate) enum $name { #[default] $first, $($other,)* }
+    };
+}
+diagnostic_enum!(DiagnosticTargetKind {
+    Other,
+    Page,
+    Iframe,
+    Worker,
+    SharedWorker,
+    ServiceWorker,
+    Browser,
+    BrowserUi,
+    Tab,
+    Webview,
+    BackgroundPage
+});
+diagnostic_enum!(DiagnosticTargetOrigin {
+    Unclassified,
+    InitialDiscovery,
+    AutoAttach
+});
+diagnostic_enum!(DiagnosticTargetPurpose {
+    Unclassified,
+    Application,
+    StateBootstrap
+});
+diagnostic_enum!(DiagnosticTargetClassification {
+    PendingReservation,
+    UnreservedApplication,
+    ReservedApplication,
+    ReservedBootstrap,
+    ReservationRemainder
+});
+diagnostic_enum!(DiagnosticTargetStage {
+    Registered,
+    ConfigureStarted,
+    ConfigureAck,
+    ConfigureFailed,
+    Resumed,
+    Detached,
+    RestartRetiring,
+    PurposeAssigned
+});
+
+impl DiagnosticTargetKind {
+    pub(crate) fn from_native(kind: &str) -> Self {
+        match kind {
+            "page" => Self::Page,
+            "iframe" => Self::Iframe,
+            "worker" => Self::Worker,
+            "shared_worker" => Self::SharedWorker,
+            "service_worker" => Self::ServiceWorker,
+            "browser" => Self::Browser,
+            "browser_ui" => Self::BrowserUi,
+            "tab" => Self::Tab,
+            "webview" => Self::Webview,
+            "background_page" => Self::BackgroundPage,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiagnosticAttachment {
+    pub attachment: u64,
+    pub target: u64,
+    pub generation: u64,
+    pub kind: DiagnosticTargetKind,
+    pub origin: DiagnosticTargetOrigin,
+    pub parent: u64,
+    pub root: u64,
+    pub stage: DiagnosticTargetStage,
+    pub purpose: DiagnosticTargetPurpose,
+    pub classification: DiagnosticTargetClassification,
+    pub configured: bool,
+    pub resumed: bool,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiagnosticTargetInventory {
+    pub observed: bool,
+    pub count: usize,
+    pub attachments: [Option<DiagnosticAttachment>; TARGET_SAMPLE_LIMIT],
+}
+pub(crate) fn next_target_ordinal() -> Option<u64> {
+    next_cleanup_ordinal(&TARGET_ORDINALS, TARGET_ORDINAL_LIMIT)
+}
+pub(crate) fn next_attachment_ordinal() -> Option<u64> {
+    next_cleanup_ordinal(&ATTACHMENT_ORDINALS, TARGET_ORDINAL_LIMIT)
+}
+
+pub(crate) fn target_observation_lost(generation: u64, sequence: u64) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::TargetObservationLost,
+            Facts {
+                generation: Some(generation),
+                ..Facts::default()
+            },
+        );
+    }
+}
+pub(crate) fn target_lifecycle(
+    generation: u64,
+    sequence: u64,
+    target: DiagnosticAttachment,
+    error: Option<ProtocolError>,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        target_lifecycle_into(capture, generation, sequence, target, error);
+    }
+}
+fn target_lifecycle_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    target: DiagnosticAttachment,
+    error: Option<ProtocolError>,
+) {
+    target_attribution_into(capture, generation, sequence, None, target);
+    record_capture(
+        capture,
+        sequence,
+        Phase::TargetLifecycle,
+        Facts {
+            generation: Some(generation),
+            attachment_ordinal: Some(target.attachment),
+            target_stage: Some(target.stage),
+            target_purpose: Some(target.purpose),
+            target_classification: Some(target.classification),
+            target_configured: Some(target.configured),
+            target_resumed: Some(target.resumed),
+            error,
+            ..Facts::default()
+        },
+    );
+}
+fn target_attribution_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    point: Option<InventoryPoint>,
+    target: DiagnosticAttachment,
+) {
+    target_attribution_record(
+        capture,
+        generation,
+        sequence,
+        point.map(|point| (point, 0)),
+        target,
+    );
+}
+fn target_attribution_record(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    inventory: Option<(InventoryPoint, u64)>,
+    target: DiagnosticAttachment,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::TargetAttribution,
+        Facts {
+            generation: Some(generation),
+            inventory_point: inventory.map(|v| v.0),
+            inventory_ordinal: inventory.map(|v| v.1),
+            attachment_ordinal: Some(target.attachment),
+            target_ordinal: Some(target.target),
+            target_kind: Some(target.kind),
+            target_origin: Some(target.origin),
+            parent_attachment_ordinal: Some(target.parent),
+            root_attachment_ordinal: Some(target.root),
+            ..Facts::default()
+        },
+    );
 }
 // Independent of a cleanup attempt: record the actual refused settlement before
 // quarantine mutates the registry. Only bounded facts reach the opt-in sink.
@@ -483,12 +714,16 @@ fn inventory_snapshot_into(
     point: InventoryPoint,
     snapshot: InventorySnapshot,
 ) {
+    let inventory_ordinal = snapshot
+        .attachments
+        .map(|_| next_cleanup_ordinal(&INVENTORY_ORDINALS, TARGET_ORDINAL_LIMIT).unwrap_or(0));
     record_capture(
         capture,
         sequence,
         Phase::InventorySnapshot,
         Facts {
             generation: Some(generation),
+            inventory_ordinal,
             inventory_point: Some(point),
             inventory_observed: Some(
                 snapshot.observed && snapshot.reservations <= 8192 && snapshot.unconfigured <= 8192,
@@ -500,6 +735,52 @@ fn inventory_snapshot_into(
             ..Facts::default()
         },
     );
+    if let Some(targets) = snapshot.attachments {
+        let sampled = targets.attachments.iter().flatten().count();
+        record_capture(
+            capture,
+            sequence,
+            Phase::TargetInventorySummary,
+            Facts {
+                generation: Some(generation),
+                inventory_point: Some(point),
+                inventory_ordinal,
+                target_count: Some(targets.count.min(8192) as u64),
+                target_sampled: Some(sampled as u64),
+                target_observed: Some(
+                    targets.observed
+                        && targets.count <= TARGET_SAMPLE_LIMIT
+                        && sampled == targets.count,
+                ),
+                ..Facts::default()
+            },
+        );
+        for target in targets.attachments.into_iter().flatten() {
+            target_attribution_record(
+                capture,
+                generation,
+                sequence,
+                Some((point, inventory_ordinal.unwrap_or(0))),
+                target,
+            );
+            record_capture(
+                capture,
+                sequence,
+                Phase::TargetInventory,
+                Facts {
+                    generation: Some(generation),
+                    inventory_point: Some(point),
+                    inventory_ordinal,
+                    attachment_ordinal: Some(target.attachment),
+                    target_purpose: Some(target.purpose),
+                    target_classification: Some(target.classification),
+                    target_configured: Some(target.configured),
+                    target_resumed: Some(target.resumed),
+                    ..Facts::default()
+                },
+            );
+        }
+    }
 }
 // Exhaustion disables observation instead of aliasing a previous identity.
 #[allow(deprecated)]

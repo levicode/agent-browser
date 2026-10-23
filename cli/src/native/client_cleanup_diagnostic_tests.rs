@@ -516,6 +516,7 @@ fn inventory_failure_snapshot_does_not_require_active_cleanup() {
             integrity_lost: false,
             reservations: 1,
             unconfigured: 2,
+            ..Default::default()
         },
     );
     let rows = records(&file);
@@ -579,4 +580,113 @@ fn unobserved_or_oversized_inventory_never_claims_healthy_snapshot() {
     assert_eq!(rows[1]["inventoryObserved"], false);
     assert_eq!(rows[1]["inventoryReservations"], 8192);
     assert_eq!(rows[1]["inventoryUnconfigured"], 8192);
+}
+
+#[test]
+fn target_diagnostics_keep_identity_closed_and_preserve_failure_and_snapshot_bounds() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+    let target = DiagnosticAttachment {
+        attachment: TARGET_ORDINAL_LIMIT,
+        target: TARGET_ORDINAL_LIMIT,
+        generation: SAFE_INTEGER,
+        kind: DiagnosticTargetKind::BackgroundPage,
+        origin: DiagnosticTargetOrigin::InitialDiscovery,
+        parent: TARGET_ORDINAL_LIMIT,
+        root: TARGET_ORDINAL_LIMIT,
+        stage: DiagnosticTargetStage::ConfigureFailed,
+        purpose: DiagnosticTargetPurpose::Application,
+        classification: DiagnosticTargetClassification::UnreservedApplication,
+        configured: false,
+        resumed: false,
+    };
+    target_lifecycle_into(
+        &capture,
+        SAFE_INTEGER,
+        SAFE_INTEGER,
+        target,
+        Some(ProtocolError::BrowserFailure),
+    );
+    let mut targets = DiagnosticTargetInventory {
+        observed: true,
+        count: 1,
+        ..Default::default()
+    };
+    targets.attachments[0] = Some(target);
+    inventory_snapshot_into(
+        &capture,
+        SAFE_INTEGER,
+        SAFE_INTEGER,
+        InventoryPoint::SettlementRefused,
+        InventorySnapshot {
+            observed: true,
+            unconfigured: 1,
+            attachments: Some(targets),
+            ..Default::default()
+        },
+    );
+    let rows = records(&file);
+    assert_eq!(
+        rows.len(),
+        7,
+        "every declared attachment must retain its exact rows"
+    );
+    assert_eq!(rows[1]["targetKind"], "background-page");
+    assert_eq!(rows[2]["error"], "browser-failure");
+    assert_eq!(rows[2]["targetConfigured"], false);
+    assert_eq!(rows[4]["targetObserved"], true);
+    assert_eq!(rows[4]["targetSampled"], 1);
+    assert_eq!(rows[5]["targetOrdinal"], TARGET_ORDINAL_LIMIT);
+    assert_eq!(rows[5]["inventoryOrdinal"], rows[3]["inventoryOrdinal"]);
+    assert_eq!(rows[6]["attachmentOrdinal"], rows[5]["attachmentOrdinal"]);
+    for row in rows {
+        assert!(serde_json::to_vec(&row).unwrap().len() < MAX_RECORD_BYTES);
+    }
+    for private in [
+        "private-target",
+        "private-session",
+        "private-context",
+        "https:",
+        "targetId",
+        "sessionId",
+        "identityScope",
+    ] {
+        assert!(!std::fs::read_to_string(file.path())
+            .unwrap()
+            .contains(private));
+    }
+}
+
+#[test]
+fn target_inventory_cannot_claim_complete_when_history_or_sample_is_missing() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    for (count, observed) in [(TARGET_SAMPLE_LIMIT + 1, true), (1, false), (1, true)] {
+        inventory_snapshot_into(
+            &capture,
+            1,
+            28,
+            InventoryPoint::RestartBegin,
+            InventorySnapshot {
+                observed: true,
+                attachments: Some(DiagnosticTargetInventory {
+                    count,
+                    observed,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    let rows = records(&file);
+    for row in rows
+        .iter()
+        .filter(|r| r["phase"] == "TargetInventorySummary")
+    {
+        assert_eq!(
+            row["targetObserved"], false,
+            "a missing attachment cannot be fabricated as complete"
+        );
+    }
 }

@@ -2,6 +2,7 @@
 //! waits on this registry before configuration/resume; no URL or timing guess
 //! assigns a bootstrap target to a generic request handler.
 use super::client_protocol::ProtocolError;
+use super::client_settlement_trace as diagnostic;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -23,10 +24,25 @@ pub struct OwnedTarget {
     // Minted only by authoritative insertion. Retaining the Arc prevents an
     // identical target/session reattachment from reusing an earlier tenure.
     tenure: Arc<AttachmentTenure>,
+    diagnostic: Option<diagnostic::DiagnosticAttachment>,
 }
 #[derive(Debug)]
 struct AttachmentTenure;
 impl OwnedTarget {
+    fn diagnostic_snapshot(&self) -> Option<diagnostic::DiagnosticAttachment> {
+        let mut value = self.diagnostic?;
+        value.kind = diagnostic::DiagnosticTargetKind::from_native(&self.kind);
+        value.purpose = match self.purpose {
+            None => diagnostic::DiagnosticTargetPurpose::Unclassified,
+            Some(TargetPurpose::Application) => diagnostic::DiagnosticTargetPurpose::Application,
+            Some(TargetPurpose::StateBootstrap) => {
+                diagnostic::DiagnosticTargetPurpose::StateBootstrap
+            }
+        };
+        value.configured = self.configured;
+        value.resumed = self.resumed;
+        Some(value)
+    }
     pub(crate) fn same_attachment(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.tenure, &other.tenure)
             && self.target_id == other.target_id
@@ -60,10 +76,73 @@ struct Registry {
     protected_read: bool,
     enrollment_ready: bool,
     targets: HashMap<String, OwnedTarget>,
+    diagnostic_identities: Option<HashMap<String, u64>>,
+    diagnostic_lost: bool,
     auxiliary_sequence: u64,
     auxiliary: HashMap<u64, AuxiliaryAttachment>,
 }
 impl Registry {
+    // Opt-in history is bounded and cannot return a product error or grant authority.
+    fn diagnostic_attachment(&mut self, target: &str) -> Option<diagnostic::DiagnosticAttachment> {
+        if !diagnostic::inventory_enabled() {
+            return None;
+        }
+        let identities = self.diagnostic_identities.get_or_insert_with(HashMap::new);
+        let target_ordinal = if let Some(ordinal) = identities.get(target) {
+            *ordinal
+        } else if identities.len() < 2048 && target.len() <= 1024 {
+            let ordinal = diagnostic::next_target_ordinal().unwrap_or(0);
+            if ordinal != 0 {
+                identities.insert(target.to_owned(), ordinal);
+            }
+            ordinal
+        } else {
+            0
+        };
+        let attachment = diagnostic::next_attachment_ordinal().unwrap_or(0);
+        self.diagnostic_lost |= target_ordinal == 0 || attachment == 0;
+        Some(diagnostic::DiagnosticAttachment {
+            attachment,
+            target: target_ordinal,
+            classification: if self.reservations == 0 {
+                diagnostic::DiagnosticTargetClassification::UnreservedApplication
+            } else {
+                diagnostic::DiagnosticTargetClassification::PendingReservation
+            },
+            ..Default::default()
+        })
+    }
+    fn diagnostic_inventory(&self) -> diagnostic::InventorySnapshot {
+        let mut inventory = diagnostic::DiagnosticTargetInventory {
+            observed: !self.diagnostic_lost
+                && self.targets.len() <= diagnostic::TARGET_SAMPLE_LIMIT,
+            count: self.targets.len(),
+            ..Default::default()
+        };
+        for (index, target) in self.targets.values().enumerate() {
+            if index >= diagnostic::TARGET_SAMPLE_LIMIT {
+                break;
+            }
+            inventory.attachments[index] = target.diagnostic_snapshot();
+            inventory.observed &=
+                inventory.attachments[index].is_some_and(|v| v.attachment > 0 && v.target > 0);
+        }
+        inventory
+            .attachments
+            .sort_by_key(|v| v.map_or(u64::MAX, |v| v.attachment));
+        diagnostic::InventorySnapshot {
+            observed: true,
+            sealed: self.sealed,
+            integrity_lost: self.integrity_lost,
+            reservations: self.reservations,
+            unconfigured: self
+                .targets
+                .values()
+                .filter(|t| t.purpose.is_none() || !t.configured)
+                .count(),
+            attachments: diagnostic::inventory_enabled().then_some(inventory),
+        }
+    }
     fn inventory_complete(&self) -> bool {
         self.reservations == 0
             && self
@@ -164,7 +243,15 @@ impl ResumePermit {
             return Err(ProtocolError::StaleScope);
         }
         target.resumed = true;
+        if let Some(value) = &mut target.diagnostic {
+            value.stage = diagnostic::DiagnosticTargetStage::Resumed;
+        }
+        let observed = target.diagnostic_snapshot();
         self.completed = true;
+        drop(state);
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(value.generation, 0, value, None);
+        }
         Ok(())
     }
 }
@@ -640,6 +727,7 @@ impl ClientTargets {
             .revision
             .checked_add(1)
             .ok_or(ProtocolError::IdentifierExhausted)?;
+        let diagnostic = state.diagnostic_attachment(&target_id);
         state.targets.insert(
             target_id.clone(),
             OwnedTarget {
@@ -651,6 +739,7 @@ impl ClientTargets {
                 resumed: false,
                 resume_pending: false,
                 tenure: Arc::new(AttachmentTenure),
+                diagnostic,
             },
         );
         drop(state);
@@ -806,6 +895,14 @@ impl ClientTargets {
             return Err(ProtocolError::ScopeUnavailable);
         }
         target.configured = true;
+        if let Some(value) = &mut target.diagnostic {
+            value.stage = diagnostic::DiagnosticTargetStage::ConfigureAck;
+        }
+        let observed = target.diagnostic_snapshot();
+        drop(state);
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(value.generation, 0, value, None);
+        }
         Ok(())
     }
     pub fn detach(&self, target_id: &str) -> Result<(), ProtocolError> {
@@ -813,7 +910,8 @@ impl ClientTargets {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.targets.remove(target_id).is_some() {
+        let removed = state.targets.remove(target_id);
+        if removed.is_some() {
             state.revision = state
                 .revision
                 .checked_add(1)
@@ -821,6 +919,10 @@ impl ClientTargets {
         }
         drop(state);
         self.changed.notify_waiters();
+        if let Some(mut value) = removed.and_then(|target| target.diagnostic_snapshot()) {
+            value.stage = diagnostic::DiagnosticTargetStage::Detached;
+            diagnostic::target_lifecycle(value.generation, 0, value, None);
+        }
         Ok(())
     }
     pub fn invalidate_inventory(&self) -> Result<(), ProtocolError> {
@@ -929,6 +1031,78 @@ impl ClientTargets {
     pub(crate) fn inventory_diagnostic(&self) -> super::client_settlement_trace::InventorySnapshot {
         self.settlement_integrity_diagnostic(true).1
     }
+    pub(crate) fn try_inventory_diagnostic(&self) -> diagnostic::InventorySnapshot {
+        self.state
+            .try_lock()
+            .map(|state| state.diagnostic_inventory())
+            .unwrap_or_default()
+    }
+    pub(crate) fn diagnostic_register(
+        &self,
+        target_id: &str,
+        parent: Option<&str>,
+        root: Option<&str>,
+        origin: diagnostic::DiagnosticTargetOrigin,
+        operation: (u64, u64),
+    ) {
+        if !diagnostic::inventory_enabled() {
+            return;
+        }
+        let Ok(mut state) = self.state.try_lock() else {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+            return;
+        };
+        let parent = parent
+            .and_then(|id| state.targets.get(id))
+            .and_then(|t| t.diagnostic)
+            .map_or(0, |t| t.attachment);
+        let root = root
+            .and_then(|id| state.targets.get(id))
+            .and_then(|t| t.diagnostic)
+            .map_or(0, |t| t.attachment);
+        let observed = state.targets.get_mut(target_id).and_then(|target| {
+            let value = target.diagnostic.as_mut()?;
+            value.generation = operation.0;
+            value.origin = origin;
+            value.parent = parent;
+            value.root = root;
+            value.stage = diagnostic::DiagnosticTargetStage::Registered;
+            target.diagnostic_snapshot()
+        });
+        drop(state);
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(operation.0, operation.1, value, None);
+        } else {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+        }
+    }
+    pub(crate) fn diagnostic_step(
+        &self,
+        target_id: &str,
+        operation: (u64, u64),
+        stage: diagnostic::DiagnosticTargetStage,
+        error: Option<ProtocolError>,
+    ) {
+        if !diagnostic::inventory_enabled() {
+            return;
+        }
+        let Ok(mut state) = self.state.try_lock() else {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+            return;
+        };
+        let observed = state.targets.get_mut(target_id).and_then(|target| {
+            let value = target.diagnostic.as_mut()?;
+            value.generation = operation.0;
+            value.stage = stage;
+            target.diagnostic_snapshot()
+        });
+        drop(state);
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(operation.0, operation.1, value, error);
+        } else {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn check_settlement_integrity(&self) -> Result<(), ProtocolError> {
         self.settlement_integrity_diagnostic(false).0
@@ -944,17 +1118,7 @@ impl ClientTargets {
             return (Err(ProtocolError::ScopeUnavailable), Default::default());
         };
         let snapshot = if observe {
-            super::client_settlement_trace::InventorySnapshot {
-                observed: true,
-                sealed: state.sealed,
-                integrity_lost: state.integrity_lost,
-                reservations: state.reservations,
-                unconfigured: state
-                    .targets
-                    .values()
-                    .filter(|target| target.purpose.is_none() || !target.configured)
-                    .count(),
-            }
+            state.diagnostic_inventory()
         } else {
             Default::default()
         };
@@ -1285,9 +1449,24 @@ impl CreationReservation {
             return Err(ProtocolError::InvalidArguments);
         }
         target.purpose = Some(self.purpose);
+        if let Some(value) = &mut target.diagnostic {
+            value.classification = match self.purpose {
+                TargetPurpose::Application => {
+                    diagnostic::DiagnosticTargetClassification::ReservedApplication
+                }
+                TargetPurpose::StateBootstrap => {
+                    diagnostic::DiagnosticTargetClassification::ReservedBootstrap
+                }
+            };
+            value.stage = diagnostic::DiagnosticTargetStage::PurposeAssigned;
+        }
+        let observed = target.diagnostic_snapshot();
         self.claimed = true;
         drop(state);
         self.registry.changed.notify_waiters();
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(value.generation, 0, value, None);
+        }
         Ok(())
     }
 }
@@ -1315,6 +1494,11 @@ impl Drop for CreationReservation {
                 for target in state.targets.values_mut() {
                     if target.purpose.is_none() {
                         target.purpose = Some(TargetPurpose::Application);
+                        if let Some(value) = &mut target.diagnostic {
+                            value.classification =
+                                diagnostic::DiagnosticTargetClassification::ReservationRemainder;
+                            value.stage = diagnostic::DiagnosticTargetStage::PurposeAssigned;
+                        }
                     }
                 }
             }
@@ -1732,6 +1916,54 @@ mod tests {
         assert_eq!(
             registry.owned_target("created").unwrap().purpose,
             Some(super::TargetPurpose::StateBootstrap)
+        );
+    }
+    #[test]
+    fn diagnostic_ordinals_cannot_admit_inventory_or_change_attachment_authority() {
+        let registry = super::ClientTargets::new("private-context".into(), "private-scope".into());
+        registry
+            .attached(
+                "private-context",
+                "private-target".into(),
+                "private-session".into(),
+                "worker".into(),
+            )
+            .unwrap();
+        let before = registry.owned_target("private-target").unwrap();
+        assert!(registry.check_settlement_integrity().is_err());
+        {
+            let mut state = registry.state.lock().unwrap();
+            state.targets.get_mut("private-target").unwrap().diagnostic =
+                Some(super::diagnostic::DiagnosticAttachment {
+                    attachment: 7,
+                    target: 9,
+                    origin: super::diagnostic::DiagnosticTargetOrigin::AutoAttach,
+                    classification:
+                        super::diagnostic::DiagnosticTargetClassification::ReservedBootstrap,
+                    ..Default::default()
+                });
+        }
+        let observed = registry.owned_target("private-target").unwrap();
+        assert!(
+            before.same_attachment(&observed),
+            "diagnostic identity is never ticket authority"
+        );
+        assert!(
+            registry.check_settlement_integrity().is_err(),
+            "an unconfigured attachment must still refuse settlement"
+        );
+        let facts = observed.diagnostic_snapshot().unwrap();
+        assert_eq!(facts.kind, super::diagnostic::DiagnosticTargetKind::Worker);
+        assert_eq!(
+            facts.purpose,
+            super::diagnostic::DiagnosticTargetPurpose::Application
+        );
+        assert!(!facts.configured);
+        assert!(!format!("{facts:?}").contains("private-"));
+        registry.configured("private-target").unwrap();
+        assert!(
+            registry.check_settlement_integrity().is_ok(),
+            "only the original configured state changes admission"
         );
     }
     fn auxiliary_registry() -> std::sync::Arc<super::ClientTargets> {
