@@ -13,6 +13,9 @@ mod metadata_deadline_tests;
 #[path = "client_capture_acquisition_deadline_tests.rs"]
 mod acquisition_deadline_tests;
 
+#[path = "client_capture_frame_owner_deadline_tests.rs"]
+mod frame_owner_deadline_tests;
+
 struct Owner {
     client: Arc<CdpClient>,
     targets: Arc<ClientTargets>,
