@@ -37,7 +37,7 @@ impl OwnedTarget {
             && self.resumed == other.resumed
             && self.resume_pending == other.resume_pending
     }
-    fn capture_ready(&self) -> bool {
+    pub(crate) fn capture_ready(&self) -> bool {
         self.purpose == Some(TargetPurpose::Application)
             && self.configured
             && self.resumed
@@ -1507,6 +1507,28 @@ mod tests {
         );
         registry.check_capture_tickets(&replacement).unwrap();
     }
+    #[tokio::test]
+    async fn capture_readiness_rejects_pending_resume_even_with_resumed_flag() {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        registry
+            .attached("ctx", "target".into(), "session".into(), "page".into())
+            .unwrap();
+        registry.configured("target").unwrap();
+        let resume = registry.resume_permit("target").await.unwrap();
+        let mut pending = registry.owned_target("target").unwrap();
+        assert!(!pending.capture_ready());
+        // Keep every other readiness term true to prove that the existing
+        // private pending bit cannot be bypassed by the exposed predicate.
+        pending.resumed = true;
+        assert!(!pending.capture_ready());
+        resume.complete().unwrap();
+        assert!(registry.owned_target("target").unwrap().capture_ready());
+        assert!(
+            !pending.capture_ready(),
+            "old snapshots never gain readiness"
+        );
+    }
+
     #[tokio::test]
     async fn capture_ticket_checks_entire_exact_binding_and_rejects_duplicates() {
         let registry = super::ClientTargets::new("ctx".into(), "scope".into());

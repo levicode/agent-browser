@@ -124,10 +124,7 @@ pub(super) async fn trigger(
             .matches_owner(operation.generation, &page.identity_scope)
         || attachment.session_id != page.page_session_id
         || attachment.kind != "page"
-        || attachment.purpose != Some(crate::native::client_targets::TargetPurpose::Application)
-        || !attachment.configured
-        || !attachment.resumed
-        || attachment.resume_pending
+        || !attachment.capture_ready()
     {
         return Err(ProtocolError::StaleScope);
     }
