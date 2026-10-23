@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
@@ -667,10 +667,24 @@ impl Default for WorkerRpcFailure {
     }
 }
 /// Passed explicitly along only the observed Network.enable future. It has no
-/// global registry, task-local ownership, pending entry or authority of its own.
+/// global registry, task-local ownership or authority of its own. Only the
+/// independently selected terminal sidecar enables a reader witness.
 #[derive(Default)]
-pub(crate) struct WorkerRpcFailureNote(Mutex<Option<WorkerRpcFailure>>);
+pub(crate) struct WorkerRpcFailureNote(
+    Mutex<Option<WorkerRpcFailure>>,
+    OnceLock<Arc<WorkerReaderObservation>>,
+);
 impl WorkerRpcFailureNote {
+    fn enable_reader(&self) -> Arc<WorkerReaderObservation> {
+        self.1.get_or_init(Default::default).clone()
+    }
+    pub(crate) fn reader(&self) -> Option<Arc<WorkerReaderObservation>> {
+        self.1.get().cloned()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_enable_reader(&self) -> Arc<WorkerReaderObservation> {
+        self.enable_reader()
+    }
     fn record(note: Option<&Self>, failure: WorkerRpcFailure) {
         if let Some(note) = note {
             if let Ok(mut slot) = note.0.try_lock() {
@@ -741,6 +755,75 @@ impl WorkerRpcFailureNote {
     pub(crate) fn test_snapshot(&self) -> serde_json::Value {
         let failure = Self::snapshot(Some(self));
         serde_json::json!({"rpcFailure": failure.origin, "error": failure.error, "cdpCode": failure.code})
+    }
+}
+/// Positive, best-effort witnesses for one existing pending command. A missing
+/// bit means unknown, not that Chrome did not send a response. One Acquire load
+/// captures positive milestones; the raw probe may miss earlier evidence.
+/// There are no IDs, arbitrary strings, locks or clocks here.
+#[derive(Default)]
+pub(crate) struct WorkerReaderObservation(AtomicU8);
+#[derive(Clone, Copy)]
+pub(crate) enum WorkerReaderStep {
+    Frame = 1,
+    Typed = 2,
+    Pending = 4,
+    SettleIn = 8,
+    SettleOut = 16,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorkerFrameWitness {
+    Unknown,
+    Seen,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorkerReaderSend {
+    Unobserved,
+    Succeeded,
+    ReceiverClosed,
+}
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerReaderSnapshot {
+    frame: WorkerFrameWitness,
+    typed: bool,
+    pending: bool,
+    settle_in: bool,
+    settle_out: bool,
+    send: WorkerReaderSend,
+}
+impl WorkerReaderObservation {
+    pub(crate) fn mark(&self, step: WorkerReaderStep) {
+        self.0.fetch_or(step as u8, Ordering::Release);
+    }
+    pub(crate) fn sent(&self, succeeded: bool) {
+        self.0
+            .fetch_or(if succeeded { 32 } else { 64 }, Ordering::Release);
+    }
+    fn snapshot(&self) -> WorkerReaderSnapshot {
+        let bits = self.0.load(Ordering::Acquire);
+        WorkerReaderSnapshot {
+            frame: if bits & 1 != 0 {
+                WorkerFrameWitness::Seen
+            } else {
+                WorkerFrameWitness::Unknown
+            },
+            typed: bits & 2 != 0,
+            pending: bits & 4 != 0,
+            settle_in: bits & 8 != 0,
+            settle_out: bits & 16 != 0,
+            send: match bits & 96 {
+                32 => WorkerReaderSend::Succeeded,
+                64 => WorkerReaderSend::ReceiverClosed,
+                _ => WorkerReaderSend::Unobserved,
+            },
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(&self) -> serde_json::Value {
+        serde_json::to_value(self.snapshot()).unwrap()
     }
 }
 const MAX_WORKER_RPC_MS: u64 = 60_000;
@@ -822,6 +905,8 @@ struct WorkerNetworkTerminalRecord {
     error: Option<ProtocolError>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cdp_code: Option<WorkerCdpCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reader: Option<WorkerReaderSnapshot>,
 }
 
 fn write_worker_terminal(
@@ -847,6 +932,7 @@ fn write_worker_terminal(
 #[derive(Default)]
 pub(crate) struct WorkerNetworkTerminal {
     output: Option<(File, WorkerNetworkTerminalRecord, std::time::Instant)>,
+    reader: Option<Arc<WorkerReaderObservation>>,
 }
 impl WorkerNetworkTerminal {
     pub(crate) async fn observe<T>(
@@ -871,6 +957,9 @@ impl WorkerNetworkTerminal {
         future: impl std::future::Future<Output = Result<T, String>>,
     ) -> Result<T, String> {
         self.claim(trace, writer);
+        if self.output.is_some() {
+            self.reader = note.map(WorkerRpcFailureNote::enable_reader);
+        }
         let result = future.await;
         self.finish(
             if result.is_ok() {
@@ -895,7 +984,7 @@ impl WorkerNetworkTerminal {
                     self.output = Some((
                         file,
                         WorkerNetworkTerminalRecord {
-                            schema_version: 1,
+                            schema_version: 2,
                             phase: "ServiceWorkerNetworkTerminal",
                             source: Source::Native,
                             pid: std::process::id(),
@@ -910,6 +999,7 @@ impl WorkerNetworkTerminal {
                             rpc_failure: None,
                             error: None,
                             cdp_code: None,
+                            reader: None,
                         },
                         trace.started,
                     ));
@@ -932,6 +1022,7 @@ impl WorkerNetworkTerminal {
         record.end_ms = end.0;
         record.ms_capped |= end.1;
         record.termination = termination;
+        record.reader = self.reader.take().map(|reader| reader.snapshot());
         if matches!(termination, WorkerNetworkTermination::ReturnedError) {
             let failure = WorkerRpcFailureNote::snapshot(note);
             record.rpc_failure = Some(failure.origin);
@@ -2013,6 +2104,7 @@ mod worker_terminal_tests {
         assert_eq!(bytes.last(), Some(&b'\n'));
         assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
         let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["schemaVersion"], 2);
         assert_eq!(value["phase"], "ServiceWorkerNetworkTerminal");
         assert_eq!(value["operationSeq"], 0);
         assert!(value["endMs"].as_u64().unwrap() >= value["startMs"].as_u64().unwrap());
@@ -2105,6 +2197,13 @@ mod worker_terminal_tests {
                 assert_eq!(result, Err("private-original-error".to_string()));
                 assert!(terminal.output.is_none());
                 let value = read(&file);
+                assert_eq!(
+                    value["reader"],
+                    serde_json::json!({
+                        "frame":"unknown", "typed":false, "pending":false,
+                        "settleIn":false, "settleOut":false, "send":"unobserved"
+                    })
+                );
                 assert_eq!(value["termination"], "returned-error");
                 assert_eq!(value["rpcFailure"], serde_json::to_value(origin).unwrap());
                 assert_eq!(value["workerOrdinal"], 8);
@@ -2247,6 +2346,59 @@ mod worker_terminal_tests {
         assert_eq!(value["termination"], "returned-ok");
         assert_eq!(value["waitingForDebugger"], false);
         assert!(value.get("rpcFailure").is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_terminal_reader_snapshot_survives_drop_timeout_and_send_publication_race() {
+        for case in 0..3 {
+            let (file, writer) = output();
+            let trace = trace(&AtomicU64::new(0), Some(true));
+            let note = WorkerRpcFailureNote::default();
+            let mut terminal = WorkerNetworkTerminal::default();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let mut future = Box::pin(terminal.observe_into(
+                Some(&trace),
+                Some(&writer),
+                Some(&note),
+                async { receiver.await.unwrap() },
+            ));
+            assert!(note.reader().is_none());
+            assert!(futures_util::poll!(future.as_mut()).is_pending());
+            let reader = note.reader().unwrap();
+            if case == 2 {
+                // The actual oneshot has delivered, but the sending thread's
+                // diagnostic publication can occur after this terminal write.
+                sender.send(Ok::<(), String>(())).unwrap();
+                assert_eq!(future.await, Ok(()));
+            } else {
+                reader.mark(WorkerReaderStep::Frame);
+                reader.mark(WorkerReaderStep::Typed);
+                reader.mark(WorkerReaderStep::Pending);
+                reader.mark(WorkerReaderStep::SettleIn);
+                drop(future);
+                drop(sender);
+                if case == 0 {
+                    terminal.outer_timeout();
+                }
+            }
+            drop(terminal);
+            let value = read(&file);
+            assert_eq!(
+                value["termination"],
+                ["outer-timeout", "abandoned", "returned-ok"][case]
+            );
+            assert_eq!(
+                value["reader"]["frame"],
+                if case == 2 { "unknown" } else { "seen" }
+            );
+            assert_eq!(value["reader"]["settleIn"], case != 2);
+            assert_eq!(value["reader"]["settleOut"], false);
+            assert_eq!(value["reader"]["send"], "unobserved");
+            let before = std::fs::read(file.path()).unwrap();
+            reader.mark(WorkerReaderStep::SettleOut);
+            reader.sent(true);
+            assert_eq!(std::fs::read(file.path()).unwrap(), before);
+        }
     }
 
     #[tokio::test]

@@ -22,7 +22,9 @@ use super::super::client_debt::{
     SubmittedCommand,
 };
 use super::super::client_protocol::ProtocolError;
-use super::super::client_settlement_trace::{WorkerRpcFailureNote, WorkerRpcFailureOrigin};
+use super::super::client_settlement_trace::{
+    WorkerReaderObservation, WorkerReaderStep, WorkerRpcFailureNote, WorkerRpcFailureOrigin,
+};
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
 
 type TrackedResponses = Arc<std::sync::Mutex<HashMap<u64, SubmittedCommand>>>;
@@ -35,8 +37,38 @@ struct DisposalWork {
 struct PendingResponse {
     sender: oneshot::Sender<CdpMessage>,
     session: Option<String>,
+    reader: Option<Arc<WorkerReaderObservation>>,
+}
+impl PendingResponse {
+    fn deliver(self, message: CdpMessage) -> bool {
+        let succeeded = self.sender.send(message).is_ok();
+        // Sending may wake the terminal owner on another thread before this
+        // result bit is published. Its earlier snapshot remains unobserved.
+        if let Some(reader) = self.reader {
+            reader.sent(succeeded);
+        }
+        !succeeded
+    }
 }
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+
+// The per-transport hint only avoids work on the default path. Correlation and
+// lifetime still come exclusively from the existing pending entry. Once set,
+// the opt-in hint stays enabled until transport close. Lock misses,
+// malformed IDs and late frames are unknown; never wait or create another map.
+fn observe_reader_frame(
+    enabled: bool,
+    pending: &PendingMap,
+    message: &str,
+) -> Option<(u64, Arc<WorkerReaderObservation>)> {
+    if !enabled {
+        return None;
+    }
+    let id = extract_command_id(message)?;
+    let reader = pending.try_lock().ok()?.get(&id)?.reader.clone()?;
+    reader.mark(WorkerReaderStep::Frame);
+    Some((id, reader))
+}
 
 /// Only read-side EOF or peer-reset evidence may preserve EOF-only integrity.
 /// Timeouts, local/resource failures, and ambiguous aborts are not remote EOF.
@@ -436,6 +468,7 @@ struct CdpTransport {
     cancel_tx: watch::Sender<bool>,
     next_id: Arc<AtomicU64>,
     pending: PendingMap,
+    reader_probe_enabled: Arc<AtomicBool>,
     tracked_responses: TrackedResponses,
     debt_owner: DebtOwner,
     event_tx: broadcast::Sender<CdpEvent>,
@@ -554,6 +587,8 @@ impl CdpClient {
             maximum: 32 * 1024,
         });
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let reader_probe_enabled = Arc::new(AtomicBool::new(false));
+        let reader_probe_hint = reader_probe_enabled.clone();
         let tracked_responses: TrackedResponses = Arc::default();
         let debt_owner: DebtOwner = Arc::default();
         let tracked_reader = tracked_responses.clone();
@@ -701,6 +736,11 @@ impl CdpClient {
                     });
                 }
 
+                let raw_observation = observe_reader_frame(
+                    reader_probe_hint.load(Ordering::Acquire),
+                    &pending_clone,
+                    &msg,
+                );
                 let parsed: CdpMessage = match serde_json::from_str(&msg) {
                     Ok(parsed) => parsed,
                     Err(_) => {
@@ -728,7 +768,10 @@ impl CdpClient {
                                     }
                                     let waiter = pending_clone.lock().await.remove(&id);
                                     if let Some(tx) = waiter {
-                                        let _ = tx.sender.send(CdpMessage {
+                                        if let Some(reader) = &tx.reader {
+                                            reader.mark(WorkerReaderStep::Pending);
+                                        }
+                                        let _ = tx.deliver(CdpMessage {
                                             id: Some(id),
                                             result: None,
                                             error: Some(CdpError {
@@ -751,6 +794,11 @@ impl CdpClient {
                     }
                 };
 
+                if let Some((id, reader)) = &raw_observation {
+                    if parsed.id == Some(*id) {
+                        reader.mark(WorkerReaderStep::Typed);
+                    }
+                }
                 let valid_envelope = if parsed.id.is_some() {
                     parsed.method.is_none()
                         && parsed.params.is_none()
@@ -780,17 +828,30 @@ impl CdpClient {
 
                 if let Some(id) = parsed.id {
                     let waiter = pending_clone.lock().await.remove(&id);
+                    let reader = waiter.as_ref().and_then(|waiter| waiter.reader.as_ref());
+                    if let Some(reader) = reader {
+                        reader.mark(WorkerReaderStep::Typed);
+                        reader.mark(WorkerReaderStep::Pending);
+                    }
                     // Parse/correlate/settle before waiter delivery. Queue only
                     // exact disposal work, never the old application's next step.
                     let tracked = tracked_reader
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .remove(&id);
+                    // These marks bracket the optional settlement path, even
+                    // with no tracked entry; neither proves clean settlement.
+                    if let Some(reader) = reader {
+                        reader.mark(WorkerReaderStep::SettleIn);
+                    }
                     let disposals = tracked
                         .map_or_else(Vec::new, |tracked| tracked.settle_for_delivery(&parsed));
+                    if let Some(reader) = reader {
+                        reader.mark(WorkerReaderStep::SettleOut);
+                    }
                     // Delivery itself is the authority: is_closed() alone races
                     // receiver cancellation between inspection and send.
-                    let abandoned = waiter.is_none_or(|tx| tx.sender.send(parsed).is_err());
+                    let abandoned = waiter.is_none_or(|tx| tx.deliver(parsed));
                     for disposal in disposals {
                         if disposal.needed_after_delivery(abandoned) {
                             if let Ok(command) = disposal.reserve() {
@@ -925,6 +986,7 @@ impl CdpClient {
                 cancel_tx,
                 next_id,
                 pending,
+                reader_probe_enabled,
                 tracked_responses,
                 debt_owner,
                 event_tx,
@@ -1468,11 +1530,18 @@ impl CdpClient {
                 }
             }
             self.track_submission_observed(id, reservation, observation)?;
+            let reader = observation.and_then(WorkerRpcFailureNote::reader);
+            if reader.is_some() {
+                self.transport
+                    .reader_probe_enabled
+                    .store(true, Ordering::Release);
+            }
             pending.insert(
                 id,
                 PendingResponse {
                     sender: tx,
                     session: cmd.session_id.clone(),
+                    reader,
                 },
             );
             drop(pending);
@@ -1898,6 +1967,197 @@ mod tests {
     use tokio::sync::oneshot;
 
     #[tokio::test]
+    async fn network_enable_reader_witnesses_real_success_error_and_malformed_reply() {
+        for case in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let command: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                let mut reply = json!({"id":command["id"],"sessionId":command["sessionId"]});
+                if case == 1 {
+                    reply["error"] = json!({"code":-32000,"message":"private-message"});
+                } else {
+                    reply["result"] = json!({});
+                    if case == 2 {
+                        reply["method"] = json!(42);
+                    }
+                }
+                socket.send(Message::Text(reply.to_string())).await.unwrap();
+                while let Some(Ok(_)) = socket.next().await {}
+            });
+            let client = CdpClient::connect(&endpoint).await.unwrap();
+            assert!(!client
+                .transport
+                .reader_probe_enabled
+                .load(Ordering::Acquire));
+            let note = WorkerRpcFailureNote::default();
+            assert!(note.reader().is_none());
+            let reader = note.test_enable_reader();
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.send_network_enable_observed(None, Some("private-worker"), Some(&note)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), case == 0);
+            let snapshot = reader.test_snapshot();
+            assert_eq!(snapshot["frame"], "seen");
+            assert_eq!(snapshot["typed"], case != 2);
+            assert_eq!(snapshot["pending"], true);
+            assert_eq!(snapshot["settleIn"], case != 2);
+            assert_eq!(snapshot["settleOut"], case != 2);
+            // This single-thread test resumes after delivery publication. The
+            // terminal snapshot on another thread may instead be unobserved.
+            assert_eq!(snapshot["send"], "succeeded");
+            assert!(!snapshot.to_string().contains("private"));
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn network_enable_reader_busy_probe_is_unknown_without_blocking_delivery() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let command: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            seen_tx.send(()).unwrap();
+            reply_rx.await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"id":command["id"],"sessionId":command["sessionId"],"result":{}})
+                        .to_string(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let mut raw = client.subscribe_raw();
+        let note = WorkerRpcFailureNote::default();
+        let reader = note.test_enable_reader();
+        let mut request =
+            Box::pin(client.send_network_enable_observed(None, Some("worker"), Some(&note)));
+        tokio::select! {
+            result = &mut request => panic!("unexpected reply: {result:?}"),
+            _ = seen_rx => {}
+        }
+        let held = client.transport.pending.lock().await;
+        reply_tx.send(()).unwrap();
+        // On this current-thread runtime the reader broadcasts, misses the
+        // nonblocking probe, then yields at its original pending.lock await.
+        tokio::time::timeout(Duration::from_secs(1), raw.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reader.test_snapshot()["frame"], "unknown");
+        assert_eq!(reader.test_snapshot()["pending"], false);
+        drop(held);
+        assert!(tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .unwrap()
+            .is_ok());
+        let snapshot = reader.test_snapshot();
+        assert_eq!(snapshot["frame"], "unknown");
+        assert_eq!(snapshot["typed"], true);
+        assert_eq!(snapshot["pending"], true);
+        assert_eq!(snapshot["send"], "succeeded");
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_enable_reader_late_reply_after_drop_or_outer_timeout_stays_unknown() {
+        for timeout in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let (seen_tx, seen_rx) = oneshot::channel();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let command: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                seen_tx.send(()).unwrap();
+                reply_rx.await.unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id":command["id"],"sessionId":command["sessionId"],"result":{}})
+                            .to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                while let Some(Ok(_)) = socket.next().await {}
+            });
+            let client = CdpClient::connect(&endpoint).await.unwrap();
+            let mut raw = client.subscribe_raw();
+            let note = WorkerRpcFailureNote::default();
+            let reader = note.test_enable_reader();
+            let mut request =
+                Box::pin(client.send_network_enable_observed(None, Some("worker"), Some(&note)));
+            tokio::select! {
+                result = &mut request => panic!("unexpected reply: {result:?}"),
+                _ = seen_rx => {}
+            }
+            if timeout {
+                assert!(tokio::time::timeout(Duration::from_millis(1), request)
+                    .await
+                    .is_err());
+            } else {
+                drop(request);
+            }
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while client.pending_len().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let before = reader.test_snapshot();
+            reply_tx.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), raw.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(reader.test_snapshot(), before);
+            assert_eq!(before["frame"], "unknown");
+            assert_eq!(before["send"], "unobserved");
+            assert_eq!(note.test_snapshot()["rpcFailure"], "unknown");
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn network_enable_reader_records_actual_closed_receiver_without_an_ack() {
+        let note = WorkerRpcFailureNote::default();
+        let reader = note.test_enable_reader();
+        let (sender, receiver) = oneshot::channel();
+        drop(receiver);
+        let waiter = PendingResponse {
+            sender,
+            session: Some("private-session".into()),
+            reader: Some(reader.clone()),
+        };
+        assert!(waiter.deliver(serde_json::from_value(json!({"id":1,"result":{}})).unwrap()));
+        let snapshot = reader.test_snapshot();
+        assert_eq!(snapshot["send"], "receiver-closed");
+        assert_eq!(snapshot["frame"], "unknown");
+        assert!(!snapshot.to_string().contains("private"));
+    }
+
+    #[tokio::test]
     async fn network_enable_failure_origin_concurrent_workers_keep_exact_call_notes() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -1927,10 +2187,11 @@ mod tests {
             let client = client.clone();
             tokio::spawn(async move {
                 let note = WorkerRpcFailureNote::default();
+                let reader = note.test_enable_reader();
                 let result = client
                     .send_network_enable_observed(None, Some(session), Some(&note))
                     .await;
-                (result, note.test_snapshot())
+                (result, note.test_snapshot(), reader.test_snapshot())
             })
         };
         let a = spawn("worker-a");
@@ -1954,6 +2215,11 @@ mod tests {
         assert_eq!(b.1["rpcFailure"], "response-error");
         assert!(!a.1.to_string().contains("private"));
         assert!(!b.1.to_string().contains("private"));
+        for snapshot in [&a.2, &b.2] {
+            assert_eq!(snapshot["frame"], "seen");
+            assert_eq!(snapshot["pending"], true);
+            assert_eq!(snapshot["send"], "succeeded");
+        }
         client.close().await;
         peer.await.unwrap();
     }
@@ -2865,6 +3131,7 @@ mod tests {
                 PendingResponse {
                     sender,
                     session: session.map(str::to_owned),
+                    reader: None,
                 },
             );
             receivers.push(receiver);
