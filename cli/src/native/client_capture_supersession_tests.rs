@@ -10,6 +10,9 @@ use futures_util::StreamExt;
 #[path = "client_capture_metadata_deadline_tests.rs"]
 mod metadata_deadline_tests;
 
+#[path = "client_capture_mask_failure_tests.rs"]
+mod mask_failure_tests;
+
 struct Owner {
     client: Arc<CdpClient>,
     targets: Arc<ClientTargets>,
