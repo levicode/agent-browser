@@ -4515,6 +4515,16 @@ impl ClientEnrollment {
         self.stop.send_replace(CancelSignal::SessionClosed);
         self.changed.notify_waiters();
     }
+    /// Observe this exact owner's existing terminal signal. This grants no
+    /// replacement authority and cannot miss a seal preceding subscription.
+    pub(crate) async fn wait_retired(&self) {
+        let mut stop = self.stop.subscribe();
+        while *stop.borrow() == CancelSignal::None {
+            if stop.changed().await.is_err() {
+                return;
+            }
+        }
+    }
     /// The lifecycle journal, not a local read or a failing producer, owns this
     /// stamp. Sealing still rejects every new application/observation admission.
     pub(crate) fn retirement_targets(&self) -> &Arc<ClientTargets> {

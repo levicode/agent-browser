@@ -3583,9 +3583,20 @@ async fn read_batch_with_refs(
     }
     let session = &frame.binding.session;
     let group = format!("native-metadata-{}", lease.sequence);
+    #[cfg(test)]
+    let mut diagnostic_stage = "World";
+    macro_rules! metadata_stage {
+        ($stage:ident) => {
+            #[cfg(test)]
+            {
+                diagnostic_stage = stringify!($stage);
+            }
+        };
+    }
     let result=async {
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing isolated realm")?;
+        metadata_stage!(Resolve);
         let backend_ids:Vec<Option<i64>>=nodes.iter().map(|ax|ax.backend_d_o_m_node_id).collect();
         let resolved:Vec<Result<Value,ObservationError>>=stream::iter(backend_ids.into_iter().map(|backend| {
             let group=&group;
@@ -3594,8 +3605,10 @@ async fn read_batch_with_refs(
             }
         })).buffered(16).collect().await;
         let resolved=collect_hint_results(resolved)?;
+        metadata_stage!(PseudoInventory);
         let has_pseudo=resolved.iter().any(|value|value["object"]["subtype"]!="node");
         let origins=if has_pseudo{pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?}else{HashMap::new()};
+        metadata_stage!(ReceiverIdentity);
         let mut objects=Vec::with_capacity(nodes.len());let mut pseudo=Vec::with_capacity(nodes.len());
         for (ax,value) in nodes.iter().zip(&resolved){
             let remote=&value["object"];
@@ -3609,6 +3622,7 @@ async fn read_batch_with_refs(
             if owner["object"]["subtype"]!="node"{return Err(ObservationError::StaleReference);}
             objects.push(owner["object"]["objectId"].as_str().ok_or(ObservationError::StaleReference)?.to_owned());pseudo.push(Some(origin));
         }
+        metadata_stage!(ReceiverPolicy);
         let mut arguments=vec![json!({"value":options.test_id_attribute}),json!({"value":options.secure_field_selector})];
         arguments.extend(objects.iter().map(|o|json!({"objectId":o})));
         let protected_editors = metadata_receiver_protection(nodes, &pseudo, acquisition_policy)?;
@@ -3619,18 +3633,21 @@ async fn read_batch_with_refs(
         let local_name_inventory:Vec<bool>=nodes.iter().zip(&pseudo).map(|(node,origin)|origin.is_none()&&node.backend_d_o_m_node_id.is_some_and(|id|acquisition_policy.local_name_inventory.contains(&id))).collect();
         let local_name_inventory=serde_json::to_string(&local_name_inventory).map_err(|_|ObservationError::BackendFailure)?;
         let function=format!("function(testId,secureSelector,...nodes) {{ const read={METADATA}; const protectedEditors={protected_editors}; const focusedReceivers={focused_receivers}; const localNameInventory={local_name_inventory}; return nodes.map((node,index)=>read.call(node,testId,secureSelector,{bounded},protectedEditors[index],{simple_name_inventory},focusedReceivers[index],localNameInventory[index])); }}");
+        metadata_stage!(ReadCall);
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){
             #[cfg(test)]
             diagnostic_receivers(client,session,&objects,lease).await;
             return Err(ObservationError::BackendFailure);
         }
+        metadata_stage!(ReadResult);
         check(lease)?;
         let mut values=result["result"]["value"].as_array().ok_or("Missing metadata batch")?.clone();
         if values.len()!=nodes.len(){return Err("Incomplete metadata batch".into());}
         // Own the bounded descriptors before entering the async stream. Nested
         // borrowed filter/zip iterators are not sufficiently general for the
         // Send future required by the spawned operation dispatcher.
+        metadata_stage!(HandlerHints);
         let mut hint_candidates = Vec::new();
         for index in 0..nodes.len() {
             if pseudo[index].is_none() && values[index]["handlerProbe"] == true {
@@ -3646,6 +3663,7 @@ async fn read_batch_with_refs(
         // in-flight helper would skip its mandatory object-group cleanup.
         let hints = collect_hint_results(hints)?;
         for (index,hint) in hints { if hint { values[index]["author"]["action"]=json!(true); } }
+        metadata_stage!(PseudoRevalidation);
         let policy=if has_pseudo{Some(security_inventory(client,frame,options,lease).await?)}else{None};
         if has_pseudo {
             let current=pseudo_origins(&frame_dom(client,frame,lease).await?["root"])?;
@@ -3659,6 +3677,7 @@ async fn read_batch_with_refs(
         }
         // The originating element supplies security policy only. Identity stays
         // the native pseudo backend, never the origin's DOM reference.
+        metadata_stage!(Projection);
         nodes.iter().zip(&values).zip(pseudo).map(|((ax,data),origin)|{
             let readonly=if origin.is_some(){readonly_pseudo_metadata(data,ax)}else{data.clone()};
             let mut node=match refs.as_deref_mut() {
@@ -3669,7 +3688,17 @@ async fn read_batch_with_refs(
             Ok(node)
         }).collect()
     }.await;
+    #[cfg(test)]
+    let primary_failed = result.is_err();
+    #[cfg(test)]
+    if primary_failed {
+        eprintln!("native-metadata-first-failure stage={}", diagnostic_stage);
+    }
     let result = settle_object_group(client, session, &group, result, lease).await;
+    #[cfg(test)]
+    if !primary_failed && result.is_err() {
+        eprintln!("native-metadata-first-failure stage=ObjectGroupCleanup");
+    }
     result
 }
 

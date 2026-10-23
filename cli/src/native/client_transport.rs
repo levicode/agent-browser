@@ -1543,13 +1543,15 @@ async fn execute_until_deadline<E: ClientExecutor>(
     settlement_trace!(sequence, ExecuteStarted);
     let execution = executor.execute(command, args, lease);
     tokio::pin!(execution);
-    let reason = tokio::select! {
+    tokio::select! {
         biased;
         outcome = &mut execution => { settlement_trace!(sequence, ExecuteReturned); return outcome; },
-        _ = cancellation.changed() => { settlement_trace!(sequence, CancelObserved); ProtocolError::Cancelled },
-        _ = tokio::time::sleep_until(deadline) => { settlement_trace!(sequence, DeadlineObserved); ProtocolError::DeadlineExceeded },
+        _ = cancellation.changed() => { settlement_trace!(sequence, CancelObserved); },
+        _ = tokio::time::sleep_until(deadline) => {
+            settlement_trace!(sequence, DeadlineObserved);
+            let _ = broker.expire(generation, sequence);
+        },
     };
-    let _ = broker.cancel(generation, sequence);
     executor.cancel_operation_producer(super::client_debt::OperationKey {
         generation,
         operation_seq: sequence,
@@ -1573,6 +1575,9 @@ async fn execute_until_deadline<E: ClientExecutor>(
         None if !broker.has_started(sequence) => Effects::NotDispatched,
         None => Effects::Unknown,
     };
+    let reason = (*cancellation.borrow())
+        .error()
+        .unwrap_or(ProtocolError::Cancelled);
     NativeOutcome {
         retention: if effects == Effects::Unknown {
             status.proof()
@@ -3232,13 +3237,10 @@ mod tests {
             while *cancellation.borrow() == super::super::client_session::CancelSignal::None {
                 cancellation.changed().await.unwrap();
             }
+            let reason = (*cancellation.borrow()).error().unwrap();
             NativeOutcome {
                 retention: None,
-                result: Err(if std::time::Instant::now() >= lease.deadline {
-                    ProtocolError::DeadlineExceeded
-                } else {
-                    ProtocolError::Cancelled
-                }),
+                result: Err(reason),
                 effects: Effects::NotDispatched,
             }
         }

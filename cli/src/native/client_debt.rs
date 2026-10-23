@@ -1220,8 +1220,8 @@ impl OwnerDebtLedger {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if *cancellation.borrow() != CancelSignal::None {
-                return Err(ProtocolError::Cancelled);
+            if let Some(error) = (*cancellation.borrow()).error() {
+                return Err(error);
             }
             if Instant::now() >= operation.deadline {
                 return Err(ProtocolError::DeadlineExceeded);
@@ -1234,8 +1234,8 @@ impl OwnerDebtLedger {
                 return Ok(());
             }
             tokio::select! { biased;
-                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
-                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                _ = cancellation.changed() => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled)),
+                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)),
                 _ = &mut changed => {},
             }
         }

@@ -146,7 +146,12 @@ async fn generic_waiter_case(command: &str, change: ChangeWhileWaiting) {
     assert_eq!(ledger.snapshot().input_debt, 0);
 
     fixture.sequence += 1;
-    let waiter_lease = broker.admit(1, fixture.sequence, 10_000).unwrap();
+    let waiter_budget = if command == "browser.pointer" && change == ChangeWhileWaiting::InputDebt {
+        1000
+    } else {
+        10_000
+    };
+    let waiter_lease = broker.admit(1, fixture.sequence, waiter_budget).unwrap();
     let waiter_key = OperationKey {
         generation: 1,
         operation_seq: waiter_lease.sequence,
@@ -159,6 +164,9 @@ async fn generic_waiter_case(command: &str, change: ChangeWhileWaiting) {
     let args = match command {
         "input.keyboard" => json!({"identityScope":scope,"action":"press","value":"ArrowRight"}),
         "input.mouse" => json!({"identityScope":scope,"action":"move","x":41,"y":73}),
+        "browser.pointer" => {
+            json!({"identityScope":scope,"point":{"x":41,"y":73},"action":{"kind":"hover"}})
+        }
         "context.viewport" => json!({"identityScope":scope,"width":811,"height":613}),
         _ => unreachable!(),
     };
@@ -298,7 +306,7 @@ async fn generic_waiter_case(command: &str, change: ChangeWhileWaiting) {
         assert_eq!(outcome.effects, Effects::Completed);
         let expected_method = match command {
             "input.keyboard" => "Input.dispatchKeyEvent",
-            "input.mouse" => "Input.dispatchMouseEvent",
+            "input.mouse" | "browser.pointer" => "Input.dispatchMouseEvent",
             "context.viewport" => "Emulation.setDeviceMetricsOverride",
             _ => unreachable!(),
         };
@@ -321,7 +329,7 @@ async fn generic_waiter_case(command: &str, change: ChangeWhileWaiting) {
                     .iter()
                     .all(|r| r["params"]["key"] == "ArrowRight"));
             }
-            "input.mouse" => {
+            "input.mouse" | "browser.pointer" => {
                 assert_eq!(dispatched[0]["params"]["type"], "mouseMoved");
                 assert_eq!(dispatched[0]["params"]["x"], 41.0);
                 assert_eq!(dispatched[0]["params"]["y"], 73.0);
@@ -346,6 +354,10 @@ async fn generic_waiter_case(command: &str, change: ChangeWhileWaiting) {
                     && r["method"] != "Emulation.setDeviceMetricsOverride"),
             "waiter dispatched after {change:?}: {fresh:?}"
         );
+    }
+    if command == "browser.pointer" && change == ChangeWhileWaiting::InputDebt {
+        assert_eq!(outcome.result, Err(ProtocolError::DeadlineExceeded));
+        assert_eq!(ledger.snapshot().input_debt, 1);
     }
     assert!(outcome.retention.is_none());
     assert_eq!(
@@ -412,5 +424,18 @@ async fn actual_configuration_waiter_revalidates_after_its_own_mutex() {
         ChangeWhileWaiting::SameIdAttachmentReplaced,
     ] {
         generic_waiter_case("context.viewport", change).await;
+    }
+}
+
+#[tokio::test]
+async fn actual_point_waiter_preserves_post_lock_producer_publication_and_attachment_checks() {
+    for change in [
+        ChangeWhileWaiting::Healthy,
+        ChangeWhileWaiting::InputDebt,
+        ChangeWhileWaiting::ProducerResultUnfixed,
+        ChangeWhileWaiting::PublicationRetiring,
+        ChangeWhileWaiting::SameIdAttachmentReplaced,
+    ] {
+        generic_waiter_case("browser.pointer", change).await;
     }
 }

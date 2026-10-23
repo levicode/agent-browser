@@ -1792,10 +1792,18 @@ async fn observe_generic_guard_wait<'a>(
     key: super::client_debt::OperationKey,
     probe: &Arc<Mutex<Option<GenericAdmissionProbe>>>,
 ) -> tokio::sync::MutexGuard<'a, ()> {
-    let lock = gate.lock();
-    tokio::pin!(lock);
+    observe_generic_admission_wait(gate.lock(), key, probe).await
+}
+
+#[cfg(test)]
+async fn observe_generic_admission_wait<F: std::future::Future>(
+    wait: F,
+    key: super::client_debt::OperationKey,
+    probe: &Arc<Mutex<Option<GenericAdmissionProbe>>>,
+) -> F::Output {
+    tokio::pin!(wait);
     std::future::poll_fn(|cx| {
-        let polled = std::future::Future::poll(lock.as_mut(), cx);
+        let polled = std::future::Future::poll(wait.as_mut(), cx);
         if polled.is_pending() {
             let mut probe = probe.lock().unwrap();
             if probe.as_ref().is_some_and(|probe| probe.key == key) {
@@ -3004,17 +3012,52 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             };
             let action_broker = self.broker.clone();
             let action_tasks = self.tasks.clone();
+            #[cfg(test)]
+            let admission_probe = self.generic_admission_probe.clone();
             let receive = self.tasks.start_operation(page.identity_scope.clone(), page.targets.clone(), self.broker.clone(), journal.clone(), lease.cancellation.clone(), async move {
                 let mut activation_dispatched = false;
                 let admission = async {
+                  loop {
+                    if direct_point {
+                        let ledger = page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?;
+                        let check_owner = || {
+                            page.permit.check()?;
+                            if !ledger.matches_owner(lease.generation, &page.identity_scope)
+                                || page.identity_scope != page.targets.identity_scope
+                                || journal.key().generation != lease.generation
+                                || journal.key().operation_seq != lease.sequence
+                                || attachment.session_id != page.page_session_id
+                                || !attachment.capture_ready()
+                                || !attachment.same_attachment(&page.targets.owned_target(&page.target_id)?)
+                            { return Err(ProtocolError::StaleScope); }
+                            if !action_broker.check_application_publication(lease.generation)? {
+                                return Err(ProtocolError::StaleReference);
+                            }
+                            Ok(())
+                        };
+                        // Remote debt remains owned by the older operation. Do
+                        // not hold UI/input locks needed by its owner services,
+                        // reset this deadline, or infer dispatch from waiting.
+                        let waiting = ledger.wait_admission(super::client_debt::AdmissionClass::Input, &lease, &check_owner);
+                        #[cfg(test)]
+                        let waited = observe_generic_admission_wait(waiting, journal.key(), &admission_probe).await;
+                        #[cfg(not(test))]
+                        let waited = waiting.await;
+                        check_owner()?;
+                        waited?;
+                    }
                     page.permit.check()?;
                     let ui_permit = ui.enter(false, lease.is_callback, lease.deadline, lease.cancellation.clone()).await?;
                     page.permit.check()?;
                     let mut cancellation = lease.cancellation.clone();
                     if *cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
+                    #[cfg(test)]
+                    let lock = observe_generic_guard_wait(&input_gate, journal.key(), &admission_probe);
+                    #[cfg(not(test))]
+                    let lock = input_gate.lock();
                     let input_permit = tokio::select! { biased;
                         _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
-                        guard = tokio::time::timeout_at(lease.deadline.into(), input_gate.lock()) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
+                        guard = tokio::time::timeout_at(lease.deadline.into(), lock) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
                     };
                     page.permit.check()?;
                     if !attachment.same_attachment(&page.targets.owned_target(&page.target_id)?) {
@@ -3023,14 +3066,34 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     if !action_broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
                     action_tasks.check_input_dispatch(journal.key())?;
                     let ledger = page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?;
-                    ledger.check_admission(if direct_point { super::client_debt::AdmissionClass::Input } else { super::client_debt::AdmissionClass::Reference })?;
+                    if let Err(error) = ledger.check_admission(if direct_point { super::client_debt::AdmissionClass::Input } else { super::client_debt::AdmissionClass::Reference }) {
+                        if direct_point && error == ProtocolError::ScopeUnavailable {
+                            // A new debt may have arrived while acquiring the
+                            // guards. Only wait_admission distinguishes pending
+                            // debt from retired/poisoned accounting; it rejects
+                            // the latter immediately, even after a late ACK.
+                            drop(input_permit);
+                            drop(ui_permit);
+                            continue;
+                        }
+                        return Err(error);
+                    }
                     if !direct_point { observation.check_publication_fence(publication_fence)?; }
                     if command == "recording.start" {
                         super::client_actions::ClientActions::validate_recording_start(&page.identity_scope, &args)?;
                         activation.ensure(&page, &lease, &mut activation_dispatched).await?;
                     }
-                    Ok((ui_permit, input_permit))
-                }.await;
+                    return Ok((ui_permit, input_permit));
+                  }
+                };
+                let admission = if direct_point {
+                    // Only pre-dispatch admission is interruptible here. Once
+                    // input starts its retained owner still performs cleanup.
+                    tokio::select! { biased;
+                        _ = enrollment.wait_retired() => Err(ProtocolError::StaleScope),
+                        result = admission => result,
+                    }
+                } else { admission.await };
                 let (ui_permit, input_permit) = match admission {
                     Ok(value) => value,
                     Err(error) => { let dirty = error == ProtocolError::CleanupFailed; return (NativeOutcome { retention: None, result: Err(error), effects: if activation_dispatched { Effects::Unknown } else { Effects::NotDispatched } }, dirty); },
@@ -3611,7 +3674,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         output
                 }.await;
                 let cleanup_failed = matches!(result, Err(ProtocolError::CleanupFailed));
-                let expired = *lease.cancellation.borrow() != super::client_session::CancelSignal::None
+                if std::time::Instant::now() >= lease.deadline {
+                    let _ = broker.expire(lease.generation, lease.sequence);
+                }
+                let interruption = (*lease.cancellation.borrow()).error();
+                let expired = interruption.is_some()
                     || std::time::Instant::now() >= lease.deadline;
                 let navigation_settled = command == "page.navigate"
                     && matches!(result, Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded))
@@ -3623,7 +3690,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 } else if expired || (result.is_err() && mutating) {
                     Effects::Unknown
                 } else { Effects::Completed };
-                let result = if expired && !navigation_settled { Err(ProtocolError::Cancelled) } else { result };
+                // Only interruption/success outcomes are normalized. Lost
+                // authority and cleanup failures must not become usable timeout
+                // results merely because a deadline also elapsed.
+                let result = match (&result, interruption) {
+                    (Ok(_) | Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded), Some(reason))
+                        if !navigation_settled => Err(reason),
+                    _ => result,
+                };
                 (NativeOutcome { retention: None, result, effects }, cleanup_failed)
             }).await;
             return await_retained(receive).await;
@@ -3897,6 +3971,10 @@ impl ClientBrowser {
                     if borrowed { owner.borrowed_targets = Some(vec![replacement.target_id.clone()]); }
                     (owner.lease(gate.enter(false)?)?, owner.recovery_identity())
                 };
+                if cleanup_trace::inventory_enabled() {
+                    cleanup_trace::inventory_snapshot(operation.generation, operation.sequence,
+                        cleanup_trace::InventoryPoint::RestartReady, next.targets.inventory_diagnostic());
+                }
                 active.store(true, std::sync::atomic::Ordering::SeqCst);
                 if actions.is_recording_armed().await? {
                     let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
@@ -4800,15 +4878,16 @@ mod tests {
         let families = capabilities
             .iter()
             .filter(|capability| capability.starts_with("browser."))
+            .cloned()
             .collect::<std::collections::HashSet<_>>();
-        assert_eq!(families.len(), 14);
-        for family in [
+        let expected = [
             "scope",
             "lifecycle",
             "evaluate",
             "page",
             "observe",
             "query",
+            "fixture-read-fields",
             "actions",
             "network",
             "dialog",
@@ -4817,9 +4896,11 @@ mod tests {
             "state",
             "recording",
             "blobs",
-        ] {
-            assert!(capabilities.contains(&format!("browser.{family}/1")));
-        }
+        ]
+        .into_iter()
+        .map(|family| format!("browser.{family}/1"))
+        .collect::<std::collections::HashSet<_>>();
+        assert_eq!(families, expected);
     }
 
     #[test]

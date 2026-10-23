@@ -108,10 +108,52 @@ async fn peer_with_cleanup(
     ack_before_attach: bool,
     old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     hold_old_input: bool,
+    cleanup_ack: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    peer_with_title(
+        ack_before_attach,
+        old_input,
+        hold_old_input,
+        cleanup_ack,
+        None,
+    )
+    .await
+}
+async fn peer_with_title(
+    ack_before_attach: bool,
+    old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    hold_old_input: bool,
+    cleanup_ack: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    peer_with_input_replies(
+        ack_before_attach,
+        old_input,
+        hold_old_input,
+        cleanup_ack,
+        title_seen,
+        None,
+        false,
+    )
+    .await
+}
+async fn peer_with_input_replies(
+    ack_before_attach: bool,
+    old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    hold_old_input: bool,
     mut cleanup_ack: Option<(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
+    title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    mut input_replies: Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
+    hold_point: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -125,7 +167,21 @@ async fn peer_with_cleanup(
         let mut created = 0;
         let mut worker = false;
         let mut late_old = false;
-        while let Some(Ok(Message::Text(text))) = socket.next().await {
+        loop {
+            let incoming = if let Some(replies) = &mut input_replies {
+                tokio::select! {
+                    incoming = socket.next() => incoming,
+                    Some(reply) = replies.recv() => {
+                        if socket.send(Message::Text(reply.to_string())).await.is_err() { return; }
+                        continue;
+                    }
+                }
+            } else {
+                socket.next().await
+            };
+            let Some(Ok(Message::Text(text))) = incoming else {
+                break;
+            };
             let request: Value = serde_json::from_str(&text).unwrap();
             recorded.lock().unwrap().push(request.clone());
             let method = request["method"].as_str().unwrap();
@@ -215,6 +271,15 @@ async fn peer_with_cleanup(
                 }
                 "Page.addScriptToEvaluateOnNewDocument" => json!({"identifier":"synthetic-script"}),
                 "Runtime.evaluate" => {
+                    if request["params"]["expression"] == "document.title" {
+                        if let Some(seen) = &title_seen {
+                            seen.send(request.clone()).unwrap();
+                            // Withhold this read's reply, not the transport or
+                            // cleanup commands. Only native cancel/deadline can
+                            // settle the real ClientBrowser operation.
+                            continue;
+                        }
+                    }
                     if created > 1 {
                         assert_eq!(
                             session,
@@ -251,6 +316,10 @@ async fn peer_with_cleanup(
                         continue;
                     }
                     json!({})
+                }
+                "Input.dispatchMouseEvent" if hold_point => {
+                    old_input.as_ref().unwrap().send(request.clone()).unwrap();
+                    continue;
                 }
                 "Input.dispatchKeyEvent"
                 | "Input.dispatchMouseEvent"
@@ -406,6 +475,12 @@ async fn real_restart_writer_then_first_evaluate_and_navigation_use_replacement(
 
 #[path = "client_browser_input_waiter_tests.rs"]
 mod input_waiter_tests;
+
+#[path = "client_browser_interruption_reason_tests.rs"]
+mod interruption_reason_tests;
+
+#[path = "client_browser_point_debt_tests.rs"]
+mod point_debt_tests;
 
 #[path = "client_browser_owner_transition_tests.rs"]
 mod owner_transition_tests;

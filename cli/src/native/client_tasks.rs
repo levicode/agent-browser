@@ -177,10 +177,24 @@ impl RetainedTasks {
                     ),
                 };
                 let snapshot = journal.snapshot();
-                let dirty = dirty
+                let already_dirty = dirty
                     || matches!(&outcome.result, Err(ProtocolError::CleanupFailed))
-                    || snapshot.integrity_lost
-                    || task_targets.check_settlement_integrity().is_err();
+                    || snapshot.integrity_lost;
+                let observe_inventory = super::client_settlement_trace::inventory_enabled();
+                let (settlement, inventory) = if already_dirty && !observe_inventory {
+                    (Ok(()), Default::default())
+                } else {
+                    task_targets.settlement_integrity_diagnostic(observe_inventory)
+                };
+                if settlement.is_err() {
+                    super::client_settlement_trace::inventory_snapshot(
+                        key.generation,
+                        key.operation_seq,
+                        super::client_settlement_trace::InventoryPoint::SettlementRefused,
+                        inventory,
+                    );
+                }
+                let dirty = already_dirty || settlement.is_err();
                 if !dirty && outcome.result.is_err() {
                     // Executor entry and current debt count are not dispatch
                     // evidence. Preserve a completed prefix, but never invent a

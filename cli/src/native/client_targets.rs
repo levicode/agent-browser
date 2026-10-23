@@ -926,18 +926,47 @@ impl ClientTargets {
     /// Settlement is not application admission. A completed local producer may
     /// retire under its original owner after normal lifecycle sealing, but every
     /// accounting failure and incomplete inventory still rejects settlement.
+    pub(crate) fn inventory_diagnostic(&self) -> super::client_settlement_trace::InventorySnapshot {
+        self.settlement_integrity_diagnostic(true).1
+    }
+    #[cfg(test)]
     pub(crate) fn check_settlement_integrity(&self) -> Result<(), ProtocolError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.integrity_lost
+        self.settlement_integrity_diagnostic(false).0
+    }
+    pub(crate) fn settlement_integrity_diagnostic(
+        &self,
+        observe: bool,
+    ) -> (
+        Result<(), ProtocolError>,
+        super::client_settlement_trace::InventorySnapshot,
+    ) {
+        let Ok(state) = self.state.lock() else {
+            return (Err(ProtocolError::ScopeUnavailable), Default::default());
+        };
+        let snapshot = if observe {
+            super::client_settlement_trace::InventorySnapshot {
+                observed: true,
+                sealed: state.sealed,
+                integrity_lost: state.integrity_lost,
+                reservations: state.reservations,
+                unconfigured: state
+                    .targets
+                    .values()
+                    .filter(|target| target.purpose.is_none() || !target.configured)
+                    .count(),
+            }
+        } else {
+            Default::default()
+        };
+        let result = if state.integrity_lost
             || !state.inventory_complete()
             || (state.sealed && state.owner_retirement_inventory != Some(true))
         {
-            return Err(ProtocolError::ScopeUnavailable);
-        }
-        Ok(())
+            Err(ProtocolError::ScopeUnavailable)
+        } else {
+            Ok(())
+        };
+        (result, snapshot)
     }
 }
 impl AuxiliaryAttachmentReservation {
@@ -1296,6 +1325,24 @@ impl Drop for CreationReservation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn inventory_diagnostic_preserves_refusal_and_never_seals_pending_inventory() {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        let reservation = registry
+            .reserve_creation(super::TargetPurpose::Application)
+            .unwrap();
+        let (result, snapshot) = registry.settlement_integrity_diagnostic(true);
+        assert_eq!(result, Err(super::ProtocolError::ScopeUnavailable));
+        assert!(snapshot.observed);
+        assert_eq!(snapshot.reservations, 1);
+        assert!(!snapshot.sealed && !snapshot.integrity_lost);
+        assert_eq!(registry.inventory_diagnostic().reservations, 1);
+        registry.seal();
+        let (result, snapshot) = registry.settlement_integrity_diagnostic(true);
+        assert_eq!(result, Err(super::ProtocolError::ScopeUnavailable));
+        assert!(snapshot.sealed && snapshot.integrity_lost);
+        drop(reservation);
+    }
     fn settlement_registry() -> std::sync::Arc<super::ClientTargets> {
         let registry = super::ClientTargets::new("ctx".into(), "scope".into());
         registry

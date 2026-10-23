@@ -21,7 +21,18 @@ const MAX_REGISTRIES: usize = 256;
 pub enum CancelSignal {
     None,
     Requested,
+    DeadlineExceeded,
     SessionClosed,
+}
+
+impl CancelSignal {
+    pub(crate) fn error(self) -> Option<ProtocolError> {
+        match self {
+            Self::None => None,
+            Self::Requested | Self::SessionClosed => Some(ProtocolError::Cancelled),
+            Self::DeadlineExceeded => Some(ProtocolError::DeadlineExceeded),
+        }
+    }
 }
 
 pub struct OperationLease {
@@ -369,6 +380,22 @@ impl ClientSession {
             return Err(ProtocolError::OperationMissing);
         }
         Self::cancel_tree(&mut inner, sequence);
+        Ok(())
+    }
+
+    /// Record the native deadline on the same token as explicit cancellation.
+    /// The broker lock orders both causes; an existing cause wins. Sealing the
+    /// session remains stronger and can still replace either with SessionClosed.
+    pub(crate) fn expire(&self, generation: u64, sequence: u64) -> Result<(), ProtocolError> {
+        let mut inner = self.lock()?;
+        Self::check(&inner, generation)?;
+        let operation = inner
+            .operations
+            .get(&sequence)
+            .ok_or(ProtocolError::OperationMissing)?;
+        if Instant::now() >= operation.deadline {
+            Self::interrupt_tree(&mut inner, sequence, CancelSignal::DeadlineExceeded);
+        }
         Ok(())
     }
 
@@ -1147,6 +1174,10 @@ impl ClientSession {
     }
 
     fn cancel_tree(inner: &mut Inner, root: u64) {
+        Self::interrupt_tree(inner, root, CancelSignal::Requested);
+    }
+
+    fn interrupt_tree(inner: &mut Inner, root: u64, signal: CancelSignal) {
         let mut sequences = vec![root];
         let mut index = 0;
         while index < sequences.len() {
@@ -1162,7 +1193,16 @@ impl ClientSession {
         }
         for sequence in sequences {
             if let Some(operation) = inner.operations.get(&sequence) {
-                operation.cancel.send_replace(CancelSignal::Requested);
+                // Do not relabel a deadline as user cancellation (or vice versa)
+                // when cancellation of descendants/decisions re-enters this path.
+                operation.cancel.send_if_modified(|current| {
+                    if *current == CancelSignal::None {
+                        *current = signal;
+                        true
+                    } else {
+                        false
+                    }
+                });
             }
             Self::cancel_decisions(inner, sequence);
         }
@@ -1333,6 +1373,158 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn elapsed_operation(broker: &ClientSession) -> OperationLease {
+        let operation = broker.admit(1, 1, 5000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        // Control the broker deadline only in this unit seam. The production
+        // ClientBrowser framed tests use the actual admitted timer and native read.
+        broker
+            .lock()
+            .unwrap()
+            .operations
+            .get_mut(&1)
+            .unwrap()
+            .deadline = Instant::now();
+        operation
+    }
+
+    #[test]
+    fn interruption_first_cause_survives_the_other_cause_and_seal_is_stronger() {
+        for first in [CancelSignal::Requested, CancelSignal::DeadlineExceeded] {
+            let broker = ClientSession::new();
+            let operation = elapsed_operation(&broker);
+            if first == CancelSignal::Requested {
+                broker.cancel(1, 1).unwrap();
+                broker.expire(1, 1).unwrap();
+            } else {
+                broker.expire(1, 1).unwrap();
+                broker.cancel(1, 1).unwrap();
+            }
+            assert_eq!(*operation.cancellation.borrow(), first);
+            assert_eq!(
+                first.error(),
+                Some(if first == CancelSignal::Requested {
+                    ProtocolError::Cancelled
+                } else {
+                    ProtocolError::DeadlineExceeded
+                })
+            );
+            broker.quarantine().unwrap();
+            assert_eq!(
+                *operation.cancellation.borrow(),
+                CancelSignal::SessionClosed
+            );
+            assert_eq!(
+                operation.cancellation.borrow().error(),
+                Some(ProtocolError::Cancelled)
+            );
+            assert_eq!(broker.health().unwrap().1, ScopeState::Quarantined);
+            assert_eq!(broker.expire(1, 1), Err(ProtocolError::ScopeUnavailable));
+            assert_eq!(broker.cancel(1, 1), Err(ProtocolError::ScopeUnavailable));
+            assert_eq!(
+                *operation.cancellation.borrow(),
+                CancelSignal::SessionClosed
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_cancel_and_deadline_share_one_atomic_first_cause() {
+        let broker = Arc::new(ClientSession::new());
+        let operation = elapsed_operation(&broker);
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        std::thread::scope(|scope| {
+            for deadline in [false, true] {
+                let broker = broker.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    if deadline {
+                        broker.expire(1, 1).unwrap();
+                    } else {
+                        broker.cancel(1, 1).unwrap();
+                    }
+                });
+            }
+            barrier.wait();
+        });
+        let first = *operation.cancellation.borrow();
+        assert!(matches!(
+            first,
+            CancelSignal::Requested | CancelSignal::DeadlineExceeded
+        ));
+        broker.expire(1, 1).unwrap();
+        broker.cancel(1, 1).unwrap();
+        assert_eq!(*operation.cancellation.borrow(), first);
+    }
+
+    #[test]
+    fn deadline_cannot_be_registered_before_the_admitted_deadline() {
+        let broker = ClientSession::new();
+        let operation = broker.admit(1, 1, 5000).unwrap();
+        broker.expire(1, 1).unwrap();
+        assert_eq!(*operation.cancellation.borrow(), CancelSignal::None);
+    }
+
+    #[tokio::test]
+    async fn deadline_cause_is_preserved_through_callback_tree() {
+        let broker = ClientSession::new();
+        let root = broker.admit(1, 1, 5000).unwrap();
+        let route = broker
+            .decision(
+                1,
+                DecisionOwner::Operation(1),
+                DecisionKind::Request,
+                5000,
+                None,
+            )
+            .unwrap();
+        let child = broker
+            .admit_callback(1, 2, 5000, Some(&route.token))
+            .unwrap();
+        let nested = broker
+            .decision(
+                1,
+                DecisionOwner::Operation(2),
+                DecisionKind::Dialog,
+                5000,
+                None,
+            )
+            .unwrap();
+        let grandchild = broker
+            .admit_callback(1, 3, 5000, Some(&nested.token))
+            .unwrap();
+        broker
+            .lock()
+            .unwrap()
+            .operations
+            .get_mut(&1)
+            .unwrap()
+            .deadline = Instant::now();
+        broker.expire(1, 1).unwrap();
+        for operation in [&root, &child, &grandchild] {
+            assert_eq!(
+                *operation.cancellation.borrow(),
+                CancelSignal::DeadlineExceeded
+            );
+        }
+        assert!(matches!(
+            route.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        assert!(matches!(
+            nested.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        broker.cancel(1, 1).unwrap();
+        for operation in [&root, &child, &grandchild] {
+            assert_eq!(
+                *operation.cancellation.borrow(),
+                CancelSignal::DeadlineExceeded
+            );
+        }
+    }
 
     fn live_field_callback(broker: &ClientSession) -> (OperationLease, DecisionLease) {
         let decision = broker

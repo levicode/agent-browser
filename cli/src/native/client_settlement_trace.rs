@@ -20,6 +20,7 @@ pub(crate) enum SettlementPhase {
     CleanupStarted,
     CleanupFirstFailure,
     CleanupResult,
+    InventorySnapshot,
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -156,6 +157,18 @@ pub(crate) enum MessageKind {
 pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_point: Option<InventoryPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_observed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_sealed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_integrity_lost: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_reservations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_unconfigured: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup_owner: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -433,6 +446,60 @@ fn cleanup_capture(path: Option<&Path>) -> Option<Capture> {
         sink: Mutex::new(AppendSink::open(path?, MAX_RECORDS, MAX_BYTES).ok()?),
         counters: Counters::default(),
     })
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryPoint {
+    RestartReady,
+    SettlementRefused,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct InventorySnapshot {
+    pub observed: bool,
+    pub sealed: bool,
+    pub integrity_lost: bool,
+    pub reservations: usize,
+    pub unconfigured: usize,
+}
+// Independent of a cleanup attempt: record the actual refused settlement before
+// quarantine mutates the registry. Only bounded facts reach the opt-in sink.
+pub(crate) fn inventory_enabled() -> bool {
+    CLEANUP_SINK.get().and_then(Option::as_ref).is_some()
+}
+pub(crate) fn inventory_snapshot(
+    generation: u64,
+    sequence: u64,
+    point: InventoryPoint,
+    snapshot: InventorySnapshot,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        inventory_snapshot_into(capture, generation, sequence, point, snapshot);
+    }
+}
+fn inventory_snapshot_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    point: InventoryPoint,
+    snapshot: InventorySnapshot,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::InventorySnapshot,
+        Facts {
+            generation: Some(generation),
+            inventory_point: Some(point),
+            inventory_observed: Some(
+                snapshot.observed && snapshot.reservations <= 8192 && snapshot.unconfigured <= 8192,
+            ),
+            inventory_sealed: Some(snapshot.sealed),
+            inventory_integrity_lost: Some(snapshot.integrity_lost),
+            inventory_reservations: Some(snapshot.reservations.min(8192) as u64),
+            inventory_unconfigured: Some(snapshot.unconfigured.min(8192) as u64),
+            ..Facts::default()
+        },
+    );
 }
 // Exhaustion disables observation instead of aliasing a previous identity.
 #[allow(deprecated)]

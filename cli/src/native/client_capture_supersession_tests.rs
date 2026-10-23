@@ -1602,11 +1602,14 @@ async fn field_read_waits_for_debt_only_outside_a_live_callback_before_acquisiti
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            while let Some(Ok(message)) = socket.next().await {
-                let Ok(text) = message.to_text() else {
-                    continue;
+            while let Some(message) = socket.next().await {
+                let message = message.expect("mock CDP websocket protocol failed");
+                let text = match message {
+                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    tokio_tungstenite::tungstenite::Message::Text(text) => text,
+                    other => panic!("unexpected mock CDP websocket frame: {other:?}"),
                 };
-                let request: Value = serde_json::from_str(text).unwrap();
+                let request: Value = serde_json::from_str(&text).unwrap();
                 assert_eq!(request["method"], "Page.getFrameTree");
                 seen.fetch_add(1, Ordering::SeqCst);
                 // Refuse the first read after admission: this test proves the

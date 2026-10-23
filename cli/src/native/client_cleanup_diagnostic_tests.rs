@@ -499,3 +499,84 @@ async fn actual_cleanup_command_errors_record_closed_components_without_native_p
         .contains("private-"));
     client.close().await;
 }
+
+#[test]
+fn inventory_failure_snapshot_does_not_require_active_cleanup() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+    inventory_snapshot_into(
+        &capture,
+        7,
+        19,
+        InventoryPoint::SettlementRefused,
+        InventorySnapshot {
+            observed: true,
+            sealed: false,
+            integrity_lost: false,
+            reservations: 1,
+            unconfigured: 2,
+        },
+    );
+    let rows = records(&file);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["phase"], "InventorySnapshot");
+    assert_eq!(rows[1]["inventoryPoint"], "settlement-refused");
+    assert_eq!(rows[1]["operationSeq"], 19);
+    assert_eq!(rows[1]["inventoryObserved"], true);
+    assert_eq!(rows[1]["inventoryReservations"], 1);
+    assert_eq!(rows[1]["inventoryUnconfigured"], 2);
+    assert!(rows[1].get("cleanupAttempt").is_none());
+    assert_eq!(
+        keys(&rows[1]),
+        [
+            "droppedBefore",
+            "emittedBefore",
+            "generation",
+            "inventoryIntegrityLost",
+            "inventoryObserved",
+            "inventoryPoint",
+            "inventoryReservations",
+            "inventorySealed",
+            "inventoryUnconfigured",
+            "operationSeq",
+            "overflow",
+            "phase",
+            "pid",
+            "record",
+            "schemaVersion",
+            "source",
+            "suppressedBefore"
+        ]
+    );
+}
+
+#[test]
+fn unobserved_or_oversized_inventory_never_claims_healthy_snapshot() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    inventory_snapshot_into(
+        &capture,
+        1,
+        2,
+        InventoryPoint::RestartReady,
+        InventorySnapshot::default(),
+    );
+    inventory_snapshot_into(
+        &capture,
+        1,
+        3,
+        InventoryPoint::SettlementRefused,
+        InventorySnapshot {
+            observed: true,
+            reservations: usize::MAX,
+            unconfigured: usize::MAX,
+            ..Default::default()
+        },
+    );
+    let rows = records(&file);
+    assert_eq!(rows[0]["inventoryObserved"], false);
+    assert_eq!(rows[1]["inventoryObserved"], false);
+    assert_eq!(rows[1]["inventoryReservations"], 8192);
+    assert_eq!(rows[1]["inventoryUnconfigured"], 8192);
+}
