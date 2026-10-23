@@ -16,7 +16,7 @@ use super::client_session::{
     OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
 };
 use super::client_settlement_trace::{
-    ServiceWorkerAdmission, WorkerAdmissionStep, WorkerRpcFailureNote,
+    ServiceWorkerAdmission, WorkerAdmissionStep, WorkerNetworkTerminal, WorkerRpcFailureNote,
 };
 use super::client_transport::ClientEventSink;
 use base64::Engine;
@@ -553,16 +553,22 @@ impl ClientNetwork {
                 },
             );
         }
+        // Keep observation ownership outside timeout_at: dropping its inner
+        // future is not a returned RPC error. No deadline or result is changed.
+        let mut terminal = WorkerNetworkTerminal::default();
         let result = tokio::time::timeout_at(operation.deadline.into(), async {
             let failure = admission.map(|_| WorkerRpcFailureNote::default());
             ServiceWorkerAdmission::observe_network_enable(admission, failure.as_ref(),
-                self.client.send_network_enable_observed(Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id), failure.as_ref())).await?;
+                terminal.observe(admission, failure.as_ref(), self.client.send_network_enable_observed(Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id), failure.as_ref()))).await?;
             if policy.bypass_service_worker { ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkBypass,
                 self.client.send_command("Network.setBypassServiceWorker",Some(json!({"bypass":true})),Some(&id))).await?; }
             ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::FetchEnable,
                 self.client.send_command("Fetch.enable", Some(json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}],"handleAuthRequests":true})), Some(&id))).await?;
             Ok::<(), String>(())
         }).await;
+        if result.is_err() {
+            terminal.outer_timeout();
+        }
         if !matches!(result, Ok(Ok(()))) {
             self.broker.quarantine()?;
             return Err(ProtocolError::BrowserFailure);

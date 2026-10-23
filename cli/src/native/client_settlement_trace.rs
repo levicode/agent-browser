@@ -84,6 +84,8 @@ pub(crate) use SettlementPhase as Phase;
 
 const PATH_ENV: &str = "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE";
 const CLEANUP_PATH_ENV: &str = "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE";
+// Temporary, separately opted-in P41 support. Never a product outcome source.
+const WORKER_TERMINAL_ENV: &str = "AGENT_BROWSER_WORKER_NETWORK_DIAGNOSTIC_FILE";
 const MAX_RECORDS: usize = 2048;
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_RECORD_BYTES: usize = 512;
@@ -503,6 +505,21 @@ pub(super) fn initialize_cleanup() {
             record_capture(capture, 0, Phase::CaptureStarted, Facts::default());
         }
     }
+    WORKER_TERMINAL.get_or_init(|| {
+        capture.as_ref()?;
+        let forbidden: Vec<_> = [CLEANUP_PATH_ENV, PATH_ENV]
+            .into_iter()
+            .filter_map(std::env::var_os)
+            .map(PathBuf::from)
+            .collect();
+        worker_terminal_file(
+            std::env::var_os(WORKER_TERMINAL_ENV)
+                .map(PathBuf::from)
+                .as_deref(),
+            &forbidden,
+        )
+        .map(|file| Mutex::new(Some(file)))
+    });
 }
 fn cleanup_capture(path: Option<&Path>) -> Option<Capture> {
     Some(Capture {
@@ -734,6 +751,204 @@ fn worker_rpc_ms(elapsed: std::time::Duration) -> (u64, bool) {
         millis > u128::from(MAX_WORKER_RPC_MS),
     )
 }
+
+static WORKER_TERMINAL: OnceLock<Option<Mutex<Option<File>>>> = OnceLock::new();
+
+// This temporary diagnostic fails closed on platforms without stable file identity.
+#[cfg(not(unix))]
+fn worker_terminal_file(_path: Option<&Path>, _forbidden: &[PathBuf]) -> Option<File> {
+    None
+}
+#[cfg(unix)]
+fn worker_terminal_file(path: Option<&Path>, forbidden: &[PathBuf]) -> Option<File> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let path = path?;
+    let before = std::fs::symlink_metadata(path).ok()?;
+    if !path.is_absolute() || !before.is_file() || before.len() != 0 || before.nlink() != 1 {
+        return None;
+    }
+    let file = OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW)
+        .open(path)
+        .ok()?;
+    // Retain this nonblocking exclusive lock for the file handle's lifetime.
+    file.try_lock().ok()?;
+    let metadata = file.metadata().ok()?;
+    let same =
+        |other: &std::fs::Metadata| other.dev() == metadata.dev() && other.ino() == metadata.ino();
+    if !metadata.is_file()
+        || metadata.len() != 0
+        || metadata.nlink() != 1
+        || !same(&before)
+        || forbidden
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .any(|other| same(&other))
+    {
+        return None;
+    }
+    Some(file)
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorkerNetworkTermination {
+    ReturnedOk,
+    ReturnedError,
+    OuterTimeout,
+    Abandoned,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerNetworkTerminalRecord {
+    schema_version: u8,
+    phase: &'static str,
+    source: Source,
+    pid: u32,
+    operation_seq: u8,
+    generation: u64,
+    worker_ordinal: u8,
+    waiting_for_debugger: WorkerDebuggerWait,
+    termination: WorkerNetworkTermination,
+    start_ms: u64,
+    // End of local observation, not an RPC completion time on timeout/drop.
+    end_ms: u64,
+    ms_capped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rpc_failure: Option<WorkerRpcFailureOrigin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<ProtocolError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cdp_code: Option<WorkerCdpCode>,
+}
+
+fn write_worker_terminal(
+    writer: &mut impl Write,
+    record: &WorkerNetworkTerminalRecord,
+) -> io::Result<()> {
+    let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
+    line.push(b'\n');
+    if line.len() > MAX_RECORD_BYTES {
+        return Err(io::Error::other("terminal record limit"));
+    }
+    // Exactly one write attempt. A short/error write is incomplete evidence;
+    // never retry, repair, truncate, fsync, or replace the product result.
+    if writer.write(&line)? != line.len() {
+        return Err(io::Error::from(io::ErrorKind::WriteZero));
+    }
+    Ok(())
+}
+
+/// One local await's temporary diagnostic owner, not a command state machine.
+/// The first eligible observer to take the file token is the only selected one;
+/// this does not identify the earliest attachment or cover other workers.
+#[derive(Default)]
+pub(crate) struct WorkerNetworkTerminal {
+    output: Option<(File, WorkerNetworkTerminalRecord, std::time::Instant)>,
+}
+impl WorkerNetworkTerminal {
+    pub(crate) async fn observe<T>(
+        &mut self,
+        trace: Option<&ServiceWorkerAdmission>,
+        note: Option<&WorkerRpcFailureNote>,
+        future: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        self.observe_into(
+            trace,
+            WORKER_TERMINAL.get().and_then(Option::as_ref),
+            note,
+            future,
+        )
+        .await
+    }
+    async fn observe_into<T>(
+        &mut self,
+        trace: Option<&ServiceWorkerAdmission>,
+        writer: Option<&Mutex<Option<File>>>,
+        note: Option<&WorkerRpcFailureNote>,
+        future: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        self.claim(trace, writer);
+        let result = future.await;
+        self.finish(
+            if result.is_ok() {
+                WorkerNetworkTermination::ReturnedOk
+            } else {
+                WorkerNetworkTermination::ReturnedError
+            },
+            note,
+        );
+        result
+    }
+    fn claim(
+        &mut self,
+        trace: Option<&ServiceWorkerAdmission>,
+        writer: Option<&Mutex<Option<File>>>,
+    ) {
+        if let (Some(trace), Some(writer)) = (trace, writer) {
+            if trace.generation <= SAFE_INTEGER {
+                let file = writer.try_lock().ok().and_then(|mut slot| slot.take());
+                if let Some(file) = file {
+                    let start = worker_rpc_ms(trace.started.elapsed());
+                    self.output = Some((
+                        file,
+                        WorkerNetworkTerminalRecord {
+                            schema_version: 1,
+                            phase: "ServiceWorkerNetworkTerminal",
+                            source: Source::Native,
+                            pid: std::process::id(),
+                            operation_seq: 0,
+                            generation: trace.generation,
+                            worker_ordinal: trace.ordinal,
+                            waiting_for_debugger: trace.waiting,
+                            termination: WorkerNetworkTermination::Abandoned,
+                            start_ms: start.0,
+                            end_ms: start.0,
+                            ms_capped: start.1,
+                            rpc_failure: None,
+                            error: None,
+                            cdp_code: None,
+                        },
+                        trace.started,
+                    ));
+                }
+            }
+        }
+    }
+    pub(crate) fn outer_timeout(&mut self) {
+        self.finish(WorkerNetworkTermination::OuterTimeout, None);
+    }
+    fn finish(
+        &mut self,
+        termination: WorkerNetworkTermination,
+        note: Option<&WorkerRpcFailureNote>,
+    ) {
+        let Some((mut file, mut record, epoch)) = self.output.take() else {
+            return;
+        };
+        let end = worker_rpc_ms(epoch.elapsed());
+        record.end_ms = end.0;
+        record.ms_capped |= end.1;
+        record.termination = termination;
+        if matches!(termination, WorkerNetworkTermination::ReturnedError) {
+            let failure = WorkerRpcFailureNote::snapshot(note);
+            record.rpc_failure = Some(failure.origin);
+            record.error = failure.error;
+            record.cdp_code = failure.code;
+        }
+        // Regular-file I/O can delay this diagnostic path even with O_NONBLOCK.
+        // A killed process may never run this code. Missing evidence is unknown.
+        let _ = write_worker_terminal(&mut file, &record);
+    }
+}
+impl Drop for WorkerNetworkTerminal {
+    fn drop(&mut self) {
+        self.finish(WorkerNetworkTermination::Abandoned, None);
+    }
+}
+
 #[derive(Default)]
 struct WorkerRpcObservation {
     start_ms: u64,
@@ -1774,6 +1989,367 @@ impl FrameTrace {
 impl Drop for FrameTrace {
     fn drop(&mut self) {
         record(0, Phase::FrameSummary, self.facts());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod worker_terminal_tests {
+    use super::*;
+    use serde_json::Value;
+
+    fn trace(workers: &AtomicU64, waiting: Option<bool>) -> ServiceWorkerAdmission {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        ServiceWorkerAdmission::start_into(&capture, workers, SAFE_INTEGER, waiting).unwrap()
+    }
+    fn output() -> (tempfile::NamedTempFile, Mutex<Option<File>>) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let writer = Mutex::new(Some(worker_terminal_file(Some(file.path()), &[]).unwrap()));
+        (file, writer)
+    }
+    fn read(file: &tempfile::NamedTempFile) -> Value {
+        let bytes = std::fs::read(file.path()).unwrap();
+        assert!(bytes.len() <= MAX_RECORD_BYTES);
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 1);
+        let value: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["phase"], "ServiceWorkerNetworkTerminal");
+        assert_eq!(value["operationSeq"], 0);
+        assert!(value["endMs"].as_u64().unwrap() >= value["startMs"].as_u64().unwrap());
+        assert!(!String::from_utf8(bytes)
+            .unwrap()
+            .contains("private-original"));
+        value
+    }
+
+    #[test]
+    fn worker_terminal_requires_precreated_empty_exclusive_regular_file() {
+        assert!(worker_terminal_file(None, &[]).is_none());
+        assert!(worker_terminal_file(Some(Path::new("relative")), &[]).is_none());
+        let directory = tempfile::tempdir().unwrap();
+        assert!(worker_terminal_file(Some(directory.path()), &[]).is_none());
+        assert!(worker_terminal_file(Some(&directory.path().join("absent")), &[]).is_none());
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert!(worker_terminal_file(Some(file.path()), &[file.path().to_owned()]).is_none());
+        let alias = directory.path().join("hardlink");
+        std::fs::hard_link(file.path(), &alias).unwrap();
+        assert!(worker_terminal_file(Some(&alias), &[file.path().to_owned()]).is_none());
+        assert!(worker_terminal_file(Some(&alias), &[]).is_none());
+        std::fs::remove_file(alias).unwrap();
+        let owned = worker_terminal_file(Some(file.path()), &[]).unwrap();
+        assert!(worker_terminal_file(Some(file.path()), &[]).is_none());
+        drop(owned);
+        std::fs::write(file.path(), b"existing").unwrap();
+        assert!(worker_terminal_file(Some(file.path()), &[]).is_none());
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"existing");
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("link");
+            std::os::unix::fs::symlink(file.path(), &link).unwrap();
+            assert!(worker_terminal_file(Some(&link), &[]).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_terminal_real_constructor_keeps_closed_typed_errors_bounded() {
+        let mut longest = 0;
+        for origin in [
+            WorkerRpcFailureOrigin::OwnerCheck,
+            WorkerRpcFailureOrigin::OwnerView,
+            WorkerRpcFailureOrigin::Reserve,
+            WorkerRpcFailureOrigin::Identifier,
+            WorkerRpcFailureOrigin::SubmitOwner,
+            WorkerRpcFailureOrigin::Submit,
+            WorkerRpcFailureOrigin::Correlation,
+            WorkerRpcFailureOrigin::CleanupEnvelope,
+            WorkerRpcFailureOrigin::Envelope,
+            WorkerRpcFailureOrigin::InitCancelled,
+            WorkerRpcFailureOrigin::InitDeadline,
+            WorkerRpcFailureOrigin::Serialize,
+            WorkerRpcFailureOrigin::Closed,
+            WorkerRpcFailureOrigin::Send,
+            WorkerRpcFailureOrigin::ResponseChannel,
+            WorkerRpcFailureOrigin::ResponseTimeout,
+            WorkerRpcFailureOrigin::ResponseError,
+            WorkerRpcFailureOrigin::Unknown,
+        ] {
+            for code in [
+                None,
+                Some(-(SAFE_INTEGER as i64)),
+                Some(i64::MIN),
+                Some(i64::MAX),
+            ] {
+                let (file, writer) = output();
+                let mut trace = trace(&AtomicU64::new(7), None);
+                trace.started = std::time::Instant::now() - std::time::Duration::from_secs(61);
+                let note = WorkerRpcFailureNote::default();
+                let mut terminal = WorkerNetworkTerminal::default();
+                let result = terminal
+                    .observe_into(Some(&trace), Some(&writer), Some(&note), async {
+                        match origin {
+                            WorkerRpcFailureOrigin::OwnerCheck
+                            | WorkerRpcFailureOrigin::Reserve
+                            | WorkerRpcFailureOrigin::Submit => WorkerRpcFailureNote::native(
+                                Some(&note),
+                                origin,
+                                &ProtocolError::RedirectBodyUnavailable,
+                            ),
+                            WorkerRpcFailureOrigin::ResponseError => {
+                                WorkerRpcFailureNote::response(Some(&note), code)
+                            }
+                            other => WorkerRpcFailureNote::simple(Some(&note), other),
+                        }
+                        Err::<(), _>("private-original-error".to_string())
+                    })
+                    .await;
+                assert_eq!(result, Err("private-original-error".to_string()));
+                assert!(terminal.output.is_none());
+                let value = read(&file);
+                assert_eq!(value["termination"], "returned-error");
+                assert_eq!(value["rpcFailure"], serde_json::to_value(origin).unwrap());
+                assert_eq!(value["workerOrdinal"], 8);
+                assert_eq!(value["waitingForDebugger"], "unknown");
+                assert_eq!(value["startMs"], MAX_WORKER_RPC_MS);
+                assert_eq!(value["endMs"], MAX_WORKER_RPC_MS);
+                assert_eq!(value["msCapped"], true);
+                let native = matches!(
+                    origin,
+                    WorkerRpcFailureOrigin::OwnerCheck
+                        | WorkerRpcFailureOrigin::Reserve
+                        | WorkerRpcFailureOrigin::Submit
+                );
+                assert_eq!(value.get("error").is_some(), native);
+                assert_eq!(
+                    value.get("cdpCode").is_some(),
+                    origin == WorkerRpcFailureOrigin::ResponseError
+                );
+                if origin == WorkerRpcFailureOrigin::ResponseError {
+                    assert_eq!(
+                        value["cdpCode"],
+                        serde_json::to_value(WorkerCdpCode::from(code)).unwrap()
+                    );
+                }
+                longest = longest.max(std::fs::metadata(file.path()).unwrap().len());
+            }
+        }
+        eprintln!("worker-terminal real-constructor maximum bytes: {longest}");
+        assert!(longest <= MAX_RECORD_BYTES as u64);
+    }
+
+    #[tokio::test]
+    async fn worker_terminal_opt_out_unpolled_and_unknown_preserve_results() {
+        let (file, writer) = output();
+        let trace = trace(&AtomicU64::new(0), Some(true));
+        let mut terminal = WorkerNetworkTerminal::default();
+        assert_eq!(
+            terminal
+                .observe_into(Some(&trace), None, None, async { Ok::<_, String>(7) })
+                .await,
+            Ok(7)
+        );
+        assert_eq!(
+            terminal
+                .observe_into(None, Some(&writer), None, async { Ok::<_, String>(8) })
+                .await,
+            Ok(8)
+        );
+        drop(terminal.observe_into(
+            Some(&trace),
+            Some(&writer),
+            None,
+            std::future::pending::<Result<(), String>>(),
+        ));
+        assert!(terminal.output.is_none());
+        assert!(writer.lock().unwrap().is_some());
+        assert_eq!(std::fs::metadata(file.path()).unwrap().len(), 0);
+        let result = terminal
+            .observe_into(Some(&trace), Some(&writer), None, async {
+                Err::<(), _>("private-original-unknown".to_string())
+            })
+            .await;
+        assert_eq!(result, Err("private-original-unknown".to_string()));
+        let value = read(&file);
+        assert_eq!(value["rpcFailure"], "unknown");
+        assert!(value.get("error").is_none() && value.get("cdpCode").is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_terminal_outer_timeout_and_owner_drop_are_not_rpc_errors() {
+        for timeout in [true, false] {
+            let (file, writer) = output();
+            let trace = trace(&AtomicU64::new(0), Some(true));
+            let mut terminal = WorkerNetworkTerminal::default();
+            {
+                let mut pending = Box::pin(terminal.observe_into(
+                    Some(&trace),
+                    Some(&writer),
+                    None,
+                    std::future::pending::<Result<(), String>>(),
+                ));
+                assert!(futures_util::poll!(pending.as_mut()).is_pending());
+                if timeout {
+                    assert!(tokio::time::timeout(std::time::Duration::ZERO, pending)
+                        .await
+                        .is_err());
+                }
+            }
+            assert_eq!(std::fs::metadata(file.path()).unwrap().len(), 0);
+            if timeout {
+                terminal.outer_timeout();
+            }
+            drop(terminal);
+            let value = read(&file);
+            assert_eq!(
+                value["termination"],
+                if timeout {
+                    "outer-timeout"
+                } else {
+                    "abandoned"
+                }
+            );
+            assert!(
+                value.get("rpcFailure").is_none()
+                    && value.get("error").is_none()
+                    && value.get("cdpCode").is_none()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_terminal_success_survives_later_configuration_timeout() {
+        let (file, writer) = output();
+        let trace = trace(&AtomicU64::new(0), Some(false));
+        let mut terminal = WorkerNetworkTerminal::default();
+        {
+            let mut configuration = Box::pin(async {
+                assert_eq!(
+                    terminal
+                        .observe_into(Some(&trace), Some(&writer), None, async {
+                            Ok::<_, String>(17)
+                        })
+                        .await,
+                    Ok(17)
+                );
+                std::future::pending::<()>().await;
+            });
+            assert!(futures_util::poll!(configuration.as_mut()).is_pending());
+            assert!(
+                tokio::time::timeout(std::time::Duration::ZERO, configuration)
+                    .await
+                    .is_err()
+            );
+        }
+        let before = std::fs::read(file.path()).unwrap();
+        terminal.outer_timeout();
+        drop(terminal);
+        assert_eq!(std::fs::read(file.path()).unwrap(), before);
+        let value = read(&file);
+        assert_eq!(value["termination"], "returned-ok");
+        assert_eq!(value["waitingForDebugger"], false);
+        assert!(value.get("rpcFailure").is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_terminal_concurrent_owners_and_busy_token_do_not_alias() {
+        fn assert_send<T: Send>(_: &T) {}
+        let (file, writer) = output();
+        let workers = AtomicU64::new(0);
+        let a = trace(&workers, Some(true));
+        let b = trace(&workers, Some(false));
+        let mut first = WorkerNetworkTerminal::default();
+        let mut second = WorkerNetworkTerminal::default();
+        {
+            let held = writer.lock().unwrap();
+            first.claim(Some(&a), Some(&writer));
+            assert!(first.output.is_none());
+            assert!(held.is_some());
+        }
+        let barrier = tokio::sync::Barrier::new(2);
+        let note_a = WorkerRpcFailureNote::default();
+        let note_b = WorkerRpcFailureNote::default();
+        let future_a = first.observe_into(Some(&a), Some(&writer), Some(&note_a), async {
+            barrier.wait().await;
+            WorkerRpcFailureNote::native(
+                Some(&note_a),
+                WorkerRpcFailureOrigin::Reserve,
+                &ProtocolError::Cancelled,
+            );
+            Err::<(), _>("private-original-a".to_string())
+        });
+        let future_b = second.observe_into(Some(&b), Some(&writer), Some(&note_b), async {
+            barrier.wait().await;
+            WorkerRpcFailureNote::response(Some(&note_b), Some(-32002));
+            Err::<(), _>("private-original-b".to_string())
+        });
+        assert_send(&future_a);
+        assert_send(&future_b);
+        let results = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            tokio::join!(future_a, future_b)
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            results,
+            (
+                Err("private-original-a".to_string()),
+                Err("private-original-b".to_string())
+            )
+        );
+        drop((first, second));
+        let value = read(&file);
+        if value["workerOrdinal"] == 1 {
+            assert_eq!(value["rpcFailure"], "reserve");
+            assert_eq!(value["error"], "cancelled");
+            assert!(value.get("cdpCode").is_none());
+        } else {
+            assert_eq!(value["workerOrdinal"], 2);
+            assert_eq!(value["rpcFailure"], "response-error");
+            assert_eq!(value["cdpCode"], -32002);
+            assert!(value.get("error").is_none());
+        }
+        assert!(writer.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_terminal_short_or_failed_write_is_not_retried() {
+        struct ShortWriter {
+            calls: usize,
+            fail: bool,
+        }
+        impl Write for ShortWriter {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.calls += 1;
+                if self.fail {
+                    Err(io::ErrorKind::Interrupted.into())
+                } else {
+                    Ok(bytes.len() - 1)
+                }
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                panic!("terminal must not flush")
+            }
+        }
+        let (file, writer) = output();
+        let trace = trace(&AtomicU64::new(0), Some(true));
+        let mut terminal = WorkerNetworkTerminal::default();
+        terminal.claim(Some(&trace), Some(&writer));
+        let (_, record, _) = terminal.output.take().unwrap();
+        for fail in [false, true] {
+            let mut short = ShortWriter { calls: 0, fail };
+            assert!(write_worker_terminal(&mut short, &record).is_err());
+            assert_eq!(short.calls, 1);
+        }
+        let readonly = Mutex::new(Some(File::open(file.path()).unwrap()));
+        let result = terminal
+            .observe_into(Some(&trace), Some(&readonly), None, async {
+                Ok::<_, String>(19)
+            })
+            .await;
+        assert_eq!(result, Ok(19));
+        assert!(terminal.output.is_none() && readonly.lock().unwrap().is_none());
+        terminal.outer_timeout();
+        drop(terminal);
+        assert_eq!(std::fs::metadata(file.path()).unwrap().len(), 0);
     }
 }
 
