@@ -743,6 +743,52 @@ impl ClientSession {
         let inner = self.lock()?;
         Self::check_live_operation(&inner, operation)
     }
+    /// A field read borrows only its live native callback's resource scope.
+    /// It gains no parent-operation, reference, or input authority.
+    pub(crate) fn validate_field_read(
+        &self,
+        operation: &OperationLease,
+        identity_scope: &str,
+    ) -> Result<(), ProtocolError> {
+        let inner = self.lock()?;
+        Self::check(&inner, operation.generation)?;
+        let admitted = inner
+            .operations
+            .get(&operation.sequence)
+            .ok_or(ProtocolError::OperationMissing)?;
+        if !admitted.started
+            || admitted.deadline != operation.deadline
+            || admitted.callback_token.is_some() != operation.is_callback
+            || !admitted
+                .cancel
+                .subscribe()
+                .same_channel(&operation.cancellation)
+        {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if let Some(token) = &admitted.callback_token {
+            let decision = inner
+                .decisions
+                .get(token)
+                .ok_or(ProtocolError::DecisionMissing)?;
+            if decision.selected.is_some() {
+                return Err(ProtocolError::DecisionMissing);
+            }
+            if Instant::now() >= decision.deadline {
+                return Err(ProtocolError::DecisionExpired);
+            }
+            if decision.resource_scope.as_deref() != Some(identity_scope) {
+                return Err(ProtocolError::StaleScope);
+            }
+        }
+        Ok(())
+    }
     /// Bind once, only after real lifecycle admission. Failure leaves the hold
     /// dormant and available for explicit retirement, not implicit restoration.
     pub(crate) fn bind_parked_registry(
@@ -1287,6 +1333,104 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn live_field_callback(broker: &ClientSession) -> (OperationLease, DecisionLease) {
+        let decision = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Authentication,
+                5000,
+                None,
+                Some("scope".into()),
+            )
+            .unwrap();
+        let operation = broker
+            .admit_callback(1, 1, 5000, Some(&decision.token))
+            .unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        (operation, decision)
+    }
+
+    #[test]
+    fn field_read_requires_an_exact_started_operation_even_without_a_callback() {
+        let broker = ClientSession::new();
+        let mut operation = broker.admit(1, 1, 5000).unwrap();
+        assert_eq!(
+            broker.validate_field_read(&operation, "scope"),
+            Err(ProtocolError::InvalidSequence)
+        );
+        assert!(broker.start(1, 1).unwrap());
+        assert_eq!(broker.validate_field_read(&operation, "scope"), Ok(()));
+        operation.is_callback = true;
+        assert_eq!(
+            broker.validate_field_read(&operation, "scope"),
+            Err(ProtocolError::InvalidSequence)
+        );
+        operation.is_callback = false;
+        let original = operation.cancellation.clone();
+        let (_sender, forged) = watch::channel(CancelSignal::None);
+        operation.cancellation = forged;
+        assert_eq!(
+            broker.validate_field_read(&operation, "scope"),
+            Err(ProtocolError::InvalidSequence)
+        );
+        operation.cancellation = original;
+        broker.settle(1, 1, Effects::Completed).unwrap();
+        assert_eq!(
+            broker.validate_field_read(&operation, "scope"),
+            Err(ProtocolError::OperationMissing)
+        );
+    }
+
+    #[test]
+    fn field_read_rejects_cross_scope_and_selected_callback_decisions() {
+        let broker = ClientSession::new();
+        let (operation, decision) = live_field_callback(&broker);
+        assert_eq!(broker.validate_field_read(&operation, "scope"), Ok(()));
+        assert_eq!(
+            broker.validate_field_read(&operation, "foreign"),
+            Err(ProtocolError::StaleScope)
+        );
+        broker
+            .resolve(1, &decision.token, Decision::CancelAuth {})
+            .unwrap();
+        assert_eq!(
+            broker.validate_field_read(&operation, "scope"),
+            Err(ProtocolError::Cancelled)
+        );
+    }
+
+    #[test]
+    fn field_read_rejects_expired_revoked_and_cancelled_callback_authority() {
+        for case in ["expired", "revoked", "cancelled"] {
+            let broker = ClientSession::new();
+            let (operation, decision) = live_field_callback(&broker);
+            match case {
+                "expired" => {
+                    broker
+                        .lock()
+                        .unwrap()
+                        .decisions
+                        .get_mut(&decision.token)
+                        .unwrap()
+                        .deadline = Instant::now() - Duration::from_millis(1)
+                }
+                "revoked" => {
+                    broker.lock().unwrap().decisions.remove(&decision.token);
+                }
+                _ => broker.cancel(1, operation.sequence).unwrap(),
+            }
+            assert_eq!(
+                broker.validate_field_read(&operation, "scope"),
+                Err(match case {
+                    "expired" => ProtocolError::DecisionExpired,
+                    "revoked" => ProtocolError::DecisionMissing,
+                    _ => ProtocolError::Cancelled,
+                })
+            );
+        }
+    }
 
     #[tokio::test]
     async fn parked_registry_waits_for_old_callbacks_and_preserves_exact_version() {

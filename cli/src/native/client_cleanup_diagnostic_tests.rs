@@ -1,7 +1,6 @@
 //! Source-authored coverage for the default-off production cleanup carrier.
 //! These tests use local sinks and never change the process-wide environment.
 use super::*;
-use crate::native::client_debt::{OwnerDebtLedger, ScopeCleanupCommand};
 use serde_json::{json, Value};
 
 fn records(file: &tempfile::NamedTempFile) -> Vec<Value> {
@@ -43,6 +42,7 @@ fn disabled_cleanup_capture_has_zero_output_and_no_active_attempt() {
 
 #[test]
 fn cleanup_snapshot_schema_separates_first_obligation_from_original_result() {
+    use crate::native::client_debt::OwnerDebtLedger;
     let file = tempfile::NamedTempFile::new().unwrap();
     let capture = cleanup_capture(Some(file.path())).unwrap();
     record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
@@ -243,6 +243,7 @@ fn abandoned_attempt_clear_tolerates_first_failure_race_without_clearing_next_at
 
 #[test]
 fn simultaneous_obligations_keep_one_first_component_without_authority_state_changes() {
+    use crate::native::client_debt::OwnerDebtLedger;
     let file = tempfile::NamedTempFile::new().unwrap();
     let capture = cleanup_capture(Some(file.path())).unwrap();
     let owner = OwnerDebtLedger::new(1, "private-owner".into());
@@ -273,6 +274,7 @@ fn simultaneous_obligations_keep_one_first_component_without_authority_state_cha
 
 #[test]
 fn bounds_contention_and_write_failure_do_not_change_terminal_owner_or_result() {
+    use crate::native::client_debt::OwnerDebtLedger;
     let owner = OwnerDebtLedger::new(1, "never-emit-scope".into());
     owner.bind_context("never-emit-context").unwrap();
     owner
@@ -400,6 +402,7 @@ fn cleanup_ordinals_never_alias_and_maximum_scalar_records_fit_the_record_bound(
 #[tokio::test]
 async fn actual_cleanup_command_errors_record_closed_components_without_native_payloads() {
     use crate::native::cdp::client::CdpClient;
+    use crate::native::client_debt::{OwnerDebtLedger, ScopeCleanupCommand};
     use futures_util::{SinkExt, StreamExt};
     use std::time::{Duration, Instant};
     use tokio_tungstenite::tungstenite::Message;

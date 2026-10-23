@@ -15,11 +15,14 @@ use super::cdp::types::CdpEvent;
 use super::client_browser::BrowserExecutionLease;
 use super::client_debt::{
     self, CleanupDisposition, CommandCategory, CommandStatusHandle, OperationJournalHandle,
-    ScopeCleanupCommand,
+    OperationKey, ScopeCleanupCommand,
 };
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
 use super::interaction::{char_to_key_info, key_text, named_key_info};
+
+#[path = "client_navigation_retirement.rs"]
+mod navigation_retirement;
 
 #[derive(Clone, Default)]
 struct Config {
@@ -101,6 +104,43 @@ pub struct ClientPageState {
     context_id: String,
     state: Mutex<State>,
     network_changed: tokio::sync::Notify,
+}
+
+/// Native-only terminal receipt for one interrupted Page.navigate. This does
+/// not assert that the navigation had no business effects or permit replay.
+pub(crate) struct NavigationInterruptionProof {
+    key: OperationKey,
+    identity_scope: String,
+    attachment: super::client_targets::OwnedTarget,
+}
+impl NavigationInterruptionProof {
+    pub(crate) fn confirms(
+        self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+        journal: &OperationJournalHandle,
+    ) -> bool {
+        let snapshot = journal.snapshot();
+        self.key == journal.key()
+            && self.key.generation == operation.generation
+            && self.key.operation_seq == operation.sequence
+            && self.identity_scope == page.identity_scope
+            && journal
+                .ledger()
+                .matches_owner(operation.generation, &page.identity_scope)
+            && page.permit.check().is_ok()
+            && page
+                .targets
+                .owned_target(&page.target_id)
+                .is_ok_and(|current| {
+                    self.attachment.same_attachment(&current)
+                        && current.session_id == page.page_session_id
+                })
+            && snapshot.mutation_dispatched
+            && !snapshot.integrity_lost
+            && snapshot.input_debt == 0
+            && snapshot.object_debt == 0
+    }
 }
 
 fn append_script(config: &mut Config, source: Arc<str>) -> Result<(), ProtocolError> {
@@ -721,6 +761,41 @@ impl ClientPageState {
         }
         Ok(())
     }
+    /// Production navigation keeps cleanup in the already registered producer.
+    /// Other callers retain the existing result-only primitive below.
+    pub(crate) async fn execute_with_retirement(
+        &self,
+        page: &BrowserExecutionLease,
+        sessions: &[String],
+        op: &OperationLease,
+        name: &str,
+        args: &Value,
+        tasks: &super::client_tasks::RetainedTasks,
+    ) -> (
+        Result<Value, ProtocolError>,
+        Option<NavigationInterruptionProof>,
+    ) {
+        if name != "page.navigate" {
+            return (self.execute(page, sessions, op, name, args).await, None);
+        }
+        let mut proof = None;
+        let result = async {
+            self.validate(page, op)?;
+            let a = decode_navigation(args)?;
+            self.navigate(
+                page,
+                op,
+                "Page.navigate",
+                json!({"url":a.url}),
+                &a.wait_until,
+                Some((tasks, &mut proof)),
+            )
+            .await?;
+            Ok(Value::Null)
+        }
+        .await;
+        (result, proof)
+    }
     /// The native dispatcher supplies only sessions proven owned by context_id.
     pub async fn execute(
         &self,
@@ -784,13 +859,14 @@ impl ClientPageState {
                     "Page.navigate",
                     json!({"url":a.url}),
                     &a.wait_until,
+                    None,
                 )
                 .await?;
                 Ok(Value::Null)
             }
             "page.reload" => {
                 let _: Empty = decode(args)?;
-                self.navigate(page, op, "Page.reload", json!({}), "load")
+                self.navigate(page, op, "Page.reload", json!({}), "load", None)
                     .await?;
                 Ok(Value::Null)
             }
@@ -818,6 +894,7 @@ impl ClientPageState {
                         "Page.navigateToHistoryEntry",
                         json!({"entryId":id}),
                         "load",
+                        None,
                     )
                     .await?;
                 }
@@ -961,6 +1038,10 @@ impl ClientPageState {
         method: &str,
         args: Value,
         wait: &str,
+        retirement: Option<(
+            &super::client_tasks::RetainedTasks,
+            &mut Option<NavigationInterruptionProof>,
+        )>,
     ) -> Result<(), ProtocolError> {
         let expected = navigation_wait(wait)?;
         if wait == "networkidle" {
@@ -994,19 +1075,29 @@ impl ClientPageState {
             .map(str::to_owned);
         // Subscribe after setup history but BEFORE the trigger. Overflow is an
         // explicit unknown browser outcome, never a dropped-event success.
+        let methods: &'static [&'static str] = if retirement.is_some() {
+            &[
+                "Page.lifecycleEvent",
+                "Page.frameNavigated",
+                "Page.navigatedWithinDocument",
+                "Page.frameStartedNavigating",
+                "Page.frameStoppedLoading",
+                "Page.frameDetached",
+                "Inspector.detached",
+                "Target.detachedFromTarget",
+            ]
+        } else {
+            &[
+                "Page.lifecycleEvent",
+                "Page.frameNavigated",
+                "Page.navigatedWithinDocument",
+                "Inspector.detached",
+                "Target.detachedFromTarget",
+            ]
+        };
         let mut events = page
             .client
-            .subscribe_bounded_methods(
-                &[
-                    "Page.lifecycleEvent",
-                    "Page.frameNavigated",
-                    "Page.navigatedWithinDocument",
-                    "Inspector.detached",
-                    "Target.detachedFromTarget",
-                ],
-                256,
-                65_536,
-            )
+            .subscribe_bounded_methods(methods, 256, 65_536)
             .map_err(|_| ProtocolError::CapacityExceeded)?;
         if wait == "networkidle" {
             self.state()?
@@ -1015,7 +1106,17 @@ impl ClientPageState {
                 .ok_or(ProtocolError::ScopeUnavailable)?
                 .quiet_since = Instant::now();
         }
-        let response = command(page, op, session, method, args).await?;
+        let response = navigation_retirement::trigger(
+            page,
+            op,
+            method,
+            args,
+            &frame,
+            previous_loader.as_deref(),
+            &mut events,
+            retirement,
+        )
+        .await?;
         if response
             .get("errorText")
             .and_then(Value::as_str)

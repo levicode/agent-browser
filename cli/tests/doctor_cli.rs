@@ -10,6 +10,10 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
 
+#[cfg(unix)]
+#[path = "fixtures/cleanup_diagnostics_cli.rs"]
+mod cleanup_diagnostics_cli;
+
 fn build_doctor_cmd(tmp: &TempDir, args: &[&str]) -> Command {
     let socket_dir = tmp.path().join("sockets");
     let home = tmp.path().join("home");

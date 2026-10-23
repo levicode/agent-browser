@@ -472,16 +472,18 @@ pub(crate) enum CommandStatus {
     IntegrityLost,
 }
 #[derive(Clone)]
-pub(crate) struct CommandStatusHandle(Arc<AtomicU8>, bool);
+pub(crate) struct CommandStatusHandle(Arc<AtomicU8>, bool, Arc<tokio::sync::Notify>);
 impl CommandStatusHandle {
-    fn new(object_only: bool) -> Self {
+    fn new(object_only: bool, changed: Arc<tokio::sync::Notify>) -> Self {
         Self(
             Arc::new(AtomicU8::new(CommandStatus::Reserved as u8)),
             object_only,
+            changed,
         )
     }
     fn set(&self, status: CommandStatus) {
         self.0.store(status as u8, Ordering::SeqCst);
+        self.2.notify_waiters();
     }
     pub(crate) fn snapshot(&self) -> CommandStatus {
         match self.0.load(Ordering::SeqCst) {
@@ -629,7 +631,14 @@ pub(crate) struct OwnerDebtLedger {
     generation: u64,
     identity_scope: String,
     state: Mutex<LedgerState>,
+    changed: Arc<tokio::sync::Notify>,
     pub(crate) cleanup_diagnostics: Arc<super::client_settlement_trace::CleanupDiagnostics>,
+}
+struct DebtChange<'a>(&'a tokio::sync::Notify);
+impl Drop for DebtChange<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
 }
 impl OwnerDebtLedger {
     /// A replacement route transfer belongs to the original unpublished request,
@@ -952,6 +961,7 @@ impl OwnerDebtLedger {
         Arc::new(Self {
             generation,
             identity_scope,
+            changed: Arc::new(tokio::sync::Notify::new()),
             cleanup_diagnostics: super::client_settlement_trace::CleanupDiagnostics::new(
                 generation,
             ),
@@ -1146,6 +1156,7 @@ impl OwnerDebtLedger {
         }
         state.object_bytes = 0;
         state.retired = true;
+        self.changed.notify_waiters();
         Ok(())
     }
     pub(crate) fn snapshot(&self) -> OwnerDebtSnapshot {
@@ -1167,18 +1178,67 @@ impl OwnerDebtLedger {
             },
         }
     }
-    pub(crate) fn check_admission(&self, category: AdmissionClass) -> Result<(), ProtocolError> {
-        let snapshot = self.snapshot();
-        if snapshot.integrity_lost {
+    fn admission_ready(&self, category: AdmissionClass) -> Result<bool, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired || state.integrity_lost {
             return Err(ProtocolError::ScopeUnavailable);
         }
-        if category != AdmissionClass::FixedRead && snapshot.input_debt > 0 {
-            return Err(ProtocolError::ScopeUnavailable);
+        if category != AdmissionClass::FixedRead
+            && state
+                .commands
+                .values()
+                .any(|command| command.submitted && command.category.input())
+        {
+            return Ok(false);
         }
-        if category == AdmissionClass::Reference && snapshot.object_debt >= 32 {
+        if category == AdmissionClass::Reference && object_count(&state) >= 32 {
             return Err(ProtocolError::CapacityExceeded);
         }
-        Ok(())
+        Ok(true)
+    }
+    pub(crate) fn check_admission(&self, category: AdmissionClass) -> Result<(), ProtocolError> {
+        if self.admission_ready(category)? {
+            Ok(())
+        } else {
+            Err(ProtocolError::ScopeUnavailable)
+        }
+    }
+    /// Wait only for already-accounted remote input to settle. Notifications
+    /// confer no authority: the caller revalidates its immutable owner/attachment
+    /// before every admission check. An ACK never revives a poisoned scope.
+    pub(crate) async fn wait_admission(
+        &self,
+        category: AdmissionClass,
+        operation: &OperationLease,
+        check_authority: impl Fn() -> Result<(), ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        let mut cancellation = operation.cancellation.clone();
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if *cancellation.borrow() != CancelSignal::None {
+                return Err(ProtocolError::Cancelled);
+            }
+            if Instant::now() >= operation.deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if operation.generation != self.generation {
+                return Err(ProtocolError::StaleScope);
+            }
+            check_authority()?;
+            if self.admission_ready(category)? {
+                return Ok(());
+            }
+            tokio::select! { biased;
+                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                _ = &mut changed => {},
+            }
+        }
     }
     fn operation_counts(&self, key: OperationKey) -> (u32, u32, bool) {
         match self.state.lock() {
@@ -1567,8 +1627,10 @@ impl OwnerDebtLedger {
         state.next_reservation = id;
         state.counts[index] += 1;
         state.bytes[index] += footprint;
-        let status =
-            CommandStatusHandle::new(physical_creation_slots > 0 && !classification.mutation);
+        let status = CommandStatusHandle::new(
+            physical_creation_slots > 0 && !classification.mutation,
+            self.changed.clone(),
+        );
         match &acquisition {
             Some(LifecycleAcquisition::Context) => state.context_creation_claimed = true,
             Some(LifecycleAcquisition::Target) => state.root_creation_claimed = true,
@@ -1623,6 +1685,7 @@ impl OwnerDebtLedger {
         })
     }
     pub(crate) fn connection_lost(&self) {
+        let _notification = DebtChange(&self.changed);
         match self.state.lock() {
             Ok(mut state) => state.contaminate_integrity(),
             Err(error) => error.into_inner().contaminate_integrity(),
@@ -1631,6 +1694,7 @@ impl OwnerDebtLedger {
     /// Only the real transport reader may record this cause. Earlier damage is
     /// irreversible, and EOF itself never acknowledges or clears remote debt.
     pub(crate) fn observe_remote_eof(&self) {
+        let _notification = DebtChange(&self.changed);
         match self.state.lock() {
             Ok(mut state) => {
                 if state.eof_integrity_cause == EofIntegrityCause::NotObserved {
@@ -1646,6 +1710,17 @@ impl OwnerDebtLedger {
         }
     }
     pub(crate) fn observe_event(&self, event: &CdpEvent) {
+        if !matches!(
+            event.method.as_str(),
+            "Runtime.executionContextCreated"
+                | "Runtime.executionContextDestroyed"
+                | "Runtime.executionContextsCleared"
+                | "Target.detachedFromTarget"
+                | "Target.targetDestroyed"
+        ) {
+            return;
+        }
+        let _notification = DebtChange(&self.changed);
         let Ok(mut state) = self.state.lock() else {
             return;
         };
@@ -2240,6 +2315,7 @@ impl SubmittedCommand {
         let _ = self.settle_for_delivery(response);
     }
     pub(crate) fn settle_for_delivery(&self, response: &CdpMessage) -> Vec<LateDisposal> {
+        let _notification = DebtChange(&self.ledger.changed);
         let Ok(mut state) = self.ledger.state.lock() else {
             return Vec::new();
         };
@@ -2662,6 +2738,161 @@ mod tests {
             }),
         )
         .await
+    }
+    fn admission_operation(
+        timeout_ms: u64,
+    ) -> (tokio::sync::watch::Sender<CancelSignal>, OperationLease) {
+        let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        (
+            cancel,
+            OperationLease {
+                is_callback: false,
+                generation: 7,
+                sequence: 2,
+                deadline: Instant::now() + std::time::Duration::from_millis(timeout_ms),
+                cancellation,
+            },
+        )
+    }
+    fn pending_input(
+        ledger: &Arc<OwnerDebtLedger>,
+        journal: &OperationJournalHandle,
+    ) -> SubmittedCommand {
+        ledger
+            .reserve_command(
+                Some(journal),
+                "Input.dispatchMouseEvent",
+                Some(&json!({"type":"mousePressed"})),
+                Some("page"),
+            )
+            .unwrap()
+            .submit()
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn reference_admission_waiters_all_wake_on_exact_reader_ack_without_forgiving_debt() {
+        let (ledger, journal) = owner();
+        let submitted = pending_input(&ledger, &journal);
+        let (_cancel, operation) = admission_operation(1000);
+        let mut first =
+            Box::pin(ledger.wait_admission(AdmissionClass::Reference, &operation, || Ok(())));
+        let mut second =
+            Box::pin(ledger.wait_admission(AdmissionClass::Reference, &operation, || Ok(())));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), first.as_mut())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), second.as_mut())
+                .await
+                .is_err()
+        );
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        assert!(ledger.check_admission(AdmissionClass::Reference).is_err());
+        submitted.settle(&response(json!({})));
+        let both = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            tokio::join!(first, second)
+        })
+        .await
+        .unwrap();
+        assert_eq!(both, (Ok(()), Ok(())));
+        assert!(journal.snapshot().mutation_dispatched);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        // ACK before initial polling is equally valid and cannot lose a wake.
+        ledger
+            .wait_admission(AdmissionClass::Reference, &operation, || Ok(()))
+            .await
+            .unwrap();
+    }
+    #[tokio::test]
+    async fn reference_admission_deadline_and_cancel_keep_unsettled_input_owned() {
+        let (ledger, journal) = owner();
+        let _submitted = pending_input(&ledger, &journal);
+        let (_cancel, operation) = admission_operation(20);
+        assert_eq!(
+            ledger
+                .wait_admission(AdmissionClass::Reference, &operation, || Ok(()))
+                .await,
+            Err(ProtocolError::DeadlineExceeded)
+        );
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        let (cancel, operation) = admission_operation(1000);
+        let mut waiting =
+            Box::pin(ledger.wait_admission(AdmissionClass::Reference, &operation, || Ok(())));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        cancel.send_replace(CancelSignal::Requested);
+        assert_eq!(waiting.await, Err(ProtocolError::Cancelled));
+        assert_eq!(ledger.snapshot().input_debt, 1);
+    }
+    #[tokio::test]
+    async fn reference_admission_rechecks_authority_after_ack_and_never_revives_failed_owner() {
+        let (ledger, journal) = owner();
+        let submitted = pending_input(&ledger, &journal);
+        let (_cancel, operation) = admission_operation(1000);
+        let live = std::sync::atomic::AtomicBool::new(true);
+        let mut waiting =
+            Box::pin(
+                ledger.wait_admission(AdmissionClass::Reference, &operation, || {
+                    if live.load(Ordering::SeqCst) {
+                        Ok(())
+                    } else {
+                        Err(ProtocolError::StaleScope)
+                    }
+                }),
+            );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(5), waiting.as_mut())
+                .await
+                .is_err()
+        );
+        live.store(false, Ordering::SeqCst);
+        submitted.settle(&response(json!({})));
+        assert_eq!(waiting.await, Err(ProtocolError::StaleScope));
+        ledger.connection_lost();
+        assert_eq!(
+            ledger
+                .wait_admission(AdmissionClass::Reference, &operation, || Ok(()))
+                .await,
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        assert_eq!(ledger.snapshot().input_debt, 0);
+    }
+    #[tokio::test]
+    async fn reference_admission_eof_and_context_retirement_wake_without_admitting() {
+        for eof in [false, true] {
+            let (ledger, journal) = owner();
+            ledger.bind_context("context").unwrap();
+            let submitted = pending_input(&ledger, &journal);
+            let (_cancel, operation) = admission_operation(1000);
+            let mut waiting =
+                Box::pin(ledger.wait_admission(AdmissionClass::Reference, &operation, || Ok(())));
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(5), waiting.as_mut())
+                    .await
+                    .is_err()
+            );
+            if eof {
+                ledger.observe_remote_eof();
+            } else {
+                ledger.retire_after_context_destroy("context").unwrap();
+            }
+            assert_eq!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), waiting)
+                    .await
+                    .unwrap(),
+                Err(ProtocolError::ScopeUnavailable)
+            );
+            submitted.settle(&response(json!({})));
+            assert_eq!(
+                ledger.check_admission(AdmissionClass::Reference),
+                Err(ProtocolError::ScopeUnavailable)
+            );
+        }
     }
     #[test]
     fn submission_not_waiter_lifetime_owns_debt_and_ack_does_not_erase_dispatch() {

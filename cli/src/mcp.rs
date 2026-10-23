@@ -765,6 +765,8 @@ fn tool_profile_summaries() -> Vec<Value> {
 // retain canonical one-shot command behavior; session clients use the CLI.
 // Scoped blob handles/decision tokens belong to that negotiated connection and
 // are intentionally not exposed as separate stateless MCP tools.
+// fixture.read-fields likewise needs the negotiated capability and exact live
+// callback envelope; no stateless MCP tool may manufacture that authority.
 fn tools() -> Vec<Value> {
     let mut tools = vec![
         tool(

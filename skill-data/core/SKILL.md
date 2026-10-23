@@ -575,6 +575,7 @@ That pulls in:
 - `references/snapshot-refs.md` — deep dive on the snapshot + ref model
 - `references/authentication.md` — auth vault, credential plugins, credential handling
 - `references/trust-boundaries.md` — safety rules for driving a real browser
+- Negotiated integrations use `fixture.read-fields` only with `browser.fixture-read-fields/1`: current pure values, no refs or input-debt forgiveness. See `references/session-management.md`.
 - `references/session-management.md` — persistence, multi-session workflows
 - `references/profiling.md` — Chrome DevTools tracing and profiling
 - `references/video-recording.md` — video capture options

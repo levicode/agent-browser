@@ -3984,6 +3984,7 @@ Sessions:
   session connect --json     Persistent protocol; explicit one-use --session required
                              Negotiated trace captures do not publish semantic observations
                              terminal.close/1: cleanup-only close after quarantine
+                             browser.fixture-read-fields/1: pure values, no refs or debt reset
 
 MCP:
   mcp                        Start an MCP stdio server exposing agent-browser tools

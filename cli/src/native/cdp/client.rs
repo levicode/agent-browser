@@ -1283,6 +1283,50 @@ impl CdpClient {
         )
         .await
     }
+    /// Fixed cleanup for an interrupted navigation in the existing producer.
+    /// Preserve its journal/input debt and check the absolute cleanup bound
+    /// again under websocket ownership, never borrow a new application lease.
+    pub(crate) async fn stop_retiring_navigation(
+        &self,
+        session: &str,
+        key: super::super::client_debt::OperationKey,
+        deadline: std::time::Instant,
+    ) -> Result<super::super::client_debt::CommandStatusHandle, String> {
+        use super::super::client_debt::{command_scope, CommandCategory};
+        let journal = current_operation().ok_or("Native navigation cleanup has no producer")?;
+        let expected = self
+            .debt_ledger()
+            .ok_or("Native navigation cleanup has no owner")?;
+        let state = journal.snapshot();
+        if journal.key() != key
+            || !Arc::ptr_eq(&journal.ledger(), &expected)
+            || !state.submission_revoked
+            || state.integrity_lost
+            || std::time::Instant::now() >= deadline
+        {
+            return Err("Native navigation cleanup authority expired".into());
+        }
+        let params = serde_json::json!({});
+        let reservation = command_scope(CommandCategory::CleanupInput, false, async {
+            self.reserve_tracked_command("Page.stopLoading", Some(&params), Some(session))
+        })
+        .await?
+        .ok_or("Native navigation cleanup is not tracked")?;
+        let status = reservation.status();
+        tokio::time::timeout_at(
+            deadline.into(),
+            self.send_reserved_command_bound(
+                "Page.stopLoading",
+                Some(params),
+                Some(session),
+                Some(reservation),
+                Some((Some(expected), deadline)),
+            ),
+        )
+        .await
+        .map_err(|_| "Native navigation cleanup deadline expired".to_owned())??;
+        Ok(status)
+    }
     async fn send_reserved_command_bound(
         &self,
         method: &str,
@@ -1746,6 +1790,83 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn navigation_stop_requires_exact_retiring_journal_and_original_writer_deadline() {
+        use crate::native::client_debt::OperationKey;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                assert!(!message.is_text(), "expired/unbound cleanup sent CDP");
+            }
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let ledger = OwnerDebtLedger::new(1, "owner".into());
+        client.install_debt_ledger(ledger.clone()).unwrap();
+        let key = OperationKey {
+            generation: 1,
+            operation_seq: 1,
+        };
+        let journal = ledger
+            .operation(key, "target".into(), "session".into())
+            .unwrap();
+        let limit = std::time::Instant::now() + Duration::from_secs(1);
+        assert!(client
+            .stop_retiring_navigation("session", key, limit)
+            .await
+            .is_err());
+        assert!(
+            journal
+                .scope(client.stop_retiring_navigation("session", key, limit))
+                .await
+                .is_err(),
+            "active application journal is not retirement authority"
+        );
+        journal.revoke_application_submission();
+        assert!(journal
+            .scope(client.stop_retiring_navigation(
+                "session",
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 2
+                },
+                limit
+            ))
+            .await
+            .is_err());
+        let foreign = OwnerDebtLedger::new(1, "foreign".into());
+        let foreign_journal = foreign
+            .operation(key, "target".into(), "session".into())
+            .unwrap();
+        foreign_journal.revoke_application_submission();
+        assert!(foreign_journal
+            .scope(client.stop_retiring_navigation("session", key, limit))
+            .await
+            .is_err());
+        let writer = client.transport.ws_tx.lock().await;
+        let deadline = std::time::Instant::now() + Duration::from_millis(10);
+        let mut stop =
+            Box::pin(journal.scope(client.stop_retiring_navigation("session", key, deadline)));
+        assert!(futures_util::poll!(stop.as_mut()).is_pending());
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        tokio::time::sleep_until(deadline.into()).await;
+        drop(writer);
+        assert!(stop.await.is_err());
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(
+            journal.snapshot().input_debt,
+            0,
+            "unsent cleanup reservation must be abandoned"
+        );
+        client.close().await;
+        tokio::time::timeout(Duration::from_secs(1), peer)
+            .await
+            .unwrap()
+            .unwrap();
+    }
 
     #[tokio::test]
     async fn owner_cleanup_rechecks_exact_ledger_and_deadline_after_writer_wait() {

@@ -2325,6 +2325,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             "browser.page/1",
             "browser.observe/1",
             "browser.query/1",
+            "browser.fixture-read-fields/1",
             "browser.actions/1",
             "browser.network/1",
             "browser.dialog/1",
@@ -2467,8 +2468,13 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 serde_json::from_value::<ReconnectRequest>(serde_json::Value::Object(args.clone()))
                     .map(|_| None)
             }
-            "scope.configure" | "browser.observe" | "browser.query" | "fixture.query"
-            | "fixture.correlate" | "capture.screenshot" => Ok(None),
+            "scope.configure"
+            | "browser.observe"
+            | "browser.query"
+            | "fixture.query"
+            | "fixture.read-fields"
+            | "fixture.correlate"
+            | "capture.screenshot" => Ok(None),
             "page.navigate"
             | "page.reload"
             | "page.back"
@@ -2744,11 +2750,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             "browser.observe"
                 | "browser.query"
                 | "fixture.query"
+                | "fixture.read-fields"
                 | "fixture.correlate"
                 | "capture.screenshot"
         ) {
             use super::client_observation_dispatch::{
-                DispatchContext, DispatchRequest, QueryPurpose, QueryRequest,
+                DispatchContext, DispatchRequest, FieldReadRequest, QueryPurpose, QueryRequest,
             };
             let value = serde_json::Value::Object(args);
             let request = match command.as_str() {
@@ -2758,6 +2765,22 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 }
                 "capture.screenshot" => {
                     serde_json::from_value(value).map(DispatchRequest::Screenshot)
+                }
+                "fixture.read-fields" => {
+                    let mut value = value;
+                    let fields = value
+                        .as_object_mut()
+                        .and_then(|args| args.remove("fields"))
+                        .unwrap_or(serde_json::Value::Null);
+                    serde_json::from_value(fields).and_then(|fields| {
+                        serde_json::from_value(value).map(|options| {
+                            DispatchRequest::ReadFields(FieldReadRequest {
+                                options,
+                                fields,
+                                broker: self.broker.clone(),
+                            })
+                        })
+                    })
                 }
                 _ => serde_json::from_value(value).map(|options| {
                     DispatchRequest::Query(QueryRequest {
@@ -3458,6 +3481,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     return (NativeOutcome { retention: None, result: Err(error), effects: Effects::NotDispatched }, false);
                 }
                 let mut dispatched = false;
+                let mut navigation_interruption = None;
                 let result = async {
                         if command != "page.navigate" && command != "page.activate" && command != "session.environment" && !command.starts_with("context.") && !page_active.load(std::sync::atomic::Ordering::SeqCst) {
                             return Err(ProtocolError::ScopeUnavailable);
@@ -3568,15 +3592,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             Some(network.begin_app_navigation(&page, &lease)?)
                         } else { None };
                         dispatched = true;
-                        let output = page_state
-                            .execute(
+                        let (output, interruption) = page_state
+                            .execute_with_retirement(
                                 &page,
                                 &sessions,
                                 &lease,
                                 &command,
                                 &serde_json::Value::Object(args),
+                                &dispatch_tasks,
                             )
                             .await;
+                        navigation_interruption = interruption;
                         if navigation.is_some() {
                             let flushed = enrollment.flush_app_events(&page, &lease).await;
                             if output.is_ok() { flushed?; }
@@ -3587,12 +3613,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 let cleanup_failed = matches!(result, Err(ProtocolError::CleanupFailed));
                 let expired = *lease.cancellation.borrow() != super::client_session::CancelSignal::None
                     || std::time::Instant::now() >= lease.deadline;
+                let navigation_settled = command == "page.navigate"
+                    && matches!(result, Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded))
+                    && navigation_interruption.is_some_and(|proof| proof.confirms(&page, &lease, &journal));
                 let effects = if !dispatched || matches!(result, Err(ProtocolError::InvalidArguments | ProtocolError::UnsupportedCommand)) {
                     Effects::NotDispatched
+                } else if navigation_settled {
+                    Effects::Completed
                 } else if expired || (result.is_err() && mutating) {
                     Effects::Unknown
                 } else { Effects::Completed };
-                let result = if expired { Err(ProtocolError::Cancelled) } else { result };
+                let result = if expired && !navigation_settled { Err(ProtocolError::Cancelled) } else { result };
                 (NativeOutcome { retention: None, result, effects }, cleanup_failed)
             }).await;
             return await_retained(receive).await;

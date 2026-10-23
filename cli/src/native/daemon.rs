@@ -960,6 +960,7 @@ mod tests {
             "browser.page/1",
             "browser.observe/1",
             "browser.query/1",
+            "browser.fixture-read-fields/1",
             "browser.actions/1",
             "browser.network/1",
             "browser.dialog/1",

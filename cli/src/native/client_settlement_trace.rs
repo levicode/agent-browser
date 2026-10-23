@@ -1022,7 +1022,9 @@ impl Drop for FrameTrace {
     }
 }
 
-#[cfg(test)]
+// These original acceptance-phase contracts remain feature-only. Production
+// cleanup coverage lives in cleanup_diagnostic_tests below.
+#[cfg(all(test, feature = "acceptance-faults"))]
 mod tests {
     use super::*;
 

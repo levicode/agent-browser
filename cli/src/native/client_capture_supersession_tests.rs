@@ -1459,3 +1459,260 @@ async fn uncertainty_retirement_fences_additive_trace_and_capture_without_recycl
 
 #[path = "client_optional_mask_retirement_tests.rs"]
 mod optional_mask_retirement_tests;
+
+#[tokio::test]
+async fn remote_debt_wait_leaves_callback_ui_free_and_supersession_retires_without_ack() {
+    use crate::native::client_debt::{OperationKey, OwnerDebtLedger};
+    let (owner, server) = peer().await;
+    let ledger = OwnerDebtLedger::new(1, "scope".into());
+    owner.client.install_debt_ledger(ledger.clone()).unwrap();
+    let journal = ledger
+        .operation(
+            OperationKey {
+                generation: 1,
+                operation_seq: 99,
+            },
+            "target".into(),
+            "session".into(),
+        )
+        .unwrap();
+    let input = ledger
+        .reserve_command(
+            Some(&journal),
+            "Input.dispatchMouseEvent",
+            Some(&json!({"type":"mousePressed"})),
+            Some("session"),
+        )
+        .unwrap()
+        .submit()
+        .unwrap();
+    let refs = Arc::new(Mutex::new(RefMap::new()));
+    let dispatch = ObservationDispatch::new(refs);
+    let (op, _cancel) = operation(1);
+    let a = dispatch.prepare(owner.context(), observe(), op).unwrap();
+    let mut task = dispatch.clone().start_prepared(a);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut task.result)
+            .await
+            .is_err()
+    );
+    // A late paused browser event must be able to enter and release the input.
+    let reservation = owner.ui.reserve_callback().unwrap();
+    let (callback, _cancel_callback) = operation(3);
+    let entered = tokio::time::timeout(
+        Duration::from_millis(100),
+        reservation.enter(callback.deadline, callback.cancellation),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    drop(entered);
+    let (op, _cancel_next) = operation(2);
+    let _replacement = dispatch.prepare(owner.context(), observe(), op).unwrap();
+    let failure = tokio::time::timeout(Duration::from_millis(100), task.result)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(failure.error, ProtocolError::StaleReference);
+    assert!(!failure.cleanup_integrity_lost);
+    task.join.await.unwrap().unwrap();
+    assert_eq!(ledger.snapshot().input_debt, 1);
+    assert_eq!(dispatch.publication.lock().await.revision, 0);
+    drop(input);
+    owner.client.close().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn remote_debt_ack_cannot_admit_a_replacement_with_reused_textual_ids() {
+    use crate::native::client_debt::{OperationKey, OwnerDebtLedger};
+    let (owner, server) = peer().await;
+    let ledger = OwnerDebtLedger::new(1, "scope".into());
+    owner.client.install_debt_ledger(ledger.clone()).unwrap();
+    let journal = ledger
+        .operation(
+            OperationKey {
+                generation: 1,
+                operation_seq: 99,
+            },
+            "target".into(),
+            "session".into(),
+        )
+        .unwrap();
+    let input = ledger
+        .reserve_command(
+            Some(&journal),
+            "Input.dispatchMouseEvent",
+            Some(&json!({"type":"mousePressed"})),
+            Some("session"),
+        )
+        .unwrap()
+        .submit()
+        .unwrap();
+    let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+    let (op, _cancel) = operation(1);
+    let captured = dispatch.prepare(owner.context(), observe(), op).unwrap();
+    let mut task = dispatch.clone().start_prepared(captured);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(10), &mut task.result)
+            .await
+            .is_err()
+    );
+    owner.targets.detach("target").unwrap();
+    owner
+        .targets
+        .attached("context", "target".into(), "session".into(), "page".into())
+        .unwrap();
+    owner.targets.configured("target").unwrap();
+    owner
+        .targets
+        .resume_permit("target")
+        .await
+        .unwrap()
+        .complete()
+        .unwrap();
+    input.settle(
+        &serde_json::from_value(json!({"id":1,"sessionId":"session","result":{}})).unwrap(),
+    );
+    let failure = tokio::time::timeout(Duration::from_secs(1), task.result)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(failure.error, ProtocolError::StaleScope);
+    task.join.await.unwrap().unwrap();
+    assert_eq!(ledger.snapshot().input_debt, 0);
+    assert_eq!(dispatch.publication.lock().await.revision, 0);
+    owner.client.close().await;
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn field_read_waits_for_debt_only_outside_a_live_callback_before_acquisition() {
+    use crate::native::client_debt::{OperationKey, OwnerDebtLedger};
+    use crate::native::client_session::{ClientSession, DecisionKind, DecisionOwner};
+    use futures_util::SinkExt;
+    use std::sync::atomic::AtomicUsize;
+    for callback in [false, true] {
+        let acquired = Arc::new(AtomicUsize::new(0));
+        let seen = acquired.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                assert_eq!(request["method"], "Page.getFrameTree");
+                seen.fetch_add(1, Ordering::SeqCst);
+                // Refuse the first read after admission: this test proves the
+                // exact acquisition boundary, not renderer value semantics.
+                if socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id":request["id"],"sessionId":request["sessionId"],"error":{"code":-32000,"message":"synthetic acquisition boundary"}}).to_string()
+                )).await.is_err() { break; }
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+        let owner = Owner::new(client, "session", "target", "scope").await;
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        owner.client.install_debt_ledger(ledger.clone()).unwrap();
+        let parent = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 99,
+                },
+                "target".into(),
+                "session".into(),
+            )
+            .unwrap();
+        let mut input = Some(
+            ledger
+                .reserve_command(
+                    Some(&parent),
+                    "Input.dispatchMouseEvent",
+                    Some(&json!({"type":"mousePressed"})),
+                    Some("session"),
+                )
+                .unwrap()
+                .submit()
+                .unwrap(),
+        );
+        let broker = Arc::new(ClientSession::new());
+        let decision = if callback {
+            Some(
+                broker
+                    .decision_scoped(
+                        1,
+                        DecisionOwner::Scope,
+                        DecisionKind::Authentication,
+                        5000,
+                        None,
+                        Some("scope".into()),
+                    )
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let operation = broker
+            .admit_callback(
+                1,
+                1,
+                5000,
+                decision.as_ref().map(|decision| decision.token.as_str()),
+            )
+            .unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "session".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&operation).unwrap();
+        let refs = Arc::new(Mutex::new(RefMap::new()));
+        let dispatch = ObservationDispatch::new(refs.clone());
+        let request = DispatchRequest::ReadFields(FieldReadRequest { broker, fields: vec![observation::ReadField::Text], options: serde_json::from_value(json!({"expression":{"kind":"selector","selector":"button"},"secureFieldSelector":"input[type=password]"})).unwrap() });
+        let prepared = dispatch
+            .prepare(owner.context(), request, operation)
+            .unwrap();
+        let mut task = journal
+            .scope(async { dispatch.clone().start_prepared(prepared) })
+            .await;
+        if !callback {
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut task.result)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(acquired.load(Ordering::SeqCst), 0);
+            assert_eq!(ledger.snapshot().input_debt, 1);
+            input.take().unwrap().settle(
+                &serde_json::from_value(json!({"id":1,"sessionId":"session","result":{}})).unwrap(),
+            );
+        }
+        let failure = tokio::time::timeout(Duration::from_secs(1), task.result)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(failure.error, ProtocolError::BrowserFailure);
+        task.join.await.unwrap().unwrap();
+        assert_eq!(acquired.load(Ordering::SeqCst), 1);
+        assert_eq!(ledger.snapshot().input_debt, if callback { 1 } else { 0 });
+        assert!(refs.lock().unwrap().ref_ids().is_empty());
+        assert_eq!(dispatch.publication.lock().await.revision, 0);
+        drop(input);
+        owner.client.close().await;
+        server.await.unwrap();
+    }
+}

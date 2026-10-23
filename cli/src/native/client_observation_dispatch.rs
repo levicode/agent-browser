@@ -147,6 +147,41 @@ pub struct QueryRequest {
     pub options: QueryOptions,
     pub purpose: QueryPurpose,
 }
+pub struct FieldReadRequest {
+    pub options: QueryOptions,
+    pub fields: Vec<observation::ReadField>,
+    pub broker: Arc<super::client_session::ClientSession>,
+}
+impl FieldReadRequest {
+    fn admission_class(&self, operation: &OperationLease) -> super::client_debt::AdmissionClass {
+        if operation.is_callback {
+            super::client_debt::AdmissionClass::FixedRead
+        } else {
+            super::client_debt::AdmissionClass::Reference
+        }
+    }
+    fn check_authority(
+        &self,
+        operation: &OperationLease,
+        identity: &str,
+        ledger: &super::client_debt::OwnerDebtLedger,
+    ) -> Result<(), ProtocolError> {
+        self.broker.validate_field_read(operation, identity)?;
+        if !ledger.matches_owner(operation.generation, identity) {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    fn check_admission(
+        &self,
+        operation: &OperationLease,
+        identity: &str,
+        ledger: &super::client_debt::OwnerDebtLedger,
+    ) -> Result<(), ProtocolError> {
+        self.check_authority(operation, identity, ledger)?;
+        ledger.check_admission(self.admission_class(operation))
+    }
+}
 /// Screenshot publication policy; omitted purpose preserves pixels-only behavior.
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -163,6 +198,7 @@ pub struct ScreenshotRequest {
     pub purpose: ScreenshotPurpose,
 }
 pub enum DispatchRequest {
+    ReadFields(FieldReadRequest),
     Correlate(CorrelateRequest),
     Observe(ObserveRequest),
     Query(QueryRequest),
@@ -454,8 +490,15 @@ impl ObservationDispatch {
             observation::validate_expression(&query.options.expression, 0)
                 .map_err(observation_error)?;
         }
-        let protected =
-            !matches!(&request, DispatchRequest::Query(q) if q.purpose == QueryPurpose::Fixture);
+        if let DispatchRequest::ReadFields(read) = &request {
+            observation::validate_expression(&read.options.expression, 0)
+                .map_err(observation_error)?;
+            observation::validate_read_fields(&read.fields).map_err(observation_error)?;
+            read.broker
+                .validate_field_read(&operation, &context.page.identity_scope)?;
+        }
+        let protected = !matches!(&request, DispatchRequest::ReadFields(_))
+            && !matches!(&request, DispatchRequest::Query(q) if q.purpose == QueryPurpose::Fixture);
         if protected && operation.is_callback {
             return Err(ProtocolError::InvalidArguments);
         }
@@ -736,13 +779,49 @@ impl ObservationDispatch {
                 .map_err(map_observation)
                 .map_err(failure)?;
         }
-        let protected =
-            !matches!(&request, DispatchRequest::Query(q) if q.purpose == QueryPurpose::Fixture);
+        let protected = !matches!(&request, DispatchRequest::ReadFields(_))
+            && !matches!(&request, DispatchRequest::Query(q) if q.purpose == QueryPurpose::Fixture);
         // Semantic-only reads need exclusive admission and exact target/frame
         // fences, not a browser lifecycle mutation. Chromium's frozen state
         // also hides the page; setting active does not undo that visibility.
         let stabilize_pixels = matches!(&request, DispatchRequest::Screenshot(_))
             || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
+        // Pending browser input can need a late route/dialog callback to settle.
+        // Wait before UI/publication locks so that owner service stays runnable.
+        if let Some(ledger) = context.page.client.debt_ledger() {
+            let category = match &request {
+                DispatchRequest::ReadFields(read) => read.admission_class(&operation),
+                _ => super::client_debt::AdmissionClass::Reference,
+            };
+            let admission = ledger.wait_admission(category, &operation, || {
+                check(&context.page, &operation)?;
+                if let DispatchRequest::ReadFields(read) = &request {
+                    // Class choice is not authority. Never turn an invalid
+                    // callback into an ordinary read or bypass its broker.
+                    read.check_authority(&operation, &identity, &ledger)?;
+                }
+                if !ledger.matches_owner(operation.generation, &context.scope.identity_scope) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                self.check_publication_fence(retirement_fence)?;
+                if !context
+                    .attachment
+                    .same_attachment(&context.page.targets.owned_target(&context.page.target_id)?)
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                Ok(())
+            });
+            tokio::select! {
+                result = admission => result.map_err(failure)?,
+                _ = observation::capture_retired() => {
+                    check(&context.page, &operation).map_err(failure)?;
+                    return Err(failure(ProtocolError::StaleReference));
+                }
+            }
+        } else if matches!(&request, DispatchRequest::ReadFields(_)) {
+            return Err(failure(ProtocolError::ScopeUnavailable));
+        }
         let _ui = tokio::select! {
             result = context.ui.enter(protected, operation.is_callback,
                 operation.deadline, operation.cancellation.clone()) => result.map_err(failure)?,
@@ -751,6 +830,51 @@ impl ObservationDispatch {
                 return Err(failure(ProtocolError::StaleReference));
             }
         };
+        if let DispatchRequest::ReadFields(read) = &request {
+            let check_authority = || {
+                check(&context.page, &operation)?;
+                self.check_publication_fence(retirement_fence)?;
+                if !context
+                    .attachment
+                    .same_attachment(&context.page.targets.owned_target(&context.page.target_id)?)
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let ledger = context
+                    .page
+                    .client
+                    .debt_ledger()
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                read.check_admission(&operation, &identity, &ledger)
+            };
+            check_authority().map_err(failure)?;
+            let frames =
+                verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
+                    .await
+                    .map_err(failure)?;
+            let values = observation::query_fields(
+                &context.page.client,
+                &frames,
+                &read.options,
+                &read.fields,
+                &operation,
+            )
+            .await
+            .map_err(map_observation)
+            .map_err(failure)?;
+            let current =
+                verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
+                    .await
+                    .map_err(failure)?;
+            same_frames(&frames, &current).map_err(failure)?;
+            check_authority().map_err(failure)?;
+            let value = json!({"identityScope":identity,"values":values});
+            bounded_result(&value).map_err(failure)?;
+            return Ok(Output {
+                value,
+                handles: vec![],
+            });
+        }
         // Acquire UI first: a queued protected writer must not hold this mutex
         // while a valid callback query needs it to finish the active parent.
         let mut cancellation = operation.cancellation.clone();
@@ -766,6 +890,15 @@ impl ObservationDispatch {
         check(&context.page, &operation).map_err(failure)?;
         self.check_publication_fence(retirement_fence)
             .map_err(failure)?;
+        if !context.attachment.same_attachment(
+            &context
+                .page
+                .targets
+                .owned_target(&context.page.target_id)
+                .map_err(failure)?,
+        ) {
+            return Err(failure(ProtocolError::StaleScope));
+        }
         if let Some(ledger) = context.page.client.debt_ledger() {
             ledger
                 .check_admission(super::client_debt::AdmissionClass::Reference)
@@ -792,6 +925,7 @@ impl ObservationDispatch {
             });
         }
         let publication_kind = match &request {
+            DispatchRequest::ReadFields(_) => return Err(failure(ProtocolError::InvalidArguments)),
             DispatchRequest::Correlate(_) => return Err(failure(ProtocolError::InvalidArguments)),
             DispatchRequest::Observe(_) => PublicationKind::Snapshot,
             DispatchRequest::Query(_) => PublicationKind::AdditiveQuery,
@@ -877,6 +1011,7 @@ impl ObservationDispatch {
                 geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(map_geometry)?);
             }
             match request {
+                DispatchRequest::ReadFields(_) => Err(ProtocolError::InvalidArguments),
                 DispatchRequest::Correlate(_) => Err(ProtocolError::InvalidArguments),
                 DispatchRequest::Query(query) => {
                     let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
@@ -1351,6 +1486,10 @@ fn validate_policy(policy: &ReadPolicy, request: &DispatchRequest) -> Result<(),
         return Err(ProtocolError::PolicyDenied);
     }
     let matches = match request {
+        DispatchRequest::ReadFields(request) => {
+            policy.test_id_attribute == request.options.test_id_attribute
+                && policy.secure_field_selector == request.options.secure_field_selector
+        }
         DispatchRequest::Correlate(_) => true,
         DispatchRequest::Observe(request) => {
             policy.test_id_attribute == request.test_id_attribute
@@ -1933,6 +2072,90 @@ fn capture_error(error: CaptureReason) -> ProtocolError {
 mod tests {
     use super::super::element::ExactBinding;
     use super::*;
+    #[test]
+    fn only_live_callback_fields_can_read_over_unchanged_unrelated_input_debt() {
+        use super::super::client_debt::{AdmissionClass, OperationKey, OwnerDebtLedger};
+        use super::super::client_session::{ClientSession, DecisionKind, DecisionOwner};
+        let broker = Arc::new(ClientSession::new());
+        let parent = broker.admit(1, 1, 5000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let decision = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Authentication,
+                5000,
+                None,
+                Some("scope".into()),
+            )
+            .unwrap();
+        let mut callback = broker
+            .admit_callback(1, 2, 5000, Some(&decision.token))
+            .unwrap();
+        assert!(broker.start(1, 2).unwrap());
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        let _retained = ledger
+            .reserve_command(
+                Some(&journal),
+                "Input.dispatchMouseEvent",
+                Some(&json!({"type":"mousePressed"})),
+                Some("page"),
+            )
+            .unwrap()
+            .submit()
+            .unwrap();
+        let request = FieldReadRequest {
+            broker,
+            fields: vec![observation::ReadField::Text],
+            options: serde_json::from_value(
+                json!({"expression":{"kind":"selector","selector":"button"}}),
+            )
+            .unwrap(),
+        };
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        assert_eq!(
+            ledger.check_admission(AdmissionClass::Reference),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        assert_eq!(
+            request.check_admission(&parent, "scope", &ledger),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        assert_eq!(request.check_admission(&callback, "scope", &ledger), Ok(()));
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        assert_eq!(
+            ledger.check_admission(AdmissionClass::Input),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        let foreign = OwnerDebtLedger::new(1, "foreign".into());
+        assert_eq!(
+            request.check_admission(&callback, "scope", &foreign),
+            Err(ProtocolError::StaleScope)
+        );
+        callback.is_callback = false;
+        assert_eq!(
+            request.check_admission(&callback, "scope", &ledger),
+            Err(ProtocolError::InvalidSequence)
+        );
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        callback.is_callback = true;
+        ledger.connection_lost();
+        assert_eq!(
+            request.check_admission(&callback, "scope", &ledger),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        assert_eq!(ledger.snapshot().input_debt, 1);
+    }
     #[test]
     fn frame_failures_preserve_typed_facts_but_never_downgrade_cleanup_uncertainty() {
         use super::super::client_protocol::{Effects, FrameAmbiguity, FrameSelectionIndex};

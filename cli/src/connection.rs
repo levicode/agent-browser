@@ -881,8 +881,16 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
 }
 
 fn isolated_client_env_allowed(key: &str) -> bool {
+    // Default-off production diagnostics use the caller's existing regular
+    // file, validated and bounded by the daemon's sink. Preserve only the
+    // exact diagnostic key, never a browser configuration prefix.
     !key.starts_with("AGENT_BROWSER_")
-        || matches!(key, "AGENT_BROWSER_SOCKET_DIR" | "AGENT_BROWSER_NAMESPACE")
+        || matches!(
+            key,
+            "AGENT_BROWSER_SOCKET_DIR"
+                | "AGENT_BROWSER_NAMESPACE"
+                | "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE"
+        )
         || (cfg!(feature = "acceptance-faults") && key == "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
 }
 
@@ -936,6 +944,7 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "PATH",
         "AGENT_BROWSER_SOCKET_DIR",
         "AGENT_BROWSER_NAMESPACE",
+        "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE",
     ] {
         assert!(isolated_client_env_allowed(preserved));
     }
@@ -948,6 +957,9 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "AGENT_BROWSER_PLUGINS",
         "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE_EXTRA",
         "AGENT_BROWSER_ACCEPTANCE_OTHER",
+        "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE_EXTRA",
+        "AGENT_BROWSER_CLEANUP_DIAGNOSTIC",
+        "AGENT_BROWSER_CLEANUP_OTHER",
     ] {
         assert!(!isolated_client_env_allowed(removed));
     }

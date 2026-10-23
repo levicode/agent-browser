@@ -2412,7 +2412,7 @@ pub struct QueryResult {
     pub revision: u64,
     pub nodes: Vec<SemanticNode>,
 }
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ReadField {
     Role,
@@ -2428,6 +2428,59 @@ pub enum ReadField {
     Rect,
     Selector,
     FramePath,
+}
+/// Closed value projection. Geometry still uses its existing measured-reference path.
+pub(crate) fn validate_read_fields(fields: &[ReadField]) -> Result<(), ObservationError> {
+    if fields.is_empty()
+        || fields.len() > 12
+        || fields.iter().enumerate().any(|(index, field)| {
+            matches!(field, ReadField::Rect) || fields[..index].contains(field)
+        })
+    {
+        return Err(ObservationError::InvalidArguments);
+    }
+    Ok(())
+}
+
+/// Resolve current values with the native matcher without minting any reference.
+pub(crate) async fn query_fields(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    options: &QueryOptions,
+    fields: &[ReadField],
+    lease: &OperationLease,
+) -> Result<Vec<Value>, ObservationError> {
+    validate_read_fields(fields)?;
+    validate_expression(&options.expression, 0)?;
+    let (path, expression) = split_frame_expression(&options.expression)?;
+    let frame = query_frame(client, frames, &path, options, lease, false).await?;
+    let evaluated = evaluate_query(client, frame, &expression, options, lease).await?;
+    if evaluated.matches.len() > super::element::MAX_EXACT_REFERENCES {
+        return Err(ObservationError::ResourceLimit);
+    }
+    let mut values = Vec::with_capacity(evaluated.matches.len());
+    for matched in evaluated.matches {
+        check(lease)?;
+        values.push(project_fixture_fields(matched.node, fields)?);
+    }
+    validate_frame_ancestry(client, frames, frame, lease).await?;
+    validate_frame(client, query_root(frames)?, lease).await?;
+    check(lease)?;
+    Ok(values)
+}
+fn project_fixture_fields(
+    node: SemanticNode,
+    fields: &[ReadField],
+) -> Result<Value, ObservationError> {
+    validate_read_fields(fields)?;
+    let secure = node.states.get("secure") == Some(&true);
+    let mut value = project_read_fields(node, Some(fields))?;
+    value
+        .as_object_mut()
+        .ok_or(ObservationError::BackendFailure)?
+        .remove("ref");
+    value["states"]["secure"] = Value::Bool(secure);
+    Ok(value)
 }
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -6822,6 +6875,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fixture_fields_keep_frame_cancellation_and_cleanup_guards_without_publication() {
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        for mode in [
+            "success",
+            "changed-loader",
+            "cleanup-failed",
+            "cancelled",
+            "cancelled-before-publication",
+        ] {
+            let (operation, cancel) = lease();
+            let cancel_after_match = cancel.clone();
+            let query_releases = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let released = query_releases.clone();
+            let methods = Arc::new(Mutex::new(Vec::<String>::new()));
+            let seen = methods.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut queried = false;
+                while let Some(Ok(message)) = ws.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(text).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    seen.lock().unwrap().push(method.into());
+                    let query_release = method == "Runtime.releaseObjectGroup"
+                        && request["params"]["objectGroup"]
+                            .as_str()
+                            .unwrap_or("")
+                            .starts_with("native-query-");
+                    if query_release {
+                        released.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    // The match result already exists when its group release
+                    // starts. Cancel before that ACK, never race the matcher reply.
+                    if mode == "cancelled-before-publication" && query_release && queried {
+                        cancel_after_match.send_replace(CancelSignal::Requested);
+                    }
+                    let result = match method {
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"main","loaderId":if queried && mode == "changed-loader" {"other"} else {"doc"}}}})
+                        }
+                        "Accessibility.getFullAXTree" => {
+                            json!({"nodes":[{"nodeId":"button","backendDOMNodeId":42,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}]})
+                        }
+                        "DOM.getDocument" => {
+                            json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":42}]}})
+                        }
+                        "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                        "DOM.resolveNode" => {
+                            json!({"object":{"objectId":"owned","subtype":"node"}})
+                        }
+                        "Runtime.getProperties" => {
+                            json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
+                        }
+                        "Runtime.callFunctionOn" => {
+                            let declaration =
+                                request["params"]["functionDeclaration"].as_str().unwrap();
+                            if declaration.contains("Array.from(result)") {
+                                json!({"result":{"objectId":"security"}})
+                            } else if declaration == MATCH_QUERY {
+                                queried = true;
+                                json!({"result":{"value":{"indices":[0],"redacted":[]}}})
+                            } else {
+                                json!({"result":{"value":[metadata()]}})
+                            }
+                        }
+                        "Runtime.releaseObjectGroup" => json!({}),
+                        _ => panic!("unexpected value-read command: {method}"),
+                    };
+                    let release_failed = mode == "cleanup-failed"
+                        && method == "Runtime.releaseObjectGroup"
+                        && request["params"]["objectGroup"]
+                            .as_str()
+                            .unwrap_or("")
+                            .starts_with("native-query-");
+                    let reply = if release_failed {
+                        json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic release failure"}})
+                    } else {
+                        json!({"id":request["id"],"result":result})
+                    };
+                    if ws
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            reply.to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let client = CdpClient::connect(&endpoint).await.unwrap();
+            if mode == "cancelled" {
+                cancel.send_replace(CancelSignal::Requested);
+            }
+            let options: QueryOptions = serde_json::from_value(
+                json!({"expression":{"kind":"selector","selector":"button"}}),
+            )
+            .unwrap();
+            let result = query_fields(
+                &client,
+                &[frame()],
+                &options,
+                &[ReadField::Text],
+                &operation,
+            )
+            .await;
+            match mode {
+                "success" => assert_eq!(
+                    result.unwrap(),
+                    vec![json!({"text":"Save","states":{"secure":false}})]
+                ),
+                "changed-loader" => {
+                    assert_eq!(result.unwrap_err(), ObservationError::StaleReference)
+                }
+                "cleanup-failed" => assert_eq!(
+                    result.unwrap_err(),
+                    ObservationError::CleanupFailed { primary: None }
+                ),
+                "cancelled-before-publication" => {
+                    assert_eq!(result.unwrap_err(), ObservationError::Cancelled);
+                    assert_eq!(query_releases.load(std::sync::atomic::Ordering::SeqCst), 1);
+                }
+                _ => {
+                    assert_eq!(result.unwrap_err(), ObservationError::Cancelled);
+                    assert!(methods.lock().unwrap().is_empty());
+                }
+            }
+            assert!(!methods.lock().unwrap().iter().any(|method| method
+                == "Page.setWebLifecycleState"
+                || method == "Page.bringToFront"));
+            server.abort();
+            let _ = server.await;
+        }
+    }
+
+    #[tokio::test]
     async fn query_group_cleanup_failure_preserves_primary_and_never_publishes() {
         use futures_util::{SinkExt, StreamExt};
         use std::sync::{
@@ -8828,6 +9023,41 @@ mod tests {
         assert_eq!(value["states"], json!({"secure":true}));
         assert!(value.get("value").is_none());
         assert!(value.get("ref").is_some());
+    }
+    #[test]
+    fn fixture_field_projection_has_no_reference_geometry_or_unrequested_content() {
+        let mut node = node_with_public_states(false);
+        node.text = Some("current value".into());
+        node.selector = Some("#private-selector".into());
+        node.frame_path = vec!["#private-frame".into()];
+        node.children.push(SemanticNode::default());
+        assert_eq!(
+            project_fixture_fields(node.clone(), &[ReadField::Text]).unwrap(),
+            json!({"text":"current value","states":{"secure":false}})
+        );
+        node.states.insert("secure".into(), true);
+        assert_eq!(
+            project_fixture_fields(node, &[ReadField::Text]).unwrap(),
+            json!({"states":{"secure":true}})
+        );
+    }
+    #[test]
+    fn fixture_fields_reject_empty_duplicate_unknown_and_geometry_selection() {
+        for fields in [
+            vec![],
+            vec![ReadField::Text, ReadField::Text],
+            vec![ReadField::Rect],
+        ] {
+            assert_eq!(
+                validate_read_fields(&fields),
+                Err(ObservationError::InvalidArguments)
+            );
+        }
+        assert!(serde_json::from_value::<Vec<ReadField>>(json!(["arbitraryScript"])).is_err());
+        assert_eq!(
+            validate_read_fields(&[ReadField::Text, ReadField::States]),
+            Ok(())
+        );
     }
     #[test]
     fn schema_rejects_unknown_nested_query_fields() {
