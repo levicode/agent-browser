@@ -183,21 +183,26 @@ async fn acquisition_deadline(boundary: Boundary) {
                     if group == peer_held_group {
                         assert!(!started.contains(&backend), "acquisition replayed");
                         started.push(backend);
-                        if backend == 1 || boundary == Boundary::StartedSiblings {
+                        let hold = backend == 1 || boundary == Boundary::StartedSiblings;
+                        if hold {
                             assert!(held
                                 .insert(
                                     backend,
                                     json!({"id":request["id"],"sessionId":"session","result":value})
                                 )
                                 .is_none());
-                            if started.len() == expected_started {
-                                reached_tx.take().unwrap().send(Instant::now()).unwrap();
-                            }
+                        } else {
+                            acknowledgements.push(backend);
+                        }
+                        // Candidate arrival order is not ownership order. Only
+                        // signal after every required acquisition was observed
+                        // and any withheld response was registered for release.
+                        if started.len() == expected_started {
+                            reached_tx.take().unwrap().send(Instant::now()).unwrap();
+                        }
+                        if hold {
                             continue;
                         }
-                        acknowledgements.push(backend);
-                        assert_eq!(started.len(), expected_started);
-                        reached_tx.take().unwrap().send(Instant::now()).unwrap();
                     }
                     value
                 }
