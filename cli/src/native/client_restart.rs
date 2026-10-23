@@ -9,7 +9,7 @@ use super::client_browser::BrowserExecutionLease;
 use super::client_enrollment::{BorrowedRestartPermit, ClientEnrollment};
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
-use super::client_targets::{ClientTargets, TargetPurpose};
+use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
 use super::client_transport::ClientEventSink;
 use super::client_ui::{UiGate, UiPermit};
 use serde_json::{json, Value};
@@ -163,6 +163,7 @@ pub(crate) struct RestartedPage {
     source_session: String,
     generation: u64,
     sequence: u64,
+    attachment: OwnedTarget,
 }
 impl RestartedPage {
     /// Validate immediately before owner publication under the retained permits.
@@ -181,7 +182,8 @@ impl RestartedPage {
             return Err(ProtocolError::StaleScope);
         }
         let target = self.registry.owned_target(&self.target_id)?;
-        if target.session_id != self.session_id
+        if !target.same_attachment(&self.attachment)
+            || target.session_id != self.session_id
             || target.kind != "page"
             || target.purpose != Some(TargetPurpose::Application)
             || !target.configured
@@ -190,6 +192,22 @@ impl RestartedPage {
             return Err(ProtocolError::StaleScope);
         }
         Ok(())
+    }
+    /// Validate retained owner authority before waiting, then publish under the
+    /// enrollment/reader/inventory fence. The closure cannot reacquire them.
+    pub(crate) async fn publish_ready<T>(
+        &self,
+        context: &RestartContext<'_>,
+        publish: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        self.validate(context)?;
+        self.coordinator
+            .publish_restart_ready(&self.attachment, context.operation, || {
+                context.page.permit.check()?;
+                context.ui.check_exclusive(context.ui_gate)?;
+                publish()
+            })
+            .await
     }
 }
 
@@ -393,6 +411,7 @@ async fn replace_inner(
         .enrollment
         .wait_restart_page_ready(&target, &session, context.operation)
         .await?;
+    let attachment = context.page.targets.owned_target(&target)?;
     let page = RestartedPage {
         target_id: target,
         session_id: session,
@@ -403,6 +422,7 @@ async fn replace_inner(
         source_session: context.page.page_session_id.clone(),
         generation: context.operation.generation,
         sequence: context.operation.sequence,
+        attachment,
     };
     page.validate(context)?;
     if let Some(admission) = borrowed_admission {
@@ -835,6 +855,7 @@ mod tests {
             let context = context(&fixture, &permit);
             let mut page = replace_pages(&context).await.unwrap();
             page.validate(&context).unwrap();
+            page.publish_ready(&context, || Ok(())).await.unwrap();
             let replacement_session = page.session_id.clone();
             page.session_id = "old-session".into();
             assert_eq!(page.validate(&context), Err(ProtocolError::StaleScope));
@@ -983,6 +1004,7 @@ mod tests {
             let context = context(&fixture, &permit);
             let page = replace_pages(&context).await.unwrap();
             page.validate(&context).unwrap();
+            page.publish_ready(&context, || Ok(())).await.unwrap();
             assert_eq!(page.target_id, "replacement");
             assert_eq!(page.session_id, "replacement-session");
             assert!(page.closed_targets.contains(&"old-page".into()));

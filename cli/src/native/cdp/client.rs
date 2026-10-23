@@ -200,13 +200,22 @@ pub struct BoundedEventWatermark {
 }
 impl BoundedEventWatermark {
     pub fn received(&self) -> Result<u64, &'static str> {
+        self.with_received(|received| received)
+    }
+    /// Synchronous publication fence against this exact reader subscription.
+    /// The closure must not await or acquire the enrollment index: callers hold
+    /// index -> routes and publish_bounded never takes the index.
+    pub(crate) fn with_received<T>(
+        &self,
+        publish: impl FnOnce(u64) -> T,
+    ) -> Result<T, &'static str> {
         let routes = self.routes.upgrade().ok_or("control event stream closed")?;
         let routes = routes.lock().map_err(|_| "control event stream poisoned")?;
         let route = routes.get(&self.id).ok_or("control event stream closed")?;
         if self.failed.load(Ordering::SeqCst) || !Arc::ptr_eq(&route.received, &self.received) {
             return Err("control event stream unavailable");
         }
-        Ok(self.received.load(Ordering::SeqCst))
+        Ok(publish(self.received.load(Ordering::SeqCst)))
     }
 }
 pub struct BoundedMethodEvents {
@@ -2304,6 +2313,27 @@ mod tests {
         let watermark = events.watermark();
         routes.lock().unwrap().get_mut(&1).unwrap().received = Arc::new(AtomicU64::new(0));
         assert!(watermark.received().is_err());
+    }
+    #[test]
+    fn exact_tap_publication_fence_retains_reader_admission_lock() {
+        let (routes, events) = bounded_fixture(2, 100);
+        let watermark = events.watermark();
+        publish_bounded(&routes, &paused_event(), 30);
+        watermark
+            .with_received(|received| {
+                assert_eq!(received, 1);
+                assert!(
+                    routes.try_lock().is_err(),
+                    "reader admission must remain fenced through publish"
+                );
+            })
+            .unwrap();
+        publish_bounded(&routes, &paused_event(), 30);
+        assert_eq!(watermark.received(), Ok(2));
+        drop(events);
+        let mut published = false;
+        assert!(watermark.with_received(|_| published = true).is_err());
+        assert!(!published);
     }
     #[tokio::test]
     async fn terminal_receipt_count_requires_closed_empty_exact_receiver_without_overflow() {

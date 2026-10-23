@@ -699,6 +699,7 @@ struct CaptureSnapshot {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CaptureTestPoint {
+    RestartWaiting,
     AfterInitialDrain,
     BeforeInfo,
     AfterInfoAck,
@@ -1984,6 +1985,100 @@ impl ClientEnrollment {
             }
             bounded(op, async {
                 changed.await;
+                Ok(())
+            })
+            .await?;
+        }
+    }
+    /// Restart publication joins all observed configuration work, not only the
+    /// selected page. No index/routes/registry guard survives an await.
+    pub(crate) async fn publish_restart_ready<T>(
+        &self,
+        replacement: &OwnedTarget,
+        op: &OperationLease,
+        publish: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        let watermark = self.realm_watermark()?;
+        let mut publish = Some(publish);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let targets_changed = self.targets.changed();
+            tokio::pin!(targets_changed);
+            targets_changed.as_mut().enable();
+            self.check_restart_operation(op)?;
+            let result = {
+                let index = self
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if let Some(error) = &index.failure {
+                    return Err(error.clone());
+                }
+                if self.sealed.load(Ordering::Acquire) || !index.reconciled {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                let entry = index
+                    .sessions
+                    .get(&replacement.session_id)
+                    .ok_or(ProtocolError::StaleReference)?;
+                if entry.target != replacement.target_id
+                    || entry.kind != "page"
+                    || entry.root != entry.session
+                    || !entry.application
+                    || !entry.resumed
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                // Unknown incompleteness is not permission to wait indefinitely.
+                if index.sessions.values().any(|entry| {
+                    (entry.application || entry.observation_only)
+                        && !entry.resumed
+                        && !index.pending_enrollment.contains(&entry.session)
+                }) {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                watermark
+                    .with_received(|received| {
+                        if index.applied_watermark > received {
+                            return Err(ProtocolError::StaleScope);
+                        }
+                        self.targets.publish_restart_ready(
+                            replacement,
+                            &index.pending_enrollment,
+                            index.applied_watermark == received
+                                && index.pending_enrollment.is_empty(),
+                            || {
+                                if *op.cancellation.borrow() != CancelSignal::None {
+                                    return Err(ProtocolError::Cancelled);
+                                }
+                                if Instant::now() >= op.deadline {
+                                    return Err(ProtocolError::DeadlineExceeded);
+                                }
+                                // index -> reader routes -> targets, through result
+                                // publication. No newly admitted event can fall in
+                                // the gap between this watermark and this inventory.
+                                publish.take().ok_or(ProtocolError::StaleScope)?()
+                            },
+                        )
+                    })
+                    .map_err(|_| ProtocolError::ScopeUnavailable)??
+            };
+            if let Some(result) = result {
+                return Ok(result);
+            }
+            #[cfg(test)]
+            if let Some(waiting) = self
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .remove(&CaptureTestPoint::RestartWaiting)
+            {
+                waiting.entered.add_permits(1);
+            }
+            bounded(op, async {
+                tokio::select! { _ = changed => {}, _ = targets_changed => {} }
                 Ok(())
             })
             .await?;
@@ -5256,6 +5351,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
     type Log = Arc<Mutex<Vec<Value>>>;
     type Notices = tokio::sync::mpsc::Receiver<ServerMessage>;
+    include!("client_restart_readiness_tests.rs");
     fn coordinator(
         client: Arc<CdpClient>,
         context: &str,

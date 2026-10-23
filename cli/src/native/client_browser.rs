@@ -3971,21 +3971,22 @@ impl ClientBrowser {
                     if borrowed { owner.borrowed_targets = Some(vec![replacement.target_id.clone()]); }
                     (owner.lease(gate.enter(false)?)?, owner.recovery_identity())
                 };
+                replacement.publish_ready(&context, || next.permit.check()).await?;
                 if cleanup_trace::inventory_enabled() {
                     cleanup_trace::inventory_snapshot(operation.generation, operation.sequence,
                         cleanup_trace::InventoryPoint::RestartReady, next.targets.inventory_diagnostic());
                 }
-                active.store(true, std::sync::atomic::Ordering::SeqCst);
                 if actions.is_recording_armed().await? {
                     let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
                     let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
                     actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
                 }
-                if *operation.cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
-                if std::time::Instant::now() >= operation.deadline { return Err(ProtocolError::DeadlineExceeded); }
-                next.permit.check()?;
-                Ok(serde_json::json!({"identityScope":scope,"recoveryIdentity":recovery_identity}))
+                replacement.publish_ready(&context, || {
+                    next.permit.check()?;
+                    active.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(serde_json::json!({"identityScope":scope,"recoveryIdentity":recovery_identity}))
+                }).await
             }.await;
             // Any failed destructive restart cannot be replayed against its new
             // page. Retain the original context for normal lifecycle containment.

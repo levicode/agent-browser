@@ -949,6 +949,76 @@ impl ClientTargets {
         }
         Ok((state.revision, state.targets.values().cloned().collect()))
     }
+    /// Restart alone may wait for exact, already-observed enrollment work. Keep
+    /// the full registry guard through publication; ordinary settlement remains
+    /// fail closed and never treats an incomplete inventory as reusable.
+    pub(crate) fn publish_restart_ready<T>(
+        &self,
+        replacement: &OwnedTarget,
+        pending: &HashSet<String>,
+        enrollment_ready: bool,
+        publish: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<Option<T>, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || state.integrity_lost
+            || !state.enrollment_ready
+            || state.protected_read
+            || state.reservations != 0
+            || state
+                .auxiliary
+                .values()
+                .any(|entry| !entry.detached && entry.claimed_session.is_none())
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let current = state
+            .targets
+            .get(&replacement.target_id)
+            .ok_or(ProtocolError::StaleReference)?;
+        if !current.same_attachment(replacement)
+            || current.kind != "page"
+            || !current.capture_ready()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut configuring = false;
+        for target in state.targets.values() {
+            if target.purpose.is_none()
+                || !target.configured
+                || !target.resumed
+                || target.resume_pending
+            {
+                if !pending.contains(&target.session_id) {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                configuring = true;
+            }
+        }
+        if state.resuming
+            != state
+                .targets
+                .values()
+                .filter(|target| target.resume_pending)
+                .count()
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if configuring || !enrollment_ready {
+            return Ok(None);
+        }
+        // Preserve the original full-inventory contract at the final boundary.
+        if !state.inventory_complete() {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        publish().map(Some)
+    }
+    pub(crate) fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
+    }
     pub fn check_revision(&self, revision: u64) -> Result<(), ProtocolError> {
         let state = self
             .state
