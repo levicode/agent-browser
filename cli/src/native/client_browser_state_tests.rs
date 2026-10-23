@@ -657,3 +657,6 @@ document.getElementById('token').textContent = localStorage.getItem('token') ?? 
 
 #[path = "client_browser_restart_transport_tests.rs"]
 mod restart_transport_tests;
+
+#[path = "client_browser_service_worker_admission_tests.rs"]
+mod service_worker_admission_tests;
