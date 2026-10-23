@@ -198,6 +198,21 @@ mod restart_readiness {
     }
 
     #[tokio::test]
+    async fn stored_failure_precedes_its_secondary_stop_cancellation() {
+        let f = CaptureWireFixture::new(false).await;
+        emit_held(&f, "held", "held-session", "browser-ui").await;
+        let _request = held_request(&f, "held-session").await;
+        let published = Arc::new(AtomicBool::new(false));
+        let waiting = f.gate(CaptureTestPoint::RestartWaiting);
+        let task = publish(&f, f.owner.operation(), published.clone());
+        waiting.wait_entered().await;
+        f.owner.poison(ProtocolError::CleanupFailed);
+        assert_eq!(task.await.unwrap(), Err(ProtocolError::CleanupFailed));
+        assert!(!published.load(Ordering::SeqCst));
+        f.finish().await;
+    }
+
+    #[tokio::test]
     async fn seal_wakes_waiter_and_never_becomes_a_pending_configuration() {
         for coordinator in [true, false] {
             let f = CaptureWireFixture::new(false).await;

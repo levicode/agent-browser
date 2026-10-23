@@ -2077,11 +2077,17 @@ impl ClientEnrollment {
             {
                 waiting.entered.add_permits(1);
             }
-            bounded(op, async {
+            let waited = bounded(op, async {
                 tokio::select! { _ = changed => {}, _ = targets_changed => {} }
                 Ok(())
             })
-            .await?;
+            .await;
+            if let Err(error) = waited {
+                // poison() also cancels the coordinator's stop channel. Keep
+                // the stored cause instead of returning secondary cancellation.
+                self.check()?;
+                return Err(error);
+            }
         }
     }
     /// Explicit exact-page retirement, never permission to close a worker or
