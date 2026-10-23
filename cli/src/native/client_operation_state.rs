@@ -1,6 +1,9 @@
 //! Bounded status of retained application producers, not browser ownership.
 //! Entries never infer clean retirement from a dropped waiter or empty debt.
-use super::client_debt::{CleanupDisposition, OperationJournalHandle, OperationKey};
+use super::client_debt::{
+    CleanupDisposition, EvalAuthorityStamp, EvalWindowHandle, OperationJournalHandle, OperationKey,
+    ReentrantEvalPermit,
+};
 use super::client_protocol::{ProtocolError, RetentionDescriptor, RetentionProducerState};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -103,6 +106,72 @@ pub(crate) struct OperationRegistry {
     pub(crate) changed: Notify,
 }
 impl OperationRegistry {
+    /// Retain entries across provisional installation and snapshots. Ledger is
+    /// deliberately not held while journal.snapshot performs its own accounting.
+    pub(crate) fn prepare_eval_window(
+        &self,
+        journal: &OperationJournalHandle,
+        operation: &super::client_session::OperationLease,
+        stamp: EvalAuthorityStamp,
+    ) -> Result<EvalWindowHandle, ProtocolError> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let entry = entries
+            .get(&journal.key())
+            .ok_or(ProtocolError::OperationMissing)?;
+        if entry.state != ProducerState::Running
+            || !std::sync::Arc::ptr_eq(&entry.journal.ledger(), &journal.ledger())
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let ledger = journal.ledger();
+        let handle = ledger.begin_eval_window(journal, operation, stamp)?;
+        let result = (|| {
+            if !Self::entries_input_ready(&entries, journal.key(), None)? {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            ledger.arm_eval_window(&handle)
+        })();
+        if let Err(error) = result {
+            ledger.abandon_eval_preparation(&handle);
+            return Err(error);
+        }
+        Ok(handle)
+    }
+    pub(crate) fn check_eval_dispatch(
+        &self,
+        permit: &ReentrantEvalPermit,
+    ) -> Result<(), ProtocolError> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let child = entries
+            .get(&permit.child())
+            .ok_or(ProtocolError::OperationMissing)?;
+        let ledger = child.journal.ledger();
+        if !permit.window().belongs_to(&ledger) {
+            return Err(ProtocolError::StaleScope);
+        }
+        ledger.check_eval_input(permit)?;
+        if Self::entries_input_ready(&entries, permit.child(), Some(permit.window().root()))? {
+            Ok(())
+        } else {
+            Err(ProtocolError::ScopeUnavailable)
+        }
+    }
+    fn revoke_eval_windows(entries: &HashMap<OperationKey, Entry>) {
+        for entry in entries.values() {
+            entry.journal.ledger().invalidate_eval_authority();
+        }
+    }
+    fn fail_eval_windows(entries: &HashMap<OperationKey, Entry>) {
+        for entry in entries.values() {
+            entry.journal.ledger().fail_eval_authority();
+        }
+    }
     pub(crate) fn register(&self, journal: OperationJournalHandle) -> Result<(), ProtocolError> {
         let mut entries = self
             .entries
@@ -171,6 +240,10 @@ impl OperationRegistry {
     /// once; subsequent lookups/new requests cannot extend it.
     pub(crate) fn retire(&self, key: OperationKey) -> Option<Instant> {
         let mut entries = self.entries.lock().ok()?;
+        if !entries.contains_key(&key) {
+            return None;
+        }
+        Self::revoke_eval_windows(&entries);
         let entry = entries.get_mut(&key)?;
         entry.journal.revoke_application_submission();
         if entry.state == ProducerState::IntegrityLost {
@@ -189,15 +262,31 @@ impl OperationRegistry {
         let Ok(mut entries) = self.entries.lock() else {
             return true;
         };
+        let expired = entries.get(&key).is_some_and(|entry| {
+            entry.state == ProducerState::Retiring
+                && entry
+                    .retirement_deadline
+                    .is_some_and(|limit| Instant::now() >= limit)
+        });
+        if integrity_lost
+            || expired
+            || entries
+                .get(&key)
+                .is_some_and(|entry| entry.state == ProducerState::IntegrityLost)
+        {
+            Self::fail_eval_windows(&entries);
+        }
         let Some(entry) = entries.get_mut(&key) else {
             return true;
         };
         // Completion and expiry linearize under the same lock. A delayed timer
         // cannot let a late producer erase its already-fixed Unknown receipt.
-        let expired = entry.state == ProducerState::Retiring
-            && entry
-                .retirement_deadline
-                .is_some_and(|limit| Instant::now() >= limit);
+        // The retained future really returned. Revoke before publishing any
+        // producer transition; a fixed result alone never ends this obligation.
+        entry
+            .journal
+            .ledger()
+            .eval_operation_terminal(key, true, entry.result_fixed);
         if integrity_lost || expired || entry.state == ProducerState::IntegrityLost {
             entry
                 .journal
@@ -223,8 +312,6 @@ impl OperationRegistry {
             });
             entry.state = ProducerState::Retired;
         }
-        // This is only called after the retained future, including cleanup,
-        // really returned. Neither transport cancellation nor Drop calls it.
         entry.journal.finish_local_producers();
         let integrity_lost = entry.state == ProducerState::IntegrityLost;
         if entry.result_fixed && entry.state == ProducerState::Retired {
@@ -238,6 +325,10 @@ impl OperationRegistry {
             return;
         };
         if let Some(entry) = entries.get_mut(&key) {
+            entry
+                .journal
+                .ledger()
+                .eval_operation_terminal(key, false, true);
             entry.result_fixed = true;
             if entry.state == ProducerState::Retired {
                 entries.remove(&key);
@@ -250,6 +341,12 @@ impl OperationRegistry {
         let Ok(mut entries) = self.entries.lock() else {
             return true;
         };
+        if entries.get(&key).is_some_and(|entry| {
+            entry.state == ProducerState::Retiring
+                && entry.retirement_deadline.is_some_and(|limit| now >= limit)
+        }) {
+            Self::fail_eval_windows(&entries);
+        }
         let Some(entry) = entries.get_mut(&key) else {
             return false;
         };
@@ -354,12 +451,29 @@ impl OperationRegistry {
             .entries
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        Self::entries_input_ready(&entries, key, None)
+    }
+    fn entries_input_ready(
+        entries: &HashMap<OperationKey, Entry>,
+        key: OperationKey,
+        eval_root: Option<OperationKey>,
+    ) -> Result<bool, ProtocolError> {
         for (other, entry) in entries.iter() {
             let snapshot = entry.journal.snapshot();
             if snapshot.integrity_lost || entry.state == ProducerState::IntegrityLost {
                 return Err(ProtocolError::ScopeUnavailable);
             }
             if *other == key {
+                continue;
+            }
+            if Some(*other) == eval_root {
+                if entry.state != ProducerState::Running
+                    || snapshot.submission_revoked
+                    || snapshot.local_producers_finished
+                    || !snapshot.mutation_dispatched
+                {
+                    return Ok(false);
+                }
                 continue;
             }
             if entry.state == ProducerState::Retiring
@@ -415,6 +529,114 @@ mod tests {
             )
             .unwrap()
     }
+    fn eval_operation(
+        ledger: &std::sync::Arc<OwnerDebtLedger>,
+        sequence: u64,
+    ) -> (
+        super::super::client_session::OperationLease,
+        OperationJournalHandle,
+    ) {
+        let (_send, cancellation) =
+            tokio::sync::watch::channel(super::super::client_session::CancelSignal::None);
+        let op = super::super::client_session::OperationLease {
+            generation: 1,
+            sequence,
+            deadline: Instant::now() + Duration::from_secs(5),
+            cancellation,
+            is_callback: false,
+        };
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: sequence,
+                },
+                "page".into(),
+                "session".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&op).unwrap();
+        (op, journal)
+    }
+    fn eval_stamp(ledger: &OwnerDebtLedger) -> EvalAuthorityStamp {
+        EvalAuthorityStamp {
+            revision: ledger.eval_authority_revision().unwrap(),
+            target: "page".into(),
+            session: "session".into(),
+            frame: "frame".into(),
+            loader: "loader".into(),
+        }
+    }
+    #[tokio::test]
+    async fn eval_family_exception_is_exact_root_only_and_retirement_revokes_reserved_child() {
+        use super::super::client_debt::{eval_command_scope, EvalCommandGrant};
+        let registry = OperationRegistry::default();
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        let (root, journal) = eval_operation(&ledger, 1);
+        registry.register(journal.clone()).unwrap();
+        registry.running(journal.key());
+        let window = registry
+            .prepare_eval_window(&journal, &root, eval_stamp(&ledger))
+            .unwrap();
+        window.bind_root(&root).unwrap();
+        let params = serde_json::json!({"expression":"1","awaitPromise":true,"returnByValue":true,"userGesture":true});
+        let _command = eval_command_scope(EvalCommandGrant::Root(window.clone()), async {
+            ledger
+                .reserve_command(
+                    Some(&journal),
+                    "Runtime.evaluate",
+                    Some(&params),
+                    Some("session"),
+                )
+                .unwrap()
+                .submit()
+                .unwrap()
+        })
+        .await;
+        let (mut child, child_journal) = eval_operation(&ledger, 2);
+        child.is_callback = true;
+        child.deadline = root.deadline;
+        registry.register(child_journal.clone()).unwrap();
+        registry.running(child_journal.key());
+        let permit = window.issue_child(&child).unwrap();
+        assert!(
+            !registry.input_dispatch_ready(child_journal.key()).unwrap(),
+            "normal gate still refuses root debt"
+        );
+        registry.check_eval_dispatch(&permit).unwrap();
+        let (_, unrelated) = eval_operation(&ledger, 3);
+        registry.register(unrelated.clone()).unwrap();
+        registry.running(unrelated.key());
+        registry.retire(unrelated.key()).unwrap();
+        assert!(
+            registry.check_eval_dispatch(&permit).is_err(),
+            "unrelated retirement is never exempted"
+        );
+        assert_eq!(ledger.snapshot().input_debt, 1);
+    }
+    #[test]
+    fn eval_provisional_is_abandoned_for_unrelated_zero_debt_unfixed_result() {
+        let registry = OperationRegistry::default();
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        let (root, journal) = eval_operation(&ledger, 1);
+        let (_, unrelated) = eval_operation(&ledger, 2);
+        registry.register(journal.clone()).unwrap();
+        registry.running(journal.key());
+        registry.register(unrelated.clone()).unwrap();
+        registry.running(unrelated.key());
+        registry.retire(unrelated.key()).unwrap();
+        registry.finish(unrelated.key(), false);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(registry
+            .prepare_eval_window(&journal, &root, eval_stamp(&ledger))
+            .is_err());
+        registry.fix_result(unrelated.key());
+        let window = registry
+            .prepare_eval_window(&journal, &root, eval_stamp(&ledger))
+            .unwrap();
+        ledger.abandon_eval_preparation(&window);
+    }
+
     #[test]
     fn late_finish_cannot_erase_fixed_unknown_before_expiry_monitor_runs() {
         let registry = OperationRegistry::default();

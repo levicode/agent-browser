@@ -807,13 +807,11 @@ impl CdpClient {
                         params: parsed.params.clone().unwrap_or(Value::Null),
                         session_id: parsed.session_id.clone(),
                     };
-                    if let Some(ledger) = debt_reader
+                    let eval_publication = debt_reader
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .as_ref()
-                    {
-                        ledger.observe_event(&event);
-                    }
+                        .and_then(|ledger| ledger.observe_event_for_publication(&event));
                     let routed = event.session_id.as_deref().is_some_and(|sid| {
                         let mut routes = private_clone.lock().unwrap_or_else(|e| e.into_inner());
                         match routes.get(sid) {
@@ -828,6 +826,9 @@ impl CdpClient {
                         }
                     });
                     publish_bounded(&bounded_taps_clone, &event, msg.len());
+                    if let Some(publication) = eval_publication {
+                        publication.complete();
+                    }
                     // Register the lifecycle watermark before waking a failed
                     // caller, so a following operation cannot outrun admission.
                     retire_detached_waiters(&pending_clone, &event).await;
@@ -2262,6 +2263,105 @@ mod tests {
             session_id: Some("owned".into()),
         }
     }
+    #[test]
+    fn eval_publication_completion_preserves_exact_route_and_identity_failures() {
+        use super::super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        for mode in [
+            "normal",
+            "oversize",
+            "budget",
+            "full",
+            "closed",
+            "removed",
+            "poisoned",
+            "exhausted",
+            "unmatched",
+            "destroyed-no-route",
+            "abandoned-after-publish",
+        ] {
+            let ledger = OwnerDebtLedger::new(7, "scope".into());
+            let _journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 7,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            let (routes, mut events) = bounded_fixture(1, 100);
+            routes.lock().unwrap().get_mut(&1).unwrap().methods = &["Page.frameNavigated"];
+            let watermark = events.watermark();
+            let event = CdpEvent {
+                method: if mode == "destroyed-no-route" {
+                    "Target.targetDestroyed"
+                } else {
+                    "Page.frameNavigated"
+                }
+                .into(),
+                params: json!({"targetId":"target","frame":{"id":"frame","loaderId":"next"}}),
+                session_id: Some("page".into()),
+            };
+            match mode {
+                "full" => publish_bounded(&routes, &event, 30),
+                "budget" => {
+                    routes
+                        .lock()
+                        .unwrap()
+                        .get_mut(&1)
+                        .unwrap()
+                        .budget
+                        .used
+                        .store(100, Ordering::SeqCst);
+                }
+                "closed" => events.receiver.close(),
+                "removed" => routes.lock().unwrap().clear(),
+                "poisoned" => {
+                    let routes = routes.clone();
+                    assert!(std::panic::catch_unwind(move || {
+                        let _guard = routes.lock().unwrap();
+                        panic!("synthetic route poison");
+                    })
+                    .is_err());
+                }
+                "exhausted" => events.received.store(u64::MAX, Ordering::SeqCst),
+                "unmatched" => {
+                    routes.lock().unwrap().get_mut(&1).unwrap().methods = &["Fetch.requestPaused"]
+                }
+                _ => {}
+            }
+            let publication = ledger.observe_event_for_publication(&event).unwrap();
+            assert!(ledger.capture_eval_revision("page", "target").is_err());
+            publish_bounded(&routes, &event, if mode == "oversize" { 101 } else { 30 });
+            if mode == "abandoned-after-publish" {
+                drop(publication);
+                assert!(ledger.capture_eval_revision("page", "target").is_err());
+            } else {
+                publication.complete();
+                if mode == "destroyed-no-route" {
+                    assert_eq!(watermark.received(), Ok(0));
+                    assert!(
+                        ledger.capture_eval_revision("page", "target").is_err(),
+                        "missing target identity is not repaired by zero matching subscriptions"
+                    );
+                } else {
+                    assert!(ledger.capture_eval_revision("page", "target").is_ok());
+                    if mode == "normal" {
+                        assert_eq!(watermark.received(), Ok(1));
+                    } else if mode == "unmatched" {
+                        assert_eq!(watermark.received(), Ok(0));
+                    } else {
+                        assert!(
+                            watermark.received().is_err(),
+                            "completion cannot repair {mode} subscription"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn exact_tap_watermark_includes_queued_events_and_sequence_survives_recv() {
         let (routes, mut events) = bounded_fixture(4, 100);

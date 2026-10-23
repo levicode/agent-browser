@@ -2137,13 +2137,16 @@ impl ClientNetwork {
         if request_origin != parsed.origin() || attempted {
             return self.client.send_command("Fetch.continueWithAuth",Some(json!({"requestId":request_id,"authChallengeResponse":{"response":"CancelAuth"}})),Some(session)).await.map(|_|()).map_err(|_|ProtocolError::BrowserFailure);
         }
-        let lease = self.broker.decision_scoped(
+        let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
             DecisionOwner::Scope,
             DecisionKind::Authentication,
             30_000,
             None,
             Some(self.scope.identity_scope.clone()),
+            self.client.debt_ledger().and_then(|ledger| {
+                ledger.capturable_eval_window(&self.scope.identity_scope, session)
+            }),
         )?;
         let _token = self.track_token(session, &lease.token)?;
         sink.emit("network.auth".into(),json!({"identityScope":self.scope.identity_scope,"origin":parsed.origin().ascii_serialization(),"source":"Server","scheme":challenge.get("scheme"),"realm":challenge.get("realm")}),Some(DecisionNotice{token:lease.token,timeout_ms:30_000}))?;
@@ -2179,13 +2182,16 @@ impl ClientNetwork {
             return Err(ProtocolError::InvalidArguments);
         }
         let message = required_string(&params, "message")?;
-        let lease = self.broker.decision_scoped(
+        let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
             DecisionOwner::Scope,
             DecisionKind::Dialog,
             30_000,
             None,
             Some(self.scope.identity_scope.clone()),
+            self.client.debt_ledger().and_then(|ledger| {
+                ledger.capturable_eval_window(&self.scope.identity_scope, session)
+            }),
         )?;
         let _token = self.track_token(session, &lease.token)?;
         sink.emit(
@@ -2709,13 +2715,16 @@ impl ClientNetwork {
         if self.routes_frozen.load(Ordering::Acquire) {
             return Err(ProtocolError::StaleScope);
         }
-        let lease = self.broker.decision_scoped(
+        let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
             owner,
             DecisionKind::Request,
             timeout_ms,
             *current,
             Some(self.scope.identity_scope.clone()),
+            self.client.debt_ledger().and_then(|ledger| {
+                ledger.capturable_eval_window(&self.scope.identity_scope, session)
+            }),
         )?;
         let mut tokens = self
             .tokens

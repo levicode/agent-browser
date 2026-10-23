@@ -80,6 +80,7 @@ pub struct ClientTargets {
     pub context_id: String,
     pub identity_scope: String,
     state: Mutex<Registry>,
+    eval_owner: std::sync::OnceLock<std::sync::Weak<super::client_debt::OwnerDebtLedger>>,
     changed: Notify,
 }
 pub struct CreationReservation {
@@ -147,41 +148,49 @@ impl Drop for ProtectedTargetBarrier {
 }
 impl ResumePermit {
     pub fn complete(mut self) -> Result<(), ProtocolError> {
-        let mut state = self
-            .registry
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed {
-            return Err(ProtocolError::StaleScope);
-        }
-        let target = state
-            .targets
-            .get_mut(&self.target_id)
-            .ok_or(ProtocolError::StaleReference)?;
-        if target.session_id != self.session_id {
-            state.lose_integrity();
-            return Err(ProtocolError::StaleScope);
-        }
-        target.resumed = true;
-        self.completed = true;
-        Ok(())
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .registry
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.sealed {
+                return Err(ProtocolError::StaleScope);
+            }
+            let target = state
+                .targets
+                .get_mut(&self.target_id)
+                .ok_or(ProtocolError::StaleReference)?;
+            if target.session_id != self.session_id {
+                state.lose_integrity();
+                return Err(ProtocolError::StaleScope);
+            }
+            target.resumed = true;
+            self.completed = true;
+            Ok(())
+        })
     }
 }
 impl Drop for ResumePermit {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.registry.state.lock() {
-            if let Some(target) = state.targets.get_mut(&self.target_id) {
-                if target.session_id == self.session_id {
-                    target.resume_pending = false;
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.registry.state.lock() {
+                if let Some(target) = state.targets.get_mut(&self.target_id) {
+                    if target.session_id == self.session_id {
+                        target.resume_pending = false;
+                    }
+                }
+                state.resuming = state.resuming.saturating_sub(1);
+                if !self.completed {
+                    state.lose_integrity();
                 }
             }
-            state.resuming = state.resuming.saturating_sub(1);
-            if !self.completed {
-                state.lose_integrity();
-            }
-        }
-        self.registry.changed.notify_waiters();
+            self.registry.changed.notify_waiters();
+        })
     }
 }
 impl ClientTargets {
@@ -190,8 +199,54 @@ impl ClientTargets {
             context_id,
             identity_scope,
             state: Mutex::new(Registry::default()),
+            eval_owner: std::sync::OnceLock::new(),
             changed: Notify::new(),
         })
+    }
+    pub(crate) fn bind_eval_owner(
+        &self,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+        generation: u64,
+    ) -> Result<(), ProtocolError> {
+        if !ledger.matches_owner(generation, &self.identity_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if let Some(owner) = self.eval_owner.get() {
+            if owner
+                .upgrade()
+                .is_none_or(|owner| !Arc::ptr_eq(&owner, ledger))
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            return Ok(());
+        }
+        self.eval_owner
+            .set(Arc::downgrade(ledger))
+            .map_err(|_| ProtocolError::ScopeUnavailable)
+    }
+    pub(crate) fn require_eval_owner(
+        &self,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+    ) -> Result<(), ProtocolError> {
+        if self
+            .eval_owner
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|owner| Arc::ptr_eq(&owner, ledger))
+        {
+            Ok(())
+        } else {
+            Err(ProtocolError::StaleScope)
+        }
+    }
+    /// Called before taking state: initialization already uses ledger -> targets.
+    fn eval_invalidation<T>(&self, mutation: impl FnOnce(&mut dyn FnMut()) -> T) -> T {
+        if let Some(owner) = self.eval_owner.get().and_then(std::sync::Weak::upgrade) {
+            owner.with_eval_target_invalidation(mutation)
+        } else {
+            // No eval grant can exist without the exact live owner binding.
+            mutation(&mut || {})
+        }
     }
     /// Lifecycle owner calls this only after bounded event routing and recursive
     /// target attachment barriers are installed and initial inventory reconciled.
@@ -517,7 +572,7 @@ impl ClientTargets {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            {
+            let disposition = self.eval_invalidation(|revoke| {
                 let mut state = self
                     .state
                     .lock()
@@ -527,7 +582,7 @@ impl ClientTargets {
                         && (entry.acknowledged_session.as_deref() == Some(session_id)
                             || entry.cleanup_owned.contains(session_id))
                 }) {
-                    return Ok(AuxiliaryDisposition::RecorderOwned);
+                    return Ok(Some(AuxiliaryDisposition::RecorderOwned));
                 }
                 let sealed = state.sealed;
                 let pending = state.auxiliary.values_mut().find(|entry| {
@@ -536,28 +591,39 @@ impl ClientTargets {
                         && !entry.detached
                 });
                 let Some(pending) = pending else {
-                    return Ok(AuxiliaryDisposition::Ordinary);
+                    return Ok(Some(AuxiliaryDisposition::Ordinary));
                 };
                 if pending.primary_session == session_id {
-                    return Ok(AuxiliaryDisposition::Ordinary);
+                    return Ok(Some(AuxiliaryDisposition::Ordinary));
                 }
                 if session_id.is_empty() || session_id.len() > 1024 {
                     return Err(ProtocolError::InvalidFrame);
                 }
                 if pending.candidates.len() >= 64 && !pending.candidates.contains(session_id) {
+                    revoke();
                     pending.failed = true;
                     state.lose_integrity();
                     self.changed.notify_waiters();
                     return Err(ProtocolError::CapacityExceeded);
                 }
-                pending.candidates.insert(session_id.into());
+                if !pending.candidates.contains(session_id) {
+                    revoke();
+                    pending.candidates.insert(session_id.into());
+                }
                 if sealed || pending.failed {
                     // The retained recorder supervisor, not generic enrollment,
                     // owns this candidate's detach. A later exact ACK must not
                     // create a second concurrent cleanup owner.
-                    pending.cleanup_owned.insert(session_id.into());
-                    return Ok(AuxiliaryDisposition::RecorderOwned);
+                    if !pending.cleanup_owned.contains(session_id) {
+                        revoke();
+                        pending.cleanup_owned.insert(session_id.into());
+                    }
+                    return Ok(Some(AuxiliaryDisposition::RecorderOwned));
                 }
+                Ok(None)
+            })?;
+            if let Some(disposition) = disposition {
+                return Ok(disposition);
             }
             changed.await;
         }
@@ -611,51 +677,54 @@ impl ClientTargets {
         if context_id != self.context_id {
             return Ok(false);
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed {
-            return Err(ProtocolError::StaleScope);
-        }
-        if state.targets.len() >= 1024 {
-            return Err(ProtocolError::CapacityExceeded);
-        }
-        if target_id.is_empty()
-            || session_id.is_empty()
-            || state.targets.contains_key(&target_id)
-            || state
-                .targets
-                .values()
-                .any(|target| target.session_id == session_id)
-        {
-            return Err(ProtocolError::InvalidArguments);
-        }
-        let purpose = if state.reservations == 0 {
-            Some(TargetPurpose::Application)
-        } else {
-            None
-        };
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or(ProtocolError::IdentifierExhausted)?;
-        state.targets.insert(
-            target_id.clone(),
-            OwnedTarget {
-                target_id,
-                session_id,
-                kind,
-                purpose,
-                configured: false,
-                resumed: false,
-                resume_pending: false,
-                tenure: Arc::new(AttachmentTenure),
-            },
-        );
-        drop(state);
-        self.changed.notify_waiters();
-        Ok(true)
+        self.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.sealed {
+                return Err(ProtocolError::StaleScope);
+            }
+            if state.targets.len() >= 1024 {
+                return Err(ProtocolError::CapacityExceeded);
+            }
+            if target_id.is_empty()
+                || session_id.is_empty()
+                || state.targets.contains_key(&target_id)
+                || state
+                    .targets
+                    .values()
+                    .any(|target| target.session_id == session_id)
+            {
+                return Err(ProtocolError::InvalidArguments);
+            }
+            let purpose = if state.reservations == 0 {
+                Some(TargetPurpose::Application)
+            } else {
+                None
+            };
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(ProtocolError::IdentifierExhausted)?;
+            state.targets.insert(
+                target_id.clone(),
+                OwnedTarget {
+                    target_id,
+                    session_id,
+                    kind,
+                    purpose,
+                    configured: false,
+                    resumed: false,
+                    resume_pending: false,
+                    tenure: Arc::new(AttachmentTenure),
+                },
+            );
+            drop(state);
+            self.changed.notify_waiters();
+            Ok(true)
+        })
     }
     /// The create reply and attach event may arrive in either order. The
     /// lifecycle supervisor retains this wait under its original deadline.
@@ -809,33 +878,39 @@ impl ClientTargets {
         Ok(())
     }
     pub fn detach(&self, target_id: &str) -> Result<(), ProtocolError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.targets.remove(target_id).is_some() {
+        self.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.targets.remove(target_id).is_some() {
+                state.revision = state
+                    .revision
+                    .checked_add(1)
+                    .ok_or(ProtocolError::IdentifierExhausted)?;
+            }
+            drop(state);
+            self.changed.notify_waiters();
+            Ok(())
+        })
+    }
+    pub fn invalidate_inventory(&self) -> Result<(), ProtocolError> {
+        self.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.sealed {
+                return Err(ProtocolError::StaleScope);
+            }
             state.revision = state
                 .revision
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
-        }
-        drop(state);
-        self.changed.notify_waiters();
-        Ok(())
-    }
-    pub fn invalidate_inventory(&self) -> Result<(), ProtocolError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed {
-            return Err(ProtocolError::StaleScope);
-        }
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or(ProtocolError::IdentifierExhausted)?;
-        Ok(())
+            Ok(())
+        })
     }
     pub fn inventory(&self) -> Result<(u64, Vec<OwnedTarget>), ProtocolError> {
         let state = self
@@ -859,18 +934,24 @@ impl ClientTargets {
         }
     }
     pub fn seal(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.lose_integrity();
-        }
-        self.changed.notify_waiters();
+        self.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.state.lock() {
+                state.lose_integrity();
+            }
+            self.changed.notify_waiters();
+        })
     }
     /// Stop admission without inventing either cleanup success or accounting
     /// failure. Only an earlier owner-retirement stamp can certify settlement.
     pub(crate) fn seal_admission(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.sealed = true;
-        }
-        self.changed.notify_waiters();
+        self.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.state.lock() {
+                state.sealed = true;
+            }
+            self.changed.notify_waiters();
+        })
     }
     /// Called by the retained lifecycle owner before stopping enrollment. The
     /// first inventory is immutable: later cleanup cannot repair missing proof,
@@ -879,19 +960,22 @@ impl ClientTargets {
         &self,
         authority: &super::client_browser::OwnerRetirement,
     ) {
-        if let Ok(mut state) = self.state.lock() {
-            if !authority.authorizes(self) {
-                state.lose_integrity();
-                self.changed.notify_waiters();
-                return;
+        self.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.state.lock() {
+                if !authority.authorizes(self) {
+                    state.lose_integrity();
+                    self.changed.notify_waiters();
+                    return;
+                }
+                if state.owner_retirement_inventory.is_none() {
+                    state.owner_retirement_inventory =
+                        Some(!state.sealed && !state.integrity_lost && state.inventory_complete());
+                }
+                state.sealed = true;
             }
-            if state.owner_retirement_inventory.is_none() {
-                state.owner_retirement_inventory =
-                    Some(!state.sealed && !state.integrity_lost && state.inventory_complete());
-            }
-            state.sealed = true;
-        }
-        self.changed.notify_waiters();
+            self.changed.notify_waiters();
+        })
     }
     /// Final-local cleanup only: admission may already be sealed, but no
     /// accounting damage or unsettled exact resource/reservation is waived.
@@ -997,77 +1081,85 @@ impl AuxiliaryAttachmentReservation {
         Ok(())
     }
     pub(crate) fn claim(&mut self, session_id: &str) -> Result<(), ProtocolError> {
-        let mut state = self
-            .registry
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if self.completed {
-            return Err(ProtocolError::StaleScope);
-        }
-        if session_id.is_empty()
-            || session_id.len() > 1024
-            || state
-                .targets
-                .values()
-                .any(|target| target.session_id == session_id)
-            || state
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .registry
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if self.completed {
+                return Err(ProtocolError::StaleScope);
+            }
+            if session_id.is_empty()
+                || session_id.len() > 1024
+                || state
+                    .targets
+                    .values()
+                    .any(|target| target.session_id == session_id)
+                || state
+                    .auxiliary
+                    .values()
+                    .any(|entry| entry.acknowledged_session.as_deref() == Some(session_id))
+            {
+                return Err(ProtocolError::InvalidArguments);
+            }
+            let reserved = state
                 .auxiliary
-                .values()
-                .any(|entry| entry.acknowledged_session.as_deref() == Some(session_id))
-        {
-            return Err(ProtocolError::InvalidArguments);
-        }
-        let reserved = state
-            .auxiliary
-            .get(&self.nonce)
-            .ok_or(ProtocolError::StaleScope)?;
-        if session_id == reserved.primary_session {
-            return Err(ProtocolError::InvalidArguments);
-        }
-        if reserved.acknowledged_session.is_some() {
-            return Err(ProtocolError::StaleScope);
-        }
-        let valid = !state.sealed
-            && !reserved.failed
-            && state.targets.get(&reserved.target).is_some_and(|target| {
-                target.session_id == reserved.primary_session
-                    && target.purpose == Some(TargetPurpose::Application)
-                    && target.configured
-                    && target.resumed
-            });
-        let entry = state
-            .auxiliary
-            .get_mut(&self.nonce)
-            .ok_or(ProtocolError::StaleScope)?;
-        // Even a late rejected ACK identifies a session we must clean up. Never
-        // lose it merely because its attach notification has not arrived yet.
-        entry.acknowledged_session = Some(session_id.into());
-        if !valid {
-            entry.failed = true;
-            state.lose_integrity();
+                .get(&self.nonce)
+                .ok_or(ProtocolError::StaleScope)?;
+            if session_id == reserved.primary_session {
+                return Err(ProtocolError::InvalidArguments);
+            }
+            if reserved.acknowledged_session.is_some() {
+                return Err(ProtocolError::StaleScope);
+            }
+            let valid = !state.sealed
+                && !reserved.failed
+                && state.targets.get(&reserved.target).is_some_and(|target| {
+                    target.session_id == reserved.primary_session
+                        && target.purpose == Some(TargetPurpose::Application)
+                        && target.configured
+                        && target.resumed
+                });
+            let entry = state
+                .auxiliary
+                .get_mut(&self.nonce)
+                .ok_or(ProtocolError::StaleScope)?;
+            // Even a late rejected ACK identifies a session we must clean up. Never
+            // lose it merely because its attach notification has not arrived yet.
+            entry.acknowledged_session = Some(session_id.into());
+            if !valid {
+                entry.failed = true;
+                state.lose_integrity();
+                drop(state);
+                self.registry.changed.notify_waiters();
+                return Err(ProtocolError::StaleScope);
+            }
+            entry.claimed_session = Some(session_id.into());
             drop(state);
             self.registry.changed.notify_waiters();
-            return Err(ProtocolError::StaleScope);
-        }
-        entry.claimed_session = Some(session_id.into());
-        drop(state);
-        self.registry.changed.notify_waiters();
-        Ok(())
+            Ok(())
+        })
     }
     /// Stop new scope work and wake enrollment while retaining this token's
     /// exact candidate journal for the recorder's bounded failure cleanup.
     pub(crate) fn quarantine(&self) {
-        if let Ok(mut state) = self.registry.state.lock() {
-            if let Some(entry) = state.auxiliary.get_mut(&self.nonce) {
-                entry.failed = true;
-                if entry.acknowledged_session.is_none() {
-                    entry.cleanup_owned.extend(entry.candidates.iter().cloned());
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.registry.state.lock() {
+                if let Some(entry) = state.auxiliary.get_mut(&self.nonce) {
+                    entry.failed = true;
+                    if entry.acknowledged_session.is_none() {
+                        entry.cleanup_owned.extend(entry.candidates.iter().cloned());
+                    }
                 }
+                state.lose_integrity();
             }
-            state.lose_integrity();
-        }
-        self.registry.changed.notify_waiters();
+            self.registry.changed.notify_waiters();
+        })
     }
     /// Only for a retained startup path that proves attach was never sent.
     pub(crate) fn cancel_unsubmitted(mut self) -> Result<(), ProtocolError> {
@@ -1293,38 +1385,254 @@ impl CreationReservation {
 }
 impl Drop for CreationReservation {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.registry.state.lock() {
-            // An abandoned create may still produce a late browser target.
-            // Never reinterpret that unclaimed bootstrap as application work.
-            if !self.claimed {
-                state.lose_integrity();
-                if self.purpose == TargetPurpose::StateBootstrap
-                    && self.native_created_target.is_none()
-                {
-                    // No exact create ACK means no safe target to close. Keep
-                    // this uncertainty after the pending reservation is gone.
-                    state.unknown_bootstrap_create = true;
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.registry.state.lock() {
+                // An abandoned create may still produce a late browser target.
+                // Never reinterpret that unclaimed bootstrap as application work.
+                if !self.claimed {
+                    state.lose_integrity();
+                    if self.purpose == TargetPurpose::StateBootstrap
+                        && self.native_created_target.is_none()
+                    {
+                        // No exact create ACK means no safe target to close. Keep
+                        // this uncertainty after the pending reservation is gone.
+                        state.unknown_bootstrap_create = true;
+                    }
                 }
-            }
-            if let Some(nonce) = self.bootstrap_nonce {
-                state.bootstrap_creations.remove(&nonce);
-                state.bootstrap_cleanup_reservations.remove(&nonce);
-            }
-            state.reservations = state.reservations.saturating_sub(1);
-            if state.reservations == 0 && !state.sealed {
-                for target in state.targets.values_mut() {
-                    if target.purpose.is_none() {
-                        target.purpose = Some(TargetPurpose::Application);
+                if let Some(nonce) = self.bootstrap_nonce {
+                    state.bootstrap_creations.remove(&nonce);
+                    state.bootstrap_cleanup_reservations.remove(&nonce);
+                }
+                state.reservations = state.reservations.saturating_sub(1);
+                if state.reservations == 0 && !state.sealed {
+                    for target in state.targets.values_mut() {
+                        if target.purpose.is_none() {
+                            target.purpose = Some(TargetPurpose::Application);
+                        }
                     }
                 }
             }
-        }
-        self.registry.changed.notify_waiters();
+            self.registry.changed.notify_waiters();
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{ClientTargets, ProtocolError};
+
+    #[test]
+    fn eval_owner_binding_requires_exact_ledger_before_enable_and_cannot_be_rebound() {
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(1, "scope".into());
+        let same_labels = super::super::client_debt::OwnerDebtLedger::new(1, "scope".into());
+        assert_eq!(
+            targets.require_eval_owner(&ledger),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            targets.bind_eval_owner(&ledger, 2),
+            Err(ProtocolError::StaleScope)
+        );
+        targets.bind_eval_owner(&ledger, 1).unwrap();
+        targets.require_eval_owner(&ledger).unwrap();
+        assert_eq!(
+            targets.bind_eval_owner(&same_labels, 1),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            targets.require_eval_owner(&same_labels),
+            Err(ProtocolError::StaleScope)
+        );
+        let revision = ledger.eval_authority_revision().unwrap();
+        targets.seal_admission();
+        assert!(ledger.eval_authority_revision().unwrap() > revision);
+    }
+
+    #[tokio::test]
+    async fn eval_target_failure_and_drop_paths_revoke_reserved_child_and_retain_root_debt() {
+        use super::super::client_debt::{
+            tests::{eval_child, eval_fixture, eval_reservation},
+            EvalCommandGrant,
+        };
+        for mode in [
+            "resume-complete",
+            "resume-drop",
+            "aux-claim",
+            "aux-quarantine",
+            "aux-overflow",
+            "creation-drop",
+            "seal",
+            "seal-admission",
+            "owner-foreign",
+            "owner",
+            "inventory",
+        ] {
+            let targets = ClientTargets::new("context".into(), "scope".into());
+            targets
+                .attached("context", "target".into(), "page".into(), "page".into())
+                .unwrap();
+            targets.configured("target").unwrap();
+            let resume = targets.resume_permit("target").await.unwrap();
+            let mut resume = if mode.starts_with("resume-") {
+                Some(resume)
+            } else {
+                resume.complete().unwrap();
+                None
+            };
+            let mut auxiliary = if mode.starts_with("aux-") {
+                Some(
+                    targets
+                        .reserve_auxiliary_attachment("scope", "target", "page")
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let mut creation = if mode == "creation-drop" {
+                Some(
+                    targets
+                        .reserve_creation(super::TargetPurpose::Application)
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            // Arrange the exact late failure without triggering its production
+            // loss-of-integrity path until after the child has been reserved.
+            if mode == "resume-complete" {
+                targets
+                    .state
+                    .lock()
+                    .unwrap()
+                    .targets
+                    .get_mut("target")
+                    .unwrap()
+                    .session_id = "replacement".into();
+            }
+            if let Some(auxiliary) = &auxiliary {
+                let mut state = targets.state.lock().unwrap();
+                let entry = state.auxiliary.get_mut(&auxiliary.nonce).unwrap();
+                if mode == "aux-claim" {
+                    entry.failed = true;
+                }
+                if mode == "aux-overflow" {
+                    entry
+                        .candidates
+                        .extend((0..64).map(|n| format!("candidate-{n}")));
+                }
+            }
+            let (ledger, journal, root, window) = eval_fixture();
+            targets.bind_eval_owner(&ledger, 7).unwrap();
+            let _root = eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+                .await
+                .submit()
+                .unwrap();
+            let (_, child_journal, permit) = eval_child(&ledger, &root, &window);
+            let child =
+                eval_reservation(&ledger, &child_journal, EvalCommandGrant::Child(permit)).await;
+            match mode {
+                "resume-complete" => {
+                    assert_eq!(
+                        resume.take().unwrap().complete(),
+                        Err(ProtocolError::StaleScope)
+                    );
+                }
+                "resume-drop" => drop(resume.take()),
+                "aux-claim" => {
+                    assert_eq!(
+                        auxiliary.as_mut().unwrap().claim("late-recorder"),
+                        Err(ProtocolError::StaleScope)
+                    );
+                }
+                "aux-quarantine" => auxiliary.as_ref().unwrap().quarantine(),
+                "aux-overflow" => {
+                    assert_eq!(
+                        targets
+                            .classify_auxiliary_attachment("target", "new-candidate")
+                            .await,
+                        Err(ProtocolError::CapacityExceeded)
+                    );
+                }
+                "creation-drop" => drop(creation.take()),
+                "seal" => targets.seal(),
+                "seal-admission" => targets.seal_admission(),
+                "inventory" => targets.invalidate_inventory().unwrap(),
+                "owner-foreign" => {
+                    let foreign = ClientTargets::new("foreign".into(), "foreign".into());
+                    targets.seal_for_owner_retirement(
+                        &super::super::client_browser::OwnerRetirement::for_test(&foreign),
+                    );
+                }
+                _ => targets.seal_for_owner_retirement(
+                    &super::super::client_browser::OwnerRetirement::for_test(&targets),
+                ),
+            }
+            assert!(
+                matches!(child.submit(), Err(ProtocolError::ScopeUnavailable)),
+                "{mode}"
+            );
+            assert_eq!(ledger.snapshot().input_debt, 1, "{mode}");
+            assert!(!child_journal.snapshot().mutation_dispatched, "{mode}");
+            if let Some(auxiliary) = &mut auxiliary {
+                let _ = auxiliary.claim("late-recorder");
+                assert!(ledger.issue_eval_child(&window, &root).is_err());
+                assert_eq!(ledger.snapshot().input_debt, 1);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn eval_read_only_auxiliary_classification_does_not_revoke_on_repeat() {
+        use futures_util::FutureExt;
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        targets
+            .attached("context", "target".into(), "page".into(), "page".into())
+            .unwrap();
+        targets.configured("target").unwrap();
+        targets
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        let auxiliary = targets
+            .reserve_auxiliary_attachment("scope", "target", "page")
+            .unwrap();
+        targets
+            .state
+            .lock()
+            .unwrap()
+            .auxiliary
+            .get_mut(&auxiliary.nonce)
+            .unwrap()
+            .candidates
+            .insert("candidate".into());
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(7, "scope".into());
+        targets.bind_eval_owner(&ledger, 7).unwrap();
+        let revision = ledger.eval_authority_revision().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                targets
+                    .classify_auxiliary_attachment("target", "page")
+                    .await,
+                Ok(super::AuxiliaryDisposition::Ordinary)
+            );
+            assert!(targets
+                .classify_auxiliary_attachment("target", "candidate")
+                .now_or_never()
+                .is_none());
+            assert_eq!(ledger.eval_authority_revision(), Ok(revision));
+        }
+        // A genuinely new candidate is a mutation and does revoke once.
+        assert!(targets
+            .classify_auxiliary_attachment("target", "new-candidate")
+            .now_or_never()
+            .is_none());
+        assert!(ledger.eval_authority_revision().unwrap() > revision);
+    }
+
     #[test]
     fn inventory_diagnostic_preserves_refusal_and_never_seals_pending_inventory() {
         let registry = super::ClientTargets::new("ctx".into(), "scope".into());

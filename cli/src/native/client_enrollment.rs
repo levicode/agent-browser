@@ -223,6 +223,7 @@ struct Attribution {
 }
 #[derive(Clone, Debug)]
 struct FrameOwner {
+    loader: Option<String>,
     name: Option<String>,
     session: String,
     parent: Option<String>,
@@ -1183,6 +1184,7 @@ impl ClientEnrollment {
     }
     fn poison(&self, error: ProtocolError) {
         if let Ok(mut index) = self.index.lock() {
+            self.revoke_eval_authority();
             index.failure.get_or_insert(error);
             for entry in index.sessions.values() {
                 let _ = self.page.network_incomplete(&entry.root);
@@ -1294,11 +1296,103 @@ impl ClientEnrollment {
         index.applied_watermark = sequence;
         Ok(())
     }
+    /// Always index -> ledger, never called by ledger.submit.
+    fn revoke_eval_authority(&self) {
+        if let Some(ledger) = self.client.debt_ledger() {
+            ledger.invalidate_eval_authority();
+        }
+    }
+    pub(crate) fn capture_eval_authority(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<super::client_debt::EvalAuthorityStamp, ProtocolError> {
+        self.check_restart_operation(op)?;
+        if op.is_callback
+            || !Arc::ptr_eq(&page.client, &self.client)
+            || !Arc::ptr_eq(&page.targets, &self.targets)
+            || page.identity_scope != self.targets.identity_scope
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        page.permit.check()?;
+        let ledger = self
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        self.targets.require_eval_owner(&ledger)?;
+        let watermark = self.realm_watermark()?;
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        // Observe the ledger before reading the index/watermark: the reader
+        // fences observation before publishing received, with no lock spanning it.
+        let revision = ledger.capture_eval_revision(&page.page_session_id, &page.target_id)?;
+        self.realm_snapshot_healthy(&index, &watermark)?;
+        if !index.pending_enrollment.is_empty()
+            || index
+                .sessions
+                .values()
+                .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
+            || !restart_retirements_settled(
+                &index,
+                watermark
+                    .received()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?,
+            )
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let entry = index
+            .sessions
+            .get(&page.page_session_id)
+            .ok_or(ProtocolError::StaleScope)?;
+        if !entry.application
+            || entry.observation_only
+            || !entry.resumed
+            || entry.target != page.target_id
+            || entry.kind != "page"
+            || entry.root != entry.session
+            || *self
+                .active_root
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                != entry.session
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut frames = index
+            .frames
+            .iter()
+            .filter(|(_, frame)| frame.session == entry.session && frame.parent.is_none());
+        let (frame, owner) = frames.next().ok_or(ProtocolError::InvalidFrame)?;
+        if frames.next().is_some() {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        let loader = owner.loader.clone().ok_or(ProtocolError::InvalidFrame)?;
+        let attachment = self.targets.owned_target(&page.target_id)?;
+        if attachment.session_id != page.page_session_id
+            || !attachment.capture_ready()
+            || ledger.capture_eval_revision(&page.page_session_id, &page.target_id)? != revision
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.realm_snapshot_healthy(&index, &watermark)?;
+        Ok(super::client_debt::EvalAuthorityStamp {
+            revision,
+            target: entry.target.clone(),
+            session: entry.session.clone(),
+            frame: frame.clone(),
+            loader,
+        })
+    }
     fn bump_application_epoch(&self) -> Result<(), ProtocolError> {
         let mut index = self
             .index
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.revoke_eval_authority();
         index.application_epoch = index
             .application_epoch
             .checked_add(1)
@@ -2497,6 +2591,7 @@ impl ClientEnrollment {
         if entry.root != session || entry.kind != "page" {
             return Err(ProtocolError::InvalidArguments);
         }
+        self.revoke_eval_authority();
         *self
             .active_root
             .lock()
@@ -2596,6 +2691,7 @@ impl ClientEnrollment {
             observer_paused: false,
             resumed: false,
         };
+        self.revoke_eval_authority();
         index.sessions.insert(session.into(), entry.clone());
         #[cfg(test)]
         self.trace_capture_registry(CaptureLifecycleStep::Registered, &entry, &index);
@@ -2610,6 +2706,7 @@ impl ClientEnrollment {
             index.frames.insert(
                 target.into(),
                 FrameOwner {
+                    loader: None,
                     name: None,
                     session: session.into(),
                     parent: parent_frame,
@@ -2697,6 +2794,7 @@ impl ClientEnrollment {
                 .sessions
                 .get_mut(&entry.session)
                 .ok_or(ProtocolError::StaleReference)?;
+            self.revoke_eval_authority();
             current.application = true;
             index.application_epoch = index
                 .application_epoch
@@ -3984,6 +4082,7 @@ impl ClientEnrollment {
         if let Some(debt) = self.client.debt_ledger() {
             debt.bind_observer_session(&self.targets.context_id, target, session)?;
         }
+        self.revoke_eval_authority();
         index.sessions.insert(session.into(), entry.clone());
         #[cfg(test)]
         self.trace_capture_registry(CaptureLifecycleStep::Registered, &entry, &index);
@@ -4214,18 +4313,30 @@ impl ClientEnrollment {
                     .is_some_and(|owner| owner.kind == "iframe")
         });
         if !is_child_session {
+            let loader = frame
+                .get("loaderId")
+                .and_then(Value::as_str)
+                .filter(|loader| loader.len() <= 4096)
+                .map(str::to_owned);
+            let parent = frame
+                .get("parentId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if index.frames.get(id).is_none_or(|known| {
+                known.session != entry.session || known.loader != loader || known.parent != parent
+            }) {
+                self.revoke_eval_authority();
+            }
             index.frames.insert(
                 id.into(),
                 FrameOwner {
+                    loader,
                     name: frame
                         .get("name")
                         .and_then(Value::as_str)
                         .map(super::client_app_events::diagnostic_frame_name),
                     session: entry.session.clone(),
-                    parent: frame
-                        .get("parentId")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
+                    parent,
                 },
             );
         }
@@ -4309,6 +4420,7 @@ impl ClientEnrollment {
                     .iter()
                     .any(|entry| entry.application || entry.observation_only)
                 {
+                    self.revoke_eval_authority();
                     index.application_epoch = index
                         .application_epoch
                         .checked_add(1)
@@ -5550,6 +5662,126 @@ mod tests {
         let page = owner.lease(&entry).unwrap();
         (owner, page, notices, emit, server)
     }
+    #[tokio::test]
+    async fn eval_stamp_uses_native_loader_and_same_identity_refresh_does_not_revoke() {
+        let (owner, page, _notices, _emit, server) = realm_test_owner().await;
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(
+            1,
+            owner.targets.identity_scope.clone(),
+        );
+        owner.client.install_debt_ledger(ledger.clone()).unwrap();
+        owner.targets.bind_eval_owner(&ledger, 1).unwrap();
+        let op = owner.operation();
+        let _journal = ledger
+            .operation(
+                super::super::client_debt::OperationKey {
+                    generation: op.generation,
+                    operation_seq: op.sequence,
+                },
+                page.target_id.clone(),
+                page.page_session_id.clone(),
+            )
+            .unwrap();
+        let stamp = owner.capture_eval_authority(&page, &op).unwrap();
+        assert_eq!(stamp.loader, "synthetic-loader");
+        let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+        owner
+            .record_frame(
+                &entry,
+                &json!({"id":"frame-initial", "loaderId":"synthetic-loader"}),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            owner.capture_eval_authority(&page, &op).unwrap().revision,
+            stamp.revision
+        );
+        owner
+            .record_frame(
+                &entry,
+                &json!({"id":"frame-initial", "loaderId":"replacement-loader"}),
+                false,
+            )
+            .unwrap();
+        let next = owner.capture_eval_authority(&page, &op).unwrap();
+        assert_eq!(next.loader, "replacement-loader");
+        assert!(next.revision > stamp.revision);
+        owner
+            .record_frame(&entry, &json!({"id":"frame-initial"}), false)
+            .unwrap();
+        assert!(matches!(
+            owner.capture_eval_authority(&page, &op),
+            Err(ProtocolError::InvalidFrame)
+        ));
+        owner.targets.seal_admission();
+        assert!(owner.capture_eval_authority(&page, &op).is_err());
+        owner.client.close().await;
+        server.abort();
+    }
+    #[tokio::test]
+    async fn eval_capture_rejects_observed_unpublished_and_published_unapplied_events() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        let (owner, page, _notices, emit, server) = realm_test_owner().await;
+        let ledger = OwnerDebtLedger::new(1, owner.targets.identity_scope.clone());
+        owner.client.install_debt_ledger(ledger.clone()).unwrap();
+        owner.targets.bind_eval_owner(&ledger, 1).unwrap();
+        let op = owner.operation();
+        let _journal = ledger
+            .operation(
+                OperationKey {
+                    generation: op.generation,
+                    operation_seq: op.sequence,
+                },
+                page.target_id.clone(),
+                page.page_session_id.clone(),
+            )
+            .unwrap();
+        let stamp = owner.capture_eval_authority(&page, &op).unwrap();
+        let watermark = owner.realm_watermark().unwrap();
+        let received = watermark.received().unwrap();
+        let event = super::super::cdp::types::CdpEvent {
+            method: "Page.frameNavigated".into(),
+            session_id: Some("initial".into()),
+            params: json!({"frame":{"id":"frame-initial","loaderId":"next-loader","url":"about:blank"}}),
+        };
+        // Simulate the synchronous reader boundary before any bounded publication.
+        let publication = ledger.observe_event_for_publication(&event).unwrap();
+        assert_eq!(watermark.received(), Ok(received));
+        assert!(owner.capture_eval_authority(&page, &op).is_err());
+        publication.complete();
+        // Now use the real reader and existing deterministic enrollment gate.
+        let gate = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+        emit.send(
+            json!({"method":event.method,"sessionId":event.session_id,"params":event.params}),
+        )
+        .await
+        .unwrap();
+        gate.wait_entered().await;
+        let pending_application = owner.capture_eval_authority(&page, &op);
+        assert!(watermark.received().unwrap() > received);
+        gate.release();
+        owner
+            .drain_capture_watermark(&watermark, &op)
+            .await
+            .unwrap();
+        assert!(pending_application.is_err());
+        let next = owner.capture_eval_authority(&page, &op).unwrap();
+        assert_eq!(next.loader, "next-loader");
+        assert!(next.revision > stamp.revision);
+        *owner.event_watermark.lock().unwrap() = None;
+        assert!(
+            owner.capture_eval_authority(&page, &op).is_err(),
+            "no subscription is not application proof"
+        );
+        owner.client.close().await;
+        server.abort();
+    }
+
     fn realm_test_binding() -> super::super::element::ExactBinding {
         super::super::element::ExactBinding {
             page_session: "initial".into(),
@@ -11242,6 +11474,7 @@ mod tests {
         owner.index.lock().unwrap().frames.insert(
             "popup-frame".into(),
             FrameOwner {
+                loader: None,
                 name: None,
                 session: "popup".into(),
                 parent: None,
@@ -11265,6 +11498,7 @@ mod tests {
         owner.index.lock().unwrap().frames.insert(
             "child".into(),
             FrameOwner {
+                loader: None,
                 name: Some("checkout".into()),
                 session: "popup".into(),
                 parent: Some("popup-frame".into()),
