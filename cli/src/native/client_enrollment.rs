@@ -2047,6 +2047,11 @@ impl ClientEnrollment {
                         self.targets.publish_restart_ready(
                             replacement,
                             &index.pending_enrollment,
+                            |target| {
+                                index.sessions.get(&target.session_id).is_some_and(|entry| {
+                                    entry.target == target.target_id && entry.kind == target.kind
+                                })
+                            },
                             index.applied_watermark == received
                                 && index.pending_enrollment.is_empty(),
                             || {

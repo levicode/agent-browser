@@ -242,12 +242,19 @@ mod restart_readiness {
 
     #[tokio::test]
     async fn unknown_inventory_and_same_id_reattachment_refuse_without_publication() {
-        for case in ["unknown", "reattached", "generation", "session", "stream"] {
+        for case in [
+            "unknown",
+            "unknown-ready",
+            "reattached",
+            "generation",
+            "session",
+            "stream",
+        ] {
             let f = CaptureWireFixture::new(false).await;
             let replacement = f.owner.targets.owned_target("target").unwrap();
             let mut op = f.owner.operation();
             match case {
-                "unknown" => {
+                "unknown" | "unknown-ready" => {
                     f.owner
                         .targets
                         .attached(
@@ -257,6 +264,16 @@ mod restart_readiness {
                             "browser-ui".into(),
                         )
                         .unwrap();
+                    if case == "unknown-ready" {
+                        f.owner.targets.configured("unknown").unwrap();
+                        f.owner
+                            .targets
+                            .resume_permit("unknown")
+                            .await
+                            .unwrap()
+                            .complete()
+                            .unwrap();
+                    }
                 }
                 "reattached" => {
                     f.owner.targets.detach("target").unwrap();

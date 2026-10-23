@@ -956,6 +956,7 @@ impl ClientTargets {
         &self,
         replacement: &OwnedTarget,
         pending: &HashSet<String>,
+        known: impl Fn(&OwnedTarget) -> bool,
         enrollment_ready: bool,
         publish: impl FnOnce() -> Result<T, ProtocolError>,
     ) -> Result<Option<T>, ProtocolError> {
@@ -987,6 +988,9 @@ impl ClientTargets {
         }
         let mut configuring = false;
         for target in state.targets.values() {
+            if !known(target) {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
             if target.purpose.is_none()
                 || !target.configured
                 || !target.resumed
