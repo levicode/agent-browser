@@ -305,23 +305,24 @@ impl MaskFailurePeer {
             Err(BlobError::QuotaExceeded)
         ));
         drop((first, second));
-        let log = self.commands.lock().unwrap();
-        assert!(!log
-            .iter()
-            .any(|request| request["method"] == "Page.captureScreenshot"));
-        assert!(!log
-            .iter()
-            .any(|request| request["method"] == "Runtime.evaluate"));
-        assert!(!log.iter().any(|request| request["params"]["objectGroup"]
-            .as_str()
-            .is_some_and(|group| group.starts_with("capture-source-"))));
-        assert_eq!(
-            log.iter()
-                .filter(|request| request["method"] == "DOMSnapshot.captureSnapshot")
-                .count(),
-            1
-        );
-        drop(log);
+        {
+            let log = self.commands.lock().unwrap();
+            assert!(!log
+                .iter()
+                .any(|request| request["method"] == "Page.captureScreenshot"));
+            assert!(!log
+                .iter()
+                .any(|request| request["method"] == "Runtime.evaluate"));
+            assert!(!log.iter().any(|request| request["params"]["objectGroup"]
+                .as_str()
+                .is_some_and(|group| group.starts_with("capture-source-"))));
+            assert_eq!(
+                log.iter()
+                    .filter(|request| request["method"] == "DOMSnapshot.captureSnapshot")
+                    .count(),
+                1
+            );
+        }
         self.stop.send(()).unwrap();
         let released = self.server.await.unwrap();
         let mask_group = format!("capture-{sequence}-frame");

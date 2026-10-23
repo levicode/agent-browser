@@ -347,23 +347,24 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
     assert_eq!(client.pending_len().await, 0);
     assert!(owner.targets.inventory().is_ok());
     owner.blobs.check_budget_integrity().unwrap();
-    let log = commands.lock().unwrap();
-    assert_eq!(
-        log.iter()
-            .map(|r| r["method"].as_str().unwrap())
-            .collect::<Vec<_>>(),
-        [
-            "Page.getFrameTree",
-            "Page.getFrameTree",
-            "Page.createIsolatedWorld",
-            "Page.createIsolatedWorld",
-            "DOM.getFrameOwner",
-            "Page.createIsolatedWorld",
-            "DOM.resolveNode",
-            "Runtime.releaseObject",
-        ]
-    );
-    drop(log);
+    {
+        let log = commands.lock().unwrap();
+        assert_eq!(
+            log.iter()
+                .map(|r| r["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "Page.getFrameTree",
+                "Page.getFrameTree",
+                "Page.createIsolatedWorld",
+                "Page.createIsolatedWorld",
+                "DOM.getFrameOwner",
+                "Page.createIsolatedWorld",
+                "DOM.resolveNode",
+                "Runtime.releaseObject",
+            ]
+        );
+    }
     stop.send(()).unwrap();
     assert!(
         server.await.unwrap() >= deadline,
