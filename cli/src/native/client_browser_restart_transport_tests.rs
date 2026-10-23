@@ -133,6 +133,17 @@ async fn peer_with_cleanup(
             let mut before = Vec::new();
             let mut after = Vec::new();
             let result = match method {
+                "Browser.getVersion" => {
+                    assert!(request.get("sessionId").is_none());
+                    assert_eq!(request["params"], json!({}));
+                    json!({
+                        "protocolVersion":"1.3",
+                        "product":"Synthetic Chromium/1.0",
+                        "revision":"synthetic-revision",
+                        "userAgent":"Synthetic Chromium Linux",
+                        "jsVersion":"synthetic-js"
+                    })
+                }
                 "Target.createBrowserContext" => json!({"browserContextId":"synthetic-context"}),
                 "Target.createTarget" => {
                     created += 1;
@@ -327,6 +338,26 @@ async fn real_restart_writer_then_first_evaluate_and_navigation_use_replacement(
             assert_eq!(published["payload"]["identityScope"],scope);
             fixture.event_sequence += 1;
             assert_eq!(published["sequence"],fixture.event_sequence);
+            let enrollment = browser.owner.lock().await.as_ref().unwrap()
+                .runtime.as_ref().unwrap().enrollment.clone();
+            let (_cancel, cancellation) = tokio::sync::watch::channel(
+                crate::native::client_session::CancelSignal::None,
+            );
+            let input_operation = crate::native::client_session::OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: fixture.sequence,
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+                cancellation,
+            };
+            let current = browser.page_lease(false).await.map_err(|e|format!("first replacement input lease: {e:?}"))?;
+            // The real lifecycle left old-page tombstones in this enrollment.
+            // Fresh input authority must distinguish those from pending retirement.
+            let first_input = enrollment.capture_settled_input_authority(&current, &input_operation)
+                .map_err(|e|format!("first replacement input authority: {e:?}"))?;
+            first_input.check(&enrollment, &current, &input_operation)
+                .map_err(|e|format!("first replacement input check: {e:?}"))?;
+            drop(current);
             let evaluated = fixture.command("page.evaluate",json!({"identityScope":scope,"source":"()=>17","argument":null}),5).await?;
             assert_eq!(evaluated,json!({"value":17}));
             fixture.command("page.navigate",json!({"identityScope":scope,"url":"https://synthetic.test/after-restart","waitUntil":"load"}),5).await?;
@@ -337,6 +368,20 @@ async fn real_restart_writer_then_first_evaluate_and_navigation_use_replacement(
             drop(current);
             // A second transition must not reuse the first replacement or its staged operation key.
             fixture.command("scope.restart",json!({"identityScope":scope}),5).await?;
+            let current = browser.page_lease(false).await.map_err(|e|format!("second replacement input lease: {e:?}"))?;
+            assert!(first_input.check(&enrollment, &current, &input_operation).is_err());
+            let second_operation = crate::native::client_session::OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: fixture.sequence,
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+                cancellation: input_operation.cancellation.clone(),
+            };
+            let second_input = enrollment.capture_settled_input_authority(&current, &second_operation)
+                .map_err(|e|format!("second replacement input authority: {e:?}"))?;
+            second_input.check(&enrollment, &current, &second_operation)
+                .map_err(|e|format!("second replacement input check: {e:?}"))?;
+            drop(current);
             assert_eq!(fixture.command("page.evaluate",json!({"identityScope":scope,"source":"()=>17","argument":null}),5).await?,json!({"value":17}));
             fixture.command("page.navigate",json!({"identityScope":scope,"url":"https://synthetic.test/after-restart","waitUntil":"load"}),5).await?;
             let current = browser.page_lease(false).await.map_err(|e|format!("second replacement lease: {e:?}"))?;
@@ -361,6 +406,9 @@ async fn real_restart_writer_then_first_evaluate_and_navigation_use_replacement(
 
 #[path = "client_browser_input_waiter_tests.rs"]
 mod input_waiter_tests;
+
+#[path = "client_browser_owner_transition_tests.rs"]
+mod owner_transition_tests;
 
 #[tokio::test]
 async fn owned_cleanup_retires_application_before_phase_two_and_browser_close() {

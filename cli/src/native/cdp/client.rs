@@ -31,7 +31,49 @@ struct DisposalWork {
     _bytes: EventBudgetLease,
 }
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
+struct PendingResponse {
+    sender: oneshot::Sender<CdpMessage>,
+    session: Option<String>,
+}
+type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+
+/// Only read-side EOF or peer-reset evidence may preserve EOF-only integrity.
+/// Timeouts, local/resource failures, and ambiguous aborts are not remote EOF.
+fn is_remote_eof_error(error: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::error::ProtocolError as WebSocketProtocolError;
+    use tokio_tungstenite::tungstenite::Error as WebSocketError;
+    match error {
+        WebSocketError::Io(error) => matches!(
+            error.kind(),
+            std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::ConnectionReset
+        ),
+        WebSocketError::ConnectionClosed
+        | WebSocketError::Protocol(WebSocketProtocolError::ResetWithoutClosingHandshake) => true,
+        _ => false,
+    }
+}
+
+/// Detachment terminates only waiters on that exact session. Dropping a sender
+/// is a transport failure, never a fabricated reply or remote command ACK.
+/// Reader-owned command/debt tracking deliberately remains untouched: a late
+/// reply must still settle its original provenance and cannot revive its caller.
+async fn retire_detached_waiters(pending: &PendingMap, event: &CdpEvent) {
+    if event.method != "Target.detachedFromTarget" {
+        return;
+    }
+    let Some(session) = event
+        .params
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|session| !session.is_empty())
+    else {
+        return;
+    };
+    pending
+        .lock()
+        .await
+        .retain(|_, waiter| waiter.session.as_deref() != Some(session));
+}
 async fn within_initialization<T>(
     budget: Option<(
         std::time::Instant,
@@ -182,6 +224,17 @@ impl BoundedMethodEvents {
             received: self.received.clone(),
             failed: self.failed.clone(),
         }
+    }
+    /// Terminal subscription count, not a live watermark. Only a closed, empty,
+    /// non-overflowed receiver can expose this immutable final receipt boundary.
+    pub(crate) fn terminal_received(&self) -> Result<u64, &'static str> {
+        if !self.receiver.is_closed()
+            || !self.receiver.is_empty()
+            || self.failed.load(Ordering::SeqCst)
+        {
+            return Err("control event stream not cleanly drained");
+        }
+        Ok(self.received.load(Ordering::SeqCst))
     }
     pub async fn recv(&mut self) -> Result<BoundedCdpEvent, &'static str> {
         if self.failed.load(Ordering::SeqCst) {
@@ -583,7 +636,16 @@ impl CdpClient {
                     Ok(Message::Text(text)) => text,
                     Ok(Message::Binary(data)) => match String::from_utf8(data) {
                         Ok(text) => text,
-                        Err(_) => continue,
+                        Err(_) => {
+                            if let Some(ledger) = debt_reader
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .as_ref()
+                            {
+                                ledger.connection_lost();
+                            }
+                            continue;
+                        }
                     },
                     Ok(Message::Close(frame)) => {
                         if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
@@ -599,6 +661,18 @@ impl CdpClient {
                     Ok(Message::Pong(_)) => continue,
                     Ok(_) => continue,
                     Err(e) => {
+                        // Network EOF/reset can end an intact reader. Invalid
+                        // UTF-8, protocol framing, and capacity failures cannot
+                        // be laundered into EOF-only evidence by that same end.
+                        if !is_remote_eof_error(&e) {
+                            if let Some(ledger) = debt_reader
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .as_ref()
+                            {
+                                ledger.connection_lost();
+                            }
+                        }
                         if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
                             let _ = writeln!(std::io::stderr(), "[cdp] WebSocket Error: {}", e);
                         }
@@ -626,6 +700,15 @@ impl CdpClient {
                         match serde_json::from_str(candidate) {
                             Ok(parsed) => parsed,
                             Err(error) => {
+                                // Even an uncorrelated malformed frame damages
+                                // the stream. A missing/unknown ID is no pardon.
+                                if let Some(ledger) = debt_reader
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .as_ref()
+                                {
+                                    ledger.connection_lost();
+                                }
                                 if let Some(id) = extract_command_id(candidate) {
                                     if let Some(tracked) = tracked_reader
                                         .lock()
@@ -636,7 +719,7 @@ impl CdpClient {
                                     }
                                     let waiter = pending_clone.lock().await.remove(&id);
                                     if let Some(tx) = waiter {
-                                        let _ = tx.send(CdpMessage {
+                                        let _ = tx.sender.send(CdpMessage {
                                             id: Some(id),
                                             result: None,
                                             error: Some(CdpError {
@@ -659,6 +742,33 @@ impl CdpClient {
                     }
                 };
 
+                let valid_envelope = if parsed.id.is_some() {
+                    parsed.method.is_none()
+                        && parsed.params.is_none()
+                        && match (&parsed.result, &parsed.error) {
+                            (Some(Value::Object(_)), None) => true,
+                            (None, Some(error)) => error.code.is_some(),
+                            _ => false,
+                        }
+                } else {
+                    parsed
+                        .method
+                        .as_ref()
+                        .is_some_and(|method| !method.is_empty())
+                        && parsed.result.is_none()
+                        && parsed.error.is_none()
+                        && parsed.params.as_ref().is_none_or(Value::is_object)
+                };
+                if !valid_envelope {
+                    if let Some(ledger) = debt_reader
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .as_ref()
+                    {
+                        ledger.connection_lost();
+                    }
+                }
+
                 if let Some(id) = parsed.id {
                     let waiter = pending_clone.lock().await.remove(&id);
                     // Parse/correlate/settle before waiter delivery. Queue only
@@ -671,7 +781,7 @@ impl CdpClient {
                         .map_or_else(Vec::new, |tracked| tracked.settle_for_delivery(&parsed));
                     // Delivery itself is the authority: is_closed() alone races
                     // receiver cancellation between inspection and send.
-                    let abandoned = waiter.is_none_or(|tx| tx.send(parsed).is_err());
+                    let abandoned = waiter.is_none_or(|tx| tx.sender.send(parsed).is_err());
                     for disposal in disposals {
                         if disposal.needed_after_delivery(abandoned) {
                             if let Ok(command) = disposal.reserve() {
@@ -718,6 +828,9 @@ impl CdpClient {
                         }
                     });
                     publish_bounded(&bounded_taps_clone, &event, msg.len());
+                    // Register the lifecycle watermark before waking a failed
+                    // caller, so a following operation cannot outrun admission.
+                    retire_detached_waiters(&pending_clone, &event).await;
                     if !routed {
                         let mut taps = taps_clone.lock().unwrap_or_else(|e| e.into_inner());
                         taps.retain(|(methods, tx)| {
@@ -736,20 +849,28 @@ impl CdpClient {
             // Publish terminal classification before dropping bounded senders:
             // a receiver on another runtime thread may wake immediately on EOF.
             // Local teardown sets closed first and never grants remote-loss proof.
-            if !closed_reader.swap(true, Ordering::SeqCst) {
-                remote_closed_tx.send_replace(true);
+            {
+                // Serialize classification with local close and owner install.
+                // A remote watcher must never see EOF before its ledger cause.
+                let owner = debt_reader
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner());
+                let remote = !closed_reader.swap(true, Ordering::SeqCst);
+                if let Some(ledger) = owner.as_ref() {
+                    if remote {
+                        ledger.observe_remote_eof();
+                    } else {
+                        ledger.connection_lost();
+                    }
+                }
+                if remote {
+                    remote_closed_tx.send_replace(true);
+                }
             }
             bounded_taps_clone
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
-            if let Some(ledger) = debt_reader
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .as_ref()
-            {
-                ledger.connection_lost();
-            }
             tracked_reader
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
@@ -840,7 +961,17 @@ impl CdpClient {
         if self.transport.close_complete.load(Ordering::SeqCst) {
             return;
         }
-        self.transport.closed.store(true, Ordering::SeqCst);
+        {
+            let owner = self
+                .transport
+                .debt_owner
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.transport.closed.store(true, Ordering::SeqCst);
+            if let Some(ledger) = owner.as_ref() {
+                ledger.connection_lost();
+            }
+        }
 
         let _ = self.transport.cancel_tx.send(true);
         Self::abort_task(&self.transport.keepalive_handle).await;
@@ -1161,7 +1292,13 @@ impl CdpClient {
                 }
             }
             self.track_submission(id, reservation)?;
-            pending.insert(id, tx);
+            pending.insert(
+                id,
+                PendingResponse {
+                    sender: tx,
+                    session: cmd.session_id.clone(),
+                },
+            );
             drop(pending);
             if let Err(error) = ws_tx.send(Message::Text(json)).await {
                 self.transport.pending.lock().await.remove(&id);
@@ -1713,6 +1850,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn eof_error_classifier_rejects_unknown_local_and_timeout_failures() {
+        use std::io::ErrorKind;
+        use tokio_tungstenite::tungstenite::error::ProtocolError as WebSocketProtocolError;
+        use tokio_tungstenite::tungstenite::Error as WebSocketError;
+        for kind in [ErrorKind::UnexpectedEof, ErrorKind::ConnectionReset] {
+            assert!(is_remote_eof_error(&WebSocketError::Io(
+                std::io::Error::from(kind)
+            )));
+        }
+        for kind in [
+            ErrorKind::Other,
+            ErrorKind::TimedOut,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::BrokenPipe,
+            ErrorKind::InvalidData,
+            ErrorKind::WouldBlock,
+            ErrorKind::Interrupted,
+        ] {
+            assert!(!is_remote_eof_error(&WebSocketError::Io(
+                std::io::Error::from(kind)
+            )));
+        }
+        assert!(is_remote_eof_error(&WebSocketError::ConnectionClosed));
+        assert!(is_remote_eof_error(&WebSocketError::Protocol(
+            WebSocketProtocolError::ResetWithoutClosingHandshake
+        )));
+        assert!(!is_remote_eof_error(&WebSocketError::AlreadyClosed));
+    }
+
+    fn borrowed_eof_ledger() -> Arc<OwnerDebtLedger> {
+        use super::super::super::client_session::{CancelSignal, OperationLease};
+        let (_cancel, cancellation) = watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 1,
+            deadline: std::time::Instant::now() + Duration::from_secs(30),
+            cancellation,
+        };
+        let ledger = OwnerDebtLedger::unpublished(&operation, "scope".into(), false).unwrap();
+        ledger.bind_context("borrowed-context").unwrap();
+        ledger
+            .bind_session("borrowed-context", "target", "page")
+            .unwrap();
+        ledger
+            .allow_initialization_script("inert authorization")
+            .unwrap();
+        ledger
+    }
+
     #[tokio::test]
     async fn remote_connection_loss_is_distinct_from_local_close() {
         for remote in [false, true] {
@@ -1724,6 +1912,16 @@ mod tests {
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
                 if remote {
                     released.await.unwrap();
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "method":"Target.detachedFromTarget",
+                                "params":{"sessionId":"page"}
+                            })
+                            .to_string(),
+                        ))
+                        .await
+                        .unwrap();
                     socket.close(None).await.unwrap();
                 } else {
                     while let Some(message) = socket.next().await {
@@ -1734,6 +1932,8 @@ mod tests {
                 }
             });
             let client = CdpClient::connect(&url).await.unwrap();
+            let ledger = borrowed_eof_ledger();
+            client.install_debt_ledger(ledger.clone()).unwrap();
             let mut loss = client.remote_connection_closed();
             let mut events = client
                 .subscribe_bounded_methods(&["Target.attachedToTarget"], 4, 65536)
@@ -1746,6 +1946,13 @@ mod tests {
                     .unwrap();
                 assert!(matches!(end, Err("control event stream closed")));
                 assert!(*loss.borrow(), "terminal classification precedes tap EOF");
+                assert!(
+                    ledger.check_final_local_eof(1, "scope").is_ok(),
+                    "ledger EOF-only classification must also precede tap EOF"
+                );
+                assert!(ledger.snapshot().integrity_lost);
+                assert!(!ledger.replacement_ready());
+                assert_eq!(ledger.bound_context().as_deref(), Some("borrowed-context"));
                 tokio::time::timeout(Duration::from_secs(2), loss.wait_for(|value| *value))
                     .await
                     .unwrap()
@@ -1757,10 +1964,72 @@ mod tests {
                     !*loss.borrow(),
                     "local teardown is not replacement authority"
                 );
+                assert!(ledger.check_final_local_eof(1, "scope").is_err());
             }
             client.close().await;
             server.await.unwrap();
             assert_eq!(*loss.borrow(), remote);
+            assert!(ledger.check_final_local_eof(1, "scope").is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn reader_eof_cannot_launder_uncorrelated_malformed_frames_or_live_session() {
+        for (frame, detach) in [
+            (Some(Message::Text("{broken".into())), true),
+            (Some(Message::Text(r#"{"method":42}"#.into())), true),
+            (
+                Some(Message::Text(r#"{"id":999,"result":null}"#.into())),
+                true,
+            ),
+            (Some(Message::Text("{}".into())), true),
+            (Some(Message::Binary(vec![0xff])), true),
+            (None, false),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("ws://{}", listener.local_addr().unwrap());
+            let (release, released) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                released.await.unwrap();
+                if let Some(frame) = frame {
+                    socket.send(frame).await.unwrap();
+                }
+                if detach {
+                    socket
+                        .send(Message::Text(
+                            json!({
+                                "method":"Target.detachedFromTarget",
+                                "params":{"sessionId":"page"}
+                            })
+                            .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                socket.close(None).await.unwrap();
+            });
+            let client = CdpClient::connect(&url).await.unwrap();
+            let ledger = borrowed_eof_ledger();
+            client.install_debt_ledger(ledger.clone()).unwrap();
+            let loss = client.remote_connection_closed();
+            let mut events = client
+                .subscribe_bounded_methods(&["Target.attachedToTarget"], 4, 65536)
+                .unwrap();
+            release.send(()).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(2), events.recv())
+                    .await
+                    .unwrap(),
+                Err("control event stream closed")
+            ));
+            assert!(*loss.borrow());
+            assert_eq!(ledger.snapshot().outstanding_commands, 0);
+            assert!(ledger.snapshot().integrity_lost);
+            assert!(ledger.check_final_local_eof(1, "scope").is_err());
+            client.close().await;
+            server.await.unwrap();
         }
     }
 
@@ -1883,6 +2152,42 @@ mod tests {
         routes.lock().unwrap().get_mut(&1).unwrap().received = Arc::new(AtomicU64::new(0));
         assert!(watermark.received().is_err());
     }
+    #[tokio::test]
+    async fn terminal_receipt_count_requires_closed_empty_exact_receiver_without_overflow() {
+        let (routes, mut events) = bounded_fixture(2, 100);
+        let live = events.watermark();
+        assert!(events.terminal_received().is_err());
+        publish_bounded(&routes, &paused_event(), 30);
+        assert!(events.terminal_received().is_err());
+        routes.lock().unwrap().clear();
+        assert!(
+            live.received().is_err(),
+            "live watermark must remain revoked"
+        );
+        assert!(
+            events.terminal_received().is_err(),
+            "queued event is not applied proof"
+        );
+        assert_eq!(events.recv().await.unwrap().sequence(), 1);
+        assert_eq!(
+            events.recv().await.unwrap_err(),
+            "control event stream closed"
+        );
+        assert_eq!(events.terminal_received(), Ok(1));
+
+        let (routes, mut overflowed) = bounded_fixture(1, 100);
+        publish_bounded(&routes, &paused_event(), 30);
+        publish_bounded(&routes, &paused_event(), 30);
+        assert!(overflowed.terminal_received().is_err());
+        while overflowed.receiver.try_recv().is_ok() {}
+        assert!(overflowed.receiver.is_closed());
+        assert!(overflowed.receiver.is_empty());
+        assert!(
+            overflowed.terminal_received().is_err(),
+            "empty overflow is not clean EOF"
+        );
+    }
+
     #[tokio::test]
     async fn bounded_control_overflow_never_delivers_partial_history_as_complete() {
         let (routes, mut events) = bounded_fixture(1, 100);
@@ -2052,6 +2357,175 @@ mod tests {
             .unwrap();
         assert_eq!(second["value"], "ok");
 
+        client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn detached_waiters_match_only_exact_nonempty_session_not_parent_or_other_events() {
+        let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let mut receivers = Vec::new();
+        for (id, session) in [(1, Some("page")), (2, Some("sibling")), (3, None)] {
+            let (sender, receiver) = oneshot::channel();
+            pending.lock().await.insert(
+                id,
+                PendingResponse {
+                    sender,
+                    session: session.map(str::to_owned),
+                },
+            );
+            receivers.push(receiver);
+        }
+        for (method, params) in [
+            ("Target.detachedFromTarget", json!({})),
+            ("Target.detachedFromTarget", json!({"sessionId":null})),
+            ("Target.detachedFromTarget", json!({"sessionId":""})),
+            ("Target.detachedFromTarget", json!({"sessionId":"foreign"})),
+            ("Target.targetDestroyed", json!({"sessionId":"page"})),
+            (
+                "Runtime.executionContextDestroyed",
+                json!({"sessionId":"page"}),
+            ),
+        ] {
+            retire_detached_waiters(
+                &pending,
+                &CdpEvent {
+                    method: method.into(),
+                    params,
+                    session_id: Some("page".into()),
+                },
+            )
+            .await;
+            assert_eq!(pending.lock().await.len(), 3);
+            assert!(receivers.iter_mut().all(|receiver| matches!(
+                receiver.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            )));
+        }
+        // The envelope is the parent's routing session, not the detached child.
+        retire_detached_waiters(
+            &pending,
+            &CdpEvent {
+                method: "Target.detachedFromTarget".into(),
+                params: json!({"sessionId":"page"}),
+                session_id: Some("sibling".into()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            receivers[0].try_recv(),
+            Err(oneshot::error::TryRecvError::Closed)
+        ));
+        assert!(receivers[1..].iter_mut().all(|receiver| matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        )));
+        assert_eq!(pending.lock().await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn real_detachment_wakes_held_mutating_evaluation_without_ack_replay_or_erased_mutation()
+    {
+        use super::super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (detach_tx, detach_rx) = oneshot::channel();
+        let (late_tx, late_rx) = oneshot::channel();
+        let (late_seen_tx, late_seen_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request: Value =
+                serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "Runtime.evaluate");
+            assert_eq!(request["sessionId"], "page");
+            seen_tx.send(()).unwrap();
+            detach_rx.await.unwrap();
+            ws.send(Message::Text(
+                json!({"method":"Target.detachedFromTarget","params":{"sessionId":"page"}})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            late_rx.await.unwrap();
+            // A late reply still reaches original tracked debt, never its failed caller.
+            ws.send(Message::Text(
+                json!({"id":request["id"],"sessionId":"page","result":{"result":{"value":7}}})
+                    .to_string(),
+            ))
+            .await
+            .unwrap();
+            ws.send(Message::Text(
+                json!({"method":"Test.lateReplyBarrier","params":{}}).to_string(),
+            ))
+            .await
+            .unwrap();
+            late_seen_tx.send(()).unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                match message {
+                    Message::Close(_) => break,
+                    Message::Ping(bytes) => {
+                        ws.send(Message::Pong(bytes)).await.unwrap();
+                    }
+                    Message::Text(_) => panic!("evaluation must never replay"),
+                    _ => {}
+                }
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        client.install_debt_ledger(ledger.clone()).unwrap();
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        let mut events = client.subscribe();
+        let sender = client.clone();
+        let task_journal = journal.clone();
+        let task = tokio::spawn(async move {
+            task_journal.scope(sender.send_command("Runtime.evaluate", Some(json!({"expression":"globalThis.count = (globalThis.count ?? 0) + 1; new Promise(() => {})", "awaitPromise":true,"returnByValue":true})), Some("page"))).await
+        });
+        seen_rx.await.unwrap();
+        assert!(journal.snapshot().mutation_dispatched);
+        assert_eq!(client.pending_len().await, 1);
+        detach_tx.send(()).unwrap();
+        let failure = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("exact detach must wake the pending evaluation, not wait for its 30s timeout")
+            .unwrap()
+            .unwrap_err();
+        assert!(failure.contains("response channel closed"), "{failure}");
+        assert!(
+            journal.snapshot().mutation_dispatched,
+            "destruction is not proof the evaluation never mutated"
+        );
+        assert_eq!(client.pending_len().await, 0);
+        assert_eq!(
+            client.transport.tracked_responses.lock().unwrap().len(),
+            1,
+            "waiter failure must not discard late-reply accounting"
+        );
+        assert_eq!(
+            events.recv().await.unwrap().method,
+            "Target.detachedFromTarget"
+        );
+        late_tx.send(()).unwrap();
+        late_seen_rx.await.unwrap();
+        assert_eq!(events.recv().await.unwrap().method, "Test.lateReplyBarrier");
+        assert!(journal.snapshot().mutation_dispatched);
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
         client.close().await;
         server.await.unwrap();
     }

@@ -676,7 +676,24 @@ async fn late_recording_attach_ack_retains_exact_session_without_reviving_cancel
         1,
         "dropping the waiter must not erase submitted attach debt"
     );
+    // PendingGuard drops the cancelled waiter asynchronously. Observe that
+    // removal before releasing the ACK, without using it to discharge debt.
+    tokio::time::timeout(TEST_BOUND, async {
+        loop {
+            if peer.root.transport.pending.lock().await.is_empty() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled recording attach waiter was not removed");
     assert!(peer.root.transport.pending.lock().await.is_empty());
+    assert_eq!(
+        ledger.snapshot().outstanding_commands,
+        1,
+        "pending-map cleanup must not erase submitted attach debt"
+    );
 
     peer.acknowledge(&request, json!({"sessionId":"late-recording-session"}));
     peer.event(&mut events, json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"ack-barrier"}}})).await;

@@ -82,6 +82,8 @@ impl Default for NetworkActivity {
 struct State {
     config: Config,
     installed_scripts: HashMap<String, usize>,
+    #[cfg(test)]
+    script_registration_acks: HashMap<String, Vec<usize>>,
     script_ids: HashMap<String, Vec<String>>,
     uncertain_scripts: BTreeSet<String>,
     configuration_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
@@ -585,6 +587,12 @@ impl ClientPageState {
                     .push(installed_script["identifier"].as_str().unwrap().to_owned());
                 state.uncertain_scripts.remove(session);
                 state.installed_scripts.insert(session.into(), index + 1);
+                #[cfg(test)]
+                state
+                    .script_registration_acks
+                    .entry(session.into())
+                    .or_default()
+                    .push(index);
             }
             self.validate(page, op)?;
         }
@@ -608,6 +616,19 @@ impl ClientPageState {
             .await?;
         }
         Ok(config.revision)
+    }
+    /// Test-only registration evidence: successful ACK ordinals, never source/IDs.
+    #[cfg(test)]
+    pub(crate) fn script_registration_ack_ordinals(
+        &self,
+        session: &str,
+    ) -> Result<Vec<usize>, ProtocolError> {
+        Ok(self
+            .state()?
+            .script_registration_acks
+            .get(session)
+            .cloned()
+            .unwrap_or_default())
     }
     /// Lifecycle-only cleanup; the caller has drained operations and retains
     /// this future. This removes future registrations, not script side effects

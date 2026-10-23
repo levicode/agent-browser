@@ -48,8 +48,14 @@ struct Dispatch {
     preparation_refusal: AtomicBool,
     preparation_stopped: AtomicBool,
     preparation_disqualified: AtomicBool,
+    #[cfg(test)]
+    preparation_trace: Mutex<tests::PreparationTrace>,
 }
 impl Dispatch {
+    fn begin_preparation_attempt(&self) {
+        // Even a read invalidates the previous attempt's refusal receipt.
+        self.preparation_refusal.store(false, Ordering::SeqCst);
+    }
     fn mark(&self) {
         self.mark_mutation(false);
     }
@@ -889,6 +895,8 @@ impl ClientActions {
         {
             d.cleanup.store(true, Ordering::SeqCst);
         }
+        #[cfg(test)]
+        tests::emit_preparation_mismatch(&ctx, &d, &result);
         finish_dispatch(&d, result).map_err(|mut failure| {
             if settled_prefix {
                 failure.effects = Effects::Completed;
@@ -1503,6 +1511,15 @@ async fn drag(
         None,
     )
     .await?;
+    drag_move_and_release(ctx, d, from, to, pace).await
+}
+async fn drag_move_and_release(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    from: Point,
+    to: Point,
+    pace: Option<Duration>,
+) -> Result<(), ProtocolError> {
     let steps = pace
         .map(|p| (p.as_millis() / 16).max(2) as usize)
         .unwrap_or(2);
@@ -1587,13 +1604,45 @@ async fn center(
     let mut previous: Option<(Point, (f64, f64))> = None;
     let mut longest_attempt = Duration::ZERO;
     loop {
+        #[cfg(test)]
+        tests::preparation_trace(
+            ctx,
+            d,
+            tests::PreparationTracePhase::BeforeRetry,
+            longest_attempt,
+        );
+        // A pause sends no command. Recheck its actual wake time while the
+        // preceding ACK still covers the entire preparation attempt, before
+        // clearing that receipt or starting any later read or mutation.
+        preparation_refusal_checkpoint(
+            d,
+            ctx.operation
+                .deadline
+                .saturating_duration_since(Instant::now()),
+            longest_attempt,
+            || ctx.check(),
+        )?;
         // An earlier ACK cannot certify even a later read which is still pending.
-        d.preparation_refusal.store(false, Ordering::SeqCst);
+        d.begin_preparation_attempt();
+        #[cfg(test)]
+        tests::preparation_trace(
+            ctx,
+            d,
+            tests::PreparationTracePhase::AttemptStart,
+            longest_attempt,
+        );
         let started = Instant::now();
         let attempt = center_once(ctx, d, node, enabled).await;
         longest_attempt = longest_attempt.max(started.elapsed());
         #[cfg(test)]
         tests::preparation_classification_gate(ctx, d, &attempt, longest_attempt).await;
+        #[cfg(test)]
+        tests::preparation_trace(
+            ctx,
+            d,
+            tests::PreparationTracePhase::AfterAttempt,
+            longest_attempt,
+        );
         match attempt {
             Ok(current) => {
                 if previous.as_ref().is_some_and(|old| {
@@ -1608,25 +1657,14 @@ async fn center(
             }
             Err(ProtocolError::NotActionable) => {
                 previous = None;
-                if d.preparation_enabled.load(Ordering::SeqCst)
-                    && d.preparation_refusal.load(Ordering::SeqCst)
-                    && !d.preparation_disqualified.load(Ordering::SeqCst)
-                {
-                    let remaining = ctx
-                        .operation
+                preparation_refusal_checkpoint(
+                    d,
+                    ctx.operation
                         .deadline
-                        .saturating_duration_since(Instant::now());
-                    if !preparation_has_classification_slack(remaining) {
-                        // Retire this ACKed refusal promptly, but do not grant
-                        // the classification receipt after its safe window.
-                        return Err(preparation_retirement_error(ctx.check()));
-                    }
-                    if preparation_classification_window(remaining, longest_attempt) {
-                        ctx.check()?;
-                        d.preparation_stopped.store(true, Ordering::SeqCst);
-                        return Err(ProtocolError::NotActionable);
-                    }
-                }
+                        .saturating_duration_since(Instant::now()),
+                    longest_attempt,
+                    || ctx.check(),
+                )?;
             }
             Err(ProtocolError::DeadlineExceeded) => return Err(ProtocolError::NotActionable),
             Err(error) => return Err(error),
@@ -1637,6 +1675,33 @@ async fn center(
             Err(error) => return Err(error),
         }
     }
+}
+/// Return an ordinary refusal only while its exact attempt remains current.
+/// This does not certify Completed: the original authority, reference, realm,
+/// and owned cleanup must still pass perform's final settlement checks.
+fn preparation_refusal_checkpoint(
+    d: &Dispatch,
+    remaining: Duration,
+    longest_attempt: Duration,
+    check: impl FnOnce() -> Result<(), ProtocolError>,
+) -> Result<(), ProtocolError> {
+    if !d.preparation_enabled.load(Ordering::SeqCst)
+        || !d.preparation_refusal.load(Ordering::SeqCst)
+        || d.preparation_disqualified.load(Ordering::SeqCst)
+    {
+        return Ok(());
+    }
+    if !preparation_has_classification_slack(remaining) {
+        // A late wake retires conservatively, never using the preceding ACK
+        // to grant a receipt below the original cleanup/classification floor.
+        return Err(preparation_retirement_error(check()));
+    }
+    if preparation_classification_window(remaining, longest_attempt) {
+        check()?;
+        d.preparation_stopped.store(true, Ordering::SeqCst);
+        return Err(ProtocolError::NotActionable);
+    }
+    Ok(())
 }
 /// Leave the existing 250ms exact-handle cleanup budget plus a small positive
 /// classification window. Observed duration is only an admission estimate: any
@@ -1946,7 +2011,21 @@ impl ClientActions {
         d.preparation_enabled
             .store(preparation.is_some(), Ordering::SeqCst);
         let result = self.perform_node(ctx, d, &node, request.action).await;
+        #[cfg(test)]
+        tests::preparation_trace(
+            ctx,
+            d,
+            tests::PreparationTracePhase::BeforeRelease,
+            Duration::ZERO,
+        );
         let released = node.release(ctx).await;
+        #[cfg(test)]
+        tests::preparation_trace(
+            ctx,
+            d,
+            tests::PreparationTracePhase::AfterRelease,
+            Duration::ZERO,
+        );
         if released.is_err() {
             d.cleanup.store(true, Ordering::SeqCst);
             return result.and(Err(ProtocolError::CleanupFailed));
@@ -2034,17 +2113,61 @@ impl ClientActions {
             LocatorAction::Check => set_checked(ctx, d, node, true).await,
             LocatorAction::Uncheck => set_checked(ctx, d, node, false).await,
             LocatorAction::DragTo { target } => {
-                let other = action_target(ctx, d, &target).await?;
+                // Only the stored live-query origin permits selecting a different
+                // destination after mousePressed invokes application code. An
+                // observed reference keeps its original exact object throughout.
+                let live = reference(ctx, &target)?.0.live_query.is_some();
+                let mut other = Some(action_target(ctx, d, &target).await?);
+                let mut press_attempted = false;
                 let result = async {
                     let (from, _) = center(ctx, d, node, true).await?;
-                    let (to, _) = center(ctx, d, &other, true).await?;
-                    drag(ctx, d, from, to, None).await
+                    center(ctx, d, other.as_ref().unwrap(), true).await?;
+                    pointer_event(ctx, d, "mouseMoved", Some(from), None, None, None).await?;
+                    press_attempted = true;
+                    pointer_event(
+                        ctx,
+                        d,
+                        "mousePressed",
+                        Some(from),
+                        Some("left"),
+                        Some(1),
+                        None,
+                    )
+                    .await?;
+                    if live {
+                        let previous = other.take().unwrap();
+                        if previous.release(ctx).await.is_err() {
+                            d.cleanup.store(true, Ordering::SeqCst);
+                            return Err(ProtocolError::CleanupFailed);
+                        }
+                        // Reuse the same authority and resolver. Strict ambiguity,
+                        // disappearance and cancellation are post-dispatch errors,
+                        // never permission to replay the press or choose a match.
+                        other = Some(action_target(ctx, d, &target).await?);
+                    }
+                    let (to, _) = center(ctx, d, other.as_ref().unwrap(), true).await?;
+                    drag_move_and_release(ctx, d, from, to, None).await
                 }
                 .await;
-                let release = other.release(ctx).await;
-                if release.is_err() {
+                let released = match other {
+                    Some(other) => other.release(ctx).await,
+                    None => Ok(()),
+                };
+                if released.is_err() {
                     d.cleanup.store(true, Ordering::SeqCst);
-                    return result.and(Err(ProtocolError::CleanupFailed));
+                }
+                let result = result.and(released);
+                // Managed execution owns input cleanup once, in execute. A
+                // retained release ACK must keep its original status handles:
+                // calling release_input twice can resubmit and overwrite them.
+                if result.is_err()
+                    && press_attempted
+                    && OperationJournalHandle::current().is_none()
+                    && ctx.page_state.release_input(ctx.page).await.is_err()
+                {
+                    // Direct fixtures have no outer journal cleanup owner. Their
+                    // cleanup still retains the original page outside cancellation.
+                    d.cleanup.store(true, Ordering::SeqCst);
                 }
                 result
             }
@@ -3427,6 +3550,94 @@ mod tests {
         }
     }
 
+    // Test-only, operation-local numeric evidence. A fixed ring retains the
+    // last attempt/pause and cleanup boundaries, not request or page content.
+    #[derive(Clone, Copy)]
+    pub(super) enum PreparationTracePhase {
+        BeforeRetry = 1,
+        AttemptStart = 2,
+        AfterAttempt = 3,
+        BeforeRelease = 4,
+        AfterRelease = 5,
+        Finished = 6,
+    }
+    #[derive(Clone, Copy, serde::Serialize)]
+    struct PreparationTraceEvent {
+        phase: u8,
+        remaining_us: u64,
+        longest_attempt_us: u64,
+        flags: u8,
+    }
+    #[derive(Default)]
+    pub(super) struct PreparationTrace {
+        events: [Option<PreparationTraceEvent>; 8],
+        next: usize,
+        recorded: u64,
+    }
+    impl PreparationTrace {
+        fn record(&mut self, event: PreparationTraceEvent) {
+            self.events[self.next] = Some(event);
+            self.next = (self.next + 1) % self.events.len();
+            self.recorded = self.recorded.saturating_add(1);
+        }
+        fn ordered(&self) -> Vec<PreparationTraceEvent> {
+            (0..self.events.len())
+                .filter_map(|offset| self.events[(self.next + offset) % self.events.len()])
+                .collect()
+        }
+    }
+    pub(super) fn preparation_trace(
+        ctx: &ActionContext<'_>,
+        d: &Dispatch,
+        phase: PreparationTracePhase,
+        longest_attempt: Duration,
+    ) {
+        let micros = |duration: Duration| duration.as_micros().min(u64::MAX as u128) as u64;
+        // Bits: enabled, refusal, stopped, disqualified, cleanup failed,
+        // acknowledged postcondition. No diagnostic can alter these facts.
+        let flags = u8::from(d.preparation_enabled.load(Ordering::SeqCst))
+            | (u8::from(d.preparation_refusal.load(Ordering::SeqCst)) << 1)
+            | (u8::from(d.preparation_stopped.load(Ordering::SeqCst)) << 2)
+            | (u8::from(d.preparation_disqualified.load(Ordering::SeqCst)) << 3)
+            | (u8::from(d.cleanup.load(Ordering::SeqCst)) << 4)
+            | (u8::from(d.acknowledged_postcondition.load(Ordering::SeqCst)) << 5);
+        if let Ok(mut trace) = d.preparation_trace.lock() {
+            trace.record(PreparationTraceEvent {
+                phase: phase as u8,
+                remaining_us: micros(
+                    ctx.operation
+                        .deadline
+                        .saturating_duration_since(Instant::now()),
+                ),
+                longest_attempt_us: micros(longest_attempt),
+                flags,
+            });
+        }
+    }
+    pub(super) fn emit_preparation_mismatch(
+        ctx: &ActionContext<'_>,
+        d: &Dispatch,
+        result: &Result<Value, ProtocolError>,
+    ) {
+        // The two existing positive fixtures expect Completed. Scope names
+        // select diagnostics only, never classification or settlement behavior.
+        let Err(error) = result else { return };
+        if !matches!(
+            ctx.page.identity_scope.as_str(),
+            "preparation-intercepted" | "preparation-not-actionable"
+        ) || d.failure(error.clone()).effects == Effects::Completed
+        {
+            return;
+        }
+        preparation_trace(ctx, d, PreparationTracePhase::Finished, Duration::ZERO);
+        if let Ok(trace) = d.preparation_trace.lock() {
+            eprintln!(
+                "native-preparation-mismatch {}",
+                json!({"schema": 1, "recorded": trace.recorded, "events": trace.ordered()})
+            );
+        }
+    }
+
     type Log = Arc<std::sync::Mutex<Vec<Value>>>;
     // Hooks are keyed to one exact scope/generation/sequence, never a process-
     // wide next-action callback. Replacement hooks follow real keyboard ACKs;
@@ -3687,11 +3898,14 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut checked_reads = 0;
             let mut query_reads = 0;
+            let mut drag_pressed = false;
+            let mut drag_objects = 0;
             let mut preparation_scrolls = 0;
             let mut held_focus_probe: Option<Value> = None;
             let mut held_focus_release: Option<Value> = None;
             let mut held_debt_release: Option<Value> = None;
             let mut held_direct_press: Option<Value> = None;
+            let mut held_drag_releases: Vec<Value> = Vec::new();
             while let Some(Ok(message)) = socket.next().await {
                 let Ok(text) = message.to_text() else {
                     continue;
@@ -3699,6 +3913,43 @@ mod tests {
                 let request: Value = serde_json::from_str(text).unwrap();
                 captured.lock().unwrap().push(request.clone());
                 let method = request["method"].as_str().unwrap();
+                // Mutate the fixture only when the real action presses. Query
+                // count alone must not manufacture the post-press boundary.
+                if mode.starts_with("strict-query-drag-")
+                    && method == "Input.dispatchMouseEvent"
+                    && request["params"]["type"] == "mousePressed"
+                {
+                    drag_pressed = true;
+                    if mode == "strict-query-drag-press-cancel" {
+                        server_cancel.send_replace(CancelSignal::Requested);
+                    }
+                }
+                if mode == "strict-query-drag-cleanup-debt"
+                    && method == "Input.dispatchMouseEvent"
+                    && request["params"]["type"] == "mouseReleased"
+                {
+                    // Retain every release so a duplicate cannot accidentally
+                    // hide by getting an immediate ACK. The fence below ACKs
+                    // only the original command, never a replacement status.
+                    held_drag_releases.push(request.clone());
+                    continue;
+                }
+                if mode == "strict-query-drag-cleanup-debt" && method == "Browser.getVersion" {
+                    if !held_drag_releases.is_empty() {
+                        let release = held_drag_releases.remove(0);
+                        let reply = json!({"id":release["id"],"sessionId":release["sessionId"],"result":{}});
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                reply.to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        sent_replies
+                            .lock()
+                            .unwrap()
+                            .push(json!({"request":release,"reply":reply}));
+                    }
+                }
                 if mode == "direct-point-cancel"
                     && method == "Input.dispatchMouseEvent"
                     && request["params"]["type"] == "mousePressed"
@@ -3869,6 +4120,10 @@ mod tests {
                         json!({"targetInfos":[{"targetId":"target","browserContextId":"context","type":"page"}]})
                     }
                     "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                    "DOM.resolveNode" if mode.starts_with("strict-query-drag-") => {
+                        drag_objects += 1;
+                        json!({"object":{"objectId":format!("drag-node-{}-{drag_objects}", request["params"]["backendNodeId"]),"subtype":"node"}})
+                    }
                     "DOM.resolveNode" => {
                         if mode == "resolve-cancel" {
                             server_cancel.send_replace(CancelSignal::Requested);
@@ -3883,11 +4138,35 @@ mod tests {
                         };
                         json!({"object":{"objectId":object,"subtype":"node"}})
                     }
+                    "DOM.getBoxModel" if mode.starts_with("strict-query-drag-") => {
+                        let object = request["params"]["objectId"].as_str().unwrap();
+                        let x = if object.starts_with("drag-node-44-") {
+                            240
+                        } else if object.starts_with("drag-node-43-") {
+                            120
+                        } else {
+                            0
+                        };
+                        json!({"model":{"border":[x,0,x+100,0,x+100,50,x,50]}})
+                    }
                     "DOM.getBoxModel" => json!({"model":{"border":[0,0,100,0,100,50,0,50]}}),
+                    "Page.getLayoutMetrics" if mode.starts_with("strict-query-drag-") => {
+                        json!({"cssVisualViewport":{"clientWidth":400.,"clientHeight":200.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":400.,"clientHeight":200.}})
+                    }
                     "Page.getLayoutMetrics" => {
                         json!({"cssVisualViewport":{"clientWidth":100.,"clientHeight":200.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":100.,"clientHeight":200.}})
                     }
                     "Browser.getVersion" => json!({"userAgent":"Synthetic Linux"}),
+                    "DOM.getDocument" if mode.starts_with("strict-query-drag-") => {
+                        let mut children = vec![
+                            json!({"nodeType":1,"backendNodeId":42}),
+                            json!({"nodeType":1,"backendNodeId":43}),
+                        ];
+                        if drag_pressed {
+                            children.push(json!({"nodeType":1,"backendNodeId":44}));
+                        }
+                        json!({"root":{"nodeType":9,"backendNodeId":99,"children":children}})
+                    }
                     "DOM.getDocument" if mode.starts_with("strict-query") => {
                         json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":42},{"nodeType":1,"backendNodeId":43}]}})
                     }
@@ -3898,7 +4177,16 @@ mod tests {
                         json!({"nodes":[{"nodeId":"a","backendDOMNodeId":request["params"]["backendNodeId"],"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}]})
                     }
                     "Accessibility.getFullAXTree" => {
-                        if mode.starts_with("strict-query") {
+                        if mode.starts_with("strict-query-drag-") {
+                            let mut nodes = vec![
+                                json!({"nodeId":"a","backendDOMNodeId":42,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Drag"}}),
+                                json!({"nodeId":"b","backendDOMNodeId":43,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Drop"}}),
+                            ];
+                            if drag_pressed {
+                                nodes.push(json!({"nodeId":"c","backendDOMNodeId":44,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Drop"}}));
+                            }
+                            json!({"nodes":nodes})
+                        } else if mode.starts_with("strict-query") {
                             let role = match mode {
                                 "strict-query-actionable-up" if query_reads == 0 => "RootWebArea",
                                 "strict-query-actionable-down" if query_reads > 0 => "RootWebArea",
@@ -3925,13 +4213,28 @@ mod tests {
                             && source.starts_with("function(expression")
                         {
                             query_reads += 1;
-                            if query_reads > 1 && mode == "strict-query-cancel" {
+                            if (query_reads > 1 && mode == "strict-query-cancel")
+                                || (drag_pressed && mode == "strict-query-drag-cancel")
+                            {
                                 server_cancel.send_replace(CancelSignal::Requested);
                             }
                             if query_reads > 1 && mode == "strict-query-cleanup-primary" {
                                 json!({"result":{"value":{"error":"stale-reference"}}})
                             } else {
-                                let indices = if mode == "strict-query-multiple" {
+                                let indices = if mode.starts_with("strict-query-drag-") {
+                                    if !drag_pressed {
+                                        vec![1]
+                                    } else {
+                                        match mode {
+                                            "strict-query-drag-second-drop"
+                                            | "strict-query-drag-cleanup-debt" => vec![1, 2],
+                                            "strict-query-drag-missing" => vec![],
+                                            "strict-query-drag-replaced"
+                                            | "strict-query-drag-replaced-detached" => vec![2],
+                                            _ => vec![1],
+                                        }
+                                    }
+                                } else if mode == "strict-query-multiple" {
                                     vec![0, 1]
                                 } else if matches!(
                                     mode,
@@ -4017,6 +4320,23 @@ mod tests {
                             && source == "function(){return 'owned-call-revalidation'}"
                         {
                             json!({"result":{"objectId":"call-auxiliary","value":{"status":"intercepted-pointer"}}})
+                        } else if mode == "no-box-swipe"
+                            && source.contains("const rect=this.getBoundingClientRect();const style=getComputedStyle(this);")
+                            && source.ends_with("return true;}")
+                        {
+                            // The initial bbox check rejects before any scroll,
+                            // while the real action keeps its ordinary retry loop.
+                            json!({"result":{"value":{"status":"not-actionable"}}})
+                        } else if drag_pressed
+                            && request["params"]["objectId"].as_str().is_some_and(|object| {
+                                (mode == "strict-query-drag-observed-detached"
+                                    && object.starts_with("drag-node-43-"))
+                                    || (mode == "strict-query-drag-replaced-detached"
+                                        && object.starts_with("drag-node-44-"))
+                            })
+                            && source.contains("if(!this.isConnected")
+                        {
+                            json!({"result":{"value":{"status":"stale"}}})
                         } else if source.contains("const blocker=") {
                             if matches!(
                                 mode,
@@ -4078,12 +4398,18 @@ mod tests {
                     "Runtime.evaluate" => json!({"result":{"value":true}}),
                     _ => json!({}),
                 };
-                let mut reply = if (mode.starts_with("strict-query-cleanup")
-                    && query_reads > 1
-                    && method == "Runtime.releaseObjectGroup"
-                    && request["params"]["objectGroup"]
+                let mut reply = if (mode == "strict-query-drag-release-failed"
+                    && drag_pressed
+                    && method == "Runtime.releaseObject"
+                    && request["params"]["objectId"]
                         .as_str()
-                        .is_some_and(|group| group.starts_with("native-query-")))
+                        .is_some_and(|object| object.starts_with("drag-node-43-")))
+                    || (mode.starts_with("strict-query-cleanup")
+                        && query_reads > 1
+                        && method == "Runtime.releaseObjectGroup"
+                        && request["params"]["objectGroup"]
+                            .as_str()
+                            .is_some_and(|group| group.starts_with("native-query-")))
                     || ((mode == "exact-cleanup-failed"
                         || mode == "check-aux-cleanup-failed"
                         || (mode == "focus-root-cleanup-failed"
@@ -4107,7 +4433,7 @@ mod tests {
                 } else {
                     json!({"id":request["id"],"result":result})
                 };
-                if mode.starts_with("direct-point") {
+                if mode.starts_with("direct-point") || mode == "strict-query-drag-cleanup-debt" {
                     reply["sessionId"] = request["sessionId"].clone();
                 }
                 if method == "Runtime.releaseObject" {
@@ -4350,6 +4676,374 @@ mod tests {
                     .is_some_and(|source| source.starts_with("function(expression"))
             })
             .count()
+    }
+
+    fn assert_drag_handle_release_attempts(f: &Fixture) {
+        let replies = f.replies.lock().unwrap();
+        let log = f.log.lock().unwrap();
+        for reply in replies.iter().filter(|reply| {
+            reply["request"]["method"] == "DOM.resolveNode"
+                && reply["request"]["params"]["objectGroup"] == "native-exact"
+        }) {
+            let object = &reply["reply"]["result"]["object"]["objectId"];
+            assert!(object.is_string());
+            assert_eq!(
+                log.iter()
+                    .filter(|request| {
+                        request["method"] == "Runtime.releaseObject"
+                            && &request["params"]["objectId"] == object
+                    })
+                    .count(),
+                1,
+                "exact drag handle {object} needs exactly one release attempt"
+            );
+        }
+    }
+    fn assert_drag_press_cleanup_without_destination_move(f: &Fixture) {
+        let inputs = f.inputs();
+        let kinds: Vec<_> = inputs
+            .iter()
+            .map(|request| request["params"]["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(kinds, ["mouseMoved", "mousePressed", "mouseReleased"]);
+        // Failure releases at the last submitted point, never the stale target.
+        assert_eq!(inputs[2]["params"]["x"], inputs[1]["params"]["x"]);
+        assert_eq!(inputs[2]["params"]["y"], inputs[1]["params"]["y"]);
+        assert_eq!(inputs[2]["params"]["buttons"], 0);
+        assert_drag_handle_release_attempts(f);
+    }
+    #[tokio::test]
+    async fn live_drag_destination_revalidates_after_press_without_replay() {
+        for (mode, expected, queries, cleanup_failed) in [
+            (
+                "strict-query-drag-second-drop",
+                ProtocolError::StaleReference,
+                3,
+                false,
+            ),
+            (
+                "strict-query-drag-missing",
+                ProtocolError::StaleReference,
+                3,
+                false,
+            ),
+            (
+                "strict-query-drag-cancel",
+                ProtocolError::Cancelled,
+                3,
+                false,
+            ),
+            (
+                "strict-query-drag-press-cancel",
+                ProtocolError::Cancelled,
+                2,
+                false,
+            ),
+            (
+                "strict-query-drag-release-failed",
+                ProtocolError::CleanupFailed,
+                2,
+                true,
+            ),
+            (
+                "strict-query-drag-replaced-detached",
+                ProtocolError::StaleReference,
+                3,
+                false,
+            ),
+        ] {
+            let mut f = fixture(mode).await;
+            let query =
+                publish_fixture_query(&mut f, json!({"kind":"selector","selector":".drop"}))
+                    .await
+                    .unwrap();
+            let target = query.nodes[0].reference.clone();
+            assert!(f
+                .refs
+                .get(element::parse_ref(&target.id).unwrap().as_str())
+                .unwrap()
+                .live_query
+                .is_some());
+            let allocated = f.refs.next_ref_num();
+            let retained = f.refs.retained_identity_counts();
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &json!({
+                        "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                        "action":{"kind":"dragTo","target":target}
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, expected, "{mode}");
+            assert_eq!(failure.effects, Effects::Unknown, "{mode}");
+            assert_eq!(failure.cleanup_failed, cleanup_failed, "{mode}");
+            assert_eq!(f.refs.next_ref_num(), allocated);
+            assert_eq!(f.refs.retained_identity_counts(), retained);
+            assert_eq!(
+                logged_query_matches(&f),
+                queries,
+                "{mode}: publication, preflight, then after press if authorized"
+            );
+            assert_drag_press_cleanup_without_destination_move(&f);
+            let log = f.log.lock().unwrap();
+            let press = log
+                .iter()
+                .position(|request| request["params"]["type"] == "mousePressed")
+                .unwrap();
+            assert_eq!(
+                log[press + 1..]
+                    .iter()
+                    .filter(|request| request["params"]["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|source| source.starts_with("function(expression")))
+                    .count(),
+                queries - 2
+            );
+            if queries == 3 {
+                assert!(log[press + 1..].iter().any(|request| request["method"]
+                    == "Runtime.releaseObjectGroup"
+                    && request["params"]["objectGroup"]
+                        .as_str()
+                        .is_some_and(|group| group.starts_with("native-query-"))));
+            }
+        }
+    }
+    #[tokio::test]
+    async fn managed_drag_cleanup_keeps_one_release_and_its_original_late_ack() {
+        let mut f = fixture("strict-query-drag-cleanup-debt").await;
+        let query = publish_fixture_query(&mut f, json!({"kind":"selector","selector":".drop"}))
+            .await
+            .unwrap();
+        f.page
+            .targets
+            .attached("context", "target".into(), "page".into(), "page".into())
+            .unwrap();
+        f.page.targets.configured("target").unwrap();
+        f.page
+            .targets
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        let ledger = client_debt::OwnerDebtLedger::new(1, "scope".into());
+        f.page.client.install_debt_ledger(ledger.clone()).unwrap();
+        f.page.client = f.page.client.owner_view(ledger.clone()).unwrap();
+        let journal = ledger
+            .operation(
+                client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&f.op).unwrap();
+        // Exercise the actual outer execute cleanup with the managed operation
+        // installed, not execute_inner or an unjournaled action approximation.
+        let failure = journal
+            .scope(ClientActions::default().execute(
+                f.context(),
+                "browser.perform",
+                &json!({
+                    "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                    "action":{"kind":"dragTo","target":query.nodes[0].reference}
+                }),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error, ProtocolError::StaleReference);
+        assert_eq!(failure.effects, Effects::Unknown);
+        assert!(!failure.cleanup_failed);
+        assert_drag_press_cleanup_without_destination_move(&f);
+        assert_eq!(journal.snapshot().input_debt, 1);
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert_eq!(
+            f.state.mouse_state().unwrap().buttons,
+            1,
+            "unacknowledged cleanup is not clean input"
+        );
+        let release = f.inputs().last().unwrap().clone();
+        assert!(!f
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|reply| reply["request"] == release));
+        // Pending cleanup blocks new input without dispatching any replacement.
+        assert_eq!(
+            journal
+                .scope(f.state.pointer_event(
+                    &f.page,
+                    &f.op,
+                    "mouseMoved",
+                    Some((20., 30.)),
+                    None,
+                    None,
+                    None
+                ))
+                .await,
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        assert_eq!(f.inputs().len(), 3);
+        // This fence returns only the first release's real reader ACK. Losing
+        // its status handles, or replacing them with a duplicate, cannot pass.
+        f.page
+            .client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        assert_eq!(journal.snapshot().input_debt, 0);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert_eq!(f.state.mouse_state().unwrap().buttons, 0);
+        assert!(f
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|reply| reply["request"] == release));
+        assert_eq!(
+            f.inputs().len(),
+            3,
+            "late cleanup ACK must not replay press or release"
+        );
+        assert_eq!(
+            failure.effects,
+            Effects::Unknown,
+            "late cleanup is not successful drag completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_drag_destination_can_follow_unique_replacement_after_press() {
+        let mut f = fixture("strict-query-drag-replaced").await;
+        let query = publish_fixture_query(&mut f, json!({"kind":"selector","selector":".drop"}))
+            .await
+            .unwrap();
+        ClientActions::default()
+            .execute(
+                f.context(),
+                "browser.perform",
+                &json!({
+                    "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                    "action":{"kind":"dragTo","target":query.nodes[0].reference}
+                }),
+            )
+            .await
+            .unwrap();
+        let inputs = f.inputs();
+        assert_eq!(
+            inputs
+                .iter()
+                .filter(|request| request["params"]["type"] == "mousePressed")
+                .count(),
+            1
+        );
+        assert_eq!(inputs.last().unwrap()["params"]["type"], "mouseReleased");
+        assert_eq!(inputs.last().unwrap()["params"]["x"].as_f64(), Some(290.));
+        assert_eq!(logged_query_matches(&f), 3);
+        assert_drag_handle_release_attempts(&f);
+    }
+    #[tokio::test]
+    async fn observed_drag_destination_keeps_exact_identity_after_press() {
+        for mode in [
+            "strict-query-drag-second-drop",
+            "strict-query-drag-observed-detached",
+        ] {
+            let mut f = fixture(mode).await;
+            let binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
+            let id = f.refs.bind_exact(43, "button", "Drop", binding);
+            assert!(f.refs.get(&id).unwrap().live_query.is_none());
+            let result = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &json!({
+                        "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                        "action":{"kind":"dragTo","target":{"id":format!("@{id}"),"revision":"1"}}
+                    }),
+                )
+                .await;
+            if mode == "strict-query-drag-observed-detached" {
+                let failure = result.unwrap_err();
+                assert_eq!(failure.error, ProtocolError::StaleReference);
+                assert_eq!(failure.effects, Effects::Unknown);
+                assert!(!failure.cleanup_failed);
+                assert_drag_press_cleanup_without_destination_move(&f);
+            } else {
+                result.unwrap();
+                assert_eq!(
+                    f.inputs().last().unwrap()["params"]["x"].as_f64(),
+                    Some(170.)
+                );
+                assert_drag_handle_release_attempts(&f);
+            }
+            assert_eq!(
+                logged_query_matches(&f),
+                0,
+                "observed identity must not acquire query authority"
+            );
+            let log = f.log.lock().unwrap();
+            assert_eq!(
+                log.iter()
+                    .filter(|request| request["method"] == "DOM.resolveNode")
+                    .count(),
+                2,
+                "keep the same source and destination objects"
+            );
+            assert!(!log
+                .iter()
+                .any(|request| request["method"] == "DOM.resolveNode"
+                    && request["params"]["backendNodeId"] == 44));
+        }
+    }
+
+    #[tokio::test]
+    async fn pointer_drag_keeps_exact_points_without_destination_resolution() {
+        let f = fixture("strict-query-drag-second-drop").await;
+        ClientActions::default()
+            .execute(
+                f.context(),
+                "browser.pointer",
+                &json!({
+                    "identityScope":"scope", "point":{"x":10,"y":20},
+                    "action":{"kind":"dragTo","target":{"x":50,"y":60}}
+                }),
+            )
+            .await
+            .unwrap();
+        let inputs = f.inputs();
+        let points: Vec<_> = inputs
+            .iter()
+            .map(|request| {
+                (
+                    request["params"]["type"].as_str().unwrap(),
+                    request["params"]["x"].as_f64().unwrap(),
+                    request["params"]["y"].as_f64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            points,
+            [
+                ("mouseMoved", 10., 20.),
+                ("mousePressed", 10., 20.),
+                ("mouseMoved", 30., 40.),
+                ("mouseMoved", 50., 60.),
+                ("mouseReleased", 50., 60.),
+            ]
+        );
+        assert!(f
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|request| request["method"] == "Input.dispatchMouseEvent"));
     }
 
     #[tokio::test]
@@ -7980,6 +8674,159 @@ mod tests {
     }
 
     #[test]
+    fn preparation_retry_checkpoint_uses_current_ack_without_certifying_completed() {
+        let d = Dispatch::default();
+        let ms = Duration::from_millis;
+        d.preparation_enabled.store(true, Ordering::SeqCst);
+        d.begin_preparation_attempt();
+        d.mark_mutation(true);
+        d.preparation_refusal.store(true, Ordering::SeqCst);
+        let checks = std::cell::Cell::new(0);
+        let check = || {
+            checks.set(checks.get() + 1);
+            Ok(())
+        };
+        // The real attempt ended above its window. A command-free pause may
+        // enter that same window before the next attempt invalidates the ACK.
+        assert_eq!(
+            preparation_refusal_checkpoint(&d, ms(303), ms(20), check),
+            Ok(())
+        );
+        assert_eq!(checks.get(), 0);
+        assert!(!d.preparation_stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            preparation_refusal_checkpoint(&d, ms(280), ms(20), check),
+            Err(ProtocolError::NotActionable)
+        );
+        assert_eq!(checks.get(), 1);
+        assert!(d.preparation_stopped.load(Ordering::SeqCst));
+        assert!(d.preparation_refusal.load(Ordering::SeqCst));
+        // Cleanup/original-authority/reference/realm proof is still required.
+        assert!(!d.acknowledged_postcondition.load(Ordering::SeqCst));
+        assert_eq!(
+            d.failure(ProtocolError::NotActionable).effects,
+            Effects::Unknown
+        );
+    }
+
+    #[test]
+    fn preparation_retry_checkpoint_never_covers_a_started_read_or_mutation() {
+        let ms = Duration::from_millis;
+        let d = Dispatch::default();
+        d.preparation_enabled.store(true, Ordering::SeqCst);
+        d.mark_mutation(true);
+        d.preparation_refusal.store(true, Ordering::SeqCst);
+        assert_eq!(
+            preparation_refusal_checkpoint(&d, ms(303), ms(20), || Ok(())),
+            Ok(())
+        );
+        // This is the source-shared invalidation used immediately before
+        // center_once, whose first command is a read, not another scroll.
+        d.begin_preparation_attempt();
+        assert_eq!(
+            preparation_refusal_checkpoint(&d, ms(280), ms(20), || panic!(
+                "old ACK authorized a new read"
+            )),
+            Ok(())
+        );
+        d.preparation_refusal.store(true, Ordering::SeqCst);
+        d.mark_mutation(true);
+        assert_eq!(
+            preparation_refusal_checkpoint(&d, ms(280), ms(20), || panic!(
+                "old ACK authorized a new scroll"
+            )),
+            Ok(())
+        );
+        d.mark();
+        d.preparation_refusal.store(true, Ordering::SeqCst);
+        assert_eq!(
+            preparation_refusal_checkpoint(&d, ms(280), ms(20), || panic!(
+                "non-preparation mutation was ignored"
+            )),
+            Ok(())
+        );
+        assert!(!d.preparation_stopped.load(Ordering::SeqCst));
+        assert_eq!(
+            d.failure(ProtocolError::NotActionable).effects,
+            Effects::Unknown
+        );
+    }
+
+    #[test]
+    fn preparation_retry_checkpoint_below_floor_retires_unknown_without_new_attempt() {
+        let ms = Duration::from_millis;
+        for remaining in [Duration::ZERO, ms(265), ms(266) - Duration::from_nanos(1)] {
+            let d = Dispatch::default();
+            d.preparation_enabled.store(true, Ordering::SeqCst);
+            d.mark_mutation(true);
+            d.preparation_refusal.store(true, Ordering::SeqCst);
+            assert_eq!(
+                preparation_refusal_checkpoint(&d, remaining, ms(900), || Ok(())),
+                Err(ProtocolError::NotActionable)
+            );
+            assert!(!d.preparation_stopped.load(Ordering::SeqCst));
+            assert_eq!(
+                d.failure(ProtocolError::NotActionable).effects,
+                Effects::Unknown
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_retry_checkpoint_keeps_authority_error_priority() {
+        let ms = Duration::from_millis;
+        for remaining in [ms(265), ms(266), ms(280)] {
+            for error in [
+                ProtocolError::Cancelled,
+                ProtocolError::StaleScope,
+                ProtocolError::DeadlineExceeded,
+            ] {
+                let d = Dispatch::default();
+                d.preparation_enabled.store(true, Ordering::SeqCst);
+                d.mark_mutation(true);
+                d.preparation_refusal.store(true, Ordering::SeqCst);
+                let expected = if remaining < ms(266) && error == ProtocolError::DeadlineExceeded {
+                    ProtocolError::NotActionable
+                } else {
+                    error.clone()
+                };
+                assert_eq!(
+                    preparation_refusal_checkpoint(&d, remaining, ms(20), || Err(error)),
+                    Err(expected)
+                );
+                assert!(!d.preparation_stopped.load(Ordering::SeqCst));
+                assert_eq!(
+                    d.failure(ProtocolError::NotActionable).effects,
+                    Effects::Unknown
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn preparation_mismatch_trace_is_fixed_size_ordered_numeric_evidence() {
+        let mut trace = PreparationTrace::default();
+        for remaining_us in 0..12 {
+            trace.record(PreparationTraceEvent {
+                phase: PreparationTracePhase::BeforeRetry as u8,
+                remaining_us,
+                longest_attempt_us: 20_000,
+                flags: 3,
+            });
+        }
+        let events = trace.ordered();
+        assert_eq!(trace.recorded, 12);
+        assert_eq!(events.len(), 8);
+        assert_eq!(events.first().unwrap().remaining_us, 4);
+        assert_eq!(events.last().unwrap().remaining_us, 11);
+        for event in serde_json::to_value(events).unwrap().as_array().unwrap() {
+            let fields = event.as_object().unwrap();
+            assert_eq!(fields.len(), 4);
+            assert!(fields.values().all(Value::is_u64));
+        }
+    }
+
+    #[test]
     fn preparation_low_slack_retires_without_extending_the_classification_window() {
         let ms = Duration::from_millis;
         for (remaining, longest_attempt, has_slack, classify) in [
@@ -8071,6 +8918,53 @@ mod tests {
                 .filter(|request| request["params"]["type"] == "mouseReleased")
                 .count(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn no_box_swipe_retries_within_its_budget_without_scroll_or_input_dispatch() {
+        let mut f = fixture("no-box-swipe").await;
+        f.op.deadline = Instant::now() + Duration::from_millis(1_000);
+        let failure = tokio::time::timeout(
+            Duration::from_secs(2),
+            ClientActions::default().execute(
+                f.context(),
+                "browser.perform",
+                &json!({"identityScope":"scope", "ref":{"id":"@e1","revision":"1"}, "action":{"kind":"swipe","direction":"down"}}),
+            ),
+        )
+        .await
+        .expect("the real action must settle within its operation and cleanup bounds")
+        .unwrap_err();
+        assert_eq!(failure.error, ProtocolError::NotActionable);
+        assert_eq!(failure.effects, Effects::NotDispatched);
+        assert!(!failure.cleanup_failed);
+        assert!(f.inputs().is_empty());
+        let requests = f.log.lock().unwrap();
+        assert!(!requests
+            .iter()
+            .any(|request| request["method"] == "DOM.scrollIntoViewIfNeeded"));
+        let probes = requests
+            .iter()
+            .filter(|request| {
+                request["method"] == "Runtime.callFunctionOn"
+                    && request["params"]["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|source| {
+                            source.contains("const rect=this.getBoundingClientRect();const style=getComputedStyle(this);")
+                                && source.ends_with("return true;}")
+                        })
+            })
+            .count();
+        assert!(probes >= 2, "no-box refusal must not become fail-fast");
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "Runtime.releaseObject"
+                    && request["params"]["objectId"] == "exact-node")
+                .count(),
+            1,
+            "the exact resolved handle is released before settlement"
         );
     }
 
@@ -8313,6 +9207,115 @@ mod tests {
                 .result
                 .map_err(|error| format!("{command}: {error:?}"))
         }
+        async fn inert_after_frame(
+            browser: &ClientBrowser,
+            operations: &mut FixtureOperations,
+            sink: &ClientEventSink,
+            scope: &str,
+        ) -> Result<(), String> {
+            // Preserve the public visibility fixture's preceding document and
+            // its only readiness check. This launch fixture exercises the full
+            // owner, but does not replace the borrowed-CDP public regression.
+            const REPLACE_DOCUMENT: &str =
+                "content=>{document.open();document.write(content);document.close();return null}";
+            const FRAME: &str = r#"<iframe style="margin:13px;border:7px solid;padding:5px;width:200px;height:100px" srcdoc="<button>Framed</button>"></iframe>"#;
+            const INERT: &str = r#"
+      <main inert><h2>Behind the drawer</h2><button id="inert-save">Save</button></main>
+      <button>Close drawer</button>
+    "#;
+            run(
+                browser,
+                operations,
+                sink,
+                "page.evaluate",
+                json!({
+                    "identityScope":scope,"source":REPLACE_DOCUMENT,"argument":FRAME
+                }),
+                10,
+            )
+            .await?;
+            let ready_by = Instant::now() + Duration::from_secs(10);
+            loop {
+                let ready = run(browser, operations, sink, "page.evaluate", json!({
+                    "identityScope":scope,
+                    "source":"()=>{const frames=[...document.querySelectorAll('iframe')];return frames.length>0&&frames.every(frame=>frame.contentDocument?.readyState==='complete'&&frame.contentDocument.body.querySelector('button')!==null)}",
+                    "argument":null
+                }), 2).await?;
+                if ready["value"] == true {
+                    break;
+                }
+                if Instant::now() >= ready_by {
+                    return Err("preceding iframe document did not become ready".into());
+                }
+                tokio::task::yield_now().await;
+            }
+            let observe = json!({"identityScope":scope,"testIdAttribute":"data-testid",
+                "secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{}});
+            let framed = run(
+                browser,
+                operations,
+                sink,
+                "browser.observe",
+                observe.clone(),
+                10,
+            )
+            .await?;
+            fn names<'a>(node: &'a Value, out: &mut Vec<&'a str>) {
+                if let Some(name) = node["name"].as_str() {
+                    out.push(name);
+                }
+                if let Some(children) = node["children"].as_array() {
+                    for child in children {
+                        names(child, out);
+                    }
+                }
+            }
+            let mut framed_names = Vec::new();
+            names(&framed["root"], &mut framed_names);
+            if !framed_names.contains(&"Framed") {
+                return Err("preceding protected iframe observation lost its button".into());
+            }
+            run(
+                browser,
+                operations,
+                sink,
+                "page.evaluate",
+                json!({
+                    "identityScope":scope,"source":REPLACE_DOCUMENT,"argument":INERT
+                }),
+                10,
+            )
+            .await?;
+            // Intentionally immediate, once: no readiness read, sleep, retry,
+            // fallback, or fixture query may make this acquisition pass.
+            let snapshot = run(browser, operations, sink, "browser.observe", observe, 10).await?;
+            let mut observed_names = Vec::new();
+            names(&snapshot["root"], &mut observed_names);
+            if !observed_names.contains(&"Close drawer")
+                || observed_names.contains(&"Save")
+                || observed_names.contains(&"Behind the drawer")
+            {
+                return Err("inert subtree public semantic assertions failed".into());
+            }
+            let queried = run(
+                browser,
+                operations,
+                sink,
+                "fixture.query",
+                json!({
+                    "identityScope":scope,"expression":{"kind":"selector","selector":"#inert-save"}
+                }),
+                10,
+            )
+            .await?;
+            let nodes = queried["nodes"]
+                .as_array()
+                .ok_or("missing inert fixture nodes")?;
+            if nodes.len() != 1 || nodes[0]["states"]["hidden"].as_bool().unwrap_or(false) {
+                return Err("inert element must remain visible in trusted fixture reads".into());
+            }
+            Ok(())
+        }
         fn flatten_refs(node: &Value, references: &mut Vec<Value>) {
             if node["ref"].is_object() {
                 references.push(node["ref"].clone());
@@ -8362,6 +9365,9 @@ mod tests {
             let scope = opened["identityScope"].as_str().ok_or("missing scope")?;
             run(&browser, &mut operations, &sink, "scope.configure", fixture_configuration(scope,None), 30).await?;
             run(&browser, &mut operations, &sink, "page.activate", json!({"identityScope":scope}), 30).await?;
+            if acquisition=="protected" {
+                inert_after_frame(&browser, &mut operations, &sink, scope).await?;
+            }
             run(&browser, &mut operations, &sink, "page.evaluate", json!({"identityScope":scope,"source":"()=>{document.body.innerHTML='<label><input id=box type=checkbox>Notify</label>';return true}","argument":null}), 2).await?;
             if acquisition=="iframe" {
                 // Install a same-origin frame synchronously, without timer sleeps.

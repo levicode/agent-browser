@@ -34,6 +34,80 @@ mod reference_correlation;
 mod supersession_tests;
 pub use reference_correlation::CorrelateRequest;
 
+// Failure-only hosted-test evidence. This value lives in one dispatcher run,
+// not a global registry or inherited task-local, and cannot mix operations.
+// The semantic phase deliberately remains aggregate: no renderer values,
+// command arguments, identities, or exception text enter this witness.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ObserveFailureStage {
+    Admission,
+    InitialFrames,
+    ProtectedBarrier,
+    ProtectedFrames,
+    Viewport,
+    SemanticRead,
+    Geometry,
+    DocumentRoot,
+    Restoration,
+    FinalProof,
+    Publication,
+}
+
+#[cfg(test)]
+struct ObserveFailureWitness {
+    enabled: bool,
+    state: Mutex<(ObserveFailureStage, bool)>,
+}
+
+#[cfg(test)]
+impl ObserveFailureWitness {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            state: Mutex::new((ObserveFailureStage::Admission, false)),
+        }
+    }
+    fn enter(&self, stage: ObserveFailureStage) {
+        if let Ok(mut state) = self.state.lock() {
+            if !state.1 {
+                state.0 = stage;
+            }
+        }
+    }
+    fn failure(&self) {
+        if self.enabled {
+            if let Ok(mut state) = self.state.lock() {
+                if !state.1 {
+                    state.1 = true;
+                    eprintln!("native-observe-first-failure stage={:?}", state.0);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn observe_failure_witness_keeps_first_stage_local_to_one_operation() {
+    let first = ObserveFailureWitness::new(true);
+    let second = ObserveFailureWitness::new(true);
+    first.enter(ObserveFailureStage::SemanticRead);
+    first.failure();
+    first.enter(ObserveFailureStage::Restoration);
+    first.failure();
+    second.enter(ObserveFailureStage::InitialFrames);
+    second.failure();
+    assert_eq!(
+        *first.state.lock().unwrap(),
+        (ObserveFailureStage::SemanticRead, true)
+    );
+    assert_eq!(
+        *second.state.lock().unwrap(),
+        (ObserveFailureStage::InitialFrames, true)
+    );
+}
+
 #[cfg(test)]
 tokio::task_local! {
     // Scoped to one retained dispatcher task, never shared between fixtures.
@@ -631,14 +705,22 @@ impl ObservationDispatch {
         retirement_fence: u64,
     ) -> Result<Output, DispatchFailure> {
         let identity = context.page.identity_scope.clone();
+        #[cfg(test)]
+        let witness = ObserveFailureWitness::new(
+            matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels && !request.options.pixel_fallback),
+        );
         let observation_cleanup = AtomicBool::new(false);
         let map_observation = |error| observation_error_with_cleanup(error, &observation_cleanup);
         let map_geometry = |error| geometry_error_with_cleanup(error, &observation_cleanup);
-        let failure = |error: ProtocolError| DispatchFailure {
-            error: error.clone(),
-            identity_scope: identity.clone(),
-            cleanup_integrity_lost: error == ProtocolError::CleanupFailed
-                || observation_cleanup.load(Ordering::SeqCst),
+        let failure = |error: ProtocolError| {
+            #[cfg(test)]
+            witness.failure();
+            DispatchFailure {
+                error: error.clone(),
+                identity_scope: identity.clone(),
+                cleanup_integrity_lost: error == ProtocolError::CleanupFailed
+                    || observation_cleanup.load(Ordering::SeqCst),
+            }
         };
         if context.scope.identity_scope != identity
             || context.scope.generation != operation.generation
@@ -745,6 +827,8 @@ impl ObservationDispatch {
         } else {
             None
         };
+        #[cfg(test)]
+        witness.enter(ObserveFailureStage::InitialFrames);
         let frames =
             verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
                 .await
@@ -762,6 +846,8 @@ impl ObservationDispatch {
         };
         let is_observe = matches!(&request, DispatchRequest::Observe(_));
         let outcome = async {
+        #[cfg(test)]
+        witness.enter(ObserveFailureStage::ProtectedBarrier);
         let mut journal = if protected {
             Some(
                 ProtectedReadJournal::begin(
@@ -780,6 +866,8 @@ impl ObservationDispatch {
         let mut geometry = None;
         let result = async {
             if stabilize_pixels { journal.as_mut().ok_or(ProtocolError::PolicyDenied)?.stabilize_animations().await.map_err(protected_error)?; }
+            #[cfg(test)]
+            witness.enter(ObserveFailureStage::ProtectedFrames);
             let frozen = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
             same_frames(&capture_context.frames, &frozen)?;
             // A semantic tree may prove an iframe owner non-rendering. Acquire
@@ -811,8 +899,12 @@ impl ObservationDispatch {
                 }
                 DispatchRequest::Observe(request) => {
                     let options = ObservationOptions { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector.clone(), ..ObservationOptions::default() };
+                    #[cfg(test)]
+                    witness.enter(ObserveFailureStage::Viewport);
                     let observed_viewport = viewport(&capture_context.page, &operation).await?;
                     let semantic = semantic_lease(&operation, request.options.pixel_fallback);
+                    #[cfg(test)]
+                    witness.enter(ObserveFailureStage::SemanticRead);
                     let tree = async {
                         #[cfg(test)]
                         {
@@ -835,11 +927,15 @@ impl ObservationDispatch {
                     }.await;
                     let (mut value, fallback) = match tree {
                         Ok(mut tree) => {
+                            #[cfg(test)]
+                            witness.enter(ObserveFailureStage::Geometry);
                             if geometry.is_none() {
                                 geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.hidden_frame_proof, &operation).await.map_err(map_geometry)?);
                             }
                             let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                             observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut tree.roots, &operation).await.map_err(map_geometry)?;
+                            #[cfg(test)]
+                            witness.enter(ObserveFailureStage::DocumentRoot);
                             let root = exact_root(tree.roots, &staged, &frozen)?;
                             verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
                             (json!({"identityScope":identity,"revision":revision.to_string(),"root":root,"viewportRef":tree.viewport_ref,"truncated":tree.truncated}), false)
@@ -852,6 +948,8 @@ impl ObservationDispatch {
                         }
                         Err(error) => return Err(map_observation(error)),
                     };
+                    #[cfg(test)]
+                    witness.enter(ObserveFailureStage::Viewport);
                     if viewport(&capture_context.page, &operation).await? != observed_viewport { return Err(ProtocolError::StaleScope); }
                     value["viewport"] = observed_viewport;
                     let main = main_frame(&frozen)?;
@@ -876,6 +974,12 @@ impl ObservationDispatch {
                 }
             }
         }.await;
+        #[cfg(test)]
+        {
+            // Capture the primary before restoration or final proof can fail.
+            if result.is_err() { witness.failure(); }
+            witness.enter(ObserveFailureStage::Restoration);
+        }
         let restoration = match &mut journal {
             Some(journal) => journal.restore().await,
             None => Ok(()),
@@ -895,6 +999,8 @@ impl ObservationDispatch {
         // A clean restore must not turn a policy failure into a timeout and
         // thereby accidentally authorize fallback at a higher layer.
         let (mut value, mut pixels, fallback_cause) = result.map_err(failure)?;
+        #[cfg(test)]
+        witness.enter(ObserveFailureStage::FinalProof);
         if fallback_cause.is_none() {
             if let Some(geometry) = &geometry {
                 geometry
@@ -984,6 +1090,8 @@ impl ObservationDispatch {
                 value["pixels"] = image;
             }
         }
+        #[cfg(test)]
+        witness.enter(ObserveFailureStage::Publication);
         let publish = (|| {
             bounded_result(&value)?;
             check(&capture_context.page, &operation)?;
@@ -1007,6 +1115,10 @@ impl ObservationDispatch {
         }
         Ok(Output { value, handles })
         }.await;
+        #[cfg(test)]
+        if outcome.is_err() {
+            witness.failure();
+        }
         match outcome {
             Err(mut failure)
                 if is_observe

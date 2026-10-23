@@ -346,9 +346,11 @@ struct RuntimeInitialization<'a> {
 
 /// One explicit new-scope request, not old application or final-close authority.
 /// The old ledger remains retired; the writer barrier installs a distinct owner.
-struct ReplacementLease {
+pub(super) struct ReplacementLease {
     debt: Arc<super::client_debt::OwnerDebtLedger>,
     identity_scope: String,
+    previous_client: Arc<CdpClient>,
+    replacement_client: Arc<CdpClient>,
 }
 impl ReplacementLease {
     fn begin(
@@ -366,6 +368,7 @@ impl ReplacementLease {
         {
             return Err(ProtocolError::CleanupFailed);
         }
+        let previous_client = manager.client.clone();
         let identity_scope = uuid::Uuid::new_v4().to_string();
         let debt = super::client_debt::OwnerDebtLedger::unpublished(
             operation,
@@ -376,7 +379,35 @@ impl ReplacementLease {
         Ok(Self {
             debt,
             identity_scope,
+            previous_client,
+            replacement_client: manager.client.clone(),
         })
+    }
+
+    /// Only this manager-issued facade pair may move a drained route registry.
+    /// The previous facade remains permanently bound to its retired ledger.
+    pub(super) fn check_route_replacement(
+        &self,
+        previous: &Arc<CdpClient>,
+        replacement: &Arc<CdpClient>,
+        identity_scope: &str,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        check_lifecycle_budget(operation)?;
+        if !Arc::ptr_eq(previous, &self.previous_client)
+            || !Arc::ptr_eq(replacement, &self.replacement_client)
+            || identity_scope != self.identity_scope
+            || !self
+                .debt
+                .matches_owner(operation.generation, identity_scope)
+            || previous
+                .debt_ledger()
+                .is_none_or(|old| !old.replacement_ready())
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.debt.check_unpublished_operation(operation)?;
+        replacement.check_cleanup_owner(&Some(self.debt.clone()))
     }
 }
 
@@ -387,6 +418,7 @@ struct ReplacementSeed {
     policy: super::client_observation_dispatch::ReadPolicy,
     downloads: DownloadConfiguration,
     actions: Arc<super::client_actions::ClientActions>,
+    owner: Option<ReplacementLease>,
 }
 
 struct OwnedRuntime {
@@ -580,20 +612,10 @@ impl OwnedRuntime {
             }) {
             Ok(proof) => proof,
             Err(_) => {
-                // A failed proof forbids recovery, but cannot skip final local
-                // drainage or leave an internally parked route unretired.
+                // A missing recovery root cannot revive a page or preserve
+                // routes. Final close has a separate, stricter debt-free proof.
                 if !preserve_recording {
-                    self.enrollment.seal();
-                    let drained = self.enrollment.drain().await;
-                    let network = self.network.close().await;
-                    let _ = self.actions.cleanup().await;
-                    // Reader drainage, not remote detach proof, permits deleting
-                    // this runtime's private local download directory. Failed
-                    // cleanup keeps its TempDir/join journal for later retry.
-                    if drained.is_ok() && network.is_ok() {
-                        let _ = self.remove_download_directory().await;
-                    }
-                    let _ = self.blobs.revoke_scope(&self.scope);
+                    return self.release_final_local_connection(client).await;
                 }
                 return Err(ProtocolError::CleanupFailed);
             }
@@ -632,6 +654,45 @@ impl OwnedRuntime {
             || terminal_recording.is_err()
             || actions.is_err()
             || retired.is_err()
+            || directory.is_err()
+            || blobs.is_err()
+        {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
+    async fn release_final_local_connection(
+        &self,
+        client: &Arc<super::cdp::client::CdpClient>,
+    ) -> Result<(), ProtocolError> {
+        self.enrollment.seal();
+        let drained = self.enrollment.drain().await;
+        let proof = self
+            .enrollment
+            .final_local_connection_proof()
+            .and_then(|proof| {
+                proof.check_client(client)?;
+                Ok(proof)
+            });
+        // Every local obligation is still joined, even when proof is refused.
+        // No recording detach/stop failure is reclassified using transport EOF.
+        let network = self.network.close().await;
+        let actions = self.actions.cleanup().await;
+        let directory = if drained.is_ok() && network.is_ok() {
+            self.remove_download_directory().await
+        } else {
+            Err(ProtocolError::CleanupFailed)
+        };
+        let blobs = self.blobs.revoke_scope(&self.scope);
+        let exact = proof.and_then(|proof| {
+            proof.check_client(client)?;
+            proof.check_network(&self.network)
+        });
+        if drained.is_err()
+            || exact.is_err()
+            || network.is_err()
+            || actions.is_err()
             || directory.is_err()
             || blobs.is_err()
         {
@@ -721,9 +782,9 @@ impl OwnedBrowser {
     async fn bootstrap_context(
         &mut self,
         operation: &super::client_session::OperationLease,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<ReplacementLease, ProtocolError> {
         let lease = ReplacementLease::begin(&mut self.manager, operation)?;
-        self.identity_scope = lease.identity_scope;
+        self.identity_scope = lease.identity_scope.clone();
         self.context_id.clear();
         let response = self
             .manager
@@ -755,7 +816,8 @@ impl OwnedBrowser {
             .owned_blank_page(Some(&self.context_id))
             .await
             .map_err(|_| ProtocolError::BrowserFailure)?;
-        check_lifecycle_budget(operation)
+        check_lifecycle_budget(operation)?;
+        Ok(lease)
     }
     pub async fn connect(
         endpoint: &str,
@@ -942,7 +1004,7 @@ impl OwnedBrowser {
     async fn replace_cleaned_context(
         &mut self,
         operation: &super::client_session::OperationLease,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<ReplacementLease, ProtocolError> {
         // Caller has a complete old-context cleanup proof. Keep this object in
         // the lifecycle owner journal while the new context identity is unknown.
         let ids = self
@@ -1121,7 +1183,11 @@ impl OwnedBrowser {
                     .replacement_routes
                     .as_mut()
                     .ok_or(ProtocolError::ScopeUnavailable)?;
-                routes.bind(&runtime.network)?;
+                routes.bind_replacement(
+                    &runtime.network,
+                    seed.owner.as_ref().ok_or(ProtocolError::ScopeUnavailable)?,
+                    operation,
+                )?;
                 routes.adopt(operation)?;
                 self.replacement_routes = None;
             }
@@ -1577,6 +1643,22 @@ struct RetirementJournal {
     shutting_down: bool,
     coordinator: Option<std::sync::Weak<super::client_enrollment::ClientEnrollment>>,
 }
+/// Constructible only by the lifecycle journal, bound to the exact registry it
+/// is retiring. It conveys no remote cleanup or replacement-admission proof.
+pub(crate) struct OwnerRetirement {
+    targets: Arc<super::client_targets::ClientTargets>,
+}
+impl OwnerRetirement {
+    pub(crate) fn authorizes(&self, targets: &super::client_targets::ClientTargets) -> bool {
+        std::ptr::eq(self.targets.as_ref(), targets)
+    }
+    #[cfg(test)]
+    pub(crate) fn for_test(targets: &Arc<super::client_targets::ClientTargets>) -> Self {
+        Self {
+            targets: targets.clone(),
+        }
+    }
+}
 impl RetirementJournal {
     fn register(
         &mut self,
@@ -1592,7 +1674,14 @@ impl RetirementJournal {
     fn stop(&mut self, permanent: bool) {
         self.shutting_down |= permanent;
         if let Some(coordinator) = self.coordinator.as_ref().and_then(std::sync::Weak::upgrade) {
-            coordinator.seal();
+            if permanent {
+                coordinator.seal();
+            } else {
+                let authority = OwnerRetirement {
+                    targets: coordinator.retirement_targets().clone(),
+                };
+                coordinator.seal_for_owner_retirement(&authority);
+            }
         }
     }
 }
@@ -3888,7 +3977,7 @@ impl ClientBrowser {
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
                     .retire_owner_references();
                 check_lifecycle_budget(&operation)?;
-                resource.replace_cleaned_context(&operation).await?;
+                let replacement_owner = resource.replace_cleaned_context(&operation).await?;
                 let authority = resource
                     .initialize_runtime(
                         gate.clone(),
@@ -3904,6 +3993,7 @@ impl ClientBrowser {
                                 policy,
                                 downloads,
                                 actions: actions.clone(),
+                                owner: Some(replacement_owner),
                             }),
                         },
                     )
@@ -4248,14 +4338,19 @@ impl ClientBrowser {
                 // old socket. Host page/context ownership is never acquired.
                 resource.manager.disconnect_transport().await;
                 check_lifecycle_budget(&operation)?;
-                let verified =
-                    super::client_reconnect::reconnect(&request.endpoint, &retained, &operation)
-                        .await?;
+                let identity_scope = uuid::Uuid::new_v4().to_string();
+                let verified = super::client_reconnect::reconnect(
+                    &request.endpoint,
+                    &retained,
+                    &operation,
+                    &identity_scope,
+                )
+                .await?;
                 let (manager, context_id, target_id, proof) = verified.into_parts();
                 // Journal the new transport before any initialization await.
                 resource.manager = manager;
                 resource.context_id = context_id;
-                resource.identity_scope = uuid::Uuid::new_v4().to_string();
+                resource.identity_scope = identity_scope;
                 resource.borrowed_targets = Some(vec![target_id]);
                 resource.reconnect_proof = Some(proof);
                 resource.targets = super::client_targets::ClientTargets::new(
@@ -4278,6 +4373,7 @@ impl ClientBrowser {
                                 policy,
                                 downloads,
                                 actions: actions.clone(),
+                                owner: None,
                             }),
                         },
                     )
@@ -4805,12 +4901,32 @@ mod tests {
         journal.register(&first).unwrap();
         journal.stop(false);
         assert!(first_targets.inventory().is_err());
+        // Exercise the production owner path rather than minting a test
+        // capability: admission is permanently closed, but orderly retirement
+        // alone must not dirty an otherwise accounted operation settlement.
+        assert_eq!(first_targets.check_settlement_integrity(), Ok(()));
+        journal.stop(false);
+        assert_eq!(first_targets.check_settlement_integrity(), Ok(()));
         assert!(!journal.shutting_down);
+        // A later integrity failure cannot be laundered by stopping the same
+        // journal again, nor can an earlier failure acquire a clean stamp.
+        first_targets.seal();
+        journal.stop(false);
+        assert!(first_targets.check_settlement_integrity().is_err());
+        assert!(first_targets.inventory().is_err());
+        let (poisoned, poisoned_targets, _poisoned_notices) = create("poisoned");
+        let mut poisoned_journal = RetirementJournal::default();
+        poisoned_journal.register(&poisoned).unwrap();
+        poisoned_targets.seal();
+        poisoned_journal.stop(false);
+        assert!(poisoned_targets.check_settlement_integrity().is_err());
+        assert!(poisoned_targets.inventory().is_err());
         let (replacement, replacement_targets, _replacement_notices) = create("replacement");
         journal.register(&replacement).unwrap();
         assert!(replacement_targets.inventory().is_ok());
         journal.stop(true);
         assert!(replacement_targets.inventory().is_err());
+        assert!(replacement_targets.check_settlement_integrity().is_err());
         let (late, late_targets, _late_notices) = create("late");
         assert_eq!(journal.register(&late), Err(ProtocolError::Cancelled));
         assert!(late_targets.inventory().is_err());
@@ -5266,3 +5382,7 @@ mod reference_lifetime_tests;
 #[cfg(test)]
 #[path = "client_browser_state_tests.rs"]
 mod state_lifecycle_tests;
+
+#[cfg(test)]
+#[path = "client_browser_final_local_tests.rs"]
+mod final_local_tests;

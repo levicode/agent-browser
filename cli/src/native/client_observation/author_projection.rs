@@ -464,7 +464,12 @@ pub(super) fn compact(
             String::new()
         };
         node.text = (!text.is_empty() || f.skips_content).then_some(text);
-        let independent = node.role.is_some()
+        // A presentational role removes semantics; it is not by itself a reason
+        // to retain a wrapper. Other evidence still retains its exact role/ref.
+        let independent = node
+            .role
+            .as_deref()
+            .is_some_and(|role| !matches!(role, "none" | "presentation"))
             || node.test_id.is_some()
             || node.name.is_some()
             || (f.action && coverage[id] && node.text.is_some());
@@ -849,6 +854,68 @@ mod tests {
         let code = f.el("code", None, vec![code]);
         let p = f.el("p", None, vec![before, strong, code]);
         assert_eq!(texts(&f.run(vec![p])), vec![Some("Use bold code")]);
+    }
+    #[test]
+    fn presentational_roles_alone_do_not_retain_wrappers_or_lose_children() {
+        for role in ["none", "presentation"] {
+            let mut f = Fixture::default();
+            let decorative = f.el("svg", Some(role), vec![]);
+            let button = f.el("button", Some("button"), vec![]);
+            let button_ref = reference(&button);
+            let wrapper = f.el("div", Some(role), vec![button]);
+            let nodes = f.run(vec![decorative, wrapper]);
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].role.as_deref(), Some("button"));
+            assert_eq!(nodes[0].reference.id, button_ref);
+        }
+    }
+    #[test]
+    fn presentational_nodes_with_independent_evidence_keep_role_and_identity() {
+        for role in ["none", "presentation"] {
+            for evidence in ["test-id", "name", "text"] {
+                let mut f = Fixture::default();
+                let children = if evidence == "text" {
+                    vec![f.text("Independent text")]
+                } else {
+                    vec![]
+                };
+                let wrapper = f.el("div", Some(role), children);
+                let expected_ref = reference(&wrapper);
+                let node = f
+                    .nodes
+                    .get_mut(&wrapper["backendNodeId"].as_i64().unwrap())
+                    .unwrap();
+                if evidence == "test-id" {
+                    node.test_id = Some("retained".into());
+                }
+                if evidence == "name" {
+                    node.name = Some("Independent name".into());
+                }
+                let nodes = f.run(vec![wrapper]);
+                assert_eq!(nodes.len(), 1, "{role} {evidence}");
+                assert_eq!(nodes[0].role.as_deref(), Some(role));
+                assert_eq!(nodes[0].reference.id, expected_ref);
+                if evidence == "text" {
+                    assert_eq!(nodes[0].text.as_deref(), Some("Independent text"));
+                }
+            }
+        }
+    }
+    #[test]
+    fn decorative_svg_does_not_replace_its_links_independent_name() {
+        let mut f = Fixture::default();
+        let svg = f.el("svg", Some("none"), vec![]);
+        let link = f.el("a", Some("link"), vec![svg]);
+        let expected_ref = reference(&link);
+        f.nodes
+            .get_mut(&link["backendNodeId"].as_i64().unwrap())
+            .unwrap()
+            .name = Some("Home".into());
+        let nodes = f.run(vec![link]);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].name.as_deref(), Some("Home"));
+        assert_eq!(nodes[0].reference.id, expected_ref);
+        assert!(nodes[0].children.is_empty());
     }
     #[test]
     fn coverage_preserves_test_id_and_roleless_action_endpoints() {

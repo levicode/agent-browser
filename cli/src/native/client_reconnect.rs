@@ -44,7 +44,7 @@ impl RetainedIdentity {
 
 /// Owns only the newly connected transport and its exact attached session.
 /// This does not own the host browser, context, or page. On any subsequent
-/// initialization/publication failure, await manager.client.close(), without
+/// initialization/publication failure, await manager.disconnect_transport(), without
 /// disposing the context or closing any host target. Keep the old owner until
 /// its independent detach-only retirement has settled.
 pub(super) struct VerifiedReconnect {
@@ -128,9 +128,13 @@ pub(super) async fn reconnect(
     endpoint: &str,
     retained: &RetainedIdentity,
     operation: &OperationLease,
+    identity_scope: &str,
 ) -> Result<VerifiedReconnect, ProtocolError> {
     check_operation(operation)?;
-    if endpoint.trim().is_empty() || endpoint.len() > MAX_ENDPOINT_BYTES || endpoint.contains('\0')
+    if identity_scope.is_empty()
+        || endpoint.trim().is_empty()
+        || endpoint.len() > MAX_ENDPOINT_BYTES
+        || endpoint.contains('\0')
     {
         return Err(ProtocolError::InvalidArguments);
     }
@@ -141,7 +145,21 @@ pub(super) async fn reconnect(
         BrowserManager::connect_owned_browser(endpoint, None),
     )
     .await?;
-    let result = verify_and_attach(&mut manager, retained, operation).await;
+    let result = async {
+        let session = verify_and_attach(&mut manager, retained, operation).await?;
+        // Bind the final immutable facade before proof capture. Runtime setup
+        // must reuse this exact owner facade, not create another transport view.
+        let debt = super::client_debt::OwnerDebtLedger::unpublished(
+            operation,
+            identity_scope.to_owned(),
+            false,
+        )?;
+        debt.bind_context(&retained.context_id)?;
+        debt.bind_session(&retained.context_id, &retained.target_id, &session)?;
+        manager.bind_native_owner(debt)?;
+        Ok::<_, ProtocolError>(session)
+    }
+    .await;
     match result {
         Ok(session_id) => {
             // verify_and_attach checked this exact binding and operation after
@@ -536,9 +554,14 @@ mod tests {
     async fn reconnect_proof_survives_manager_move_but_rejects_other_identity_or_operation() {
         let source_server = server(Fixture::default(), "/proof").await;
         let (operation, cancel) = operation(Duration::from_secs(5));
-        let verified = reconnect(&source_server.endpoint, &retained(), &operation)
-            .await
-            .unwrap();
+        let verified = reconnect(
+            &source_server.endpoint,
+            &retained(),
+            &operation,
+            "reconnected-owner",
+        )
+        .await
+        .unwrap();
         let (manager, context, target, proof) = verified.into_parts();
         assert_eq!(
             proof.check(&manager.client, &context, &target, &operation),
@@ -589,6 +612,59 @@ mod tests {
         );
         manager.disconnect_transport().await;
         finish(source_server).await;
+    }
+
+    #[tokio::test]
+    async fn reconnect_proof_binds_final_owner_facade_before_route_adoption() {
+        use crate::native::client_debt::OwnerDebtLedger;
+
+        let source_server = server(Fixture::default(), "/owner-facade").await;
+        let (operation, _cancel) = operation(Duration::from_secs(5));
+        let verified = reconnect(
+            &source_server.endpoint,
+            &retained(),
+            &operation,
+            "reconnected-owner",
+        )
+        .await
+        .unwrap();
+        let (mut manager, context, target, proof) = verified.into_parts();
+        // Reproduce initialize_runtime's managed-owner boundary. Reconnect must
+        // already have captured its final facade, not an ambient physical handle.
+        if manager.client.debt_ledger().is_none() {
+            let ledger =
+                OwnerDebtLedger::unpublished(&operation, "reconnected-owner".into(), false)
+                    .unwrap();
+            ledger.bind_context(&context).unwrap();
+            manager.bind_native_owner(ledger).unwrap();
+        }
+        let checked = proof.check(&manager.client, &context, &target, &operation);
+        let debt = manager.client.debt_ledger().unwrap();
+        let owner_matches = debt.matches_owner(operation.generation, "reconnected-owner");
+        // The borrowed host context is never promoted to destruction authority.
+        assert!(manager
+            .client
+            .reserve_tracked_command(
+                "Target.disposeBrowserContext",
+                Some(&json!({"browserContextId":context})),
+                None,
+            )
+            .is_err());
+        // Same physical transport and owner ledger still do not authorize a
+        // substitute facade. Keep the generic proof's strict Arc equality.
+        manager.bind_native_owner(debt).unwrap();
+        assert_eq!(
+            proof.check(&manager.client, &context, &target, &operation),
+            Err(ProtocolError::StaleScope)
+        );
+        manager.disconnect_transport().await;
+        finish(source_server).await;
+        assert!(owner_matches, "reconnect lost the intended immutable owner");
+        assert_eq!(
+            checked,
+            Ok(()),
+            "verified reconnect proof retained the pre-owner physical facade"
+        );
     }
 
     async fn finish(server: Server) -> Vec<Value> {
@@ -643,7 +719,7 @@ mod tests {
         )
         .await;
         let (operation, _cancel) = operation(Duration::from_secs(3));
-        let verified = reconnect(&new.endpoint, &identity, &operation)
+        let verified = reconnect(&new.endpoint, &identity, &operation, "reconnected-owner")
             .await
             .unwrap();
         assert_eq!(verified.context_id, "original-default-context");
@@ -703,9 +779,14 @@ mod tests {
         ] {
             let server = server(fixture, "/new").await;
             let (operation, _cancel) = operation(Duration::from_secs(3));
-            assert!(reconnect(&server.endpoint, &retained(), &operation)
-                .await
-                .is_err());
+            assert!(reconnect(
+                &server.endpoint,
+                &retained(),
+                &operation,
+                "reconnected-owner",
+            )
+            .await
+            .is_err());
             let commands = finish(server).await;
             assert!(!commands
                 .iter()
@@ -733,9 +814,14 @@ mod tests {
         ] {
             let server = server(fixture, "/new").await;
             let (operation, _cancel) = operation(Duration::from_secs(3));
-            assert!(reconnect(&server.endpoint, &retained(), &operation)
-                .await
-                .is_err());
+            assert!(reconnect(
+                &server.endpoint,
+                &retained(),
+                &operation,
+                "reconnected-owner",
+            )
+            .await
+            .is_err());
             let commands = finish(server).await;
             assert_eq!(
                 commands
@@ -759,7 +845,13 @@ mod tests {
         .await;
         let (operation, _cancel) = operation(Duration::from_millis(100));
         assert!(matches!(
-            reconnect(&server.endpoint, &retained(), &operation).await,
+            reconnect(
+                &server.endpoint,
+                &retained(),
+                &operation,
+                "reconnected-owner"
+            )
+            .await,
             Err(ProtocolError::DeadlineExceeded)
         ));
         let commands = finish(server).await;
@@ -780,8 +872,9 @@ mod tests {
         .await;
         let (operation, cancel) = operation(Duration::from_secs(3));
         let endpoint = server.endpoint.clone();
-        let attempt =
-            tokio::spawn(async move { reconnect(&endpoint, &retained(), &operation).await });
+        let attempt = tokio::spawn(async move {
+            reconnect(&endpoint, &retained(), &operation, "reconnected-owner").await
+        });
         tokio::time::timeout(Duration::from_secs(2), async {
             while server
                 .received
@@ -813,19 +906,37 @@ mod tests {
         let (mut operation, cancel) = operation(Duration::from_secs(3));
         cancel.send(CancelSignal::Requested).unwrap();
         assert!(matches!(
-            reconnect("ws://127.0.0.1:1", &retained(), &operation).await,
+            reconnect(
+                "ws://127.0.0.1:1",
+                &retained(),
+                &operation,
+                "reconnected-owner"
+            )
+            .await,
             Err(ProtocolError::Cancelled)
         ));
         cancel.send(CancelSignal::None).unwrap();
         operation.deadline = Instant::now();
         assert!(matches!(
-            reconnect("ws://127.0.0.1:1", &retained(), &operation).await,
+            reconnect(
+                "ws://127.0.0.1:1",
+                &retained(),
+                &operation,
+                "reconnected-owner"
+            )
+            .await,
             Err(ProtocolError::DeadlineExceeded)
         ));
         operation.deadline = Instant::now() + Duration::from_secs(3);
         operation.is_callback = true;
         assert!(matches!(
-            reconnect("ws://127.0.0.1:1", &retained(), &operation).await,
+            reconnect(
+                "ws://127.0.0.1:1",
+                &retained(),
+                &operation,
+                "reconnected-owner"
+            )
+            .await,
             Err(ProtocolError::InvalidArguments)
         ));
     }

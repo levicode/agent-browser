@@ -84,7 +84,11 @@ impl RouteTransfer {
         if operation.generation != self.source.scope.generation {
             return Err(ProtocolError::StaleGeneration);
         }
-        if operation.is_callback || operation.sequence != self.sequence {
+        if operation.is_callback
+            || operation.sequence != self.sequence
+            || operation.deadline != self.deadline
+            || !operation.cancellation.same_channel(&self.cancellation)
+        {
             return Err(ProtocolError::InvalidSequence);
         }
         if *self.cancellation.borrow() != CancelSignal::None
@@ -101,7 +105,36 @@ impl RouteTransfer {
     }
     /// Bind once to the exact replacement, not a string token supplied by a
     /// client. Its route slot is frozen until successful adoption/publication.
-    pub(crate) fn bind(&mut self, replacement: &Arc<ClientNetwork>) -> Result<(), ProtocolError> {
+    pub(super) fn bind_replacement(
+        &mut self,
+        replacement: &Arc<ClientNetwork>,
+        owner: &super::client_browser::ReplacementLease,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check_operation(operation)?;
+        owner.check_route_replacement(
+            &self.source.client,
+            &replacement.client,
+            &replacement.scope.identity_scope,
+            operation,
+        )?;
+        self.bind_checked(replacement)
+    }
+
+    // Existing protocol-only fixtures have no lifecycle manager or managed
+    // owner. They retain the old same-handle guard; production has no such path.
+    #[cfg(test)]
+    fn bind_unmanaged(&mut self, replacement: &Arc<ClientNetwork>) -> Result<(), ProtocolError> {
+        if self.source.client.debt_ledger().is_some()
+            || replacement.client.debt_ledger().is_some()
+            || !Arc::ptr_eq(&self.source.client, &replacement.client)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.bind_checked(replacement)
+    }
+
+    fn bind_checked(&mut self, replacement: &Arc<ClientNetwork>) -> Result<(), ProtocolError> {
         if !self.active || self.replacement.is_some() {
             return Err(ProtocolError::StaleScope);
         }
@@ -117,7 +150,6 @@ impl RouteTransfer {
         if Arc::ptr_eq(&self.source, replacement)
             || replacement.scope.identity_scope.is_empty()
             || replacement.scope.identity_scope == self.source.scope.identity_scope
-            || !Arc::ptr_eq(&self.source.client, &replacement.client)
             || !Arc::ptr_eq(&self.source.broker, &replacement.broker)
             || !Arc::ptr_eq(&self.source.blobs, &replacement.blobs)
         {
@@ -299,6 +331,18 @@ impl DisconnectedRoutes {
             &self.parked.target_id,
             operation,
         )?;
+        let owner = replacement
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::StaleScope)?;
+        if !owner.matches_owner(
+            replacement.scope.generation,
+            &replacement.scope.identity_scope,
+        ) {
+            return Err(ProtocolError::StaleScope);
+        }
+        owner.check_unpublished_operation(operation)?;
+        replacement.client.check_cleanup_owner(&Some(owner))?;
         replacement.check()?;
         let current = replacement
             .registry
@@ -1847,20 +1891,43 @@ impl ClientNetwork {
         proof: &super::client_enrollment::NativeTerminalProof,
     ) -> Result<(), ProtocolError> {
         self.check_terminal_proof(proof)?;
-        self.close_with_terminal_proof(Some(proof)).await
+        self.close_with_terminal_proof(Some(proof), None).await
+    }
+
+    /// Rootless final close retires routes instead of parking them. The distinct
+    /// proof carries no target recovery or remote cleanup acknowledgement.
+    pub(crate) async fn close_for_final_local_eof(
+        self: &Arc<Self>,
+        proof: &super::client_enrollment::FinalLocalEofProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check_network(self)?;
+        proof.check_client(&self.client)?;
+        if proof.generation() != self.scope.generation
+            || proof.identity_scope() != self.scope.identity_scope
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.close_with_terminal_proof(None, Some(proof)).await
     }
 
     /// Keep the close worker retained if its caller is cancelled or dropped.
     /// A second close awaits that same worker rather than treating moved-out
     /// task/reader sets as proof that their work already completed.
     pub async fn close(self: &Arc<Self>) -> Result<(), ProtocolError> {
-        self.close_with_terminal_proof(None).await
+        self.close_with_terminal_proof(None, None).await
     }
     async fn close_with_terminal_proof(
         self: &Arc<Self>,
         proof: Option<&super::client_enrollment::NativeTerminalProof>,
+        final_local: Option<&super::client_enrollment::FinalLocalEofProof>,
     ) -> Result<(), ProtocolError> {
         let mut state = self.close_gate.lock().await;
+        // Only the EOF supervisor starts this once. Cached ordinary close is
+        // not evidence that the final-local callback fence was performed.
+        if final_local.is_some() && (proof.is_some() || !matches!(*state, NetworkCloseState::Open))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
         let retire_failed = if let Some(proof) = proof {
             self.check_terminal_proof(proof)?;
             if matches!(*state, NetworkCloseState::Open) {
@@ -1896,8 +1963,9 @@ impl ClientNetwork {
             }
             let network = self.clone();
             let terminal = proof.cloned();
+            let final_local = final_local.cloned();
             *state = NetworkCloseState::Running(tokio::spawn(async move {
-                network.close_retained(failed, terminal).await
+                network.close_retained(failed, terminal, final_local).await
             }));
         }
         let result = match &mut *state {
@@ -1925,6 +1993,7 @@ impl ClientNetwork {
         self: &Arc<Self>,
         mut failed: bool,
         terminal: Option<super::client_enrollment::NativeTerminalProof>,
+        final_local: Option<super::client_enrollment::FinalLocalEofProof>,
     ) -> Result<(), ProtocolError> {
         // Cleanup failure never short-circuits owned-task drainage. In
         // particular spawn_blocking cannot be canceled by dropping its handle.
@@ -1960,6 +2029,23 @@ impl ClientNetwork {
                 .and_then(|()| {
                     self.retirement_sink
                         .retire_callbacks_after_terminal_drain(&proof)
+                });
+            if retired.is_err() {
+                failed = true;
+            }
+        }
+        if let Some(proof) = final_local {
+            // The exact same producer-join boundary, without route preservation
+            // or a synthetic active target. File readers still join below.
+            let retired = proof
+                .check_network(self)
+                .and_then(|()| {
+                    self.broker
+                        .revoke_scope_decisions(&self.scope.identity_scope)
+                })
+                .and_then(|()| {
+                    self.retirement_sink
+                        .retire_callbacks_after_final_local_drain(&proof)
                 });
             if retired.is_err() {
                 failed = true;
@@ -3214,6 +3300,17 @@ mod bridge_tests {
         tokio::sync::mpsc::Receiver<Value>,
         tokio::task::JoinHandle<()>,
     ) {
+        fixture_with_delays(delay, false).await
+    }
+    async fn fixture_with_delays(
+        delay: bool,
+        hold_input: bool,
+    ) -> (
+        Arc<ClientNetwork>,
+        tokio::sync::mpsc::Receiver<ServerMessage>,
+        tokio::sync::mpsc::Receiver<Value>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (commands, received) = tokio::sync::mpsc::channel(64);
@@ -3231,12 +3328,21 @@ mod bridge_tests {
                     json!({})
                 };
                 commands.send(command.clone()).await.unwrap();
+                if hold_input && command["method"] == "Input.dispatchMouseEvent" {
+                    // Keep the actual submitted command unacknowledged while
+                    // the socket still services unrelated owner cleanup.
+                    continue;
+                }
                 if delay && command["method"] == "Browser.setDownloadBehavior" {
                     tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                 }
+                let mut reply = json!({"id":command["id"],"result":result});
+                if let Some(session) = command.get("sessionId") {
+                    reply["sessionId"] = session.clone();
+                }
                 if socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
-                        json!({"id":command["id"],"result":result}).to_string(),
+                        reply.to_string(),
                     ))
                     .await
                     .is_err()
@@ -3281,6 +3387,294 @@ mod bridge_tests {
             },
         );
         (network, events, received, server)
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum RetirementWatchCase {
+        Clean,
+        UnownedSeal,
+        PoisonBefore,
+        PoisonAfter,
+        IncompleteInventory,
+        LostAccounting,
+        MutatingPrefix,
+        InputDebt,
+    }
+
+    async fn retained_body_watch_retirement(case: RetirementWatchCase) {
+        use super::super::client_browser::ExecutionGate;
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_protocol::{Effects, ScopeState};
+        use super::super::client_resource_dispatch::{execute, ResourceContext};
+        use super::super::client_targets::ClientTargets;
+        use super::super::client_tasks::RetainedTasks;
+        use super::super::client_transport::NativeOutcome;
+        use std::future::Future;
+        use std::time::Duration;
+
+        let input_debt = matches!(case, RetirementWatchCase::InputDebt);
+        let (network, mut events, mut commands, server) =
+            fixture_with_delays(false, input_debt).await;
+        network.subscribe_responses().unwrap();
+        network.event(&CdpEvent {
+            method: "Network.responseReceived".into(),
+            session_id: Some("owned".into()),
+            params: json!({"requestId":"endless","response":{"url":"https://synthetic.test/endless","status":200,"headers":{}}}),
+        }).unwrap();
+        let (_, payload, _) = next_event(&mut events).await;
+        let handle = payload["handle"].as_str().unwrap().to_owned();
+        let resource = network
+            .resources
+            .lock()
+            .unwrap()
+            .get(&handle)
+            .unwrap()
+            .clone();
+        assert!(resource.completed.borrow().is_none());
+        // No loadingFinished event: the real resource dispatcher must park on
+        // the pending body watch, not a substituted future or fabricated error.
+        let targets = ClientTargets::new("ctx".into(), network.scope.identity_scope.clone());
+        targets
+            .attached("ctx", "page".into(), "owned".into(), "page".into())
+            .unwrap();
+        targets.configured("page").unwrap();
+        let gate = Arc::new(ExecutionGate::default());
+        let permit = gate.enter(false).unwrap();
+        let tasks = RetainedTasks::default();
+        let ledger = OwnerDebtLedger::new(1, network.scope.identity_scope.clone());
+        network.client.install_debt_ledger(ledger.clone()).unwrap();
+        let operation = network.broker.admit(1, 1, 5_000).unwrap();
+        let deadline = operation.deadline;
+        assert!(network.broker.start(1, 1).unwrap());
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "page".into(),
+                "owned".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&operation).unwrap();
+        let (watch_ready, waiting_watch) = tokio::sync::oneshot::channel();
+        let (body_returned, waiting_body) = tokio::sync::oneshot::channel();
+        let (finish, finishing) = tokio::sync::oneshot::channel();
+        let (input_seen, waiting_input) = tokio::sync::oneshot::channel();
+        let captured = network.clone();
+        let receive = tasks.start_operation(
+            network.scope.identity_scope.clone(), targets.clone(), network.broker.clone(),
+            journal.clone(), operation.cancellation.clone(), async move {
+                if matches!(case, RetirementWatchCase::MutatingPrefix) {
+                    captured.client.send_command("Runtime.evaluate", Some(json!({"expression":"globalThis.retirementWitness = true","returnByValue":true})), Some("owned")).await.unwrap();
+                }
+                if input_debt {
+                    let input = captured.client.send_command("Input.dispatchMouseEvent", Some(json!({"type":"mousePressed","x":1,"y":1,"button":"left"})), Some("owned"));
+                    tokio::pin!(input);
+                    tokio::select! {
+                        _ = waiting_input => {},
+                        result = &mut input => panic!("held input unexpectedly settled: {result:?}"),
+                    }
+                    // Dropping the local waiter does not erase submitted debt.
+                }
+                let result = {
+                    let args = json!({"handle":handle,"offset":0,"maxBytes":32});
+                    let read = execute(ResourceContext {
+                        network: &captured, blobs: &captured.blobs, scope: &captured.scope,
+                        operation: &operation, permit: &permit,
+                    }, "network.body.read", &args);
+                    tokio::pin!(read);
+                    let mut watch_ready = Some(watch_ready);
+                    std::future::poll_fn(|cx| {
+                        let poll = read.as_mut().poll(cx);
+                        if poll.is_pending() {
+                            if let Some(ready) = watch_ready.take() { let _ = ready.send(()); }
+                        }
+                        poll
+                    }).await
+                };
+                body_returned.send(()).unwrap();
+                finishing.await.unwrap();
+                let outcome = match result {
+                    Ok(value) => NativeOutcome { retention: None, result: Ok(value), effects: Effects::Completed },
+                    Err(failure) => NativeOutcome { retention: None, result: Err(failure.error), effects: failure.effects },
+                };
+                drop(permit);
+                (outcome, false)
+            },
+        ).await.unwrap();
+        if input_debt {
+            let sent = tokio::time::timeout(Duration::from_secs(1), commands.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(sent["method"], "Input.dispatchMouseEvent");
+            input_seen.send(()).unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), waiting_watch)
+            .await
+            .unwrap()
+            .unwrap();
+        if matches!(case, RetirementWatchCase::MutatingPrefix) {
+            assert_eq!(commands.recv().await.unwrap()["method"], "Runtime.evaluate");
+        }
+        let before = journal.snapshot();
+        assert_eq!(
+            before.mutation_dispatched,
+            input_debt || matches!(case, RetirementWatchCase::MutatingPrefix)
+        );
+        assert_eq!(before.input_debt > 0, input_debt);
+        assert_eq!(before.object_debt, 0);
+        assert!(!before.integrity_lost);
+        assert!(!before.local_producers_finished);
+
+        if matches!(case, RetirementWatchCase::IncompleteInventory) {
+            targets
+                .attached(
+                    "ctx",
+                    "unfinished".into(),
+                    "unfinished-session".into(),
+                    "page".into(),
+                )
+                .unwrap();
+        }
+        if matches!(case, RetirementWatchCase::PoisonBefore) {
+            targets.seal();
+        }
+        if matches!(case, RetirementWatchCase::UnownedSeal) {
+            targets.seal_admission();
+        } else {
+            targets.seal_for_owner_retirement(
+                &super::super::client_browser::OwnerRetirement::for_test(&targets),
+            );
+        }
+        if matches!(case, RetirementWatchCase::PoisonAfter) {
+            targets.seal();
+        }
+        if matches!(case, RetirementWatchCase::LostAccounting) {
+            ledger.connection_lost();
+        }
+        gate.begin_transition().unwrap();
+        assert!(gate.enter(false).is_err());
+        assert!(targets.inventory().is_err());
+        let drained = gate.drained();
+        tokio::pin!(drained);
+        assert!(futures_util::poll!(&mut drained).is_pending());
+        tokio::time::timeout(Duration::from_secs(1), network.close())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            *resource.completed.borrow(),
+            Some(Err(ProtocolError::StaleScope))
+        );
+        tokio::time::timeout(Duration::from_secs(1), waiting_body)
+            .await
+            .unwrap()
+            .unwrap();
+        // Revocation wakes the real local watch, but cannot drop its producer's
+        // captured permit or claim completion before that owner has returned.
+        assert!(futures_util::poll!(&mut drained).is_pending());
+        assert!(!journal.snapshot().local_producers_finished);
+        assert!(
+            std::time::Instant::now() < deadline,
+            "retirement must not wait for the body deadline"
+        );
+        finish.send(()).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(1), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        let dirty = matches!(
+            case,
+            RetirementWatchCase::UnownedSeal
+                | RetirementWatchCase::PoisonBefore
+                | RetirementWatchCase::PoisonAfter
+                | RetirementWatchCase::IncompleteInventory
+                | RetirementWatchCase::LostAccounting
+        );
+        let unknown = dirty || input_debt || matches!(case, RetirementWatchCase::MutatingPrefix);
+        assert_eq!(outcome.result, Err(ProtocolError::StaleScope));
+        assert_eq!(
+            outcome.effects,
+            if unknown {
+                Effects::Unknown
+            } else {
+                Effects::NotDispatched
+            },
+            "{case:?}"
+        );
+        assert_eq!(
+            tasks.drain().await,
+            if dirty {
+                Err(ProtocolError::CleanupFailed)
+            } else {
+                Ok(())
+            }
+        );
+        drained.await.unwrap();
+        assert!(journal.snapshot().local_producers_finished);
+        assert_eq!(
+            journal.snapshot().input_debt > 0,
+            input_debt,
+            "retirement must not erase real input debt"
+        );
+        assert_eq!(
+            network.broker.health().unwrap().1,
+            if dirty {
+                ScopeState::Quarantined
+            } else {
+                ScopeState::Usable
+            }
+        );
+        // Exercise the delivered result's broker settlement as well. Unknown
+        // without a completed publication-retirement handshake stays terminal.
+        assert_eq!(
+            network.broker.settle(1, 1, outcome.effects).unwrap(),
+            if unknown {
+                ScopeState::Quarantined
+            } else {
+                ScopeState::Usable
+            }
+        );
+        tasks.fix_operation_result(journal.key());
+        if !unknown {
+            gate.commit_transition().unwrap();
+        }
+        assert!(
+            targets.inventory().is_err(),
+            "retirement never reopens old scope admission"
+        );
+        let (_cancel, retired_read) = download_operation();
+        assert!(network
+            .read_resource(payload["handle"].as_str().unwrap(), 0, 32, &retired_read)
+            .await
+            .is_err());
+        assert!(
+            commands.try_recv().is_err(),
+            "body watch/retirement must not replay input or fetch a body"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn normal_owner_retirement_drains_pending_body_watch_without_false_unknown() {
+        retained_body_watch_retirement(RetirementWatchCase::Clean).await;
+    }
+
+    #[tokio::test]
+    async fn pending_body_retirement_keeps_poison_incomplete_inventory_and_debt_unknown() {
+        for case in [
+            RetirementWatchCase::UnownedSeal,
+            RetirementWatchCase::PoisonBefore,
+            RetirementWatchCase::PoisonAfter,
+            RetirementWatchCase::IncompleteInventory,
+            RetirementWatchCase::LostAccounting,
+            RetirementWatchCase::MutatingPrefix,
+            RetirementWatchCase::InputDebt,
+        ] {
+            retained_body_watch_retirement(case).await;
+        }
     }
     async fn pressure_fixture() -> (
         Arc<ClientNetwork>,
@@ -3669,11 +4063,13 @@ mod bridge_tests {
         Arc<ClientNetwork>,
         Arc<super::super::client_targets::ClientTargets>,
         super::super::client_reconnect::VerifiedReconnectProof,
+        super::super::browser::BrowserManager,
     ) {
         let verified = super::super::client_reconnect::reconnect(
             &fixture.endpoint,
             &fixture.retained,
             operation,
+            "terminal-replacement",
         )
         .await
         .unwrap();
@@ -3695,7 +4091,7 @@ mod bridge_tests {
             context,
             replacement.scope.identity_scope.clone(),
         );
-        (replacement, targets, proof)
+        (replacement, targets, proof, manager)
     }
     #[tokio::test]
     async fn terminal_routes_hold_release_until_exact_reconnect_and_ignore_late_old_scope() {
@@ -3739,7 +4135,8 @@ mod bridge_tests {
         assert!(source
             .take_disconnected_routes(&fixture.targets, &operation)
             .is_err());
-        let (replacement, targets, verified) = reconnected_network(&fixture, &operation).await;
+        let (replacement, targets, verified, manager) =
+            reconnected_network(&fixture, &operation).await;
         routes
             .bind(&replacement, &targets, &verified, &operation)
             .unwrap();
@@ -3779,7 +4176,7 @@ mod bridge_tests {
             source.broker.take_released_registry_events(8).unwrap(),
             vec![(7, Some("terminal-replacement".into()))]
         );
-        replacement.client.close().await;
+        manager.disconnect_transport().await;
         fixture.server.await.unwrap();
     }
     #[tokio::test]
@@ -3793,7 +4190,8 @@ mod bridge_tests {
         let mut routes = source
             .take_disconnected_routes(&fixture.targets, &operation)
             .unwrap();
-        let (replacement, targets, verified) = reconnected_network(&fixture, &operation).await;
+        let (replacement, targets, verified, manager) =
+            reconnected_network(&fixture, &operation).await;
         for wrong in [
             "client",
             "store",
@@ -3873,7 +4271,7 @@ mod bridge_tests {
         assert!(routes.adopt(&targets, &operation).is_err());
         source.close().await.unwrap();
         replacement.close().await.unwrap();
-        replacement.client.close().await;
+        manager.disconnect_transport().await;
         fixture.server.await.unwrap();
     }
     #[tokio::test]
@@ -4125,7 +4523,7 @@ mod bridge_tests {
             Err(ProtocolError::StaleScope)
         );
         let replacement = route_replacement(&source, "replacement");
-        transfer.bind(&replacement).unwrap();
+        transfer.bind_unmanaged(&replacement).unwrap();
         assert_eq!(
             transfer.adopt(&operation),
             Err(ProtocolError::RegistryInUse)
@@ -4192,7 +4590,10 @@ mod bridge_tests {
         let (_cancel, operation) = download_operation();
         source.replace_routes(1, vec!["route".into()]).unwrap();
         let mut transfer = source.capture_route_transfer(&operation).unwrap();
-        assert_eq!(transfer.bind(&source), Err(ProtocolError::StaleScope));
+        assert_eq!(
+            transfer.bind_unmanaged(&source),
+            Err(ProtocolError::StaleScope)
+        );
         for kind in ["client", "broker", "store", "generation", "identity"] {
             let client = if kind == "client" {
                 foreign.client.clone()
@@ -4226,7 +4627,7 @@ mod bridge_tests {
                 NetworkPolicy::default(),
             ));
             assert_eq!(
-                transfer.bind(&candidate),
+                transfer.bind_unmanaged(&candidate),
                 Err(if kind == "generation" {
                     ProtocolError::StaleGeneration
                 } else {
@@ -4237,8 +4638,11 @@ mod bridge_tests {
         }
         let replacement = route_replacement(&source, "replacement");
         let other = route_replacement(&source, "other-replacement");
-        transfer.bind(&replacement).unwrap();
-        assert_eq!(transfer.bind(&other), Err(ProtocolError::StaleScope));
+        transfer.bind_unmanaged(&replacement).unwrap();
+        assert_eq!(
+            transfer.bind_unmanaged(&other),
+            Err(ProtocolError::StaleScope)
+        );
         assert!(!other.routes_frozen.load(Ordering::Acquire));
         transfer.restore(&operation).unwrap();
         assert!(!source.routes_frozen.load(Ordering::Acquire));
@@ -4262,7 +4666,7 @@ mod bridge_tests {
             source.replace_routes(1, vec!["route".into()]).unwrap();
             let mut transfer = source.capture_route_transfer(&operation).unwrap();
             let replacement = route_replacement(&source, "replacement");
-            transfer.bind(&replacement).unwrap();
+            transfer.bind_unmanaged(&replacement).unwrap();
             if cancel_after_close {
                 source.close().await.unwrap();
             }
@@ -4325,7 +4729,7 @@ mod bridge_tests {
         source.replace_routes(1, vec!["route".into()]).unwrap();
         let mut transfer = source.capture_route_transfer(&operation).unwrap();
         let replacement = route_replacement(&source, "replacement");
-        transfer.bind(&replacement).unwrap();
+        transfer.bind_unmanaged(&replacement).unwrap();
         let (release, wait) = std::sync::mpsc::channel();
         let (started, entered) = tokio::sync::oneshot::channel();
         source
@@ -4380,7 +4784,7 @@ mod bridge_tests {
         source.replace_routes(1, vec!["route".into()]).unwrap();
         let mut transfer = source.capture_route_transfer(&operation).unwrap();
         let replacement = route_replacement(&source, "replacement");
-        transfer.bind(&replacement).unwrap();
+        transfer.bind_unmanaged(&replacement).unwrap();
         source
             .blocking_reads
             .lock()

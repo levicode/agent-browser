@@ -566,6 +566,15 @@ struct GroupObligation {
     release_inflight: bool,
     cleanup_issued: bool,
 }
+/// Private final-local evidence only. This never restores transport integrity
+/// or grants command admission, owner replacement, or remote retirement.
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+enum EofIntegrityCause {
+    #[default]
+    NotObserved,
+    RemoteEofOnly,
+    Contaminated,
+}
 #[derive(Default)]
 struct LedgerState {
     next_reservation: u64,
@@ -582,6 +591,7 @@ struct LedgerState {
     object_bytes: usize,
     journal_bytes: usize,
     integrity_lost: bool,
+    eof_integrity_cause: EofIntegrityCause,
     retired: bool,
     context_id: Option<String>,
     final_cleanup_claimed: [bool; 2],
@@ -594,12 +604,46 @@ struct LedgerState {
     root_creation_claimed: bool,
     recording_targets: HashSet<String>,
 }
+impl LedgerState {
+    fn contaminate_integrity(&mut self) {
+        self.integrity_lost = true;
+        self.eof_integrity_cause = EofIntegrityCause::Contaminated;
+    }
+}
 pub(crate) struct OwnerDebtLedger {
     generation: u64,
     identity_scope: String,
     state: Mutex<LedgerState>,
 }
 impl OwnerDebtLedger {
+    /// A replacement route transfer belongs to the original unpublished request,
+    /// including its cancellation channel. Publication consumes this authority.
+    pub(crate) fn check_unpublished_operation(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired
+            || state.integrity_lost
+            || operation.is_callback
+            || operation.generation != self.generation
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let bootstrap = state.bootstrap.as_ref().ok_or(ProtocolError::StaleScope)?;
+        if bootstrap.published
+            || bootstrap.sequence != operation.sequence
+            || bootstrap.deadline != operation.deadline
+            || !bootstrap.cancellation.same_channel(&operation.cancellation)
+        {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        bootstrap.check()
+    }
+
     pub(crate) async fn initialization_work<F: Future>(
         self: &Arc<Self>,
         work: InitializationWork,
@@ -894,6 +938,11 @@ impl OwnerDebtLedger {
             identity_scope,
             state: Mutex::new(LedgerState {
                 integrity_lost: invalid,
+                eof_integrity_cause: if invalid {
+                    EofIntegrityCause::Contaminated
+                } else {
+                    EofIntegrityCause::NotObserved
+                },
                 ..Default::default()
             }),
         })
@@ -932,6 +981,44 @@ impl OwnerDebtLedger {
     }
     pub(crate) fn matches_owner(&self, generation: u64, identity_scope: &str) -> bool {
         self.generation == generation && self.identity_scope == identity_scope
+    }
+    /// A read-only terminal check, never proof that EOF destroyed a borrowed
+    /// context. Exact reader events must already have settled every obligation.
+    pub(crate) fn check_final_local_eof(
+        &self,
+        generation: u64,
+        identity_scope: &str,
+    ) -> Result<(), ProtocolError> {
+        if !self.matches_owner(generation, identity_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.eof_integrity_cause != EofIntegrityCause::RemoteEofOnly
+            || !state.integrity_lost
+            || state.retired
+            || state
+                .bootstrap
+                .as_ref()
+                .is_none_or(|scope| scope.owns_context)
+            || state.context_id.is_none()
+            || state.context_creation_claimed
+            || !state.commands.is_empty()
+            || !state.objects.is_empty()
+            || !state.groups.is_empty()
+            || !state.realms.is_empty()
+            || !state.targets.is_empty()
+            || !state.lifecycle_sessions.is_empty()
+            || !state.created_targets.is_empty()
+            || !state.recording_targets.is_empty()
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        // Bound context identity and script authorization digests are inert
+        // metadata, not live resources. Do not require descriptor_bytes == 0.
+        Ok(())
     }
     pub(crate) fn operation(
         self: &Arc<Self>,
@@ -1466,12 +1553,10 @@ impl OwnerDebtLedger {
         match &acquisition {
             Some(LifecycleAcquisition::Context) => state.context_creation_claimed = true,
             Some(LifecycleAcquisition::Target) => state.root_creation_claimed = true,
-            Some(LifecycleAcquisition::Session(target, recording)) => {
-                if *recording {
-                    state.recording_targets.remove(target);
-                }
+            Some(LifecycleAcquisition::Session(target, true)) => {
+                state.recording_targets.remove(target);
             }
-            None => {}
+            Some(LifecycleAcquisition::Session(_, false)) | None => {}
         }
         state.commands.insert(
             id,
@@ -1520,8 +1605,25 @@ impl OwnerDebtLedger {
     }
     pub(crate) fn connection_lost(&self) {
         match self.state.lock() {
-            Ok(mut state) => state.integrity_lost = true,
-            Err(error) => error.into_inner().integrity_lost = true,
+            Ok(mut state) => state.contaminate_integrity(),
+            Err(error) => error.into_inner().contaminate_integrity(),
+        }
+    }
+    /// Only the real transport reader may record this cause. Earlier damage is
+    /// irreversible, and EOF itself never acknowledges or clears remote debt.
+    pub(crate) fn observe_remote_eof(&self) {
+        match self.state.lock() {
+            Ok(mut state) => {
+                if state.eof_integrity_cause == EofIntegrityCause::NotObserved {
+                    state.eof_integrity_cause = if state.integrity_lost {
+                        EofIntegrityCause::Contaminated
+                    } else {
+                        EofIntegrityCause::RemoteEofOnly
+                    };
+                }
+                state.integrity_lost = true;
+            }
+            Err(error) => error.into_inner().contaminate_integrity(),
         }
     }
     pub(crate) fn observe_event(&self, event: &CdpEvent) {
@@ -1553,11 +1655,11 @@ impl OwnerDebtLedger {
                         || metadata_usage(&state).saturating_add(extra) > 64 * 1024
                         || descriptor_usage(&state).saturating_add(extra) > 508 * 1024
                     {
-                        state.integrity_lost = true;
+                        state.contaminate_integrity();
                         return;
                     }
                     let Some(epoch) = state.next_realm_epoch.checked_add(1) else {
-                        state.integrity_lost = true;
+                        state.contaminate_integrity();
                         return;
                     };
                     state.next_realm_epoch = epoch;
@@ -2134,13 +2236,13 @@ impl SubmittedCommand {
             };
         if !valid_envelope {
             command.status.set(CommandStatus::IntegrityLost);
-            state.integrity_lost = true;
+            state.contaminate_integrity();
             return Vec::new();
         }
         if response.session_id.as_deref() != command.provenance.session.as_deref() {
             // Omission is valid only when both sides are browser-level.
             command.status.set(CommandStatus::IntegrityLost);
-            state.integrity_lost = true;
+            state.contaminate_integrity();
             return Vec::new();
         }
         if response.error.is_some()
@@ -2168,7 +2270,7 @@ impl SubmittedCommand {
                     .filter(|id| !id.is_empty() && id.len() <= 4096)
                     .map(str::to_owned)
                 else {
-                    state.integrity_lost = true;
+                    state.contaminate_integrity();
                     return Vec::new();
                 };
                 let extra = 64
@@ -2178,7 +2280,7 @@ impl SubmittedCommand {
                 if metadata_usage(&state).saturating_add(extra) > 64 * 1024
                     || descriptor_usage(&state).saturating_add(extra) > 508 * 1024
                 {
-                    state.integrity_lost = true;
+                    state.contaminate_integrity();
                     return Vec::new();
                 }
                 match field {
@@ -2188,7 +2290,7 @@ impl SubmittedCommand {
                             .as_ref()
                             .is_some_and(|context| context != &identity)
                         {
-                            state.integrity_lost = true;
+                            state.contaminate_integrity();
                             return Vec::new();
                         }
                         state.context_id = Some(identity);
@@ -2203,7 +2305,7 @@ impl SubmittedCommand {
                             .get(&identity)
                             .is_some_and(|known| known != &target)
                         {
-                            state.integrity_lost = true;
+                            state.contaminate_integrity();
                             return Vec::new();
                         }
                         if recording {
@@ -2266,7 +2368,7 @@ impl SubmittedCommand {
         if handles.len() > command.creation_slots
             || handles.iter().any(|object| object.len() > 4096)
         {
-            state.integrity_lost = true;
+            state.contaminate_integrity();
             // Preserve pre-reserved anonymous creation debt if an invalid
             // response cannot safely be represented, rather than truncating it.
             for _ in 0..command.creation_slots {
@@ -2290,7 +2392,7 @@ impl SubmittedCommand {
                 let footprint =
                     256 + object.len() + command.object_group.as_ref().map_or(0, String::len);
                 let Some(serial) = state.next_object_serial.checked_add(1) else {
-                    state.integrity_lost = true;
+                    state.contaminate_integrity();
                     return Vec::new();
                 };
                 state.next_object_serial = serial;
@@ -2797,6 +2899,246 @@ mod tests {
             .reserve_command(None, "Page.getFrameTree", None, Some("page"))
             .is_err());
     }
+    fn borrowed_final_local_owner() -> Arc<OwnerDebtLedger> {
+        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 7,
+            sequence: 1,
+            deadline: Instant::now() + std::time::Duration::from_secs(30),
+            cancellation,
+        };
+        let ledger = OwnerDebtLedger::unpublished(&operation, "scope".into(), false).unwrap();
+        ledger.bind_context("borrowed-context").unwrap();
+        ledger
+    }
+    #[test]
+    fn final_local_eof_is_read_only_exact_borrowed_owner_evidence_not_admission() {
+        let ledger = borrowed_final_local_owner();
+        ledger
+            .allow_initialization_script("inert authorization")
+            .unwrap();
+        ledger
+            .bind_session("borrowed-context", "target", "page")
+            .unwrap();
+        assert!(ledger.check_final_local_eof(7, "scope").is_err());
+        ledger.observe_event(&CdpEvent {
+            method: "Target.detachedFromTarget".into(),
+            session_id: None,
+            params: json!({"sessionId":"page"}),
+        });
+        assert!(ledger.check_final_local_eof(7, "scope").is_err());
+        ledger.observe_remote_eof();
+        let before = ledger.snapshot();
+        assert!(before.integrity_lost);
+        assert!(before.descriptor_bytes > 0);
+        assert!(ledger.check_final_local_eof(8, "scope").is_err());
+        assert!(ledger.check_final_local_eof(7, "replacement").is_err());
+        assert!(ledger.check_final_local_eof(7, "scope").is_ok());
+        assert_eq!(ledger.snapshot(), before);
+        assert_eq!(ledger.bound_context().as_deref(), Some("borrowed-context"));
+        assert!(!ledger.replacement_ready());
+        assert!(ledger.check_admission(AdmissionClass::FixedRead).is_err());
+        assert!(ledger
+            .reserve_command(None, "Browser.getVersion", None, None)
+            .is_err());
+        assert!(ledger
+            .bind_session("borrowed-context", "next", "next")
+            .is_err());
+    }
+    #[test]
+    fn final_local_eof_refuses_every_live_resource_and_uncertain_context() {
+        for obstruction in [
+            "object",
+            "group",
+            "realm",
+            "target",
+            "lifecycle_session",
+            "created_target",
+            "recording_target",
+            "context_claim",
+            "owned",
+            "unbound",
+            "legacy",
+            "retired",
+        ] {
+            let ledger = borrowed_final_local_owner();
+            {
+                let mut state = ledger.state.lock().unwrap();
+                let provenance = Provenance {
+                    operation: None,
+                    target: Some("target".into()),
+                    session: Some("page".into()),
+                    realm: None,
+                };
+                match obstruction {
+                    "object" => state.objects.push(ObjectObligation {
+                        provenance,
+                        object: Some("object".into()),
+                        group: None,
+                        serial: 1,
+                        footprint: 256,
+                    }),
+                    "group" => {
+                        state.groups.insert(
+                            1,
+                            GroupObligation {
+                                provenance,
+                                name: "group".into(),
+                                footprint: 256,
+                                pending_creations: 0,
+                                submitted_creations: 0,
+                                ever_submitted: true,
+                                sealed: true,
+                                release_inflight: false,
+                                cleanup_issued: false,
+                            },
+                        );
+                    }
+                    "realm" => {
+                        state.realms.insert(("page".into(), 1), 1);
+                    }
+                    "target" => {
+                        state.targets.insert("page".into(), "target".into());
+                    }
+                    "lifecycle_session" => {
+                        state
+                            .lifecycle_sessions
+                            .insert("observer".into(), LifecycleSessionPurpose::Observer);
+                    }
+                    "created_target" => {
+                        state.created_targets.insert("target".into());
+                    }
+                    "recording_target" => {
+                        state.recording_targets.insert("target".into());
+                    }
+                    "context_claim" => state.context_creation_claimed = true,
+                    "owned" => state.bootstrap.as_mut().unwrap().owns_context = true,
+                    "unbound" => state.context_id = None,
+                    "legacy" => state.bootstrap = None,
+                    "retired" => state.retired = true,
+                    _ => unreachable!(),
+                }
+            }
+            ledger.observe_remote_eof();
+            let before = ledger.snapshot();
+            assert!(
+                ledger.check_final_local_eof(7, "scope").is_err(),
+                "{obstruction}"
+            );
+            assert_eq!(ledger.snapshot(), before);
+        }
+    }
+    #[test]
+    fn eof_never_acknowledges_commands_or_pending_acquisition() {
+        for method in [
+            "Browser.getVersion",
+            "Target.createTarget",
+            "Input.dispatchKeyEvent",
+        ] {
+            let ledger = borrowed_final_local_owner();
+            let journal = if method == "Input.dispatchKeyEvent" {
+                ledger
+                    .bind_session("borrowed-context", "target", "page")
+                    .unwrap();
+                ledger.publish_initialization(|| Ok(())).unwrap();
+                Some(
+                    ledger
+                        .operation(
+                            OperationKey {
+                                generation: 7,
+                                operation_seq: 1,
+                            },
+                            "target".into(),
+                            "page".into(),
+                        )
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let params = (method == "Target.createTarget")
+                .then(|| json!({"url":"about:blank","browserContextId":"borrowed-context"}));
+            let reservation = ledger
+                .reserve_command(
+                    journal.as_ref(),
+                    method,
+                    params.as_ref(),
+                    journal.as_ref().map(|_| "page"),
+                )
+                .unwrap();
+            let status = reservation.status();
+            let _submitted = reservation.submit().unwrap();
+            ledger.observe_remote_eof();
+            assert!(ledger.check_final_local_eof(7, "scope").is_err());
+            assert_eq!(ledger.snapshot().outstanding_commands, 1);
+            assert_eq!(status.snapshot(), CommandStatus::Submitted);
+            if journal.is_some() {
+                assert_eq!(ledger.snapshot().input_debt, 1);
+            }
+        }
+    }
+    #[test]
+    fn final_local_eof_contamination_survives_exact_debt_destruction() {
+        for damage in ["local_close", "malformed", "correlation", "metadata"] {
+            let ledger = borrowed_final_local_owner();
+            ledger
+                .bind_session("borrowed-context", "target", "page")
+                .unwrap();
+            ledger.publish_initialization(|| Ok(())).unwrap();
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 7,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            let command = ledger
+                .reserve_command(Some(&journal), "Input.dispatchKeyEvent", None, Some("page"))
+                .unwrap()
+                .submit()
+                .unwrap();
+            match damage {
+                "local_close" => ledger.connection_lost(),
+                "malformed" => command.malformed_response(),
+                "correlation" => command.settle(
+                    &serde_json::from_value(json!({
+                        "id":1,"sessionId":"foreign","result":{}
+                    }))
+                    .unwrap(),
+                ),
+                "metadata" => {
+                    ledger.state.lock().unwrap().next_realm_epoch = u64::MAX;
+                    ledger.observe_event(&CdpEvent {
+                        method: "Runtime.executionContextCreated".into(),
+                        session_id: Some("page".into()),
+                        params: json!({"context":{"id":1}}),
+                    });
+                }
+                _ => unreachable!(),
+            }
+            ledger.observe_event(&CdpEvent {
+                method: "Target.detachedFromTarget".into(),
+                session_id: None,
+                params: json!({"sessionId":"page"}),
+            });
+            ledger.observe_remote_eof();
+            assert_eq!(ledger.snapshot().outstanding_commands, 0);
+            assert!(
+                ledger.check_final_local_eof(7, "scope").is_err(),
+                "{damage}"
+            );
+        }
+        let ledger = borrowed_final_local_owner();
+        ledger.observe_remote_eof();
+        assert!(ledger.check_final_local_eof(7, "scope").is_ok());
+        ledger.connection_lost();
+        ledger.observe_remote_eof();
+        assert!(ledger.check_final_local_eof(7, "scope").is_err());
+    }
     #[tokio::test]
     async fn retired_owner_cleanup_is_one_shot_accounted_and_not_application_authority() {
         let (ledger, journal) = owner();
@@ -2858,9 +3200,11 @@ mod tests {
             params: serde_json::json!({"context":{"id":1}}),
         });
         assert!(ledger.state.lock().unwrap().realms.is_empty());
-        submitted.settle(&response(serde_json::json!({})));
+        // DisableAutoAttach is browser-level; a page-session reply is not its ACK.
+        submitted.settle(&serde_json::from_value(json!({"id":1,"result":{}})).unwrap());
         assert_eq!(ledger.snapshot().outstanding_commands, 0);
         assert_eq!(cleanup_status.snapshot(), CommandStatus::Acknowledged);
+        assert!(!ledger.snapshot().integrity_lost);
         let close = ledger
             .reserve_owner_cleanup(OwnerCleanupCommand::CloseBrowser)
             .unwrap();

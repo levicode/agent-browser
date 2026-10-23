@@ -48,6 +48,8 @@ impl OwnedTarget {
 struct Registry {
     revision: u64,
     sealed: bool,
+    integrity_lost: bool,
+    owner_retirement_inventory: Option<bool>,
     reservations: usize,
     creation_sequence: u64,
     bootstrap_creations: HashMap<u64, Option<String>>,
@@ -60,6 +62,19 @@ struct Registry {
     targets: HashMap<String, OwnedTarget>,
     auxiliary_sequence: u64,
     auxiliary: HashMap<u64, AuxiliaryAttachment>,
+}
+impl Registry {
+    fn inventory_complete(&self) -> bool {
+        self.reservations == 0
+            && self
+                .targets
+                .values()
+                .all(|target| target.purpose.is_some() && target.configured)
+    }
+    fn lose_integrity(&mut self) {
+        self.sealed = true;
+        self.integrity_lost = true;
+    }
 }
 pub struct ClientTargets {
     pub context_id: String,
@@ -145,7 +160,7 @@ impl ResumePermit {
             .get_mut(&self.target_id)
             .ok_or(ProtocolError::StaleReference)?;
         if target.session_id != self.session_id {
-            state.sealed = true;
+            state.lose_integrity();
             return Err(ProtocolError::StaleScope);
         }
         target.resumed = true;
@@ -163,7 +178,7 @@ impl Drop for ResumePermit {
             }
             state.resuming = state.resuming.saturating_sub(1);
             if !self.completed {
-                state.sealed = true;
+                state.lose_integrity();
             }
         }
         self.registry.changed.notify_waiters();
@@ -531,7 +546,7 @@ impl ClientTargets {
                 }
                 if pending.candidates.len() >= 64 && !pending.candidates.contains(session_id) {
                     pending.failed = true;
-                    state.sealed = true;
+                    state.lose_integrity();
                     self.changed.notify_waiters();
                     return Err(ProtocolError::CapacityExceeded);
                 }
@@ -827,13 +842,7 @@ impl ClientTargets {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed
-            || state.reservations != 0
-            || state
-                .targets
-                .values()
-                .any(|t| t.purpose.is_none() || !t.configured)
-        {
+        if state.sealed || !state.inventory_complete() {
             return Err(ProtocolError::ScopeUnavailable);
         }
         Ok((state.revision, state.targets.values().cloned().collect()))
@@ -851,9 +860,84 @@ impl ClientTargets {
     }
     pub fn seal(&self) {
         if let Ok(mut state) = self.state.lock() {
+            state.lose_integrity();
+        }
+        self.changed.notify_waiters();
+    }
+    /// Stop admission without inventing either cleanup success or accounting
+    /// failure. Only an earlier owner-retirement stamp can certify settlement.
+    pub(crate) fn seal_admission(&self) {
+        if let Ok(mut state) = self.state.lock() {
             state.sealed = true;
         }
         self.changed.notify_waiters();
+    }
+    /// Called by the retained lifecycle owner before stopping enrollment. The
+    /// first inventory is immutable: later cleanup cannot repair missing proof,
+    /// and neither repeated retirement nor this stamp can clear a poison seal.
+    pub(crate) fn seal_for_owner_retirement(
+        &self,
+        authority: &super::client_browser::OwnerRetirement,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if !authority.authorizes(self) {
+                state.lose_integrity();
+                self.changed.notify_waiters();
+                return;
+            }
+            if state.owner_retirement_inventory.is_none() {
+                state.owner_retirement_inventory =
+                    Some(!state.sealed && !state.integrity_lost && state.inventory_complete());
+            }
+            state.sealed = true;
+        }
+        self.changed.notify_waiters();
+    }
+    /// Final-local cleanup only: admission may already be sealed, but no
+    /// accounting damage or unsettled exact resource/reservation is waived.
+    pub(crate) fn check_final_local_cleanup(&self) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        if state.integrity_lost
+            || !state.enrollment_ready
+            || !state.targets.is_empty()
+            || state.reservations != 0
+            || state.resuming != 0
+            || state.protected_read
+            || !state.bootstrap_creations.is_empty()
+            || !state.native_bootstrap_cleanup.is_empty()
+            || !state.bootstrap_cleanup_reservations.is_empty()
+            || state.unknown_bootstrap_create
+            || state.auxiliary.values().any(|entry| {
+                entry.failed
+                    || !entry.detached
+                    || !entry.cleanup_owned.iter().all(|session| {
+                        entry.acknowledged_session.as_deref() == Some(session)
+                            || entry.cleanup_acknowledged.contains(session)
+                    })
+            })
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        Ok(())
+    }
+    /// Settlement is not application admission. A completed local producer may
+    /// retire under its original owner after normal lifecycle sealing, but every
+    /// accounting failure and incomplete inventory still rejects settlement.
+    pub(crate) fn check_settlement_integrity(&self) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.integrity_lost
+            || !state.inventory_complete()
+            || (state.sealed && state.owner_retirement_inventory != Some(true))
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        Ok(())
     }
 }
 impl AuxiliaryAttachmentReservation {
@@ -932,7 +1016,7 @@ impl AuxiliaryAttachmentReservation {
         entry.acknowledged_session = Some(session_id.into());
         if !valid {
             entry.failed = true;
-            state.sealed = true;
+            state.lose_integrity();
             drop(state);
             self.registry.changed.notify_waiters();
             return Err(ProtocolError::StaleScope);
@@ -952,7 +1036,7 @@ impl AuxiliaryAttachmentReservation {
                     entry.cleanup_owned.extend(entry.candidates.iter().cloned());
                 }
             }
-            state.sealed = true;
+            state.lose_integrity();
         }
         self.registry.changed.notify_waiters();
     }
@@ -1184,7 +1268,7 @@ impl Drop for CreationReservation {
             // An abandoned create may still produce a late browser target.
             // Never reinterpret that unclaimed bootstrap as application work.
             if !self.claimed {
-                state.sealed = true;
+                state.lose_integrity();
                 if self.purpose == TargetPurpose::StateBootstrap
                     && self.native_created_target.is_none()
                 {
@@ -1212,6 +1296,171 @@ impl Drop for CreationReservation {
 
 #[cfg(test)]
 mod tests {
+    fn settlement_registry() -> std::sync::Arc<super::ClientTargets> {
+        let registry = super::ClientTargets::new("ctx".into(), "scope".into());
+        registry
+            .attached("ctx", "target".into(), "session".into(), "page".into())
+            .unwrap();
+        registry.configured("target").unwrap();
+        registry
+    }
+
+    #[test]
+    fn owner_retirement_preserves_settlement_only_and_never_reopens_admission() {
+        let registry = settlement_registry();
+        registry.check_settlement_integrity().unwrap();
+        registry.seal_for_owner_retirement(
+            &super::super::client_browser::OwnerRetirement::for_test(&registry),
+        );
+        registry.seal_admission();
+        registry.seal_for_owner_retirement(
+            &super::super::client_browser::OwnerRetirement::for_test(&registry),
+        );
+        registry.check_settlement_integrity().unwrap();
+        assert!(registry.inventory().is_err());
+        assert!(registry.owned_target("target").is_err());
+        assert!(registry
+            .reserve_creation(super::TargetPurpose::Application)
+            .is_err());
+        assert!(registry
+            .attached("ctx", "later".into(), "later-session".into(), "page".into())
+            .is_err());
+    }
+
+    #[test]
+    fn final_local_cleanup_preserves_every_registry_obligation_and_poison() {
+        let empty = ClientTargets::new("ctx".into(), "scope".into());
+        assert!(empty.check_final_local_cleanup().is_err());
+        empty.acknowledge_enrollment().unwrap();
+        empty.seal_admission();
+        empty.check_final_local_cleanup().unwrap();
+        empty.seal();
+        assert!(empty.check_final_local_cleanup().is_err());
+        for case in [
+            "reservation",
+            "resuming",
+            "protected",
+            "bootstrap",
+            "cleanup-target",
+            "cleanup-reservation",
+            "unknown-create",
+            "live-target",
+        ] {
+            let registry = ClientTargets::new("ctx".into(), "scope".into());
+            registry.acknowledge_enrollment().unwrap();
+            if case == "live-target" {
+                registry
+                    .attached("ctx", "target".into(), "session".into(), "page".into())
+                    .unwrap();
+            } else {
+                let mut state = registry.state.lock().unwrap();
+                match case {
+                    "reservation" => state.reservations = 1,
+                    "resuming" => state.resuming = 1,
+                    "protected" => state.protected_read = true,
+                    "bootstrap" => {
+                        state.bootstrap_creations.insert(1, None);
+                    }
+                    "cleanup-target" => {
+                        state.native_bootstrap_cleanup.insert("target".into());
+                    }
+                    "cleanup-reservation" => {
+                        state.bootstrap_cleanup_reservations.insert(1);
+                    }
+                    "unknown-create" => state.unknown_bootstrap_create = true,
+                    _ => unreachable!(),
+                }
+            }
+            registry.seal_admission();
+            assert!(registry.check_final_local_cleanup().is_err(), "{case}");
+        }
+    }
+
+    #[test]
+    fn owner_retirement_never_clears_earlier_or_later_integrity_sealing() {
+        for poison_first in [false, true] {
+            let registry = settlement_registry();
+            if poison_first {
+                registry.seal();
+            }
+            registry.seal_for_owner_retirement(
+                &super::super::client_browser::OwnerRetirement::for_test(&registry),
+            );
+            registry.seal();
+            registry.seal_admission();
+            registry.seal_for_owner_retirement(
+                &super::super::client_browser::OwnerRetirement::for_test(&registry),
+            );
+            assert!(registry.check_settlement_integrity().is_err());
+        }
+        let unowned = settlement_registry();
+        unowned.seal_admission();
+        unowned.seal_for_owner_retirement(
+            &super::super::client_browser::OwnerRetirement::for_test(&unowned),
+        );
+        assert!(unowned.check_settlement_integrity().is_err());
+
+        let original = settlement_registry();
+        let replacement = settlement_registry();
+        let foreign = super::super::client_browser::OwnerRetirement::for_test(&original);
+        replacement.seal_for_owner_retirement(&foreign);
+        assert!(replacement.check_settlement_integrity().is_err());
+        assert!(replacement.inventory().is_err());
+        original.check_settlement_integrity().unwrap();
+    }
+
+    #[test]
+    fn owner_retirement_does_not_repair_incomplete_inventory_or_poisoned_lock() {
+        let incomplete = settlement_registry();
+        incomplete
+            .attached(
+                "ctx",
+                "unfinished".into(),
+                "unfinished-session".into(),
+                "page".into(),
+            )
+            .unwrap();
+        incomplete.seal_for_owner_retirement(
+            &super::super::client_browser::OwnerRetirement::for_test(&incomplete),
+        );
+        assert!(incomplete.check_settlement_integrity().is_err());
+        // Even subsequent cleanup cannot manufacture the missing initial proof.
+        incomplete
+            .state
+            .lock()
+            .unwrap()
+            .targets
+            .remove("unfinished");
+        incomplete.seal_for_owner_retirement(
+            &super::super::client_browser::OwnerRetirement::for_test(&incomplete),
+        );
+        assert!(incomplete.check_settlement_integrity().is_err());
+
+        let reserved = settlement_registry();
+        let reservation = reserved
+            .reserve_creation(super::TargetPurpose::Application)
+            .unwrap();
+        reserved.seal_for_owner_retirement(
+            &super::super::client_browser::OwnerRetirement::for_test(&reserved),
+        );
+        assert!(reserved.check_settlement_integrity().is_err());
+        drop(reservation);
+        assert!(reserved.check_settlement_integrity().is_err());
+
+        let poisoned = settlement_registry();
+        poisoned.seal_for_owner_retirement(
+            &super::super::client_browser::OwnerRetirement::for_test(&poisoned),
+        );
+        let captured = poisoned.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = captured.state.lock().unwrap();
+            panic!("synthetic registry lock poison");
+        })
+        .join();
+        assert!(poisoned.check_settlement_integrity().is_err());
+        assert!(poisoned.inventory().is_err());
+    }
+
     #[tokio::test]
     async fn capture_ticket_is_insertion_only_and_rejects_same_id_aba_without_epoch() {
         let registry = super::ClientTargets::new("ctx".into(), "scope".into());

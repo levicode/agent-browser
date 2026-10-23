@@ -147,6 +147,60 @@ impl NativeTerminalProof {
         Ok(proof)
     }
 }
+/// Final-local cleanup identity only. Unlike NativeTerminalProof this has no
+/// active target and cannot preserve routes, reconnect, or prove remote ACKs.
+#[derive(Clone)]
+pub(crate) struct FinalLocalEofProof {
+    client: Arc<CdpClient>,
+    targets: Arc<ClientTargets>,
+    network: std::sync::Weak<ClientNetwork>,
+    generation: u64,
+    identity_scope: String,
+    received: u64,
+}
+impl FinalLocalEofProof {
+    pub(crate) fn check_client(&self, client: &Arc<CdpClient>) -> Result<(), ProtocolError> {
+        if !Arc::ptr_eq(&self.client, client) || !*client.remote_connection_closed().borrow() {
+            return Err(ProtocolError::StaleScope);
+        }
+        let debt = client.debt_ledger().ok_or(ProtocolError::StaleScope)?;
+        client.check_cleanup_owner(&Some(debt.clone()))?;
+        debt.check_final_local_eof(self.generation, &self.identity_scope)
+    }
+    pub(crate) fn check_targets(&self, targets: &Arc<ClientTargets>) -> Result<(), ProtocolError> {
+        self.check_client(&self.client)?;
+        if !Arc::ptr_eq(&self.targets, targets) || self.identity_scope != targets.identity_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.targets.check_final_local_cleanup()
+    }
+    pub(crate) fn check_network(&self, network: &Arc<ClientNetwork>) -> Result<(), ProtocolError> {
+        self.check_targets(&self.targets)?;
+        if self.identity_scope != self.targets.identity_scope
+            || !self
+                .network
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, network))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    pub(crate) fn check_event_sink(
+        &self,
+        sink: &super::client_transport::ClientEventSink,
+    ) -> Result<(), ProtocolError> {
+        let network = self.network.upgrade().ok_or(ProtocolError::StaleScope)?;
+        self.check_network(&network)?;
+        network.check_event_sink(sink)
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+    pub(crate) fn identity_scope(&self) -> &str {
+        &self.identity_scope
+    }
+}
 #[derive(Clone, Debug, Default)]
 pub struct ScopeConfig {
     pub viewport: Option<(u32, u32)>,
@@ -654,6 +708,7 @@ enum CaptureTestPoint {
     BeforeReturn,
     BeforeVerifyReturn,
     BeforeEventApply,
+    BeforeAttachedProcessing,
 }
 #[cfg(test)]
 struct CaptureTestGate {
@@ -753,6 +808,7 @@ pub struct ClientEnrollment {
     containment: tokio::sync::Mutex<ContainmentState>,
     retirement_events: Mutex<Option<BoundedMethodEvents>>,
     terminal_proof: Mutex<Option<NativeTerminalProof>>,
+    final_local_proof: Mutex<Option<FinalLocalEofProof>>,
     #[cfg(test)]
     capture_lifecycle: Mutex<CaptureLifecycleTrace>,
     #[cfg(test)]
@@ -796,6 +852,7 @@ impl ClientEnrollment {
             containment: tokio::sync::Mutex::new(ContainmentState::default()),
             retirement_events: Mutex::new(None),
             terminal_proof: Mutex::new(None),
+            final_local_proof: Mutex::new(None),
             #[cfg(test)]
             capture_lifecycle: Mutex::new(CaptureLifecycleTrace::default()),
             #[cfg(test)]
@@ -1041,6 +1098,51 @@ impl ClientEnrollment {
         *slot = Some(proof.clone());
         Ok(proof)
     }
+    fn capture_final_local_eof(&self, received: u64) -> Result<FinalLocalEofProof, ProtocolError> {
+        if !matches!(&self.ownership, ScopeOwnership::BorrowedTargets(_)) {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(error) = &index.failure {
+            return Err(error.clone());
+        }
+        if !index.reconciled
+            || !index.sessions.is_empty()
+            || !index.realm_pending.is_empty()
+            || index.realm_tickets != 0
+            || index.borrowed_blank.is_some()
+            || !restart_retirements_settled(&index, received)
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let proof = FinalLocalEofProof {
+            client: self.client.clone(),
+            targets: self.targets.clone(),
+            network: Arc::downgrade(&self.network),
+            generation: self.generation,
+            identity_scope: self.targets.identity_scope.clone(),
+            received,
+        };
+        proof.check_network(&self.network)?;
+        Ok(proof)
+    }
+    /// Available only after the retained EOF supervisor joined producers and
+    /// retired callback authority. It is never reconnect or containment proof.
+    pub(crate) fn final_local_connection_proof(&self) -> Result<FinalLocalEofProof, ProtocolError> {
+        let proof = self
+            .final_local_proof
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .clone()
+            .ok_or(ProtocolError::CleanupFailed)?;
+        self.capture_final_local_eof(proof.received)?;
+        proof.check_targets(&self.targets)?;
+        proof.check_network(&self.network)?;
+        Ok(proof)
+    }
     /// Dispatch holds this only around context configuration mutations. Never
     /// hold it for navigation, evaluate, or a JavaScript callback decision.
     pub fn config_gate(&self) -> Arc<tokio::sync::Mutex<()>> {
@@ -1131,33 +1233,49 @@ impl ClientEnrollment {
         error
     }
     fn register_pending_event(&self, event: &CdpEvent) -> Result<Option<String>, ProtocolError> {
+        let mut index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let retired_parent = event.session_id.as_ref().is_some_and(|parent| {
+            index.retired_page_sessions.contains(parent)
+                || index.retired_observer_sessions.contains(parent)
+        });
+        let observer_parent = event.session_id.as_ref().is_some_and(|parent| {
+            index
+                .sessions
+                .get(parent)
+                .is_some_and(|entry| entry.observation_only)
+        });
         if event
             .params
             .pointer("/targetInfo/browserContextId")
             .and_then(Value::as_str)
             != Some(self.targets.context_id.as_str())
-            && !event.session_id.as_ref().is_some_and(|parent| {
-                self.index.lock().is_ok_and(|index| {
-                    index
-                        .sessions
-                        .get(parent)
-                        .is_some_and(|entry| entry.observation_only)
-                })
-            })
+            && !observer_parent
+            && !retired_parent
         {
             return Ok(None);
         }
         let session = field(&event.params, "sessionId")?.to_owned();
-        let mut index = self
-            .index
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if index.pending_enrollment.len() >= MAX_TASKS {
             return Err(ProtocolError::CapacityExceeded);
         }
-        if !index.pending_enrollment.insert(session.clone()) {
+        if index.pending_enrollment.contains(&session) {
             return Err(ProtocolError::StaleScope);
         }
+        if retired_parent {
+            if index.retired_page_sessions.len() >= MAX_FRAMES
+                && !index.retired_page_sessions.contains(&session)
+            {
+                return Err(ProtocolError::CapacityExceeded);
+            }
+            // Publish cleanup-only ancestry before spawning attached(). A burst
+            // grandchild can arrive before its parent's task ever polls. This
+            // tombstone grants no context, registration or adoption authority.
+            index.retired_page_sessions.insert(session.clone());
+        }
+        index.pending_enrollment.insert(session.clone());
         Ok(Some(session))
     }
     fn mark_event_applied(&self, sequence: u64) -> Result<(), ProtocolError> {
@@ -1892,11 +2010,7 @@ impl ClientEnrollment {
                 if index.retiring_pages.get(target).map(String::as_str) != Some(session) {
                     return Err(ProtocolError::StaleReference);
                 }
-                index.retired_page_sessions.contains(session)
-                    && !index
-                        .sessions
-                        .values()
-                        .any(|entry| entry.target == target || entry.root == session)
+                restart_page_pair_retired(&index, target, session)
             };
             if detached {
                 let watermark = self
@@ -1911,12 +2025,7 @@ impl ClientEnrollment {
                     .index
                     .lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                if index.retiring_pages.get(target).map(String::as_str) != Some(session)
-                    || !index.retired_page_sessions.contains(session)
-                    || index
-                        .sessions
-                        .values()
-                        .any(|entry| entry.target == target || entry.root == session)
+                if !restart_page_pair_retired(&index, target, session)
                     || !capture_admission_ready(
                         &index,
                         watermark
@@ -2060,7 +2169,12 @@ impl ClientEnrollment {
                 .sessions
                 .values()
                 .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
-            || !index.retiring_pages.is_empty()
+            || !restart_retirements_settled(
+                &index,
+                watermark
+                    .received()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?,
+            )
         {
             return Err(ProtocolError::ScopeUnavailable);
         }
@@ -2876,6 +2990,7 @@ impl ClientEnrollment {
     ) -> Result<(), ProtocolError> {
         let mut tasks = JoinSet::new();
         let mut terminal = None;
+        let mut final_local = None;
         let mut result = loop {
             tokio::select! {
                 biased;
@@ -2895,6 +3010,11 @@ impl ClientEnrollment {
                         }
                         match self.terminal_connection_proof() {
                             Ok(proof) => terminal = Some(proof),
+                            Err(ProtocolError::StaleScope) => match events.terminal_received().map_err(|_| ProtocolError::ScopeUnavailable)
+                                .and_then(|received| self.capture_final_local_eof(received)) {
+                                Ok(proof) => final_local = Some(proof),
+                                Err(error) => break Err(error),
+                            },
                             Err(error) => break Err(error),
                         }
                     }
@@ -2909,6 +3029,11 @@ impl ClientEnrollment {
                         Err("control event stream closed") if *self.client.remote_connection_closed().borrow() => {
                             match self.terminal_connection_proof() {
                                 Ok(proof) => terminal = Some(proof),
+                                Err(ProtocolError::StaleScope) => match events.terminal_received().map_err(|_| ProtocolError::ScopeUnavailable)
+                                .and_then(|received| self.capture_final_local_eof(received)) {
+                                    Ok(proof) => final_local = Some(proof),
+                                    Err(error) => break Err(error),
+                                },
                                 Err(error) => break Err(error),
                             }
                             break Ok(());
@@ -2968,6 +3093,18 @@ impl ClientEnrollment {
                     }
                 },
             )
+        } else if let Some(proof) = &final_local {
+            self.targets.seal_admission();
+            self.sealed.store(true, Ordering::Release);
+            let closed = self.network.close_for_final_local_eof(proof).await;
+            if let Err(error) = &closed {
+                self.poison(error.clone());
+                // A refused final identity still cannot abandon local readers.
+                if self.network.close().await.is_err() {
+                    self.poison(ProtocolError::CleanupFailed);
+                }
+            }
+            Some(closed)
         } else {
             None
         };
@@ -2982,6 +3119,15 @@ impl ClientEnrollment {
             // Distinct local retirement. Never run ordinary close (which
             // abandons parked routes), remote containment, or fake detach ACKs.
             closed?;
+            if let Some(proof) = final_local {
+                // Recheck exact debt/session settlement after retained tasks.
+                // Never cache success over an async cleanup failure.
+                self.capture_final_local_eof(proof.received)?;
+                *self
+                    .final_local_proof
+                    .lock()
+                    .map_err(|_| ProtocolError::CleanupFailed)? = Some(proof);
+            }
             let index = self
                 .index
                 .lock()
@@ -3541,6 +3687,12 @@ impl ClientEnrollment {
             .clone())
     }
     async fn attached(&self, event: CdpEvent) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        self.pause_capture_at(
+            CaptureTestPoint::BeforeAttachedProcessing,
+            &self.operation(),
+        )
+        .await?;
         let session = field(&event.params, "sessionId")?.to_owned();
         let mut info = event
             .params
@@ -4289,10 +4441,22 @@ impl ClientEnrollment {
         }
     }
     pub fn seal(&self) {
-        self.targets.seal();
+        self.targets.seal_admission();
         self.sealed.store(true, Ordering::Release);
         self.stop.send_replace(CancelSignal::SessionClosed);
         self.changed.notify_waiters();
+    }
+    /// The lifecycle journal, not a local read or a failing producer, owns this
+    /// stamp. Sealing still rejects every new application/observation admission.
+    pub(crate) fn retirement_targets(&self) -> &Arc<ClientTargets> {
+        &self.targets
+    }
+    pub(crate) fn seal_for_owner_retirement(
+        &self,
+        authority: &super::client_browser::OwnerRetirement,
+    ) {
+        self.targets.seal_for_owner_retirement(authority);
+        self.seal();
     }
     pub async fn drain(&self) -> Result<(), ProtocolError> {
         let mut slot = self.supervisor.lock().await;
@@ -4367,6 +4531,25 @@ fn validate_capture_target_info(
 }
 fn capture_admission_ready(index: &Index, received: u64) -> bool {
     index.applied_watermark >= received && index.pending_enrollment.is_empty()
+}
+// Retain historical pairs as tombstones. Only exact observed retirement, not
+// map removal or absence alone, makes a pair complete for a fresh input lease.
+fn restart_page_pair_retired(index: &Index, target: &str, root: &str) -> bool {
+    index.retiring_pages.get(target).map(String::as_str) == Some(root)
+        && index.retired_page_sessions.contains(root)
+        && !index.sessions.contains_key(root)
+        && !index
+            .sessions
+            .values()
+            .any(|entry| entry.target == target || entry.root == root)
+}
+fn restart_retirements_settled(index: &Index, received: u64) -> bool {
+    capture_admission_ready(index, received)
+        && index.borrowed_restart.is_none()
+        && index
+            .retiring_pages
+            .iter()
+            .all(|(target, root)| restart_page_pair_retired(index, target, root))
 }
 fn capture_frame_fingerprint(
     session: &str,
@@ -5060,6 +5243,7 @@ mod tests {
                         // Test-controlled ACK: tests can apply exact lifecycle
                         // events, cancellation, or a deadline before the reply.
                         if mode=="attestation-diagnostic-held" && method=="Target.getTargetInfo" { continue; }
+                        if mode=="retired-detach-held" && method=="Target.detachFromTarget" { continue; }
                         if matches!(mode,"observer-close"|"observer-unknown-error"|"observer-detached-live") && method=="Page.enable" && request["sessionId"]=="observer" {
                             if mode!="observer-unknown-error" { socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"observer","targetId":"other-host"}}).to_string())).await.unwrap(); }
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"target closed"}}).to_string())).await.unwrap();continue;
@@ -5480,6 +5664,601 @@ mod tests {
         assert!(current.check(&owner, &page, &op).is_err());
         drop(page);
         let _ = owner.close().await;
+        server.abort();
+    }
+
+    #[test]
+    fn restart_retirement_predicate_requires_every_exact_pair_and_received_boundary() {
+        let complete = || {
+            let mut index = Index {
+                applied_watermark: 7,
+                ..Index::default()
+            };
+            index
+                .retiring_pages
+                .insert("old-target".into(), "old-root".into());
+            index.retired_page_sessions.insert("old-root".into());
+            index
+        };
+        let live = |target: &str, session: &str, root: &str| Attribution {
+            target: target.into(),
+            session: session.into(),
+            parent: (session != root).then(|| root.into()),
+            root: root.into(),
+            kind: if session == root { "page" } else { "iframe" }.into(),
+            application: true,
+            observation_only: false,
+            observer_paused: false,
+            resumed: true,
+        };
+        let index = complete();
+        assert!(restart_retirements_settled(&index, 7));
+        assert!(!restart_page_pair_retired(
+            &index,
+            "missing-target",
+            "old-root"
+        ));
+        assert!(!restart_page_pair_retired(
+            &index,
+            "old-target",
+            "wrong-root"
+        ));
+        for case in [
+            "wrong-pair",
+            "no-tombstone",
+            "live-root",
+            "live-child",
+            "same-target",
+            "same-session",
+            "incomplete-history",
+            "pending-enrollment",
+            "pending-event",
+            "borrowed-restart",
+        ] {
+            let mut index = complete();
+            match case {
+                "wrong-pair" => {
+                    index
+                        .retiring_pages
+                        .insert("old-target".into(), "other-root".into());
+                }
+                "no-tombstone" => {
+                    index.retired_page_sessions.remove("old-root");
+                }
+                "live-root" => {
+                    index.sessions.insert(
+                        "old-root".into(),
+                        live("old-target", "old-root", "old-root"),
+                    );
+                }
+                "live-child" => {
+                    index
+                        .sessions
+                        .insert("child".into(), live("child-target", "child", "old-root"));
+                }
+                "same-target" => {
+                    index.sessions.insert(
+                        "new-session".into(),
+                        live("old-target", "new-session", "new-session"),
+                    );
+                }
+                "same-session" => {
+                    index.sessions.insert(
+                        "old-root".into(),
+                        live("new-target", "old-root", "new-root"),
+                    );
+                }
+                "incomplete-history" => {
+                    index
+                        .retiring_pages
+                        .insert("older-target".into(), "older-root".into());
+                }
+                "pending-enrollment" => {
+                    index.pending_enrollment.insert("late-child".into());
+                }
+                "pending-event" => index.applied_watermark = 6,
+                "borrowed-restart" => index.borrowed_restart = Some(1),
+                _ => unreachable!(),
+            }
+            let pairs = index.retiring_pages.clone();
+            let tombstones = index.retired_page_sessions.clone();
+            assert!(!restart_retirements_settled(&index, 7), "{case}");
+            assert_eq!(index.retiring_pages, pairs, "{case}");
+            assert_eq!(index.retired_page_sessions, tombstones, "{case}");
+        }
+        let mut index = complete();
+        index
+            .retiring_pages
+            .insert("older-target".into(), "older-root".into());
+        index.retired_page_sessions.insert("older-root".into());
+        index.sessions.insert(
+            "current".into(),
+            live("current-target", "current", "current"),
+        );
+        assert!(restart_retirements_settled(&index, 7));
+        assert_eq!(index.retiring_pages.len(), 2);
+        assert_eq!(index.retired_page_sessions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn settled_input_preserves_retirement_history_and_fences_late_descendants() {
+        let (owner, _notices, log, emit, server) = fixture("normal").await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+        let page = owner.lease(&entry).unwrap();
+        {
+            let mut index = owner.index.lock().unwrap();
+            index
+                .retiring_pages
+                .insert("old-target".into(), "old-root".into());
+            index.retired_page_sessions.insert("old-root".into());
+        }
+        let op = owner.operation();
+        let proof = owner.capture_settled_input_authority(&page, &op).unwrap();
+        for (parent, session) in [
+            ("old-root", "late-child"),
+            ("late-child", "late-grandchild"),
+        ] {
+            let gate = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+            emit.send(json!({
+                "method":"Target.attachedToTarget", "sessionId":parent,
+                "params":{"sessionId":session,"waitingForDebugger":true,
+                    "targetInfo":{"targetId":format!("{session}-target"),"type":"iframe",
+                        "browserContextId":"owned-context"}}
+            }))
+            .await
+            .unwrap();
+            gate.wait_entered().await;
+            let before = log.lock().unwrap().len();
+            let blocked = proof.check(&owner, &page, &op);
+            assert_eq!(
+                log.lock().unwrap().len(),
+                before,
+                "input checks must not flush events"
+            );
+            // Always release the retained supervisor before asserting failure.
+            gate.release();
+            owner
+                .drain_capture_watermark(&owner.realm_watermark().unwrap(), &op)
+                .await
+                .unwrap();
+            assert_eq!(blocked, Err(ProtocolError::ScopeUnavailable));
+            {
+                let index = owner.index.lock().unwrap();
+                assert!(index.retired_page_sessions.contains(session));
+                assert!(!index.sessions.contains_key(session));
+                assert_eq!(
+                    index.retiring_pages.get("old-target").map(String::as_str),
+                    Some("old-root")
+                );
+            }
+            proof.check(&owner, &page, &op).unwrap();
+            let commands = log.lock().unwrap();
+            assert!(commands
+                .iter()
+                .any(|request| request["method"] == "Target.detachFromTarget"
+                    && request["params"]["sessionId"] == session));
+            assert!(!commands
+                .iter()
+                .any(|request| request["sessionId"] == session
+                    && matches!(
+                        request["method"].as_str(),
+                        Some("Runtime.enable" | "Page.enable")
+                    )));
+        }
+        assert_eq!(owner.index.lock().unwrap().retiring_pages.len(), 1);
+        drop(page);
+        owner.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn missing_context_retired_descendants_block_input_until_exact_detach_ack() {
+        for retired_observer in [false, true] {
+            let (owner, _notices, log, emit, server) = fixture("retired-detach-held").await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&entry).unwrap();
+            {
+                let mut index = owner.index.lock().unwrap();
+                index
+                    .retiring_pages
+                    .insert("old-target".into(), "old-root".into());
+                index.retired_page_sessions.insert("old-root".into());
+                if retired_observer {
+                    index
+                        .retired_observer_sessions
+                        .insert("old-observer".into());
+                }
+            }
+            let root = if retired_observer {
+                "old-observer"
+            } else {
+                "old-root"
+            };
+            let op = owner.operation();
+            let proof = owner.capture_settled_input_authority(&page, &op).unwrap();
+            let watermark = owner.realm_watermark().unwrap();
+            for (parent, session) in [(root, "late-child"), ("late-child", "late-grandchild")] {
+                emit.send(json!({
+                    "method":"Target.attachedToTarget", "sessionId":parent,
+                    "params":{"sessionId":session,"waitingForDebugger":true,
+                        "targetInfo":{"targetId":format!("{session}-target"),"type":"iframe"}}
+                }))
+                .await
+                .unwrap();
+                // The event itself is already applied. Only the real pending
+                // detach command, not a watermark backlog, must deny input.
+                let request = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let request = log
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|request| {
+                                request["method"] == "Target.detachFromTarget"
+                                    && request["params"]["sessionId"] == session
+                            })
+                            .cloned();
+                        if let Some(request) = request {
+                            let index = owner.index.lock().unwrap();
+                            if index.applied_watermark >= watermark.received().unwrap() {
+                                break request;
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(request["sessionId"], parent);
+                let pending = owner
+                    .index
+                    .lock()
+                    .unwrap()
+                    .pending_enrollment
+                    .contains(session);
+                let blocked = proof.check(&owner, &page, &op);
+                // Release the exact command before checking the outcome, so a
+                // regression does not strand the retained cleanup task.
+                emit.send(json!({"id":request["id"],"sessionId":parent,"result":{}}))
+                    .await
+                    .unwrap();
+                owner
+                    .drain_capture_watermark(&watermark, &op)
+                    .await
+                    .unwrap();
+                assert!(
+                    pending,
+                    "known retired-parent cleanup lost its pending hold"
+                );
+                assert_eq!(blocked, Err(ProtocolError::ScopeUnavailable));
+                {
+                    let index = owner.index.lock().unwrap();
+                    assert!(!index.pending_enrollment.contains(session));
+                    assert!(index.retired_page_sessions.contains(session));
+                    assert!(!index.sessions.contains_key(session));
+                    assert_eq!(
+                        index.retiring_pages.get("old-target").map(String::as_str),
+                        Some("old-root")
+                    );
+                }
+                proof.check(&owner, &page, &op).unwrap();
+            }
+            assert!(!log.lock().unwrap().iter().any(|request| {
+                (matches!(
+                    request["sessionId"].as_str(),
+                    Some("late-child" | "late-grandchild")
+                ) && matches!(
+                    request["method"].as_str(),
+                    Some("Runtime.enable" | "Page.enable")
+                )) || (request["method"] == "Target.getTargetInfo"
+                    && matches!(
+                        request["params"]["targetId"].as_str(),
+                        Some("late-child-target" | "late-grandchild-target")
+                    ))
+            }));
+            drop(page);
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn burst_missing_context_grandchild_holds_input_after_parent_detach_ack() {
+        for (retired_observer, failed_ack) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let (owner, _notices, log, emit, server) = fixture("retired-detach-held").await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&entry).unwrap();
+            let root = if retired_observer {
+                "old-observer"
+            } else {
+                "old-root"
+            };
+            {
+                let mut index = owner.index.lock().unwrap();
+                index
+                    .retiring_pages
+                    .insert("old-target".into(), "old-root".into());
+                index.retired_page_sessions.insert("old-root".into());
+                if retired_observer {
+                    index.retired_observer_sessions.insert(root.into());
+                }
+            }
+            let op = owner.operation();
+            let proof = owner.capture_settled_input_authority(&page, &op).unwrap();
+            let watermark = owner.realm_watermark().unwrap();
+            let before = watermark.received().unwrap();
+            // Prevent the child's async classifier from supplying ancestry to
+            // the next event. Only synchronous receive registration may do so.
+            let gate = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeAttachedProcessing, gate.clone());
+            for (parent, session) in [(root, "late-child"), ("late-child", "late-grandchild")] {
+                emit.send(json!({
+                    "method":"Target.attachedToTarget", "sessionId":parent,
+                    "params":{"sessionId":session,"waitingForDebugger":true,
+                        "targetInfo":{"targetId":format!("{session}-target"),"type":"iframe"}}
+                }))
+                .await
+                .unwrap();
+                if session == "late-child" {
+                    gate.wait_entered().await;
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if owner.index.lock().unwrap().applied_watermark >= before + 2 {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            gate.release();
+            let (child, grandchild) = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let requests = {
+                        let log = log.lock().unwrap();
+                        let find = |session: &str| {
+                            log.iter()
+                                .find(|request| {
+                                    request["method"] == "Target.detachFromTarget"
+                                        && request["params"]["sessionId"] == session
+                                })
+                                .cloned()
+                        };
+                        (find("late-child"), find("late-grandchild"))
+                    };
+                    if let (Some(child), Some(grandchild)) = requests {
+                        break (child, grandchild);
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(child["sessionId"], root);
+            assert_eq!(grandchild["sessionId"], "late-child");
+            emit.send(json!({"id":child["id"],"sessionId":root,"result":{}}))
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if !owner
+                        .index
+                        .lock()
+                        .unwrap()
+                        .pending_enrollment
+                        .contains("late-child")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let pending = owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_enrollment
+                .contains("late-grandchild");
+            let blocked = proof.check(&owner, &page, &op);
+            if failed_ack {
+                emit.send(json!({"id":grandchild["id"],"sessionId":"late-child",
+                    "error":{"code":-32000,"message":"synthetic detach failure"}}))
+                    .await
+                    .unwrap();
+                // The retained fallback resumes only this exact paused session
+                // and retries detach. Its second failure must poison before the
+                // pending token can disappear, never turn failure into success.
+                let retry = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let request = log
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|request| {
+                                request["method"] == "Target.detachFromTarget"
+                                    && request["params"]["sessionId"] == "late-grandchild"
+                                    && request["id"] != grandchild["id"]
+                            })
+                            .cloned();
+                        if let Some(request) = request {
+                            break request;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(proof.check(&owner, &page, &op).is_err());
+                emit.send(json!({"id":retry["id"],"sessionId":"late-child",
+                    "error":{"code":-32000,"message":"synthetic retained detach failure"}}))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let settled = {
+                            let index = owner.index.lock().unwrap();
+                            index.failure.is_some()
+                                && !index.pending_enrollment.contains("late-grandchild")
+                        };
+                        if settled {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            } else {
+                emit.send(json!({"id":grandchild["id"],"sessionId":"late-child","result":{}}))
+                    .await
+                    .unwrap();
+                owner
+                    .drain_capture_watermark(&watermark, &op)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                pending,
+                "grandchild cleanup outlived the only pending token"
+            );
+            assert_eq!(blocked, Err(ProtocolError::ScopeUnavailable));
+            {
+                let index = owner.index.lock().unwrap();
+                for session in ["late-child", "late-grandchild"] {
+                    assert!(index.retired_page_sessions.contains(session));
+                    assert!(!index.sessions.contains_key(session));
+                    assert!(!index.pending_enrollment.contains(session));
+                }
+                assert_eq!(
+                    index.retiring_pages.get("old-target").map(String::as_str),
+                    Some("old-root")
+                );
+                if failed_ack {
+                    assert_eq!(index.failure, Some(ProtocolError::CleanupFailed));
+                }
+            }
+            if failed_ack {
+                assert!(proof.check(&owner, &page, &op).is_err());
+            } else {
+                proof.check(&owner, &page, &op).unwrap();
+            }
+            assert!(!log.lock().unwrap().iter().any(|request| {
+                (matches!(
+                    request["sessionId"].as_str(),
+                    Some("late-child" | "late-grandchild")
+                ) && matches!(
+                    request["method"].as_str(),
+                    Some("Runtime.enable" | "Page.enable")
+                )) || (request["method"] == "Target.getTargetInfo"
+                    && matches!(
+                        request["params"]["targetId"].as_str(),
+                        Some("late-child-target" | "late-grandchild-target")
+                    ))
+            }));
+            drop(page);
+            if failed_ack {
+                assert!(owner.close().await.is_err());
+            } else {
+                owner.close().await.unwrap();
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_cleanup_lineage_is_bounded_and_unknown_parents_grant_nothing() {
+        let (owner, _notices, _log, emit, server) = fixture("normal").await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+        let page = owner.lease(&entry).unwrap();
+        let op = owner.operation();
+        let proof = owner.capture_settled_input_authority(&page, &op).unwrap();
+        let mut event = CdpEvent {
+            method: "Target.attachedToTarget".into(),
+            session_id: Some("unknown-parent".into()),
+            params: json!({"sessionId":"unknown-child","targetInfo":{
+                "targetId":"unknown-target","type":"iframe"}}),
+        };
+        assert_eq!(owner.register_pending_event(&event), Ok(None));
+        {
+            let mut index = owner.index.lock().unwrap();
+            assert!(!index.retired_page_sessions.contains("unknown-child"));
+            assert!(!index.pending_enrollment.contains("unknown-child"));
+            assert!(!index.sessions.contains_key("unknown-child"));
+            index
+                .retiring_pages
+                .insert("old-target".into(), "old-root".into());
+            index.retired_page_sessions.insert("old-root".into());
+            for ordinal in 1..MAX_FRAMES {
+                index
+                    .retired_page_sessions
+                    .insert(format!("retired-{ordinal}"));
+            }
+        }
+        proof.check(&owner, &page, &op).unwrap();
+        event.session_id = Some("old-root".into());
+        emit.send(
+            json!({"method":event.method,"sessionId":event.session_id,"params":event.params}),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if owner.index.lock().unwrap().failure.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let index = owner.index.lock().unwrap();
+            assert_eq!(index.failure, Some(ProtocolError::CapacityExceeded));
+            // Rejected registration never marks the received event applied:
+            // the receipt fence denies input even before poison is observed.
+            assert!(index.applied_watermark < owner.realm_watermark().unwrap().received().unwrap());
+            assert_eq!(index.retired_page_sessions.len(), MAX_FRAMES);
+            assert!(!index.retired_page_sessions.contains("unknown-child"));
+            assert!(!index.pending_enrollment.contains("unknown-child"));
+        }
+        assert!(proof.check(&owner, &page, &op).is_err());
+        drop(page);
+        assert!(owner.close().await.is_err());
         server.abort();
     }
 
@@ -11786,17 +12565,39 @@ mod tests {
         let initial = owner.index.lock().unwrap().sessions[&session].clone();
         let lease = owner.lease(&initial).unwrap();
         let op = owner.operation();
-        owner
-            .page
-            .execute(
-                &lease,
-                std::slice::from_ref(&session),
-                &op,
-                "context.init-script",
-                &json!({"source":"window.ownedSyntheticInit=41"}),
-            )
-            .await
-            .unwrap();
+        // Add the witness to the FIRST script itself, not a later companion that
+        // could miss a first-registration-only duplicate; preserve its =41 effect.
+        // Document ordinals are local to a realm; CDP realm ordinals below distinguish
+        // a new global from repeated execution in the same initial popup document.
+        for ordinal in 0..4 {
+            let source = format!(
+                r#"(() => {{
+                if ({ordinal} === 0) window.ownedSyntheticInit=41;
+                const w = window.__nativePopupWitness ??= {{ documents: new WeakMap(), next: 0, trail: [] }};
+                if (!w.documents.has(document)) w.documents.set(document, w.next++);
+                const record = [{ordinal}, w.documents.get(document), document.URL === 'about:blank'];
+                w.trail.push(record);
+                console.debug('__native_popup_witness_v1__', ...record);
+            }})();"#
+            );
+            owner
+                .page
+                .execute(
+                    &lease,
+                    std::slice::from_ref(&session),
+                    &op,
+                    "context.init-script",
+                    &json!({"source":source}),
+                )
+                .await
+                .unwrap();
+        }
+        let mut witness_events = client.subscribe_methods(&[
+            "Runtime.executionContextCreated",
+            "Runtime.executionContextDestroyed",
+            "Runtime.executionContextsCleared",
+            "Runtime.consoleAPICalled",
+        ]);
         owner.start(&op).await.unwrap();
         // This foreign target is created AFTER global pause-and-filter starts.
         // Its first inline script must still run, without our init/config.
@@ -11843,7 +12644,7 @@ mod tests {
                 let mut request = [0u8; 4096];
                 let _ = stream.read(&mut request).await;
                 let body =
-                    "<script>window.firstScriptSawInit=window.ownedSyntheticInit</script>synthetic";
+                    "<script>window.firstScriptSawInit=window.ownedSyntheticInit;window.popupBootWitness=window.__nativePopupWitness?.trail.slice()</script>synthetic";
                 let response=format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
                 let _ = stream.write_all(response.as_bytes()).await;
             }
@@ -11871,6 +12672,71 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         }).await.unwrap();
+        let boot = client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression":"window.popupBootWitness", "returnByValue":true
+                })),
+                Some(&popup.session),
+            )
+            .await
+            .unwrap();
+        let acks = owner
+            .page
+            .script_registration_ack_ordinals(&popup.session)
+            .unwrap();
+        // Correlate only this owned synthetic popup; never print source, URLs or CDP IDs.
+        let mut realms = HashMap::new();
+        let mut unique_realms = HashMap::new();
+        let mut records = Vec::new();
+        while let Ok(event) = witness_events.try_recv() {
+            if event.session_id.as_deref() != Some(popup.session.as_str()) {
+                continue;
+            }
+            if event.method == "Runtime.executionContextCreated" {
+                let context = &event.params["context"];
+                if context["auxData"]["isDefault"] == true {
+                    if let (Some(id), Some(unique)) = (
+                        context["id"].as_i64(),
+                        context["uniqueId"].as_str().filter(|id| !id.is_empty()),
+                    ) {
+                        let next = unique_realms.len();
+                        let ordinal = *unique_realms.entry(unique.to_owned()).or_insert(next);
+                        realms.insert(id, ordinal);
+                    }
+                }
+            } else if event.method == "Runtime.executionContextDestroyed" {
+                if let Some(id) = event.params["executionContextId"].as_i64() {
+                    realms.remove(&id);
+                }
+            } else if event.method == "Runtime.executionContextsCleared" {
+                realms.clear();
+            } else if event.method == "Runtime.consoleAPICalled" {
+                let args = &event.params["args"];
+                if args[0]["value"] == "__native_popup_witness_v1__" {
+                    let realm = event.params["executionContextId"]
+                        .as_i64()
+                        .and_then(|id| realms.get(&id).copied());
+                    records.push(json!({"realmOrdinal":realm,
+                        "scriptOrdinal":args[1]["value"], "documentOrdinal":args[2]["value"],
+                        "initialBlank":args[3]["value"]}));
+                }
+            }
+        }
+        eprintln!(
+            "native popup synthetic witness: {}",
+            json!({
+                "registrationAckOrdinals":acks, "executions":records,
+                "bootTrail":boot["result"]["value"]
+            })
+        );
+        assert_eq!(
+            boot["result"]["value"],
+            json!([[0, 0, false], [1, 0, false], [2, 0, false], [3, 0, false]])
+        );
+        // Policy, then four scripts; script 0 retains the original =41 effect.
+        assert_eq!(acks, vec![0, 1, 2, 3, 4]);
         assert_eq!(popup.root, popup.session);
         assert_eq!(*owner.active_root.lock().unwrap(), session);
         assert!(!owner

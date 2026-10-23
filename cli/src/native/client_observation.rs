@@ -315,6 +315,19 @@ pub(crate) async fn retained_read_command(
         _ = cancellation.changed() => ObservationError::Cancelled,
         _ = tokio::time::sleep_until(lease.deadline.into()) => ObservationError::DeadlineExceeded,
     };
+    // This exact CDP inventory returns value data only: no remote handles and
+    // no mutation. Waiting another 250ms would consume an optional pixel
+    // reserve (only 16ms for an 80ms parent) without protecting any resource.
+    // Drop only the waiter. The transport still owns the submitted command and
+    // its debt until the matching late response arrives; it cannot continue
+    // this abandoned capture. Do not generalize this to Runtime or other reads.
+    if method == "DOMSnapshot.captureSnapshot" {
+        return Err(if *lease.cancellation.borrow() != CancelSignal::None {
+            ObservationError::Cancelled
+        } else {
+            settled_stop(interrupted, lease)
+        });
+    }
     let result = tokio::time::timeout(std::time::Duration::from_millis(250), &mut command).await;
     let primary = settled_stop(interrupted, lease);
     match result {

@@ -435,6 +435,13 @@ impl ClientEventSink {
         proof.check_targets(proof.targets())?;
         self.retire_scope_callbacks(proof.generation(), &proof.targets().identity_scope)
     }
+    pub(crate) fn retire_callbacks_after_final_local_drain(
+        &self,
+        proof: &super::client_enrollment::FinalLocalEofProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check_event_sink(self)?;
+        self.retire_scope_callbacks(proof.generation(), proof.identity_scope())
+    }
     fn retire_scope_callbacks(&self, generation: u64, scope: &str) -> Result<(), ProtocolError> {
         let barrier = self.barrier.as_ref().ok_or(ProtocolError::StaleScope)?;
         if barrier.key.0 != generation || barrier.identity_scope != scope {

@@ -180,7 +180,7 @@ impl RetainedTasks {
                 let dirty = dirty
                     || matches!(&outcome.result, Err(ProtocolError::CleanupFailed))
                     || snapshot.integrity_lost
-                    || task_targets.inventory().is_err();
+                    || task_targets.check_settlement_integrity().is_err();
                 if !dirty && outcome.result.is_err() {
                     // Executor entry and current debt count are not dispatch
                     // evidence. Preserve a completed prefix, but never invent a

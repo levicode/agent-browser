@@ -1453,3 +1453,6 @@ async fn uncertainty_retirement_fences_additive_trace_and_capture_without_recycl
     drop(owner);
     server.abort();
 }
+
+#[path = "client_optional_mask_retirement_tests.rs"]
+mod optional_mask_retirement_tests;
