@@ -21,6 +21,15 @@ pub(crate) enum SettlementPhase {
     CleanupFirstFailure,
     CleanupResult,
     InventorySnapshot,
+    TargetAttribution,
+    TargetLifecycle,
+    TargetInventory,
+    TargetInventorySummary,
+    TargetObservationLost,
+    ScreenshotFirstFailure,
+    FrameInventoryRejection,
+    ReadonlyPrepareFailure,
+    ServiceWorkerAdmission,
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -156,7 +165,45 @@ pub(crate) enum MessageKind {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<DiagnosticTargetKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_origin: Option<DiagnosticTargetOrigin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_stage: Option<DiagnosticTargetStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_purpose: Option<DiagnosticTargetPurpose>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_classification: Option<DiagnosticTargetClassification>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_configured: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_resumed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_sampled: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_observed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_ordinal: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_step: Option<WorkerAdmissionStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_state: Option<WorkerAdmissionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for_debugger: Option<WorkerDebuggerWait>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_point: Option<InventoryPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -169,6 +216,48 @@ pub(crate) struct Facts {
     pub inventory_reservations: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_unconfigured: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_stage: Option<ScreenshotStage>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "pass")]
+    pub frame_pass: Option<FrameInventoryPass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_mismatch: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservations: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<[u16; 7]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<InventoryRevisionEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_target: Option<InventoryRevisionTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_phase: Option<ScreenshotCapturePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_after_failure: Option<InventoryAfterFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack: Option<ReadonlyAck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<ReadonlyWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zero_input: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<ReadonlyCleanup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup_owner: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -217,6 +306,11 @@ impl Facts {
     fn clamp(&mut self, overflow: &mut bool) {
         for value in [
             &mut self.generation,
+            &mut self.attachment_ordinal,
+            &mut self.inventory_ordinal,
+            &mut self.target_ordinal,
+            &mut self.parent_attachment_ordinal,
+            &mut self.root_attachment_ordinal,
             &mut self.cleanup_owner,
             &mut self.cleanup_attempt,
             &mut self.length,
@@ -450,6 +544,7 @@ fn cleanup_capture(path: Option<&Path>) -> Option<Capture> {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum InventoryPoint {
+    RestartBegin,
     RestartReady,
     SettlementRefused,
 }
@@ -460,11 +555,601 @@ pub(crate) struct InventorySnapshot {
     pub integrity_lost: bool,
     pub reservations: usize,
     pub unconfigured: usize,
+    pub attachments: Option<DiagnosticTargetInventory>,
+}
+
+pub(crate) const TARGET_SAMPLE_LIMIT: usize = 16;
+pub(crate) const TARGET_ORDINAL_LIMIT: u64 = 65_535;
+static TARGET_ORDINALS: AtomicU64 = AtomicU64::new(0);
+static ATTACHMENT_ORDINALS: AtomicU64 = AtomicU64::new(0);
+static INVENTORY_ORDINALS: AtomicU64 = AtomicU64::new(0);
+
+macro_rules! diagnostic_enum {
+    ($name:ident { $first:ident $(, $other:ident)* $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        pub(crate) enum $name { #[default] $first, $($other,)* }
+    };
+}
+diagnostic_enum!(DiagnosticTargetKind {
+    Other,
+    Page,
+    Iframe,
+    Worker,
+    SharedWorker,
+    ServiceWorker,
+    Browser,
+    BrowserUi,
+    Tab,
+    Webview,
+    BackgroundPage
+});
+diagnostic_enum!(DiagnosticTargetOrigin {
+    Unclassified,
+    InitialDiscovery,
+    AutoAttach
+});
+diagnostic_enum!(DiagnosticTargetPurpose {
+    Unclassified,
+    Application,
+    StateBootstrap
+});
+diagnostic_enum!(DiagnosticTargetClassification {
+    PendingReservation,
+    UnreservedApplication,
+    ReservedApplication,
+    ReservedBootstrap,
+    ReservationRemainder
+});
+diagnostic_enum!(DiagnosticTargetStage {
+    Registered,
+    ConfigureStarted,
+    ConfigureAck,
+    ConfigureFailed,
+    Resumed,
+    Detached,
+    RestartRetiring,
+    PurposeAssigned
+});
+
+impl DiagnosticTargetKind {
+    pub(crate) fn from_native(kind: &str) -> Self {
+        match kind {
+            "page" => Self::Page,
+            "iframe" => Self::Iframe,
+            "worker" => Self::Worker,
+            "shared_worker" => Self::SharedWorker,
+            "service_worker" => Self::ServiceWorker,
+            "browser" => Self::Browser,
+            "browser_ui" => Self::BrowserUi,
+            "tab" => Self::Tab,
+            "webview" => Self::Webview,
+            "background_page" => Self::BackgroundPage,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiagnosticAttachment {
+    pub attachment: u64,
+    pub target: u64,
+    pub generation: u64,
+    pub kind: DiagnosticTargetKind,
+    pub origin: DiagnosticTargetOrigin,
+    pub parent: u64,
+    pub root: u64,
+    pub stage: DiagnosticTargetStage,
+    pub purpose: DiagnosticTargetPurpose,
+    pub classification: DiagnosticTargetClassification,
+    pub configured: bool,
+    pub resumed: bool,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiagnosticTargetInventory {
+    pub observed: bool,
+    pub count: usize,
+    pub attachments: [Option<DiagnosticAttachment>; TARGET_SAMPLE_LIMIT],
+}
+pub(crate) fn next_target_ordinal() -> Option<u64> {
+    next_cleanup_ordinal(&TARGET_ORDINALS, TARGET_ORDINAL_LIMIT)
+}
+pub(crate) fn next_attachment_ordinal() -> Option<u64> {
+    next_cleanup_ordinal(&ATTACHMENT_ORDINALS, TARGET_ORDINAL_LIMIT)
+}
+
+pub(crate) fn target_observation_lost(generation: u64, sequence: u64) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::TargetObservationLost,
+            Facts {
+                generation: Some(generation),
+                ..Facts::default()
+            },
+        );
+    }
+}
+pub(crate) fn target_lifecycle(
+    generation: u64,
+    sequence: u64,
+    target: DiagnosticAttachment,
+    error: Option<ProtocolError>,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        target_lifecycle_into(capture, generation, sequence, target, error);
+    }
+}
+fn target_lifecycle_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    target: DiagnosticAttachment,
+    error: Option<ProtocolError>,
+) {
+    target_attribution_into(capture, generation, sequence, None, target);
+    record_capture(
+        capture,
+        sequence,
+        Phase::TargetLifecycle,
+        Facts {
+            generation: Some(generation),
+            attachment_ordinal: Some(target.attachment),
+            target_stage: Some(target.stage),
+            target_purpose: Some(target.purpose),
+            target_classification: Some(target.classification),
+            target_configured: Some(target.configured),
+            target_resumed: Some(target.resumed),
+            error,
+            ..Facts::default()
+        },
+    );
+}
+fn target_attribution_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    point: Option<InventoryPoint>,
+    target: DiagnosticAttachment,
+) {
+    target_attribution_record(
+        capture,
+        generation,
+        sequence,
+        point.map(|point| (point, 0)),
+        target,
+    );
+}
+fn target_attribution_record(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    inventory: Option<(InventoryPoint, u64)>,
+    target: DiagnosticAttachment,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::TargetAttribution,
+        Facts {
+            generation: Some(generation),
+            inventory_point: inventory.map(|v| v.0),
+            inventory_ordinal: inventory.map(|v| v.1),
+            attachment_ordinal: Some(target.attachment),
+            target_ordinal: Some(target.target),
+            target_kind: Some(target.kind),
+            target_origin: Some(target.origin),
+            parent_attachment_ordinal: Some(target.parent),
+            root_attachment_ordinal: Some(target.root),
+            ..Facts::default()
+        },
+    );
 }
 // Independent of a cleanup attempt: record the actual refused settlement before
 // quarantine mutates the registry. Only bounded facts reach the opt-in sink.
 pub(crate) fn inventory_enabled() -> bool {
     CLEANUP_SINK.get().and_then(Option::as_ref).is_some()
+}
+
+// Independent of operation and cleanup ownership. These observations never admit,
+// resume or retry a target. In particular enter is not a wire-submission receipt.
+const MAX_DIAGNOSTIC_WORKERS: u64 = 8;
+const MAX_WORKER_RECORDS: u64 = 32;
+static DIAGNOSTIC_WORKERS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkerAdmissionStep {
+    OwnedAttachment,
+    AuxiliaryClassification,
+    Register,
+    Purpose,
+    ConfigGate,
+    NetworkEnable,
+    NetworkBypass,
+    FetchEnable,
+    RuntimeEnable,
+    RecursiveAutoattach,
+    Configured,
+    ResumePermit,
+    ResumeDebugger,
+    ConfigurationCommitted,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum WorkerAdmissionState {
+    Enter,
+    Done,
+    Failed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerDebuggerWait {
+    True,
+    False,
+    Unknown,
+}
+impl From<Option<bool>> for WorkerDebuggerWait {
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::True,
+            Some(false) => Self::False,
+            None => Self::Unknown,
+        }
+    }
+}
+impl Serialize for WorkerDebuggerWait {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::True => serializer.serialize_bool(true),
+            Self::False => serializer.serialize_bool(false),
+            Self::Unknown => serializer.serialize_str("unknown"),
+        }
+    }
+}
+/// Stack-owned, scalar-only observation of one authorized service-worker attachment.
+/// The ordinal is process-local diagnostic data, never a target/session identity.
+pub(crate) struct ServiceWorkerAdmission {
+    generation: u64,
+    ordinal: u8,
+    waiting: WorkerDebuggerWait,
+    records: AtomicU64,
+}
+impl ServiceWorkerAdmission {
+    pub(crate) fn start(generation: u64, waiting: Option<bool>) -> Option<Self> {
+        let capture = CLEANUP_SINK.get().and_then(Option::as_ref)?;
+        Self::start_into(capture, &DIAGNOSTIC_WORKERS, generation, waiting)
+    }
+    fn start_into(
+        capture: &Capture,
+        workers: &AtomicU64,
+        generation: u64,
+        waiting: Option<bool>,
+    ) -> Option<Self> {
+        let ordinal = increment(workers, 1, &capture.counters.overflow);
+        if ordinal >= MAX_DIAGNOSTIC_WORKERS {
+            Self::limit(capture, ordinal == MAX_DIAGNOSTIC_WORKERS);
+            return None;
+        }
+        let result = Self {
+            generation,
+            ordinal: (ordinal + 1) as u8,
+            waiting: waiting.into(),
+            records: AtomicU64::new(0),
+        };
+        result.record_into(
+            capture,
+            WorkerAdmissionStep::OwnedAttachment,
+            WorkerAdmissionState::Done,
+        );
+        Some(result)
+    }
+    fn limit(capture: &Capture, first: bool) {
+        increment(&capture.counters.suppressed, 1, &capture.counters.overflow);
+        if first {
+            record_capture(capture, 0, Phase::CaptureLimitReached, Facts::default());
+        }
+    }
+    fn record_into(
+        &self,
+        capture: &Capture,
+        step: WorkerAdmissionStep,
+        state: WorkerAdmissionState,
+    ) {
+        let ordinal = increment(&self.records, 1, &capture.counters.overflow);
+        if ordinal >= MAX_WORKER_RECORDS {
+            Self::limit(capture, ordinal == MAX_WORKER_RECORDS);
+            return;
+        }
+        record_capture(
+            capture,
+            0,
+            Phase::ServiceWorkerAdmission,
+            Facts {
+                generation: Some(self.generation),
+                worker_ordinal: Some(self.ordinal),
+                admission_step: Some(step),
+                admission_state: Some(state),
+                waiting_for_debugger: Some(self.waiting),
+                ..Facts::default()
+            },
+        );
+    }
+    fn record(trace: Option<&Self>, step: WorkerAdmissionStep, state: WorkerAdmissionState) {
+        if let (Some(trace), Some(capture)) = (trace, CLEANUP_SINK.get().and_then(Option::as_ref)) {
+            trace.record_into(capture, step, state);
+        }
+    }
+    pub(crate) async fn observe<T, E>(
+        trace: Option<&Self>,
+        step: WorkerAdmissionStep,
+        future: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        Self::record(trace, step, WorkerAdmissionState::Enter);
+        let result = future.await;
+        // For RPC steps only successful completion of the original await is done.
+        Self::record(
+            trace,
+            step,
+            if result.is_ok() {
+                WorkerAdmissionState::Done
+            } else {
+                WorkerAdmissionState::Failed
+            },
+        );
+        result
+    }
+    pub(crate) fn observe_sync<T, E>(
+        trace: Option<&Self>,
+        step: WorkerAdmissionStep,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        Self::record(trace, step, WorkerAdmissionState::Enter);
+        let result = action();
+        Self::record(
+            trace,
+            step,
+            if result.is_ok() {
+                WorkerAdmissionState::Done
+            } else {
+                WorkerAdmissionState::Failed
+            },
+        );
+        result
+    }
+}
+
+/// Closed call-site evidence for optional trace screenshots, not protocol authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScreenshotStage {
+    PrepareScope,
+    PreparePermit,
+    PreparePolicy,
+    PrepareOwner,
+    PrepareFence,
+    RunScope,
+    DebtAdmission,
+    UiAdmission,
+    PublicationAdmission,
+    ProducerReservation,
+    InitialFrames,
+    FrameInventoryFence,
+    ProtectedBarrier,
+    AnimationStabilization,
+    ProtectedFrames,
+    Geometry,
+    TraceMetadata,
+    Capture,
+    Restoration,
+    FinalGeometry,
+    FinalBarrier,
+    FinalFrames,
+    FinalViewport,
+    BlobPublication,
+    Publication,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScreenshotCapturePhase {
+    NotEntered,
+    Admission,
+    IndependentCoverage,
+    SourceProtection,
+    RawCapture,
+    PostCaptureValidation,
+}
+/// Comparison with a later, best-effort inventory read. Never the atomic reject snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryAfterFailure {
+    NotSampled,
+    Unavailable,
+    Unchanged,
+    Changed,
+}
+pub(crate) struct ScreenshotFailure {
+    pub stage: ScreenshotStage,
+    pub capture_phase: ScreenshotCapturePhase,
+    pub inventory_after_failure: InventoryAfterFailure,
+    pub error: ProtocolError,
+}
+pub(crate) fn screenshot_failure(generation: u64, sequence: u64, failure: ScreenshotFailure) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        screenshot_failure_into(capture, generation, sequence, failure);
+    }
+}
+fn screenshot_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: ScreenshotFailure,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ScreenshotFirstFailure,
+        Facts {
+            generation: Some(generation),
+            screenshot_stage: Some(failure.stage),
+            capture_phase: Some(failure.capture_phase),
+            inventory_after_failure: Some(failure.inventory_after_failure),
+            error: Some(failure.error),
+            ..Facts::default()
+        },
+    );
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyAck {
+    None,
+    Current,
+    Retired,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyWindow {
+    NotEntered,
+    Entered,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyCleanup {
+    FailureObserved,
+    NotObserved,
+}
+pub(crate) struct ReadonlyPrepareFailure {
+    pub entry_us: u64,
+    pub ack_us: Option<u64>,
+    pub ack: ReadonlyAck,
+    pub wake_us: Option<u64>,
+    pub fail_us: Option<u64>,
+    pub window: ReadonlyWindow,
+    pub deadline: bool,
+    pub zero_input: bool,
+    pub cleanup: ReadonlyCleanup,
+    pub error: ProtocolError,
+}
+pub(crate) fn readonly_prepare_failure(
+    generation: u64,
+    sequence: u64,
+    failure: ReadonlyPrepareFailure,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        readonly_prepare_failure_into(capture, generation, sequence, failure);
+    }
+}
+fn readonly_prepare_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: ReadonlyPrepareFailure,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ReadonlyPrepareFailure,
+        Facts {
+            generation: Some(generation),
+            entry_us: Some(failure.entry_us),
+            ack_us: failure.ack_us,
+            ack: Some(failure.ack),
+            wake_us: failure.wake_us,
+            fail_us: failure.fail_us,
+            window: Some(failure.window),
+            deadline: Some(failure.deadline),
+            zero_input: Some(failure.zero_input),
+            cleanup: Some(failure.cleanup),
+            error: Some(failure.error),
+            ..Facts::default()
+        },
+    );
+}
+// One atomic frame-inventory rejection, emitted only after its screenshot settles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum FrameInventoryPass {
+    Initial,
+    Protected,
+    Final,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryRevisionEvent {
+    Attach,
+    Detach,
+    Info,
+    Navigate,
+    SameDocument,
+    FrameDetach,
+    Unknown,
+    None,
+}
+impl InventoryRevisionEvent {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Attach => 0,
+            Self::Detach => 1,
+            Self::Info => 2,
+            Self::Navigate => 3,
+            Self::SameDocument => 4,
+            Self::FrameDetach => 5,
+            Self::Unknown | Self::None => 6,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum InventoryRevisionTarget {
+    Same,
+    Other,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameInventoryRejection {
+    pub pass: FrameInventoryPass,
+    pub sealed: bool,
+    pub revision_mismatch: bool,
+    pub reservations: bool,
+    pub delta: Option<u16>,
+    pub events: Option<[u16; 7]>,
+    pub exact: bool,
+    pub last_event: InventoryRevisionEvent,
+    pub last_target: InventoryRevisionTarget,
+}
+pub(crate) fn frame_inventory_rejection(
+    generation: u64,
+    sequence: u64,
+    failure: FrameInventoryRejection,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        frame_inventory_rejection_into(capture, generation, sequence, failure);
+    }
+}
+fn frame_inventory_rejection_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: FrameInventoryRejection,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::FrameInventoryRejection,
+        Facts {
+            generation: Some(generation),
+            frame_pass: Some(failure.pass),
+            sealed: Some(failure.sealed),
+            revision_mismatch: Some(failure.revision_mismatch),
+            reservations: Some(failure.reservations),
+            delta: failure.delta,
+            events: failure.events,
+            exact: Some(failure.exact),
+            last_event: Some(failure.last_event),
+            last_target: Some(failure.last_target),
+            ..Facts::default()
+        },
+    );
 }
 pub(crate) fn inventory_snapshot(
     generation: u64,
@@ -483,12 +1168,16 @@ fn inventory_snapshot_into(
     point: InventoryPoint,
     snapshot: InventorySnapshot,
 ) {
+    let inventory_ordinal = snapshot
+        .attachments
+        .map(|_| next_cleanup_ordinal(&INVENTORY_ORDINALS, TARGET_ORDINAL_LIMIT).unwrap_or(0));
     record_capture(
         capture,
         sequence,
         Phase::InventorySnapshot,
         Facts {
             generation: Some(generation),
+            inventory_ordinal,
             inventory_point: Some(point),
             inventory_observed: Some(
                 snapshot.observed && snapshot.reservations <= 8192 && snapshot.unconfigured <= 8192,
@@ -500,6 +1189,52 @@ fn inventory_snapshot_into(
             ..Facts::default()
         },
     );
+    if let Some(targets) = snapshot.attachments {
+        let sampled = targets.attachments.iter().flatten().count();
+        record_capture(
+            capture,
+            sequence,
+            Phase::TargetInventorySummary,
+            Facts {
+                generation: Some(generation),
+                inventory_point: Some(point),
+                inventory_ordinal,
+                target_count: Some(targets.count.min(8192) as u64),
+                target_sampled: Some(sampled as u64),
+                target_observed: Some(
+                    targets.observed
+                        && targets.count <= TARGET_SAMPLE_LIMIT
+                        && sampled == targets.count,
+                ),
+                ..Facts::default()
+            },
+        );
+        for target in targets.attachments.into_iter().flatten() {
+            target_attribution_record(
+                capture,
+                generation,
+                sequence,
+                Some((point, inventory_ordinal.unwrap_or(0))),
+                target,
+            );
+            record_capture(
+                capture,
+                sequence,
+                Phase::TargetInventory,
+                Facts {
+                    generation: Some(generation),
+                    inventory_point: Some(point),
+                    inventory_ordinal,
+                    attachment_ordinal: Some(target.attachment),
+                    target_purpose: Some(target.purpose),
+                    target_classification: Some(target.classification),
+                    target_configured: Some(target.configured),
+                    target_resumed: Some(target.resumed),
+                    ..Facts::default()
+                },
+            );
+        }
+    }
 }
 // Exhaustion disables observation instead of aliasing a previous identity.
 #[allow(deprecated)]
@@ -1094,6 +1829,144 @@ impl Drop for FrameTrace {
 #[cfg(all(test, feature = "acceptance-faults"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_worker_admission_is_closed_process_local_and_bounded() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let workers = AtomicU64::new(0);
+        for index in 0..10 {
+            let waiting = [Some(true), Some(false), None][index % 3];
+            let trace = ServiceWorkerAdmission::start_into(&capture, &workers, 7, waiting);
+            assert_eq!(trace.is_some(), index < 8);
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                assert!(line.len() < MAX_RECORD_BYTES);
+                serde_json::from_str(line).unwrap()
+            })
+            .collect();
+        assert_eq!(values.len(), 9);
+        for (index, value) in values[..8].iter().enumerate() {
+            assert_eq!(value["phase"], "ServiceWorkerAdmission");
+            assert_eq!(value["operationSeq"], 0);
+            assert_eq!(value["workerOrdinal"], index + 1);
+            assert_eq!(value["generation"], 7);
+            assert_eq!(value["admissionStep"], "owned-attachment");
+            assert_eq!(value["admissionState"], "done");
+            assert_eq!(
+                value["waitingForDebugger"],
+                [
+                    serde_json::json!(true),
+                    serde_json::json!(false),
+                    serde_json::json!("unknown")
+                ][index % 3]
+            );
+            let keys: Vec<_> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "admissionState",
+                    "admissionStep",
+                    "droppedBefore",
+                    "emittedBefore",
+                    "generation",
+                    "operationSeq",
+                    "overflow",
+                    "phase",
+                    "pid",
+                    "record",
+                    "schemaVersion",
+                    "source",
+                    "suppressedBefore",
+                    "waitingForDebugger",
+                    "workerOrdinal"
+                ]
+            );
+        }
+        assert_eq!(values[8]["phase"], "CaptureLimitReached");
+        assert_eq!(values[8]["suppressedBefore"], 1);
+    }
+
+    #[test]
+    fn service_worker_admission_never_exceeds_thirty_two_observations() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let trace =
+            ServiceWorkerAdmission::start_into(&capture, &AtomicU64::new(0), 1, None).unwrap();
+        for _ in 0..40 {
+            trace.record_into(
+                &capture,
+                WorkerAdmissionStep::NetworkEnable,
+                WorkerAdmissionState::Enter,
+            );
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value["phase"] == "ServiceWorkerAdmission")
+                .count(),
+            32
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value["phase"] == "CaptureLimitReached")
+                .count(),
+            1
+        );
+        assert!(values.iter().all(|value| value["operationSeq"] == 0));
+    }
+
+    #[tokio::test]
+    async fn service_worker_observer_preserves_success_failure_and_pending_futures() {
+        assert_eq!(
+            ServiceWorkerAdmission::observe(None, WorkerAdmissionStep::NetworkEnable, async {
+                Ok::<_, u8>(41)
+            })
+            .await,
+            Ok(41)
+        );
+        assert_eq!(
+            ServiceWorkerAdmission::observe(None, WorkerAdmissionStep::FetchEnable, async {
+                Err::<u8, _>(42)
+            })
+            .await,
+            Err(42)
+        );
+        assert_eq!(
+            ServiceWorkerAdmission::observe_sync(None, WorkerAdmissionStep::Configured, || Err::<
+                u8,
+                _,
+            >(
+                43
+            )),
+            Err(43)
+        );
+        let pending = ServiceWorkerAdmission::observe(
+            None,
+            WorkerAdmissionStep::RuntimeEnable,
+            std::future::pending::<Result<(), u8>>(),
+        );
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("observer completed an unacknowledged command"),
+            _ = std::future::ready(()) => {}
+        }
+    }
 
     fn sample(ordinal: u64) -> Record {
         Record {

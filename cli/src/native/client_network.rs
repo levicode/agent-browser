@@ -15,6 +15,7 @@ use super::client_session::{
     CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
     OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
 };
+use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_transport::ClientEventSink;
 use base64::Engine;
 use serde_json::{json, Value};
@@ -502,10 +503,20 @@ impl ClientNetwork {
         *source = staged;
         Ok(())
     }
+    #[cfg(test)]
     pub async fn configure_session(
         &self,
         session: ApplicationSession,
         operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.configure_session_observed(session, operation, None)
+            .await
+    }
+    pub(crate) async fn configure_session_observed(
+        &self,
+        session: ApplicationSession,
+        operation: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
     ) -> Result<(), ProtocolError> {
         self.check()?;
         if operation.generation != self.scope.generation
@@ -541,9 +552,12 @@ impl ClientNetwork {
             );
         }
         let result = tokio::time::timeout_at(operation.deadline.into(), async {
-            self.client.send_command("Network.enable", Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id)).await?;
-            if policy.bypass_service_worker { self.client.send_command("Network.setBypassServiceWorker",Some(json!({"bypass":true})),Some(&id)).await?; }
-            self.client.send_command("Fetch.enable", Some(json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}],"handleAuthRequests":true})), Some(&id)).await?;
+            ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkEnable,
+                self.client.send_command("Network.enable", Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id))).await?;
+            if policy.bypass_service_worker { ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkBypass,
+                self.client.send_command("Network.setBypassServiceWorker",Some(json!({"bypass":true})),Some(&id))).await?; }
+            ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::FetchEnable,
+                self.client.send_command("Fetch.enable", Some(json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}],"handleAuthRequests":true})), Some(&id))).await?;
             Ok::<(), String>(())
         }).await;
         if !matches!(result, Ok(Ok(()))) {
@@ -2137,13 +2151,16 @@ impl ClientNetwork {
         if request_origin != parsed.origin() || attempted {
             return self.client.send_command("Fetch.continueWithAuth",Some(json!({"requestId":request_id,"authChallengeResponse":{"response":"CancelAuth"}})),Some(session)).await.map(|_|()).map_err(|_|ProtocolError::BrowserFailure);
         }
-        let lease = self.broker.decision_scoped(
+        let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
             DecisionOwner::Scope,
             DecisionKind::Authentication,
             30_000,
             None,
             Some(self.scope.identity_scope.clone()),
+            self.client.debt_ledger().and_then(|ledger| {
+                ledger.capturable_eval_window(&self.scope.identity_scope, session)
+            }),
         )?;
         let _token = self.track_token(session, &lease.token)?;
         sink.emit("network.auth".into(),json!({"identityScope":self.scope.identity_scope,"origin":parsed.origin().ascii_serialization(),"source":"Server","scheme":challenge.get("scheme"),"realm":challenge.get("realm")}),Some(DecisionNotice{token:lease.token,timeout_ms:30_000}))?;
@@ -2179,13 +2196,16 @@ impl ClientNetwork {
             return Err(ProtocolError::InvalidArguments);
         }
         let message = required_string(&params, "message")?;
-        let lease = self.broker.decision_scoped(
+        let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
             DecisionOwner::Scope,
             DecisionKind::Dialog,
             30_000,
             None,
             Some(self.scope.identity_scope.clone()),
+            self.client.debt_ledger().and_then(|ledger| {
+                ledger.capturable_eval_window(&self.scope.identity_scope, session)
+            }),
         )?;
         let _token = self.track_token(session, &lease.token)?;
         sink.emit(
@@ -2709,13 +2729,16 @@ impl ClientNetwork {
         if self.routes_frozen.load(Ordering::Acquire) {
             return Err(ProtocolError::StaleScope);
         }
-        let lease = self.broker.decision_scoped(
+        let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
             owner,
             DecisionKind::Request,
             timeout_ms,
             *current,
             Some(self.scope.identity_scope.clone()),
+            self.client.debt_ledger().and_then(|ledger| {
+                ledger.capturable_eval_window(&self.scope.identity_scope, session)
+            }),
         )?;
         let mut tokens = self
             .tokens

@@ -19,6 +19,180 @@ pub(crate) struct OperationKey {
     pub generation: u64,
     pub operation_seq: u64,
 }
+/// One native evaluate window, not an operation owner or a causal-parent claim.
+#[derive(Clone)]
+pub(crate) struct EvalWindowHandle {
+    ledger: std::sync::Weak<OwnerDebtLedger>,
+    epoch: u64,
+    root: OperationKey,
+}
+impl EvalWindowHandle {
+    pub(crate) fn root(&self) -> OperationKey {
+        self.root
+    }
+    pub(crate) fn same_window(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
+            && self.root == other.root
+            && std::sync::Weak::ptr_eq(&self.ledger, &other.ledger)
+    }
+    fn belongs_to_ref(&self, ledger: &OwnerDebtLedger) -> bool {
+        self.ledger
+            .upgrade()
+            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), ledger))
+    }
+    pub(crate) fn belongs_to(&self, ledger: &Arc<OwnerDebtLedger>) -> bool {
+        self.ledger
+            .upgrade()
+            .is_some_and(|owner| Arc::ptr_eq(&owner, ledger))
+    }
+    pub(crate) fn live_deadline(&self, scope: &str) -> Option<Instant> {
+        let ledger = self.ledger.upgrade()?;
+        let state = ledger.state.lock().ok()?;
+        let window = state.eval_window.as_ref()?;
+        if ledger.identity_scope != scope
+            || state.retired
+            || state.integrity_lost
+            || window.epoch != self.epoch
+            || window.root.key != self.root
+            || window.revoked
+            || !window.root_submitted
+            || window.root.check().is_err()
+        {
+            return None;
+        }
+        Some(window.root.deadline)
+    }
+    pub(crate) fn bind_root(&self, operation: &OperationLease) -> Result<(), ProtocolError> {
+        self.ledger
+            .upgrade()
+            .ok_or(ProtocolError::StaleScope)?
+            .bind_eval_root(self, operation)
+    }
+    pub(crate) fn issue_child(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<ReentrantEvalPermit, ProtocolError> {
+        self.ledger
+            .upgrade()
+            .ok_or(ProtocolError::StaleScope)?
+            .issue_eval_child(self, operation)
+    }
+    pub(crate) fn revoke(&self) {
+        if let Some(ledger) = self.ledger.upgrade() {
+            ledger.revoke_eval_window(self);
+        }
+    }
+}
+/// Captured from the existing enrollment index, never from command arguments.
+#[derive(Clone)]
+pub(crate) struct EvalAuthorityStamp {
+    pub(crate) revision: u64,
+    pub(crate) target: String,
+    pub(crate) session: String,
+    pub(crate) frame: String,
+    pub(crate) loader: String,
+}
+impl EvalAuthorityStamp {
+    fn footprint(&self) -> usize {
+        512 + self.target.len() + self.session.len() + self.frame.len() + self.loader.len()
+    }
+    fn valid(&self) -> bool {
+        [&self.target, &self.session, &self.frame]
+            .iter()
+            .all(|value| !value.is_empty() && value.len() <= 4096)
+            && self.loader.len() <= 4096
+    }
+}
+#[derive(Clone)]
+struct EvalAdmission {
+    key: OperationKey,
+    deadline: Instant,
+    cancellation: tokio::sync::watch::Receiver<CancelSignal>,
+    producer_finished: bool,
+    result_fixed: bool,
+}
+impl EvalAdmission {
+    fn capture(operation: &OperationLease) -> Self {
+        Self {
+            key: OperationKey {
+                generation: operation.generation,
+                operation_seq: operation.sequence,
+            },
+            deadline: operation.deadline,
+            cancellation: operation.cancellation.clone(),
+            producer_finished: false,
+            result_fixed: false,
+        }
+    }
+    fn check(&self) -> Result<(), ProtocolError> {
+        if let Some(error) = self.cancellation.borrow().error() {
+            return Err(error);
+        }
+        if self.producer_finished {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+}
+struct EvalChild {
+    admission: EvalAdmission,
+    reservation: Option<u64>,
+    consumed: bool,
+}
+struct EvalWindow {
+    epoch: u64,
+    stamp: EvalAuthorityStamp,
+    root: EvalAdmission,
+    armed: bool,
+    broker_bound: bool,
+    root_reservation: Option<u64>,
+    root_submitted: bool,
+    child: Option<EvalChild>,
+    revoked: bool,
+    integrity_lost: bool,
+}
+/// Deliberately non-Clone. Issuance never repeats within one root window.
+pub(crate) struct ReentrantEvalPermit {
+    window: EvalWindowHandle,
+    child: OperationKey,
+}
+impl ReentrantEvalPermit {
+    pub(crate) fn window(&self) -> &EvalWindowHandle {
+        &self.window
+    }
+    pub(crate) fn child(&self) -> OperationKey {
+        self.child
+    }
+}
+/// Native lexical role around the original page.evaluate primitive only.
+pub(crate) enum EvalCommandGrant {
+    Root(EvalWindowHandle),
+    Child(ReentrantEvalPermit),
+}
+impl EvalCommandGrant {
+    fn window(&self) -> &EvalWindowHandle {
+        match self {
+            Self::Root(window) => window,
+            Self::Child(permit) => &permit.window,
+        }
+    }
+    fn key(&self) -> OperationKey {
+        match self {
+            Self::Root(window) => window.root,
+            Self::Child(permit) => permit.child,
+        }
+    }
+}
+tokio::task_local! {
+    static EVAL_COMMAND: Mutex<Option<EvalCommandGrant>>;
+}
+pub(crate) async fn eval_command_scope<F: Future>(grant: EvalCommandGrant, future: F) -> F::Output {
+    EVAL_COMMAND.scope(Mutex::new(Some(grant)), future).await
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdmissionClass {
     Input,
@@ -595,6 +769,12 @@ enum EofIntegrityCause {
 #[derive(Default)]
 struct LedgerState {
     next_reservation: u64,
+    eval_epoch: u64,
+    eval_revision: u64,
+    // Reader observation has begun, but existing bounded publication has not returned.
+    // This is only an eval admission fence, not a second received/applied watermark.
+    eval_publication_pending: bool,
+    eval_window: Option<EvalWindow>,
     next_realm_epoch: u64,
     next_object_serial: u64,
     next_group: u64,
@@ -623,6 +803,9 @@ struct LedgerState {
 }
 impl LedgerState {
     fn contaminate_integrity(&mut self) {
+        if let Some(window) = &mut self.eval_window {
+            window.revoked = true;
+        }
         self.integrity_lost = true;
         self.eof_integrity_cause = EofIntegrityCause::Contaminated;
     }
@@ -634,6 +817,19 @@ pub(crate) struct OwnerDebtLedger {
     changed: Arc<tokio::sync::Notify>,
     pub(crate) cleanup_diagnostics: Arc<super::client_settlement_trace::CleanupDiagnostics>,
 }
+/// Explicit completion is required after publish_bounded returns, before any await.
+/// An abandoned guard intentionally leaves admission fenced. Overlapping readers
+/// contaminate the existing ledger; neither completion can repair that failure.
+pub(crate) struct EvalEventPublication(Arc<OwnerDebtLedger>);
+impl EvalEventPublication {
+    pub(crate) fn complete(self) {
+        if let Ok(mut state) = self.0.state.lock() {
+            if !state.integrity_lost {
+                state.eval_publication_pending = false;
+            }
+        }
+    }
+}
 struct DebtChange<'a>(&'a tokio::sync::Notify);
 impl Drop for DebtChange<'_> {
     fn drop(&mut self) {
@@ -641,6 +837,318 @@ impl Drop for DebtChange<'_> {
     }
 }
 impl OwnerDebtLedger {
+    #[cfg(test)]
+    pub(crate) fn eval_authority_revision(&self) -> Result<u64, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check_eval_authority(&state, None, None)?;
+        Ok(state.eval_revision)
+    }
+    pub(crate) fn capture_eval_revision(
+        &self,
+        session: &str,
+        target: &str,
+    ) -> Result<u64, ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        prune_eval_window(&mut state);
+        check_eval_authority(&state, Some((session, target)), None)?;
+        if state.eval_window.is_some() {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        Ok(state.eval_revision)
+    }
+    /// Call under the originating index/broker/registry lock, before publication.
+    /// Never calls that origin back or acquires an upper-layer lock.
+    pub(crate) fn invalidate_eval_authority(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        invalidate_eval(&mut state);
+    }
+    /// Keep the existing failure fence even if all remote commands later ACK.
+    /// This does not clear or replace the registry's original failure receipt.
+    pub(crate) fn fail_eval_authority(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        invalidate_eval(&mut state);
+        if let Some(window) = &mut state.eval_window {
+            window.integrity_lost = true;
+        }
+    }
+    /// Central target mutation follows the existing ledger -> targets ordering.
+    /// The closure may only lock and mutate the exact target registry, never await.
+    pub(crate) fn with_eval_target_invalidation<T>(
+        &self,
+        mutation: impl FnOnce(&mut dyn FnMut()) -> T,
+    ) -> T {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        // The callback changes this already-locked ledger. It never relocks or
+        // calls the broker, enrollment index, or operation registry.
+        mutation(&mut || invalidate_eval(&mut state))
+    }
+    /// Registry.entries stays held from provisional installation through snapshots
+    /// and promotion. A provisional slot grants no submit authority to anybody.
+    pub(crate) fn begin_eval_window(
+        self: &Arc<Self>,
+        journal: &OperationJournalHandle,
+        operation: &OperationLease,
+        stamp: EvalAuthorityStamp,
+    ) -> Result<EvalWindowHandle, ProtocolError> {
+        if operation.is_callback
+            || operation.generation != self.generation
+            || !Arc::ptr_eq(&journal.ledger, self)
+            || journal.key()
+                != (OperationKey {
+                    generation: operation.generation,
+                    operation_seq: operation.sequence,
+                })
+            || journal.journal.target != stamp.target
+            || journal.journal.session != stamp.session
+            || !stamp.valid()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        {
+            let state = journal
+                .journal
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.admission.as_ref().is_none_or(|(deadline, cancel)| {
+                *deadline != operation.deadline || !cancel.same_channel(&operation.cancellation)
+            }) {
+                return Err(ProtocolError::InvalidSequence);
+            }
+        }
+        let root = EvalAdmission::capture(operation);
+        root.check()?;
+        journal.check_application_submission()?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        prune_eval_window(&mut state);
+        check_eval_authority(
+            &state,
+            Some((&stamp.session, &stamp.target)),
+            Some(stamp.revision),
+        )?;
+        if state.eval_window.is_some()
+            || state
+                .commands
+                .values()
+                .any(|command| command.submitted && command.category.input())
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if descriptor_usage(&state).saturating_add(stamp.footprint()) > 508 * 1024 {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        let epoch = state
+            .eval_epoch
+            .checked_add(1)
+            .ok_or(ProtocolError::IdentifierExhausted)?;
+        state.eval_epoch = epoch;
+        state.eval_window = Some(EvalWindow {
+            epoch,
+            stamp,
+            root,
+            armed: false,
+            broker_bound: false,
+            root_reservation: None,
+            root_submitted: false,
+            child: None,
+            revoked: false,
+            integrity_lost: false,
+        });
+        Ok(EvalWindowHandle {
+            ledger: Arc::downgrade(self),
+            epoch,
+            root: journal.key(),
+        })
+    }
+    pub(crate) fn arm_eval_window(&self, handle: &EvalWindowHandle) -> Result<(), ProtocolError> {
+        if !handle.belongs_to_ref(self) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let window = eval_window_mut(&mut state, handle)?;
+        if window.armed {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        window.root.check()?;
+        window.armed = true;
+        Ok(())
+    }
+    pub(crate) fn bind_eval_root(
+        &self,
+        handle: &EvalWindowHandle,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        if !handle.belongs_to_ref(self) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let window = eval_window_mut(&mut state, handle)?;
+        if !window.armed
+            || window.broker_bound
+            || operation.is_callback
+            || window.root.key
+                != (OperationKey {
+                    generation: operation.generation,
+                    operation_seq: operation.sequence,
+                })
+            || window.root.deadline != operation.deadline
+            || !window
+                .root
+                .cancellation
+                .same_channel(&operation.cancellation)
+        {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        window.root.check()?;
+        window.broker_bound = true;
+        Ok(())
+    }
+    pub(crate) fn capturable_eval_window(
+        self: &Arc<Self>,
+        scope: &str,
+        session: &str,
+    ) -> Option<EvalWindowHandle> {
+        let state = self.state.lock().ok()?;
+        let window = state.eval_window.as_ref()?;
+        check_eval_authority(
+            &state,
+            Some((&window.stamp.session, &window.stamp.target)),
+            Some(window.stamp.revision),
+        )
+        .ok()?;
+        if self.identity_scope != scope
+            || window.revoked
+            || !window.root_submitted
+            || window.child.is_some()
+            || window.stamp.session != session
+            || window.root.check().is_err()
+        {
+            return None;
+        }
+        Some(EvalWindowHandle {
+            ledger: Arc::downgrade(self),
+            epoch: window.epoch,
+            root: window.root.key,
+        })
+    }
+    pub(crate) fn issue_eval_child(
+        &self,
+        handle: &EvalWindowHandle,
+        operation: &OperationLease,
+    ) -> Result<ReentrantEvalPermit, ProtocolError> {
+        if !handle.belongs_to_ref(self) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let window = eval_window_mut(&mut state, handle)?;
+        window.root.check()?;
+        let child = EvalAdmission::capture(operation);
+        child.check()?;
+        if !operation.is_callback
+            || !window.root_submitted
+            || window.child.is_some()
+            || child.key.generation != window.root.key.generation
+            || child.key == window.root.key
+            || child.deadline > window.root.deadline
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let key = child.key;
+        window.child = Some(EvalChild {
+            admission: child,
+            reservation: None,
+            consumed: false,
+        });
+        Ok(ReentrantEvalPermit {
+            window: handle.clone(),
+            child: key,
+        })
+    }
+    pub(crate) fn check_eval_input(
+        &self,
+        permit: &ReentrantEvalPermit,
+    ) -> Result<(), ProtocolError> {
+        if !permit.window.belongs_to_ref(self) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check_eval_child(&state, &permit.window, permit.child)
+    }
+    pub(crate) fn revoke_eval_window(&self, handle: &EvalWindowHandle) {
+        if !handle.belongs_to_ref(self) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(window) = &mut state.eval_window {
+            if window.epoch == handle.epoch && window.root.key == handle.root {
+                window.revoked = true;
+            }
+        }
+    }
+    /// Failed preparation has no submitted reservation or child. Never use this
+    /// to erase a window after submission, cancellation, or a late ACK.
+    pub(crate) fn abandon_eval_preparation(&self, handle: &EvalWindowHandle) {
+        if !handle.belongs_to_ref(self) {
+            return;
+        }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.eval_window.as_ref().is_some_and(|window| {
+            window.epoch == handle.epoch
+                && window.root.key == handle.root
+                && window.root_reservation.is_none()
+                && window.child.is_none()
+        }) {
+            state.eval_window = None;
+        }
+    }
+    pub(crate) fn eval_operation_terminal(
+        &self,
+        key: OperationKey,
+        producer: bool,
+        result_fixed: bool,
+    ) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some(window) = &mut state.eval_window {
+            let admission = if window.root.key == key {
+                Some(&mut window.root)
+            } else {
+                window
+                    .child
+                    .as_mut()
+                    .filter(|child| child.admission.key == key)
+                    .map(|child| &mut child.admission)
+            };
+            if let Some(admission) = admission {
+                admission.producer_finished |= producer;
+                admission.result_fixed |= result_fixed;
+                if producer {
+                    window.revoked = true;
+                }
+            }
+        }
+        prune_eval_window(&mut state);
+    }
     /// A replacement route transfer belongs to the original unpublished request,
     /// including its cancellation channel. Publication consumes this authority.
     pub(crate) fn check_unpublished_operation(
@@ -1155,6 +1663,7 @@ impl OwnerDebtLedger {
             state.bytes[index] += footprint;
         }
         state.object_bytes = 0;
+        invalidate_eval(&mut state);
         state.retired = true;
         self.changed.notify_waiters();
         Ok(())
@@ -1336,6 +1845,45 @@ impl OwnerDebtLedger {
                 },
             )
         };
+        if method == "Runtime.evaluate"
+            && classification.category == CommandCategory::ApplicationInput
+        {
+            EVAL_COMMAND
+                .try_with(|slot| {
+                    let slot = slot.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    let grant = slot.as_ref().ok_or(ProtocolError::ScopeUnavailable)?;
+                    if !grant.window().belongs_to(self) {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    let state = self
+                        .state
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    let window = state
+                        .eval_window
+                        .as_ref()
+                        .ok_or(ProtocolError::ScopeUnavailable)?;
+                    if window.epoch != grant.window().epoch
+                        || window.root.key != grant.window().root
+                    {
+                        return Err(ProtocolError::ScopeUnavailable);
+                    }
+                    window.root.check()?;
+                    if let EvalCommandGrant::Child(permit) = grant {
+                        let child = window
+                            .child
+                            .as_ref()
+                            .ok_or(ProtocolError::ScopeUnavailable)?;
+                        if child.admission.key != permit.child {
+                            return Err(ProtocolError::InvalidSequence);
+                        }
+                        child.admission.check()?;
+                    }
+                    Ok(())
+                })
+                .ok()
+                .transpose()?;
+        }
         if classification.category.application() {
             if let Some(journal) = journal {
                 journal.check_application_submission()?;
@@ -1373,6 +1921,33 @@ impl OwnerDebtLedger {
             .is_some_and(|group| object_group.as_ref().is_some_and(|actual| actual != group))
         {
             return Err(ProtocolError::StaleScope);
+        }
+        let eval = if method == "Runtime.evaluate"
+            && classification.category == CommandCategory::ApplicationInput
+        {
+            EVAL_COMMAND
+                .try_with(|slot| {
+                    slot.lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?
+                        .take()
+                        .ok_or(ProtocolError::ScopeUnavailable)
+                })
+                .ok()
+                .transpose()?
+        } else {
+            None
+        };
+        if let Some(grant) = &eval {
+            if !grant.window().belongs_to(self)
+                || journal.map(OperationJournalHandle::key) != Some(grant.key())
+                || params.is_none_or(|value| {
+                    value["returnByValue"] != true
+                        || value["awaitPromise"] != true
+                        || value["userGesture"] != true
+                })
+            {
+                return Err(ProtocolError::InvalidArguments);
+            }
         }
         let envelope = command_envelope_digest(method, params, session);
         let physical_creation_slots = creation_slots(method, params);
@@ -1589,11 +2164,47 @@ impl OwnerDebtLedger {
             .next_reservation
             .checked_add(1)
             .ok_or(ProtocolError::IdentifierExhausted)?;
+        let next_group_id = if new_group_footprint > 0 {
+            Some(
+                state
+                    .next_group
+                    .checked_add(1)
+                    .ok_or(ProtocolError::IdentifierExhausted)?,
+            )
+        } else {
+            None
+        };
+        if let Some(grant) = &eval {
+            let window = eval_window_mut(&mut state, grant.window())?;
+            if provenance.session.as_deref() != Some(window.stamp.session.as_str())
+                || provenance.target.as_deref() != Some(window.stamp.target.as_str())
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            match grant {
+                EvalCommandGrant::Root(_) => {
+                    if !window.broker_bound || window.root_reservation.is_some() {
+                        return Err(ProtocolError::ScopeUnavailable);
+                    }
+                    window.root_reservation = Some(id);
+                }
+                EvalCommandGrant::Child(permit) => {
+                    let child = window
+                        .child
+                        .as_mut()
+                        .ok_or(ProtocolError::ScopeUnavailable)?;
+                    if child.admission.key != permit.child
+                        || child.reservation.is_some()
+                        || child.consumed
+                    {
+                        return Err(ProtocolError::ScopeUnavailable);
+                    }
+                    child.reservation = Some(id);
+                }
+            }
+        }
         let group_id = if new_group_footprint > 0 {
-            let group_id = state
-                .next_group
-                .checked_add(1)
-                .ok_or(ProtocolError::IdentifierExhausted)?;
+            let group_id = next_group_id.expect("validated group identifier");
             state.next_group = group_id;
             state.groups.insert(
                 group_id,
@@ -1665,6 +2276,7 @@ impl OwnerDebtLedger {
             },
         );
         Ok(CommandReservation {
+            eval,
             owner_cleanup: owner_cleanup.is_some(),
             envelope,
             ledger: self.clone(),
@@ -1704,12 +2316,24 @@ impl OwnerDebtLedger {
                         EofIntegrityCause::RemoteEofOnly
                     };
                 }
+                invalidate_eval(&mut state);
                 state.integrity_lost = true;
             }
             Err(error) => error.into_inner().contaminate_integrity(),
         }
     }
+    #[cfg(test)]
     pub(crate) fn observe_event(&self, event: &CdpEvent) {
+        self.observe_event_inner(event, false);
+    }
+    pub(crate) fn observe_event_for_publication(
+        self: &Arc<Self>,
+        event: &CdpEvent,
+    ) -> Option<EvalEventPublication> {
+        self.observe_event_inner(event, true)
+            .then(|| EvalEventPublication(self.clone()))
+    }
+    fn observe_event_inner(&self, event: &CdpEvent, publication: bool) -> bool {
         if !matches!(
             event.method.as_str(),
             "Runtime.executionContextCreated"
@@ -1717,15 +2341,27 @@ impl OwnerDebtLedger {
                 | "Runtime.executionContextsCleared"
                 | "Target.detachedFromTarget"
                 | "Target.targetDestroyed"
+                | "Page.frameNavigated"
+                | "Page.frameDetached"
         ) {
-            return;
+            return false;
         }
         let _notification = DebtChange(&self.changed);
         let Ok(mut state) = self.state.lock() else {
-            return;
+            return false;
         };
         if state.retired {
-            return;
+            return false;
+        }
+        let affects_eval = eval_lifecycle_event(&state, event);
+        if affects_eval {
+            if publication {
+                if state.eval_publication_pending {
+                    state.contaminate_integrity();
+                }
+                state.eval_publication_pending = true;
+            }
+            invalidate_eval(&mut state);
         }
         match event.method.as_str() {
             "Runtime.executionContextCreated" => {
@@ -1736,7 +2372,7 @@ impl OwnerDebtLedger {
                         || state.lifecycle_sessions.get(session)
                             == Some(&LifecycleSessionPurpose::Observer)
                     {
-                        return;
+                        return false;
                     }
                     let extra = if state.realms.contains_key(&(session.clone(), context)) {
                         0
@@ -1750,11 +2386,11 @@ impl OwnerDebtLedger {
                         || descriptor_usage(&state).saturating_add(extra) > 508 * 1024
                     {
                         state.contaminate_integrity();
-                        return;
+                        return false;
                     }
                     let Some(epoch) = state.next_realm_epoch.checked_add(1) else {
                         state.contaminate_integrity();
-                        return;
+                        return false;
                     };
                     state.next_realm_epoch = epoch;
                     state.realms.insert((session.clone(), context), epoch);
@@ -1823,6 +2459,7 @@ impl OwnerDebtLedger {
             }
             _ => {}
         }
+        affects_eval && publication
     }
 }
 fn metadata_usage(state: &LedgerState) -> usize {
@@ -1863,8 +2500,240 @@ fn check_metadata_add(state: &LedgerState, extra: usize) -> Result<(), ProtocolE
         Ok(())
     }
 }
+// Only the six existing lifecycle revocation methods. Attribution comes from
+// this owner's existing session/target maps, never a callback or adapter claim.
+fn eval_lifecycle_event(state: &LedgerState, event: &CdpEvent) -> bool {
+    let owned = |session: &str| {
+        state.targets.contains_key(session)
+            && !matches!(
+                state.lifecycle_sessions.get(session),
+                Some(LifecycleSessionPurpose::Observer | LifecycleSessionPurpose::Recording)
+            )
+    };
+    match event.method.as_str() {
+        "Target.detachedFromTarget" => event.params["sessionId"].as_str().is_some_and(owned),
+        "Target.targetDestroyed" => event.params["targetId"].as_str().is_some_and(|target| {
+            !state.recording_targets.contains(target)
+                && state
+                    .targets
+                    .iter()
+                    .any(|(session, known)| known == target && owned(session))
+        }),
+        "Page.frameNavigated"
+        | "Page.frameDetached"
+        | "Runtime.executionContextDestroyed"
+        | "Runtime.executionContextsCleared" => event.session_id.as_deref().is_some_and(owned),
+        _ => false,
+    }
+}
+// One ledger-locked authority check for capture, installation, arm, and consume.
+// TargetDestroyed has no production enrollment route, so exact identity must
+// also remain present in the reader-maintained map, not just the applied index.
+fn check_eval_authority(
+    state: &LedgerState,
+    identity: Option<(&str, &str)>,
+    revision: Option<u64>,
+) -> Result<(), ProtocolError> {
+    if state.retired
+        || state.integrity_lost
+        || state.eval_publication_pending
+        || revision.is_some_and(|revision| revision != state.eval_revision)
+        || identity.is_some_and(|(session, target)| {
+            state.targets.get(session).map(String::as_str) != Some(target)
+        })
+    {
+        return Err(ProtocolError::ScopeUnavailable);
+    }
+    Ok(())
+}
+fn invalidate_eval(state: &mut LedgerState) {
+    if let Some(window) = &mut state.eval_window {
+        window.revoked = true;
+    }
+    match state.eval_revision.checked_add(1) {
+        Some(revision) => state.eval_revision = revision,
+        None => state.contaminate_integrity(),
+    }
+}
+fn eval_window_mut<'a>(
+    state: &'a mut LedgerState,
+    handle: &EvalWindowHandle,
+) -> Result<&'a mut EvalWindow, ProtocolError> {
+    let window = state
+        .eval_window
+        .as_ref()
+        .ok_or(ProtocolError::ScopeUnavailable)?;
+    check_eval_authority(
+        state,
+        Some((&window.stamp.session, &window.stamp.target)),
+        Some(window.stamp.revision),
+    )?;
+    if window.epoch != handle.epoch || window.root.key != handle.root || window.revoked {
+        return Err(ProtocolError::ScopeUnavailable);
+    }
+    state
+        .eval_window
+        .as_mut()
+        .ok_or(ProtocolError::ScopeUnavailable)
+}
+fn check_eval_child(
+    state: &LedgerState,
+    handle: &EvalWindowHandle,
+    key: OperationKey,
+) -> Result<(), ProtocolError> {
+    let window = state
+        .eval_window
+        .as_ref()
+        .ok_or(ProtocolError::ScopeUnavailable)?;
+    check_eval_authority(
+        state,
+        Some((&window.stamp.session, &window.stamp.target)),
+        Some(window.stamp.revision),
+    )?;
+    if window.epoch != handle.epoch
+        || window.root.key != handle.root
+        || window.revoked
+        || !window.root_submitted
+    {
+        return Err(ProtocolError::ScopeUnavailable);
+    }
+    window.root.check()?;
+    let child = window
+        .child
+        .as_ref()
+        .ok_or(ProtocolError::ScopeUnavailable)?;
+    if child.admission.key != key || child.consumed {
+        return Err(ProtocolError::ScopeUnavailable);
+    }
+    child.admission.check()?;
+    let root_id = window
+        .root_reservation
+        .ok_or(ProtocolError::ScopeUnavailable)?;
+    if !state.commands.get(&root_id).is_some_and(|command| {
+        command.submitted
+            && command.status.snapshot() == CommandStatus::Submitted
+            && command.provenance.operation == Some(window.root.key)
+    }) || state
+        .commands
+        .iter()
+        .any(|(id, command)| *id != root_id && command.submitted && command.category.input())
+    {
+        return Err(ProtocolError::ScopeUnavailable);
+    }
+    Ok(())
+}
+fn prune_eval_window(state: &mut LedgerState) {
+    let Some(window) = &state.eval_window else {
+        return;
+    };
+    if window.integrity_lost {
+        return;
+    }
+    let settled = |admission: &EvalAdmission| {
+        admission.producer_finished
+            && admission.result_fixed
+            && !state
+                .commands
+                .values()
+                .any(|command| command.provenance.operation == Some(admission.key))
+            && !state
+                .groups
+                .values()
+                .any(|group| group.provenance.operation == Some(admission.key))
+            && !state
+                .objects
+                .iter()
+                .any(|object| object.provenance.operation == Some(admission.key))
+    };
+    if settled(&window.root)
+        && window
+            .child
+            .as_ref()
+            .is_none_or(|child| settled(&child.admission))
+    {
+        state.eval_window = None;
+    }
+}
+fn prepare_eval_submit(
+    state: &mut LedgerState,
+    id: u64,
+    grant: Option<&EvalCommandGrant>,
+) -> Result<(), ProtocolError> {
+    prune_eval_window(state);
+    let command = state
+        .commands
+        .get(&id)
+        .ok_or(ProtocolError::ScopeUnavailable)?;
+    if command.category == CommandCategory::CleanupInput {
+        invalidate_eval(state);
+        return Ok(());
+    }
+    if command.category != CommandCategory::ApplicationInput {
+        return Ok(());
+    }
+    if state.eval_window.is_none() {
+        return if grant.is_none() {
+            Ok(())
+        } else {
+            Err(ProtocolError::ScopeUnavailable)
+        };
+    }
+    let grant = grant.ok_or(ProtocolError::ScopeUnavailable)?;
+    if command.provenance.operation != Some(grant.key()) {
+        return Err(ProtocolError::InvalidSequence);
+    }
+    match grant {
+        EvalCommandGrant::Root(handle) => {
+            if state
+                .commands
+                .values()
+                .any(|command| command.submitted && command.category.input())
+            {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            let window = eval_window_mut(state, handle)?;
+            window.root.check()?;
+            if !window.armed
+                || !window.broker_bound
+                || window.root_submitted
+                || window.root_reservation != Some(id)
+            {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+        }
+        EvalCommandGrant::Child(permit) => {
+            check_eval_child(state, &permit.window, permit.child)?;
+            if state
+                .eval_window
+                .as_ref()
+                .and_then(|window| window.child.as_ref())
+                .and_then(|child| child.reservation)
+                != Some(id)
+            {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+        }
+    }
+    Ok(())
+}
+fn commit_eval_submit(state: &mut LedgerState, grant: Option<&EvalCommandGrant>) {
+    if let (Some(window), Some(grant)) = (&mut state.eval_window, grant) {
+        match grant {
+            EvalCommandGrant::Root(_) => window.root_submitted = true,
+            EvalCommandGrant::Child(_) => {
+                if let Some(child) = &mut window.child {
+                    child.consumed = true;
+                }
+            }
+        }
+    }
+}
 fn descriptor_usage(state: &LedgerState) -> usize {
     metadata_usage(state)
+        + state
+            .eval_window
+            .as_ref()
+            .map_or(0, |window| window.stamp.footprint())
         + state.journal_bytes
         + state
             .groups
@@ -1948,6 +2817,7 @@ fn destroy_matching(
     }
 }
 pub(crate) struct CommandReservation {
+    eval: Option<EvalCommandGrant>,
     owner_cleanup: bool,
     envelope: [u8; 32],
     ledger: Arc<OwnerDebtLedger>,
@@ -1998,6 +2868,7 @@ impl CommandReservation {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        prepare_eval_submit(&mut state, self.id, self.eval.as_ref())?;
         let group_fence = state.next_object_serial;
         if state
             .commands
@@ -2071,6 +2942,7 @@ impl CommandReservation {
                 group.submitted_creations += 1;
             }
         }
+        commit_eval_submit(&mut state, self.eval.as_ref());
         self.submitted = true;
         Ok(SubmittedCommand {
             ledger: self.ledger.clone(),
@@ -2082,6 +2954,13 @@ impl Drop for CommandReservation {
     fn drop(&mut self) {
         if !self.submitted {
             if let Ok(mut state) = self.ledger.state.lock() {
+                if let (Some(grant), Some(window)) = (&self.eval, &mut state.eval_window) {
+                    if window.epoch == grant.window().epoch
+                        && window.root.key == grant.window().root
+                    {
+                        window.revoked = true;
+                    }
+                }
                 let removed = remove_command(&mut state, self.id);
                 if let Some(id) = removed.and_then(|command| command.group_id) {
                     if state
@@ -2319,6 +3198,11 @@ impl SubmittedCommand {
         let Ok(mut state) = self.ledger.state.lock() else {
             return Vec::new();
         };
+        if let Some(window) = &mut state.eval_window {
+            if window.root_reservation == Some(self.id) {
+                window.revoked = true;
+            }
+        }
         let Some(command) = state.commands.get(&self.id) else {
             return Vec::new();
         };
@@ -2702,7 +3586,7 @@ fn classify(method: &str, _params: Option<&Value>, operation: bool) -> Classific
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
     fn owner() -> (Arc<OwnerDebtLedger>, OperationJournalHandle) {
@@ -2718,6 +3602,580 @@ mod tests {
             )
             .unwrap();
         (ledger, journal)
+    }
+    pub(crate) fn eval_fixture() -> (
+        Arc<OwnerDebtLedger>,
+        OperationJournalHandle,
+        OperationLease,
+        EvalWindowHandle,
+    ) {
+        let (ledger, journal) = owner();
+        let (_send, mut op) = admission_operation(5000);
+        op.sequence = 1;
+        journal.bind_operation(&op).unwrap();
+        let stamp = EvalAuthorityStamp {
+            revision: ledger.eval_authority_revision().unwrap(),
+            target: "target".into(),
+            session: "page".into(),
+            frame: "frame".into(),
+            loader: "loader".into(),
+        };
+        let window = ledger.begin_eval_window(&journal, &op, stamp).unwrap();
+        ledger.arm_eval_window(&window).unwrap();
+        ledger.bind_eval_root(&window, &op).unwrap();
+        (ledger, journal, op, window)
+    }
+    pub(crate) async fn eval_reservation(
+        ledger: &Arc<OwnerDebtLedger>,
+        journal: &OperationJournalHandle,
+        grant: EvalCommandGrant,
+    ) -> CommandReservation {
+        eval_command_scope(grant, async {
+            ledger.reserve_command(
+                Some(journal),
+                "Runtime.evaluate",
+                Some(&json!({
+                    "expression":"globalThis.synthetic = 1", "awaitPromise":true,
+                    "returnByValue":true, "userGesture":true
+                })),
+                Some("page"),
+            )
+        })
+        .await
+        .unwrap()
+    }
+    pub(crate) fn eval_child(
+        ledger: &Arc<OwnerDebtLedger>,
+        root: &OperationLease,
+        window: &EvalWindowHandle,
+    ) -> (OperationLease, OperationJournalHandle, ReentrantEvalPermit) {
+        let (_send, mut child) = admission_operation(5000);
+        child.deadline = root.deadline;
+        child.is_callback = true;
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: child.generation,
+                    operation_seq: child.sequence,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&child).unwrap();
+        let permit = ledger.issue_eval_child(window, &child).unwrap();
+        (child, journal, permit)
+    }
+    fn lifecycle_event(method: &str, session: &str) -> CdpEvent {
+        CdpEvent {
+            method: method.into(),
+            session_id: Some(session.into()),
+            params: json!({"sessionId":session,"targetId":"target",
+                "frame":{"id":"frame","loaderId":"replacement"},"frameId":"frame",
+                "executionContextId":1,"context":{"id":1}}),
+        }
+    }
+    #[test]
+    fn eval_capture_before_reader_without_slot_cannot_install_stale_stamp() {
+        for method in [
+            "Target.detachedFromTarget",
+            "Target.targetDestroyed",
+            "Page.frameNavigated",
+            "Page.frameDetached",
+            "Runtime.executionContextDestroyed",
+            "Runtime.executionContextsCleared",
+        ] {
+            let (ledger, journal) = owner();
+            let (_send, mut op) = admission_operation(5000);
+            op.sequence = 1;
+            journal.bind_operation(&op).unwrap();
+            let stamp = EvalAuthorityStamp {
+                revision: ledger.capture_eval_revision("page", "target").unwrap(),
+                session: "page".into(),
+                target: "target".into(),
+                frame: "frame".into(),
+                loader: "loader".into(),
+            };
+            let publication = ledger
+                .observe_event_for_publication(&lifecycle_event(method, "page"))
+                .unwrap();
+            assert!(ledger.capture_eval_revision("page", "target").is_err());
+            publication.complete();
+            assert!(
+                matches!(
+                    ledger.begin_eval_window(&journal, &op, stamp),
+                    Err(ProtocolError::ScopeUnavailable)
+                ),
+                "{method}"
+            );
+            assert_eq!(ledger.snapshot().input_debt, 0);
+            assert!(!journal.snapshot().mutation_dispatched);
+        }
+    }
+    #[tokio::test]
+    async fn eval_publication_pending_blocks_arm_and_final_consume_without_clearing_root() {
+        // An unarmed provisional window cannot cross reader observation.
+        let (ledger, journal, _, window) = eval_fixture();
+        ledger
+            .state
+            .lock()
+            .unwrap()
+            .eval_window
+            .as_mut()
+            .unwrap()
+            .armed = false;
+        let publication = ledger
+            .observe_event_for_publication(&lifecycle_event("Page.frameNavigated", "page"))
+            .unwrap();
+        assert!(ledger.arm_eval_window(&window).is_err());
+        assert!(!journal.snapshot().mutation_dispatched);
+        publication.complete();
+        assert!(ledger.arm_eval_window(&window).is_err());
+
+        for submitted_child in [false, true] {
+            let (ledger, journal, root, window) = eval_fixture();
+            let root_command =
+                eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+                    .await
+                    .submit()
+                    .unwrap();
+            let (_, child_journal, permit) = eval_child(&ledger, &root, &window);
+            let child =
+                eval_reservation(&ledger, &child_journal, EvalCommandGrant::Child(permit)).await;
+            let (reserved, submitted) = if submitted_child {
+                (None, Some(child.submit().unwrap()))
+            } else {
+                (Some(child), None)
+            };
+            let _other = ledger
+                .operation(
+                    OperationKey {
+                        generation: 7,
+                        operation_seq: 3,
+                    },
+                    "other-target".into(),
+                    "other-page".into(),
+                )
+                .unwrap();
+            let publication = ledger
+                .observe_event_for_publication(&lifecycle_event(
+                    "Runtime.executionContextsCleared",
+                    "other-page",
+                ))
+                .unwrap();
+            if let Some(reserved) = reserved {
+                assert!(matches!(
+                    reserved.submit(),
+                    Err(ProtocolError::ScopeUnavailable)
+                ));
+            }
+            assert_eq!(
+                ledger.snapshot().input_debt,
+                if submitted_child { 2 } else { 1 }
+            );
+            assert_eq!(
+                child_journal.snapshot().mutation_dispatched,
+                submitted_child
+            );
+            // The new admission fence does not replace an already submitted result.
+            let status = ledger.state.lock().unwrap().commands[&root_command.id]
+                .status
+                .clone();
+            root_command.settle(&response(json!({"result":{"type":"number","value":17}})));
+            assert_eq!(status.snapshot(), CommandStatus::Acknowledged);
+            assert_eq!(ledger.snapshot().input_debt, u32::from(submitted_child));
+            publication.complete();
+            if let Some(submitted) = submitted {
+                submitted.settle(&response(json!({"result":{"type":"undefined"}})));
+            }
+            assert_eq!(ledger.snapshot().input_debt, 0);
+            assert!(
+                ledger
+                    .state
+                    .lock()
+                    .unwrap()
+                    .eval_window
+                    .as_ref()
+                    .unwrap()
+                    .revoked
+            );
+        }
+    }
+    #[tokio::test]
+    async fn eval_owned_event_fences_new_capture_after_old_slot_settles_before_publish() {
+        let (ledger, journal, _, window) = eval_fixture();
+        let root = eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+            .await
+            .submit()
+            .unwrap();
+        let _other = ledger
+            .operation(
+                OperationKey {
+                    generation: 7,
+                    operation_seq: 3,
+                },
+                "other-target".into(),
+                "other-page".into(),
+            )
+            .unwrap();
+        let publication = ledger
+            .observe_event_for_publication(&lifecycle_event(
+                "Runtime.executionContextsCleared",
+                "other-page",
+            ))
+            .unwrap();
+        root.settle(&response(json!({"result":{"type":"undefined"}})));
+        ledger.eval_operation_terminal(window.root(), true, true);
+        assert!(ledger.state.lock().unwrap().eval_window.is_none());
+        assert!(
+            ledger.capture_eval_revision("page", "target").is_err(),
+            "old slot cannot hide another owned event before publication"
+        );
+        publication.complete();
+        assert!(ledger.capture_eval_revision("page", "target").unwrap() > 0);
+    }
+    #[test]
+    fn eval_incomplete_or_overlapping_publication_never_reopens_authority() {
+        for overlap in [false, true] {
+            let (ledger, _) = owner();
+            let first = ledger
+                .observe_event_for_publication(&lifecycle_event("Page.frameNavigated", "page"))
+                .unwrap();
+            if overlap {
+                let second = ledger
+                    .observe_event_for_publication(&lifecycle_event("Page.frameDetached", "page"))
+                    .unwrap();
+                first.complete();
+                second.complete();
+                assert!(ledger.snapshot().integrity_lost);
+            } else {
+                drop(first);
+            }
+            assert!(ledger.capture_eval_revision("page", "target").is_err());
+            // Even a later normal publication cannot repair a dropped/overlapping one.
+            let later = ledger
+                .observe_event_for_publication(&lifecycle_event("Page.frameNavigated", "page"))
+                .unwrap();
+            later.complete();
+            assert!(ledger.capture_eval_revision("page", "target").is_err());
+        }
+    }
+    #[test]
+    fn eval_created_foreign_observer_and_recording_events_do_not_revoke() {
+        let (ledger, _) = owner();
+        {
+            let mut state = ledger.state.lock().unwrap();
+            for (session, purpose) in [
+                ("observer", LifecycleSessionPurpose::Observer),
+                ("recorder", LifecycleSessionPurpose::Recording),
+            ] {
+                state
+                    .targets
+                    .insert(session.into(), format!("{session}-target"));
+                state.lifecycle_sessions.insert(session.into(), purpose);
+            }
+            state.recording_targets.insert("recorder-target".into());
+        }
+        let before = ledger.capture_eval_revision("page", "target").unwrap();
+        let mut events = vec![lifecycle_event("Runtime.executionContextCreated", "page")];
+        for session in ["foreign", "observer", "recorder"] {
+            for method in [
+                "Target.detachedFromTarget",
+                "Target.targetDestroyed",
+                "Page.frameNavigated",
+                "Page.frameDetached",
+                "Runtime.executionContextDestroyed",
+                "Runtime.executionContextsCleared",
+            ] {
+                let mut event = lifecycle_event(method, session);
+                event.params["targetId"] = json!(format!("{session}-target"));
+                events.push(event);
+            }
+        }
+        // Run destructive cases last so each excluded session has its real map proof.
+        events.sort_by_key(|event| {
+            matches!(
+                event.method.as_str(),
+                "Target.detachedFromTarget" | "Target.targetDestroyed"
+            )
+        });
+        for event in events {
+            assert!(
+                ledger.observe_event_for_publication(&event).is_none(),
+                "{}",
+                event.method
+            );
+            assert_eq!(ledger.capture_eval_revision("page", "target"), Ok(before));
+        }
+    }
+
+    #[tokio::test]
+    async fn eval_permit_final_submit_rejects_pre_admitted_unrelated_input() {
+        let (ledger, journal) = owner();
+        let unrelated = ledger
+            .reserve_command(
+                Some(&journal),
+                "Input.dispatchMouseEvent",
+                Some(&json!({"type":"mousePressed"})),
+                Some("page"),
+            )
+            .unwrap();
+        let (_send, mut op) = admission_operation(5000);
+        op.sequence = 1;
+        journal.bind_operation(&op).unwrap();
+        let window = ledger
+            .begin_eval_window(
+                &journal,
+                &op,
+                EvalAuthorityStamp {
+                    revision: 0,
+                    target: "target".into(),
+                    session: "page".into(),
+                    frame: "frame".into(),
+                    loader: "loader".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            unrelated.submit(),
+            Err(ProtocolError::ScopeUnavailable)
+        ));
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(!journal.snapshot().mutation_dispatched);
+        ledger.abandon_eval_preparation(&window);
+        assert!(ledger.state.lock().unwrap().eval_window.is_none());
+    }
+    #[tokio::test]
+    async fn eval_permit_revoke_before_consume_has_no_child_mutation() {
+        let (ledger, journal, root, window) = eval_fixture();
+        let _root = eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+            .await
+            .submit()
+            .unwrap();
+        let (_child, child_journal, permit) = eval_child(&ledger, &root, &window);
+        let reserved =
+            eval_reservation(&ledger, &child_journal, EvalCommandGrant::Child(permit)).await;
+        window.revoke();
+        assert!(matches!(
+            reserved.submit(),
+            Err(ProtocolError::ScopeUnavailable)
+        ));
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        assert!(!child_journal.snapshot().mutation_dispatched);
+    }
+    #[tokio::test]
+    async fn eval_permit_consume_before_revoke_keeps_both_debts_and_late_ack_never_reopens() {
+        let (ledger, journal, root, window) = eval_fixture();
+        let root_command =
+            eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+                .await
+                .submit()
+                .unwrap();
+        let (child, child_journal, permit) = eval_child(&ledger, &root, &window);
+        let child_command =
+            eval_reservation(&ledger, &child_journal, EvalCommandGrant::Child(permit))
+                .await
+                .submit()
+                .unwrap();
+        assert_eq!(ledger.snapshot().input_debt, 2);
+        assert!(
+            journal.snapshot().mutation_dispatched && child_journal.snapshot().mutation_dispatched
+        );
+        window.revoke();
+        child_command.settle(&response(json!({"result":{"type":"undefined"}})));
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        assert!(ledger.issue_eval_child(&window, &child).is_err());
+        root_command.settle(&response(json!({"result":{"type":"undefined"}})));
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(
+            ledger.state.lock().unwrap().eval_window.is_some(),
+            "ACK is not producer/result settlement"
+        );
+        ledger.eval_operation_terminal(window.root(), true, true);
+        assert!(
+            ledger.state.lock().unwrap().eval_window.is_some(),
+            "child producer still owns its result"
+        );
+        ledger.eval_operation_terminal(child_journal.key(), true, false);
+        assert!(
+            ledger.state.lock().unwrap().eval_window.is_some(),
+            "unfixed result is retained"
+        );
+        ledger.eval_operation_terminal(child_journal.key(), false, true);
+        assert!(ledger.state.lock().unwrap().eval_window.is_none());
+        assert!(ledger.issue_eval_child(&window, &child).is_err());
+    }
+    #[tokio::test]
+    async fn eval_permit_root_terminal_and_authority_change_each_reject_reserved_child() {
+        for mode in ["root", "authority", "eof"] {
+            let (ledger, journal, root, window) = eval_fixture();
+            let root_command =
+                eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+                    .await
+                    .submit()
+                    .unwrap();
+            let (_child, child_journal, permit) = eval_child(&ledger, &root, &window);
+            let reserved =
+                eval_reservation(&ledger, &child_journal, EvalCommandGrant::Child(permit)).await;
+            match mode {
+                "root" => root_command.settle(&response(json!({"result":{"type":"undefined"}}))),
+                "authority" => ledger.invalidate_eval_authority(),
+                _ => ledger.observe_remote_eof(),
+            }
+            assert!(
+                matches!(reserved.submit(), Err(ProtocolError::ScopeUnavailable)),
+                "{mode}"
+            );
+            assert!(!child_journal.snapshot().mutation_dispatched);
+        }
+    }
+    #[tokio::test]
+    async fn eval_permit_is_one_child_and_exact_owner_not_just_equal_numeric_keys() {
+        let (ledger, journal, root, window) = eval_fixture();
+        let _root = eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+            .await
+            .submit()
+            .unwrap();
+        let (child, _child_journal, _permit) = eval_child(&ledger, &root, &window);
+        assert!(ledger.issue_eval_child(&window, &child).is_err());
+        let (other, _, other_op, other_window) = eval_fixture();
+        assert!(matches!(
+            other.bind_eval_root(&window, &other_op),
+            Err(ProtocolError::StaleScope)
+        ));
+        other.revoke_eval_window(&window);
+        assert!(
+            !other
+                .state
+                .lock()
+                .unwrap()
+                .eval_window
+                .as_ref()
+                .unwrap()
+                .revoked
+        );
+        assert!(matches!(
+            ledger.arm_eval_window(&other_window),
+            Err(ProtocolError::StaleScope)
+        ));
+    }
+    #[test]
+    fn eval_admission_preserves_token_first_cause_before_clock_expiry() {
+        for signal in [
+            CancelSignal::Requested,
+            CancelSignal::DeadlineExceeded,
+            CancelSignal::SessionClosed,
+        ] {
+            let (send, mut op) = admission_operation(5000);
+            op.deadline = Instant::now();
+            send.send_replace(signal);
+            assert_eq!(
+                EvalAdmission::capture(&op).check(),
+                Err(signal.error().unwrap())
+            );
+        }
+        let (_send, mut op) = admission_operation(5000);
+        op.deadline = Instant::now();
+        assert_eq!(
+            EvalAdmission::capture(&op).check(),
+            Err(ProtocolError::DeadlineExceeded)
+        );
+    }
+    #[tokio::test]
+    async fn eval_reservation_failure_before_commit_does_not_leave_a_half_reservation() {
+        let (ledger, journal, _, window) = eval_fixture();
+        ledger.state.lock().unwrap().next_group = u64::MAX;
+        let error = native_object_group(
+            "native-eval-test",
+            eval_command_scope(EvalCommandGrant::Root(window.clone()), async {
+                ledger.reserve_command(Some(&journal), "Runtime.evaluate", Some(&json!({
+                "expression":"1", "awaitPromise":true,"returnByValue":true,"userGesture":true
+            })), Some("page"))
+            }),
+        )
+        .await;
+        assert!(matches!(error, Err(ProtocolError::IdentifierExhausted)));
+        let state = ledger.state.lock().unwrap();
+        assert!(state
+            .eval_window
+            .as_ref()
+            .unwrap()
+            .root_reservation
+            .is_none());
+        assert!(state.groups.is_empty() && state.commands.is_empty());
+        drop(state);
+        assert!(!journal.snapshot().mutation_dispatched);
+        ledger.eval_operation_terminal(window.root(), true, false);
+        assert!(ledger.state.lock().unwrap().eval_window.is_some());
+        ledger.eval_operation_terminal(window.root(), false, true);
+        assert!(ledger.state.lock().unwrap().eval_window.is_none());
+    }
+    #[tokio::test]
+    async fn eval_native_identity_and_owner_retirement_revoke_before_reserved_child_submit() {
+        for mode in ["detach", "reattach", "owner", "loader", "realm"] {
+            let (ledger, journal, root, window) = eval_fixture();
+            let targets =
+                super::super::client_targets::ClientTargets::new("context".into(), "scope".into());
+            targets.bind_eval_owner(&ledger, 7).unwrap();
+            let _root = eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+                .await
+                .submit()
+                .unwrap();
+            let (_, child_journal, permit) = eval_child(&ledger, &root, &window);
+            let child =
+                eval_reservation(&ledger, &child_journal, EvalCommandGrant::Child(permit)).await;
+            match mode {
+                "detach" => targets.detach("target").unwrap(),
+                "reattach" => {
+                    let _ =
+                        targets.attached("context", "target".into(), "page".into(), "page".into());
+                }
+                "owner" => targets.seal_for_owner_retirement(
+                    &super::super::client_browser::OwnerRetirement::for_test(&targets),
+                ),
+                "loader" => ledger.observe_event(&CdpEvent {
+                    method: "Page.frameNavigated".into(),
+                    session_id: Some("page".into()),
+                    params: json!({"frame":{"id":"frame","loaderId":"replacement"}}),
+                }),
+                _ => ledger.observe_event(&CdpEvent {
+                    method: "Runtime.executionContextsCleared".into(),
+                    session_id: Some("page".into()),
+                    params: json!({}),
+                }),
+            }
+            assert!(
+                matches!(child.submit(), Err(ProtocolError::ScopeUnavailable)),
+                "{mode}"
+            );
+            assert!(!child_journal.snapshot().mutation_dispatched);
+            assert_eq!(ledger.snapshot().input_debt, 1);
+        }
+    }
+    #[tokio::test]
+    async fn eval_failure_receipt_is_not_cleared_by_full_late_ack_and_producer_settlement() {
+        let (ledger, journal, _, window) = eval_fixture();
+        let root = eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+            .await
+            .submit()
+            .unwrap();
+        ledger.fail_eval_authority();
+        root.settle(&response(json!({"result":{"type":"undefined"}})));
+        ledger.eval_operation_terminal(window.root(), true, true);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(ledger.state.lock().unwrap().eval_window.is_some());
+        let unrelated = ledger
+            .reserve_command(
+                Some(&journal),
+                "Input.dispatchMouseEvent",
+                Some(&json!({"type":"mousePressed"})),
+                Some("page"),
+            )
+            .unwrap();
+        assert!(matches!(
+            unrelated.submit(),
+            Err(ProtocolError::ScopeUnavailable)
+        ));
     }
     fn response(result: Value) -> CdpMessage {
         serde_json::from_value(json!({"id":1,"sessionId":"page","result":result})).unwrap()

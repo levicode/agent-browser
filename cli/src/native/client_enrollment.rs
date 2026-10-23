@@ -11,6 +11,7 @@ use super::client_network::{ApplicationSession, ClientNetwork};
 use super::client_page::ClientPageState;
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
+use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -223,6 +224,7 @@ struct Attribution {
 }
 #[derive(Clone, Debug)]
 struct FrameOwner {
+    loader: Option<String>,
     name: Option<String>,
     session: String,
     parent: Option<String>,
@@ -699,6 +701,7 @@ struct CaptureSnapshot {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CaptureTestPoint {
+    RestartWaiting,
     AfterInitialDrain,
     BeforeInfo,
     AfterInfoAck,
@@ -1183,6 +1186,7 @@ impl ClientEnrollment {
     }
     fn poison(&self, error: ProtocolError) {
         if let Ok(mut index) = self.index.lock() {
+            self.revoke_eval_authority();
             index.failure.get_or_insert(error);
             for entry in index.sessions.values() {
                 let _ = self.page.network_incomplete(&entry.root);
@@ -1294,11 +1298,103 @@ impl ClientEnrollment {
         index.applied_watermark = sequence;
         Ok(())
     }
+    /// Always index -> ledger, never called by ledger.submit.
+    fn revoke_eval_authority(&self) {
+        if let Some(ledger) = self.client.debt_ledger() {
+            ledger.invalidate_eval_authority();
+        }
+    }
+    pub(crate) fn capture_eval_authority(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<super::client_debt::EvalAuthorityStamp, ProtocolError> {
+        self.check_restart_operation(op)?;
+        if op.is_callback
+            || !Arc::ptr_eq(&page.client, &self.client)
+            || !Arc::ptr_eq(&page.targets, &self.targets)
+            || page.identity_scope != self.targets.identity_scope
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        page.permit.check()?;
+        let ledger = self
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        self.targets.require_eval_owner(&ledger)?;
+        let watermark = self.realm_watermark()?;
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        // Observe the ledger before reading the index/watermark: the reader
+        // fences observation before publishing received, with no lock spanning it.
+        let revision = ledger.capture_eval_revision(&page.page_session_id, &page.target_id)?;
+        self.realm_snapshot_healthy(&index, &watermark)?;
+        if !index.pending_enrollment.is_empty()
+            || index
+                .sessions
+                .values()
+                .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
+            || !restart_retirements_settled(
+                &index,
+                watermark
+                    .received()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?,
+            )
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let entry = index
+            .sessions
+            .get(&page.page_session_id)
+            .ok_or(ProtocolError::StaleScope)?;
+        if !entry.application
+            || entry.observation_only
+            || !entry.resumed
+            || entry.target != page.target_id
+            || entry.kind != "page"
+            || entry.root != entry.session
+            || *self
+                .active_root
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                != entry.session
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut frames = index
+            .frames
+            .iter()
+            .filter(|(_, frame)| frame.session == entry.session && frame.parent.is_none());
+        let (frame, owner) = frames.next().ok_or(ProtocolError::InvalidFrame)?;
+        if frames.next().is_some() {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        let loader = owner.loader.clone().ok_or(ProtocolError::InvalidFrame)?;
+        let attachment = self.targets.owned_target(&page.target_id)?;
+        if attachment.session_id != page.page_session_id
+            || !attachment.capture_ready()
+            || ledger.capture_eval_revision(&page.page_session_id, &page.target_id)? != revision
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.realm_snapshot_healthy(&index, &watermark)?;
+        Ok(super::client_debt::EvalAuthorityStamp {
+            revision,
+            target: entry.target.clone(),
+            session: entry.session.clone(),
+            frame: frame.clone(),
+            loader,
+        })
+    }
     fn bump_application_epoch(&self) -> Result<(), ProtocolError> {
         let mut index = self
             .index
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.revoke_eval_authority();
         index.application_epoch = index
             .application_epoch
             .checked_add(1)
@@ -1989,6 +2085,111 @@ impl ClientEnrollment {
             .await?;
         }
     }
+    /// Restart publication joins all observed configuration work, not only the
+    /// selected page. No index/routes/registry guard survives an await.
+    pub(crate) async fn publish_restart_ready<T>(
+        &self,
+        replacement: &OwnedTarget,
+        op: &OperationLease,
+        publish: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        let watermark = self.realm_watermark()?;
+        let mut publish = Some(publish);
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let targets_changed = self.targets.changed();
+            tokio::pin!(targets_changed);
+            targets_changed.as_mut().enable();
+            self.check_restart_operation(op)?;
+            let result = {
+                let index = self
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if let Some(error) = &index.failure {
+                    return Err(error.clone());
+                }
+                if self.sealed.load(Ordering::Acquire) || !index.reconciled {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                let entry = index
+                    .sessions
+                    .get(&replacement.session_id)
+                    .ok_or(ProtocolError::StaleReference)?;
+                if entry.target != replacement.target_id
+                    || entry.kind != "page"
+                    || entry.root != entry.session
+                    || !entry.application
+                    || !entry.resumed
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                // Unknown incompleteness is not permission to wait indefinitely.
+                if index.sessions.values().any(|entry| {
+                    (entry.application || entry.observation_only)
+                        && !entry.resumed
+                        && !index.pending_enrollment.contains(&entry.session)
+                }) {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                watermark
+                    .with_received(|received| {
+                        if index.applied_watermark > received {
+                            return Err(ProtocolError::StaleScope);
+                        }
+                        self.targets.publish_restart_ready(
+                            replacement,
+                            &index.pending_enrollment,
+                            |target| {
+                                index.sessions.get(&target.session_id).is_some_and(|entry| {
+                                    entry.target == target.target_id && entry.kind == target.kind
+                                })
+                            },
+                            index.applied_watermark == received
+                                && index.pending_enrollment.is_empty(),
+                            || {
+                                if *op.cancellation.borrow() != CancelSignal::None {
+                                    return Err(ProtocolError::Cancelled);
+                                }
+                                if Instant::now() >= op.deadline {
+                                    return Err(ProtocolError::DeadlineExceeded);
+                                }
+                                // index -> reader routes -> targets, through result
+                                // publication. No newly admitted event can fall in
+                                // the gap between this watermark and this inventory.
+                                publish.take().ok_or(ProtocolError::StaleScope)?()
+                            },
+                        )
+                    })
+                    .map_err(|_| ProtocolError::ScopeUnavailable)??
+            };
+            if let Some(result) = result {
+                return Ok(result);
+            }
+            #[cfg(test)]
+            if let Some(waiting) = self
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .remove(&CaptureTestPoint::RestartWaiting)
+            {
+                waiting.entered.add_permits(1);
+            }
+            let waited = bounded(op, async {
+                tokio::select! { _ = changed => {}, _ = targets_changed => {} }
+                Ok(())
+            })
+            .await;
+            if let Err(error) = waited {
+                // poison() also cancels the coordinator's stop channel. Keep
+                // the stored cause instead of returning secondary cancellation.
+                self.check()?;
+                return Err(error);
+            }
+        }
+    }
     /// Explicit exact-page retirement, never permission to close a worker or
     /// adopted host page. Mark before Target.closeTarget dispatch.
     pub(crate) fn expect_restart_page_retirement(
@@ -2000,6 +2201,14 @@ impl ClientEnrollment {
         self.check_restart_operation(op)?;
         if !matches!(self.ownership, ScopeOwnership::IsolatedContext) {
             return Err(ProtocolError::UnsupportedCapability);
+        }
+        if super::client_settlement_trace::inventory_enabled() {
+            super::client_settlement_trace::inventory_snapshot(
+                op.generation,
+                op.sequence,
+                super::client_settlement_trace::InventoryPoint::RestartBegin,
+                self.targets.try_inventory_diagnostic(),
+            );
         }
         let mut index = self
             .index
@@ -2029,6 +2238,15 @@ impl ClientEnrollment {
             return Err(ProtocolError::StaleReference);
         }
         index.retiring_pages.insert(target.into(), session.into());
+        if super::client_settlement_trace::inventory_enabled() {
+            drop(index);
+            self.targets.diagnostic_step(
+                target,
+                (op.generation, op.sequence),
+                super::client_settlement_trace::DiagnosticTargetStage::RestartRetiring,
+                None,
+            );
+        }
         Ok(())
     }
     pub(crate) async fn wait_restart_page_detached(
@@ -2497,6 +2715,7 @@ impl ClientEnrollment {
         if entry.root != session || entry.kind != "page" {
             return Err(ProtocolError::InvalidArguments);
         }
+        self.revoke_eval_authority();
         *self
             .active_root
             .lock()
@@ -2521,11 +2740,44 @@ impl ClientEnrollment {
         let entry = self
             .register(&self.targets.context_id, target, session, kind, None)?
             .ok_or(ProtocolError::InvalidArguments)?;
+        self.diagnostic_registration(
+            &entry,
+            super::client_settlement_trace::DiagnosticTargetOrigin::InitialDiscovery,
+            op.sequence,
+        );
         let result = self.initialize(entry, op).await;
         if let Err(error) = &result {
             self.poison(error.clone());
         }
         result
+    }
+    fn diagnostic_registration(
+        &self,
+        entry: &Attribution,
+        origin: super::client_settlement_trace::DiagnosticTargetOrigin,
+        sequence: u64,
+    ) {
+        if !super::client_settlement_trace::inventory_enabled() {
+            return;
+        }
+        let Ok(index) = self.index.try_lock() else {
+            super::client_settlement_trace::target_observation_lost(self.generation, sequence);
+            return;
+        };
+        let parent = entry
+            .parent
+            .as_ref()
+            .and_then(|id| index.sessions.get(id))
+            .map(|e| e.target.clone());
+        let root = index.sessions.get(&entry.root).map(|e| e.target.clone());
+        drop(index);
+        self.targets.diagnostic_register(
+            &entry.target,
+            parent.as_deref(),
+            root.as_deref(),
+            origin,
+            (self.generation, sequence),
+        );
     }
     fn register(
         &self,
@@ -2596,6 +2848,7 @@ impl ClientEnrollment {
             observer_paused: false,
             resumed: false,
         };
+        self.revoke_eval_authority();
         index.sessions.insert(session.into(), entry.clone());
         #[cfg(test)]
         self.trace_capture_registry(CaptureLifecycleStep::Registered, &entry, &index);
@@ -2610,6 +2863,7 @@ impl ClientEnrollment {
             index.frames.insert(
                 target.into(),
                 FrameOwner {
+                    loader: None,
                     name: None,
                     session: session.into(),
                     parent: parent_frame,
@@ -2624,10 +2878,24 @@ impl ClientEnrollment {
         entry: Attribution,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
-        let result = self.initialize_inner(entry.clone(), op).await;
+        self.initialize_observed(entry, op, None).await
+    }
+    async fn initialize_observed(
+        &self,
+        entry: Attribution,
+        op: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
+    ) -> Result<(), ProtocolError> {
+        let result = self.initialize_inner(entry.clone(), op, admission).await;
         let Err(error) = result else {
             return Ok(());
         };
+        self.targets.diagnostic_step(
+            &entry.target,
+            (op.generation, op.sequence),
+            super::client_settlement_trace::DiagnosticTargetStage::ConfigureFailed,
+            Some(error.clone()),
+        );
         if !matches!(
             error,
             ProtocolError::BrowserFailure | ProtocolError::StaleReference
@@ -2676,13 +2944,30 @@ impl ClientEnrollment {
         &self,
         mut entry: Attribution,
         op: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
     ) -> Result<(), ProtocolError> {
-        let purpose = bounded(op, self.targets.purpose(&entry.target)).await?;
+        self.targets.diagnostic_step(
+            &entry.target,
+            (op.generation, op.sequence),
+            super::client_settlement_trace::DiagnosticTargetStage::ConfigureStarted,
+            None,
+        );
+        let purpose = ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::Purpose,
+            bounded(op, self.targets.purpose(&entry.target)),
+        )
+        .await?;
         if purpose == TargetPurpose::StateBootstrap {
             return Ok(());
         }
         let lease = self.lease(&entry)?;
-        let _config = bounded(op, async { Ok(self.config_gate.lock().await) }).await?;
+        let _config = ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::ConfigGate,
+            bounded(op, async { Ok(self.config_gate.lock().await) }),
+        )
+        .await?;
         self.check()?;
         if self.config.block_service_workers {
             self.page.ensure_service_worker_policy(&lease, op)?;
@@ -2697,6 +2982,7 @@ impl ClientEnrollment {
                 .sessions
                 .get_mut(&entry.session)
                 .ok_or(ProtocolError::StaleReference)?;
+            self.revoke_eval_authority();
             current.application = true;
             index.application_epoch = index
                 .application_epoch
@@ -2713,13 +2999,14 @@ impl ClientEnrollment {
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             == entry.root;
         self.network
-            .configure_session(
+            .configure_session_observed(
                 ApplicationSession {
                     session_id: entry.session.clone(),
                     root_page_session: entry.root.clone(),
                     active_page: active,
                 },
                 op,
+                admission,
             )
             .await?;
         let page_target = matches!(entry.kind.as_str(), "page" | "iframe");
@@ -2751,8 +3038,12 @@ impl ClientEnrollment {
         // new windows; creating the world inside that first registration can
         // re-enter new-document injection and execute only script zero twice.
         // Runtime events are already subscribed, and the target stays paused.
-        self.command(op, Some(&entry.session), "Runtime.enable", json!({}))
-            .await?;
+        ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::RuntimeEnable,
+            self.command(op, Some(&entry.session), "Runtime.enable", json!({})),
+        )
+        .await?;
         if page_target {
             let revision = self
                 .page
@@ -2763,25 +3054,44 @@ impl ClientEnrollment {
             }
         }
         // Autoattach is recursive. Install it while this target is paused.
-        self.command(
-            op,
-            Some(&entry.session),
-            "Target.setAutoAttach",
-            autoattach(true),
+        ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::RecursiveAutoattach,
+            self.command(
+                op,
+                Some(&entry.session),
+                "Target.setAutoAttach",
+                autoattach(true),
+            ),
         )
         .await?;
-        self.targets.configured(&entry.target)?;
-        let permit = bounded(op, self.targets.resume_permit(&entry.target)).await?;
-        self.command(
-            op,
-            Some(&entry.session),
-            "Runtime.runIfWaitingForDebugger",
-            json!({}),
+        ServiceWorkerAdmission::observe_sync(admission, WorkerAdmissionStep::Configured, || {
+            self.targets.configured(&entry.target)
+        })?;
+        let permit = ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::ResumePermit,
+            bounded(op, self.targets.resume_permit(&entry.target)),
+        )
+        .await?;
+        ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::ResumeDebugger,
+            self.command(
+                op,
+                Some(&entry.session),
+                "Runtime.runIfWaitingForDebugger",
+                json!({}),
+            ),
         )
         .await?;
         lease.permit.check()?;
         permit.complete()?;
-        self.network.configuration_committed(&entry.session, op)?;
+        ServiceWorkerAdmission::observe_sync(
+            admission,
+            WorkerAdmissionStep::ConfigurationCommitted,
+            || self.network.configuration_committed(&entry.session, op),
+        )?;
         if let Some(current) = self
             .index
             .lock()
@@ -3906,9 +4216,25 @@ impl ClientEnrollment {
         // Stored scope failure takes precedence over retirement cancellation.
         // Foreign cleanup above must remain live even for a poisoned scope.
         self.check().map_err(|error| self.admission_error(error))?;
-        let auxiliary = bounded(
-            &self.operation(),
-            self.targets.classify_auxiliary_attachment(target, &session),
+        // Only this authorized service-worker attachment receives a diagnostic ordinal.
+        let admission = if kind == "service_worker" {
+            ServiceWorkerAdmission::start(
+                self.generation,
+                event
+                    .params
+                    .get("waitingForDebugger")
+                    .and_then(Value::as_bool),
+            )
+        } else {
+            None
+        };
+        let auxiliary = ServiceWorkerAdmission::observe(
+            admission.as_ref(),
+            WorkerAdmissionStep::AuxiliaryClassification,
+            bounded(
+                &self.operation(),
+                self.targets.classify_auxiliary_attachment(target, &session),
+            ),
         )
         .await?;
         match auxiliary {
@@ -3917,8 +4243,20 @@ impl ClientEnrollment {
         }
         #[cfg(test)]
         self.trace_capture_admission(CaptureLifecycleStep::RegisteringAttached, target, &session);
-        match self.register(context, target, &session, kind, event.session_id.as_deref())? {
-            Some(entry) => self.initialize(entry, &self.operation()).await,
+        match ServiceWorkerAdmission::observe_sync(
+            admission.as_ref(),
+            WorkerAdmissionStep::Register,
+            || self.register(context, target, &session, kind, event.session_id.as_deref()),
+        )? {
+            Some(entry) => {
+                self.diagnostic_registration(
+                    &entry,
+                    super::client_settlement_trace::DiagnosticTargetOrigin::AutoAttach,
+                    0,
+                );
+                self.initialize_observed(entry, &self.operation(), admission.as_ref())
+                    .await
+            }
             None => {
                 let same = self
                     .index
@@ -3984,6 +4322,7 @@ impl ClientEnrollment {
         if let Some(debt) = self.client.debt_ledger() {
             debt.bind_observer_session(&self.targets.context_id, target, session)?;
         }
+        self.revoke_eval_authority();
         index.sessions.insert(session.into(), entry.clone());
         #[cfg(test)]
         self.trace_capture_registry(CaptureLifecycleStep::Registered, &entry, &index);
@@ -4214,18 +4553,30 @@ impl ClientEnrollment {
                     .is_some_and(|owner| owner.kind == "iframe")
         });
         if !is_child_session {
+            let loader = frame
+                .get("loaderId")
+                .and_then(Value::as_str)
+                .filter(|loader| loader.len() <= 4096)
+                .map(str::to_owned);
+            let parent = frame
+                .get("parentId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if index.frames.get(id).is_none_or(|known| {
+                known.session != entry.session || known.loader != loader || known.parent != parent
+            }) {
+                self.revoke_eval_authority();
+            }
             index.frames.insert(
                 id.into(),
                 FrameOwner {
+                    loader,
                     name: frame
                         .get("name")
                         .and_then(Value::as_str)
                         .map(super::client_app_events::diagnostic_frame_name),
                     session: entry.session.clone(),
-                    parent: frame
-                        .get("parentId")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
+                    parent,
                 },
             );
         }
@@ -4309,6 +4660,7 @@ impl ClientEnrollment {
                     .iter()
                     .any(|entry| entry.application || entry.observation_only)
                 {
+                    self.revoke_eval_authority();
                     index.application_epoch = index
                         .application_epoch
                         .checked_add(1)
@@ -4348,7 +4700,10 @@ impl ClientEnrollment {
                 .cloned();
             if entry.is_some_and(|entry| entry.application) {
                 self.bump_application_epoch()?;
-                self.targets.invalidate_inventory()?;
+                self.targets.invalidate_inventory_for(
+                    super::client_settlement_trace::InventoryRevisionEvent::Info,
+                    target,
+                )?;
             }
             return Ok(());
         }
@@ -4447,7 +4802,10 @@ impl ClientEnrollment {
             }
             "Page.frameNavigated" => {
                 self.bump_application_epoch()?;
-                self.targets.invalidate_inventory()?;
+                self.targets.invalidate_inventory_for(
+                    super::client_settlement_trace::InventoryRevisionEvent::Navigate,
+                    &entry.target,
+                )?;
                 self.record_frame(
                     &entry,
                     event
@@ -4459,11 +4817,17 @@ impl ClientEnrollment {
             }
             "Page.navigatedWithinDocument" => {
                 self.bump_application_epoch()?;
-                self.targets.invalidate_inventory()?;
+                self.targets.invalidate_inventory_for(
+                    super::client_settlement_trace::InventoryRevisionEvent::SameDocument,
+                    &entry.target,
+                )?;
             }
             "Page.frameDetached" => {
                 self.bump_application_epoch()?;
-                self.targets.invalidate_inventory()?;
+                self.targets.invalidate_inventory_for(
+                    super::client_settlement_trace::InventoryRevisionEvent::FrameDetach,
+                    &entry.target,
+                )?;
                 let frame = field(&event.params, "frameId")?;
                 let mut index = self
                     .index
@@ -5187,6 +5551,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
     type Log = Arc<Mutex<Vec<Value>>>;
     type Notices = tokio::sync::mpsc::Receiver<ServerMessage>;
+    include!("client_restart_readiness_tests.rs");
     fn coordinator(
         client: Arc<CdpClient>,
         context: &str,
@@ -5550,6 +5915,128 @@ mod tests {
         let page = owner.lease(&entry).unwrap();
         (owner, page, notices, emit, server)
     }
+    #[tokio::test]
+    async fn eval_stamp_uses_native_loader_and_same_identity_refresh_does_not_revoke() {
+        let (owner, page, _notices, _emit, server) = realm_test_owner().await;
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(
+            1,
+            owner.targets.identity_scope.clone(),
+        );
+        owner.client.install_debt_ledger(ledger.clone()).unwrap();
+        owner.targets.bind_eval_owner(&ledger, 1).unwrap();
+        let mut op = owner.operation();
+        op.sequence = 1;
+        let _journal = ledger
+            .operation(
+                super::super::client_debt::OperationKey {
+                    generation: op.generation,
+                    operation_seq: op.sequence,
+                },
+                page.target_id.clone(),
+                page.page_session_id.clone(),
+            )
+            .unwrap();
+        let stamp = owner.capture_eval_authority(&page, &op).unwrap();
+        assert_eq!(stamp.loader, "synthetic-loader");
+        let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+        owner
+            .record_frame(
+                &entry,
+                &json!({"id":"frame-initial", "loaderId":"synthetic-loader"}),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            owner.capture_eval_authority(&page, &op).unwrap().revision,
+            stamp.revision
+        );
+        owner
+            .record_frame(
+                &entry,
+                &json!({"id":"frame-initial", "loaderId":"replacement-loader"}),
+                false,
+            )
+            .unwrap();
+        let next = owner.capture_eval_authority(&page, &op).unwrap();
+        assert_eq!(next.loader, "replacement-loader");
+        assert!(next.revision > stamp.revision);
+        owner
+            .record_frame(&entry, &json!({"id":"frame-initial"}), false)
+            .unwrap();
+        assert!(matches!(
+            owner.capture_eval_authority(&page, &op),
+            Err(ProtocolError::InvalidFrame)
+        ));
+        owner.targets.seal_admission();
+        assert!(owner.capture_eval_authority(&page, &op).is_err());
+        owner.client.close().await;
+        server.abort();
+    }
+    #[tokio::test]
+    async fn eval_capture_rejects_observed_unpublished_and_published_unapplied_events() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        let (owner, page, _notices, emit, server) = realm_test_owner().await;
+        let ledger = OwnerDebtLedger::new(1, owner.targets.identity_scope.clone());
+        owner.client.install_debt_ledger(ledger.clone()).unwrap();
+        owner.targets.bind_eval_owner(&ledger, 1).unwrap();
+        let mut op = owner.operation();
+        op.sequence = 1;
+        let _journal = ledger
+            .operation(
+                OperationKey {
+                    generation: op.generation,
+                    operation_seq: op.sequence,
+                },
+                page.target_id.clone(),
+                page.page_session_id.clone(),
+            )
+            .unwrap();
+        let stamp = owner.capture_eval_authority(&page, &op).unwrap();
+        let watermark = owner.realm_watermark().unwrap();
+        let received = watermark.received().unwrap();
+        let event = super::super::cdp::types::CdpEvent {
+            method: "Page.frameNavigated".into(),
+            session_id: Some("initial".into()),
+            params: json!({"frame":{"id":"frame-initial","loaderId":"next-loader","url":"about:blank"}}),
+        };
+        // Simulate the synchronous reader boundary before any bounded publication.
+        let publication = ledger.observe_event_for_publication(&event).unwrap();
+        assert_eq!(watermark.received(), Ok(received));
+        assert!(owner.capture_eval_authority(&page, &op).is_err());
+        publication.complete();
+        // Now use the real reader and existing deterministic enrollment gate.
+        let gate = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+        emit.send(
+            json!({"method":event.method,"sessionId":event.session_id,"params":event.params}),
+        )
+        .await
+        .unwrap();
+        gate.wait_entered().await;
+        let pending_application = owner.capture_eval_authority(&page, &op);
+        assert!(watermark.received().unwrap() > received);
+        gate.release();
+        owner
+            .drain_capture_watermark(&watermark, &op)
+            .await
+            .unwrap();
+        assert!(pending_application.is_err());
+        let next = owner.capture_eval_authority(&page, &op).unwrap();
+        assert_eq!(next.loader, "next-loader");
+        assert!(next.revision > stamp.revision);
+        *owner.event_watermark.lock().unwrap() = None;
+        assert!(
+            owner.capture_eval_authority(&page, &op).is_err(),
+            "no subscription is not application proof"
+        );
+        owner.client.close().await;
+        server.abort();
+    }
+
     fn realm_test_binding() -> super::super::element::ExactBinding {
         super::super::element::ExactBinding {
             page_session: "initial".into(),
@@ -11242,6 +11729,7 @@ mod tests {
         owner.index.lock().unwrap().frames.insert(
             "popup-frame".into(),
             FrameOwner {
+                loader: None,
                 name: None,
                 session: "popup".into(),
                 parent: None,
@@ -11265,6 +11753,7 @@ mod tests {
         owner.index.lock().unwrap().frames.insert(
             "child".into(),
             FrameOwner {
+                loader: None,
                 name: Some("checkout".into()),
                 session: "popup".into(),
                 parent: Some("popup-frame".into()),

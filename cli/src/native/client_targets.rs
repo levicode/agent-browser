@@ -2,6 +2,7 @@
 //! waits on this registry before configuration/resume; no URL or timing guess
 //! assigns a bootstrap target to a generic request handler.
 use super::client_protocol::ProtocolError;
+use super::client_settlement_trace as diagnostic;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -23,10 +24,25 @@ pub struct OwnedTarget {
     // Minted only by authoritative insertion. Retaining the Arc prevents an
     // identical target/session reattachment from reusing an earlier tenure.
     tenure: Arc<AttachmentTenure>,
+    diagnostic: Option<diagnostic::DiagnosticAttachment>,
 }
 #[derive(Debug)]
 struct AttachmentTenure;
 impl OwnedTarget {
+    fn diagnostic_snapshot(&self) -> Option<diagnostic::DiagnosticAttachment> {
+        let mut value = self.diagnostic?;
+        value.kind = diagnostic::DiagnosticTargetKind::from_native(&self.kind);
+        value.purpose = match self.purpose {
+            None => diagnostic::DiagnosticTargetPurpose::Unclassified,
+            Some(TargetPurpose::Application) => diagnostic::DiagnosticTargetPurpose::Application,
+            Some(TargetPurpose::StateBootstrap) => {
+                diagnostic::DiagnosticTargetPurpose::StateBootstrap
+            }
+        };
+        value.configured = self.configured;
+        value.resumed = self.resumed;
+        Some(value)
+    }
     pub(crate) fn same_attachment(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.tenure, &other.tenure)
             && self.target_id == other.target_id
@@ -47,6 +63,7 @@ impl OwnedTarget {
 #[derive(Default)]
 struct Registry {
     revision: u64,
+    revision_history: Option<RevisionHistory>,
     sealed: bool,
     integrity_lost: bool,
     owner_retirement_inventory: Option<bool>,
@@ -60,10 +77,198 @@ struct Registry {
     protected_read: bool,
     enrollment_ready: bool,
     targets: HashMap<String, OwnedTarget>,
+    diagnostic_identities: Option<HashMap<String, u64>>,
+    diagnostic_lost: bool,
     auxiliary_sequence: u64,
     auxiliary: HashMap<u64, AuxiliaryAttachment>,
 }
+// Opt-in scalar history belongs to this registry only. The empty identity token
+// detects cross-registry/reset samples; attachment tokens contain no native IDs.
+#[derive(Default)]
+struct RevisionHistory {
+    identity: Arc<RevisionHistoryIdentity>,
+    counts: [u64; 7],
+    overflow: bool,
+    last_revision: u64,
+    last: Option<(
+        diagnostic::InventoryRevisionEvent,
+        Option<Arc<AttachmentTenure>>,
+    )>,
+}
+#[derive(Default)]
+struct RevisionHistoryIdentity;
+#[derive(Clone)]
+pub(crate) struct RevisionSnapshot {
+    identity: Arc<RevisionHistoryIdentity>,
+    counts: [u64; 7],
+    overflow: bool,
+}
+// Product classification from the original atomic fence, independent of diagnostics.
+pub(crate) struct InventoryRevisionCheck {
+    pub result: Result<(), ProtocolError>,
+    pub revision_only: bool,
+    pub diagnostic: Option<diagnostic::FrameInventoryRejection>,
+}
 impl Registry {
+    fn note_revision_enabled(
+        &mut self,
+        event: diagnostic::InventoryRevisionEvent,
+        attachment: Option<Arc<AttachmentTenure>>,
+    ) {
+        let history = self
+            .revision_history
+            .get_or_insert_with(RevisionHistory::default);
+        let counter = &mut history.counts[event.index()];
+        match counter.checked_add(1) {
+            Some(next) => *counter = next,
+            None => history.overflow = true,
+        }
+        history.last_revision = self.revision;
+        history.last = Some((event, attachment));
+    }
+    fn revision_snapshot(&mut self) -> RevisionSnapshot {
+        let history = self
+            .revision_history
+            .get_or_insert_with(RevisionHistory::default);
+        RevisionSnapshot {
+            identity: history.identity.clone(),
+            counts: history.counts,
+            overflow: history.overflow,
+        }
+    }
+    fn revision_result(&self, expected: u64) -> Result<(), ProtocolError> {
+        if self.sealed || self.revision != expected || self.reservations != 0 {
+            Err(ProtocolError::StaleScope)
+        } else {
+            Ok(())
+        }
+    }
+    fn revision_rejection(
+        &self,
+        expected: u64,
+        before: Option<&RevisionSnapshot>,
+        selected: &OwnedTarget,
+        pass: diagnostic::FrameInventoryPass,
+    ) -> diagnostic::FrameInventoryRejection {
+        use diagnostic::{InventoryRevisionEvent as Event, InventoryRevisionTarget as Target};
+        let delta = self.revision.checked_sub(expected);
+        let history = self.revision_history.as_ref().filter(|history| {
+            before.is_some_and(|before| {
+                Arc::ptr_eq(&history.identity, &before.identity)
+                    && !before.overflow
+                    && !history.overflow
+            })
+        });
+        let counts = history.zip(before).and_then(|(history, before)| {
+            let mut counts = [0; 7];
+            for (index, count) in counts.iter_mut().enumerate() {
+                *count = history.counts[index].checked_sub(before.counts[index])?;
+            }
+            Some(counts)
+        });
+        let exact = delta.is_some_and(|delta| delta <= u16::MAX as u64)
+            && counts.is_some_and(|counts| {
+                counts[6] == 0
+                    && counts.iter().all(|count| *count <= u16::MAX as u64)
+                    && counts
+                        .iter()
+                        .try_fold(0u64, |sum, count| sum.checked_add(*count))
+                        == delta
+            });
+        let (last_event, last_target) = if delta == Some(0) && counts.is_some() {
+            (Event::None, Target::Unknown)
+        } else if delta.is_some_and(|delta| delta > 0) && counts.is_some() {
+            history
+                .filter(|history| history.last_revision == self.revision)
+                .and_then(|history| history.last.as_ref())
+                .map_or((Event::Unknown, Target::Unknown), |(event, attachment)| {
+                    (
+                        *event,
+                        attachment.as_ref().map_or(Target::Unknown, |attachment| {
+                            if Arc::ptr_eq(attachment, &selected.tenure) {
+                                Target::Same
+                            } else {
+                                Target::Other
+                            }
+                        }),
+                    )
+                })
+        } else {
+            (Event::Unknown, Target::Unknown)
+        };
+        diagnostic::FrameInventoryRejection {
+            pass,
+            sealed: self.sealed,
+            revision_mismatch: self.revision != expected,
+            reservations: self.reservations != 0,
+            delta: delta.map(|delta| delta.min(u16::MAX as u64) as u16),
+            events: counts.map(|counts| counts.map(|count| count.min(u16::MAX as u64) as u16)),
+            exact,
+            last_event,
+            last_target,
+        }
+    }
+    // Opt-in history is bounded and cannot return a product error or grant authority.
+    fn diagnostic_attachment(&mut self, target: &str) -> Option<diagnostic::DiagnosticAttachment> {
+        if !diagnostic::inventory_enabled() {
+            return None;
+        }
+        let identities = self.diagnostic_identities.get_or_insert_with(HashMap::new);
+        let target_ordinal = if let Some(ordinal) = identities.get(target) {
+            *ordinal
+        } else if identities.len() < 2048 && target.len() <= 1024 {
+            let ordinal = diagnostic::next_target_ordinal().unwrap_or(0);
+            if ordinal != 0 {
+                identities.insert(target.to_owned(), ordinal);
+            }
+            ordinal
+        } else {
+            0
+        };
+        let attachment = diagnostic::next_attachment_ordinal().unwrap_or(0);
+        self.diagnostic_lost |= target_ordinal == 0 || attachment == 0;
+        Some(diagnostic::DiagnosticAttachment {
+            attachment,
+            target: target_ordinal,
+            classification: if self.reservations == 0 {
+                diagnostic::DiagnosticTargetClassification::UnreservedApplication
+            } else {
+                diagnostic::DiagnosticTargetClassification::PendingReservation
+            },
+            ..Default::default()
+        })
+    }
+    fn diagnostic_inventory(&self) -> diagnostic::InventorySnapshot {
+        let mut inventory = diagnostic::DiagnosticTargetInventory {
+            observed: !self.diagnostic_lost
+                && self.targets.len() <= diagnostic::TARGET_SAMPLE_LIMIT,
+            count: self.targets.len(),
+            ..Default::default()
+        };
+        for (index, target) in self.targets.values().enumerate() {
+            if index >= diagnostic::TARGET_SAMPLE_LIMIT {
+                break;
+            }
+            inventory.attachments[index] = target.diagnostic_snapshot();
+            inventory.observed &=
+                inventory.attachments[index].is_some_and(|v| v.attachment > 0 && v.target > 0);
+        }
+        inventory
+            .attachments
+            .sort_by_key(|v| v.map_or(u64::MAX, |v| v.attachment));
+        diagnostic::InventorySnapshot {
+            observed: true,
+            sealed: self.sealed,
+            integrity_lost: self.integrity_lost,
+            reservations: self.reservations,
+            unconfigured: self
+                .targets
+                .values()
+                .filter(|t| t.purpose.is_none() || !t.configured)
+                .count(),
+            attachments: diagnostic::inventory_enabled().then_some(inventory),
+        }
+    }
     fn inventory_complete(&self) -> bool {
         self.reservations == 0
             && self
@@ -80,6 +285,7 @@ pub struct ClientTargets {
     pub context_id: String,
     pub identity_scope: String,
     state: Mutex<Registry>,
+    eval_owner: std::sync::OnceLock<std::sync::Weak<super::client_debt::OwnerDebtLedger>>,
     changed: Notify,
 }
 pub struct CreationReservation {
@@ -147,41 +353,57 @@ impl Drop for ProtectedTargetBarrier {
 }
 impl ResumePermit {
     pub fn complete(mut self) -> Result<(), ProtocolError> {
-        let mut state = self
-            .registry
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed {
-            return Err(ProtocolError::StaleScope);
+        let registry = self.registry.clone();
+        let observed = registry.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .registry
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.sealed {
+                return Err(ProtocolError::StaleScope);
+            }
+            let target = state
+                .targets
+                .get_mut(&self.target_id)
+                .ok_or(ProtocolError::StaleReference)?;
+            if target.session_id != self.session_id {
+                state.lose_integrity();
+                return Err(ProtocolError::StaleScope);
+            }
+            target.resumed = true;
+            if let Some(value) = &mut target.diagnostic {
+                value.stage = diagnostic::DiagnosticTargetStage::Resumed;
+            }
+            let observed = target.diagnostic_snapshot();
+            self.completed = true;
+            Ok(observed)
+        })?;
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(value.generation, 0, value, None);
         }
-        let target = state
-            .targets
-            .get_mut(&self.target_id)
-            .ok_or(ProtocolError::StaleReference)?;
-        if target.session_id != self.session_id {
-            state.lose_integrity();
-            return Err(ProtocolError::StaleScope);
-        }
-        target.resumed = true;
-        self.completed = true;
         Ok(())
     }
 }
 impl Drop for ResumePermit {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.registry.state.lock() {
-            if let Some(target) = state.targets.get_mut(&self.target_id) {
-                if target.session_id == self.session_id {
-                    target.resume_pending = false;
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.registry.state.lock() {
+                if let Some(target) = state.targets.get_mut(&self.target_id) {
+                    if target.session_id == self.session_id {
+                        target.resume_pending = false;
+                    }
+                }
+                state.resuming = state.resuming.saturating_sub(1);
+                if !self.completed {
+                    state.lose_integrity();
                 }
             }
-            state.resuming = state.resuming.saturating_sub(1);
-            if !self.completed {
-                state.lose_integrity();
-            }
-        }
-        self.registry.changed.notify_waiters();
+            self.registry.changed.notify_waiters();
+        })
     }
 }
 impl ClientTargets {
@@ -190,8 +412,54 @@ impl ClientTargets {
             context_id,
             identity_scope,
             state: Mutex::new(Registry::default()),
+            eval_owner: std::sync::OnceLock::new(),
             changed: Notify::new(),
         })
+    }
+    pub(crate) fn bind_eval_owner(
+        &self,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+        generation: u64,
+    ) -> Result<(), ProtocolError> {
+        if !ledger.matches_owner(generation, &self.identity_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if let Some(owner) = self.eval_owner.get() {
+            if owner
+                .upgrade()
+                .is_none_or(|owner| !Arc::ptr_eq(&owner, ledger))
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            return Ok(());
+        }
+        self.eval_owner
+            .set(Arc::downgrade(ledger))
+            .map_err(|_| ProtocolError::ScopeUnavailable)
+    }
+    pub(crate) fn require_eval_owner(
+        &self,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+    ) -> Result<(), ProtocolError> {
+        if self
+            .eval_owner
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+            .is_some_and(|owner| Arc::ptr_eq(&owner, ledger))
+        {
+            Ok(())
+        } else {
+            Err(ProtocolError::StaleScope)
+        }
+    }
+    /// Called before taking state: initialization already uses ledger -> targets.
+    fn eval_invalidation<T>(&self, mutation: impl FnOnce(&mut dyn FnMut()) -> T) -> T {
+        if let Some(owner) = self.eval_owner.get().and_then(std::sync::Weak::upgrade) {
+            owner.with_eval_target_invalidation(mutation)
+        } else {
+            // No eval grant can exist without the exact live owner binding.
+            mutation(&mut || {})
+        }
     }
     /// Lifecycle owner calls this only after bounded event routing and recursive
     /// target attachment barriers are installed and initial inventory reconciled.
@@ -517,7 +785,7 @@ impl ClientTargets {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            {
+            let disposition = self.eval_invalidation(|revoke| {
                 let mut state = self
                     .state
                     .lock()
@@ -527,7 +795,7 @@ impl ClientTargets {
                         && (entry.acknowledged_session.as_deref() == Some(session_id)
                             || entry.cleanup_owned.contains(session_id))
                 }) {
-                    return Ok(AuxiliaryDisposition::RecorderOwned);
+                    return Ok(Some(AuxiliaryDisposition::RecorderOwned));
                 }
                 let sealed = state.sealed;
                 let pending = state.auxiliary.values_mut().find(|entry| {
@@ -536,28 +804,39 @@ impl ClientTargets {
                         && !entry.detached
                 });
                 let Some(pending) = pending else {
-                    return Ok(AuxiliaryDisposition::Ordinary);
+                    return Ok(Some(AuxiliaryDisposition::Ordinary));
                 };
                 if pending.primary_session == session_id {
-                    return Ok(AuxiliaryDisposition::Ordinary);
+                    return Ok(Some(AuxiliaryDisposition::Ordinary));
                 }
                 if session_id.is_empty() || session_id.len() > 1024 {
                     return Err(ProtocolError::InvalidFrame);
                 }
                 if pending.candidates.len() >= 64 && !pending.candidates.contains(session_id) {
+                    revoke();
                     pending.failed = true;
                     state.lose_integrity();
                     self.changed.notify_waiters();
                     return Err(ProtocolError::CapacityExceeded);
                 }
-                pending.candidates.insert(session_id.into());
+                if !pending.candidates.contains(session_id) {
+                    revoke();
+                    pending.candidates.insert(session_id.into());
+                }
                 if sealed || pending.failed {
                     // The retained recorder supervisor, not generic enrollment,
                     // owns this candidate's detach. A later exact ACK must not
                     // create a second concurrent cleanup owner.
-                    pending.cleanup_owned.insert(session_id.into());
-                    return Ok(AuxiliaryDisposition::RecorderOwned);
+                    if !pending.cleanup_owned.contains(session_id) {
+                        revoke();
+                        pending.cleanup_owned.insert(session_id.into());
+                    }
+                    return Ok(Some(AuxiliaryDisposition::RecorderOwned));
                 }
+                Ok(None)
+            })?;
+            if let Some(disposition) = disposition {
+                return Ok(disposition);
             }
             changed.await;
         }
@@ -611,51 +890,64 @@ impl ClientTargets {
         if context_id != self.context_id {
             return Ok(false);
         }
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed {
-            return Err(ProtocolError::StaleScope);
-        }
-        if state.targets.len() >= 1024 {
-            return Err(ProtocolError::CapacityExceeded);
-        }
-        if target_id.is_empty()
-            || session_id.is_empty()
-            || state.targets.contains_key(&target_id)
-            || state
-                .targets
-                .values()
-                .any(|target| target.session_id == session_id)
-        {
-            return Err(ProtocolError::InvalidArguments);
-        }
-        let purpose = if state.reservations == 0 {
-            Some(TargetPurpose::Application)
-        } else {
-            None
-        };
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or(ProtocolError::IdentifierExhausted)?;
-        state.targets.insert(
-            target_id.clone(),
-            OwnedTarget {
-                target_id,
-                session_id,
-                kind,
-                purpose,
-                configured: false,
-                resumed: false,
-                resume_pending: false,
-                tenure: Arc::new(AttachmentTenure),
-            },
-        );
-        drop(state);
-        self.changed.notify_waiters();
-        Ok(true)
+        self.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.sealed {
+                return Err(ProtocolError::StaleScope);
+            }
+            if state.targets.len() >= 1024 {
+                return Err(ProtocolError::CapacityExceeded);
+            }
+            if target_id.is_empty()
+                || session_id.is_empty()
+                || state.targets.contains_key(&target_id)
+                || state
+                    .targets
+                    .values()
+                    .any(|target| target.session_id == session_id)
+            {
+                return Err(ProtocolError::InvalidArguments);
+            }
+            let purpose = if state.reservations == 0 {
+                Some(TargetPurpose::Application)
+            } else {
+                None
+            };
+            state.revision = state
+                .revision
+                .checked_add(1)
+                .ok_or(ProtocolError::IdentifierExhausted)?;
+            let diagnostic = state.diagnostic_attachment(&target_id);
+            let tenure = Arc::new(AttachmentTenure);
+            let observed_tenure = diagnostic::inventory_enabled().then(|| tenure.clone());
+            state.targets.insert(
+                target_id.clone(),
+                OwnedTarget {
+                    target_id,
+                    session_id,
+                    kind,
+                    purpose,
+                    configured: false,
+                    resumed: false,
+                    resume_pending: false,
+                    tenure,
+                    diagnostic,
+                },
+            );
+            if let Some(tenure) = observed_tenure {
+                state.note_revision_enabled(
+                    diagnostic::InventoryRevisionEvent::Attach,
+                    Some(tenure),
+                );
+            }
+            drop(state);
+            self.changed.notify_waiters();
+            Ok(true)
+        })
     }
     /// The create reply and attach event may arrive in either order. The
     /// lifecycle supervisor retains this wait under its original deadline.
@@ -806,71 +1098,247 @@ impl ClientTargets {
             return Err(ProtocolError::ScopeUnavailable);
         }
         target.configured = true;
+        if let Some(value) = &mut target.diagnostic {
+            value.stage = diagnostic::DiagnosticTargetStage::ConfigureAck;
+        }
+        let observed = target.diagnostic_snapshot();
+        drop(state);
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(value.generation, 0, value, None);
+        }
         Ok(())
     }
     pub fn detach(&self, target_id: &str) -> Result<(), ProtocolError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.targets.remove(target_id).is_some() {
+        let observed = self.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            let removed = state.targets.remove(target_id);
+            if removed.is_some() {
+                state.revision = state
+                    .revision
+                    .checked_add(1)
+                    .ok_or(ProtocolError::IdentifierExhausted)?;
+                if diagnostic::inventory_enabled() {
+                    state.note_revision_enabled(
+                        diagnostic::InventoryRevisionEvent::Detach,
+                        removed.as_ref().map(|target| target.tenure.clone()),
+                    );
+                }
+            }
+            drop(state);
+            self.changed.notify_waiters();
+            Ok(removed.and_then(|target| target.diagnostic_snapshot()))
+        })?;
+        if let Some(mut value) = observed {
+            value.stage = diagnostic::DiagnosticTargetStage::Detached;
+            diagnostic::target_lifecycle(value.generation, 0, value, None);
+        }
+        Ok(())
+    }
+    pub fn invalidate_inventory(&self) -> Result<(), ProtocolError> {
+        self.invalidate_inventory_inner(diagnostic::InventoryRevisionEvent::Unknown, None)
+    }
+    pub(crate) fn invalidate_inventory_for(
+        &self,
+        event: diagnostic::InventoryRevisionEvent,
+        target: &str,
+    ) -> Result<(), ProtocolError> {
+        if event == diagnostic::InventoryRevisionEvent::Unknown {
+            return self.invalidate_inventory();
+        }
+        self.invalidate_inventory_inner(event, Some(target))
+    }
+    fn invalidate_inventory_inner(
+        &self,
+        event: diagnostic::InventoryRevisionEvent,
+        target: Option<&str>,
+    ) -> Result<(), ProtocolError> {
+        self.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.sealed {
+                return Err(ProtocolError::StaleScope);
+            }
             state.revision = state
                 .revision
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
-        }
-        drop(state);
-        self.changed.notify_waiters();
-        Ok(())
-    }
-    pub fn invalidate_inventory(&self) -> Result<(), ProtocolError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed {
-            return Err(ProtocolError::StaleScope);
-        }
-        state.revision = state
-            .revision
-            .checked_add(1)
-            .ok_or(ProtocolError::IdentifierExhausted)?;
-        Ok(())
+            if diagnostic::inventory_enabled() {
+                let attachment = target
+                    .and_then(|target| state.targets.get(target))
+                    .map(|target| target.tenure.clone());
+                state.note_revision_enabled(event, attachment);
+            }
+            Ok(())
+        })
     }
     pub fn inventory(&self) -> Result<(u64, Vec<OwnedTarget>), ProtocolError> {
-        let state = self
+        self.inventory_with_diagnostic(false)
+            .map(|(revision, targets, _)| (revision, targets))
+    }
+    pub(crate) fn inventory_with_diagnostic(
+        &self,
+        observe: bool,
+    ) -> Result<(u64, Vec<OwnedTarget>, Option<RevisionSnapshot>), ProtocolError> {
+        let mut state = self
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if state.sealed || !state.inventory_complete() {
             return Err(ProtocolError::ScopeUnavailable);
         }
-        Ok((state.revision, state.targets.values().cloned().collect()))
+        let snapshot = observe.then(|| state.revision_snapshot());
+        Ok((
+            state.revision,
+            state.targets.values().cloned().collect(),
+            snapshot,
+        ))
+    }
+    /// Restart alone may wait for exact, already-observed enrollment work. Keep
+    /// the full registry guard through publication; ordinary settlement remains
+    /// fail closed and never treats an incomplete inventory as reusable.
+    pub(crate) fn publish_restart_ready<T>(
+        &self,
+        replacement: &OwnedTarget,
+        pending: &HashSet<String>,
+        known: impl Fn(&OwnedTarget) -> bool,
+        enrollment_ready: bool,
+        publish: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<Option<T>, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || state.integrity_lost
+            || !state.enrollment_ready
+            || state.protected_read
+            || state.reservations != 0
+            || state
+                .auxiliary
+                .values()
+                .any(|entry| !entry.detached && entry.claimed_session.is_none())
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let current = state
+            .targets
+            .get(&replacement.target_id)
+            .ok_or(ProtocolError::StaleReference)?;
+        if !current.same_attachment(replacement)
+            || current.kind != "page"
+            || !current.capture_ready()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut configuring = false;
+        for target in state.targets.values() {
+            if !known(target) {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            if target.purpose.is_none()
+                || !target.configured
+                || !target.resumed
+                || target.resume_pending
+            {
+                if !pending.contains(&target.session_id) {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+                configuring = true;
+            }
+        }
+        if state.resuming
+            != state
+                .targets
+                .values()
+                .filter(|target| target.resume_pending)
+                .count()
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if configuring || !enrollment_ready {
+            return Ok(None);
+        }
+        // Preserve the original full-inventory contract at the final boundary.
+        if !state.inventory_complete() {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        publish().map(Some)
+    }
+    pub(crate) fn changed(&self) -> tokio::sync::futures::Notified<'_> {
+        self.changed.notified()
     }
     pub fn check_revision(&self, revision: u64) -> Result<(), ProtocolError> {
         let state = self
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed || state.revision != revision || state.reservations != 0 {
-            Err(ProtocolError::StaleScope)
-        } else {
-            Ok(())
+        state.revision_result(revision)
+    }
+    #[cfg(test)]
+    pub(crate) fn check_revision_with_diagnostic(
+        &self,
+        revision: u64,
+        before: Option<&RevisionSnapshot>,
+        selected: &OwnedTarget,
+        pass: diagnostic::FrameInventoryPass,
+    ) -> (
+        Result<(), ProtocolError>,
+        Option<diagnostic::FrameInventoryRejection>,
+    ) {
+        let check = self.check_acquisition_revision(revision, before, selected, pass, true);
+        (check.result, check.diagnostic)
+    }
+    pub(crate) fn check_acquisition_revision(
+        &self,
+        revision: u64,
+        before: Option<&RevisionSnapshot>,
+        selected: &OwnedTarget,
+        pass: diagnostic::FrameInventoryPass,
+        observe: bool,
+    ) -> InventoryRevisionCheck {
+        let Ok(state) = self.state.lock() else {
+            return InventoryRevisionCheck {
+                result: Err(ProtocolError::ScopeUnavailable),
+                revision_only: false,
+                diagnostic: None,
+            };
+        };
+        let result = state.revision_result(revision);
+        let revision_only = !state.sealed && state.reservations == 0 && state.revision != revision;
+        let diagnostic = (observe && result.is_err())
+            .then(|| state.revision_rejection(revision, before, selected, pass));
+        InventoryRevisionCheck {
+            result,
+            revision_only,
+            diagnostic,
         }
     }
     pub fn seal(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.lose_integrity();
-        }
-        self.changed.notify_waiters();
+        self.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.state.lock() {
+                state.lose_integrity();
+            }
+            self.changed.notify_waiters();
+        })
     }
     /// Stop admission without inventing either cleanup success or accounting
     /// failure. Only an earlier owner-retirement stamp can certify settlement.
     pub(crate) fn seal_admission(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.sealed = true;
-        }
-        self.changed.notify_waiters();
+        self.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.state.lock() {
+                state.sealed = true;
+            }
+            self.changed.notify_waiters();
+        })
     }
     /// Called by the retained lifecycle owner before stopping enrollment. The
     /// first inventory is immutable: later cleanup cannot repair missing proof,
@@ -879,19 +1347,22 @@ impl ClientTargets {
         &self,
         authority: &super::client_browser::OwnerRetirement,
     ) {
-        if let Ok(mut state) = self.state.lock() {
-            if !authority.authorizes(self) {
-                state.lose_integrity();
-                self.changed.notify_waiters();
-                return;
+        self.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.state.lock() {
+                if !authority.authorizes(self) {
+                    state.lose_integrity();
+                    self.changed.notify_waiters();
+                    return;
+                }
+                if state.owner_retirement_inventory.is_none() {
+                    state.owner_retirement_inventory =
+                        Some(!state.sealed && !state.integrity_lost && state.inventory_complete());
+                }
+                state.sealed = true;
             }
-            if state.owner_retirement_inventory.is_none() {
-                state.owner_retirement_inventory =
-                    Some(!state.sealed && !state.integrity_lost && state.inventory_complete());
-            }
-            state.sealed = true;
-        }
-        self.changed.notify_waiters();
+            self.changed.notify_waiters();
+        })
     }
     /// Final-local cleanup only: admission may already be sealed, but no
     /// accounting damage or unsettled exact resource/reservation is waived.
@@ -929,6 +1400,78 @@ impl ClientTargets {
     pub(crate) fn inventory_diagnostic(&self) -> super::client_settlement_trace::InventorySnapshot {
         self.settlement_integrity_diagnostic(true).1
     }
+    pub(crate) fn try_inventory_diagnostic(&self) -> diagnostic::InventorySnapshot {
+        self.state
+            .try_lock()
+            .map(|state| state.diagnostic_inventory())
+            .unwrap_or_default()
+    }
+    pub(crate) fn diagnostic_register(
+        &self,
+        target_id: &str,
+        parent: Option<&str>,
+        root: Option<&str>,
+        origin: diagnostic::DiagnosticTargetOrigin,
+        operation: (u64, u64),
+    ) {
+        if !diagnostic::inventory_enabled() {
+            return;
+        }
+        let Ok(mut state) = self.state.try_lock() else {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+            return;
+        };
+        let parent = parent
+            .and_then(|id| state.targets.get(id))
+            .and_then(|t| t.diagnostic)
+            .map_or(0, |t| t.attachment);
+        let root = root
+            .and_then(|id| state.targets.get(id))
+            .and_then(|t| t.diagnostic)
+            .map_or(0, |t| t.attachment);
+        let observed = state.targets.get_mut(target_id).and_then(|target| {
+            let value = target.diagnostic.as_mut()?;
+            value.generation = operation.0;
+            value.origin = origin;
+            value.parent = parent;
+            value.root = root;
+            value.stage = diagnostic::DiagnosticTargetStage::Registered;
+            target.diagnostic_snapshot()
+        });
+        drop(state);
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(operation.0, operation.1, value, None);
+        } else {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+        }
+    }
+    pub(crate) fn diagnostic_step(
+        &self,
+        target_id: &str,
+        operation: (u64, u64),
+        stage: diagnostic::DiagnosticTargetStage,
+        error: Option<ProtocolError>,
+    ) {
+        if !diagnostic::inventory_enabled() {
+            return;
+        }
+        let Ok(mut state) = self.state.try_lock() else {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+            return;
+        };
+        let observed = state.targets.get_mut(target_id).and_then(|target| {
+            let value = target.diagnostic.as_mut()?;
+            value.generation = operation.0;
+            value.stage = stage;
+            target.diagnostic_snapshot()
+        });
+        drop(state);
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(operation.0, operation.1, value, error);
+        } else {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+        }
+    }
     #[cfg(test)]
     pub(crate) fn check_settlement_integrity(&self) -> Result<(), ProtocolError> {
         self.settlement_integrity_diagnostic(false).0
@@ -944,17 +1487,7 @@ impl ClientTargets {
             return (Err(ProtocolError::ScopeUnavailable), Default::default());
         };
         let snapshot = if observe {
-            super::client_settlement_trace::InventorySnapshot {
-                observed: true,
-                sealed: state.sealed,
-                integrity_lost: state.integrity_lost,
-                reservations: state.reservations,
-                unconfigured: state
-                    .targets
-                    .values()
-                    .filter(|target| target.purpose.is_none() || !target.configured)
-                    .count(),
-            }
+            state.diagnostic_inventory()
         } else {
             Default::default()
         };
@@ -997,77 +1530,85 @@ impl AuxiliaryAttachmentReservation {
         Ok(())
     }
     pub(crate) fn claim(&mut self, session_id: &str) -> Result<(), ProtocolError> {
-        let mut state = self
-            .registry
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if self.completed {
-            return Err(ProtocolError::StaleScope);
-        }
-        if session_id.is_empty()
-            || session_id.len() > 1024
-            || state
-                .targets
-                .values()
-                .any(|target| target.session_id == session_id)
-            || state
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            let mut state = self
+                .registry
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if self.completed {
+                return Err(ProtocolError::StaleScope);
+            }
+            if session_id.is_empty()
+                || session_id.len() > 1024
+                || state
+                    .targets
+                    .values()
+                    .any(|target| target.session_id == session_id)
+                || state
+                    .auxiliary
+                    .values()
+                    .any(|entry| entry.acknowledged_session.as_deref() == Some(session_id))
+            {
+                return Err(ProtocolError::InvalidArguments);
+            }
+            let reserved = state
                 .auxiliary
-                .values()
-                .any(|entry| entry.acknowledged_session.as_deref() == Some(session_id))
-        {
-            return Err(ProtocolError::InvalidArguments);
-        }
-        let reserved = state
-            .auxiliary
-            .get(&self.nonce)
-            .ok_or(ProtocolError::StaleScope)?;
-        if session_id == reserved.primary_session {
-            return Err(ProtocolError::InvalidArguments);
-        }
-        if reserved.acknowledged_session.is_some() {
-            return Err(ProtocolError::StaleScope);
-        }
-        let valid = !state.sealed
-            && !reserved.failed
-            && state.targets.get(&reserved.target).is_some_and(|target| {
-                target.session_id == reserved.primary_session
-                    && target.purpose == Some(TargetPurpose::Application)
-                    && target.configured
-                    && target.resumed
-            });
-        let entry = state
-            .auxiliary
-            .get_mut(&self.nonce)
-            .ok_or(ProtocolError::StaleScope)?;
-        // Even a late rejected ACK identifies a session we must clean up. Never
-        // lose it merely because its attach notification has not arrived yet.
-        entry.acknowledged_session = Some(session_id.into());
-        if !valid {
-            entry.failed = true;
-            state.lose_integrity();
+                .get(&self.nonce)
+                .ok_or(ProtocolError::StaleScope)?;
+            if session_id == reserved.primary_session {
+                return Err(ProtocolError::InvalidArguments);
+            }
+            if reserved.acknowledged_session.is_some() {
+                return Err(ProtocolError::StaleScope);
+            }
+            let valid = !state.sealed
+                && !reserved.failed
+                && state.targets.get(&reserved.target).is_some_and(|target| {
+                    target.session_id == reserved.primary_session
+                        && target.purpose == Some(TargetPurpose::Application)
+                        && target.configured
+                        && target.resumed
+                });
+            let entry = state
+                .auxiliary
+                .get_mut(&self.nonce)
+                .ok_or(ProtocolError::StaleScope)?;
+            // Even a late rejected ACK identifies a session we must clean up. Never
+            // lose it merely because its attach notification has not arrived yet.
+            entry.acknowledged_session = Some(session_id.into());
+            if !valid {
+                entry.failed = true;
+                state.lose_integrity();
+                drop(state);
+                self.registry.changed.notify_waiters();
+                return Err(ProtocolError::StaleScope);
+            }
+            entry.claimed_session = Some(session_id.into());
             drop(state);
             self.registry.changed.notify_waiters();
-            return Err(ProtocolError::StaleScope);
-        }
-        entry.claimed_session = Some(session_id.into());
-        drop(state);
-        self.registry.changed.notify_waiters();
-        Ok(())
+            Ok(())
+        })
     }
     /// Stop new scope work and wake enrollment while retaining this token's
     /// exact candidate journal for the recorder's bounded failure cleanup.
     pub(crate) fn quarantine(&self) {
-        if let Ok(mut state) = self.registry.state.lock() {
-            if let Some(entry) = state.auxiliary.get_mut(&self.nonce) {
-                entry.failed = true;
-                if entry.acknowledged_session.is_none() {
-                    entry.cleanup_owned.extend(entry.candidates.iter().cloned());
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.registry.state.lock() {
+                if let Some(entry) = state.auxiliary.get_mut(&self.nonce) {
+                    entry.failed = true;
+                    if entry.acknowledged_session.is_none() {
+                        entry.cleanup_owned.extend(entry.candidates.iter().cloned());
+                    }
                 }
+                state.lose_integrity();
             }
-            state.lose_integrity();
-        }
-        self.registry.changed.notify_waiters();
+            self.registry.changed.notify_waiters();
+        })
     }
     /// Only for a retained startup path that proves attach was never sent.
     pub(crate) fn cancel_unsubmitted(mut self) -> Result<(), ProtocolError> {
@@ -1285,46 +1826,281 @@ impl CreationReservation {
             return Err(ProtocolError::InvalidArguments);
         }
         target.purpose = Some(self.purpose);
+        if let Some(value) = &mut target.diagnostic {
+            value.classification = match self.purpose {
+                TargetPurpose::Application => {
+                    diagnostic::DiagnosticTargetClassification::ReservedApplication
+                }
+                TargetPurpose::StateBootstrap => {
+                    diagnostic::DiagnosticTargetClassification::ReservedBootstrap
+                }
+            };
+            value.stage = diagnostic::DiagnosticTargetStage::PurposeAssigned;
+        }
+        let observed = target.diagnostic_snapshot();
         self.claimed = true;
         drop(state);
         self.registry.changed.notify_waiters();
+        if let Some(value) = observed {
+            diagnostic::target_lifecycle(value.generation, 0, value, None);
+        }
         Ok(())
     }
 }
 impl Drop for CreationReservation {
     fn drop(&mut self) {
-        if let Ok(mut state) = self.registry.state.lock() {
-            // An abandoned create may still produce a late browser target.
-            // Never reinterpret that unclaimed bootstrap as application work.
-            if !self.claimed {
-                state.lose_integrity();
-                if self.purpose == TargetPurpose::StateBootstrap
-                    && self.native_created_target.is_none()
-                {
-                    // No exact create ACK means no safe target to close. Keep
-                    // this uncertainty after the pending reservation is gone.
-                    state.unknown_bootstrap_create = true;
+        let registry = self.registry.clone();
+        registry.eval_invalidation(|revoke| {
+            revoke();
+            if let Ok(mut state) = self.registry.state.lock() {
+                // An abandoned create may still produce a late browser target.
+                // Never reinterpret that unclaimed bootstrap as application work.
+                if !self.claimed {
+                    state.lose_integrity();
+                    if self.purpose == TargetPurpose::StateBootstrap
+                        && self.native_created_target.is_none()
+                    {
+                        // No exact create ACK means no safe target to close. Keep
+                        // this uncertainty after the pending reservation is gone.
+                        state.unknown_bootstrap_create = true;
+                    }
                 }
-            }
-            if let Some(nonce) = self.bootstrap_nonce {
-                state.bootstrap_creations.remove(&nonce);
-                state.bootstrap_cleanup_reservations.remove(&nonce);
-            }
-            state.reservations = state.reservations.saturating_sub(1);
-            if state.reservations == 0 && !state.sealed {
-                for target in state.targets.values_mut() {
-                    if target.purpose.is_none() {
-                        target.purpose = Some(TargetPurpose::Application);
+                if let Some(nonce) = self.bootstrap_nonce {
+                    state.bootstrap_creations.remove(&nonce);
+                    state.bootstrap_cleanup_reservations.remove(&nonce);
+                }
+                state.reservations = state.reservations.saturating_sub(1);
+                if state.reservations == 0 && !state.sealed {
+                    for target in state.targets.values_mut() {
+                        if target.purpose.is_none() {
+                            target.purpose = Some(TargetPurpose::Application);
+                            if let Some(value) = &mut target.diagnostic {
+                                value.classification = diagnostic::DiagnosticTargetClassification::ReservationRemainder;
+                                value.stage = diagnostic::DiagnosticTargetStage::PurposeAssigned;
+                            }
+                        }
                     }
                 }
             }
-        }
-        self.registry.changed.notify_waiters();
+            self.registry.changed.notify_waiters();
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{ClientTargets, ProtocolError};
+
+    #[test]
+    fn eval_owner_binding_requires_exact_ledger_before_enable_and_cannot_be_rebound() {
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(1, "scope".into());
+        let same_labels = super::super::client_debt::OwnerDebtLedger::new(1, "scope".into());
+        assert_eq!(
+            targets.require_eval_owner(&ledger),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            targets.bind_eval_owner(&ledger, 2),
+            Err(ProtocolError::StaleScope)
+        );
+        targets.bind_eval_owner(&ledger, 1).unwrap();
+        targets.require_eval_owner(&ledger).unwrap();
+        assert_eq!(
+            targets.bind_eval_owner(&same_labels, 1),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            targets.require_eval_owner(&same_labels),
+            Err(ProtocolError::StaleScope)
+        );
+        let revision = ledger.eval_authority_revision().unwrap();
+        targets.seal_admission();
+        assert!(ledger.eval_authority_revision().unwrap() > revision);
+    }
+
+    #[tokio::test]
+    async fn eval_target_failure_and_drop_paths_revoke_reserved_child_and_retain_root_debt() {
+        use super::super::client_debt::{
+            tests::{eval_child, eval_fixture, eval_reservation},
+            EvalCommandGrant,
+        };
+        for mode in [
+            "resume-complete",
+            "resume-drop",
+            "aux-claim",
+            "aux-quarantine",
+            "aux-overflow",
+            "creation-drop",
+            "seal",
+            "seal-admission",
+            "owner-foreign",
+            "owner",
+            "inventory",
+        ] {
+            let targets = ClientTargets::new("context".into(), "scope".into());
+            targets
+                .attached("context", "target".into(), "page".into(), "page".into())
+                .unwrap();
+            targets.configured("target").unwrap();
+            let resume = targets.resume_permit("target").await.unwrap();
+            let mut resume = if mode.starts_with("resume-") {
+                Some(resume)
+            } else {
+                resume.complete().unwrap();
+                None
+            };
+            let mut auxiliary = if mode.starts_with("aux-") {
+                Some(
+                    targets
+                        .reserve_auxiliary_attachment("scope", "target", "page")
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let mut creation = if mode == "creation-drop" {
+                Some(
+                    targets
+                        .reserve_creation(super::TargetPurpose::Application)
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            // Arrange the exact late failure without triggering its production
+            // loss-of-integrity path until after the child has been reserved.
+            if mode == "resume-complete" {
+                targets
+                    .state
+                    .lock()
+                    .unwrap()
+                    .targets
+                    .get_mut("target")
+                    .unwrap()
+                    .session_id = "replacement".into();
+            }
+            if let Some(auxiliary) = &auxiliary {
+                let mut state = targets.state.lock().unwrap();
+                let entry = state.auxiliary.get_mut(&auxiliary.nonce).unwrap();
+                if mode == "aux-claim" {
+                    entry.failed = true;
+                }
+                if mode == "aux-overflow" {
+                    entry
+                        .candidates
+                        .extend((0..64).map(|n| format!("candidate-{n}")));
+                }
+            }
+            let (ledger, journal, root, window) = eval_fixture();
+            targets.bind_eval_owner(&ledger, 7).unwrap();
+            let _root = eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window.clone()))
+                .await
+                .submit()
+                .unwrap();
+            let (_, child_journal, permit) = eval_child(&ledger, &root, &window);
+            let child =
+                eval_reservation(&ledger, &child_journal, EvalCommandGrant::Child(permit)).await;
+            match mode {
+                "resume-complete" => {
+                    assert_eq!(
+                        resume.take().unwrap().complete(),
+                        Err(ProtocolError::StaleScope)
+                    );
+                }
+                "resume-drop" => drop(resume.take()),
+                "aux-claim" => {
+                    assert_eq!(
+                        auxiliary.as_mut().unwrap().claim("late-recorder"),
+                        Err(ProtocolError::StaleScope)
+                    );
+                }
+                "aux-quarantine" => auxiliary.as_ref().unwrap().quarantine(),
+                "aux-overflow" => {
+                    assert_eq!(
+                        targets
+                            .classify_auxiliary_attachment("target", "new-candidate")
+                            .await,
+                        Err(ProtocolError::CapacityExceeded)
+                    );
+                }
+                "creation-drop" => drop(creation.take()),
+                "seal" => targets.seal(),
+                "seal-admission" => targets.seal_admission(),
+                "inventory" => targets.invalidate_inventory().unwrap(),
+                "owner-foreign" => {
+                    let foreign = ClientTargets::new("foreign".into(), "foreign".into());
+                    targets.seal_for_owner_retirement(
+                        &super::super::client_browser::OwnerRetirement::for_test(&foreign),
+                    );
+                }
+                _ => targets.seal_for_owner_retirement(
+                    &super::super::client_browser::OwnerRetirement::for_test(&targets),
+                ),
+            }
+            assert!(
+                matches!(child.submit(), Err(ProtocolError::ScopeUnavailable)),
+                "{mode}"
+            );
+            assert_eq!(ledger.snapshot().input_debt, 1, "{mode}");
+            assert!(!child_journal.snapshot().mutation_dispatched, "{mode}");
+            if let Some(auxiliary) = &mut auxiliary {
+                let _ = auxiliary.claim("late-recorder");
+                assert!(ledger.issue_eval_child(&window, &root).is_err());
+                assert_eq!(ledger.snapshot().input_debt, 1);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn eval_read_only_auxiliary_classification_does_not_revoke_on_repeat() {
+        use futures_util::FutureExt;
+        let targets = ClientTargets::new("context".into(), "scope".into());
+        targets
+            .attached("context", "target".into(), "page".into(), "page".into())
+            .unwrap();
+        targets.configured("target").unwrap();
+        targets
+            .resume_permit("target")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        let auxiliary = targets
+            .reserve_auxiliary_attachment("scope", "target", "page")
+            .unwrap();
+        targets
+            .state
+            .lock()
+            .unwrap()
+            .auxiliary
+            .get_mut(&auxiliary.nonce)
+            .unwrap()
+            .candidates
+            .insert("candidate".into());
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(7, "scope".into());
+        targets.bind_eval_owner(&ledger, 7).unwrap();
+        let revision = ledger.eval_authority_revision().unwrap();
+        for _ in 0..2 {
+            assert_eq!(
+                targets
+                    .classify_auxiliary_attachment("target", "page")
+                    .await,
+                Ok(super::AuxiliaryDisposition::Ordinary)
+            );
+            assert!(targets
+                .classify_auxiliary_attachment("target", "candidate")
+                .now_or_never()
+                .is_none());
+            assert_eq!(ledger.eval_authority_revision(), Ok(revision));
+        }
+        // A genuinely new candidate is a mutation and does revoke once.
+        assert!(targets
+            .classify_auxiliary_attachment("target", "new-candidate")
+            .now_or_never()
+            .is_none());
+        assert!(ledger.eval_authority_revision().unwrap() > revision);
+    }
+
     #[test]
     fn inventory_diagnostic_preserves_refusal_and_never_seals_pending_inventory() {
         let registry = super::ClientTargets::new("ctx".into(), "scope".into());
@@ -1732,6 +2508,54 @@ mod tests {
         assert_eq!(
             registry.owned_target("created").unwrap().purpose,
             Some(super::TargetPurpose::StateBootstrap)
+        );
+    }
+    #[test]
+    fn diagnostic_ordinals_cannot_admit_inventory_or_change_attachment_authority() {
+        let registry = super::ClientTargets::new("private-context".into(), "private-scope".into());
+        registry
+            .attached(
+                "private-context",
+                "private-target".into(),
+                "private-session".into(),
+                "worker".into(),
+            )
+            .unwrap();
+        let before = registry.owned_target("private-target").unwrap();
+        assert!(registry.check_settlement_integrity().is_err());
+        {
+            let mut state = registry.state.lock().unwrap();
+            state.targets.get_mut("private-target").unwrap().diagnostic =
+                Some(super::diagnostic::DiagnosticAttachment {
+                    attachment: 7,
+                    target: 9,
+                    origin: super::diagnostic::DiagnosticTargetOrigin::AutoAttach,
+                    classification:
+                        super::diagnostic::DiagnosticTargetClassification::ReservedBootstrap,
+                    ..Default::default()
+                });
+        }
+        let observed = registry.owned_target("private-target").unwrap();
+        assert!(
+            before.same_attachment(&observed),
+            "diagnostic identity is never ticket authority"
+        );
+        assert!(
+            registry.check_settlement_integrity().is_err(),
+            "an unconfigured attachment must still refuse settlement"
+        );
+        let facts = observed.diagnostic_snapshot().unwrap();
+        assert_eq!(facts.kind, super::diagnostic::DiagnosticTargetKind::Worker);
+        assert_eq!(
+            facts.purpose,
+            super::diagnostic::DiagnosticTargetPurpose::Application
+        );
+        assert!(!facts.configured);
+        assert!(!format!("{facts:?}").contains("private-"));
+        registry.configured("private-target").unwrap();
+        assert!(
+            registry.check_settlement_integrity().is_ok(),
+            "only the original configured state changes admission"
         );
     }
     fn auxiliary_registry() -> std::sync::Arc<super::ClientTargets> {
@@ -2142,5 +2966,204 @@ mod tests {
         drop(gate.enter(false).unwrap());
         gate.seal();
         assert!(registry.publish_initialization(&authority).is_err());
+    }
+}
+
+#[cfg(test)]
+mod atomic_revision_diagnostic_tests {
+    use super::diagnostic::{
+        FrameInventoryPass as Pass, InventoryRevisionEvent as Event,
+        InventoryRevisionTarget as Target,
+    };
+    use super::*;
+    fn selected() -> OwnedTarget {
+        OwnedTarget {
+            target_id: "private-target".into(),
+            session_id: "private-session".into(),
+            kind: "page".into(),
+            purpose: Some(TargetPurpose::Application),
+            configured: true,
+            resumed: true,
+            resume_pending: false,
+            tenure: Arc::new(AttachmentTenure),
+            diagnostic: None,
+        }
+    }
+    fn advance(state: &mut Registry, event: Event, target: Option<&OwnedTarget>) {
+        state.revision += 1;
+        state.note_revision_enabled(event, target.map(|target| target.tenure.clone()));
+    }
+    #[test]
+    fn atomic_revision_causes_keep_original_result_and_snapshot() {
+        for mask in 0..8 {
+            let registry = ClientTargets::new("private-context".into(), "private-scope".into());
+            let target = selected();
+            registry
+                .state
+                .lock()
+                .unwrap()
+                .targets
+                .insert(target.target_id.clone(), target.clone());
+            let (revision, _, before) = registry.inventory_with_diagnostic(true).unwrap();
+            {
+                let mut state = registry.state.lock().unwrap();
+                state.sealed = mask & 1 != 0;
+                if mask & 2 != 0 {
+                    advance(&mut state, Event::Navigate, Some(&target));
+                }
+                state.reservations = usize::from(mask & 4 != 0);
+            }
+            let original = registry.check_revision(revision);
+            let (result, fact) = registry.check_revision_with_diagnostic(
+                revision,
+                before.as_ref(),
+                &target,
+                Pass::Protected,
+            );
+            assert_eq!(result, original);
+            assert_eq!(fact.is_some(), mask != 0);
+            if let Some(fact) = fact {
+                assert_eq!(
+                    (fact.sealed, fact.revision_mismatch, fact.reservations),
+                    (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0)
+                );
+                assert!(fact.exact);
+                assert_eq!(fact.pass, Pass::Protected);
+                registry.state.lock().unwrap().reservations = 0;
+                assert_eq!(fact.reservations, mask & 4 != 0);
+            }
+        }
+    }
+    #[test]
+    fn atomic_revision_events_include_every_bucket_and_same_target() {
+        for event in [
+            Event::Attach,
+            Event::Detach,
+            Event::Info,
+            Event::Navigate,
+            Event::SameDocument,
+            Event::FrameDetach,
+            Event::Unknown,
+        ] {
+            let mut state = Registry::default();
+            let target = selected();
+            let before = state.revision_snapshot();
+            advance(
+                &mut state,
+                event,
+                (event != Event::Unknown).then_some(&target),
+            );
+            let fact = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
+            let mut expected = [0; 7];
+            expected[event.index()] = 1;
+            assert_eq!(fact.events, Some(expected));
+            assert_eq!(fact.delta, Some(1));
+            assert_eq!(fact.last_event, event);
+            assert_eq!(
+                fact.last_target,
+                if event == Event::Unknown {
+                    Target::Unknown
+                } else {
+                    Target::Same
+                }
+            );
+            assert_eq!(fact.exact, event != Event::Unknown);
+        }
+    }
+    #[test]
+    fn atomic_revision_multi_event_window_keeps_other_last_target() {
+        let mut state = Registry::default();
+        let target = selected();
+        let other = selected();
+        let before = state.revision_snapshot();
+        advance(&mut state, Event::Attach, Some(&other));
+        advance(&mut state, Event::Navigate, Some(&target));
+        advance(&mut state, Event::Info, Some(&other));
+        let fact = state.revision_rejection(0, Some(&before), &target, Pass::Final);
+        assert_eq!(fact.events, Some([1, 0, 1, 1, 0, 0, 0]));
+        assert_eq!(fact.delta, Some(3));
+        assert!(fact.exact);
+        assert_eq!(fact.last_target, Target::Other);
+        assert_eq!(fact.last_event, Event::Info);
+        state.revision += 1;
+        let lost = state.revision_rejection(0, Some(&before), &target, Pass::Final);
+        assert!(!lost.exact);
+        assert_eq!(lost.last_event, Event::Unknown);
+        assert_eq!(lost.last_target, Target::Unknown);
+    }
+    #[test]
+    fn atomic_revision_missing_reset_and_overflow_are_unknown_not_zero() {
+        let target = selected();
+        for mode in ["missing", "reset", "overflow", "underflow", "reverse"] {
+            let mut state = Registry::default();
+            let mut before = state.revision_snapshot();
+            advance(&mut state, Event::Info, Some(&target));
+            if mode == "underflow" {
+                before.counts[2] = 2;
+            }
+            if mode == "reset" {
+                state.revision_history = Some(RevisionHistory::default());
+            }
+            if mode == "overflow" {
+                state.revision_history.as_mut().unwrap().overflow = true;
+            }
+            let fact = state.revision_rejection(
+                if mode == "reverse" { 2 } else { 0 },
+                (mode != "missing").then_some(&before),
+                &target,
+                Pass::Initial,
+            );
+            assert!(!fact.exact);
+            if mode != "reverse" {
+                assert_eq!(fact.events, None);
+            } else {
+                assert_eq!(fact.delta, None);
+            }
+            assert_eq!(fact.last_event, Event::Unknown);
+            assert_eq!(fact.last_target, Target::Unknown);
+        }
+    }
+    #[test]
+    fn atomic_revision_bounds_and_counter_overflow_are_explicit() {
+        let target = selected();
+        let mut state = Registry::default();
+        let before = state.revision_snapshot();
+        state.revision = 65_536;
+        state.revision_history.as_mut().unwrap().counts[2] = 65_535;
+        state.note_revision_enabled(Event::Info, Some(target.tenure.clone()));
+        let fact = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
+        assert!(!fact.exact);
+        assert_eq!(fact.delta, Some(65_535));
+        assert_eq!(fact.events, Some([0, 0, 65_535, 0, 0, 0, 0]));
+        state.revision_history.as_mut().unwrap().counts[2] = u64::MAX;
+        state.note_revision_enabled(Event::Info, Some(target.tenure.clone()));
+        assert!(state.revision_history.as_ref().unwrap().overflow);
+        assert_eq!(
+            state
+                .revision_rejection(0, Some(&before), &target, Pass::Initial)
+                .events,
+            None
+        );
+    }
+    #[test]
+    fn atomic_revision_disabled_inventory_keeps_no_history() {
+        let registry = ClientTargets::new("private-context".into(), "private-scope".into());
+        let target = selected();
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .targets
+            .insert(target.target_id.clone(), target);
+        for _ in 0..3 {
+            assert!(registry
+                .inventory_with_diagnostic(false)
+                .unwrap()
+                .2
+                .is_none());
+            assert!(registry.inventory().is_ok());
+            assert_eq!(registry.check_revision(0), Ok(()));
+        }
+        assert!(registry.state.lock().unwrap().revision_history.is_none());
     }
 }

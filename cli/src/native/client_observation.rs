@@ -1293,6 +1293,10 @@ fn project_node_with_refs(
     }
     if data["__nativeReadonlyPseudo"] != true && authored_role(&data["attributes"]).is_none() {
         match author.as_ref().map(|facts| facts.tag.as_str()) {
+            // The public reader derives HTML heading semantics from the tag,
+            // even when AX omits an inert/hidden descendant. Observation's
+            // existing author-graph suppression still excludes that subtree.
+            Some("h1" | "h2" | "h3" | "h4" | "h5" | "h6") => role = Some("heading".into()),
             Some("form") if data["formOwnName"] == false => role = None,
             Some("form") if data["formOwnName"] == true => role = Some("form".into()),
             Some("thead" | "tbody" | "tfoot") => role = Some("rowgroup".into()),
@@ -5102,6 +5106,187 @@ mod tests {
             data["redactName"] = json!(true);
             assert_eq!(project(&data), None);
         }
+    }
+
+    #[test]
+    fn html_heading_projection_keeps_original_tag_semantics_when_ax_omits_role() {
+        // Original read-semantics implicitRole maps h1-h6 to heading; AX role
+        // absence is not permission to reject a valid DOM content-name fact.
+        for tag in ["h1", "h2", "h3", "h4", "h5", "h6"] {
+            for role in [None, Some("none"), Some("generic"), Some("heading")] {
+                for hidden in [false, true] {
+                    for bounded in [false, true] {
+                        let mut native = ax("heading", 42, &[]);
+                        native.role = role.map(|role| {
+                            serde_json::from_value(json!({"type":"role","value":role})).unwrap()
+                        });
+                        native.name = None;
+                        let mut data = metadata();
+                        data["author"] = json!({"tag":tag,"nodeType":1,"visible":!hidden});
+                        data["states"]["hidden"] = json!(hidden);
+                        if !hidden {
+                            data["completeContentNameFact"] =
+                                json!({"source":"heading","name":"Title"});
+                        }
+                        let mut refs = observed_refs();
+                        let node =
+                            project_node(&frame(), 42, &native, &mut refs, 1, &data, bounded)
+                                .unwrap();
+                        assert_eq!(
+                            node.role.as_deref(),
+                            Some("heading"),
+                            "{tag}/{role:?}/{hidden}/{bounded}"
+                        );
+                        assert_eq!(node.name.as_deref(), (!hidden).then_some("Title"));
+                        assert_eq!(node.states.get("hidden"), Some(&hidden));
+                        let entry = refs.get(node.reference.id.trim_start_matches('@')).unwrap();
+                        assert_eq!(entry.backend_node_id, Some(42));
+                        assert_eq!(entry.issued_revision(), Some(1));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inert_heading_projection_reaches_existing_parent_subtree_suppression() {
+        // This is the original public inert fixture as a native author graph,
+        // not an AX-only tree: ignored descendants still enter metadata.
+        let dom = json!({"nodeType":9,"backendNodeId":1,"children":[
+            {"nodeType":1,"backendNodeId":2,"children":[
+                {"nodeType":1,"backendNodeId":3,"children":[{"nodeType":3,"backendNodeId":4}]},
+                {"nodeType":1,"backendNodeId":5,"children":[{"nodeType":3,"backendNodeId":6}]}
+            ]},
+            {"nodeType":1,"backendNodeId":7,"children":[{"nodeType":3,"backendNodeId":8}]}
+        ]});
+        let graph = author_projection::Graph::read(&dom).unwrap();
+        for ignored_heading_role in [None, Some("none")] {
+            let rows = [
+                (1, "", 9, Some("RootWebArea"), "", false),
+                (2, "main", 1, None, "", true),
+                (3, "h2", 1, ignored_heading_role, "Behind the drawer", false),
+                (4, "", 3, None, "Behind the drawer", false),
+                (5, "button", 1, None, "Save", false),
+                (6, "", 3, None, "Save", false),
+                (7, "button", 1, Some("button"), "Close drawer", false),
+                (8, "", 3, Some("StaticText"), "Close drawer", false),
+            ];
+            let mut refs = observed_refs();
+            let mut nodes = HashMap::new();
+            for (backend, tag, kind, role, name, suppress) in rows {
+                let mut native = ax("fixture", backend, &[]);
+                native.role = role.map(|role| {
+                    serde_json::from_value(json!({"type":"role","value":role})).unwrap()
+                });
+                native.name = role.filter(|_| !name.is_empty()).map(|_| {
+                    serde_json::from_value(json!({"type":"string","value":name})).unwrap()
+                });
+                let mut data = metadata();
+                data["author"] = json!({"tag":tag,"nodeType":kind,"visible":true,
+                    "inline":kind==3,"breaking":tag=="button","suppress":suppress,
+                    "text":if kind==3{name}else{""}});
+                data["text"] = Value::Null;
+                if kind != 1 {
+                    data["rect"] = Value::Null;
+                }
+                if backend == 2 {
+                    data["attributes"]["inert"] = json!("");
+                }
+                if backend == 3 {
+                    data["completeContentNameFact"] = json!({"source":"heading","name":name});
+                }
+                if tag == "button" {
+                    data["completeButtonContentName"] = json!(name);
+                }
+                let node =
+                    project_node(&frame(), backend, &native, &mut refs, 1, &data, true).unwrap();
+                if backend == 3 {
+                    assert_eq!(node.role.as_deref(), Some("heading"));
+                    assert_eq!(node.name.as_deref(), Some("Behind the drawer"));
+                    assert_eq!(node.states.get("hidden"), Some(&false));
+                }
+                nodes.insert(backend, node);
+            }
+            let (roots, truncated) = author_projection::compact(&graph, nodes, 100).unwrap();
+            assert!(!truncated);
+            assert_eq!(roots.len(), 1);
+            assert_eq!(roots[0].role.as_deref(), Some("document"));
+            assert_eq!(roots[0].children.len(), 1);
+            let outside = &roots[0].children[0];
+            assert_eq!(outside.role.as_deref(), Some("button"));
+            assert_eq!(outside.name.as_deref(), Some("Close drawer"));
+            assert!(outside.children.is_empty());
+            assert_eq!(
+                refs.get(outside.reference.id.trim_start_matches('@'))
+                    .unwrap()
+                    .backend_node_id,
+                Some(7)
+            );
+        }
+    }
+
+    #[test]
+    fn html_heading_projection_preserves_explicit_roles_pseudo_and_editing_host() {
+        let mut native = ax("heading", 42, &[]);
+        native.role = None;
+        let mut data = metadata();
+        data["author"]["tag"] = json!("h2");
+        for role in ["none", "presentation", "button", "alert", "heading"] {
+            data["attributes"]["role"] = json!(role);
+            let node =
+                project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true).unwrap();
+            assert_eq!(node.role.as_deref(), Some(role));
+        }
+        data["attributes"] = json!({});
+        data["__nativeReadonlyPseudo"] = json!(true);
+        assert_eq!(
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true)
+                .unwrap()
+                .role,
+            None
+        );
+        data["__nativeReadonlyPseudo"] = json!(false);
+        data["editingHost"] = json!(true);
+        assert_eq!(
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true)
+                .unwrap()
+                .role
+                .as_deref(),
+            Some("textbox")
+        );
+    }
+
+    #[test]
+    fn html_heading_projection_does_not_relax_content_fact_validation() {
+        let mut native = ax("heading", 42, &[]);
+        native.role = None;
+        let mut data = metadata();
+        data["author"]["tag"] = json!("h2");
+        for invalid in [
+            json!({"source":"alert","name":"Wrong receiver"}),
+            json!({"source":"other","name":"Wrong source"}),
+            json!({"source":"heading","name":false}),
+            json!({"source":"heading","name":"Title","extra":true}),
+            json!({"source":"heading","name":"x".repeat(513)}),
+        ] {
+            data["completeContentNameFact"] = invalid;
+            assert!(matches!(
+                project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true),
+                Err(ObservationError::BackendFailure)
+            ));
+        }
+        data["completeContentNameFact"] = json!({"source":"heading","name":"Title"});
+        data["attributes"]["role"] = json!("button");
+        assert!(matches!(
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true),
+            Err(ObservationError::BackendFailure)
+        ));
+        data["attributes"] = json!({});
+        data["author"]["tag"] = json!("div");
+        assert!(matches!(
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true),
+            Err(ObservationError::BackendFailure)
+        ));
     }
 
     #[test]

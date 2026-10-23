@@ -516,6 +516,7 @@ fn inventory_failure_snapshot_does_not_require_active_cleanup() {
             integrity_lost: false,
             reservations: 1,
             unconfigured: 2,
+            ..Default::default()
         },
     );
     let rows = records(&file);
@@ -579,4 +580,374 @@ fn unobserved_or_oversized_inventory_never_claims_healthy_snapshot() {
     assert_eq!(rows[1]["inventoryObserved"], false);
     assert_eq!(rows[1]["inventoryReservations"], 8192);
     assert_eq!(rows[1]["inventoryUnconfigured"], 8192);
+}
+
+#[test]
+fn target_diagnostics_keep_identity_closed_and_preserve_failure_and_snapshot_bounds() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+    let target = DiagnosticAttachment {
+        attachment: TARGET_ORDINAL_LIMIT,
+        target: TARGET_ORDINAL_LIMIT,
+        generation: SAFE_INTEGER,
+        kind: DiagnosticTargetKind::BackgroundPage,
+        origin: DiagnosticTargetOrigin::InitialDiscovery,
+        parent: TARGET_ORDINAL_LIMIT,
+        root: TARGET_ORDINAL_LIMIT,
+        stage: DiagnosticTargetStage::ConfigureFailed,
+        purpose: DiagnosticTargetPurpose::Application,
+        classification: DiagnosticTargetClassification::UnreservedApplication,
+        configured: false,
+        resumed: false,
+    };
+    target_lifecycle_into(
+        &capture,
+        SAFE_INTEGER,
+        SAFE_INTEGER,
+        target,
+        Some(ProtocolError::BrowserFailure),
+    );
+    let mut targets = DiagnosticTargetInventory {
+        observed: true,
+        count: 1,
+        ..Default::default()
+    };
+    targets.attachments[0] = Some(target);
+    inventory_snapshot_into(
+        &capture,
+        SAFE_INTEGER,
+        SAFE_INTEGER,
+        InventoryPoint::SettlementRefused,
+        InventorySnapshot {
+            observed: true,
+            unconfigured: 1,
+            attachments: Some(targets),
+            ..Default::default()
+        },
+    );
+    let rows = records(&file);
+    assert_eq!(
+        rows.len(),
+        7,
+        "every declared attachment must retain its exact rows"
+    );
+    assert_eq!(rows[1]["targetKind"], "background-page");
+    assert_eq!(rows[2]["error"], "browser-failure");
+    assert_eq!(rows[2]["targetConfigured"], false);
+    assert_eq!(rows[4]["targetObserved"], true);
+    assert_eq!(rows[4]["targetSampled"], 1);
+    assert_eq!(rows[5]["targetOrdinal"], TARGET_ORDINAL_LIMIT);
+    assert_eq!(rows[5]["inventoryOrdinal"], rows[3]["inventoryOrdinal"]);
+    assert_eq!(rows[6]["attachmentOrdinal"], rows[5]["attachmentOrdinal"]);
+    for row in rows {
+        assert!(serde_json::to_vec(&row).unwrap().len() < MAX_RECORD_BYTES);
+    }
+    for private in [
+        "private-target",
+        "private-session",
+        "private-context",
+        "https:",
+        "targetId",
+        "sessionId",
+        "identityScope",
+    ] {
+        assert!(!std::fs::read_to_string(file.path())
+            .unwrap()
+            .contains(private));
+    }
+}
+
+#[test]
+fn target_inventory_cannot_claim_complete_when_history_or_sample_is_missing() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    for (count, observed) in [(TARGET_SAMPLE_LIMIT + 1, true), (1, false), (1, true)] {
+        inventory_snapshot_into(
+            &capture,
+            1,
+            28,
+            InventoryPoint::RestartBegin,
+            InventorySnapshot {
+                observed: true,
+                attachments: Some(DiagnosticTargetInventory {
+                    count,
+                    observed,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+    }
+    let rows = records(&file);
+    for row in rows
+        .iter()
+        .filter(|r| r["phase"] == "TargetInventorySummary")
+    {
+        assert_eq!(
+            row["targetObserved"], false,
+            "a missing attachment cannot be fabricated as complete"
+        );
+    }
+}
+
+#[test]
+fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+    screenshot_failure_into(
+        &capture,
+        1,
+        11,
+        ScreenshotFailure {
+            stage: ScreenshotStage::Capture,
+            capture_phase: ScreenshotCapturePhase::PostCaptureValidation,
+            inventory_after_failure: InventoryAfterFailure::Changed,
+            error: ProtocolError::StaleScope,
+        },
+    );
+    let rows = records(&file);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["phase"], "ScreenshotFirstFailure");
+    assert_eq!(rows[1]["operationSeq"], 11);
+    assert_eq!(rows[1]["screenshotStage"], "capture");
+    assert_eq!(rows[1]["capturePhase"], "post-capture-validation");
+    assert_eq!(rows[1]["inventoryAfterFailure"], "changed");
+    assert_eq!(rows[1]["error"], "stale-scope");
+    assert_eq!(
+        keys(&rows[1]),
+        [
+            "capturePhase",
+            "droppedBefore",
+            "emittedBefore",
+            "error",
+            "generation",
+            "inventoryAfterFailure",
+            "operationSeq",
+            "overflow",
+            "phase",
+            "pid",
+            "record",
+            "schemaVersion",
+            "screenshotStage",
+            "source",
+            "suppressedBefore"
+        ]
+    );
+}
+
+#[test]
+fn screenshot_failure_maximal_closed_record_fits_existing_bound() {
+    let record = Record {
+        schema_version: 2,
+        source: Source::Native,
+        pid: u32::MAX,
+        record: SAFE_INTEGER,
+        operation_seq: SAFE_INTEGER,
+        phase: Phase::ScreenshotFirstFailure,
+        dropped_before: SAFE_INTEGER,
+        emitted_before: SAFE_INTEGER,
+        suppressed_before: SAFE_INTEGER,
+        overflow: false,
+        facts: Facts {
+            generation: Some(SAFE_INTEGER),
+            screenshot_stage: Some(ScreenshotStage::AnimationStabilization),
+            capture_phase: Some(ScreenshotCapturePhase::NotEntered),
+            inventory_after_failure: Some(InventoryAfterFailure::Unavailable),
+            error: Some(ProtocolError::UnsupportedCapability),
+            ..Facts::default()
+        },
+    };
+    assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
+}
+
+#[test]
+fn readonly_prepare_failure_uses_production_sink_with_unknown_timings_omitted() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+    readonly_prepare_failure_into(
+        &capture,
+        1,
+        9,
+        ReadonlyPrepareFailure {
+            entry_us: 900_000,
+            ack_us: None,
+            ack: ReadonlyAck::None,
+            wake_us: None,
+            fail_us: Some(0),
+            window: ReadonlyWindow::NotEntered,
+            deadline: true,
+            zero_input: true,
+            cleanup: ReadonlyCleanup::NotObserved,
+            error: ProtocolError::DeadlineExceeded,
+        },
+    );
+    let rows = records(&file);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["phase"], "ReadonlyPrepareFailure");
+    assert_eq!(rows[1]["ack"], "none");
+    assert_eq!(rows[1]["failUs"], 0);
+    assert_eq!(rows[1]["error"], "deadline-exceeded");
+    assert_eq!(
+        keys(&rows[1]),
+        [
+            "ack",
+            "cleanup",
+            "deadline",
+            "droppedBefore",
+            "emittedBefore",
+            "entryUs",
+            "error",
+            "failUs",
+            "generation",
+            "operationSeq",
+            "overflow",
+            "phase",
+            "pid",
+            "record",
+            "schemaVersion",
+            "source",
+            "suppressedBefore",
+            "window",
+            "zeroInput"
+        ]
+    );
+}
+
+#[test]
+fn readonly_prepare_failure_maximal_closed_record_fits_existing_bound() {
+    let mut record = Record {
+        schema_version: 2,
+        source: Source::Native,
+        pid: u32::MAX,
+        record: SAFE_INTEGER,
+        operation_seq: SAFE_INTEGER,
+        phase: Phase::ReadonlyPrepareFailure,
+        dropped_before: SAFE_INTEGER,
+        emitted_before: SAFE_INTEGER,
+        suppressed_before: SAFE_INTEGER,
+        overflow: false,
+        facts: Facts {
+            generation: Some(SAFE_INTEGER),
+            entry_us: Some(60_000_000),
+            ack_us: Some(60_000_000),
+            ack: Some(ReadonlyAck::Retired),
+            wake_us: Some(60_000_000),
+            fail_us: Some(60_000_000),
+            window: Some(ReadonlyWindow::NotEntered),
+            deadline: Some(false),
+            zero_input: Some(true),
+            cleanup: Some(ReadonlyCleanup::FailureObserved),
+            error: Some(ProtocolError::RedirectBodyUnavailable),
+            ..Facts::default()
+        },
+    };
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert_eq!(bytes.len() + 1, 505);
+    assert!(bytes.len() < MAX_RECORD_BYTES);
+    record.facts.error = Some(ProtocolError::UnsupportedCapability);
+    assert_eq!(serde_json::to_vec(&record).unwrap().len() + 1, 502);
+}
+
+fn atomic_inventory_failure() -> FrameInventoryRejection {
+    FrameInventoryRejection {
+        pass: FrameInventoryPass::Protected,
+        sealed: false,
+        revision_mismatch: true,
+        reservations: false,
+        delta: Some(1),
+        events: Some([0, 0, 1, 0, 0, 0, 0]),
+        exact: true,
+        last_event: InventoryRevisionEvent::Info,
+        last_target: InventoryRevisionTarget::Other,
+    }
+}
+#[test]
+fn atomic_inventory_rejection_uses_production_sink_without_payload_or_cleanup_pair() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+    frame_inventory_rejection_into(&capture, 1, 11, atomic_inventory_failure());
+    let rows = records(&file);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["phase"], "FrameInventoryRejection");
+    assert_eq!(rows[1]["events"], json!([0, 0, 1, 0, 0, 0, 0]));
+    assert_eq!(
+        keys(&rows[1]),
+        [
+            "delta",
+            "droppedBefore",
+            "emittedBefore",
+            "events",
+            "exact",
+            "generation",
+            "lastEvent",
+            "lastTarget",
+            "operationSeq",
+            "overflow",
+            "pass",
+            "phase",
+            "pid",
+            "record",
+            "reservations",
+            "revisionMismatch",
+            "schemaVersion",
+            "sealed",
+            "source",
+            "suppressedBefore"
+        ]
+    );
+    assert!(cleanup_capture(None).is_none());
+}
+#[test]
+fn atomic_inventory_rejection_maximal_record_is_507_bytes_and_missing_counts_stay_missing() {
+    let record = Record {
+        schema_version: 2,
+        source: Source::Native,
+        pid: u32::MAX,
+        record: SAFE_INTEGER,
+        operation_seq: SAFE_INTEGER,
+        phase: Phase::FrameInventoryRejection,
+        dropped_before: SAFE_INTEGER,
+        emitted_before: SAFE_INTEGER,
+        suppressed_before: SAFE_INTEGER,
+        overflow: false,
+        facts: Facts {
+            generation: Some(SAFE_INTEGER),
+            frame_pass: Some(FrameInventoryPass::Protected),
+            sealed: Some(false),
+            revision_mismatch: Some(true),
+            reservations: Some(false),
+            delta: Some(u16::MAX),
+            events: Some([u16::MAX; 7]),
+            exact: Some(false),
+            last_event: Some(InventoryRevisionEvent::SameDocument),
+            last_target: Some(InventoryRevisionTarget::Unknown),
+            ..Facts::default()
+        },
+    };
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert_eq!(bytes.len() + 1, 507);
+    assert!(bytes.len() < MAX_RECORD_BYTES);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    frame_inventory_rejection_into(
+        &capture,
+        1,
+        11,
+        FrameInventoryRejection {
+            delta: None,
+            events: None,
+            exact: false,
+            last_event: InventoryRevisionEvent::Unknown,
+            last_target: InventoryRevisionTarget::Unknown,
+            ..atomic_inventory_failure()
+        },
+    );
+    let rows = records(&file);
+    assert!(rows[0].get("delta").is_none());
+    assert!(rows[0].get("events").is_none());
+    assert_eq!(rows[0]["exact"], false);
 }

@@ -14,6 +14,10 @@ use super::client_observation::{
 use super::client_protected_read::{ProtectedReadJournal, ProtectedReadReason};
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
+use super::client_settlement_trace::{
+    self as diagnostic, InventoryAfterFailure, ScreenshotCapturePhase, ScreenshotFailure,
+    ScreenshotStage,
+};
 use super::client_targets::TargetPurpose;
 use super::client_ui::UiGate;
 use super::element::{parse_ref, RefMap};
@@ -84,6 +88,149 @@ impl ObserveFailureWitness {
                 }
             }
         }
+    }
+}
+
+// Production, default-off evidence for precisely one trace Screenshot. The cell
+// contains no browser authority and holds no lock across an await. It records
+// the first failed call site before restoration, but emits only after run returns.
+struct ScreenshotFailureWitness {
+    generation: u64,
+    sequence: u64,
+    state: Mutex<ScreenshotFailureState>,
+}
+struct ScreenshotFailureState {
+    stage: ScreenshotStage,
+    first: Option<(ScreenshotStage, ScreenshotCapturePhase, ProtocolError)>,
+    revision: Option<u64>,
+    inventory_rejection: Option<diagnostic::FrameInventoryRejection>,
+}
+impl ScreenshotFailureWitness {
+    fn new(request: &DispatchRequest, operation: &OperationLease, enabled: bool) -> Option<Self> {
+        (enabled && matches!(request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace)).then(|| Self {
+            generation: operation.generation,
+            sequence: operation.sequence,
+            state: Mutex::new(ScreenshotFailureState {
+                stage: ScreenshotStage::PrepareScope,
+                first: None,
+                revision: None,
+                inventory_rejection: None,
+            }),
+        })
+    }
+    fn enter(&self, stage: ScreenshotStage) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() {
+                state.stage = stage;
+            }
+        }
+    }
+    fn failure(&self, error: &ProtocolError) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() {
+                state.first = Some((
+                    state.stage,
+                    ScreenshotCapturePhase::NotEntered,
+                    error.clone(),
+                ));
+            }
+        }
+    }
+    fn inventory_failure(
+        &self,
+        failure: Option<diagnostic::FrameInventoryRejection>,
+        error: &ProtocolError,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() {
+                state.first = Some((
+                    ScreenshotStage::FrameInventoryFence,
+                    ScreenshotCapturePhase::NotEntered,
+                    error.clone(),
+                ));
+                state.inventory_rejection = failure;
+            }
+        }
+    }
+    fn frame_pass(&self) -> diagnostic::FrameInventoryPass {
+        use diagnostic::FrameInventoryPass;
+        match self.state.lock().ok().map(|state| state.stage) {
+            Some(ScreenshotStage::ProtectedFrames) => FrameInventoryPass::Protected,
+            Some(ScreenshotStage::FinalFrames) => FrameInventoryPass::Final,
+            _ => FrameInventoryPass::Initial,
+        }
+    }
+    fn capture_failure(&self, failure: CaptureAttemptFailure) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() {
+                let phase = match failure.phase {
+                    CapturePhase::Admission => ScreenshotCapturePhase::Admission,
+                    CapturePhase::IndependentCoverage => {
+                        ScreenshotCapturePhase::IndependentCoverage
+                    }
+                    CapturePhase::SourceProtection => ScreenshotCapturePhase::SourceProtection,
+                    CapturePhase::RawCapture => ScreenshotCapturePhase::RawCapture,
+                    CapturePhase::PostCaptureValidation => {
+                        ScreenshotCapturePhase::PostCaptureValidation
+                    }
+                };
+                state.first = Some((
+                    ScreenshotStage::Capture,
+                    phase,
+                    capture_error(failure.reason),
+                ));
+            }
+        }
+    }
+    // Called only with the revision already returned by an ordinary inventory
+    // read. This does not acquire a diagnostic baseline or change admission.
+    fn revision(&self, revision: u64) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() && state.revision.is_none() {
+                state.revision = Some(revision);
+            }
+        }
+    }
+    fn finish(self, targets: Option<&super::client_targets::ClientTargets>) {
+        if let Some(failure) = self.take_failure(|| {
+            targets.and_then(|targets| targets.inventory().ok().map(|(revision, _)| revision))
+        }) {
+            diagnostic::screenshot_failure(self.generation, self.sequence, failure);
+            let inventory = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|mut state| state.inventory_rejection.take());
+            if let Some(inventory) = inventory {
+                diagnostic::frame_inventory_rejection(self.generation, self.sequence, inventory);
+            }
+        }
+    }
+    fn take_failure(&self, after: impl FnOnce() -> Option<u64>) -> Option<ScreenshotFailure> {
+        let (stage, capture_phase, error, before) = {
+            let mut state = self.state.lock().ok()?;
+            let (stage, phase, error) = state.first.take()?;
+            (stage, phase, error, state.revision)
+        };
+        let inventory_after_failure = match before {
+            None => InventoryAfterFailure::NotSampled,
+            Some(before) => match after() {
+                None => InventoryAfterFailure::Unavailable,
+                Some(after) if after == before => InventoryAfterFailure::Unchanged,
+                Some(_) => InventoryAfterFailure::Changed,
+            },
+        };
+        Some(ScreenshotFailure {
+            stage,
+            capture_phase,
+            error,
+            inventory_after_failure,
+        })
+    }
+}
+fn screenshot_stage(witness: Option<&ScreenshotFailureWitness>, stage: ScreenshotStage) {
+    if let Some(witness) = witness {
+        witness.enter(stage);
     }
 }
 
@@ -351,6 +498,7 @@ pub(crate) struct PreparedDispatch {
     operation: OperationLease,
     capture: Option<Arc<CaptureAdmission>>,
     trace: Option<TraceFence>,
+    screenshot: Option<ScreenshotFailureWitness>,
 }
 pub struct ObservationDispatch {
     captures: Mutex<CaptureAuthority>,
@@ -478,13 +626,41 @@ impl ObservationDispatch {
         request: DispatchRequest,
         operation: OperationLease,
     ) -> Result<PreparedDispatch, ProtocolError> {
+        let screenshot =
+            ScreenshotFailureWitness::new(&request, &operation, diagnostic::inventory_enabled());
+        let result = self.prepare_inner(context, request, operation, screenshot.as_ref());
+        match result {
+            Ok(mut prepared) => {
+                prepared.screenshot = screenshot;
+                Ok(prepared)
+            }
+            Err(error) => {
+                if let Some(witness) = screenshot {
+                    witness.failure(&error);
+                    witness.finish(None);
+                }
+                Err(error)
+            }
+        }
+    }
+    fn prepare_inner(
+        &self,
+        context: DispatchContext,
+        request: DispatchRequest,
+        operation: OperationLease,
+        screenshot: Option<&ScreenshotFailureWitness>,
+    ) -> Result<PreparedDispatch, ProtocolError> {
+        screenshot_stage(screenshot, ScreenshotStage::PrepareFence);
         let retirement_fence = self.publication_fence()?;
+        screenshot_stage(screenshot, ScreenshotStage::PrepareScope);
         if context.scope.identity_scope != context.page.identity_scope
             || context.scope.generation != operation.generation
         {
             return Err(ProtocolError::StaleScope);
         }
+        screenshot_stage(screenshot, ScreenshotStage::PreparePermit);
         check(&context.page, &operation)?;
+        screenshot_stage(screenshot, ScreenshotStage::PreparePolicy);
         validate_policy(&context.policy, &request)?;
         if let DispatchRequest::Query(query) = &request {
             observation::validate_expression(&query.options.expression, 0)
@@ -547,7 +723,9 @@ impl ObservationDispatch {
                 .captures
                 .lock()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            screenshot_stage(screenshot, ScreenshotStage::PreparePermit);
             check(&context.page, &operation)?;
+            screenshot_stage(screenshot, ScreenshotStage::PrepareOwner);
             let owner = CaptureOwner::new(&context)?;
             let admission = authority
                 .latest
@@ -564,6 +742,7 @@ impl ObservationDispatch {
         } else {
             None
         };
+        screenshot_stage(screenshot, ScreenshotStage::PrepareFence);
         self.check_publication_fence(retirement_fence)?;
         Ok(PreparedDispatch {
             retirement_fence,
@@ -572,6 +751,7 @@ impl ObservationDispatch {
             operation,
             capture,
             trace,
+            screenshot: None,
         })
     }
     #[cfg(test)]
@@ -606,6 +786,7 @@ impl ObservationDispatch {
             operation,
             capture,
             trace,
+            screenshot,
         } = prepared;
         let (send, result) = oneshot::channel();
         // Explicit inheritance only for this operation-local capture task.
@@ -631,6 +812,7 @@ impl ObservationDispatch {
                 capture,
                 trace,
                 retirement_fence,
+                screenshot.as_ref(),
             );
             #[cfg(test)]
             let run = FALLBACK_OBSERVED_CLEANUP_FOR_TEST.scope(observed_cleanup, run);
@@ -639,6 +821,10 @@ impl ObservationDispatch {
                 Some(journal) => journal.scope(run).await,
                 None => run.await,
             };
+            if let (Some(witness), Err(failure)) = (screenshot, &output) {
+                witness.failure(&failure.error);
+                witness.finish(Some(&targets));
+            }
             if let Err(failure) = &mut output {
                 // A cancellation already visible at this unsettled boundary
                 // wins over clean supersession, never over cleanup uncertainty.
@@ -738,6 +924,99 @@ impl ObservationDispatch {
         publication.commit_refs(kind, revision, &mut refs, staged);
         Ok(())
     }
+    fn check_initial_trace_owner(
+        &self,
+        context: &DispatchContext,
+        operation: &OperationLease,
+        retirement_fence: u64,
+    ) -> Result<(), ProtocolError> {
+        check(&context.page, operation)?;
+        self.check_publication_fence(retirement_fence)?;
+        if !context
+            .attachment
+            .same_attachment(&context.page.targets.owned_target(&context.page.target_id)?)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    // This is a settled-prefix check, not permission for later commands. The
+    // existing journal/admission checks still run on every subsequent RPC.
+    fn initial_trace_prefix_settled(
+        context: &DispatchContext,
+        operation: &OperationLease,
+        cleanup: &AtomicBool,
+    ) -> bool {
+        let Some(ledger) = context.page.client.debt_ledger() else {
+            return false;
+        };
+        if cleanup.load(Ordering::SeqCst)
+            || !ledger.matches_owner(operation.generation, &context.scope.identity_scope)
+            || context
+                .page
+                .client
+                .check_cleanup_owner(&Some(ledger.clone()))
+                .is_err()
+            || ledger
+                .check_admission(super::client_debt::AdmissionClass::Reference)
+                .is_err()
+        {
+            return false;
+        }
+        let debt = ledger.snapshot();
+        !debt.integrity_lost
+            && debt.input_debt == 0
+            && debt.object_debt == 0
+            && debt.outstanding_commands == 0
+    }
+    async fn initial_trace_frames(
+        &self,
+        context: &DispatchContext,
+        operation: &OperationLease,
+        retirement_fence: u64,
+        cleanup: &AtomicBool,
+        screenshot: Option<&ScreenshotFailureWitness>,
+    ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+        let mut reacquired = false;
+        loop {
+            self.check_initial_trace_owner(context, operation, retirement_fence)?;
+            let result =
+                frame_inventory_attempt(&context.page, operation, Some(cleanup), screenshot).await;
+            match result {
+                Ok(inventory) => {
+                    self.check_initial_trace_owner(context, operation, retirement_fence)?;
+                    // A later prefix cannot borrow the previous round's zero-debt
+                    // observation. In particular, an accepted retained release is
+                    // not a settled ACK, even when enumeration returned success.
+                    if reacquired
+                        && !Self::initial_trace_prefix_settled(context, operation, cleanup)
+                    {
+                        return Err(ProtocolError::ScopeUnavailable);
+                    }
+                    return Ok(inventory.frames);
+                }
+                Err(failure) => {
+                    if !failure.revision_only() {
+                        return Err(failure.record(screenshot));
+                    }
+                    self.check_initial_trace_owner(context, operation, retirement_fence)?;
+                    if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+                        return Err(failure.record(screenshot));
+                    }
+                    // The failed attempt owns only local binding vectors here;
+                    // all remote obligations must have settled before repeating.
+                    // No protected journal, animation, source mask or capture has begun.
+                    tokio::task::yield_now().await;
+                    self.check_initial_trace_owner(context, operation, retirement_fence)?;
+                    if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+                        return Err(failure.record(screenshot));
+                    }
+                    reacquired = true;
+                }
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)] // The optional diagnostic borrows only for this run.
     async fn run(
         &self,
         context: DispatchContext,
@@ -746,6 +1025,7 @@ impl ObservationDispatch {
         capture: Option<Arc<CaptureAdmission>>,
         trace: Option<TraceFence>,
         retirement_fence: u64,
+        screenshot: Option<&ScreenshotFailureWitness>,
     ) -> Result<Output, DispatchFailure> {
         let identity = context.page.identity_scope.clone();
         #[cfg(test)]
@@ -756,6 +1036,9 @@ impl ObservationDispatch {
         let map_observation = |error| observation_error_with_cleanup(error, &observation_cleanup);
         let map_geometry = |error| geometry_error_with_cleanup(error, &observation_cleanup);
         let failure = |error: ProtocolError| {
+            if let Some(witness) = screenshot {
+                witness.failure(&error);
+            }
             #[cfg(test)]
             witness.failure();
             DispatchFailure {
@@ -765,6 +1048,7 @@ impl ObservationDispatch {
                     || observation_cleanup.load(Ordering::SeqCst),
             }
         };
+        screenshot_stage(screenshot, ScreenshotStage::RunScope);
         if context.scope.identity_scope != identity
             || context.scope.generation != operation.generation
         {
@@ -788,6 +1072,7 @@ impl ObservationDispatch {
             || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
         // Pending browser input can need a late route/dialog callback to settle.
         // Wait before UI/publication locks so that owner service stays runnable.
+        screenshot_stage(screenshot, ScreenshotStage::DebtAdmission);
         if let Some(ledger) = context.page.client.debt_ledger() {
             let category = match &request {
                 DispatchRequest::ReadFields(read) => read.admission_class(&operation),
@@ -822,6 +1107,7 @@ impl ObservationDispatch {
         } else if matches!(&request, DispatchRequest::ReadFields(_)) {
             return Err(failure(ProtocolError::ScopeUnavailable));
         }
+        screenshot_stage(screenshot, ScreenshotStage::UiAdmission);
         let _ui = tokio::select! {
             result = context.ui.enter(protected, operation.is_callback,
                 operation.deadline, operation.cancellation.clone()) => result.map_err(failure)?,
@@ -877,6 +1163,7 @@ impl ObservationDispatch {
         }
         // Acquire UI first: a queued protected writer must not hold this mutex
         // while a valid callback query needs it to finish the active parent.
+        screenshot_stage(screenshot, ScreenshotStage::PublicationAdmission);
         let mut cancellation = operation.cancellation.clone();
         let mut publication = tokio::select! {
             lock = self.publication.lock() => lock,
@@ -948,6 +1235,7 @@ impl ObservationDispatch {
         let wants_pixels = matches!(&request, DispatchRequest::Screenshot(_))
             || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
         // Charge the native producer before screenshot collection starts.
+        screenshot_stage(screenshot, ScreenshotStage::ProducerReservation);
         let mut producer = if wants_pixels {
             Some(
                 context
@@ -963,10 +1251,12 @@ impl ObservationDispatch {
         };
         #[cfg(test)]
         witness.enter(ObserveFailureStage::InitialFrames);
-        let frames =
-            verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
-                .await
-                .map_err(failure)?;
+        screenshot_stage(screenshot, ScreenshotStage::InitialFrames);
+        let frames = if matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
+            self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
+        } else {
+            verified_frames_with_diagnostic(&context.page, &operation, Some(&observation_cleanup), screenshot).await
+        }.map_err(failure)?;
         let fallback_selector = match &request {
             DispatchRequest::Observe(request) if request.options.pixel_fallback => {
                 Some(request.secure_field_selector.clone())
@@ -982,6 +1272,7 @@ impl ObservationDispatch {
         let outcome = async {
         #[cfg(test)]
         witness.enter(ObserveFailureStage::ProtectedBarrier);
+        screenshot_stage(screenshot, ScreenshotStage::ProtectedBarrier);
         let mut journal = if protected {
             Some(
                 ProtectedReadJournal::begin(
@@ -999,14 +1290,17 @@ impl ObservationDispatch {
         };
         let mut geometry = None;
         let result = async {
+            screenshot_stage(screenshot, ScreenshotStage::AnimationStabilization);
             if stabilize_pixels { journal.as_mut().ok_or(ProtocolError::PolicyDenied)?.stabilize_animations().await.map_err(protected_error)?; }
             #[cfg(test)]
             witness.enter(ObserveFailureStage::ProtectedFrames);
-            let frozen = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
+            screenshot_stage(screenshot, ScreenshotStage::ProtectedFrames);
+            let frozen = verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?;
             same_frames(&capture_context.frames, &frozen)?;
             // A semantic tree may prove an iframe owner non-rendering. Acquire
             // that exact proof before spatial validation, never infer it from
             // omitted/truncated output. Pixel and query paths remain strict.
+            screenshot_stage(screenshot, ScreenshotStage::Geometry);
             if !matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels) {
                 geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(map_geometry)?);
             }
@@ -1020,6 +1314,7 @@ impl ObservationDispatch {
                     Ok((serde_json::to_value(output).map_err(|_| ProtocolError::BrowserFailure)?, None, None))
                 }
                 DispatchRequest::Screenshot(request) => {
+                    screenshot_stage(screenshot, ScreenshotStage::TraceMetadata);
                     let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     let value = if request.purpose == ScreenshotPurpose::Trace {
                         let viewport_ref = staged.try_viewport_ref(&identity, operation.generation,
@@ -1029,7 +1324,11 @@ impl ObservationDispatch {
                             "viewport":viewport(&capture_context.page, &operation).await?,
                             "location":main_frame(&frozen)?.url})
                     } else { Value::Null };
-                    let pixels = client_capture::capture_under_journal(&capture_context, &CaptureRequest { secure_field_selector: request.secure_field_selector }, &operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(|error| capture_error(error.reason))?;
+                    screenshot_stage(screenshot, ScreenshotStage::Capture);
+                    let pixels = client_capture::capture_under_journal(&capture_context, &CaptureRequest { secure_field_selector: request.secure_field_selector }, &operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(|error| {
+                        if let Some(witness) = screenshot { witness.capture_failure(error); }
+                        capture_error(error.reason)
+                    })?;
                     Ok((value, Some(pixels), None))
                 }
                 DispatchRequest::Observe(request) => {
@@ -1109,6 +1408,8 @@ impl ObservationDispatch {
                 }
             }
         }.await;
+        if let (Some(witness), Err(error)) = (screenshot, &result) { witness.failure(error); }
+        screenshot_stage(screenshot, ScreenshotStage::Restoration);
         #[cfg(test)]
         {
             // Capture the primary before restoration or final proof can fail.
@@ -1120,6 +1421,7 @@ impl ObservationDispatch {
             None => Ok(()),
         };
         if let Err(error) = restoration {
+            if let Some(witness) = screenshot { witness.failure(&protected_error(error.reason)); }
             return Err(DispatchFailure {
                 error: result
                     .as_ref()
@@ -1136,6 +1438,7 @@ impl ObservationDispatch {
         let (mut value, mut pixels, fallback_cause) = result.map_err(failure)?;
         #[cfg(test)]
         witness.enter(ObserveFailureStage::FinalProof);
+        screenshot_stage(screenshot, ScreenshotStage::FinalGeometry);
         if fallback_cause.is_none() {
             if let Some(geometry) = &geometry {
                 geometry
@@ -1189,14 +1492,17 @@ impl ObservationDispatch {
             pixels = Some(fresh_pixels);
             journal = Some(fresh_journal);
         }
+        screenshot_stage(screenshot, ScreenshotStage::FinalBarrier);
         if let Some(journal) = &journal {
             journal.check().map_err(|e| failure(protected_error(e)))?;
         }
         check(&capture_context.page, &operation).map_err(failure)?;
-        let final_frames = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup))
+        screenshot_stage(screenshot, ScreenshotStage::FinalFrames);
+        let final_frames = verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot)
             .await
             .map_err(failure)?;
         same_frames(&capture_context.frames, &final_frames).map_err(failure)?;
+        screenshot_stage(screenshot, ScreenshotStage::FinalViewport);
         if value.get("viewport").is_some()
             && viewport(&capture_context.page, &operation)
                 .await
@@ -1205,6 +1511,7 @@ impl ObservationDispatch {
         {
             return Err(failure(ProtocolError::StaleScope));
         }
+        screenshot_stage(screenshot, ScreenshotStage::BlobPublication);
         let mut handles = Vec::new();
         if let Some(pixels) = pixels {
             let producer = producer
@@ -1227,6 +1534,7 @@ impl ObservationDispatch {
         }
         #[cfg(test)]
         witness.enter(ObserveFailureStage::Publication);
+        screenshot_stage(screenshot, ScreenshotStage::Publication);
         let publish = (|| {
             bounded_result(&value)?;
             check(&capture_context.page, &operation)?;
@@ -1238,6 +1546,7 @@ impl ObservationDispatch {
             Ok::<(), ProtocolError>(())
         })();
         if let Err(error) = publish {
+            if let Some(witness) = screenshot { witness.failure(&error); }
             let clean = release_handles(&context.blobs, &context.scope, &handles);
             if !clean {
                 capture_context.page.targets.seal();
@@ -1585,8 +1894,16 @@ async fn verified_frames_with_cleanup(
     operation: &OperationLease,
     cleanup: Option<&AtomicBool>,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+    verified_frames_with_diagnostic(page, operation, cleanup, None).await
+}
+async fn verified_frames_with_diagnostic(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+    screenshot: Option<&ScreenshotFailureWitness>,
+) -> Result<Vec<ObservationFrame>, ProtocolError> {
     Ok(
-        verified_frame_inventory_with_cleanup(page, operation, cleanup)
+        verified_frame_inventory_with_diagnostic(page, operation, cleanup, screenshot)
             .await?
             .frames,
     )
@@ -1609,8 +1926,68 @@ async fn verified_frame_inventory_with_cleanup(
     operation: &OperationLease,
     cleanup: Option<&AtomicBool>,
 ) -> Result<VerifiedFrameInventory, ProtocolError> {
+    verified_frame_inventory_with_diagnostic(page, operation, cleanup, None).await
+}
+async fn verified_frame_inventory_with_diagnostic(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+    screenshot: Option<&ScreenshotFailureWitness>,
+) -> Result<VerifiedFrameInventory, ProtocolError> {
+    frame_inventory_attempt(page, operation, cleanup, screenshot)
+        .await
+        .map_err(|failure| failure.record(screenshot))
+}
+enum FrameInventoryFailure {
+    Read(ProtocolError),
+    Fence {
+        error: ProtocolError,
+        revision_only: bool,
+        diagnostic: Option<diagnostic::FrameInventoryRejection>,
+    },
+}
+impl From<ProtocolError> for FrameInventoryFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self::Read(error)
+    }
+}
+impl FrameInventoryFailure {
+    fn revision_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Fence {
+                revision_only: true,
+                ..
+            }
+        )
+    }
+    fn record(self, witness: Option<&ScreenshotFailureWitness>) -> ProtocolError {
+        match self {
+            Self::Read(error) => error,
+            Self::Fence {
+                error, diagnostic, ..
+            } => {
+                if let Some(witness) = witness {
+                    witness.inventory_failure(diagnostic, &error);
+                }
+                error
+            }
+        }
+    }
+}
+async fn frame_inventory_attempt(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+    screenshot: Option<&ScreenshotFailureWitness>,
+) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
     check(page, operation)?;
-    let (revision, targets) = page.targets.inventory()?;
+    let (revision, targets, inventory_before) = page
+        .targets
+        .inventory_with_diagnostic(screenshot.is_some())?;
+    if let Some(witness) = screenshot {
+        witness.revision(revision);
+    }
     let main = targets
         .iter()
         .find(|target| {
@@ -1621,7 +1998,7 @@ async fn verified_frame_inventory_with_cleanup(
         })
         .ok_or(ProtocolError::StaleScope)?;
     if !main.resumed {
-        return Err(ProtocolError::ScopeUnavailable);
+        return Err(ProtocolError::ScopeUnavailable.into());
     }
     let mut sessions = HashSet::new();
     let mut trees = Vec::new();
@@ -1632,10 +2009,10 @@ async fn verified_frame_inventory_with_cleanup(
             continue;
         }
         if !target.configured || !target.resumed {
-            return Err(ProtocolError::ScopeUnavailable);
+            return Err(ProtocolError::ScopeUnavailable.into());
         }
         if !sessions.insert(target.session_id.clone()) {
-            return Err(ProtocolError::StaleScope);
+            return Err(ProtocolError::StaleScope.into());
         }
         if !matches!(target.kind.as_str(), "page" | "iframe") {
             continue;
@@ -1661,7 +2038,7 @@ async fn verified_frame_inventory_with_cleanup(
             })?;
     let root = main_frame(&frames)?;
     if root.binding.session != page.page_session_id {
-        return Err(ProtocolError::StaleScope);
+        return Err(ProtocolError::StaleScope.into());
     }
     let mut ids = HashSet::new();
     for frame in &frames {
@@ -1670,14 +2047,14 @@ async fn verified_frame_inventory_with_cleanup(
             || !sessions.contains(&frame.binding.session)
             || !ids.insert(frame.binding.frame.clone())
         {
-            return Err(ProtocolError::StaleScope);
+            return Err(ProtocolError::StaleScope.into());
         }
         if let Some(parent) = &frame.parent_frame_id {
             if !frames
                 .iter()
                 .any(|candidate| &candidate.binding.frame == parent)
             {
-                return Err(ProtocolError::StaleScope);
+                return Err(ProtocolError::StaleScope.into());
             }
         }
     }
@@ -1686,7 +2063,7 @@ async fn verified_frame_inventory_with_cleanup(
             .iter()
             .any(|frame| lineage.parents.get(&frame.binding.frame) != Some(&frame.parent_frame_id))
     {
-        return Err(ProtocolError::StaleScope);
+        return Err(ProtocolError::StaleScope.into());
     }
     for (frame, session) in &mapping {
         if !frames.iter().any(|candidate| {
@@ -1694,10 +2071,26 @@ async fn verified_frame_inventory_with_cleanup(
                 && &candidate.binding.session == session
                 && candidate.parent_frame_id.is_some()
         }) {
-            return Err(ProtocolError::UnsupportedCapability);
+            return Err(ProtocolError::UnsupportedCapability.into());
         }
     }
-    page.targets.check_revision(revision)?;
+    let fence = page.targets.check_acquisition_revision(
+        revision,
+        inventory_before.as_ref(),
+        main,
+        screenshot.map_or(
+            diagnostic::FrameInventoryPass::Initial,
+            ScreenshotFailureWitness::frame_pass,
+        ),
+        screenshot.is_some(),
+    );
+    if let Err(error) = fence.result {
+        return Err(FrameInventoryFailure::Fence {
+            error,
+            revision_only: fence.revision_only,
+            diagnostic: fence.diagnostic,
+        });
+    }
     check(page, operation)?;
     Ok(VerifiedFrameInventory {
         frames,
@@ -2369,6 +2762,208 @@ mod tests {
             sequence: 7,
             deadline: Instant::now() + Duration::from_secs(8),
             cancellation,
+        }
+    }
+    fn diagnostic_trace() -> DispatchRequest {
+        DispatchRequest::Screenshot(ScreenshotRequest {
+            secure_field_selector: "input[type=password]".into(),
+            purpose: ScreenshotPurpose::Trace,
+        })
+    }
+    #[test]
+    fn screenshot_witness_is_disabled_for_opt_out_nontrace_and_success() {
+        let op = operation();
+        assert!(ScreenshotFailureWitness::new(&diagnostic_trace(), &op, false).is_none());
+        let pixels = DispatchRequest::Screenshot(ScreenshotRequest {
+            secure_field_selector: "input[type=password]".into(),
+            purpose: ScreenshotPurpose::PixelsOnly,
+        });
+        assert!(ScreenshotFailureWitness::new(&pixels, &op, true).is_none());
+        let observe = DispatchRequest::Observe(ObserveRequest {
+            options: ObserveFlags::default(),
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password]".into(),
+        });
+        assert!(ScreenshotFailureWitness::new(&observe, &op, true).is_none());
+        let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &op, true).unwrap();
+        assert!(witness
+            .take_failure(|| panic!("success must not sample inventory"))
+            .is_none());
+    }
+    #[test]
+    fn screenshot_capture_first_failure_survives_cleanup_and_is_consumed_once() {
+        let witness =
+            ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
+        witness.capture_failure(CaptureAttemptFailure {
+            phase: CapturePhase::PostCaptureValidation,
+            reason: CaptureReason::StaleScope,
+        });
+        witness.enter(ScreenshotStage::Restoration);
+        witness.failure(&ProtocolError::CleanupFailed);
+        let result = witness
+            .take_failure(|| panic!("no baseline must not sample inventory"))
+            .unwrap();
+        assert_eq!(result.stage, ScreenshotStage::Capture);
+        assert_eq!(
+            result.capture_phase,
+            ScreenshotCapturePhase::PostCaptureValidation
+        );
+        assert_eq!(result.error, ProtocolError::StaleScope);
+        assert_eq!(
+            result.inventory_after_failure,
+            InventoryAfterFailure::NotSampled
+        );
+        assert!(witness
+            .take_failure(|| panic!("must emit only once"))
+            .is_none());
+    }
+    #[tokio::test]
+    async fn screenshot_production_witness_observes_real_prepare_and_restore_failure_paths() {
+        use super::super::cdp::client::CdpClient;
+        use super::super::client_browser::ExecutionGate;
+        use super::super::client_targets::ClientTargets;
+        use futures_util::{SinkExt, StreamExt};
+        for fail_restore in [false, true] {
+            let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let targets = ClientTargets::new("context".into(), "scope".into());
+            targets
+                .attached("context", "target".into(), "session".into(), "page".into())
+                .unwrap();
+            targets.configured("target").unwrap();
+            targets
+                .resume_permit("target")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            targets.acknowledge_enrollment().unwrap();
+            let peer_targets = targets.clone();
+            let restored = Arc::new(AtomicBool::new(false));
+            let peer_restored = restored.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(text).unwrap();
+                    let result = match request["method"].as_str().unwrap() {
+                        "Page.getFrameTree" => {
+                            json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"}}})
+                        }
+                        "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                        "Animation.getPlaybackRate" => json!({"playbackRate":1}),
+                        "Animation.enable" | "Animation.setPlaybackRate" => json!({}),
+                        method => panic!("unexpected screenshot diagnostic command: {method}"),
+                    };
+                    assert_ne!(request["method"], "Page.captureScreenshot");
+                    let mut response = json!({"id":request["id"],"sessionId":request["sessionId"],"result":result});
+                    if request["method"] == "Animation.setPlaybackRate" {
+                        if request["params"]["playbackRate"].as_f64() == Some(0.0) {
+                            peer_targets.invalidate_inventory().unwrap();
+                        } else {
+                            peer_restored.store(true, Ordering::SeqCst);
+                            if fail_restore {
+                                response.as_object_mut().unwrap().remove("result");
+                                response["error"] =
+                                    json!({"code":-32000,"message":"private restore error"});
+                            }
+                        }
+                    }
+                    if socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            response.to_string(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+            let gate = Arc::new(ExecutionGate::default());
+            let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
+            let scope = BlobScope {
+                generation: 1,
+                identity_scope: "scope".into(),
+            };
+            blobs.activate_scope(scope.clone()).unwrap();
+            let context = || DispatchContext {
+                #[cfg(feature = "acceptance-faults")]
+                faults: Arc::new(super::super::client_test_faults::FaultController::default()),
+                attachment: targets.owned_target("target").unwrap(),
+                page: BrowserExecutionLease {
+                    client: client.clone(),
+                    page_session_id: "session".into(),
+                    target_id: "target".into(),
+                    identity_scope: "scope".into(),
+                    permit: gate.enter(false).unwrap(),
+                    targets: targets.clone(),
+                },
+                ui: Arc::new(UiGate::default()),
+                blobs: blobs.clone(),
+                scope: scope.clone(),
+                policy: ReadPolicy {
+                    test_id_attribute: "data-testid".into(),
+                    secure_field_selector: "input[type=password]".into(),
+                },
+            };
+            let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+            let mut op = operation();
+            op.cancellation = cancellation.clone();
+            let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &op, true).unwrap();
+            let mut wrong = context();
+            wrong.scope.generation = 2;
+            let error = dispatch
+                .prepare_inner(wrong, diagnostic_trace(), op, Some(&witness))
+                .err()
+                .unwrap();
+            witness.failure(&error);
+            let fact = witness
+                .take_failure(|| panic!("prepare does not read inventory"))
+                .unwrap();
+            assert_eq!(fact.error, ProtocolError::StaleScope);
+            assert_eq!(fact.stage, ScreenshotStage::PrepareScope);
+            let mut op = operation();
+            op.cancellation = cancellation.clone();
+            let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &op, true).unwrap();
+            let prepared = dispatch
+                .prepare_inner(context(), diagnostic_trace(), op, Some(&witness))
+                .unwrap();
+            let result = dispatch
+                .run(
+                    prepared.context,
+                    prepared.request,
+                    prepared.operation,
+                    prepared.capture,
+                    prepared.trace,
+                    prepared.retirement_fence,
+                    Some(&witness),
+                )
+                .await;
+            let error = result.err().unwrap();
+            assert_eq!(error.error, ProtocolError::StaleScope);
+            assert_eq!(error.cleanup_integrity_lost, fail_restore);
+            assert!(restored.load(Ordering::SeqCst));
+            let fact = witness
+                .take_failure(|| targets.inventory().ok().map(|(revision, _)| revision))
+                .unwrap();
+            assert_eq!(fact.stage, ScreenshotStage::AnimationStabilization);
+            assert_eq!(fact.error, ProtocolError::StaleScope);
+            assert_eq!(
+                fact.inventory_after_failure,
+                if fail_restore {
+                    InventoryAfterFailure::Unavailable
+                } else {
+                    InventoryAfterFailure::Changed
+                }
+            );
+            client.close().await;
+            peer.abort();
         }
     }
     #[tokio::test]
@@ -4126,8 +4721,53 @@ mod tests {
         assert!(flags.pixel_fallback);
         assert!(!flags.pixels);
     }
+    #[test]
+    fn atomic_inventory_first_failure_survives_cleanup_and_is_consumed_once() {
+        let witness =
+            ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
+        let fact = diagnostic::FrameInventoryRejection {
+            pass: diagnostic::FrameInventoryPass::Protected,
+            sealed: false,
+            revision_mismatch: true,
+            reservations: false,
+            delta: Some(1),
+            events: Some([0, 0, 1, 0, 0, 0, 0]),
+            exact: true,
+            last_event: diagnostic::InventoryRevisionEvent::Info,
+            last_target: diagnostic::InventoryRevisionTarget::Same,
+        };
+        witness.inventory_failure(Some(fact), &ProtocolError::StaleScope);
+        witness.enter(ScreenshotStage::Restoration);
+        witness.failure(&ProtocolError::CleanupFailed);
+        witness.inventory_failure(
+            Some(diagnostic::FrameInventoryRejection {
+                sealed: true,
+                ..fact
+            }),
+            &ProtocolError::CleanupFailed,
+        );
+        let first = witness.take_failure(|| None).unwrap();
+        assert_eq!(first.stage, ScreenshotStage::FrameInventoryFence);
+        assert_eq!(first.error, ProtocolError::StaleScope);
+        assert_eq!(
+            witness.state.lock().unwrap().inventory_rejection.take(),
+            Some(fact)
+        );
+        assert!(witness.take_failure(|| None).is_none());
+        assert!(witness
+            .state
+            .lock()
+            .unwrap()
+            .inventory_rejection
+            .take()
+            .is_none());
+    }
 }
 
 #[cfg(test)]
 #[path = "client_frame_inventory_tests.rs"]
 mod frame_inventory_tests;
+
+#[cfg(test)]
+#[path = "client_trace_initial_inventory_tests.rs"]
+mod trace_initial_inventory_tests;

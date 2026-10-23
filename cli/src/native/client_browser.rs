@@ -1106,6 +1106,7 @@ impl OwnedBrowser {
             self.context_id.clone(),
             self.identity_scope.clone(),
         );
+        self.targets.bind_eval_owner(&debt, operation.generation)?;
         let authority = gate.initialization(self.targets.clone())?;
         let scope = super::client_blobs::BlobScope {
             generation: operation.generation,
@@ -3559,14 +3560,21 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             .await?;
                         page.permit.check()?;
                         if !broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
-                        if !matches!(command.as_str(), "page.title" | "page.url" | "session.environment" | "context.cookies.get") {
-                            dispatch_tasks.check_input_dispatch(journal.key())?;
+                        // A scope callback is authorized by its exact live native
+                        // decision, never by an inferred causal parent or JS purity.
+                        let eval_child = if command == "page.evaluate" && lease.is_callback {
+                            Some(broker.issue_eval_child(&lease, &page.identity_scope)?)
+                        } else { None };
+                        let debt = page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?;
+                        let fixed_read = matches!(command.as_str(), "page.title" | "page.url" | "session.environment" | "context.cookies.get");
+                        if let Some(permit) = &eval_child {
+                            dispatch_tasks.check_eval_dispatch(permit)?;
+                            debt.check_eval_input(permit)?;
+                        } else {
+                            if !fixed_read { dispatch_tasks.check_input_dispatch(journal.key())?; }
+                            debt.check_admission(if fixed_read { super::client_debt::AdmissionClass::FixedRead }
+                                else { super::client_debt::AdmissionClass::Input })?;
                         }
-                        page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?.check_admission(
-                            if matches!(command.as_str(), "page.title" | "page.url" | "session.environment" | "context.cookies.get") {
-                                super::client_debt::AdmissionClass::FixedRead
-                            } else { super::client_debt::AdmissionClass::Input }
-                        )?;
                         // Enrollment and context changes share only this narrow
                         // configuration boundary; navigation and callback reads
                         // must never hold it while waiting on application work.
@@ -3613,12 +3621,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             return Err(ProtocolError::StaleScope);
                         }
                         if !broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
-                        let fixed_read = matches!(command.as_str(), "page.title" | "page.url" | "session.environment" | "context.cookies.get");
-                        if !fixed_read { dispatch_tasks.check_input_dispatch(journal.key())?; }
-                        page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?.check_admission(
-                            if fixed_read { super::client_debt::AdmissionClass::FixedRead }
-                            else { super::client_debt::AdmissionClass::Input }
-                        )?;
+                        if let Some(permit) = &eval_child {
+                            dispatch_tasks.check_eval_dispatch(permit)?;
+                            debt.check_eval_input(permit)?;
+                        } else {
+                            if !fixed_read { dispatch_tasks.check_input_dispatch(journal.key())?; }
+                            debt.check_admission(if fixed_read { super::client_debt::AdmissionClass::FixedRead }
+                                else { super::client_debt::AdmissionClass::Input })?;
+                        }
                         if command == "session.environment" {
                             return environment_facts(&page, &lease, configured_user_agent.as_deref()).await;
                         }
@@ -3654,17 +3664,30 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let navigation = if matches!(command.as_str(), "page.navigate" | "page.back" | "page.forward" | "page.reload") {
                             Some(network.begin_app_navigation(&page, &lease)?)
                         } else { None };
+                        // Prepare only after both original gates. The registry
+                        // installs a provisional final-submit fence while checking
+                        // existing journals; broker binding then revalidates admission.
+                        let eval_grant = if command == "page.evaluate" {
+                            Some(if let Some(permit) = eval_child {
+                                super::client_debt::EvalCommandGrant::Child(permit)
+                            } else {
+                                let stamp = enrollment.capture_eval_authority(&page, &lease)?;
+                                let window = dispatch_tasks.prepare_eval_window(&journal, &lease, stamp)?;
+                                if let Err(error) = broker.bind_eval_root(&lease, &window) {
+                                    debt.abandon_eval_preparation(&window);
+                                    return Err(error);
+                                }
+                                super::client_debt::EvalCommandGrant::Root(window)
+                            })
+                        } else { None };
                         dispatched = true;
-                        let (output, interruption) = page_state
-                            .execute_with_retirement(
-                                &page,
-                                &sessions,
-                                &lease,
-                                &command,
-                                &serde_json::Value::Object(args),
-                                &dispatch_tasks,
-                            )
-                            .await;
+                        let arguments = serde_json::Value::Object(args);
+                        let execution = page_state.execute_with_retirement(
+                            &page, &sessions, &lease, &command, &arguments, &dispatch_tasks,
+                        );
+                        let (output, interruption) = if let Some(grant) = eval_grant {
+                            super::client_debt::eval_command_scope(grant, execution).await
+                        } else { execution.await };
                         navigation_interruption = interruption;
                         if navigation.is_some() {
                             let flushed = enrollment.flush_app_events(&page, &lease).await;
@@ -3971,21 +3994,22 @@ impl ClientBrowser {
                     if borrowed { owner.borrowed_targets = Some(vec![replacement.target_id.clone()]); }
                     (owner.lease(gate.enter(false)?)?, owner.recovery_identity())
                 };
+                replacement.publish_ready(&context, || next.permit.check()).await?;
                 if cleanup_trace::inventory_enabled() {
                     cleanup_trace::inventory_snapshot(operation.generation, operation.sequence,
                         cleanup_trace::InventoryPoint::RestartReady, next.targets.inventory_diagnostic());
                 }
-                active.store(true, std::sync::atomic::Ordering::SeqCst);
                 if actions.is_recording_armed().await? {
                     let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
                     let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
                     actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
                 }
-                if *operation.cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
-                if std::time::Instant::now() >= operation.deadline { return Err(ProtocolError::DeadlineExceeded); }
-                next.permit.check()?;
-                Ok(serde_json::json!({"identityScope":scope,"recoveryIdentity":recovery_identity}))
+                replacement.publish_ready(&context, || {
+                    next.permit.check()?;
+                    active.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(serde_json::json!({"identityScope":scope,"recoveryIdentity":recovery_identity}))
+                }).await
             }.await;
             // Any failed destructive restart cannot be replayed against its new
             // page. Retain the original context for normal lifecycle containment.

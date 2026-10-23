@@ -44,6 +44,7 @@ pub struct OperationLease {
 }
 
 struct Operation {
+    eval_window: Option<super::client_debt::EvalWindowHandle>,
     callback_token: Option<String>,
     parent_sequence: Option<u64>,
     callback_depth: usize,
@@ -96,6 +97,7 @@ pub enum DecisionOwner {
 }
 
 struct PendingDecision {
+    eval_window: Option<super::client_debt::EvalWindowHandle>,
     resource_scope: Option<String>,
     selected: Option<Decision>,
     owner: DecisionOwner,
@@ -313,6 +315,11 @@ impl ClientSession {
                 return Err(ProtocolError::DecisionExpired);
             }
             deadline = deadline.min(pending.deadline);
+            if let (Some(window), Some(scope)) = (&pending.eval_window, &pending.resource_scope) {
+                if let Some(root_deadline) = window.live_deadline(scope) {
+                    deadline = deadline.min(root_deadline);
+                }
+            }
             if let DecisionOwner::Operation(parent) = pending.owner {
                 parent_sequence = Some(parent);
                 callback_depth = inner
@@ -332,6 +339,7 @@ impl ClientSession {
         inner.operations.insert(
             sequence,
             Operation {
+                eval_window: None,
                 callback_token: callback_token.map(str::to_owned),
                 parent_sequence,
                 callback_depth,
@@ -365,6 +373,104 @@ impl ClientSession {
         Ok(true)
     }
 
+    /// Binding is authorization for one native window, never a causal parent.
+    pub(crate) fn bind_eval_root(
+        &self,
+        operation: &OperationLease,
+        window: &super::client_debt::EvalWindowHandle,
+    ) -> Result<(), ProtocolError> {
+        let mut inner = self.lock()?;
+        Self::check_live_operation(&inner, operation)?;
+        if operation.is_callback
+            || window.root()
+                != (super::client_debt::OperationKey {
+                    generation: operation.generation,
+                    operation_seq: operation.sequence,
+                })
+        {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        let admitted = inner
+            .operations
+            .get_mut(&operation.sequence)
+            .ok_or(ProtocolError::OperationMissing)?;
+        if !admitted.started || admitted.eval_window.is_some() {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        window.bind_root(operation)?;
+        admitted.eval_window = Some(window.clone());
+        Ok(())
+    }
+    pub(crate) fn issue_eval_child(
+        &self,
+        operation: &OperationLease,
+        identity_scope: &str,
+    ) -> Result<super::client_debt::ReentrantEvalPermit, ProtocolError> {
+        let mut inner = self.lock()?;
+        Self::check(&inner, operation.generation)?;
+        if let Some(error) = operation.cancellation.borrow().error() {
+            return Err(error);
+        }
+        if Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let admitted = inner
+            .operations
+            .get(&operation.sequence)
+            .ok_or(ProtocolError::OperationMissing)?;
+        if !operation.is_callback
+            || !admitted.started
+            || admitted.eval_window.is_some()
+            || admitted.deadline != operation.deadline
+            || !admitted
+                .cancel
+                .subscribe()
+                .same_channel(&operation.cancellation)
+        {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        let token = admitted
+            .callback_token
+            .as_deref()
+            .ok_or(ProtocolError::DecisionMissing)?;
+        let pending = inner
+            .decisions
+            .get(token)
+            .ok_or(ProtocolError::DecisionMissing)?;
+        if pending.selected.is_some()
+            || pending.owner != DecisionOwner::Scope
+            || pending.resource_scope.as_deref() != Some(identity_scope)
+        {
+            return Err(ProtocolError::DecisionMissing);
+        }
+        if Instant::now() >= pending.deadline {
+            return Err(ProtocolError::DecisionExpired);
+        }
+        let window = pending
+            .eval_window
+            .as_ref()
+            .ok_or(ProtocolError::ScopeUnavailable)?
+            .clone();
+        if window.live_deadline(identity_scope).is_none() {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let permit = window.issue_child(operation)?;
+        inner
+            .operations
+            .get_mut(&operation.sequence)
+            .expect("validated child")
+            .eval_window = Some(window);
+        Ok(permit)
+    }
+    fn revoke_decision_eval(inner: &Inner, token: &str) {
+        if let Some(window) = inner
+            .decisions
+            .get(token)
+            .and_then(|pending| pending.eval_window.as_ref())
+        {
+            window.revoke();
+        }
+    }
     pub fn has_started(&self, sequence: u64) -> bool {
         self.lock()
             .ok()
@@ -422,6 +528,13 @@ impl ClientSession {
         Self::check(&inner, key.generation)?;
         if !inner.operations.contains_key(&key.operation_seq) {
             return Err(ProtocolError::OperationMissing);
+        }
+        if let Some(window) = inner
+            .operations
+            .get(&key.operation_seq)
+            .and_then(|operation| operation.eval_window.as_ref())
+        {
+            window.revoke();
         }
         inner.publication_retiring.insert(key.operation_seq);
         Self::revoke_uncertain_operation(&mut inner, key.operation_seq);
@@ -483,6 +596,7 @@ impl ClientSession {
             // Scope-owned tokens are not descendants of the child operation.
             // Discard any selected decision and cancel sibling child authority.
             Self::cancel_token_children(inner, &token);
+            Self::revoke_decision_eval(inner, &token);
             if let Some(pending) = inner.decisions.remove(&token) {
                 Self::release_registry(inner, pending.registry);
                 let _ = pending.sender.send(DecisionOutcome::Cancelled);
@@ -502,6 +616,13 @@ impl ClientSession {
         }
         if !inner.operations.contains_key(&sequence) {
             return Err(ProtocolError::OperationMissing);
+        }
+        if let Some(window) = inner
+            .operations
+            .get(&sequence)
+            .and_then(|operation| operation.eval_window.as_ref())
+        {
+            window.revoke();
         }
         let retained = effects == Effects::Unknown
             && proof.is_some_and(|proof| {
@@ -973,6 +1094,27 @@ impl ClientSession {
         registry: Option<u64>,
         resource_scope: Option<String>,
     ) -> Result<DecisionLease, ProtocolError> {
+        self.decision_scoped_with_eval(
+            generation,
+            owner,
+            kind,
+            timeout_ms,
+            registry,
+            resource_scope,
+            None,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn decision_scoped_with_eval(
+        &self,
+        generation: u64,
+        owner: DecisionOwner,
+        kind: DecisionKind,
+        timeout_ms: u64,
+        registry: Option<u64>,
+        resource_scope: Option<String>,
+        eval_window: Option<super::client_debt::EvalWindowHandle>,
+    ) -> Result<DecisionLease, ProtocolError> {
         if resource_scope.as_ref().is_some_and(String::is_empty) {
             return Err(ProtocolError::InvalidArguments);
         }
@@ -1001,6 +1143,22 @@ impl ClientSession {
             }
             DecisionOwner::Scope => policy_deadline,
         };
+        let eval_window = eval_window.filter(|window| {
+            owner == DecisionOwner::Scope
+                && resource_scope
+                    .as_deref()
+                    .is_some_and(|scope| window.live_deadline(scope).is_some())
+                && inner
+                    .operations
+                    .get(&window.root().operation_seq)
+                    .is_some_and(|operation| {
+                        operation.started
+                            && operation
+                                .eval_window
+                                .as_ref()
+                                .is_some_and(|registered| registered.same_window(window))
+                    })
+        });
         let registrations = if let Some(version) = registry {
             if inner.registry_scopes.get(&version) != resource_scope.as_ref() {
                 return Err(ProtocolError::StaleScope);
@@ -1022,6 +1180,7 @@ impl ClientSession {
         inner.decisions.insert(
             token.clone(),
             PendingDecision {
+                eval_window,
                 resource_scope,
                 selected: None,
                 owner,
@@ -1080,6 +1239,7 @@ impl ClientSession {
             .get(token)
             .ok_or(ProtocolError::DecisionMissing)?;
         if Instant::now() >= pending.deadline {
+            Self::revoke_decision_eval(&inner, token);
             let pending = inner.decisions.remove(token).unwrap();
             Self::cancel_token_children(&mut inner, token);
             Self::release_registry(&mut inner, pending.registry);
@@ -1097,6 +1257,7 @@ impl ClientSession {
             .values()
             .any(|op| op.callback_token.as_deref() == Some(token))
         {
+            Self::revoke_decision_eval(&inner, token);
             inner.decisions.get_mut(token).unwrap().selected = Some(decision);
             // Selecting the resource decision revokes callback work. An
             // already-running child must report its real terminal effects.
@@ -1112,6 +1273,7 @@ impl ClientSession {
         token: &str,
         decision: Decision,
     ) -> Result<(), ProtocolError> {
+        Self::revoke_decision_eval(inner, token);
         let pending = inner
             .decisions
             .remove(token)
@@ -1142,6 +1304,7 @@ impl ClientSession {
             inner.decisions.insert(
                 next_token.clone(),
                 PendingDecision {
+                    eval_window: None,
                     resource_scope: pending.resource_scope,
                     selected: None,
                     owner: pending.owner,
@@ -1159,6 +1322,7 @@ impl ClientSession {
                 })
                 .is_err()
             {
+                Self::revoke_decision_eval(inner, &next_token);
                 inner.decisions.remove(&next_token);
                 Self::release_registry(inner, pending.registry);
                 return Err(ProtocolError::DecisionMissing);
@@ -1193,6 +1357,9 @@ impl ClientSession {
         }
         for sequence in sequences {
             if let Some(operation) = inner.operations.get(&sequence) {
+                if let Some(window) = &operation.eval_window {
+                    window.revoke();
+                }
                 // Do not relabel a deadline as user cancellation (or vice versa)
                 // when cancellation of descendants/decisions re-enters this path.
                 operation.cancel.send_if_modified(|current| {
@@ -1209,6 +1376,7 @@ impl ClientSession {
     }
 
     fn cancel_token_children(inner: &mut Inner, token: &str) {
+        Self::revoke_decision_eval(inner, token);
         let children: Vec<_> = inner
             .operations
             .iter()
@@ -1228,6 +1396,7 @@ impl ClientSession {
             .map(|(t, _)| t.clone())
             .collect();
         for token in tokens {
+            Self::revoke_decision_eval(inner, &token);
             if let Some(pending) = inner.decisions.remove(&token) {
                 Self::release_registry(inner, pending.registry);
                 let _ = pending.sender.send(DecisionOutcome::Cancelled);
@@ -1246,6 +1415,7 @@ impl ClientSession {
             .map(|(token, _)| token.clone())
             .collect();
         for token in tokens {
+            Self::revoke_decision_eval(&inner, &token);
             if let Some(pending) = inner.decisions.remove(&token) {
                 Self::cancel_token_children(&mut inner, &token);
                 Self::release_registry(&mut inner, pending.registry);
@@ -1259,6 +1429,7 @@ impl ClientSession {
     /// context. Missing/settled tokens are harmless; sibling scopes are untouched.
     pub fn revoke_decision(&self, token: &str) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
+        Self::revoke_decision_eval(&inner, token);
         if let Some(pending) = inner.decisions.remove(token) {
             Self::cancel_token_children(&mut inner, token);
             Self::release_registry(&mut inner, pending.registry);
@@ -1278,6 +1449,7 @@ impl ClientSession {
             .map(|(token, _)| token.clone())
             .collect();
         for token in expired {
+            Self::revoke_decision_eval(&inner, &token);
             let Some(pending) = inner.decisions.remove(&token) else {
                 continue;
             };
@@ -1341,6 +1513,17 @@ impl ClientSession {
     }
 
     fn seal(inner: &mut Inner, health: ScopeState) {
+        // Revoke ledger admission before publishing broker retirement.
+        for operation in inner.operations.values() {
+            if let Some(window) = &operation.eval_window {
+                window.revoke();
+            }
+        }
+        for pending in inner.decisions.values() {
+            if let Some(window) = &pending.eval_window {
+                window.revoke();
+            }
+        }
         // Seal admission before waking any asynchronous waiter.
         inner.health = health;
         for operation in inner.operations.values() {
@@ -1524,6 +1707,200 @@ mod tests {
                 CancelSignal::DeadlineExceeded
             );
         }
+    }
+
+    async fn open_eval_window(
+        broker: &ClientSession,
+    ) -> (
+        Arc<super::super::client_debt::OwnerDebtLedger>,
+        OperationLease,
+        super::super::client_debt::EvalWindowHandle,
+        super::super::client_debt::SubmittedCommand,
+    ) {
+        use super::super::client_debt::*;
+        let operation = broker.admit(1, 1, 5000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "session".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&operation).unwrap();
+        let window = ledger
+            .begin_eval_window(
+                &journal,
+                &operation,
+                EvalAuthorityStamp {
+                    revision: 0,
+                    target: "target".into(),
+                    session: "session".into(),
+                    frame: "frame".into(),
+                    loader: "loader".into(),
+                },
+            )
+            .unwrap();
+        ledger.arm_eval_window(&window).unwrap();
+        broker.bind_eval_root(&operation, &window).unwrap();
+        let command = eval_command_scope(EvalCommandGrant::Root(window.clone()), async {
+            ledger.reserve_command(Some(&journal), "Runtime.evaluate", Some(&serde_json::json!({
+                "expression":"fetch('/synthetic')", "awaitPromise":true,"returnByValue":true,"userGesture":true
+            })), Some("session")).unwrap().submit().unwrap()
+        }).await;
+        (ledger, operation, window, command)
+    }
+    fn eval_decision(
+        broker: &ClientSession,
+        window: &super::super::client_debt::EvalWindowHandle,
+    ) -> DecisionLease {
+        broker
+            .decision_scoped_with_eval(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Authentication,
+                5000,
+                None,
+                Some("scope".into()),
+                Some(window.clone()),
+            )
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn eval_child_requires_exact_started_channel_live_decision_and_owner() {
+        for mode in [
+            "unstarted",
+            "channel",
+            "ordinary",
+            "cross-scope",
+            "expired",
+            "selected",
+            "missing",
+            "root-ended",
+        ] {
+            let broker = ClientSession::new();
+            let (ledger, _, window, _command) = open_eval_window(&broker).await;
+            let decision = eval_decision(&broker, &window);
+            let mut child = broker
+                .admit_callback(1, 2, 5000, Some(&decision.token))
+                .unwrap();
+            if mode != "unstarted" {
+                assert!(broker.start(1, 2).unwrap());
+            }
+            let (_send, forged) = watch::channel(CancelSignal::None);
+            match mode {
+                "channel" => child.cancellation = forged,
+                "ordinary" => child.is_callback = false,
+                "expired" => {
+                    broker
+                        .lock()
+                        .unwrap()
+                        .decisions
+                        .get_mut(&decision.token)
+                        .unwrap()
+                        .deadline = Instant::now()
+                }
+                "selected" => broker
+                    .resolve(1, &decision.token, Decision::CancelAuth {})
+                    .unwrap(),
+                "missing" => {
+                    broker.lock().unwrap().decisions.remove(&decision.token);
+                }
+                "root-ended" => {
+                    broker.settle(1, 1, Effects::Completed).unwrap();
+                }
+                _ => {}
+            }
+            assert!(
+                broker
+                    .issue_eval_child(
+                        &child,
+                        if mode == "cross-scope" {
+                            "foreign"
+                        } else {
+                            "scope"
+                        }
+                    )
+                    .is_err(),
+                "{mode}"
+            );
+            assert_eq!(
+                ledger.snapshot().input_debt,
+                1,
+                "refusal never forgives outer debt: {mode}"
+            );
+        }
+    }
+    #[tokio::test]
+    async fn eval_decision_is_not_retroactive_or_recursive_and_child_is_single_use() {
+        let broker = ClientSession::new();
+        let old = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Authentication,
+                5000,
+                None,
+                Some("scope".into()),
+            )
+            .unwrap();
+        let (ledger, root, window, _command) = open_eval_window(&broker).await;
+        let old_child = broker.admit_callback(1, 2, 5000, Some(&old.token)).unwrap();
+        broker.start(1, 2).unwrap();
+        assert!(broker.issue_eval_child(&old_child, "scope").is_err());
+        let decision = eval_decision(&broker, &window);
+        let child = broker
+            .admit_callback(1, 3, 5000, Some(&decision.token))
+            .unwrap();
+        broker.start(1, 3).unwrap();
+        assert!(child.deadline <= root.deadline);
+        assert!(
+            broker.lock().unwrap().operations[&3]
+                .parent_sequence
+                .is_none(),
+            "scope association is not causal parentage"
+        );
+        let permit = broker.issue_eval_child(&child, "scope").unwrap();
+        assert!(ledger.check_eval_input(&permit).is_ok());
+        assert!(broker.issue_eval_child(&child, "scope").is_err());
+        assert!(
+            ledger.capturable_eval_window("scope", "session").is_none(),
+            "no recursive decision grant after issuance"
+        );
+        let sibling = broker
+            .admit_callback(1, 4, 5000, Some(&decision.token))
+            .unwrap();
+        broker.start(1, 4).unwrap();
+        assert!(broker.issue_eval_child(&sibling, "scope").is_err());
+        broker
+            .resolve(1, &decision.token, Decision::CancelAuth {})
+            .unwrap();
+        assert!(
+            ledger.check_eval_input(&permit).is_err(),
+            "selected decision revokes before child settlement"
+        );
+        assert_eq!(ledger.snapshot().input_debt, 1);
+    }
+    #[tokio::test]
+    async fn eval_decision_cannot_adopt_equal_keys_from_another_ledger() {
+        let broker = ClientSession::new();
+        let (_, _, window, _command) = open_eval_window(&broker).await;
+        let other = ClientSession::new();
+        let (other_ledger, _, other_window, _other_command) = open_eval_window(&other).await;
+        assert_eq!(window.root(), other_window.root());
+        let decision = eval_decision(&broker, &other_window);
+        let child = broker
+            .admit_callback(1, 2, 5000, Some(&decision.token))
+            .unwrap();
+        broker.start(1, 2).unwrap();
+        assert!(broker.issue_eval_child(&child, "scope").is_err());
+        assert!(other_ledger
+            .capturable_eval_window("scope", "session")
+            .is_some());
     }
 
     fn live_field_callback(broker: &ClientSession) -> (OperationLease, DecisionLease) {

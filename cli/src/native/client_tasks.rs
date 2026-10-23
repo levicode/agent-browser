@@ -59,6 +59,21 @@ impl RetainedTasks {
         self.operations.fix_result(key);
     }
 
+    pub(crate) fn prepare_eval_window(
+        &self,
+        journal: &super::client_debt::OperationJournalHandle,
+        operation: &super::client_session::OperationLease,
+        stamp: super::client_debt::EvalAuthorityStamp,
+    ) -> Result<super::client_debt::EvalWindowHandle, ProtocolError> {
+        self.operations
+            .prepare_eval_window(journal, operation, stamp)
+    }
+    pub(crate) fn check_eval_dispatch(
+        &self,
+        permit: &super::client_debt::ReentrantEvalPermit,
+    ) -> Result<(), ProtocolError> {
+        self.operations.check_eval_dispatch(permit)
+    }
     pub(crate) fn check_input_dispatch(
         &self,
         key: super::client_debt::OperationKey,
