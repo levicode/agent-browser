@@ -170,6 +170,16 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting_for_debugger: Option<WorkerDebuggerWait>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_start_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_end_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_ms_capped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpc_failure: Option<WorkerRpcFailureOrigin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cdp_code: Option<WorkerCdpCode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_point: Option<InventoryPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_observed: Option<bool>,
@@ -576,6 +586,161 @@ impl Serialize for WorkerDebuggerWait {
         }
     }
 }
+// One await's diagnostic facts, never command admission or a wire tracker.
+// No arbitrary error string, message, data, command/session ID or URL is retained.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkerRpcFailureOrigin {
+    OwnerCheck,
+    OwnerView,
+    Reserve,
+    Identifier,
+    SubmitOwner,
+    Submit,
+    Correlation,
+    CleanupEnvelope,
+    Envelope,
+    InitCancelled,
+    InitDeadline,
+    Serialize,
+    Closed,
+    Send,
+    ResponseChannel,
+    ResponseTimeout,
+    ResponseError,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerCdpCode {
+    Value(i64),
+    Absent,
+    OutOfRange,
+}
+impl From<Option<i64>> for WorkerCdpCode {
+    fn from(value: Option<i64>) -> Self {
+        match value {
+            Some(value) if value.unsigned_abs() <= SAFE_INTEGER => Self::Value(value),
+            Some(_) => Self::OutOfRange,
+            None => Self::Absent,
+        }
+    }
+}
+impl Serialize for WorkerCdpCode {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Value(value) => serializer.serialize_i64(*value),
+            Self::Absent => serializer.serialize_str("absent"),
+            Self::OutOfRange => serializer.serialize_str("out-of-range"),
+        }
+    }
+}
+#[derive(Clone)]
+struct WorkerRpcFailure {
+    origin: WorkerRpcFailureOrigin,
+    error: Option<ProtocolError>,
+    code: Option<WorkerCdpCode>,
+}
+impl Default for WorkerRpcFailure {
+    fn default() -> Self {
+        Self {
+            origin: WorkerRpcFailureOrigin::Unknown,
+            error: None,
+            code: None,
+        }
+    }
+}
+/// Passed explicitly along only the observed Network.enable future. It has no
+/// global registry, task-local ownership, pending entry or authority of its own.
+#[derive(Default)]
+pub(crate) struct WorkerRpcFailureNote(Mutex<Option<WorkerRpcFailure>>);
+impl WorkerRpcFailureNote {
+    fn record(note: Option<&Self>, failure: WorkerRpcFailure) {
+        if let Some(note) = note {
+            if let Ok(mut slot) = note.0.try_lock() {
+                // Multiple incompatible observations are unknown, never first-wins.
+                *slot = Some(if slot.is_none() {
+                    failure
+                } else {
+                    WorkerRpcFailure::default()
+                });
+            }
+        }
+    }
+    pub(crate) fn simple(note: Option<&Self>, origin: WorkerRpcFailureOrigin) {
+        let origin = match origin {
+            WorkerRpcFailureOrigin::OwnerCheck
+            | WorkerRpcFailureOrigin::Reserve
+            | WorkerRpcFailureOrigin::Submit
+            | WorkerRpcFailureOrigin::ResponseError => WorkerRpcFailureOrigin::Unknown,
+            other => other,
+        };
+        Self::record(
+            note,
+            WorkerRpcFailure {
+                origin,
+                ..WorkerRpcFailure::default()
+            },
+        );
+    }
+    pub(crate) fn native(
+        note: Option<&Self>,
+        origin: WorkerRpcFailureOrigin,
+        error: &ProtocolError,
+    ) {
+        if note.is_none() {
+            return;
+        }
+        let failure = if matches!(
+            origin,
+            WorkerRpcFailureOrigin::OwnerCheck
+                | WorkerRpcFailureOrigin::Reserve
+                | WorkerRpcFailureOrigin::Submit
+        ) {
+            WorkerRpcFailure {
+                origin,
+                error: Some(error.clone()),
+                code: None,
+            }
+        } else {
+            WorkerRpcFailure::default()
+        };
+        Self::record(note, failure);
+    }
+    pub(crate) fn response(note: Option<&Self>, code: Option<i64>) {
+        Self::record(
+            note,
+            WorkerRpcFailure {
+                origin: WorkerRpcFailureOrigin::ResponseError,
+                error: None,
+                code: Some(code.into()),
+            },
+        );
+    }
+    fn snapshot(note: Option<&Self>) -> WorkerRpcFailure {
+        note.and_then(|note| note.0.try_lock().ok().and_then(|slot| slot.clone()))
+            .unwrap_or_default()
+    }
+    #[cfg(test)]
+    pub(crate) fn test_snapshot(&self) -> serde_json::Value {
+        let failure = Self::snapshot(Some(self));
+        serde_json::json!({"rpcFailure": failure.origin, "error": failure.error, "cdpCode": failure.code})
+    }
+}
+const MAX_WORKER_RPC_MS: u64 = 60_000;
+fn worker_rpc_ms(elapsed: std::time::Duration) -> (u64, bool) {
+    let millis = elapsed.as_millis();
+    (
+        millis.min(u128::from(MAX_WORKER_RPC_MS)) as u64,
+        millis > u128::from(MAX_WORKER_RPC_MS),
+    )
+}
+#[derive(Default)]
+struct WorkerRpcObservation {
+    start_ms: u64,
+    end_ms: Option<u64>,
+    capped: Option<bool>,
+    failure: Option<WorkerRpcFailure>,
+}
 /// Stack-owned, scalar-only observation of one authorized service-worker attachment.
 /// The ordinal is process-local diagnostic data, never a target/session identity.
 pub(crate) struct ServiceWorkerAdmission {
@@ -583,6 +748,7 @@ pub(crate) struct ServiceWorkerAdmission {
     ordinal: u8,
     waiting: WorkerDebuggerWait,
     records: AtomicU64,
+    started: std::time::Instant,
 }
 impl ServiceWorkerAdmission {
     pub(crate) fn start(generation: u64, waiting: Option<bool>) -> Option<Self> {
@@ -605,6 +771,7 @@ impl ServiceWorkerAdmission {
             ordinal: (ordinal + 1) as u8,
             waiting: waiting.into(),
             records: AtomicU64::new(0),
+            started: std::time::Instant::now(),
         };
         result.record_into(
             capture,
@@ -625,24 +792,91 @@ impl ServiceWorkerAdmission {
         step: WorkerAdmissionStep,
         state: WorkerAdmissionState,
     ) {
+        self.record_observation_into(capture, step, state, None);
+    }
+    fn record_observation_into(
+        &self,
+        capture: &Capture,
+        step: WorkerAdmissionStep,
+        state: WorkerAdmissionState,
+        rpc: Option<WorkerRpcObservation>,
+    ) {
         let ordinal = increment(&self.records, 1, &capture.counters.overflow);
         if ordinal >= MAX_WORKER_RECORDS {
             Self::limit(capture, ordinal == MAX_WORKER_RECORDS);
             return;
         }
-        record_capture(
-            capture,
-            0,
-            Phase::ServiceWorkerAdmission,
-            Facts {
-                generation: Some(self.generation),
-                worker_ordinal: Some(self.ordinal),
-                admission_step: Some(step),
-                admission_state: Some(state),
-                waiting_for_debugger: Some(self.waiting),
-                ..Facts::default()
-            },
-        );
+        let mut facts = Facts {
+            generation: Some(self.generation),
+            worker_ordinal: Some(self.ordinal),
+            admission_step: Some(step),
+            admission_state: Some(state),
+            waiting_for_debugger: Some(self.waiting),
+            ..Facts::default()
+        };
+        if let Some(rpc) = rpc {
+            facts.rpc_start_ms = Some(rpc.start_ms);
+            facts.rpc_end_ms = rpc.end_ms;
+            facts.rpc_ms_capped = rpc.capped;
+            if let Some(failure) = rpc.failure {
+                facts.rpc_failure = Some(failure.origin);
+                facts.error = failure.error;
+                facts.cdp_code = failure.code;
+            }
+        }
+        record_capture(capture, 0, Phase::ServiceWorkerAdmission, facts);
+    }
+    pub(crate) async fn observe_network_enable<T>(
+        trace: Option<&Self>,
+        note: Option<&WorkerRpcFailureNote>,
+        future: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        let observed = trace.zip(CLEANUP_SINK.get().and_then(Option::as_ref));
+        Self::observe_network_enable_into(observed, note, future).await
+    }
+    async fn observe_network_enable_into<T>(
+        observed: Option<(&Self, &Capture)>,
+        note: Option<&WorkerRpcFailureNote>,
+        future: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<T, String> {
+        let start = observed.map(|(trace, capture)| {
+            let start = worker_rpc_ms(trace.started.elapsed());
+            trace.record_observation_into(
+                capture,
+                WorkerAdmissionStep::NetworkEnable,
+                WorkerAdmissionState::Enter,
+                Some(WorkerRpcObservation {
+                    start_ms: start.0,
+                    capped: Some(start.1),
+                    ..WorkerRpcObservation::default()
+                }),
+            );
+            start
+        });
+        let result = future.await;
+        // Dropping this future emits no terminal; only this returned result does.
+        if let (Some((trace, capture)), Some(start)) = (observed, start) {
+            let end = worker_rpc_ms(trace.started.elapsed());
+            trace.record_observation_into(
+                capture,
+                WorkerAdmissionStep::NetworkEnable,
+                if result.is_ok() {
+                    WorkerAdmissionState::Done
+                } else {
+                    WorkerAdmissionState::Failed
+                },
+                Some(WorkerRpcObservation {
+                    start_ms: start.0,
+                    end_ms: Some(end.0),
+                    capped: Some(start.1 || end.1),
+                    failure: result
+                        .as_ref()
+                        .err()
+                        .map(|_| WorkerRpcFailureNote::snapshot(note)),
+                }),
+            );
+        }
+        result
     }
     fn record(trace: Option<&Self>, step: WorkerAdmissionStep, state: WorkerAdmissionState) {
         if let (Some(trace), Some(capture)) = (trace, CLEANUP_SINK.get().and_then(Option::as_ref)) {
@@ -1548,6 +1782,251 @@ impl Drop for FrameTrace {
 #[cfg(all(test, feature = "acceptance-faults"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn worker_rpc_failure_scalars_are_closed_safe_and_fit_one_record() {
+        let origins = [
+            WorkerRpcFailureOrigin::OwnerCheck,
+            WorkerRpcFailureOrigin::OwnerView,
+            WorkerRpcFailureOrigin::Reserve,
+            WorkerRpcFailureOrigin::Identifier,
+            WorkerRpcFailureOrigin::SubmitOwner,
+            WorkerRpcFailureOrigin::Submit,
+            WorkerRpcFailureOrigin::Correlation,
+            WorkerRpcFailureOrigin::CleanupEnvelope,
+            WorkerRpcFailureOrigin::Envelope,
+            WorkerRpcFailureOrigin::InitCancelled,
+            WorkerRpcFailureOrigin::InitDeadline,
+            WorkerRpcFailureOrigin::Serialize,
+            WorkerRpcFailureOrigin::Closed,
+            WorkerRpcFailureOrigin::Send,
+            WorkerRpcFailureOrigin::ResponseChannel,
+            WorkerRpcFailureOrigin::ResponseTimeout,
+            WorkerRpcFailureOrigin::ResponseError,
+            WorkerRpcFailureOrigin::Unknown,
+        ];
+        let expected = [
+            "owner-check",
+            "owner-view",
+            "reserve",
+            "identifier",
+            "submit-owner",
+            "submit",
+            "correlation",
+            "cleanup-envelope",
+            "envelope",
+            "init-cancelled",
+            "init-deadline",
+            "serialize",
+            "closed",
+            "send",
+            "response-channel",
+            "response-timeout",
+            "response-error",
+            "unknown",
+        ];
+        for (origin, expected) in origins.into_iter().zip(expected) {
+            assert_eq!(serde_json::to_value(origin).unwrap(), expected);
+            let native = matches!(
+                origin,
+                WorkerRpcFailureOrigin::OwnerCheck
+                    | WorkerRpcFailureOrigin::Reserve
+                    | WorkerRpcFailureOrigin::Submit
+            );
+            let response = origin == WorkerRpcFailureOrigin::ResponseError;
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: 0,
+                phase: Phase::ServiceWorkerAdmission,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: false,
+                facts: Facts {
+                    generation: Some(SAFE_INTEGER),
+                    worker_ordinal: Some(8),
+                    admission_step: Some(WorkerAdmissionStep::NetworkEnable),
+                    admission_state: Some(WorkerAdmissionState::Failed),
+                    waiting_for_debugger: Some(WorkerDebuggerWait::Unknown),
+                    rpc_start_ms: Some(MAX_WORKER_RPC_MS),
+                    rpc_end_ms: Some(MAX_WORKER_RPC_MS),
+                    rpc_ms_capped: Some(false),
+                    rpc_failure: Some(origin),
+                    error: native.then_some(ProtocolError::RedirectBodyUnavailable),
+                    cdp_code: response.then_some(WorkerCdpCode::Value(-(SAFE_INTEGER as i64))),
+                    ..Facts::default()
+                },
+            };
+            assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
+        }
+        for (raw, expected) in [
+            (None, serde_json::json!("absent")),
+            (Some(-32000), serde_json::json!(-32000)),
+            (Some(SAFE_INTEGER as i64), serde_json::json!(SAFE_INTEGER)),
+            (Some(i64::MAX), serde_json::json!("out-of-range")),
+            (Some(i64::MIN), serde_json::json!("out-of-range")),
+        ] {
+            assert_eq!(
+                serde_json::to_value(WorkerCdpCode::from(raw)).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            worker_rpc_ms(std::time::Duration::from_millis(60_000)),
+            (60_000, false)
+        );
+        assert_eq!(
+            worker_rpc_ms(std::time::Duration::from_millis(60_001)),
+            (60_000, true)
+        );
+        let note = WorkerRpcFailureNote::default();
+        WorkerRpcFailureNote::simple(Some(&note), WorkerRpcFailureOrigin::Send);
+        WorkerRpcFailureNote::native(
+            Some(&note),
+            WorkerRpcFailureOrigin::Reserve,
+            &ProtocolError::PolicyDenied,
+        );
+        assert_eq!(note.test_snapshot()["rpcFailure"], "unknown");
+    }
+
+    #[tokio::test]
+    async fn worker_rpc_observation_is_await_local_closed_and_drop_is_incomplete() {
+        fn assert_send<T: Send>(_: &T) {}
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let workers = AtomicU64::new(0);
+        let first = ServiceWorkerAdmission::start_into(&capture, &workers, 1, Some(true)).unwrap();
+        let second =
+            ServiceWorkerAdmission::start_into(&capture, &workers, 1, Some(false)).unwrap();
+        let a = WorkerRpcFailureNote::default();
+        let b = WorkerRpcFailureNote::default();
+        let future_a = ServiceWorkerAdmission::observe_network_enable_into(
+            Some((&first, &capture)),
+            Some(&a),
+            async {
+                tokio::task::yield_now().await;
+                WorkerRpcFailureNote::native(
+                    Some(&a),
+                    WorkerRpcFailureOrigin::Reserve,
+                    &ProtocolError::CapacityExceeded,
+                );
+                Err::<(), _>("private-original-a".to_string())
+            },
+        );
+        let future_b = ServiceWorkerAdmission::observe_network_enable_into(
+            Some((&second, &capture)),
+            Some(&b),
+            async {
+                WorkerRpcFailureNote::response(Some(&b), Some(-32000));
+                tokio::task::yield_now().await;
+                Err::<(), _>("private-original-b".to_string())
+            },
+        );
+        assert_send(&future_a);
+        assert_send(&future_b);
+        let (a_result, b_result) = tokio::join!(future_a, future_b);
+        assert_eq!(a_result, Err("private-original-a".to_string()));
+        assert_eq!(b_result, Err("private-original-b".to_string()));
+        let mut third = ServiceWorkerAdmission::start_into(&capture, &workers, 1, None).unwrap();
+        third.started = std::time::Instant::now() - std::time::Duration::from_secs(61);
+        let note = WorkerRpcFailureNote::default();
+        {
+            let mut pending = Box::pin(ServiceWorkerAdmission::observe_network_enable_into(
+                Some((&third, &capture)),
+                Some(&note),
+                std::future::pending::<Result<(), String>>(),
+            ));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert!(!text.contains("private-original"));
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                assert!(line.len() < MAX_RECORD_BYTES);
+                serde_json::from_str(line).unwrap()
+            })
+            .collect();
+        for ordinal in [1, 2] {
+            let rows: Vec<_> = values
+                .iter()
+                .filter(|row| row["workerOrdinal"] == ordinal)
+                .collect();
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[1]["admissionState"], "enter");
+            assert!(rows[1].get("rpcFailure").is_none());
+            assert!(rows[1].get("rpcEndMs").is_none());
+            assert_eq!(rows[2]["admissionState"], "failed");
+            assert_eq!(rows[1]["rpcStartMs"], rows[2]["rpcStartMs"]);
+            assert!(
+                rows[2]["rpcEndMs"].as_u64().unwrap() >= rows[2]["rpcStartMs"].as_u64().unwrap()
+            );
+            assert_eq!(rows[2]["rpcMsCapped"], false);
+            if ordinal == 1 {
+                assert_eq!(rows[2]["rpcFailure"], "reserve");
+                assert_eq!(rows[2]["error"], "capacity-exceeded");
+                assert!(rows[2].get("cdpCode").is_none());
+            } else {
+                assert_eq!(rows[2]["rpcFailure"], "response-error");
+                assert_eq!(rows[2]["cdpCode"], -32000);
+                assert!(rows[2].get("error").is_none());
+            }
+        }
+        let dropped: Vec<_> = values
+            .iter()
+            .filter(|row| row["workerOrdinal"] == 3)
+            .collect();
+        assert_eq!(dropped.len(), 2);
+        assert_eq!(dropped[1]["admissionState"], "enter");
+        assert_eq!(dropped[1]["rpcStartMs"], MAX_WORKER_RPC_MS);
+        assert_eq!(dropped[1]["rpcMsCapped"], true);
+        assert_eq!(note.test_snapshot()["rpcFailure"], "unknown");
+        let fourth = ServiceWorkerAdmission::start_into(&capture, &workers, 1, None).unwrap();
+        let result = ServiceWorkerAdmission::observe_network_enable_into(
+            Some((&fourth, &capture)),
+            None,
+            async { Err::<(), _>("Native CDP command admission refused".to_string()) },
+        )
+        .await;
+        assert!(result.is_err());
+        let fifth = ServiceWorkerAdmission::start_into(&capture, &workers, 1, None).unwrap();
+        assert_eq!(
+            ServiceWorkerAdmission::observe_network_enable_into(
+                Some((&fifth, &capture)),
+                None,
+                async { Ok::<_, String>(17) }
+            )
+            .await,
+            Ok(17)
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(file.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let unknown = rows
+            .iter()
+            .find(|row| row["workerOrdinal"] == 4 && row["admissionState"] == "failed")
+            .unwrap();
+        assert_eq!(
+            unknown["rpcFailure"], "unknown",
+            "an error string is not typed evidence"
+        );
+        assert!(unknown.get("error").is_none());
+        let done = rows
+            .iter()
+            .find(|row| {
+                row["workerOrdinal"] == 5
+                    && row["admissionState"] == "done"
+                    && row["admissionStep"] == "network-enable"
+            })
+            .unwrap();
+        assert!(done.get("rpcFailure").is_none());
+        assert!(done.get("rpcEndMs").is_some());
+    }
 
     #[test]
     fn service_worker_admission_is_closed_process_local_and_bounded() {

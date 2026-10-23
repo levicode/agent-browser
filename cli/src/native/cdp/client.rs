@@ -22,6 +22,7 @@ use super::super::client_debt::{
     SubmittedCommand,
 };
 use super::super::client_protocol::ProtocolError;
+use super::super::client_settlement_trace::{WorkerRpcFailureNote, WorkerRpcFailureOrigin};
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
 
 type TrackedResponses = Arc<std::sync::Mutex<HashMap<u64, SubmittedCommand>>>;
@@ -79,16 +80,24 @@ async fn within_initialization<T>(
         std::time::Instant,
         watch::Receiver<super::super::client_session::CancelSignal>,
     )>,
+    observation: Option<&WorkerRpcFailureNote>,
     future: impl std::future::Future<Output = Result<T, String>>,
 ) -> Result<T, String> {
     if let Some((deadline, mut cancellation)) = budget {
         if *cancellation.borrow() != super::super::client_session::CancelSignal::None {
+            WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::InitCancelled);
             return Err("Native initialization cancelled".into());
         }
         tokio::select! {
             biased;
-            _ = cancellation.changed() => Err("Native initialization cancelled".into()),
-            _ = tokio::time::sleep_until(deadline.into()) => Err("Native initialization deadline expired".into()),
+            _ = cancellation.changed() => {
+                WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::InitCancelled);
+                Err("Native initialization cancelled".into())
+            },
+            _ = tokio::time::sleep_until(deadline.into()) => {
+                WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::InitDeadline);
+                Err("Native initialization deadline expired".into())
+            },
             result = future => result,
         }
     } else {
@@ -1123,6 +1132,7 @@ impl CdpClient {
                     None,
                     reservation,
                     Some((expected, deadline)),
+                    None,
                 ),
             )
             .await
@@ -1175,6 +1185,7 @@ impl CdpClient {
                     session.as_deref(),
                     reservation,
                     Some((expected, deadline)),
+                    None,
                 ),
             )
             .await
@@ -1190,21 +1201,41 @@ impl CdpClient {
         params: Option<&Value>,
         session: Option<&str>,
     ) -> Result<Option<CommandReservation>, String> {
+        self.reserve_tracked_command_observed(method, params, session, None)
+    }
+    fn reserve_tracked_command_observed(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        session: Option<&str>,
+        observation: Option<&WorkerRpcFailureNote>,
+    ) -> Result<Option<CommandReservation>, String> {
         let Some(ledger) = self.debt_ledger() else {
             return Ok(None);
         };
         let journal = current_operation();
         self.check_cleanup_owner(&Some(ledger.clone()))
-            .map_err(|_| "Native CDP owner changed".to_string())?;
+            .map_err(|error| {
+                WorkerRpcFailureNote::native(
+                    observation,
+                    WorkerRpcFailureOrigin::OwnerCheck,
+                    &error,
+                );
+                "Native CDP owner changed".to_string()
+            })?;
         // Legacy handles cease being ambient native-service authority when a
         // managed owner is installed. Operation journals remain exact-bound.
         if self.owner.is_none() && journal.is_none() {
+            WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::OwnerView);
             return Err("Native CDP requires an owner-bound view".into());
         }
         ledger
             .reserve_command(journal.as_ref(), method, params, session)
             .map(Some)
-            .map_err(|_| "Native CDP command admission refused".to_string())
+            .map_err(|error| {
+                WorkerRpcFailureNote::native(observation, WorkerRpcFailureOrigin::Reserve, &error);
+                "Native CDP command admission refused".to_string()
+            })
     }
     fn next_command_id(&self) -> Result<u64, String> {
         #[allow(deprecated)]
@@ -1218,11 +1249,18 @@ impl CdpClient {
         id: u64,
         reservation: Option<CommandReservation>,
     ) -> Result<(), String> {
-        let current = self
-            .transport
-            .debt_owner
-            .lock()
-            .map_err(|_| "Native CDP owner unavailable".to_string())?;
+        self.track_submission_observed(id, reservation, None)
+    }
+    fn track_submission_observed(
+        &self,
+        id: u64,
+        reservation: Option<CommandReservation>,
+        observation: Option<&WorkerRpcFailureNote>,
+    ) -> Result<(), String> {
+        let current = self.transport.debt_owner.lock().map_err(|_| {
+            WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::SubmitOwner);
+            "Native CDP owner unavailable".to_string()
+        })?;
         match (current.as_ref(), reservation.as_ref()) {
             (None, None) if self.owner.is_none() => {}
             (Some(current), Some(reservation))
@@ -1231,16 +1269,23 @@ impl CdpClient {
                         .owner
                         .as_ref()
                         .is_none_or(|bound| Arc::ptr_eq(bound, current)) => {}
-            _ => return Err("Native CDP reservation owner changed".into()),
+            _ => {
+                WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::SubmitOwner);
+                return Err("Native CDP reservation owner changed".into());
+            }
         }
         if let Some(reservation) = reservation {
-            let submitted = reservation
-                .submit()
-                .map_err(|_| "Native CDP command admission revoked".to_string())?;
+            let submitted = reservation.submit().map_err(|error| {
+                WorkerRpcFailureNote::native(observation, WorkerRpcFailureOrigin::Submit, &error);
+                "Native CDP command admission revoked".to_string()
+            })?;
             self.transport
                 .tracked_responses
                 .lock()
-                .map_err(|_| "Native CDP correlation unavailable".to_string())?
+                .map_err(|_| {
+                    WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::Correlation);
+                    "Native CDP correlation unavailable".to_string()
+                })?
                 .insert(id, submitted);
         }
         Ok(())
@@ -1251,8 +1296,34 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        let reservation = self.reserve_tracked_command(method, params.as_ref(), session_id)?;
-        self.send_reserved_command(method, params, session_id, reservation)
+        self.send_command_observed(method, params, session_id, None)
+            .await
+    }
+    /// The only diagnostic entry: one worker's Network.enable await, opt-in at
+    /// its enrollment call site. The ordinary String result is unchanged.
+    pub(crate) async fn send_network_enable_observed(
+        &self,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        observation: Option<&WorkerRpcFailureNote>,
+    ) -> Result<Value, String> {
+        self.send_command_observed("Network.enable", params, session_id, observation)
+            .await
+    }
+    async fn send_command_observed(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        observation: Option<&WorkerRpcFailureNote>,
+    ) -> Result<Value, String> {
+        let reservation = self.reserve_tracked_command_observed(
+            method,
+            params.as_ref(),
+            session_id,
+            observation,
+        )?;
+        self.send_reserved_command_observed(method, params, session_id, reservation, observation)
             .await
     }
 
@@ -1263,15 +1334,28 @@ impl CdpClient {
         session_id: Option<&str>,
         reservation: Option<CommandReservation>,
     ) -> Result<Value, String> {
+        self.send_reserved_command_observed(method, params, session_id, reservation, None)
+            .await
+    }
+    async fn send_reserved_command_observed(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        reservation: Option<CommandReservation>,
+        observation: Option<&WorkerRpcFailureNote>,
+    ) -> Result<Value, String> {
         if reservation
             .as_ref()
             .is_some_and(CommandReservation::is_owner_cleanup)
         {
+            WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::CleanupEnvelope);
             return Err("Native cleanup requires its bound lifecycle envelope".into());
         }
         if reservation.as_ref().is_some_and(|reservation| {
             !reservation.matches_envelope(method, params.as_ref(), session_id)
         }) {
+            WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::Envelope);
             return Err("Native CDP reservation envelope changed".into());
         }
         let budget = reservation
@@ -1279,7 +1363,15 @@ impl CdpClient {
             .and_then(CommandReservation::initialization_budget);
         within_initialization(
             budget,
-            self.send_reserved_command_bound(method, params, session_id, reservation, None),
+            observation,
+            self.send_reserved_command_bound(
+                method,
+                params,
+                session_id,
+                reservation,
+                None,
+                observation,
+            ),
         )
         .await
     }
@@ -1321,6 +1413,7 @@ impl CdpClient {
                 Some(session),
                 Some(reservation),
                 Some((Some(expected), deadline)),
+                None,
             ),
         )
         .await
@@ -1334,8 +1427,11 @@ impl CdpClient {
         session_id: Option<&str>,
         reservation: Option<CommandReservation>,
         cleanup_owner: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
+        observation: Option<&WorkerRpcFailureNote>,
     ) -> Result<Value, String> {
-        let id = self.next_command_id()?;
+        let id = self.next_command_id().inspect_err(|_| {
+            WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::Identifier);
+        })?;
 
         let cmd = CdpCommand {
             id,
@@ -1344,8 +1440,10 @@ impl CdpClient {
             session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
         };
 
-        let json = serde_json::to_string(&cmd)
-            .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
+        let json = serde_json::to_string(&cmd).map_err(|e| {
+            WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::Serialize);
+            format!("Failed to serialize CDP command: {}", e)
+        })?;
 
         let (tx, rx) = oneshot::channel();
 
@@ -1358,7 +1456,9 @@ impl CdpClient {
 
         {
             let mut ws_tx = self.transport.ws_tx.lock().await;
-            self.ensure_open()?;
+            self.ensure_open().inspect_err(|_| {
+                WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::Closed);
+            })?;
             let mut pending = self.transport.pending.lock().await;
             if let Some((expected, deadline)) = &cleanup_owner {
                 self.check_cleanup_owner(expected)
@@ -1367,7 +1467,7 @@ impl CdpClient {
                     return Err("Native cleanup deadline expired".into());
                 }
             }
-            self.track_submission(id, reservation)?;
+            self.track_submission_observed(id, reservation, observation)?;
             pending.insert(
                 id,
                 PendingResponse {
@@ -1379,6 +1479,7 @@ impl CdpClient {
             if let Err(error) = ws_tx.send(Message::Text(json)).await {
                 self.transport.pending.lock().await.remove(&id);
                 guard.done = true;
+                WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::Send);
                 return Err(format!("Failed to send CDP command: {}", error));
             }
         }
@@ -1390,16 +1491,21 @@ impl CdpClient {
             }
             Ok(Err(_)) => {
                 guard.done = true;
+                WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::ResponseChannel);
                 return Err("CDP response channel closed".to_string());
             }
             Err(_) => {
                 guard.done = true;
                 self.transport.pending.lock().await.remove(&id);
+                WorkerRpcFailureNote::simple(observation, WorkerRpcFailureOrigin::ResponseTimeout);
                 return Err(format!("CDP command timed out: {}", method));
             }
         };
 
         if let Some(error) = response.error {
+            // Includes reader-synthesized malformed responses (code=None). A
+            // numeric code is retained, not a claim of valid remote provenance.
+            WorkerRpcFailureNote::response(observation, error.code);
             return Err(format!("CDP error ({}): {}", method, error));
         }
 
@@ -1578,7 +1684,7 @@ impl CdpClient {
         let budget = reservation
             .as_ref()
             .and_then(CommandReservation::initialization_budget);
-        within_initialization(budget, async {
+        within_initialization(budget, None, async {
             let id = self.next_command_id()?;
             let cmd = CdpCommand {
                 id,
@@ -1790,6 +1896,240 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn network_enable_failure_origin_concurrent_workers_keep_exact_call_notes() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut commands = Vec::new();
+            for _ in 0..2 {
+                let command: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(command["method"], "Network.enable");
+                commands.push(command);
+            }
+            for command in commands.into_iter().rev() {
+                let (code, message) = if command["sessionId"] == "worker-a" {
+                    (-32001, "private-a")
+                } else {
+                    (-32002, "private-b")
+                };
+                socket.send(Message::Text(json!({"id":command["id"], "sessionId":command["sessionId"], "error":{"code":code, "message":message}}).to_string())).await.unwrap();
+            }
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+        let spawn = |session: &'static str| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let note = WorkerRpcFailureNote::default();
+                let result = client
+                    .send_network_enable_observed(None, Some(session), Some(&note))
+                    .await;
+                (result, note.test_snapshot())
+            })
+        };
+        let a = spawn("worker-a");
+        let b = spawn("worker-b");
+        let (a, b) = tokio::time::timeout(Duration::from_secs(1), async {
+            (a.await.unwrap(), b.await.unwrap())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            a.0,
+            Err("CDP error (Network.enable): private-a".to_string())
+        );
+        assert_eq!(
+            b.0,
+            Err("CDP error (Network.enable): private-b".to_string())
+        );
+        assert_eq!(a.1["cdpCode"], -32001);
+        assert_eq!(b.1["cdpCode"], -32002);
+        assert_eq!(a.1["rpcFailure"], "response-error");
+        assert_eq!(b.1["rpcFailure"], "response-error");
+        assert!(!a.1.to_string().contains("private"));
+        assert!(!b.1.to_string().contains("private"));
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_enable_failure_origin_initialization_budget_is_not_a_response_timeout() {
+        use super::super::super::client_session::CancelSignal;
+        for cancelled in [true, false] {
+            let note = WorkerRpcFailureNote::default();
+            let (_sender, cancellation) = watch::channel(if cancelled {
+                CancelSignal::Requested
+            } else {
+                CancelSignal::None
+            });
+            let result = within_initialization(
+                Some((std::time::Instant::now(), cancellation)),
+                Some(&note),
+                std::future::pending::<Result<(), String>>(),
+            )
+            .await;
+            assert_eq!(
+                result,
+                Err(if cancelled {
+                    "Native initialization cancelled"
+                } else {
+                    "Native initialization deadline expired"
+                }
+                .to_string())
+            );
+            let diagnostic = note.test_snapshot();
+            assert_eq!(
+                diagnostic["rpcFailure"],
+                if cancelled {
+                    "init-cancelled"
+                } else {
+                    "init-deadline"
+                }
+            );
+            assert!(diagnostic["error"].is_null());
+            assert!(diagnostic["cdpCode"].is_null());
+        }
+    }
+
+    #[tokio::test]
+    async fn network_enable_failure_origin_retains_code_without_message_or_inferred_rejection() {
+        for (case, expected) in [
+            (0, json!(-32000)),
+            (1, json!("absent")),
+            (2, json!("out-of-range")),
+            (3, json!("absent")),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let command: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(command["method"], "Network.enable");
+                let reply = if case == 3 {
+                    format!(
+                        r#"{{"id":{},"result":{{"value":"\ud800"}},"method":42}}"#,
+                        command["id"]
+                    )
+                } else {
+                    let mut error = json!({"message":"Native CDP command admission refused private-message", "data":"private-data"});
+                    if case != 1 {
+                        error["code"] = if case == 0 {
+                            json!(-32000)
+                        } else {
+                            json!(i64::MAX)
+                        };
+                    }
+                    json!({"id":command["id"], "sessionId":"private-session", "error":error})
+                        .to_string()
+                };
+                socket.send(Message::Text(reply)).await.unwrap();
+                while let Some(Ok(_)) = socket.next().await {}
+            });
+            let client = CdpClient::connect(&endpoint).await.unwrap();
+            let note = WorkerRpcFailureNote::default();
+            let error = tokio::time::timeout(
+                Duration::from_secs(1),
+                client.send_network_enable_observed(
+                    Some(json!({})),
+                    Some("private-session"),
+                    Some(&note),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert!(error.starts_with("CDP error (Network.enable): "));
+            let diagnostic = note.test_snapshot();
+            assert_eq!(diagnostic["rpcFailure"], "response-error");
+            assert_eq!(diagnostic["cdpCode"], expected);
+            assert!(diagnostic["error"].is_null());
+            assert!(!diagnostic.to_string().contains("private"));
+            assert!(!diagnostic.to_string().contains("admission refused"));
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn network_enable_failure_origin_records_original_admission_error_without_sending() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                assert!(!message.is_text(), "local refusal must not send CDP");
+            }
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let ledger = OwnerDebtLedger::new(1, "owner".into());
+        client.install_debt_ledger(ledger.clone()).unwrap();
+        let view = client.owner_view(ledger).unwrap();
+        let note = WorkerRpcFailureNote::default();
+        let session = "x".repeat(4097);
+        let observed = view
+            .send_network_enable_observed(None, Some(&session), Some(&note))
+            .await;
+        let ordinary = view
+            .send_command("Network.enable", None, Some(&session))
+            .await;
+        assert_eq!(observed, ordinary);
+        assert_eq!(
+            observed,
+            Err("Native CDP command admission refused".to_string())
+        );
+        let diagnostic = note.test_snapshot();
+        assert_eq!(diagnostic["rpcFailure"], "reserve");
+        assert_eq!(diagnostic["error"], "capacity-exceeded");
+        assert!(diagnostic["cdpCode"].is_null());
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn network_enable_failure_origin_drop_is_unknown_not_a_returned_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let command: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(command["method"], "Network.enable");
+            seen_tx.send(()).unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let note = WorkerRpcFailureNote::default();
+        let mut request =
+            Box::pin(client.send_network_enable_observed(None, Some("worker"), Some(&note)));
+        tokio::select! {
+            result = &mut request => panic!("unexpected completion: {result:?}"),
+            _ = seen_rx => {}
+        }
+        drop(request);
+        assert_eq!(note.test_snapshot()["rpcFailure"], "unknown");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.pending_len().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        client.close().await;
+        peer.await.unwrap();
+    }
 
     #[tokio::test]
     async fn navigation_stop_requires_exact_retiring_journal_and_original_writer_deadline() {

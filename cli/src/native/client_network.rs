@@ -15,7 +15,9 @@ use super::client_session::{
     CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
     OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
 };
-use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
+use super::client_settlement_trace::{
+    ServiceWorkerAdmission, WorkerAdmissionStep, WorkerRpcFailureNote,
+};
 use super::client_transport::ClientEventSink;
 use base64::Engine;
 use serde_json::{json, Value};
@@ -552,8 +554,9 @@ impl ClientNetwork {
             );
         }
         let result = tokio::time::timeout_at(operation.deadline.into(), async {
-            ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkEnable,
-                self.client.send_command("Network.enable", Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id))).await?;
+            let failure = admission.map(|_| WorkerRpcFailureNote::default());
+            ServiceWorkerAdmission::observe_network_enable(admission, failure.as_ref(),
+                self.client.send_network_enable_observed(Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id), failure.as_ref())).await?;
             if policy.bypass_service_worker { ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkBypass,
                 self.client.send_command("Network.setBypassServiceWorker",Some(json!({"bypass":true})),Some(&id))).await?; }
             ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::FetchEnable,
