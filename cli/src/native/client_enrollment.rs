@@ -11,6 +11,7 @@ use super::client_network::{ApplicationSession, ClientNetwork};
 use super::client_page::ClientPageState;
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
+use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -2624,7 +2625,15 @@ impl ClientEnrollment {
         entry: Attribution,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
-        let result = self.initialize_inner(entry.clone(), op).await;
+        self.initialize_observed(entry, op, None).await
+    }
+    async fn initialize_observed(
+        &self,
+        entry: Attribution,
+        op: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
+    ) -> Result<(), ProtocolError> {
+        let result = self.initialize_inner(entry.clone(), op, admission).await;
         let Err(error) = result else {
             return Ok(());
         };
@@ -2676,13 +2685,24 @@ impl ClientEnrollment {
         &self,
         mut entry: Attribution,
         op: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
     ) -> Result<(), ProtocolError> {
-        let purpose = bounded(op, self.targets.purpose(&entry.target)).await?;
+        let purpose = ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::Purpose,
+            bounded(op, self.targets.purpose(&entry.target)),
+        )
+        .await?;
         if purpose == TargetPurpose::StateBootstrap {
             return Ok(());
         }
         let lease = self.lease(&entry)?;
-        let _config = bounded(op, async { Ok(self.config_gate.lock().await) }).await?;
+        let _config = ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::ConfigGate,
+            bounded(op, async { Ok(self.config_gate.lock().await) }),
+        )
+        .await?;
         self.check()?;
         if self.config.block_service_workers {
             self.page.ensure_service_worker_policy(&lease, op)?;
@@ -2713,13 +2733,14 @@ impl ClientEnrollment {
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             == entry.root;
         self.network
-            .configure_session(
+            .configure_session_observed(
                 ApplicationSession {
                     session_id: entry.session.clone(),
                     root_page_session: entry.root.clone(),
                     active_page: active,
                 },
                 op,
+                admission,
             )
             .await?;
         let page_target = matches!(entry.kind.as_str(), "page" | "iframe");
@@ -2751,8 +2772,12 @@ impl ClientEnrollment {
         // new windows; creating the world inside that first registration can
         // re-enter new-document injection and execute only script zero twice.
         // Runtime events are already subscribed, and the target stays paused.
-        self.command(op, Some(&entry.session), "Runtime.enable", json!({}))
-            .await?;
+        ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::RuntimeEnable,
+            self.command(op, Some(&entry.session), "Runtime.enable", json!({})),
+        )
+        .await?;
         if page_target {
             let revision = self
                 .page
@@ -2763,25 +2788,44 @@ impl ClientEnrollment {
             }
         }
         // Autoattach is recursive. Install it while this target is paused.
-        self.command(
-            op,
-            Some(&entry.session),
-            "Target.setAutoAttach",
-            autoattach(true),
+        ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::RecursiveAutoattach,
+            self.command(
+                op,
+                Some(&entry.session),
+                "Target.setAutoAttach",
+                autoattach(true),
+            ),
         )
         .await?;
-        self.targets.configured(&entry.target)?;
-        let permit = bounded(op, self.targets.resume_permit(&entry.target)).await?;
-        self.command(
-            op,
-            Some(&entry.session),
-            "Runtime.runIfWaitingForDebugger",
-            json!({}),
+        ServiceWorkerAdmission::observe_sync(admission, WorkerAdmissionStep::Configured, || {
+            self.targets.configured(&entry.target)
+        })?;
+        let permit = ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::ResumePermit,
+            bounded(op, self.targets.resume_permit(&entry.target)),
+        )
+        .await?;
+        ServiceWorkerAdmission::observe(
+            admission,
+            WorkerAdmissionStep::ResumeDebugger,
+            self.command(
+                op,
+                Some(&entry.session),
+                "Runtime.runIfWaitingForDebugger",
+                json!({}),
+            ),
         )
         .await?;
         lease.permit.check()?;
         permit.complete()?;
-        self.network.configuration_committed(&entry.session, op)?;
+        ServiceWorkerAdmission::observe_sync(
+            admission,
+            WorkerAdmissionStep::ConfigurationCommitted,
+            || self.network.configuration_committed(&entry.session, op),
+        )?;
         if let Some(current) = self
             .index
             .lock()
@@ -3906,9 +3950,25 @@ impl ClientEnrollment {
         // Stored scope failure takes precedence over retirement cancellation.
         // Foreign cleanup above must remain live even for a poisoned scope.
         self.check().map_err(|error| self.admission_error(error))?;
-        let auxiliary = bounded(
-            &self.operation(),
-            self.targets.classify_auxiliary_attachment(target, &session),
+        // Only this authorized service-worker attachment receives a diagnostic ordinal.
+        let admission = if kind == "service_worker" {
+            ServiceWorkerAdmission::start(
+                self.generation,
+                event
+                    .params
+                    .get("waitingForDebugger")
+                    .and_then(Value::as_bool),
+            )
+        } else {
+            None
+        };
+        let auxiliary = ServiceWorkerAdmission::observe(
+            admission.as_ref(),
+            WorkerAdmissionStep::AuxiliaryClassification,
+            bounded(
+                &self.operation(),
+                self.targets.classify_auxiliary_attachment(target, &session),
+            ),
         )
         .await?;
         match auxiliary {
@@ -3917,8 +3977,15 @@ impl ClientEnrollment {
         }
         #[cfg(test)]
         self.trace_capture_admission(CaptureLifecycleStep::RegisteringAttached, target, &session);
-        match self.register(context, target, &session, kind, event.session_id.as_deref())? {
-            Some(entry) => self.initialize(entry, &self.operation()).await,
+        match ServiceWorkerAdmission::observe_sync(
+            admission.as_ref(),
+            WorkerAdmissionStep::Register,
+            || self.register(context, target, &session, kind, event.session_id.as_deref()),
+        )? {
+            Some(entry) => {
+                self.initialize_observed(entry, &self.operation(), admission.as_ref())
+                    .await
+            }
             None => {
                 let same = self
                     .index

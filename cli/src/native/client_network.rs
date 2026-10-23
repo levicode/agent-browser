@@ -15,6 +15,7 @@ use super::client_session::{
     CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
     OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
 };
+use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_transport::ClientEventSink;
 use base64::Engine;
 use serde_json::{json, Value};
@@ -502,10 +503,20 @@ impl ClientNetwork {
         *source = staged;
         Ok(())
     }
+    #[cfg(test)]
     pub async fn configure_session(
         &self,
         session: ApplicationSession,
         operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.configure_session_observed(session, operation, None)
+            .await
+    }
+    pub(crate) async fn configure_session_observed(
+        &self,
+        session: ApplicationSession,
+        operation: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
     ) -> Result<(), ProtocolError> {
         self.check()?;
         if operation.generation != self.scope.generation
@@ -541,9 +552,12 @@ impl ClientNetwork {
             );
         }
         let result = tokio::time::timeout_at(operation.deadline.into(), async {
-            self.client.send_command("Network.enable", Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id)).await?;
-            if policy.bypass_service_worker { self.client.send_command("Network.setBypassServiceWorker",Some(json!({"bypass":true})),Some(&id)).await?; }
-            self.client.send_command("Fetch.enable", Some(json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}],"handleAuthRequests":true})), Some(&id)).await?;
+            ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkEnable,
+                self.client.send_command("Network.enable", Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id))).await?;
+            if policy.bypass_service_worker { ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkBypass,
+                self.client.send_command("Network.setBypassServiceWorker",Some(json!({"bypass":true})),Some(&id))).await?; }
+            ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::FetchEnable,
+                self.client.send_command("Fetch.enable", Some(json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}],"handleAuthRequests":true})), Some(&id))).await?;
             Ok::<(), String>(())
         }).await;
         if !matches!(result, Ok(Ok(()))) {

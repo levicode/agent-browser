@@ -24,6 +24,7 @@ pub(crate) enum SettlementPhase {
     ScreenshotFirstFailure,
     FrameInventoryRejection,
     ReadonlyPrepareFailure,
+    ServiceWorkerAdmission,
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -160,6 +161,14 @@ pub(crate) enum MessageKind {
 pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_ordinal: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_step: Option<WorkerAdmissionStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_state: Option<WorkerAdmissionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for_debugger: Option<WorkerDebuggerWait>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_point: Option<InventoryPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -510,6 +519,173 @@ pub(crate) struct InventorySnapshot {
 // quarantine mutates the registry. Only bounded facts reach the opt-in sink.
 pub(crate) fn inventory_enabled() -> bool {
     CLEANUP_SINK.get().and_then(Option::as_ref).is_some()
+}
+
+// Independent of operation and cleanup ownership. These observations never admit,
+// resume or retry a target. In particular enter is not a wire-submission receipt.
+const MAX_DIAGNOSTIC_WORKERS: u64 = 8;
+const MAX_WORKER_RECORDS: u64 = 32;
+static DIAGNOSTIC_WORKERS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkerAdmissionStep {
+    OwnedAttachment,
+    AuxiliaryClassification,
+    Register,
+    Purpose,
+    ConfigGate,
+    NetworkEnable,
+    NetworkBypass,
+    FetchEnable,
+    RuntimeEnable,
+    RecursiveAutoattach,
+    Configured,
+    ResumePermit,
+    ResumeDebugger,
+    ConfigurationCommitted,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum WorkerAdmissionState {
+    Enter,
+    Done,
+    Failed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerDebuggerWait {
+    True,
+    False,
+    Unknown,
+}
+impl From<Option<bool>> for WorkerDebuggerWait {
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::True,
+            Some(false) => Self::False,
+            None => Self::Unknown,
+        }
+    }
+}
+impl Serialize for WorkerDebuggerWait {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::True => serializer.serialize_bool(true),
+            Self::False => serializer.serialize_bool(false),
+            Self::Unknown => serializer.serialize_str("unknown"),
+        }
+    }
+}
+/// Stack-owned, scalar-only observation of one authorized service-worker attachment.
+/// The ordinal is process-local diagnostic data, never a target/session identity.
+pub(crate) struct ServiceWorkerAdmission {
+    generation: u64,
+    ordinal: u8,
+    waiting: WorkerDebuggerWait,
+    records: AtomicU64,
+}
+impl ServiceWorkerAdmission {
+    pub(crate) fn start(generation: u64, waiting: Option<bool>) -> Option<Self> {
+        let capture = CLEANUP_SINK.get().and_then(Option::as_ref)?;
+        Self::start_into(capture, &DIAGNOSTIC_WORKERS, generation, waiting)
+    }
+    fn start_into(
+        capture: &Capture,
+        workers: &AtomicU64,
+        generation: u64,
+        waiting: Option<bool>,
+    ) -> Option<Self> {
+        let ordinal = increment(workers, 1, &capture.counters.overflow);
+        if ordinal >= MAX_DIAGNOSTIC_WORKERS {
+            Self::limit(capture, ordinal == MAX_DIAGNOSTIC_WORKERS);
+            return None;
+        }
+        let result = Self {
+            generation,
+            ordinal: (ordinal + 1) as u8,
+            waiting: waiting.into(),
+            records: AtomicU64::new(0),
+        };
+        result.record_into(
+            capture,
+            WorkerAdmissionStep::OwnedAttachment,
+            WorkerAdmissionState::Done,
+        );
+        Some(result)
+    }
+    fn limit(capture: &Capture, first: bool) {
+        increment(&capture.counters.suppressed, 1, &capture.counters.overflow);
+        if first {
+            record_capture(capture, 0, Phase::CaptureLimitReached, Facts::default());
+        }
+    }
+    fn record_into(
+        &self,
+        capture: &Capture,
+        step: WorkerAdmissionStep,
+        state: WorkerAdmissionState,
+    ) {
+        let ordinal = increment(&self.records, 1, &capture.counters.overflow);
+        if ordinal >= MAX_WORKER_RECORDS {
+            Self::limit(capture, ordinal == MAX_WORKER_RECORDS);
+            return;
+        }
+        record_capture(
+            capture,
+            0,
+            Phase::ServiceWorkerAdmission,
+            Facts {
+                generation: Some(self.generation),
+                worker_ordinal: Some(self.ordinal),
+                admission_step: Some(step),
+                admission_state: Some(state),
+                waiting_for_debugger: Some(self.waiting),
+                ..Facts::default()
+            },
+        );
+    }
+    fn record(trace: Option<&Self>, step: WorkerAdmissionStep, state: WorkerAdmissionState) {
+        if let (Some(trace), Some(capture)) = (trace, CLEANUP_SINK.get().and_then(Option::as_ref)) {
+            trace.record_into(capture, step, state);
+        }
+    }
+    pub(crate) async fn observe<T, E>(
+        trace: Option<&Self>,
+        step: WorkerAdmissionStep,
+        future: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        Self::record(trace, step, WorkerAdmissionState::Enter);
+        let result = future.await;
+        // For RPC steps only successful completion of the original await is done.
+        Self::record(
+            trace,
+            step,
+            if result.is_ok() {
+                WorkerAdmissionState::Done
+            } else {
+                WorkerAdmissionState::Failed
+            },
+        );
+        result
+    }
+    pub(crate) fn observe_sync<T, E>(
+        trace: Option<&Self>,
+        step: WorkerAdmissionStep,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        Self::record(trace, step, WorkerAdmissionState::Enter);
+        let result = action();
+        Self::record(
+            trace,
+            step,
+            if result.is_ok() {
+                WorkerAdmissionState::Done
+            } else {
+                WorkerAdmissionState::Failed
+            },
+        );
+        result
+    }
 }
 
 /// Closed call-site evidence for optional trace screenshots, not protocol authority.
@@ -1372,6 +1548,144 @@ impl Drop for FrameTrace {
 #[cfg(all(test, feature = "acceptance-faults"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_worker_admission_is_closed_process_local_and_bounded() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let workers = AtomicU64::new(0);
+        for index in 0..10 {
+            let waiting = [Some(true), Some(false), None][index % 3];
+            let trace = ServiceWorkerAdmission::start_into(&capture, &workers, 7, waiting);
+            assert_eq!(trace.is_some(), index < 8);
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                assert!(line.len() < MAX_RECORD_BYTES);
+                serde_json::from_str(line).unwrap()
+            })
+            .collect();
+        assert_eq!(values.len(), 9);
+        for (index, value) in values[..8].iter().enumerate() {
+            assert_eq!(value["phase"], "ServiceWorkerAdmission");
+            assert_eq!(value["operationSeq"], 0);
+            assert_eq!(value["workerOrdinal"], index + 1);
+            assert_eq!(value["generation"], 7);
+            assert_eq!(value["admissionStep"], "owned-attachment");
+            assert_eq!(value["admissionState"], "done");
+            assert_eq!(
+                value["waitingForDebugger"],
+                [
+                    serde_json::json!(true),
+                    serde_json::json!(false),
+                    serde_json::json!("unknown")
+                ][index % 3]
+            );
+            let keys: Vec<_> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "admissionState",
+                    "admissionStep",
+                    "droppedBefore",
+                    "emittedBefore",
+                    "generation",
+                    "operationSeq",
+                    "overflow",
+                    "phase",
+                    "pid",
+                    "record",
+                    "schemaVersion",
+                    "source",
+                    "suppressedBefore",
+                    "waitingForDebugger",
+                    "workerOrdinal"
+                ]
+            );
+        }
+        assert_eq!(values[8]["phase"], "CaptureLimitReached");
+        assert_eq!(values[8]["suppressedBefore"], 1);
+    }
+
+    #[test]
+    fn service_worker_admission_never_exceeds_thirty_two_observations() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let trace =
+            ServiceWorkerAdmission::start_into(&capture, &AtomicU64::new(0), 1, None).unwrap();
+        for _ in 0..40 {
+            trace.record_into(
+                &capture,
+                WorkerAdmissionStep::NetworkEnable,
+                WorkerAdmissionState::Enter,
+            );
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value["phase"] == "ServiceWorkerAdmission")
+                .count(),
+            32
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value["phase"] == "CaptureLimitReached")
+                .count(),
+            1
+        );
+        assert!(values.iter().all(|value| value["operationSeq"] == 0));
+    }
+
+    #[tokio::test]
+    async fn service_worker_observer_preserves_success_failure_and_pending_futures() {
+        assert_eq!(
+            ServiceWorkerAdmission::observe(None, WorkerAdmissionStep::NetworkEnable, async {
+                Ok::<_, u8>(41)
+            })
+            .await,
+            Ok(41)
+        );
+        assert_eq!(
+            ServiceWorkerAdmission::observe(None, WorkerAdmissionStep::FetchEnable, async {
+                Err::<u8, _>(42)
+            })
+            .await,
+            Err(42)
+        );
+        assert_eq!(
+            ServiceWorkerAdmission::observe_sync(None, WorkerAdmissionStep::Configured, || Err::<
+                u8,
+                _,
+            >(
+                43
+            )),
+            Err(43)
+        );
+        let pending = ServiceWorkerAdmission::observe(
+            None,
+            WorkerAdmissionStep::RuntimeEnable,
+            std::future::pending::<Result<(), u8>>(),
+        );
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("observer completed an unacknowledged command"),
+            _ = std::future::ready(()) => {}
+        }
+    }
 
     fn sample(ordinal: u64) -> Record {
         Record {
