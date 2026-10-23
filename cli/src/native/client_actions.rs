@@ -1684,6 +1684,7 @@ async fn center(
 ) -> Result<(Point, (f64, f64)), ProtocolError> {
     let mut previous: Option<(Point, (f64, f64))> = None;
     let mut longest_attempt = Duration::ZERO;
+    let mut longest_retry_interval = Duration::ZERO;
     loop {
         #[cfg(test)]
         tests::preparation_trace(
@@ -1700,7 +1701,7 @@ async fn center(
             ctx.operation
                 .deadline
                 .saturating_duration_since(Instant::now()),
-            longest_attempt,
+            preparation_retry_estimate(d, longest_attempt, longest_retry_interval),
             || ctx.check(),
         )?;
         // An earlier ACK cannot certify even a later read which is still pending.
@@ -1743,7 +1744,7 @@ async fn center(
                     ctx.operation
                         .deadline
                         .saturating_duration_since(Instant::now()),
-                    longest_attempt,
+                    preparation_retry_estimate(d, longest_attempt, longest_retry_interval),
                     || ctx.check(),
                 )?;
             }
@@ -1775,6 +1776,22 @@ async fn center(
             }
             Err(error) => return Err(error),
         }
+        if d.readonly_preparation_enabled.load(Ordering::SeqCst) {
+            // Include the actual timer wake, not just the pure probe. A rounded
+            // retry pause can otherwise skip the entire classification window.
+            longest_retry_interval = longest_retry_interval.max(started.elapsed());
+        }
+    }
+}
+fn preparation_retry_estimate(
+    d: &Dispatch,
+    longest_attempt: Duration,
+    longest_retry_interval: Duration,
+) -> Duration {
+    if d.readonly_preparation_enabled.load(Ordering::SeqCst) {
+        longest_attempt.max(longest_retry_interval)
+    } else {
+        longest_attempt
     }
 }
 /// Return an ordinary refusal only while its exact attempt remains current.
@@ -3812,6 +3829,73 @@ mod tests {
             );
             assert!(!d.readonly_preparation_stopped.load(Ordering::SeqCst));
         }
+    }
+
+    #[test]
+    fn readonly_preparation_accounts_for_actual_retry_wake_without_widening_tap() {
+        let attempt = Duration::from_micros(50);
+        let retry = Duration::from_micros(18_500);
+        let remaining = Duration::from_millis(284);
+        assert!(preparation_has_classification_slack(remaining));
+        assert!(!preparation_classification_window(remaining, attempt));
+        let late = remaining.saturating_sub(retry);
+        assert!(!preparation_has_classification_slack(late));
+
+        let readonly = Dispatch::default();
+        readonly
+            .readonly_preparation_enabled
+            .store(true, Ordering::SeqCst);
+        readonly
+            .readonly_preparation_refusal
+            .store(true, Ordering::SeqCst);
+        assert_eq!(
+            preparation_refusal_checkpoint(
+                &readonly,
+                remaining,
+                preparation_retry_estimate(&readonly, attempt, retry),
+                || Ok(())
+            ),
+            Err(ProtocolError::NotActionable)
+        );
+        assert!(readonly.readonly_preparation_stopped.load(Ordering::SeqCst));
+
+        readonly
+            .readonly_preparation_stopped
+            .store(false, Ordering::SeqCst);
+        assert_eq!(
+            preparation_refusal_checkpoint(
+                &readonly,
+                late,
+                preparation_retry_estimate(&readonly, attempt, retry),
+                || panic!("late wake must not mint a safe refusal")
+            ),
+            Ok(())
+        );
+        assert!(!readonly.readonly_preparation_stopped.load(Ordering::SeqCst));
+        readonly.begin_preparation_attempt();
+        assert_eq!(
+            preparation_refusal_checkpoint(
+                &readonly,
+                remaining,
+                preparation_retry_estimate(&readonly, attempt, retry),
+                || panic!("new probe must invalidate the old receipt")
+            ),
+            Ok(())
+        );
+
+        let tap = Dispatch::default();
+        tap.preparation_enabled.store(true, Ordering::SeqCst);
+        tap.preparation_refusal.store(true, Ordering::SeqCst);
+        assert_eq!(
+            preparation_refusal_checkpoint(
+                &tap,
+                remaining,
+                preparation_retry_estimate(&tap, attempt, retry),
+                || panic!("read-only retry timing must not widen Tap's window")
+            ),
+            Ok(())
+        );
+        assert!(!tap.preparation_stopped.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
