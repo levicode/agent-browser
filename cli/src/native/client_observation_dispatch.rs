@@ -924,6 +924,98 @@ impl ObservationDispatch {
         publication.commit_refs(kind, revision, &mut refs, staged);
         Ok(())
     }
+    fn check_initial_trace_owner(
+        &self,
+        context: &DispatchContext,
+        operation: &OperationLease,
+        retirement_fence: u64,
+    ) -> Result<(), ProtocolError> {
+        check(&context.page, operation)?;
+        self.check_publication_fence(retirement_fence)?;
+        if !context
+            .attachment
+            .same_attachment(&context.page.targets.owned_target(&context.page.target_id)?)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    // This is a settled-prefix check, not permission for later commands. The
+    // existing journal/admission checks still run on every subsequent RPC.
+    fn initial_trace_prefix_settled(
+        context: &DispatchContext,
+        operation: &OperationLease,
+        cleanup: &AtomicBool,
+    ) -> bool {
+        let Some(ledger) = context.page.client.debt_ledger() else {
+            return false;
+        };
+        if cleanup.load(Ordering::SeqCst)
+            || !ledger.matches_owner(operation.generation, &context.scope.identity_scope)
+            || context
+                .page
+                .client
+                .check_cleanup_owner(&Some(ledger.clone()))
+                .is_err()
+            || ledger
+                .check_admission(super::client_debt::AdmissionClass::Reference)
+                .is_err()
+        {
+            return false;
+        }
+        let debt = ledger.snapshot();
+        !debt.integrity_lost
+            && debt.input_debt == 0
+            && debt.object_debt == 0
+            && debt.outstanding_commands == 0
+    }
+    async fn initial_trace_frames(
+        &self,
+        context: &DispatchContext,
+        operation: &OperationLease,
+        retirement_fence: u64,
+        cleanup: &AtomicBool,
+        screenshot: Option<&ScreenshotFailureWitness>,
+    ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+        let mut reacquired = false;
+        loop {
+            self.check_initial_trace_owner(context, operation, retirement_fence)?;
+            let result =
+                frame_inventory_attempt(&context.page, operation, Some(cleanup), screenshot).await;
+            match result {
+                Ok(inventory) => {
+                    self.check_initial_trace_owner(context, operation, retirement_fence)?;
+                    // A later prefix cannot borrow the previous round's zero-debt
+                    // observation. In particular, an accepted retained release is
+                    // not a settled ACK, even when enumeration returned success.
+                    if reacquired
+                        && !Self::initial_trace_prefix_settled(context, operation, cleanup)
+                    {
+                        return Err(ProtocolError::ScopeUnavailable);
+                    }
+                    return Ok(inventory.frames);
+                }
+                Err(failure) => {
+                    if !failure.revision_only() {
+                        return Err(failure.record(screenshot));
+                    }
+                    self.check_initial_trace_owner(context, operation, retirement_fence)?;
+                    if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+                        return Err(failure.record(screenshot));
+                    }
+                    // The failed attempt owns only local binding vectors here;
+                    // all remote obligations must have settled before repeating.
+                    // No protected journal, animation, source mask or capture has begun.
+                    tokio::task::yield_now().await;
+                    self.check_initial_trace_owner(context, operation, retirement_fence)?;
+                    if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+                        return Err(failure.record(screenshot));
+                    }
+                    reacquired = true;
+                }
+            }
+        }
+    }
     #[allow(clippy::too_many_arguments)] // The optional diagnostic borrows only for this run.
     async fn run(
         &self,
@@ -1160,14 +1252,11 @@ impl ObservationDispatch {
         #[cfg(test)]
         witness.enter(ObserveFailureStage::InitialFrames);
         screenshot_stage(screenshot, ScreenshotStage::InitialFrames);
-        let frames = verified_frames_with_diagnostic(
-            &context.page,
-            &operation,
-            Some(&observation_cleanup),
-            screenshot,
-        )
-        .await
-        .map_err(failure)?;
+        let frames = if matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
+            self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
+        } else {
+            verified_frames_with_diagnostic(&context.page, &operation, Some(&observation_cleanup), screenshot).await
+        }.map_err(failure)?;
         let fallback_selector = match &request {
             DispatchRequest::Observe(request) if request.options.pixel_fallback => {
                 Some(request.secure_field_selector.clone())
@@ -1845,6 +1934,53 @@ async fn verified_frame_inventory_with_diagnostic(
     cleanup: Option<&AtomicBool>,
     screenshot: Option<&ScreenshotFailureWitness>,
 ) -> Result<VerifiedFrameInventory, ProtocolError> {
+    frame_inventory_attempt(page, operation, cleanup, screenshot)
+        .await
+        .map_err(|failure| failure.record(screenshot))
+}
+enum FrameInventoryFailure {
+    Read(ProtocolError),
+    Fence {
+        error: ProtocolError,
+        revision_only: bool,
+        diagnostic: Option<diagnostic::FrameInventoryRejection>,
+    },
+}
+impl From<ProtocolError> for FrameInventoryFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self::Read(error)
+    }
+}
+impl FrameInventoryFailure {
+    fn revision_only(&self) -> bool {
+        matches!(
+            self,
+            Self::Fence {
+                revision_only: true,
+                ..
+            }
+        )
+    }
+    fn record(self, witness: Option<&ScreenshotFailureWitness>) -> ProtocolError {
+        match self {
+            Self::Read(error) => error,
+            Self::Fence {
+                error, diagnostic, ..
+            } => {
+                if let Some(witness) = witness {
+                    witness.inventory_failure(diagnostic, &error);
+                }
+                error
+            }
+        }
+    }
+}
+async fn frame_inventory_attempt(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+    screenshot: Option<&ScreenshotFailureWitness>,
+) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
     check(page, operation)?;
     let (revision, targets, inventory_before) = page
         .targets
@@ -1862,7 +1998,7 @@ async fn verified_frame_inventory_with_diagnostic(
         })
         .ok_or(ProtocolError::StaleScope)?;
     if !main.resumed {
-        return Err(ProtocolError::ScopeUnavailable);
+        return Err(ProtocolError::ScopeUnavailable.into());
     }
     let mut sessions = HashSet::new();
     let mut trees = Vec::new();
@@ -1873,10 +2009,10 @@ async fn verified_frame_inventory_with_diagnostic(
             continue;
         }
         if !target.configured || !target.resumed {
-            return Err(ProtocolError::ScopeUnavailable);
+            return Err(ProtocolError::ScopeUnavailable.into());
         }
         if !sessions.insert(target.session_id.clone()) {
-            return Err(ProtocolError::StaleScope);
+            return Err(ProtocolError::StaleScope.into());
         }
         if !matches!(target.kind.as_str(), "page" | "iframe") {
             continue;
@@ -1902,7 +2038,7 @@ async fn verified_frame_inventory_with_diagnostic(
             })?;
     let root = main_frame(&frames)?;
     if root.binding.session != page.page_session_id {
-        return Err(ProtocolError::StaleScope);
+        return Err(ProtocolError::StaleScope.into());
     }
     let mut ids = HashSet::new();
     for frame in &frames {
@@ -1911,14 +2047,14 @@ async fn verified_frame_inventory_with_diagnostic(
             || !sessions.contains(&frame.binding.session)
             || !ids.insert(frame.binding.frame.clone())
         {
-            return Err(ProtocolError::StaleScope);
+            return Err(ProtocolError::StaleScope.into());
         }
         if let Some(parent) = &frame.parent_frame_id {
             if !frames
                 .iter()
                 .any(|candidate| &candidate.binding.frame == parent)
             {
-                return Err(ProtocolError::StaleScope);
+                return Err(ProtocolError::StaleScope.into());
             }
         }
     }
@@ -1927,7 +2063,7 @@ async fn verified_frame_inventory_with_diagnostic(
             .iter()
             .any(|frame| lineage.parents.get(&frame.binding.frame) != Some(&frame.parent_frame_id))
     {
-        return Err(ProtocolError::StaleScope);
+        return Err(ProtocolError::StaleScope.into());
     }
     for (frame, session) in &mapping {
         if !frames.iter().any(|candidate| {
@@ -1935,19 +2071,25 @@ async fn verified_frame_inventory_with_diagnostic(
                 && &candidate.binding.session == session
                 && candidate.parent_frame_id.is_some()
         }) {
-            return Err(ProtocolError::UnsupportedCapability);
+            return Err(ProtocolError::UnsupportedCapability.into());
         }
     }
-    if let Some(witness) = screenshot {
-        let (result, rejection) = page.targets.check_revision_with_diagnostic(
-            revision,
-            inventory_before.as_ref(),
-            main,
-            witness.frame_pass(),
-        );
-        result.inspect_err(|error| witness.inventory_failure(rejection, error))?;
-    } else {
-        page.targets.check_revision(revision)?;
+    let fence = page.targets.check_acquisition_revision(
+        revision,
+        inventory_before.as_ref(),
+        main,
+        screenshot.map_or(
+            diagnostic::FrameInventoryPass::Initial,
+            ScreenshotFailureWitness::frame_pass,
+        ),
+        screenshot.is_some(),
+    );
+    if let Err(error) = fence.result {
+        return Err(FrameInventoryFailure::Fence {
+            error,
+            revision_only: fence.revision_only,
+            diagnostic: fence.diagnostic,
+        });
     }
     check(page, operation)?;
     Ok(VerifiedFrameInventory {
@@ -4625,3 +4767,7 @@ mod tests {
 #[cfg(test)]
 #[path = "client_frame_inventory_tests.rs"]
 mod frame_inventory_tests;
+
+#[cfg(test)]
+#[path = "client_trace_initial_inventory_tests.rs"]
+mod trace_initial_inventory_tests;

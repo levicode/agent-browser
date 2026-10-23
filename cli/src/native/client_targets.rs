@@ -86,6 +86,12 @@ pub(crate) struct RevisionSnapshot {
     counts: [u64; 7],
     overflow: bool,
 }
+// Product classification from the original atomic fence, independent of diagnostics.
+pub(crate) struct InventoryRevisionCheck {
+    pub result: Result<(), ProtocolError>,
+    pub revision_only: bool,
+    pub diagnostic: Option<diagnostic::FrameInventoryRejection>,
+}
 impl Registry {
     fn note_revision_enabled(
         &mut self,
@@ -1023,6 +1029,7 @@ impl ClientTargets {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         state.revision_result(revision)
     }
+    #[cfg(test)]
     pub(crate) fn check_revision_with_diagnostic(
         &self,
         revision: u64,
@@ -1033,14 +1040,33 @@ impl ClientTargets {
         Result<(), ProtocolError>,
         Option<diagnostic::FrameInventoryRejection>,
     ) {
+        let check = self.check_acquisition_revision(revision, before, selected, pass, true);
+        (check.result, check.diagnostic)
+    }
+    pub(crate) fn check_acquisition_revision(
+        &self,
+        revision: u64,
+        before: Option<&RevisionSnapshot>,
+        selected: &OwnedTarget,
+        pass: diagnostic::FrameInventoryPass,
+        observe: bool,
+    ) -> InventoryRevisionCheck {
         let Ok(state) = self.state.lock() else {
-            return (Err(ProtocolError::ScopeUnavailable), None);
+            return InventoryRevisionCheck {
+                result: Err(ProtocolError::ScopeUnavailable),
+                revision_only: false,
+                diagnostic: None,
+            };
         };
         let result = state.revision_result(revision);
-        let failure = result
-            .is_err()
+        let revision_only = !state.sealed && state.reservations == 0 && state.revision != revision;
+        let diagnostic = (observe && result.is_err())
             .then(|| state.revision_rejection(revision, before, selected, pass));
-        (result, failure)
+        InventoryRevisionCheck {
+            result,
+            revision_only,
+            diagnostic,
+        }
     }
     pub fn seal(&self) {
         if let Ok(mut state) = self.state.lock() {
