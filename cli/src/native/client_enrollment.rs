@@ -5671,7 +5671,8 @@ mod tests {
         );
         owner.client.install_debt_ledger(ledger.clone()).unwrap();
         owner.targets.bind_eval_owner(&ledger, 1).unwrap();
-        let op = owner.operation();
+        let mut op = owner.operation();
+        op.sequence = 1;
         let _journal = ledger
             .operation(
                 super::super::client_debt::OperationKey {
@@ -5725,7 +5726,8 @@ mod tests {
         let ledger = OwnerDebtLedger::new(1, owner.targets.identity_scope.clone());
         owner.client.install_debt_ledger(ledger.clone()).unwrap();
         owner.targets.bind_eval_owner(&ledger, 1).unwrap();
-        let op = owner.operation();
+        let mut op = owner.operation();
+        op.sequence = 1;
         let _journal = ledger
             .operation(
                 OperationKey {
