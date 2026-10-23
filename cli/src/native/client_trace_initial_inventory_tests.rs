@@ -166,6 +166,13 @@ impl Fixture {
                         }
                         json!({})
                     }
+                    "Browser.getVersion" if race == Race::Cancel => {
+                        // This peer sent the cancelled read's ACK before reading
+                        // this separate test-owned transport fence request.
+                        assert!(request.get("sessionId").is_none());
+                        assert_eq!(peer_samples.load(Ordering::SeqCst), 1);
+                        json!({"protocolVersion":"1.3"})
+                    }
                     "Target.setAutoAttach" => {
                         assert_eq!(request["params"]["autoAttach"], false);
                         json!({})
@@ -176,8 +183,8 @@ impl Fixture {
                     }
                     "Animation.setPlaybackRate" if race == Race::Protected => {
                         assert!(
-                            request["params"]["playbackRate"] == 0
-                                || request["params"]["playbackRate"] == 1
+                            request["params"]["playbackRate"].as_f64() == Some(0.0)
+                                || request["params"]["playbackRate"].as_f64() == Some(1.0)
                         );
                         json!({})
                     }
@@ -376,6 +383,22 @@ impl Fixture {
             .await
             .unwrap();
         }
+        if failure.error == ProtocolError::Cancelled {
+            // Cancellation can return before the prior ACK is read. Outside the
+            // cancelled operation, an exact owner-bound read fences this peer's
+            // ordered replies. Its ACK is delivered only after reader settlement;
+            // it neither resends the frame read nor forgives any remaining debt.
+            assert!(OperationJournalHandle::current().is_none());
+            let owner = client.owner_view(self.ledger.clone()).unwrap();
+            let ack = tokio::time::timeout(
+                Duration::from_secs(1),
+                owner.send_command_no_params("Browser.getVersion", None),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(ack["protocolVersion"], "1.3");
+        }
         let first = witness.as_ref().and_then(|witness| {
             witness.failure(&failure.error);
             witness.take_failure(|| None)
@@ -493,6 +516,21 @@ async fn trace_initial_inventory_cancel_wins_without_reacquisition() {
         .await;
     assert_eq!(outcome.error, ProtocolError::Cancelled);
     assert_eq!(outcome.samples, 1);
+    assert_eq!(
+        outcome
+            .log
+            .iter()
+            .map(|row| row["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "Page.getFrameTree",
+            "Page.getFrameTree",
+            "Page.createIsolatedWorld",
+            "Page.getFrameTree",
+            "Browser.getVersion",
+        ],
+        "one complete acquisition, then only the separate test-owned ACK fence"
+    );
     assert_eq!(
         outcome.first.as_ref().unwrap().stage,
         ScreenshotStage::InitialFrames
@@ -625,7 +663,7 @@ async fn trace_initial_inventory_protected_phase_remains_one_shot() {
             .log
             .iter()
             .filter(|row| row["method"] == "Animation.setPlaybackRate"
-                && row["params"]["playbackRate"] == 0)
+                && row["params"]["playbackRate"].as_f64() == Some(0.0))
             .count(),
         1
     );
@@ -634,7 +672,7 @@ async fn trace_initial_inventory_protected_phase_remains_one_shot() {
             .log
             .iter()
             .filter(|row| row["method"] == "Animation.setPlaybackRate"
-                && row["params"]["playbackRate"] == 1)
+                && row["params"]["playbackRate"].as_f64() == Some(1.0))
             .count(),
         1
     );
