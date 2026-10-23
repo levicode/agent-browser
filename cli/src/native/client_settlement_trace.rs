@@ -21,6 +21,8 @@ pub(crate) enum SettlementPhase {
     CleanupFirstFailure,
     CleanupResult,
     InventorySnapshot,
+    ScreenshotFirstFailure,
+    ReadonlyPrepareFailure,
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -169,6 +171,30 @@ pub(crate) struct Facts {
     pub inventory_reservations: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_unconfigured: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_stage: Option<ScreenshotStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_phase: Option<ScreenshotCapturePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_after_failure: Option<InventoryAfterFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack: Option<ReadonlyAck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<ReadonlyWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zero_input: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<ReadonlyCleanup>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cleanup_owner: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -465,6 +491,153 @@ pub(crate) struct InventorySnapshot {
 // quarantine mutates the registry. Only bounded facts reach the opt-in sink.
 pub(crate) fn inventory_enabled() -> bool {
     CLEANUP_SINK.get().and_then(Option::as_ref).is_some()
+}
+
+/// Closed call-site evidence for optional trace screenshots, not protocol authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScreenshotStage {
+    PrepareScope,
+    PreparePermit,
+    PreparePolicy,
+    PrepareOwner,
+    PrepareFence,
+    RunScope,
+    DebtAdmission,
+    UiAdmission,
+    PublicationAdmission,
+    ProducerReservation,
+    InitialFrames,
+    FrameInventoryFence,
+    ProtectedBarrier,
+    AnimationStabilization,
+    ProtectedFrames,
+    Geometry,
+    TraceMetadata,
+    Capture,
+    Restoration,
+    FinalGeometry,
+    FinalBarrier,
+    FinalFrames,
+    FinalViewport,
+    BlobPublication,
+    Publication,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScreenshotCapturePhase {
+    NotEntered,
+    Admission,
+    IndependentCoverage,
+    SourceProtection,
+    RawCapture,
+    PostCaptureValidation,
+}
+/// Comparison with a later, best-effort inventory read. Never the atomic reject snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryAfterFailure {
+    NotSampled,
+    Unavailable,
+    Unchanged,
+    Changed,
+}
+pub(crate) struct ScreenshotFailure {
+    pub stage: ScreenshotStage,
+    pub capture_phase: ScreenshotCapturePhase,
+    pub inventory_after_failure: InventoryAfterFailure,
+    pub error: ProtocolError,
+}
+pub(crate) fn screenshot_failure(generation: u64, sequence: u64, failure: ScreenshotFailure) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        screenshot_failure_into(capture, generation, sequence, failure);
+    }
+}
+fn screenshot_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: ScreenshotFailure,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ScreenshotFirstFailure,
+        Facts {
+            generation: Some(generation),
+            screenshot_stage: Some(failure.stage),
+            capture_phase: Some(failure.capture_phase),
+            inventory_after_failure: Some(failure.inventory_after_failure),
+            error: Some(failure.error),
+            ..Facts::default()
+        },
+    );
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyAck {
+    None,
+    Current,
+    Retired,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyWindow {
+    NotEntered,
+    Entered,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyCleanup {
+    FailureObserved,
+    NotObserved,
+}
+pub(crate) struct ReadonlyPrepareFailure {
+    pub entry_us: u64,
+    pub ack_us: Option<u64>,
+    pub ack: ReadonlyAck,
+    pub wake_us: Option<u64>,
+    pub fail_us: Option<u64>,
+    pub window: ReadonlyWindow,
+    pub deadline: bool,
+    pub zero_input: bool,
+    pub cleanup: ReadonlyCleanup,
+    pub error: ProtocolError,
+}
+pub(crate) fn readonly_prepare_failure(
+    generation: u64,
+    sequence: u64,
+    failure: ReadonlyPrepareFailure,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        readonly_prepare_failure_into(capture, generation, sequence, failure);
+    }
+}
+fn readonly_prepare_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: ReadonlyPrepareFailure,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ReadonlyPrepareFailure,
+        Facts {
+            generation: Some(generation),
+            entry_us: Some(failure.entry_us),
+            ack_us: failure.ack_us,
+            ack: Some(failure.ack),
+            wake_us: failure.wake_us,
+            fail_us: failure.fail_us,
+            window: Some(failure.window),
+            deadline: Some(failure.deadline),
+            zero_input: Some(failure.zero_input),
+            cleanup: Some(failure.cleanup),
+            error: Some(failure.error),
+            ..Facts::default()
+        },
+    );
 }
 pub(crate) fn inventory_snapshot(
     generation: u64,
