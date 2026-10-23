@@ -1481,7 +1481,7 @@ impl GeometrySnapshot {
 // Full used content-box size includes scrollbars and fractional CSS lengths.
 // LayoutViewport.clientWidth is integer/excludes scrollbars and cannot be the
 // source rectangle of a renderer boundary homography.
-const BOX_PROOF: &str = r#"function(){
+pub(crate) const BOX_PROOF: &str = r#"function(){
  const p=Node.prototype;const connected=Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this)&&(this===document||Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this)===document);
  if(!connected)return {connected:false};
  const frameOwner=this.nodeType===1&&(this.localName==='iframe'||this.localName==='frame');

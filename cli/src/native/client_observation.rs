@@ -3621,6 +3621,13 @@ fn assemble_forest(
         .collect()
 }
 
+pub(crate) const FRAME_OWNER_GEOMETRY: &str = r#"function(){
+                if(this.ownerDocument!==document||!this.isConnected)throw new Error('Frame owner moved');
+                const r=this.getBoundingClientRect();let e=this,parts=[];
+                while(e&&e.nodeType===1){if(e.id){parts.unshift('#'+CSS.escape(e.id));break;}let p=e.parentElement;let index=p?Array.from(p.children).indexOf(e)+1:1;parts.unshift(e.localName+':nth-child('+index+')');e=p;}
+                return {x:r.x+this.clientLeft,y:r.y+this.clientTop,selector:parts.join(' > ')};
+            }"#;
+
 /// Enumerate only the executor's owned page and attached frame sessions. Missing
 /// renderer ownership is an error, never permission to attach an arbitrary tab.
 fn joined_frame_children(tree: &Value, parent: &str, owned: &HashMap<String, Value>) -> Vec<Value> {
@@ -3743,12 +3750,7 @@ pub async fn enumerate_frames(
             let object = resolved["object"]["objectId"]
                 .as_str()
                 .ok_or("Frame owner unavailable")?;
-            let value=command(client,&parent.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":r#"function(){
-                if(this.ownerDocument!==document||!this.isConnected)throw new Error('Frame owner moved');
-                const r=this.getBoundingClientRect();let e=this,parts=[];
-                while(e&&e.nodeType===1){if(e.id){parts.unshift('#'+CSS.escape(e.id));break;}let p=e.parentElement;let index=p?Array.from(p.children).indexOf(e)+1:1;parts.unshift(e.localName+':nth-child('+index+')');e=p;}
-                return {x:r.x+this.clientLeft,y:r.y+this.clientTop,selector:parts.join(' > ')};
-            }"#,"returnByValue":true}),lease).await;
+            let value=command(client,&parent.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":FRAME_OWNER_GEOMETRY,"returnByValue":true}),lease).await;
             let value = value.and_then(|value| {
                 if value.get("exceptionDetails").is_some() {
                     Err(ObservationError::StaleReference)

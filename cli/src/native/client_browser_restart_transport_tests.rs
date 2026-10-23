@@ -102,6 +102,17 @@ async fn peer_with_inputs(
     old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     hold_old_input: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    peer_with_cleanup(ack_before_attach, old_input, hold_old_input, None).await
+}
+async fn peer_with_cleanup(
+    ack_before_attach: bool,
+    old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    hold_old_input: bool,
+    mut cleanup_ack: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -145,6 +156,12 @@ async fn peer_with_inputs(
                     json!({"sessionId":"session-1"})
                 }
                 "Target.setAutoAttach" => {
+                    if session.is_empty() && request["params"]["autoAttach"] == false {
+                        if let Some((reached, release)) = cleanup_ack.take() {
+                            let _ = reached.send(());
+                            let _ = release.await;
+                        }
+                    }
                     if session.is_empty() && request["params"]["autoAttach"] == true && !worker {
                         worker = true;
                         pages.insert("worker".into(), target("worker", "service_worker"));
@@ -242,6 +259,7 @@ async fn peer_with_inputs(
                 | "Fetch.enable"
                 | "Fetch.disable"
                 | "Browser.setDownloadBehavior"
+                | "Browser.close"
                 | "Page.setLifecycleEventsEnabled"
                 | "Emulation.setEmulatedMedia"
                 | "Target.setDiscoverTargets"
@@ -253,10 +271,16 @@ async fn peer_with_inputs(
                     return;
                 }
             }
+            // Flattened CDP replies carry the exact session of their request.
+            // Browser-level replies omit it; a missing session is not an ACK
+            // for a command submitted on a page or worker session.
+            let mut response = json!({"id":request["id"],"result":result});
+            if let Some(session) = request.get("sessionId") {
+                assert!(session.as_str().is_some_and(|value| !value.is_empty()));
+                response["sessionId"] = session.clone();
+            }
             if socket
-                .send(Message::Text(
-                    json!({"id":request["id"],"result":result}).to_string(),
-                ))
+                .send(Message::Text(response.to_string()))
                 .await
                 .is_err()
             {
@@ -337,3 +361,278 @@ async fn real_restart_writer_then_first_evaluate_and_navigation_use_replacement(
 
 #[path = "client_browser_input_waiter_tests.rs"]
 mod input_waiter_tests;
+
+#[tokio::test]
+async fn owned_cleanup_retires_application_before_phase_two_and_browser_close() {
+    let (cleanup_reached, reached) = tokio::sync::oneshot::channel();
+    let (release, cleanup_release) = tokio::sync::oneshot::channel();
+    let (endpoint, log, peer) =
+        peer_with_cleanup(true, None, false, Some((cleanup_reached, cleanup_release))).await;
+    let broker = Arc::new(ClientSession::new());
+    let browser = Arc::new(ClientBrowser::new(broker.clone()));
+    let mut fixture = FramedFixture::new(broker.clone(), browser.clone());
+    fixture.ready().await.unwrap();
+    let opened = fixture
+        .command(
+            "scope.open",
+            fixture_scope_open("connect", Some(&endpoint)),
+            5,
+        )
+        .await
+        .unwrap();
+    let scope = opened["identityScope"].as_str().unwrap().to_owned();
+    fixture.scope = Some(scope.clone());
+    let (ledger, waited) = {
+        let mut owner = browser.owner.lock().await;
+        let owner = owner.as_mut().unwrap();
+        let ledger = owner.manager.client.debt_ledger().unwrap();
+        let waited = owner.manager.install_cleanup_process_witness();
+        (ledger, waited)
+    };
+    // Capture a real pre-retirement application journal. It must not become
+    // usable merely because mandatory owner cleanup still has work to do.
+    let journal = ledger
+        .operation(
+            super::super::super::client_debt::OperationKey {
+                generation: 1,
+                operation_seq: 99,
+            },
+            "page-1".into(),
+            "session-1".into(),
+        )
+        .unwrap();
+    fixture
+        .write(json!({"type":"close","id":"cleanup-close","generation":1}))
+        .await
+        .unwrap();
+    let phase_two = tokio::time::timeout(Duration::from_secs(3), reached).await;
+    let application_stayed_closed = [
+        ("Input.insertText", json!({"text":"must-not-revive"})),
+        (
+            "Runtime.evaluate",
+            json!({"expression":"1","returnByValue":true}),
+        ),
+        ("Page.getFrameTree", json!({})),
+    ]
+    .iter()
+    .all(|(method, params)| {
+        ledger
+            .reserve_command(Some(&journal), method, Some(params), Some("session-1"))
+            .is_err()
+            && ledger
+                .reserve_command(None, method, Some(params), Some("session-1"))
+                .is_err()
+    });
+    let _ = release.send(());
+    let receipt = tokio::time::timeout(Duration::from_secs(7), fixture.read()).await;
+    // Always join the real shutdown owner before reporting an assertion failure.
+    let drained = fixture.finish().await;
+    let peer_result = peer.await;
+    let requests = log.lock().unwrap().clone();
+    assert!(peer_result.is_ok());
+    assert!(
+        waited.load(Ordering::SeqCst),
+        "real manager close did not join its owned process"
+    );
+    let disposal = requests
+        .iter()
+        .position(|r| r["method"] == "Target.disposeBrowserContext")
+        .expect("owned context disposal was never submitted");
+    let detach = requests
+        .iter()
+        .position(|r| r["method"] == "Target.setAutoAttach" && r["params"]["autoAttach"] == false)
+        .expect("retired ledger denied mandatory phase-two autoattach release");
+    let close = requests
+        .iter()
+        .position(|r| r["method"] == "Browser.close")
+        .expect("retired ledger denied the actual owned manager Browser.close command");
+    assert!(
+        disposal < detach && detach < close,
+        "cleanup command authority/order changed"
+    );
+    assert_eq!(
+        requests[detach]["params"],
+        json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true})
+    );
+    assert!(requests[detach].get("sessionId").is_none());
+    assert!(requests[close].get("sessionId").is_none());
+    assert!(
+        phase_two.is_ok_and(|arrived| arrived.is_ok()),
+        "phase-two cleanup never reached its real CDP ACK barrier"
+    );
+    assert!(
+        application_stayed_closed,
+        "old application authority revived while mandatory cleanup was still in flight"
+    );
+    assert!(ledger.matches_owner(1, &scope));
+    assert!(!ledger.matches_owner(2, &scope));
+    let receipt = receipt
+        .expect("cleanup receipt timed out")
+        .expect("cleanup receipt missing");
+    assert_eq!(
+        receipt,
+        json!({"type":"closed","id":"cleanup-close","generation":1,"scopeState":"closed"})
+    );
+    drained.unwrap();
+}
+
+#[tokio::test]
+async fn cancelled_pre_swap_replacement_preserves_old_terminal_cleanup_proof() {
+    use crate::native::client_debt::{OwnerCleanupCommand, OwnerDebtLedger};
+    use crate::native::client_session::{CancelSignal, OperationLease};
+
+    for isolated_reuse in [false, true] {
+        let (endpoint, log, mut peer) = peer(true).await;
+        let mut owner = tokio::time::timeout(
+            Duration::from_secs(3),
+            OwnedBrowser::connect(&endpoint, None),
+        )
+        .await
+        .expect("unmanaged initial owner did not connect")
+        .unwrap();
+        let old_context = owner.context_id.clone();
+        let old_scope = owner.identity_scope.clone();
+        let ledger = OwnerDebtLedger::new(1, old_scope.clone());
+        ledger.bind_context(&old_context).unwrap();
+        owner.manager.bind_native_owner(ledger.clone()).unwrap();
+
+        tokio::time::timeout(Duration::from_secs(3), owner.dispose_context())
+            .await
+            .expect("old context disposal ACK did not arrive")
+            .unwrap();
+        assert!(
+            !ledger.replacement_ready(),
+            "context disposal alone is not terminal cleanup proof"
+        );
+        owner
+            .manager
+            .client
+            .send_owner_cleanup(
+                Some(ledger.clone()),
+                OwnerCleanupCommand::DisableAutoAttach,
+                std::time::Instant::now() + Duration::from_secs(3),
+            )
+            .await
+            .unwrap();
+        assert!(ledger.replacement_ready());
+        let waited = owner.manager.install_cleanup_process_witness();
+
+        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::Requested);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 2,
+            deadline: std::time::Instant::now() + Duration::from_secs(30),
+            cancellation,
+        };
+        if isolated_reuse {
+            let mut failed = None;
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                OwnedBrowser::isolated_for_scope(owner.manager, &operation, &mut failed),
+            )
+            .await
+            .expect("cancelled isolated reuse did not return its resource");
+            assert!(matches!(result, Err(ProtocolError::Cancelled)));
+            owner = failed.expect("cancelled isolated reuse lost the retained manager");
+            assert!(owner.context_id.is_empty());
+            assert!(owner.identity_scope.is_empty());
+        } else {
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                owner.replace_cleaned_context(&operation),
+            )
+            .await
+            .expect("cancelled in-place replacement did not return");
+            assert!(matches!(result, Err(ProtocolError::Cancelled)));
+            assert_eq!(owner.context_id, old_context);
+            assert_eq!(owner.identity_scope, old_scope);
+        }
+        let installed = owner.manager.client.debt_ledger().unwrap();
+        assert!(
+            Arc::ptr_eq(&installed, &ledger),
+            "cancellation swapped the old owner ledger"
+        );
+        assert_eq!(
+            installed.bound_context().as_deref(),
+            Some(old_context.as_str())
+        );
+        assert!(
+            installed.replacement_ready(),
+            "pre-swap cancellation erased terminal cleanup proof"
+        );
+        owner
+            .manager
+            .client
+            .check_cleanup_owner(&Some(ledger.clone()))
+            .unwrap();
+
+        let closed = tokio::time::timeout(Duration::from_secs(3), owner.close()).await;
+        let peer_result = tokio::time::timeout(Duration::from_secs(3), &mut peer).await;
+        if peer_result.is_err() {
+            peer.abort();
+            let _ = peer.await;
+        }
+        closed
+            .expect("retained owner close exceeded its bound")
+            .unwrap();
+        assert!(
+            peer_result.is_ok_and(|joined| joined.is_ok()),
+            "peer did not terminate after the real transport close"
+        );
+        assert!(
+            waited.load(Ordering::SeqCst),
+            "real close did not join the retained owned-process witness"
+        );
+
+        let requests = log.lock().unwrap().clone();
+        for method in [
+            "Target.createBrowserContext",
+            "Target.createTarget",
+            "Target.disposeBrowserContext",
+            "Browser.close",
+        ] {
+            assert_eq!(requests.iter().filter(|request| request["method"] == method).count(), 1, "unexpected acquisition or repeated terminal cleanup for {method}, isolated reuse: {isolated_reuse}");
+        }
+        let phase_two: Vec<_> = requests
+            .iter()
+            .enumerate()
+            .filter(|(_, request)| {
+                request["method"] == "Target.setAutoAttach"
+                    && request["params"]["autoAttach"] == false
+            })
+            .collect();
+        assert_eq!(
+            phase_two.len(),
+            1,
+            "terminal phase-two cleanup was repeated"
+        );
+        let (phase_two_index, phase_two_request) = phase_two[0];
+        assert_eq!(
+            phase_two_request["params"],
+            json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true})
+        );
+        assert!(phase_two_request.get("sessionId").is_none());
+        let created = requests
+            .iter()
+            .position(|request| request["method"] == "Target.createBrowserContext")
+            .unwrap();
+        let disposed = requests
+            .iter()
+            .position(|request| request["method"] == "Target.disposeBrowserContext")
+            .unwrap();
+        let browser_closed = requests
+            .iter()
+            .position(|request| request["method"] == "Browser.close")
+            .unwrap();
+        assert!(
+            created < disposed && disposed < phase_two_index && phase_two_index < browser_closed
+        );
+        assert_eq!(
+            requests[disposed]["params"]["browserContextId"],
+            old_context
+        );
+        assert!(requests[disposed].get("sessionId").is_none());
+        assert!(requests[browser_closed].get("sessionId").is_none());
+    }
+}

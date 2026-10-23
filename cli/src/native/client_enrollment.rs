@@ -70,6 +70,7 @@ pub struct CleanupOutcome {
     pub owned_resources_contained: bool,
 }
 pub struct ContainmentProof {
+    debt: Option<Arc<super::client_debt::OwnerDebtLedger>>,
     registry: Arc<ClientTargets>,
     identity_scope: String,
     generation: u64,
@@ -1975,7 +1976,11 @@ impl ClientEnrollment {
         } else {
             return Err(ProtocolError::ScopeUnavailable);
         }
-        self.targets.publish_initialization(authority)
+        if let Some(debt) = self.client.debt_ledger() {
+            debt.publish_initialization(|| self.targets.publish_initialization(authority))
+        } else {
+            self.targets.publish_initialization(authority)
+        }
     }
     fn realm_watermark(&self) -> Result<BoundedEventWatermark, ProtocolError> {
         self.event_watermark
@@ -2404,6 +2409,11 @@ impl ClientEnrollment {
         }
         if index.sessions.len() >= MAX_SESSIONS {
             return Err(ProtocolError::CapacityExceeded);
+        }
+        if let Some(debt) = self.client.debt_ledger() {
+            // Establish exact owned tenure before any domain enable can emit
+            // realm events. Reader bookkeeping never adopts unknown sessions.
+            debt.bind_session(context, target, session)?;
         }
         let root = if kind == "page" {
             session.to_owned()
@@ -3013,6 +3023,13 @@ impl ClientEnrollment {
         if !self.sealed.load(Ordering::Acquire) {
             return Err(ProtocolError::ScopeUnavailable);
         }
+        // Capture the exact owner before containment yields or retires it.
+        let debt = self.client.debt_ledger();
+        if debt.as_ref().is_some_and(|ledger| {
+            !ledger.matches_owner(self.generation, &self.targets.identity_scope)
+        }) {
+            return Err(ProtocolError::StaleScope);
+        }
         let task = self.supervisor.lock().await;
         if task.is_some() {
             return Err(ProtocolError::ScopeUnavailable);
@@ -3036,6 +3053,7 @@ impl ClientEnrollment {
             return Err(ProtocolError::CleanupFailed);
         }
         Ok(ContainmentProof {
+            debt,
             registry: self.targets.clone(),
             identity_scope: self.targets.identity_scope.clone(),
             generation: self.generation,
@@ -3053,6 +3071,7 @@ impl ClientEnrollment {
             return Err(ProtocolError::StaleScope);
         }
         let _task = self.supervisor.lock().await;
+        self.client.check_cleanup_owner(&proof.debt)?;
         let outcome = self.cleanup_outcome()?;
         if !outcome.owned_resources_contained {
             return Err(ProtocolError::ScopeUnavailable);
@@ -3060,8 +3079,18 @@ impl ClientEnrollment {
         if outcome.autoattach_disabled {
             return Ok(());
         }
-        self.cleanup_command("Target.setAutoAttach", autoattach(false))
-            .await?;
+        let deadline = Instant::now() + CLEANUP_TIMEOUT;
+        tokio::time::timeout_at(
+            deadline.into(),
+            self.client.send_owner_cleanup(
+                proof.debt,
+                super::client_debt::OwnerCleanupCommand::DisableAutoAttach,
+                deadline,
+            ),
+        )
+        .await
+        .map_err(|_| ProtocolError::CleanupFailed)?
+        .map_err(|_| ProtocolError::CleanupFailed)?;
         self.cleanup
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?
@@ -3104,10 +3133,18 @@ impl ClientEnrollment {
         }
     }
     async fn cleanup_command(&self, method: &str, args: Value) -> Result<Value, ProtocolError> {
-        tokio::time::timeout(
-            CLEANUP_TIMEOUT,
-            self.client.send_command(method, Some(args), None),
-        )
+        tokio::time::timeout(CLEANUP_TIMEOUT, async {
+            if method == "Target.getTargets" && args == json!({}) {
+                self.client
+                    .send_scope_cleanup(
+                        super::client_debt::ScopeCleanupCommand::Inventory,
+                        Instant::now() + CLEANUP_TIMEOUT,
+                    )
+                    .await
+            } else {
+                self.client.send_command(method, Some(args), None).await
+            }
+        })
         .await
         .map_err(|_| ProtocolError::CleanupFailed)?
         .map_err(|_| ProtocolError::CleanupFailed)
@@ -3333,29 +3370,31 @@ impl ClientEnrollment {
                     .is_err();
             }
             // Do not release a debugger pause by closing the host page.
-            for (method, args) in [
-                ("Runtime.runIfWaitingForDebugger", json!({})),
-                ("Target.setAutoAttach", autoattach(false)),
-            ] {
-                if entry.observation_only
-                    && method == "Runtime.runIfWaitingForDebugger"
-                    && (!entry.observer_paused || entry.resumed)
-                {
+            for resume in [true, false] {
+                if entry.observation_only && resume && (!entry.observer_paused || entry.resumed) {
                     continue;
                 }
                 if Instant::now() >= session_deadline {
                     failed = true;
                     break;
                 }
-                failed |= !matches!(
-                    tokio::time::timeout_at(
-                        std::cmp::min(session_deadline, Instant::now() + CLEANUP_TIMEOUT).into(),
-                        self.client
-                            .send_command(method, Some(args), Some(&entry.session))
+                let command = if resume {
+                    super::client_debt::ScopeCleanupCommand::ResumeDebugger {
+                        session: entry.session.clone(),
+                    }
+                } else {
+                    super::client_debt::ScopeCleanupCommand::DisableAutoAttach {
+                        session: Some(entry.session.clone()),
+                    }
+                };
+                failed |= self
+                    .client
+                    .send_scope_cleanup(
+                        command,
+                        std::cmp::min(session_deadline, Instant::now() + CLEANUP_TIMEOUT),
                     )
-                    .await,
-                    Ok(Ok(_))
-                );
+                    .await
+                    .is_err();
             }
             match self
                 .detach_borrowed_session(&entry.session, entry.parent.as_deref(), session_deadline)
@@ -3376,8 +3415,12 @@ impl ClientEnrollment {
             && matches!(
                 tokio::time::timeout_at(
                     deadline.into(),
-                    self.client
-                        .send_command("Target.setAutoAttach", Some(autoattach(false)), None)
+                    self.client.send_scope_cleanup(
+                        super::client_debt::ScopeCleanupCommand::DisableAutoAttach {
+                            session: None
+                        },
+                        deadline
+                    )
                 )
                 .await,
                 Ok(Ok(_))
@@ -3717,6 +3760,9 @@ impl ClientEnrollment {
             observer_paused: paused_by_attachment,
             resumed: false,
         };
+        if let Some(debt) = self.client.debt_ledger() {
+            debt.bind_observer_session(&self.targets.context_id, target, session)?;
+        }
         index.sessions.insert(session.into(), entry.clone());
         #[cfg(test)]
         self.trace_capture_registry(CaptureLifecycleStep::Registered, &entry, &index);
@@ -3871,12 +3917,16 @@ impl ClientEnrollment {
         session: &str,
         parent: Option<&str>,
     ) -> Result<(), ProtocolError> {
-        // Cleanup is independent of a cancelled owned operation.
+        // Only this exact attachment, obtained from the existing enrollment
+        // owner/event, may undo its debugger pause. Never grant Runtime generally.
+        let deadline = Instant::now() + CLEANUP_TIMEOUT * 3;
         let detach = || {
-            self.client.send_command(
-                "Target.detachFromTarget",
-                Some(json!({"sessionId":session})),
-                parent,
+            self.client.send_scope_cleanup(
+                super::client_debt::ScopeCleanupCommand::Detach {
+                    session: session.into(),
+                    parent: parent.map(str::to_owned),
+                },
+                deadline,
             )
         };
         if matches!(
@@ -3885,13 +3935,13 @@ impl ClientEnrollment {
         ) {
             return Ok(());
         }
-        // Undo ONLY our debugger pause, never evaluate foreign JavaScript.
         let resumed = tokio::time::timeout(
             CLEANUP_TIMEOUT,
-            self.client.send_command(
-                "Runtime.runIfWaitingForDebugger",
-                Some(json!({})),
-                Some(session),
+            self.client.send_scope_cleanup(
+                super::client_debt::ScopeCleanupCommand::ResumeDebugger {
+                    session: session.into(),
+                },
+                deadline,
             ),
         )
         .await;
@@ -3902,6 +3952,7 @@ impl ClientEnrollment {
             Err(ProtocolError::CleanupFailed)
         }
     }
+
     fn frame_tree(
         &self,
         entry: &Attribution,

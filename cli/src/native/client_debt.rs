@@ -25,6 +25,137 @@ pub(crate) enum AdmissionClass {
     Reference,
     FixedRead,
 }
+/// Closed native lifecycle obligations. No caller-supplied method, payload or
+/// session may acquire post-retirement authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OwnerCleanupCommand {
+    DisableAutoAttach,
+    CloseBrowser,
+}
+impl OwnerCleanupCommand {
+    pub(crate) fn envelope(self) -> (&'static str, Option<Value>) {
+        match self {
+            Self::DisableAutoAttach => (
+                "Target.setAutoAttach",
+                Some(serde_json::json!({
+                    "autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true
+                })),
+            ),
+            Self::CloseBrowser => ("Browser.close", None),
+        }
+    }
+    fn category(self) -> CommandCategory {
+        match self {
+            Self::DisableAutoAttach => CommandCategory::CleanupOther,
+            Self::CloseBrowser => CommandCategory::Destroy,
+        }
+    }
+}
+/// Existing lifecycle cleanup call sites own the exact resource identifiers.
+/// This closed envelope grants no application, acquisition, or post-retirement authority.
+pub(crate) enum ScopeCleanupCommand {
+    ResumeDebugger {
+        session: String,
+    },
+    Detach {
+        session: String,
+        parent: Option<String>,
+    },
+    DisableAutoAttach {
+        session: Option<String>,
+    },
+    RemoveScript {
+        session: String,
+        identifier: String,
+    },
+    FailRequest {
+        session: String,
+        request: String,
+    },
+    CancelAuth {
+        session: String,
+        request: String,
+    },
+    DismissDialog {
+        session: String,
+    },
+    DisableFetch {
+        session: String,
+    },
+    DisableNetwork {
+        session: String,
+    },
+    Inventory,
+}
+impl ScopeCleanupCommand {
+    pub(crate) fn envelope(self) -> Result<(&'static str, Value, Option<String>), ProtocolError> {
+        use serde_json::json;
+        let result = match self {
+            Self::ResumeDebugger { session } => {
+                ("Runtime.runIfWaitingForDebugger", json!({}), Some(session))
+            }
+            Self::Detach { session, parent } => {
+                checked_cleanup_id(&session)?;
+                (
+                    "Target.detachFromTarget",
+                    json!({"sessionId":session}),
+                    parent,
+                )
+            }
+            Self::DisableAutoAttach { session } => (
+                "Target.setAutoAttach",
+                json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}),
+                session,
+            ),
+            Self::RemoveScript {
+                session,
+                identifier,
+            } => {
+                checked_cleanup_id(&identifier)?;
+                (
+                    "Page.removeScriptToEvaluateOnNewDocument",
+                    json!({"identifier":identifier}),
+                    Some(session),
+                )
+            }
+            Self::FailRequest { session, request } => {
+                checked_cleanup_id(&request)?;
+                (
+                    "Fetch.failRequest",
+                    json!({"requestId":request,"errorReason":"Aborted"}),
+                    Some(session),
+                )
+            }
+            Self::CancelAuth { session, request } => {
+                checked_cleanup_id(&request)?;
+                (
+                    "Fetch.continueWithAuth",
+                    json!({"requestId":request,"authChallengeResponse":{"response":"CancelAuth"}}),
+                    Some(session),
+                )
+            }
+            Self::DismissDialog { session } => (
+                "Page.handleJavaScriptDialog",
+                json!({"accept":false}),
+                Some(session),
+            ),
+            Self::DisableFetch { session } => ("Fetch.disable", json!({}), Some(session)),
+            Self::DisableNetwork { session } => ("Network.disable", json!({}), Some(session)),
+            Self::Inventory => ("Target.getTargets", json!({}), None),
+        };
+        if let Some(session) = &result.2 {
+            checked_cleanup_id(session)?;
+        }
+        Ok(result)
+    }
+}
+fn checked_cleanup_id(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty() || value.len() > 4096 {
+        Err(ProtocolError::InvalidArguments)
+    } else {
+        Ok(())
+    }
+}
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CleanupDisposition {
     Complete,
@@ -127,6 +258,12 @@ tokio::task_local! {
     static CURRENT_OPERATION: OperationJournalHandle;
     static COMMAND_OVERRIDE: CommandOverride;
     static NATIVE_OBJECT_GROUP: String;
+    static INITIALIZATION_WORK: (Arc<OwnerDebtLedger>, InitializationWork);
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum InitializationWork {
+    StateRestore,
+    Recording,
 }
 /// Only existing native group owners call this; never infer authority from a
 /// CDP objectId or a caller-provided group string.
@@ -359,6 +496,11 @@ impl CommandStatusHandle {
     }
 }
 struct CommandRecord {
+    owner_cleanup: bool,
+    cleanup_kind: Option<OwnerCleanupCommand>,
+    acquisition: Option<LifecycleAcquisition>,
+    lifecycle_budget: bool,
+    teardown_deadline: Option<Instant>,
     category: CommandCategory,
     status: CommandStatusHandle,
     provenance: Provenance,
@@ -374,6 +516,37 @@ struct CommandRecord {
     grouped_creation: bool,
     group_release_proven: bool,
     objects_destroyed: bool,
+}
+/// Only acquisition identities are retained, never the request payload or a
+/// continuation. The reader binds these before delivering a possibly late ACK.
+enum LifecycleAcquisition {
+    Context,
+    Target,
+    Session(String, bool),
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LifecycleSessionPurpose {
+    Observer,
+    StateBootstrap,
+    Recording,
+}
+struct ScopeBootstrap {
+    sequence: u64,
+    deadline: Instant,
+    cancellation: tokio::sync::watch::Receiver<CancelSignal>,
+    published: bool,
+    owns_context: bool,
+}
+impl ScopeBootstrap {
+    fn check(&self) -> Result<(), ProtocolError> {
+        if *self.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
 }
 struct ObjectObligation {
     provenance: Provenance,
@@ -411,6 +584,15 @@ struct LedgerState {
     integrity_lost: bool,
     retired: bool,
     context_id: Option<String>,
+    final_cleanup_claimed: [bool; 2],
+    final_cleanup_acknowledged: [bool; 2],
+    bootstrap: Option<ScopeBootstrap>,
+    created_targets: HashSet<String>,
+    lifecycle_sessions: HashMap<String, LifecycleSessionPurpose>,
+    initialization_scripts: HashSet<[u8; 32]>,
+    context_creation_claimed: bool,
+    root_creation_claimed: bool,
+    recording_targets: HashSet<String>,
 }
 pub(crate) struct OwnerDebtLedger {
     generation: u64,
@@ -418,6 +600,293 @@ pub(crate) struct OwnerDebtLedger {
     state: Mutex<LedgerState>,
 }
 impl OwnerDebtLedger {
+    pub(crate) async fn initialization_work<F: Future>(
+        self: &Arc<Self>,
+        work: InitializationWork,
+        operation: &OperationLease,
+        future: F,
+    ) -> Result<F::Output, ProtocolError> {
+        {
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if state.retired
+                || state.integrity_lost
+                || operation.is_callback
+                || operation.generation != self.generation
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            if let Some(bootstrap) = &state.bootstrap {
+                if !bootstrap.published {
+                    bootstrap.check()?;
+                    if bootstrap.sequence != operation.sequence
+                        || bootstrap.deadline != operation.deadline
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                }
+            }
+        }
+        Ok(INITIALIZATION_WORK
+            .scope((self.clone(), work), future)
+            .await)
+    }
+    pub(crate) fn allow_initialization_script(&self, source: &str) -> Result<(), ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired
+            || state
+                .bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| bootstrap.published)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let digest = command_envelope_digest(source, None, None);
+        if state.initialization_scripts.contains(&digest) {
+            return Ok(());
+        }
+        // Existing configuration admits 1024 scripts plus the fixed native
+        // service-worker policy. Re-authorizing captured configuration is free.
+        if state.initialization_scripts.len() >= 1025 {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        check_metadata_add(&state, 32)?;
+        state.initialization_scripts.insert(digest);
+        Ok(())
+    }
+    pub(crate) fn bind_state_bootstrap(
+        &self,
+        target: &str,
+        session: &str,
+    ) -> Result<(), ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired
+            || state.targets.get(session).map(String::as_str) != Some(target)
+            || !state.created_targets.contains(target)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if state.lifecycle_sessions.len() >= 256 {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        check_metadata_add(
+            &state,
+            if state.lifecycle_sessions.contains_key(session) {
+                0
+            } else {
+                64 + session.len()
+            },
+        )?;
+        state
+            .lifecycle_sessions
+            .insert(session.into(), LifecycleSessionPurpose::StateBootstrap);
+        Ok(())
+    }
+    /// Called only after the existing auxiliary-target reservation is owned,
+    /// before spawning its attach worker (task-local grants do not propagate).
+    pub(crate) fn register_recording_target(
+        self: &Arc<Self>,
+        target: &str,
+    ) -> Result<(), ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired || !state.targets.values().any(|known| known == target) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if state
+            .bootstrap
+            .as_ref()
+            .is_none_or(|bootstrap| bootstrap.published)
+        {
+            return Ok(());
+        }
+        if state
+            .bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| !bootstrap.published)
+        {
+            state
+                .bootstrap
+                .as_ref()
+                .ok_or(ProtocolError::ScopeUnavailable)?
+                .check()?;
+            if !INITIALIZATION_WORK
+                .try_with(|(owner, work)| {
+                    Arc::ptr_eq(owner, self) && *work == InitializationWork::Recording
+                })
+                .unwrap_or(false)
+            {
+                return Err(ProtocolError::PolicyDenied);
+            }
+        }
+        if state.recording_targets.len() >= 64 || state.recording_targets.contains(target) {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        check_metadata_add(&state, 64 + target.len())?;
+        state.recording_targets.insert(target.into());
+        Ok(())
+    }
+    pub(crate) fn unpublished(
+        operation: &OperationLease,
+        identity_scope: String,
+        owns_context: bool,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        if operation.is_callback || operation.sequence == 0 || identity_scope.is_empty() {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let ledger = Self::new(operation.generation, identity_scope);
+        let bootstrap = ScopeBootstrap {
+            sequence: operation.sequence,
+            deadline: operation.deadline,
+            cancellation: operation.cancellation.clone(),
+            published: false,
+            owns_context,
+        };
+        bootstrap.check()?;
+        ledger
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .bootstrap = Some(bootstrap);
+        Ok(ledger)
+    }
+    pub(crate) fn initialization_deadline(&self, method: &str) -> Option<Instant> {
+        if lifecycle_cleanup(method) {
+            return None;
+        }
+        self.state.lock().ok().and_then(|state| {
+            state
+                .bootstrap
+                .as_ref()
+                .filter(|bootstrap| !bootstrap.published)
+                .map(|bootstrap| bootstrap.deadline)
+        })
+    }
+    pub(crate) fn publish_initialization<T>(
+        &self,
+        publish: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired || state.integrity_lost {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if let Some(bootstrap) = &state.bootstrap {
+            if !bootstrap.published {
+                bootstrap.check()?;
+            }
+        }
+        // All fallible ledger checks precede the synchronous gate commit.
+        // Reservation cannot observe publication until both are committed.
+        let result = publish()?;
+        if let Some(bootstrap) = &mut state.bootstrap {
+            bootstrap.published = true;
+        }
+        Ok(result)
+    }
+    pub(crate) fn replacement_ready(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.retired
+                && !state.integrity_lost
+                && state.final_cleanup_acknowledged[OwnerCleanupCommand::DisableAutoAttach as usize]
+                && state.commands.is_empty()
+                && state.objects.is_empty()
+                && state.groups.is_empty()
+        })
+    }
+    pub(crate) fn bound_context(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.context_id.clone())
+    }
+    pub(crate) fn bind_session(
+        &self,
+        context: &str,
+        target: &str,
+        session: &str,
+    ) -> Result<(), ProtocolError> {
+        self.bind_session_kind(context, target, session, None)
+    }
+    pub(crate) fn bind_observer_session(
+        &self,
+        context: &str,
+        target: &str,
+        session: &str,
+    ) -> Result<(), ProtocolError> {
+        self.bind_session_kind(
+            context,
+            target,
+            session,
+            Some(LifecycleSessionPurpose::Observer),
+        )
+    }
+    fn bind_session_kind(
+        &self,
+        context: &str,
+        target: &str,
+        session: &str,
+        purpose: Option<LifecycleSessionPurpose>,
+    ) -> Result<(), ProtocolError> {
+        if [target, session]
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 4096)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired
+            || state.integrity_lost
+            || state.context_id.as_deref().unwrap_or("") != context
+            || state
+                .targets
+                .get(session)
+                .is_some_and(|existing| existing != target)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if purpose.is_none()
+            && state.lifecycle_sessions.get(session) == Some(&LifecycleSessionPurpose::Observer)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let extra = (if state.targets.contains_key(session) {
+            0
+        } else {
+            64 + target.len() + session.len()
+        }) + if purpose.is_some() && !state.lifecycle_sessions.contains_key(session) {
+            64 + session.len()
+        } else {
+            0
+        };
+        if state.targets.len() >= 4096
+            || metadata_usage(&state).saturating_add(extra) > 64 * 1024
+            || descriptor_usage(&state).saturating_add(extra) > 508 * 1024
+        {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        state.targets.insert(session.into(), target.into());
+        if let Some(purpose) = purpose {
+            state.lifecycle_sessions.insert(session.into(), purpose);
+        }
+        state.root_creation_claimed = true;
+        Ok(())
+    }
     pub(crate) fn new(generation: u64, identity_scope: String) -> Arc<Self> {
         let invalid = generation == 0 || identity_scope.len() > 4096;
         Arc::new(Self {
@@ -483,8 +952,11 @@ impl OwnerDebtLedger {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.integrity_lost {
+        if state.retired || state.integrity_lost {
             return Err(ProtocolError::ScopeUnavailable);
+        }
+        if state.bootstrap.is_some() && state.targets.get(&session_id) != Some(&target_id) {
+            return Err(ProtocolError::StaleScope);
         }
         if state
             .targets
@@ -536,16 +1008,36 @@ impl OwnerDebtLedger {
         if state.context_id.as_deref() != Some(context_id) {
             return Err(ProtocolError::StaleScope);
         }
-        for command in state.commands.values() {
-            command.status.set(CommandStatus::Destroyed);
+        if state.retired {
+            return Ok(());
         }
-        state.commands.clear();
+        state.commands.retain(|_, command| {
+            if command.owner_cleanup {
+                true
+            } else {
+                command.status.set(CommandStatus::Destroyed);
+                false
+            }
+        });
         state.objects.clear();
         state.groups.clear();
         state.realms.clear();
         state.targets.clear();
+        state.created_targets.clear();
+        state.lifecycle_sessions.clear();
+        state.initialization_scripts.clear();
+        state.recording_targets.clear();
         state.counts = [0; 11];
         state.bytes = [0; 11];
+        let remaining: Vec<_> = state
+            .commands
+            .values()
+            .map(|command| (command.category.index(), command.footprint))
+            .collect();
+        for (index, footprint) in remaining {
+            state.counts[index] += 1;
+            state.bytes[index] += footprint;
+        }
         state.object_bytes = 0;
         state.retired = true;
         Ok(())
@@ -628,13 +1120,56 @@ impl OwnerDebtLedger {
         params: Option<&Value>,
         session: Option<&str>,
     ) -> Result<CommandReservation, ProtocolError> {
+        self.reserve_command_inner(journal, method, params, session, None, None)
+    }
+    pub(crate) fn reserve_owner_cleanup(
+        self: &Arc<Self>,
+        command: OwnerCleanupCommand,
+    ) -> Result<CommandReservation, ProtocolError> {
+        let (method, params) = command.envelope();
+        self.reserve_command_inner(None, method, params.as_ref(), None, Some(command), None)
+    }
+    pub(super) fn reserve_scope_cleanup(
+        self: &Arc<Self>,
+        method: &str,
+        params: &Value,
+        session: Option<&str>,
+        deadline: Instant,
+    ) -> Result<CommandReservation, ProtocolError> {
+        self.reserve_command_inner(None, method, Some(params), session, None, Some(deadline))
+    }
+    fn reserve_command_inner(
+        self: &Arc<Self>,
+        journal: Option<&OperationJournalHandle>,
+        method: &str,
+        params: Option<&Value>,
+        session: Option<&str>,
+        owner_cleanup: Option<OwnerCleanupCommand>,
+        teardown_deadline: Option<Instant>,
+    ) -> Result<CommandReservation, ProtocolError> {
         if method.len() > 256 || session.is_some_and(|session| session.len() > 4096) {
             return Err(ProtocolError::CapacityExceeded);
         }
         if journal.is_some_and(|journal| !Arc::ptr_eq(&journal.ledger, self)) {
             return Err(ProtocolError::StaleScope);
         }
-        let classification = classify(method, params, journal.is_some());
+        if teardown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let classification = if teardown_deadline.is_some() {
+            Classification {
+                category: CommandCategory::CleanupOther,
+                mutation: false,
+            }
+        } else {
+            owner_cleanup.map_or_else(
+                || classify(method, params, journal.is_some()),
+                |command| Classification {
+                    category: command.category(),
+                    mutation: false,
+                },
+            )
+        };
         if classification.category.application() {
             if let Some(journal) = journal {
                 journal.check_application_submission()?;
@@ -662,13 +1197,18 @@ impl OwnerDebtLedger {
         {
             return Err(ProtocolError::CapacityExceeded);
         }
-        let native_group = NATIVE_OBJECT_GROUP.try_with(Clone::clone).ok();
+        let native_group = if owner_cleanup.is_none() && teardown_deadline.is_none() {
+            NATIVE_OBJECT_GROUP.try_with(Clone::clone).ok()
+        } else {
+            None
+        };
         if native_group
             .as_ref()
             .is_some_and(|group| object_group.as_ref().is_some_and(|actual| actual != group))
         {
             return Err(ProtocolError::StaleScope);
         }
+        let envelope = command_envelope_digest(method, params, session);
         let physical_creation_slots = creation_slots(method, params);
         let creation_slots = if native_group.is_some() {
             0
@@ -679,10 +1219,96 @@ impl OwnerDebtLedger {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.retired
+        if matches!(
+            method,
+            "Target.createBrowserContext" | "Target.disposeBrowserContext"
+        ) && state
+            .bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| !bootstrap.owns_context)
+        {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        if (state.retired && owner_cleanup.is_none())
+            || owner_cleanup.is_some_and(|command| state.final_cleanup_claimed[command as usize])
             || (state.integrity_lost && classification.category != CommandCategory::Destroy)
         {
             return Err(ProtocolError::ScopeUnavailable);
+        }
+        if owner_cleanup.is_none()
+            && teardown_deadline.is_none()
+            && state
+                .bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| !bootstrap.published)
+        {
+            let work = INITIALIZATION_WORK
+                .try_with(|(ledger, work)| Arc::ptr_eq(ledger, self).then_some(*work))
+                .ok()
+                .flatten();
+            if !unpublished_admits(&state, method, params, session, work) {
+                return Err(ProtocolError::PolicyDenied);
+            }
+        }
+        let acquisition = if state
+            .bootstrap
+            .as_ref()
+            .is_some_and(|bootstrap| !bootstrap.published)
+        {
+            match method {
+                "Target.createBrowserContext" => {
+                    if state.context_id.is_some()
+                        || state.context_creation_claimed
+                        || params != Some(&serde_json::json!({"disposeOnDetach":true}))
+                        || session.is_some()
+                    {
+                        return Err(ProtocolError::PolicyDenied);
+                    }
+                    Some(LifecycleAcquisition::Context)
+                }
+                "Target.createTarget" => {
+                    if params.and_then(|p| p["browserContextId"].as_str())
+                        != state.context_id.as_deref()
+                        || params.and_then(|p| p["url"].as_str()) != Some("about:blank")
+                        || session.is_some()
+                    {
+                        return Err(ProtocolError::PolicyDenied);
+                    }
+                    Some(LifecycleAcquisition::Target)
+                }
+                "Target.attachToTarget" => {
+                    let target = params
+                        .and_then(|p| p["targetId"].as_str())
+                        .ok_or(ProtocolError::PolicyDenied)?;
+                    if !state.created_targets.contains(target)
+                        && !state.targets.values().any(|known| known == target)
+                    {
+                        return Err(ProtocolError::PolicyDenied);
+                    }
+                    let recording = state.recording_targets.contains(target);
+                    if !recording && (state.targets.values().any(|known| known == target) || state.commands.values().any(|command| matches!(&command.acquisition, Some(LifecycleAcquisition::Session(known, _)) if known == target))) {
+                        return Err(ProtocolError::PolicyDenied);
+                    }
+                    Some(LifecycleAcquisition::Session(target.into(), recording))
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let lifecycle_budget = owner_cleanup.is_none()
+            && teardown_deadline.is_none()
+            && state
+                .bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| !bootstrap.published)
+            && !lifecycle_cleanup(method);
+        if lifecycle_budget {
+            state
+                .bootstrap
+                .as_ref()
+                .ok_or(ProtocolError::ScopeUnavailable)?
+                .check()?;
         }
         let session = session
             .filter(|session| !session.is_empty())
@@ -763,12 +1389,15 @@ impl OwnerDebtLedger {
         } else {
             0
         };
-        let footprint = 192
-            + self.identity_scope.len()
-            + provenance.session.as_ref().map_or(0, String::len)
-            + provenance.target.as_ref().map_or(0, String::len)
-            + release_object.as_ref().map_or(0, String::len)
-            + object_group.as_ref().map_or(0, String::len);
+        let footprint =
+            224 + match &acquisition {
+                Some(LifecycleAcquisition::Session(target, _)) => target.len(),
+                _ => 0,
+            } + self.identity_scope.len()
+                + provenance.session.as_ref().map_or(0, String::len)
+                + provenance.target.as_ref().map_or(0, String::len)
+                + release_object.as_ref().map_or(0, String::len)
+                + object_group.as_ref().map_or(0, String::len);
         let index = classification.category.index();
         let (maximum_count, maximum_bytes) = classification.category.limits();
         if state.counts[index] >= maximum_count
@@ -826,14 +1455,32 @@ impl OwnerDebtLedger {
                 group.pending_creations += 1;
             }
         }
+        if let Some(command) = owner_cleanup {
+            state.final_cleanup_claimed[command as usize] = true;
+        }
         state.next_reservation = id;
         state.counts[index] += 1;
         state.bytes[index] += footprint;
         let status =
             CommandStatusHandle::new(physical_creation_slots > 0 && !classification.mutation);
+        match &acquisition {
+            Some(LifecycleAcquisition::Context) => state.context_creation_claimed = true,
+            Some(LifecycleAcquisition::Target) => state.root_creation_claimed = true,
+            Some(LifecycleAcquisition::Session(target, recording)) => {
+                if *recording {
+                    state.recording_targets.remove(target);
+                }
+            }
+            None => {}
+        }
         state.commands.insert(
             id,
             CommandRecord {
+                owner_cleanup: owner_cleanup.is_some(),
+                cleanup_kind: owner_cleanup,
+                acquisition,
+                lifecycle_budget,
+                teardown_deadline,
                 category: classification.category,
                 status: status.clone(),
                 provenance,
@@ -852,6 +1499,8 @@ impl OwnerDebtLedger {
             },
         );
         Ok(CommandReservation {
+            owner_cleanup: owner_cleanup.is_some(),
+            envelope,
             ledger: self.clone(),
             id,
             journal: journal.cloned(),
@@ -879,11 +1528,20 @@ impl OwnerDebtLedger {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
+        if state.retired {
+            return;
+        }
         match event.method.as_str() {
             "Runtime.executionContextCreated" => {
                 if let (Some(session), Some(context)) =
                     (&event.session_id, event.params["context"]["id"].as_i64())
                 {
+                    if !state.targets.contains_key(session)
+                        || state.lifecycle_sessions.get(session)
+                            == Some(&LifecycleSessionPurpose::Observer)
+                    {
+                        return;
+                    }
                     let extra = if state.realms.contains_key(&(session.clone(), context)) {
                         0
                     } else {
@@ -936,6 +1594,7 @@ impl OwnerDebtLedger {
             "Target.detachedFromTarget" => {
                 if let Some(session) = event.params["sessionId"].as_str() {
                     state.targets.remove(session);
+                    state.lifecycle_sessions.remove(session);
                     state.realms.retain(|(owner, _), _| owner != session);
                     destroy_matching(
                         &mut state,
@@ -954,6 +1613,9 @@ impl OwnerDebtLedger {
                         .collect();
                     state.targets.retain(|_, owner| owner != target);
                     state
+                        .lifecycle_sessions
+                        .retain(|session, _| !sessions.contains(session));
+                    state
                         .realms
                         .retain(|(session, _), _| !sessions.contains(session));
                     destroy_matching(
@@ -970,6 +1632,22 @@ impl OwnerDebtLedger {
 fn metadata_usage(state: &LedgerState) -> usize {
     state.context_id.as_ref().map_or(0, String::len)
         + state
+            .created_targets
+            .iter()
+            .map(|target| 64 + target.len())
+            .sum::<usize>()
+        + state
+            .lifecycle_sessions
+            .keys()
+            .map(|session| 64 + session.len())
+            .sum::<usize>()
+        + state.initialization_scripts.len() * 32
+        + state
+            .recording_targets
+            .iter()
+            .map(|id| 64 + id.len())
+            .sum::<usize>()
+        + state
             .targets
             .iter()
             .map(|(session, target)| 64 + session.len() + target.len())
@@ -979,6 +1657,15 @@ fn metadata_usage(state: &LedgerState) -> usize {
             .keys()
             .map(|(session, _)| 64 + session.len())
             .sum::<usize>()
+}
+fn check_metadata_add(state: &LedgerState, extra: usize) -> Result<(), ProtocolError> {
+    if metadata_usage(state).saturating_add(extra) > 64 * 1024
+        || descriptor_usage(state).saturating_add(extra) > 508 * 1024
+    {
+        Err(ProtocolError::CapacityExceeded)
+    } else {
+        Ok(())
+    }
 }
 fn descriptor_usage(state: &LedgerState) -> usize {
     metadata_usage(state)
@@ -1065,6 +1752,8 @@ fn destroy_matching(
     }
 }
 pub(crate) struct CommandReservation {
+    owner_cleanup: bool,
+    envelope: [u8; 32],
     ledger: Arc<OwnerDebtLedger>,
     id: u64,
     journal: Option<OperationJournalHandle>,
@@ -1072,6 +1761,36 @@ pub(crate) struct CommandReservation {
     submitted: bool,
 }
 impl CommandReservation {
+    pub(crate) fn initialization_budget(
+        &self,
+    ) -> Option<(Instant, tokio::sync::watch::Receiver<CancelSignal>)> {
+        let state = self.ledger.state.lock().ok()?;
+        if !state.commands.get(&self.id)?.lifecycle_budget {
+            return None;
+        }
+        let bootstrap = state.bootstrap.as_ref()?;
+        Some((bootstrap.deadline, bootstrap.cancellation.clone()))
+    }
+    pub(crate) fn matches_envelope(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        session: Option<&str>,
+    ) -> bool {
+        self.envelope == command_envelope_digest(method, params, session)
+    }
+    pub(crate) fn belongs_to(&self, ledger: &Arc<OwnerDebtLedger>) -> bool {
+        Arc::ptr_eq(&self.ledger, ledger)
+    }
+    pub(crate) fn is_owner_cleanup(&self) -> bool {
+        self.owner_cleanup
+            || self.ledger.state.lock().map_or(true, |state| {
+                state
+                    .commands
+                    .get(&self.id)
+                    .is_some_and(|command| command.teardown_deadline.is_some())
+            })
+    }
     pub(crate) fn status(&self) -> CommandStatusHandle {
         self.status.clone()
     }
@@ -1084,6 +1803,25 @@ impl CommandReservation {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         let group_fence = state.next_object_serial;
+        if state
+            .commands
+            .get(&self.id)
+            .and_then(|command| command.teardown_deadline)
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if state
+            .commands
+            .get(&self.id)
+            .is_some_and(|command| command.lifecycle_budget)
+        {
+            state
+                .bootstrap
+                .as_ref()
+                .ok_or(ProtocolError::ScopeUnavailable)?
+                .check()?;
+        }
         if let Some(command) = state.commands.get(&self.id) {
             if command.grouped_creation
                 && command
@@ -1163,6 +1901,207 @@ impl Drop for CommandReservation {
         }
     }
 }
+fn command_envelope_digest(
+    method: &str,
+    params: Option<&Value>,
+    session: Option<&str>,
+) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut hash = Sha256::new();
+    hash.update(method.as_bytes());
+    hash.update([0]);
+    hash.update(serde_json::to_vec(&params).unwrap_or_default());
+    hash.update([0]);
+    hash.update(
+        session
+            .filter(|session| !session.is_empty())
+            .unwrap_or_default()
+            .as_bytes(),
+    );
+    hash.finalize().into()
+}
+fn lifecycle_cleanup(method: &str) -> bool {
+    matches!(
+        method,
+        "Target.disposeBrowserContext"
+            | "Target.closeTarget"
+            | "Target.detachFromTarget"
+            | "Runtime.releaseObject"
+            | "Runtime.releaseObjectGroup"
+            | "Page.stopScreencast"
+            | "Fetch.failRequest"
+            | "Browser.cancelDownload"
+            | "IO.close"
+    )
+}
+/// The unpublished owner is not application authority. This list is independent
+/// of COMMAND_OVERRIDE, and executable native helpers need an exact-purpose
+/// lexical grant as well as an immutable transport owner and registered session.
+fn unpublished_admits(
+    state: &LedgerState,
+    method: &str,
+    params: Option<&Value>,
+    session: Option<&str>,
+    work: Option<InitializationWork>,
+) -> bool {
+    let p = params.unwrap_or(&Value::Null);
+    let known_session = session.is_some_and(|session| state.targets.contains_key(session));
+    let state_session = session.is_some_and(|session| {
+        state.lifecycle_sessions.get(session) == Some(&LifecycleSessionPurpose::StateBootstrap)
+    });
+    if session.is_some_and(|session| {
+        state.lifecycle_sessions.get(session) == Some(&LifecycleSessionPurpose::Observer)
+    }) && !matches!(
+        method,
+        "Page.enable"
+            | "Page.getFrameTree"
+            | "Target.setAutoAttach"
+            | "Runtime.runIfWaitingForDebugger"
+    ) {
+        return false;
+    }
+    let exact_context = p["browserContextId"]
+        .as_str()
+        .is_some_and(|context| state.context_id.as_deref() == Some(context));
+    let exact_target = p["targetId"].as_str().is_some_and(|target| {
+        state.created_targets.contains(target)
+            || state.targets.values().any(|known| known == target)
+    });
+    match method {
+        "Target.createBrowserContext" => {
+            session.is_none()
+                && state
+                    .bootstrap
+                    .as_ref()
+                    .is_some_and(|bootstrap| bootstrap.owns_context)
+                && state.context_id.is_none()
+                && !state.context_creation_claimed
+                && p == &serde_json::json!({"disposeOnDetach":true})
+        }
+        "Target.createTarget" => {
+            session.is_none()
+                && exact_context
+                && p["url"] == "about:blank"
+                && (!state.root_creation_claimed || work == Some(InitializationWork::StateRestore))
+        }
+        "Target.attachToTarget" => session.is_none() && exact_target && p["flatten"] == true,
+        "Target.closeTarget" => session.is_none() && exact_target,
+        "Target.disposeBrowserContext" => {
+            session.is_none()
+                && exact_context
+                && state
+                    .bootstrap
+                    .as_ref()
+                    .is_some_and(|bootstrap| bootstrap.owns_context)
+        }
+        "Target.detachFromTarget" => p["sessionId"]
+            .as_str()
+            .is_some_and(|id| state.targets.contains_key(id)),
+        "Target.getTargets" | "Browser.getVersion" => session.is_none(),
+        "Target.getTargetInfo" => {
+            (known_session && p == &serde_json::json!({}))
+                || p["targetId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty() && id.len() <= 4096)
+        }
+        "Target.setAutoAttach" => {
+            (session.is_none() || known_session)
+                && p["autoAttach"] == true
+                && p["waitForDebuggerOnStart"] == true
+                && p["flatten"] == true
+        }
+        "Browser.setDownloadBehavior" => session.is_none() && exact_context,
+        "Browser.cancelDownload" => session.is_none(),
+        "Storage.setCookies" => {
+            session.is_none() && exact_context && work == Some(InitializationWork::StateRestore)
+        }
+        "Page.navigate" => {
+            state_session
+                && work == Some(InitializationWork::StateRestore)
+                && p["url"].as_str().is_some_and(|url| {
+                    url.ends_with("/__agent_browser_state_bootstrap__")
+                        && (url.starts_with("https://") || url.starts_with("http://"))
+                })
+        }
+        "Runtime.evaluate" => {
+            known_session
+                && p["returnByValue"] == true
+                && match work {
+                    Some(InitializationWork::Recording) => {
+                        p["expression"] == "[window.innerWidth, window.innerHeight]"
+                    }
+                    Some(InitializationWork::StateRestore) => {
+                        state_session
+                            && p["expression"].as_str().is_some_and(
+                                super::client_state::is_initialization_state_expression,
+                            )
+                    }
+                    None => false,
+                }
+        }
+        "Runtime.callFunctionOn" => {
+            known_session
+                && work == Some(InitializationWork::Recording)
+                && p["returnByValue"] == true
+                && p["functionDeclaration"].as_str().is_some_and(|source| {
+                    source == super::client_geometry::BOX_PROOF
+                        || source == super::client_observation::FRAME_OWNER_GEOMETRY
+                })
+        }
+        "Page.addScriptToEvaluateOnNewDocument" => {
+            known_session
+                && p["source"].as_str().is_some_and(|source| {
+                    state
+                        .initialization_scripts
+                        .contains(&command_envelope_digest(source, None, None))
+                })
+        }
+        "Page.createIsolatedWorld" => {
+            known_session
+                && (p["worldName"] == "agent-browser-native-observation"
+                    || (state_session
+                        && work == Some(InitializationWork::StateRestore)
+                        && p["worldName"] == "agent-browser-state"))
+        }
+        "Fetch.fulfillRequest" => {
+            state_session
+                && work == Some(InitializationWork::StateRestore)
+                && p["responseCode"] == 200
+                && p["body"] == "PCFkb2N0eXBlIGh0bWw+PHRpdGxlPjwvdGl0bGU+"
+        }
+        "Page.captureScreenshot" => known_session && work == Some(InitializationWork::Recording),
+        "Page.startScreencast" | "Page.screencastFrameAck" | "Page.stopScreencast" => session
+            .is_some_and(|id| {
+                state.lifecycle_sessions.get(id) == Some(&LifecycleSessionPurpose::Recording)
+            }),
+        "Page.enable"
+        | "Runtime.enable"
+        | "Network.enable"
+        | "DOM.enable"
+        | "WebMCP.enable"
+        | "Page.getFrameTree"
+        | "Page.getLayoutMetrics"
+        | "Page.setLifecycleEventsEnabled"
+        | "Network.setBypassServiceWorker"
+        | "Fetch.enable"
+        | "Fetch.failRequest"
+        | "Fetch.continueRequest"
+        | "Fetch.continueWithAuth"
+        | "Emulation.setUserAgentOverride"
+        | "Emulation.setLocaleOverride"
+        | "Emulation.setTimezoneOverride"
+        | "Emulation.setDeviceMetricsOverride"
+        | "Emulation.setEmulatedMedia"
+        | "Runtime.runIfWaitingForDebugger"
+        | "Runtime.getIsolateId"
+        | "Runtime.releaseObject"
+        | "Runtime.releaseObjectGroup" => known_session,
+        "DOM.getFrameOwner" | "DOM.resolveNode" | "DOM.getBoxModel" => {
+            known_session && work == Some(InitializationWork::Recording)
+        }
+        _ => false,
+    }
+}
 pub(crate) struct SubmittedCommand {
     ledger: Arc<OwnerDebtLedger>,
     id: u64,
@@ -1214,7 +2153,75 @@ impl SubmittedCommand {
             // exact obligation; no waiter can promote it to clean state.
             return Vec::new();
         }
+        if response.error.is_none() {
+            if let Some(acquisition) = &command.acquisition {
+                let result = response.result.as_ref().unwrap_or(&Value::Null);
+                let (field, target, recording) = match acquisition {
+                    LifecycleAcquisition::Context => ("browserContextId", None, false),
+                    LifecycleAcquisition::Target => ("targetId", None, false),
+                    LifecycleAcquisition::Session(target, recording) => {
+                        ("sessionId", Some(target.clone()), *recording)
+                    }
+                };
+                let Some(identity) = result[field]
+                    .as_str()
+                    .filter(|id| !id.is_empty() && id.len() <= 4096)
+                    .map(str::to_owned)
+                else {
+                    state.integrity_lost = true;
+                    return Vec::new();
+                };
+                let extra = 64
+                    + identity.len()
+                    + target.as_ref().map_or(0, String::len)
+                    + if recording { 64 + identity.len() } else { 0 };
+                if metadata_usage(&state).saturating_add(extra) > 64 * 1024
+                    || descriptor_usage(&state).saturating_add(extra) > 508 * 1024
+                {
+                    state.integrity_lost = true;
+                    return Vec::new();
+                }
+                match field {
+                    "browserContextId" => {
+                        if state
+                            .context_id
+                            .as_ref()
+                            .is_some_and(|context| context != &identity)
+                        {
+                            state.integrity_lost = true;
+                            return Vec::new();
+                        }
+                        state.context_id = Some(identity);
+                    }
+                    "targetId" => {
+                        state.created_targets.insert(identity);
+                    }
+                    _ => {
+                        let target = target.expect("session acquisition target");
+                        if state
+                            .targets
+                            .get(&identity)
+                            .is_some_and(|known| known != &target)
+                        {
+                            state.integrity_lost = true;
+                            return Vec::new();
+                        }
+                        if recording {
+                            state
+                                .lifecycle_sessions
+                                .insert(identity.clone(), LifecycleSessionPurpose::Recording);
+                        }
+                        state.targets.insert(identity, target);
+                    }
+                }
+            }
+        }
         let command = remove_command(&mut state, self.id).expect("checked command");
+        if response.error.is_none() {
+            if let Some(kind) = command.cleanup_kind {
+                state.final_cleanup_acknowledged[kind as usize] = true;
+            }
+        }
         command.status.set(CommandStatus::Acknowledged);
         if let Some(group_id) = command.group_id {
             if command.release_group && command.group_release_proven {
@@ -1790,6 +2797,82 @@ mod tests {
             .reserve_command(None, "Page.getFrameTree", None, Some("page"))
             .is_err());
     }
+    #[tokio::test]
+    async fn retired_owner_cleanup_is_one_shot_accounted_and_not_application_authority() {
+        let (ledger, journal) = owner();
+        ledger.bind_context("context").unwrap();
+        let stale_application = ledger
+            .reserve_command(Some(&journal), "Input.insertText", None, Some("page"))
+            .unwrap();
+        let cleanup = ledger
+            .reserve_owner_cleanup(OwnerCleanupCommand::DisableAutoAttach)
+            .unwrap();
+        let cleanup_status = cleanup.status();
+        // First retirement preserves only the registered connection obligation.
+        ledger.retire_after_context_destroy("context").unwrap();
+        assert!(stale_application.submit().is_err());
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        assert_eq!(cleanup_status.snapshot(), CommandStatus::Reserved);
+        let submitted = cleanup.submit().unwrap();
+        ledger.retire_after_context_destroy("context").unwrap();
+        assert_eq!(cleanup_status.snapshot(), CommandStatus::Submitted);
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        assert!(ledger
+            .reserve_owner_cleanup(OwnerCleanupCommand::DisableAutoAttach)
+            .is_err());
+        for (method, params) in [
+            ("Browser.close", None),
+            (
+                "Target.setAutoAttach",
+                Some(
+                    serde_json::json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}),
+                ),
+            ),
+            (
+                "Runtime.evaluate",
+                Some(serde_json::json!({"expression":"1","returnByValue":true})),
+            ),
+        ] {
+            assert!(ledger
+                .reserve_command(None, method, params.as_ref(), None)
+                .is_err());
+            assert!(command_scope(CommandCategory::Destroy, false, async {
+                ledger.reserve_command(Some(&journal), method, params.as_ref(), None)
+            })
+            .await
+            .is_err());
+        }
+        assert!(ledger
+            .operation(
+                OperationKey {
+                    generation: 7,
+                    operation_seq: 2
+                },
+                "target".into(),
+                "page".into()
+            )
+            .is_err());
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: serde_json::json!({"context":{"id":1}}),
+        });
+        assert!(ledger.state.lock().unwrap().realms.is_empty());
+        submitted.settle(&response(serde_json::json!({})));
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(cleanup_status.snapshot(), CommandStatus::Acknowledged);
+        let close = ledger
+            .reserve_owner_cleanup(OwnerCleanupCommand::CloseBrowser)
+            .unwrap();
+        drop(close);
+        assert!(
+            ledger
+                .reserve_owner_cleanup(OwnerCleanupCommand::CloseBrowser)
+                .is_err(),
+            "abandoned cleanup must not silently renew authority"
+        );
+    }
+
     #[test]
     fn realm_metadata_is_bounded_and_counted_without_borrowing_destroy_reserve() {
         let (ledger, _journal) = owner();

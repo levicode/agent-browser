@@ -1035,6 +1035,8 @@ async fn capture_dispatch_case(case: CaptureDispatchCase) {
     let png = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
     let source = Arc::new(Mutex::new(Vec::new()));
     let peer_source = source.clone();
+    let mask_releases = Arc::new(Mutex::new(Vec::new()));
+    let peer_mask_releases = mask_releases.clone();
     let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let peer_captures = captures.clone();
     let (capture_reached, capture_receipt) = oneshot::channel();
@@ -1063,15 +1065,15 @@ async fn capture_dispatch_case(case: CaptureDispatchCase) {
                 }
                 "Runtime.evaluate" => {
                     assert_eq!(request["params"]["contextId"], 1);
-                    assert!(request["params"]["objectGroup"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with("capture-source-"));
+                    assert_eq!(request["sessionId"], "session");
+                    assert_eq!(request["params"]["objectGroup"], "capture-source-2-frame");
                     peer_source.lock().unwrap().push("holder");
                     json!({"result":{"type":"object","objectId":"source-holder"}})
                 }
                 "Runtime.callFunctionOn" => {
                     assert_eq!(request["params"]["objectId"], "source-holder");
+                    assert_eq!(request["sessionId"], "session");
+                    assert_eq!(request["params"]["objectGroup"], "capture-source-2-frame");
                     let phase = match request["params"]["functionDeclaration"].as_str().unwrap() {
                         "function(){return this.verify()}" => {
                             verifies += 1;
@@ -1084,11 +1086,21 @@ async fn capture_dispatch_case(case: CaptureDispatchCase) {
                     json!({"result":{"type":"boolean","value":!(case == CaptureDispatchCase::TraceMaskFailure && phase == "verify" && verifies == 2)}})
                 }
                 "Runtime.releaseObjectGroup" => {
-                    assert!(request["params"]["objectGroup"]
-                        .as_str()
-                        .unwrap()
-                        .starts_with("capture-source-"));
-                    peer_source.lock().unwrap().push("release");
+                    assert_eq!(request["sessionId"], "session");
+                    match request["params"]["objectGroup"].as_str().unwrap() {
+                        // Independent coverage owns a separate read-only group,
+                        // including when this finite fixture contains no nodes.
+                        "capture-2-frame" => {
+                            peer_mask_releases
+                                .lock()
+                                .unwrap()
+                                .push(peer_captures.load(Ordering::SeqCst));
+                        }
+                        "capture-source-2-frame" => {
+                            peer_source.lock().unwrap().push("release");
+                        }
+                        other => panic!("unexpected capture object group: {other}"),
+                    }
                     json!({})
                 }
                 "Page.captureScreenshot" => {
@@ -1233,6 +1245,15 @@ async fn capture_dispatch_case(case: CaptureDispatchCase) {
         .unwrap();
     task.join.await.unwrap().unwrap();
     assert_eq!(captures.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *mask_releases.lock().unwrap(),
+        if case == CaptureDispatchCase::TraceMaskFailure {
+            vec![0]
+        } else {
+            vec![0, 1]
+        },
+        "independent coverage groups must be released before and after capture, unless source verification refuses the post-capture pass"
+    );
     assert_eq!(
         *source.lock().unwrap(),
         ["holder", "verify", "verify", "remove", "release"]

@@ -18,7 +18,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 
 use super::super::client_debt::{
-    current_operation, CommandReservation, OwnerDebtLedger, ReservedDisposal, SubmittedCommand,
+    current_operation, CommandReservation, OwnerCleanupCommand, OwnerDebtLedger, ReservedDisposal,
+    SubmittedCommand,
 };
 use super::super::client_protocol::ProtocolError;
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
@@ -31,6 +32,27 @@ struct DisposalWork {
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
+async fn within_initialization<T>(
+    budget: Option<(
+        std::time::Instant,
+        watch::Receiver<super::super::client_session::CancelSignal>,
+    )>,
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    if let Some((deadline, mut cancellation)) = budget {
+        if *cancellation.borrow() != super::super::client_session::CancelSignal::None {
+            return Err("Native initialization cancelled".into());
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.changed() => Err("Native initialization cancelled".into()),
+            _ = tokio::time::sleep_until(deadline.into()) => Err("Native initialization deadline expired".into()),
+            result = future => result,
+        }
+    } else {
+        future.await
+    }
+}
 type WsTx = Arc<
     Mutex<
         futures_util::stream::SplitSink<
@@ -335,7 +357,14 @@ fn extract_command_id(msg: &str) -> Option<u64> {
     envelope.id.filter(|id| *id > 0)
 }
 
+/// A handle is either the legacy physical owner or an immutable native-owner
+/// view. Views share one reader/writer/task set and cannot close that transport.
 pub struct CdpClient {
+    transport: Arc<CdpTransport>,
+    owner: Option<Arc<OwnerDebtLedger>>,
+}
+
+struct CdpTransport {
     ws_tx: WsTx,
     socket: socket2::Socket,
     closed: Arc<AtomicBool>,
@@ -755,36 +784,39 @@ impl CdpClient {
         });
 
         Ok(Self {
-            ws_tx,
-            socket,
-            closed,
-            close_complete: AtomicBool::new(false),
-            remote_closed,
-            close_lock: Mutex::new(()),
-            cancel_tx,
-            next_id,
-            pending,
-            tracked_responses,
-            debt_owner,
-            event_tx,
-            raw_tx,
-            reader_handle: Mutex::new(Some(reader_handle)),
-            keepalive_handle: Mutex::new(Some(keepalive_handle)),
-            disposal_handle: Mutex::new(Some(disposal_handle)),
-            private_sessions,
-            method_taps,
-            bounded_method_taps,
-            next_tap_id: AtomicU64::new(1),
+            owner: None,
+            transport: Arc::new(CdpTransport {
+                ws_tx,
+                socket,
+                closed,
+                close_complete: AtomicBool::new(false),
+                remote_closed,
+                close_lock: Mutex::new(()),
+                cancel_tx,
+                next_id,
+                pending,
+                tracked_responses,
+                debt_owner,
+                event_tx,
+                raw_tx,
+                reader_handle: Mutex::new(Some(reader_handle)),
+                keepalive_handle: Mutex::new(Some(keepalive_handle)),
+                disposal_handle: Mutex::new(Some(disposal_handle)),
+                private_sessions,
+                method_taps,
+                bounded_method_taps,
+                next_tap_id: AtomicU64::new(1),
+            }),
         })
     }
 
     /// Evidence of underlying CDP connection loss, never local close or RPC EOF.
     pub fn remote_connection_closed(&self) -> watch::Receiver<bool> {
-        self.remote_closed.clone()
+        self.transport.remote_closed.clone()
     }
 
     fn ensure_open(&self) -> Result<(), String> {
-        if self.closed.load(Ordering::SeqCst) {
+        if self.transport.closed.load(Ordering::SeqCst) {
             Err(CONNECTION_CLOSED_ERROR.to_string())
         } else {
             Ok(())
@@ -800,33 +832,38 @@ impl CdpClient {
     }
 
     pub async fn close(&self) {
-        let _close_guard = self.close_lock.lock().await;
-        if self.close_complete.load(Ordering::SeqCst) {
+        // A captured runtime view never owns the connection or its tasks.
+        if self.owner.is_some() {
             return;
         }
-        self.closed.store(true, Ordering::SeqCst);
+        let _close_guard = self.transport.close_lock.lock().await;
+        if self.transport.close_complete.load(Ordering::SeqCst) {
+            return;
+        }
+        self.transport.closed.store(true, Ordering::SeqCst);
 
-        let _ = self.cancel_tx.send(true);
-        Self::abort_task(&self.keepalive_handle).await;
-        Self::abort_task(&self.disposal_handle).await;
+        let _ = self.transport.cancel_tx.send(true);
+        Self::abort_task(&self.transport.keepalive_handle).await;
+        Self::abort_task(&self.transport.disposal_handle).await;
 
         let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
-            let mut ws_tx = self.ws_tx.lock().await;
+            let mut ws_tx = self.transport.ws_tx.lock().await;
             let _ = ws_tx.close().await;
         })
         .await;
 
-        let _ = self.socket.shutdown(Shutdown::Both);
-        Self::abort_task(&self.reader_handle).await;
+        let _ = self.transport.socket.shutdown(Shutdown::Both);
+        Self::abort_task(&self.transport.reader_handle).await;
         if let Some(ledger) = self.debt_ledger() {
             ledger.connection_lost();
         }
-        self.tracked_responses
+        self.transport
+            .tracked_responses
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
-        self.pending.lock().await.clear();
-        self.close_complete.store(true, Ordering::SeqCst);
+        self.transport.pending.lock().await.clear();
+        self.transport.close_complete.store(true, Ordering::SeqCst);
     }
 
     /// Install only on the concentrated owner path. Real lifecycle replacement
@@ -835,7 +872,18 @@ impl CdpClient {
         &self,
         ledger: Arc<OwnerDebtLedger>,
     ) -> Result<(), ProtocolError> {
+        if self.owner.is_some() {
+            return Err(ProtocolError::StaleScope);
+        }
+        // Legacy raw/inspect writes have no reservation. Native adoption must
+        // serialize with their final managed-owner check under writer ownership.
+        let _writer = self
+            .transport
+            .ws_tx
+            .try_lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
         let mut owner = self
+            .transport
             .debt_owner
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
@@ -847,7 +895,10 @@ impl CdpClient {
                 return Err(ProtocolError::StaleScope);
             }
             let old = previous.snapshot();
-            if old.outstanding_commands != 0 || old.object_debt != 0 {
+            if old.outstanding_commands != 0
+                || old.object_debt != 0
+                || !previous.replacement_ready()
+            {
                 return Err(ProtocolError::ScopeUnavailable);
             }
         }
@@ -855,7 +906,120 @@ impl CdpClient {
         Ok(())
     }
     pub(crate) fn debt_ledger(&self) -> Option<Arc<OwnerDebtLedger>> {
-        self.debt_owner.lock().ok().and_then(|owner| owner.clone())
+        self.owner.clone().or_else(|| {
+            self.transport
+                .debt_owner
+                .lock()
+                .ok()
+                .and_then(|owner| owner.clone())
+        })
+    }
+    /// Constructed only by the native lifecycle owner, never by a callback.
+    pub(crate) fn owner_view(
+        &self,
+        ledger: Arc<OwnerDebtLedger>,
+    ) -> Result<Arc<Self>, ProtocolError> {
+        if self.owner.is_some() {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.check_cleanup_owner(&Some(ledger.clone()))?;
+        Ok(Arc::new(Self {
+            transport: self.transport.clone(),
+            owner: Some(ledger),
+        }))
+    }
+    pub(crate) fn check_cleanup_owner(
+        &self,
+        expected: &Option<Arc<OwnerDebtLedger>>,
+    ) -> Result<(), ProtocolError> {
+        if self.owner.as_ref().is_some_and(|bound| {
+            expected
+                .as_ref()
+                .is_none_or(|expected| !Arc::ptr_eq(bound, expected))
+        }) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let current = self
+            .transport
+            .debt_owner
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        match (expected, current.as_ref()) {
+            (None, None) => Ok(()),
+            (Some(expected), Some(current)) if Arc::ptr_eq(expected, current) => Ok(()),
+            _ => Err(ProtocolError::StaleScope),
+        }
+    }
+    /// One pre-bound, native lifecycle obligation. Its envelope cannot be
+    /// broadened by a method string, session ID or task-local category override.
+    pub(crate) async fn send_owner_cleanup(
+        &self,
+        expected: Option<Arc<OwnerDebtLedger>>,
+        command: OwnerCleanupCommand,
+        deadline: std::time::Instant,
+    ) -> Result<Value, String> {
+        self.check_cleanup_owner(&expected)
+            .map_err(|_| "Native cleanup owner changed".to_string())?;
+        if std::time::Instant::now() >= deadline {
+            return Err("Native cleanup deadline expired".into());
+        }
+        let reservation = expected
+            .as_ref()
+            .map(|ledger| ledger.reserve_owner_cleanup(command))
+            .transpose()
+            .map_err(|_| "Native cleanup admission refused".to_string())?;
+        let (method, params) = command.envelope();
+        tokio::time::timeout_at(
+            deadline.into(),
+            self.send_reserved_command_bound(
+                method,
+                params,
+                None,
+                reservation,
+                Some((expected, deadline)),
+            ),
+        )
+        .await
+        .map_err(|_| "Native cleanup deadline expired".to_string())?
+    }
+    /// Called only from native cleanup owners after selecting their exact retained
+    /// resource. No generic envelope, inherited category, or renewed app budget.
+    pub(crate) async fn send_scope_cleanup(
+        &self,
+        command: super::super::client_debt::ScopeCleanupCommand,
+        deadline: std::time::Instant,
+    ) -> Result<Value, String> {
+        let expected = self.debt_ledger();
+        self.check_cleanup_owner(&expected)
+            .map_err(|_| "Native cleanup owner changed".to_string())?;
+        if expected.is_some() && self.owner.is_none() {
+            return Err("Native cleanup requires an owner-bound view".into());
+        }
+        let (method, params, session) = command
+            .envelope()
+            .map_err(|_| "Invalid native cleanup identity".to_string())?;
+        if std::time::Instant::now() >= deadline {
+            return Err("Native cleanup deadline expired".into());
+        }
+        let reservation = expected
+            .as_ref()
+            .map(|ledger| {
+                ledger.reserve_scope_cleanup(method, &params, session.as_deref(), deadline)
+            })
+            .transpose()
+            .map_err(|_| "Native cleanup admission refused".to_string())?;
+        tokio::time::timeout_at(
+            deadline.into(),
+            self.send_reserved_command_bound(
+                method,
+                Some(params),
+                session.as_deref(),
+                reservation,
+                Some((expected, deadline)),
+            ),
+        )
+        .await
+        .map_err(|_| "Native cleanup deadline expired".to_string())?
     }
     pub(crate) fn reserve_tracked_command(
         &self,
@@ -867,6 +1031,13 @@ impl CdpClient {
             return Ok(None);
         };
         let journal = current_operation();
+        self.check_cleanup_owner(&Some(ledger.clone()))
+            .map_err(|_| "Native CDP owner changed".to_string())?;
+        // Legacy handles cease being ambient native-service authority when a
+        // managed owner is installed. Operation journals remain exact-bound.
+        if self.owner.is_none() && journal.is_none() {
+            return Err("Native CDP requires an owner-bound view".into());
+        }
         ledger
             .reserve_command(journal.as_ref(), method, params, session)
             .map(Some)
@@ -874,7 +1045,8 @@ impl CdpClient {
     }
     fn next_command_id(&self) -> Result<u64, String> {
         #[allow(deprecated)]
-        self.next_id
+        self.transport
+            .next_id
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| "CDP command identifier exhausted".to_string())
     }
@@ -883,11 +1055,27 @@ impl CdpClient {
         id: u64,
         reservation: Option<CommandReservation>,
     ) -> Result<(), String> {
+        let current = self
+            .transport
+            .debt_owner
+            .lock()
+            .map_err(|_| "Native CDP owner unavailable".to_string())?;
+        match (current.as_ref(), reservation.as_ref()) {
+            (None, None) if self.owner.is_none() => {}
+            (Some(current), Some(reservation))
+                if reservation.belongs_to(current)
+                    && self
+                        .owner
+                        .as_ref()
+                        .is_none_or(|bound| Arc::ptr_eq(bound, current)) => {}
+            _ => return Err("Native CDP reservation owner changed".into()),
+        }
         if let Some(reservation) = reservation {
             let submitted = reservation
                 .submit()
                 .map_err(|_| "Native CDP command admission revoked".to_string())?;
-            self.tracked_responses
+            self.transport
+                .tracked_responses
                 .lock()
                 .map_err(|_| "Native CDP correlation unavailable".to_string())?
                 .insert(id, submitted);
@@ -912,6 +1100,34 @@ impl CdpClient {
         session_id: Option<&str>,
         reservation: Option<CommandReservation>,
     ) -> Result<Value, String> {
+        if reservation
+            .as_ref()
+            .is_some_and(CommandReservation::is_owner_cleanup)
+        {
+            return Err("Native cleanup requires its bound lifecycle envelope".into());
+        }
+        if reservation.as_ref().is_some_and(|reservation| {
+            !reservation.matches_envelope(method, params.as_ref(), session_id)
+        }) {
+            return Err("Native CDP reservation envelope changed".into());
+        }
+        let budget = reservation
+            .as_ref()
+            .and_then(CommandReservation::initialization_budget);
+        within_initialization(
+            budget,
+            self.send_reserved_command_bound(method, params, session_id, reservation, None),
+        )
+        .await
+    }
+    async fn send_reserved_command_bound(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        reservation: Option<CommandReservation>,
+        cleanup_owner: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
+    ) -> Result<Value, String> {
         let id = self.next_command_id()?;
 
         let cmd = CdpCommand {
@@ -928,20 +1144,27 @@ impl CdpClient {
 
         // Cleans up the pending entry if this future is cancelled mid-await (#1528).
         let mut guard = PendingGuard {
-            pending: self.pending.clone(),
+            pending: self.transport.pending.clone(),
             id,
             done: false,
         };
 
         {
-            let mut ws_tx = self.ws_tx.lock().await;
+            let mut ws_tx = self.transport.ws_tx.lock().await;
             self.ensure_open()?;
-            let mut pending = self.pending.lock().await;
+            let mut pending = self.transport.pending.lock().await;
+            if let Some((expected, deadline)) = &cleanup_owner {
+                self.check_cleanup_owner(expected)
+                    .map_err(|_| "Native cleanup owner changed".to_string())?;
+                if std::time::Instant::now() >= *deadline {
+                    return Err("Native cleanup deadline expired".into());
+                }
+            }
             self.track_submission(id, reservation)?;
             pending.insert(id, tx);
             drop(pending);
             if let Err(error) = ws_tx.send(Message::Text(json)).await {
-                self.pending.lock().await.remove(&id);
+                self.transport.pending.lock().await.remove(&id);
                 guard.done = true;
                 return Err(format!("Failed to send CDP command: {}", error));
             }
@@ -958,7 +1181,7 @@ impl CdpClient {
             }
             Err(_) => {
                 guard.done = true;
-                self.pending.lock().await.remove(&id);
+                self.transport.pending.lock().await.remove(&id);
                 return Err(format!("CDP command timed out: {}", method));
             }
         };
@@ -971,7 +1194,7 @@ impl CdpClient {
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
-        self.event_tx.subscribe()
+        self.transport.event_tx.subscribe()
     }
 
     /// Deliver every event whose method is in `methods` to the returned
@@ -982,7 +1205,8 @@ impl CdpClient {
         methods: &'static [&'static str],
     ) -> mpsc::UnboundedReceiver<CdpEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
-        self.method_taps
+        self.transport
+            .method_taps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((methods, tx));
@@ -1028,13 +1252,15 @@ impl CdpClient {
         }
         #[allow(deprecated)] // Keep compatibility with older stable toolchains.
         let id = self
+            .transport
             .next_tap_id
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
             .map_err(|_| "control subscription ids exhausted")?;
         let (sender, receiver) = mpsc::channel(capacity);
         let failed = Arc::new(AtomicBool::new(false));
         let received = Arc::new(AtomicU64::new(0));
-        self.bounded_method_taps
+        self.transport
+            .bounded_method_taps
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(
@@ -1055,7 +1281,7 @@ impl CdpClient {
             receiver,
             received,
             failed,
-            routes: self.bounded_method_taps.clone(),
+            routes: self.transport.bounded_method_taps.clone(),
             id,
         })
     }
@@ -1068,7 +1294,8 @@ impl CdpClient {
     /// receiver also ends the route on the next event for that session.
     pub fn subscribe_session(&self, session_id: &str) -> mpsc::Receiver<CdpEvent> {
         let (tx, rx) = mpsc::channel(PRIVATE_SESSION_BUFFER);
-        self.private_sessions
+        self.transport
+            .private_sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(session_id.to_string(), tx);
@@ -1076,7 +1303,8 @@ impl CdpClient {
     }
 
     pub fn unsubscribe_session(&self, session_id: &str) {
-        self.private_sessions
+        self.transport
+            .private_sessions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(session_id);
@@ -1085,16 +1313,17 @@ impl CdpClient {
     /// Subscribe to all raw incoming CDP messages (responses + events).
     /// Used by the inspect proxy to forward traffic to the DevTools frontend.
     pub fn subscribe_raw(&self) -> broadcast::Receiver<RawCdpMessage> {
-        self.raw_tx.subscribe()
+        self.transport.raw_tx.subscribe()
     }
 
     /// Create a lightweight handle for the inspect WebSocket proxy.
     /// Contains only what's needed to forward messages bidirectionally.
     pub fn inspect_handle(&self) -> InspectProxyHandle {
         InspectProxyHandle {
-            ws_tx: self.ws_tx.clone(),
-            raw_tx: self.raw_tx.clone(),
-            closed: self.closed.clone(),
+            ws_tx: self.transport.ws_tx.clone(),
+            raw_tx: self.transport.raw_tx.clone(),
+            closed: self.transport.closed.clone(),
+            debt_owner: self.transport.debt_owner.clone(),
         }
     }
 
@@ -1133,24 +1362,30 @@ impl CdpClient {
         session_id: Option<&str>,
     ) -> Result<(), String> {
         let reservation = self.reserve_tracked_command(method, params.as_ref(), session_id)?;
-        let id = self.next_command_id()?;
-        let cmd = CdpCommand {
-            id,
-            method: method.to_string(),
-            params,
-            session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
-        };
+        let budget = reservation
+            .as_ref()
+            .and_then(CommandReservation::initialization_budget);
+        within_initialization(budget, async {
+            let id = self.next_command_id()?;
+            let cmd = CdpCommand {
+                id,
+                method: method.to_string(),
+                params,
+                session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            };
 
-        let json = serde_json::to_string(&cmd)
-            .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
+            let json = serde_json::to_string(&cmd)
+                .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
-        let mut ws_tx = self.ws_tx.lock().await;
-        self.ensure_open()?;
-        self.track_submission(id, reservation)?;
-        ws_tx
-            .send(Message::Text(json))
-            .await
-            .map_err(|e| format!("Failed to send CDP command: {}", e))
+            let mut ws_tx = self.transport.ws_tx.lock().await;
+            self.ensure_open()?;
+            self.track_submission(id, reservation)?;
+            ws_tx
+                .send(Message::Text(json))
+                .await
+                .map_err(|e| format!("Failed to send CDP command: {}", e))
+        })
+        .await
     }
 
     /// Send raw JSON through the WebSocket without tracking a response.
@@ -1159,8 +1394,17 @@ impl CdpClient {
         if self.debt_ledger().is_some() {
             return Err("Raw CDP writes are not admitted by the native owner".to_string());
         }
-        let mut ws_tx = self.ws_tx.lock().await;
+        let mut ws_tx = self.transport.ws_tx.lock().await;
         self.ensure_open()?;
+        if self
+            .transport
+            .debt_owner
+            .lock()
+            .map_err(|_| "Native owner unavailable")?
+            .is_some()
+        {
+            return Err("Raw CDP writes are not admitted by the native owner".into());
+        }
         ws_tx
             .send(Message::Text(json))
             .await
@@ -1171,13 +1415,14 @@ impl CdpClient {
     /// test can assert a cancelled command left no orphaned entry (#1528).
     #[cfg(test)]
     pub(crate) async fn pending_len(&self) -> usize {
-        self.pending.lock().await.len()
+        self.transport.pending.lock().await.len()
     }
 }
 
 /// Lightweight handle for the inspect WebSocket proxy, holding only
 /// the cloneable parts of CdpClient needed for bidirectional message forwarding.
 pub struct InspectProxyHandle {
+    debt_owner: DebtOwner,
     ws_tx: WsTx,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     closed: Arc<AtomicBool>,
@@ -1186,6 +1431,14 @@ pub struct InspectProxyHandle {
 impl InspectProxyHandle {
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
         let mut ws_tx = self.ws_tx.lock().await;
+        if self
+            .debt_owner
+            .lock()
+            .map_err(|_| "Native owner unavailable")?
+            .is_some()
+        {
+            return Err("Raw CDP writes are not admitted by the native owner".into());
+        }
         if self.closed.load(Ordering::SeqCst) {
             return Err(CONNECTION_CLOSED_ERROR.to_string());
         }
@@ -1230,6 +1483,10 @@ fn underlying_tcp_stream(
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "owner_lifecycle_tests.rs"]
+mod owner_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1295,7 +1552,7 @@ mod tests {
         seen_rx.await.unwrap();
         task.abort();
         let _ = task.await;
-        assert!(client.pending.lock().await.is_empty());
+        assert!(client.transport.pending.lock().await.is_empty());
         assert_eq!(ledger.snapshot().object_debt, 1);
         late_tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -1320,6 +1577,141 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn owner_cleanup_rechecks_exact_ledger_and_deadline_after_writer_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut commands = Vec::new();
+            while let Some(Ok(message)) = socket.next().await {
+                match message {
+                    Message::Text(text) => {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(request["method"], "Target.setAutoAttach");
+                        assert_eq!(request["params"]["autoAttach"], false);
+                        socket
+                            .send(Message::Text(
+                                json!({"id":request["id"],"result":{}}).to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        commands.push(text);
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
+            }
+            commands
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let old = OwnerDebtLedger::new(1, "old-owner".into());
+        old.bind_context("old-context").unwrap();
+        client.install_debt_ledger(old.clone()).unwrap();
+        old.retire_after_context_destroy("old-context").unwrap();
+        let replacement = OwnerDebtLedger::new(1, "replacement-owner".into());
+        replacement.bind_context("replacement-context").unwrap();
+        client
+            .send_owner_cleanup(
+                Some(old.clone()),
+                OwnerCleanupCommand::DisableAutoAttach,
+                std::time::Instant::now() + Duration::from_secs(2),
+            )
+            .await
+            .unwrap();
+        let writer = client.transport.ws_tx.lock().await;
+        let mut cancelled = Box::pin(client.send_owner_cleanup(
+            Some(old.clone()),
+            OwnerCleanupCommand::CloseBrowser,
+            std::time::Instant::now() + Duration::from_secs(2),
+        ));
+        assert!(futures_util::poll!(cancelled.as_mut()).is_pending());
+        assert_eq!(old.snapshot().outstanding_commands, 1);
+        assert!(
+            client.install_debt_ledger(replacement.clone()).is_err(),
+            "in-flight final cleanup must prevent owner replacement"
+        );
+        drop(cancelled);
+        assert_eq!(old.snapshot().outstanding_commands, 0);
+        assert!(
+            client.install_debt_ledger(replacement.clone()).is_err(),
+            "writer ownership is the adoption barrier"
+        );
+        drop(writer);
+        client.install_debt_ledger(replacement.clone()).unwrap();
+        assert!(client
+            .send_owner_cleanup(
+                Some(old.clone()),
+                OwnerCleanupCommand::CloseBrowser,
+                std::time::Instant::now() + Duration::from_secs(2)
+            )
+            .await
+            .is_err());
+        assert!(old
+            .reserve_owner_cleanup(OwnerCleanupCommand::DisableAutoAttach)
+            .is_err());
+        assert!(
+            client
+                .send_owner_cleanup(
+                    None,
+                    OwnerCleanupCommand::CloseBrowser,
+                    std::time::Instant::now() + Duration::from_secs(2)
+                )
+                .await
+                .is_err(),
+            "unbound legacy cleanup cannot act on a concentrated owner"
+        );
+        replacement
+            .retire_after_context_destroy("replacement-context")
+            .unwrap();
+        let writer = client.transport.ws_tx.lock().await;
+        let deadline = std::time::Instant::now() + Duration::from_millis(10);
+        let mut expired = Box::pin(client.send_owner_cleanup(
+            Some(replacement.clone()),
+            OwnerCleanupCommand::DisableAutoAttach,
+            deadline,
+        ));
+        assert!(futures_util::poll!(expired.as_mut()).is_pending());
+        tokio::time::sleep_until(deadline.into()).await;
+        drop(writer);
+        assert!(
+            expired.await.is_err(),
+            "writer wait must not renew final cleanup deadline"
+        );
+        assert!(
+            client
+                .send_owner_cleanup(
+                    Some(replacement.clone()),
+                    OwnerCleanupCommand::DisableAutoAttach,
+                    std::time::Instant::now() + Duration::from_secs(2)
+                )
+                .await
+                .is_err(),
+            "expired final cleanup is not renewed"
+        );
+        let cleanup = replacement
+            .reserve_owner_cleanup(OwnerCleanupCommand::CloseBrowser)
+            .unwrap();
+        assert!(
+            client
+                .send_reserved_command(
+                    "Runtime.evaluate",
+                    Some(json!({"expression":"must_not_run()"})),
+                    Some("page"),
+                    Some(cleanup)
+                )
+                .await
+                .is_err(),
+            "generic reserved send broadened a final-cleanup capability"
+        );
+        client.close().await;
+        assert!(
+            peer.await.unwrap().len() == 1,
+            "only the acknowledged phase-two proof may submit bytes"
+        );
+    }
 
     #[tokio::test]
     async fn remote_connection_loss_is_distinct_from_local_close() {
@@ -1841,7 +2233,7 @@ mod tests {
 
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
         accepted_rx.await.unwrap();
-        let sink_guard = client.ws_tx.lock().await;
+        let sink_guard = client.transport.ws_tx.lock().await;
         let close_client = client.clone();
         tokio::time::timeout(Duration::from_secs(1), async move {
             close_client.close().await;

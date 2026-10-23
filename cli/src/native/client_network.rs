@@ -9,6 +9,7 @@ use super::client_blobs::{
     BlobChunk, BlobError, BlobLease, BlobProducer, BlobScope, BlobStore, MAX_CHUNK_BYTES,
 };
 use super::client_browser::BrowserExecutionLease;
+use super::client_debt::ScopeCleanupCommand;
 use super::client_protocol::{Decision, DecisionNotice, ProtocolError, RequestOverrides};
 use super::client_session::{
     CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
@@ -1577,24 +1578,24 @@ impl ClientNetwork {
         {
             return Ok(());
         }
-        let (method, params) = match event.method.as_str() {
-            "Fetch.requestPaused" => (
-                "Fetch.failRequest",
-                json!({"requestId":required_string(&event.params,"requestId")?,"errorReason":"Aborted"}),
-            ),
-            "Fetch.authRequired" => (
-                "Fetch.continueWithAuth",
-                json!({"requestId":required_string(&event.params,"requestId")?,"authChallengeResponse":{"response":"CancelAuth"}}),
-            ),
-            "Page.javascriptDialogOpening" => {
-                ("Page.handleJavaScriptDialog", json!({"accept":false}))
-            }
+        let command = match event.method.as_str() {
+            "Fetch.requestPaused" => ScopeCleanupCommand::FailRequest {
+                session: session.to_owned(),
+                request: required_string(&event.params, "requestId")?.to_owned(),
+            },
+            "Fetch.authRequired" => ScopeCleanupCommand::CancelAuth {
+                session: session.to_owned(),
+                request: required_string(&event.params, "requestId")?.to_owned(),
+            },
+            "Page.javascriptDialogOpening" => ScopeCleanupCommand::DismissDialog {
+                session: session.to_owned(),
+            },
             _ => return Ok(()),
         };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            self.client
-                .send_command(method, Some(params), Some(session)),
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        tokio::time::timeout_at(
+            deadline.into(),
+            self.client.send_scope_cleanup(command, deadline),
         )
         .await
         .map_err(|_| ProtocolError::CleanupFailed)?
@@ -1635,25 +1636,24 @@ impl ClientNetwork {
                 failed = true;
                 break;
             }
-            let (method, params) = match key.1.as_str() {
-                "Fetch.requestPaused" => (
-                    "Fetch.failRequest",
-                    json!({"requestId":key.2,"errorReason":"Aborted"}),
-                ),
-                "Fetch.authRequired" => (
-                    "Fetch.continueWithAuth",
-                    json!({"requestId":key.2,"authChallengeResponse":{"response":"CancelAuth"}}),
-                ),
-                "Page.javascriptDialogOpening" => {
-                    ("Page.handleJavaScriptDialog", json!({"accept":false}))
-                }
+            let command = match key.1.as_str() {
+                "Fetch.requestPaused" => ScopeCleanupCommand::FailRequest {
+                    session: session.to_owned(),
+                    request: key.2.clone(),
+                },
+                "Fetch.authRequired" => ScopeCleanupCommand::CancelAuth {
+                    session: session.to_owned(),
+                    request: key.2.clone(),
+                },
+                "Page.javascriptDialogOpening" => ScopeCleanupCommand::DismissDialog {
+                    session: session.to_owned(),
+                },
                 _ => return Err(ProtocolError::CleanupFailed),
             };
             if matches!(
                 tokio::time::timeout_at(
                     deadline.into(),
-                    self.client
-                        .send_command(method, Some(params), Some(session))
+                    self.client.send_scope_cleanup(command, deadline)
                 )
                 .await,
                 Ok(Ok(_))
@@ -1666,7 +1666,14 @@ impl ClientNetwork {
                 failed = true;
             }
         }
-        for (method, params) in [("Fetch.disable", json!({})), ("Network.disable", json!({}))] {
+        for command in [
+            ScopeCleanupCommand::DisableFetch {
+                session: session.to_owned(),
+            },
+            ScopeCleanupCommand::DisableNetwork {
+                session: session.to_owned(),
+            },
+        ] {
             if std::time::Instant::now() >= deadline {
                 failed = true;
                 break;
@@ -1674,8 +1681,7 @@ impl ClientNetwork {
             if !matches!(
                 tokio::time::timeout_at(
                     deadline.into(),
-                    self.client
-                        .send_command(method, Some(params), Some(session))
+                    self.client.send_scope_cleanup(command, deadline)
                 )
                 .await,
                 Ok(Ok(_))

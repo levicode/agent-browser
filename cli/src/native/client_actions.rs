@@ -66,10 +66,15 @@ impl Dispatch {
         self.sent.store(true, Ordering::SeqCst);
     }
     fn failure(&self, error: ProtocolError) -> ActionFailure {
+        // A reason refines a semantic refusal, never an authority, transport,
+        // or cleanup error from a later attempt in the same action.
+        let semantic_refusal = error == ProtocolError::NotActionable;
         ActionFailure {
             error,
             cleanup_failed: self.cleanup.load(Ordering::SeqCst),
-            reason: if self.intercepted.load(Ordering::SeqCst) {
+            reason: if !semantic_refusal {
+                None
+            } else if self.intercepted.load(Ordering::SeqCst) {
                 Some(ActionReason::InterceptedPointer)
             } else if self.checked_replaced.load(Ordering::SeqCst) {
                 Some(ActionReason::ControlReplacedAfterClick)
@@ -615,6 +620,11 @@ impl Resolved {
             return Err(ProtocolError::BrowserFailure);
         }
         released?;
+        // Object-producing replies transfer cleanup ownership before checking
+        // authority. After that cleanup, the original lease must still permit
+        // interpretation: a late semantic refusal cannot hide stale/cancelled
+        // authority or become a public action reason for a retired operation.
+        ctx.check()?;
         let value = result["result"]["value"].clone();
         match value["status"].as_str() {
             Some("stale") => Err(ProtocolError::StaleReference),
@@ -1542,6 +1552,9 @@ async fn action_target(
     if released.is_err() || value.get("exceptionDetails").is_some() || candidate.is_none() {
         let _ =
             release_call_handles(ctx, d, &resolved.session, &value, Some(&resolved.object)).await;
+        if released.is_ok() && value.get("exceptionDetails").is_none() {
+            ctx.check()?;
+        }
         return Err(if value.get("exceptionDetails").is_some() {
             ProtocolError::BrowserFailure
         } else if released.is_err() {
@@ -1552,6 +1565,12 @@ async fn action_target(
     }
     let object = candidate.unwrap().to_owned();
     release_call_handles(ctx, d, &resolved.session, &value, Some(&object)).await?;
+    if let Err(primary) = ctx.check() {
+        if !release_object_accounted(&ctx.page.client, &resolved.session, &object).await {
+            d.cleanup.store(true, Ordering::SeqCst);
+        }
+        return Err(primary);
+    }
     Ok(Resolved {
         realm: resolved.realm,
         object,
@@ -2883,6 +2902,9 @@ impl ClientActions {
             &ctx.page.target_id,
             &ctx.page.page_session_id,
         )?;
+        if let Some(debt) = ctx.page.client.debt_ledger() {
+            debt.register_recording_target(&ctx.page.target_id)?;
+        }
         let client = ctx.page.client.clone();
         let target = ctx.page.target_id.clone();
         let shared = owned.state.capture_session.clone();
@@ -3693,6 +3715,30 @@ mod tests {
                 let source = request["params"]["functionDeclaration"]
                     .as_str()
                     .unwrap_or("");
+                if mode.starts_with("target-revalidation-")
+                    && method == "Runtime.releaseObject"
+                    && request["params"]["objectId"] == "exact-node"
+                {
+                    if mode == "target-revalidation-cancelled" {
+                        server_cancel.send_replace(CancelSignal::Requested);
+                    } else {
+                        server_gate.seal();
+                    }
+                }
+                if mode.starts_with("call-revalidation-")
+                    && method == "Runtime.releaseObject"
+                    && request["params"]["objectId"] == "call-auxiliary"
+                {
+                    match mode {
+                        "call-revalidation-stale" | "call-revalidation-cleanup-failed" => {
+                            server_gate.seal();
+                        }
+                        "call-revalidation-cancelled" => {
+                            server_cancel.send_replace(CancelSignal::Requested);
+                        }
+                        _ => unreachable!(),
+                    }
+                }
                 if mode == "preparation-release-debt" && method == "Runtime.releaseObject" {
                     assert_eq!(request["params"]["objectId"], "exact-node");
                     assert_eq!(request["sessionId"], "page");
@@ -3959,6 +4005,18 @@ mod tests {
                             } else {
                                 json!({"result":{"value":true}})
                             }
+                        } else if mode.starts_with("target-revalidation-")
+                            && source == "function(){if(this!==document||!this.isConnected)return null;return this.documentElement;}"
+                        {
+                            if mode == "target-revalidation-empty" {
+                                json!({"result":{"value":null}})
+                            } else {
+                                json!({"result":{"objectId":"document-element"}})
+                            }
+                        } else if mode.starts_with("call-revalidation-")
+                            && source == "function(){return 'owned-call-revalidation'}"
+                        {
+                            json!({"result":{"objectId":"call-auxiliary","value":{"status":"intercepted-pointer"}}})
                         } else if source.contains("const blocker=") {
                             if matches!(
                                 mode,
@@ -4033,6 +4091,9 @@ mod tests {
                         || (mode == "exact-aux-cleanup-failed"
                             && request["params"]["objectId"] == "result-handle"))
                         && method == "Runtime.releaseObject")
+                    || (mode == "call-revalidation-cleanup-failed"
+                        && method == "Runtime.releaseObject"
+                        && request["params"]["objectId"] == "call-auxiliary")
                     || (mode == "preparation-handle-cleanup-failed"
                         && method == "Runtime.releaseObject"
                         && request["params"]["objectId"] == "exact-node")
@@ -4125,7 +4186,7 @@ mod tests {
                 session: "page".into(),
                 frame: "main".into(),
                 loader: "doc".into(),
-                actionable: true,
+                actionable: !mode.starts_with("target-revalidation-"),
             },
         );
         let blobs = BlobStore::new(BlobLimits::default()).unwrap();
@@ -4180,7 +4241,7 @@ mod tests {
     #[tokio::test]
     async fn direct_point_uses_only_exact_input_and_late_ack_never_resumes_double_tap() {
         for cancelled in [false, true] {
-            let f = fixture(if cancelled {
+            let mut f = fixture(if cancelled {
                 "direct-point-cancel"
             } else {
                 "direct-point"
@@ -4200,6 +4261,7 @@ mod tests {
                 .unwrap();
             let ledger = client_debt::OwnerDebtLedger::new(1, "scope".into());
             f.page.client.install_debt_ledger(ledger.clone()).unwrap();
+            f.page.client = f.page.client.owner_view(ledger.clone()).unwrap();
             let journal = ledger
                 .operation(
                     client_debt::OperationKey {
@@ -6839,6 +6901,134 @@ mod tests {
                 .count(),
             1
         );
+    }
+    #[tokio::test]
+    async fn document_action_target_revalidates_after_releasing_original_handle() {
+        for (mode, expected, acquired) in [
+            ("target-revalidation-stale", ProtocolError::StaleScope, true),
+            (
+                "target-revalidation-empty",
+                ProtocolError::StaleScope,
+                false,
+            ),
+            (
+                "target-revalidation-cancelled",
+                ProtocolError::Cancelled,
+                true,
+            ),
+        ] {
+            let f = fixture(mode).await;
+            let d = Dispatch::default();
+            let reference = NodeReference {
+                id: "@e1".into(),
+                revision: "1".into(),
+            };
+            let error = match action_target(&f.context(), &d, &reference).await {
+                Ok(_) => panic!("{mode}: retired target must not escape"),
+                Err(error) => error,
+            };
+            assert_eq!(error, expected, "{mode}");
+            assert!(!d.cleanup.load(Ordering::SeqCst), "{mode}");
+            let requests = f.log.lock().unwrap();
+            let releases: Vec<_> = requests
+                .iter()
+                .filter(|request| request["method"] == "Runtime.releaseObject")
+                .map(|request| request["params"]["objectId"].as_str().unwrap())
+                .collect();
+            assert_eq!(
+                releases,
+                if acquired {
+                    vec!["exact-node", "document-element"]
+                } else {
+                    vec!["exact-node"]
+                },
+                "{mode}"
+            );
+            assert_eq!(requests.iter().filter(|request|
+                request["method"] == "Runtime.callFunctionOn" &&
+                request["params"]["functionDeclaration"] ==
+                "function(){if(this!==document||!this.isConnected)return null;return this.documentElement;}").count(), 1);
+        }
+    }
+    #[test]
+    fn earlier_semantic_reason_cannot_override_a_later_authority_or_cleanup_failure() {
+        for reason in 0..3 {
+            let d = Dispatch::default();
+            d.mark();
+            match reason {
+                0 => d.intercepted.store(true, Ordering::SeqCst),
+                1 => d.checked_unchanged.store(true, Ordering::SeqCst),
+                _ => d.checked_replaced.store(true, Ordering::SeqCst),
+            }
+            assert!(d.failure(ProtocolError::NotActionable).reason.is_some());
+            // Retrying preparation retains earlier refusal evidence, but that
+            // evidence cannot relabel a different failure on a later attempt.
+            d.mark_mutation(true);
+            for error in [
+                ProtocolError::StaleScope,
+                ProtocolError::StaleReference,
+                ProtocolError::Cancelled,
+                ProtocolError::DeadlineExceeded,
+                ProtocolError::BrowserFailure,
+                ProtocolError::CleanupFailed,
+            ] {
+                let failure = d.failure(error.clone());
+                assert_eq!(failure.error, error);
+                assert_eq!(failure.reason, None);
+                assert_eq!(failure.effects, Effects::Unknown);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn resolved_call_revalidates_after_owned_reply_cleanup_before_semantic_reason() {
+        for (mode, expected, cleanup_failed) in [
+            ("call-revalidation-stale", ProtocolError::StaleScope, false),
+            (
+                "call-revalidation-cancelled",
+                ProtocolError::Cancelled,
+                false,
+            ),
+            (
+                "call-revalidation-cleanup-failed",
+                ProtocolError::CleanupFailed,
+                true,
+            ),
+        ] {
+            let f = fixture(mode).await;
+            let node = Resolved {
+                realm: None,
+                object: "exact-node".into(),
+                session: "page".into(),
+                binding: f.refs.get("e1").unwrap().exact_binding.clone().unwrap(),
+            };
+            let d = Dispatch::default();
+            d.mark();
+            let result = node
+                .call(
+                    &f.context(),
+                    &d,
+                    false,
+                    "function(){return 'owned-call-revalidation'}",
+                    vec![],
+                )
+                .await;
+            assert_eq!(result, Err(expected.clone()), "{mode}");
+            let failure = d.failure(expected);
+            assert_eq!(failure.reason, None, "{mode}");
+            assert_eq!(failure.effects, Effects::Unknown, "{mode}");
+            assert_eq!(failure.cleanup_failed, cleanup_failed, "{mode}");
+            let requests = f.log.lock().unwrap();
+            let releases: Vec<_> = requests
+                .iter()
+                .filter(|request| request["method"] == "Runtime.releaseObject")
+                .collect();
+            assert_eq!(releases.len(), 1, "{mode}");
+            assert_eq!(releases[0]["params"]["objectId"], "call-auxiliary");
+            assert_eq!(releases[0]["sessionId"], "page");
+            assert!(!requests.iter().any(|request| request["method"]
+                .as_str()
+                .is_some_and(|method| method.starts_with("Input."))));
+        }
     }
     #[tokio::test]
     async fn obscured_action_exposes_only_closed_interception_reason() {

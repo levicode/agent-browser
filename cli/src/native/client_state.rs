@@ -390,7 +390,7 @@ async fn retire_native_bootstrap_target(
     }
     let inventory = tokio::time::timeout_at(
         deadline.into(),
-        client.send_command("Target.getTargets", Some(json!({})), None),
+        client.send_scope_cleanup(super::client_debt::ScopeCleanupCommand::Inventory, deadline),
     )
     .await
     .map_err(|_| StateError::CleanupIntegrityLost)?
@@ -479,6 +479,11 @@ async fn bootstrap(
         let attachment=context.targets.owned_target(&target).map_err(|_|StateError::IncompleteInventory)?;
         if attachment.kind!="page" || attachment.purpose!=Some(TargetPurpose::StateBootstrap) {return Err(StateError::IncompleteInventory);}
         let session=attachment.session_id;
+        if let Some(debt) = context.client.debt_ledger() {
+            if debt.initialization_deadline("Target.createTarget").is_some() {
+                debt.bind_state_bootstrap(&target, &session).map_err(|_| StateError::IncompleteInventory)?;
+            }
+        }
         drop(reservation);
         command(context.client, Some(&session), "Page.enable", json!({}), operation).await?;
         command(context.client, Some(&session), "Page.setLifecycleEventsEnabled", json!({"enabled":true}), operation).await?;
@@ -710,6 +715,20 @@ pub async fn import_state(
         }
     }
     check(operation).map_err(Into::into)
+}
+
+/// Recognize only the state import invocation used during native initialization.
+/// The payload must be JSON, never additional JavaScript or an export request.
+pub(crate) fn is_initialization_state_expression(source: &str) -> bool {
+    let Some(payload) = source
+        .strip_prefix('(')
+        .and_then(|source| source.strip_prefix(STATE_SCRIPT))
+        .and_then(|source| source.strip_prefix(")('import', "))
+        .and_then(|source| source.strip_suffix(')'))
+    else {
+        return false;
+    };
+    serde_json::from_str::<Value>(payload).is_ok()
 }
 
 // Runs only in a native-owned isolated synthetic document. IndexedDB uses its

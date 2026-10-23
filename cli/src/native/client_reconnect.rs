@@ -167,7 +167,7 @@ pub(super) async fn reconnect(
             // Unconditional, awaited, transport-only containment, independent
             // of the expired operation budget. CdpClient::close bounds its
             // socket/task teardown internally. Never invoke host close methods.
-            manager.client.close().await;
+            manager.disconnect_transport().await;
             Err(error)
         }
     }
@@ -587,7 +587,7 @@ mod tests {
             proof.check(&manager.client, &context, &target, &operation),
             Err(ProtocolError::Cancelled)
         );
-        manager.client.close().await;
+        manager.disconnect_transport().await;
         finish(source_server).await;
     }
 
@@ -658,7 +658,7 @@ mod tests {
             .send_command_no_params("Browser.getVersion", None)
             .await
             .unwrap();
-        verified.manager.client.close().await;
+        verified.manager.disconnect_transport().await;
         let commands = finish(new).await;
         assert_eq!(
             commands
@@ -667,7 +667,7 @@ mod tests {
                 .count(),
             1
         );
-        manager.client.close().await;
+        manager.disconnect_transport().await;
         finish(old).await;
     }
 

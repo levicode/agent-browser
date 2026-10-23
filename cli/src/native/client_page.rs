@@ -15,6 +15,7 @@ use super::cdp::types::CdpEvent;
 use super::client_browser::BrowserExecutionLease;
 use super::client_debt::{
     self, CleanupDisposition, CommandCategory, CommandStatusHandle, OperationJournalHandle,
+    ScopeCleanupCommand,
 };
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
@@ -35,7 +36,12 @@ pub(crate) struct PageConfigSnapshot {
     config: Config,
     requested_viewport: Option<(u32, u32)>,
 }
-const BLOCK_SERVICE_WORKERS: &str = "if (globalThis.ServiceWorkerContainer) ServiceWorkerContainer.prototype.register = async () => { console.warn('Service Worker registration blocked by agent-browser'); };";
+impl PageConfigSnapshot {
+    pub(crate) fn initialization_scripts(&self) -> impl Iterator<Item = &str> {
+        self.config.scripts.iter().map(|script| script.as_ref())
+    }
+}
+pub(crate) const BLOCK_SERVICE_WORKERS: &str = "if (globalThis.ServiceWorkerContainer) ServiceWorkerContainer.prototype.register = async () => { console.warn('Service Worker registration blocked by agent-browser'); };";
 #[derive(Clone, Default)]
 struct InputState {
     keys: BTreeMap<String, Key>,
@@ -630,10 +636,12 @@ impl ClientPageState {
             }
             match tokio::time::timeout_at(
                 deadline.into(),
-                client.send_command(
-                    "Page.removeScriptToEvaluateOnNewDocument",
-                    Some(json!({"identifier":id})),
-                    Some(session),
+                client.send_scope_cleanup(
+                    ScopeCleanupCommand::RemoveScript {
+                        session: session.to_owned(),
+                        identifier: id.clone(),
+                    },
+                    deadline,
                 ),
             )
             .await

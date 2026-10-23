@@ -344,6 +344,42 @@ struct RuntimeInitialization<'a> {
     replacement: Option<ReplacementSeed>,
 }
 
+/// One explicit new-scope request, not old application or final-close authority.
+/// The old ledger remains retired; the writer barrier installs a distinct owner.
+struct ReplacementLease {
+    debt: Arc<super::client_debt::OwnerDebtLedger>,
+    identity_scope: String,
+}
+impl ReplacementLease {
+    fn begin(
+        manager: &mut super::browser::BrowserManager,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<Self, ProtocolError> {
+        check_lifecycle_budget(operation)?;
+        if operation.is_callback {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        if manager
+            .client
+            .debt_ledger()
+            .is_some_and(|old| !old.replacement_ready())
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        let identity_scope = uuid::Uuid::new_v4().to_string();
+        let debt = super::client_debt::OwnerDebtLedger::unpublished(
+            operation,
+            identity_scope.clone(),
+            true,
+        )?;
+        manager.bind_native_owner(debt.clone())?;
+        Ok(Self {
+            debt,
+            identity_scope,
+        })
+    }
+}
+
 /// Native lifecycle-only declarations and attempt ownership. No old session,
 /// document, input, or blob authority is copied into the replacement.
 struct ReplacementSeed {
@@ -648,6 +684,79 @@ impl OwnedRuntime {
 }
 
 impl OwnedBrowser {
+    /// The retained caller owns this resource before the first acquisition can
+    /// yield. Late ACKs bind identities in its exact ledger, even without a waiter.
+    async fn isolated_for_scope(
+        manager: super::browser::BrowserManager,
+        operation: &super::client_session::OperationLease,
+        failed: &mut Option<Self>,
+    ) -> Result<Self, ProtocolError> {
+        let mut resource = Self {
+            manager,
+            context_id: String::new(),
+            identity_scope: String::new(),
+            owns_context: true,
+            targets: super::client_targets::ClientTargets::new(String::new(), String::new()),
+            page_state: Arc::new(super::client_page::ClientPageState::new(
+                String::new(),
+                String::new(),
+            )),
+            ui: Arc::new(super::client_ui::UiGate::default()),
+            runtime: None,
+            replacement_actions: None,
+            replacement_routes: None,
+            disconnected_routes: None,
+            reconnect_proof: None,
+            persistent_probe: Default::default(),
+            borrowed_targets: None,
+            browser_tenure: uuid::Uuid::new_v4().to_string(),
+        };
+        if let Err(error) = resource.bootstrap_context(operation).await {
+            *failed = Some(resource);
+            return Err(error);
+        }
+        Ok(resource)
+    }
+
+    async fn bootstrap_context(
+        &mut self,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let lease = ReplacementLease::begin(&mut self.manager, operation)?;
+        self.identity_scope = lease.identity_scope;
+        self.context_id.clear();
+        let response = self
+            .manager
+            .client
+            .send_command(
+                "Target.createBrowserContext",
+                Some(serde_json::json!({"disposeOnDetach":true})),
+                None,
+            )
+            .await;
+        // Reader binding precedes waiter delivery. Never use an old context ID
+        // if the new acquisition timed out or returned an invalid identity.
+        self.context_id = lease.debt.bound_context().unwrap_or_default();
+        response.map_err(|_| ProtocolError::BrowserFailure)?;
+        if self.context_id.is_empty() {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        check_lifecycle_budget(operation)?;
+        self.targets = super::client_targets::ClientTargets::new(
+            self.context_id.clone(),
+            self.identity_scope.clone(),
+        );
+        self.page_state = Arc::new(super::client_page::ClientPageState::new(
+            self.identity_scope.clone(),
+            self.context_id.clone(),
+        ));
+        self.ui = Arc::new(super::client_ui::UiGate::default());
+        self.manager
+            .owned_blank_page(Some(&self.context_id))
+            .await
+            .map_err(|_| ProtocolError::BrowserFailure)?;
+        check_lifecycle_budget(operation)
+    }
     pub async fn connect(
         endpoint: &str,
         headers: Option<Vec<(String, String)>>,
@@ -845,39 +954,7 @@ impl OwnedBrowser {
         self.manager.forget_disposed_targets(&ids);
         self.replacement_actions = self.runtime.as_ref().map(|runtime| runtime.actions.clone());
         self.runtime = None;
-        let value = self
-            .manager
-            .client
-            .send_command(
-                "Target.createBrowserContext",
-                Some(serde_json::json!({"disposeOnDetach":true})),
-                None,
-            )
-            .await
-            .map_err(|_| ProtocolError::BrowserFailure)?;
-        let context = value
-            .get("browserContextId")
-            .and_then(serde_json::Value::as_str)
-            .filter(|id| !id.is_empty())
-            .ok_or(ProtocolError::InvalidFrame)?
-            .to_owned();
-        self.context_id = context;
-        self.identity_scope = uuid::Uuid::new_v4().to_string();
-        self.targets = super::client_targets::ClientTargets::new(
-            self.context_id.clone(),
-            self.identity_scope.clone(),
-        );
-        self.page_state = Arc::new(super::client_page::ClientPageState::new(
-            self.identity_scope.clone(),
-            self.context_id.clone(),
-        ));
-        self.ui = Arc::new(super::client_ui::UiGate::default());
-        check_lifecycle_budget(operation)?;
-        self.manager
-            .owned_blank_page(Some(&self.context_id))
-            .await
-            .map_err(|_| ProtocolError::BrowserFailure)?;
-        check_lifecycle_budget(operation)
+        self.bootstrap_context(operation).await
     }
 
     /// Enroll only this unpublished context. The supervisor retains both the
@@ -899,15 +976,31 @@ impl OwnedBrowser {
         if self.runtime.is_some() || (!self.owns_context && self.borrowed_targets.is_none()) {
             return Err(ProtocolError::PolicyDenied);
         }
-        let debt = super::client_debt::OwnerDebtLedger::new(
-            operation.generation,
-            self.identity_scope.clone(),
-        );
-        // A borrowed default context has no context-destruction authority.
+        let debt = match self.manager.client.debt_ledger() {
+            Some(debt) if debt.matches_owner(operation.generation, &self.identity_scope) => debt,
+            Some(_) => return Err(ProtocolError::StaleScope),
+            None => super::client_debt::OwnerDebtLedger::unpublished(
+                operation,
+                self.identity_scope.clone(),
+                self.owns_context,
+            )?,
+        };
+        // Borrowed default context still has no destruction authority.
         if !self.context_id.is_empty() {
             debt.bind_context(&self.context_id)?;
         }
-        self.manager.client.install_debt_ledger(debt)?;
+        if self.manager.client.debt_ledger().is_none() {
+            self.manager.bind_native_owner(debt.clone())?;
+        }
+        debt.allow_initialization_script(super::client_page::BLOCK_SERVICE_WORKERS)?;
+        for source in &options.init_scripts {
+            debt.allow_initialization_script(source)?;
+        }
+        if let Some(seed) = &replacement {
+            for source in seed.page_config.initialization_scripts() {
+                debt.allow_initialization_script(source)?;
+            }
+        }
         let seeded = replacement.is_some();
         if let Some(seed) = &replacement {
             self.page_state = Arc::new(super::client_page::ClientPageState::from_config_snapshot(
@@ -1271,6 +1364,40 @@ impl OwnedBrowser {
             };
         }
         let debt = self.manager.client.debt_ledger();
+        if debt.as_ref().is_some_and(|ledger| {
+            ledger.replacement_ready()
+                && self
+                    .manager
+                    .client
+                    .check_cleanup_owner(&Some(ledger.clone()))
+                    .is_ok()
+        }) {
+            // Replacement can fail before installing any new owner (original
+            // cancellation/deadline or writer contention). The exact old ledger
+            // still carries disposal plus phase-two ACK proof. Do not attempt
+            // ordinary disposal through its permanently retired application gate.
+            // A new/unknown acquisition cannot satisfy replacement_ready().
+            let closed = self.manager.close().await;
+            return if closed.is_ok() && !retained_cleanup_failed {
+                Ok(())
+            } else {
+                Err(ProtocolError::CleanupFailed)
+            };
+        }
+        if let Some(ledger) = &debt {
+            if let Some(context) = ledger.bound_context() {
+                self.context_id = context;
+            }
+        }
+        if self.context_id.is_empty() {
+            // An unknown acquisition is not clean merely because the socket
+            // closes. Keep the failed lifecycle resource journaled upstream.
+            self.manager
+                .close()
+                .await
+                .map_err(|_| ProtocolError::CleanupFailed)?;
+            return Err(ProtocolError::CleanupFailed);
+        }
         let disposed = self
             .manager
             .client
@@ -1644,7 +1771,14 @@ impl ClientBrowser {
             let mut failed_persistent = None;
             let created = match request {
                 OpenRequest::Reuse { .. } => match retained_browser.lock().await.take() {
-                    Some(manager) => OwnedBrowser::isolated(manager).await,
+                    Some(manager) => {
+                        OwnedBrowser::isolated_for_scope(
+                            manager,
+                            &operation,
+                            &mut failed_persistent,
+                        )
+                        .await
+                    }
                     None => Err(ProtocolError::ScopeUnavailable),
                 },
                 OpenRequest::Connect {
@@ -1655,7 +1789,19 @@ impl ClientBrowser {
                     if persistent {
                         OwnedBrowser::connect_persistent(&endpoint, &mut failed_persistent).await
                     } else {
-                        OwnedBrowser::connect(&endpoint, None).await
+                        match super::browser::BrowserManager::connect_owned_browser(&endpoint, None)
+                            .await
+                        {
+                            Ok(manager) => {
+                                OwnedBrowser::isolated_for_scope(
+                                    manager,
+                                    &operation,
+                                    &mut failed_persistent,
+                                )
+                                .await
+                            }
+                            Err(_) => Err(ProtocolError::BrowserFailure),
+                        }
                     }
                 }
                 OpenRequest::Launch {
@@ -1663,7 +1809,7 @@ impl ClientBrowser {
                     headless,
                     ..
                 } => {
-                    OwnedBrowser::launch(
+                    match super::browser::BrowserManager::launch_owned(
                         super::cdp::chrome::LaunchOptions {
                             executable_path,
                             headless,
@@ -1672,6 +1818,17 @@ impl ClientBrowser {
                         None,
                     )
                     .await
+                    {
+                        Ok(manager) => {
+                            OwnedBrowser::isolated_for_scope(
+                                manager,
+                                &operation,
+                                &mut failed_persistent,
+                            )
+                            .await
+                        }
+                        Err(_) => Err(ProtocolError::BrowserFailure),
+                    }
                 }
             };
             let result = match created {
@@ -3793,59 +3950,78 @@ impl ClientBrowser {
                             super::client_state_dispatch::StateContextKind::Isolated,
                         )
                         .map_err(|failure| failure.error)?;
-                        state
-                            .import(&context, &operation)
-                            .await
+                        page.client
+                            .debt_ledger()
+                            .ok_or(ProtocolError::ScopeUnavailable)?
+                            .initialization_work(
+                                super::client_debt::InitializationWork::StateRestore,
+                                &operation,
+                                state.import(&context, &operation),
+                            )
+                            .await?
                             .map_err(|failure| failure.error)?;
                         for origin in imported_origins {
                             resource.page_state.record_origin(&page, &origin)?;
                         }
                     }
                     if was_recording {
-                        let frames =
-                            super::client_observation_dispatch::verified_frames(&page, &operation)
-                                .await?;
-                        let geometry = super::client_geometry::GeometrySnapshot::capture(
-                            &page.client,
-                            &page.page_session_id,
-                            &frames,
+                        let debt = page
+                            .client
+                            .debt_ledger()
+                            .ok_or(ProtocolError::ScopeUnavailable)?;
+                        debt.initialization_work(
+                            super::client_debt::InitializationWork::Recording,
                             &operation,
+                            async {
+                                let frames = super::client_observation_dispatch::verified_frames(
+                                    &page, &operation,
+                                )
+                                .await?;
+                                let geometry = super::client_geometry::GeometrySnapshot::capture(
+                                    &page.client,
+                                    &page.page_session_id,
+                                    &frames,
+                                    &operation,
+                                )
+                                .await
+                                .map_err(|_| ProtocolError::BrowserFailure)?;
+                                let (revision, references) =
+                                    observation.snapshot_for_action(&operation).await?;
+                                let sessions = frames
+                                    .iter()
+                                    .filter(|frame| frame.parent_frame_id.is_some())
+                                    .map(|frame| {
+                                        (frame.binding.frame.clone(), frame.binding.session.clone())
+                                    })
+                                    .collect();
+                                actions
+                                    .recording_page_opened(super::client_actions::ActionContext {
+                                        observation_after: None,
+                                        observed_revision: 0,
+                                        page: &page,
+                                        operation: &operation,
+                                        page_state: &resource.page_state,
+                                        refs: &references,
+                                        revision,
+                                        iframe_sessions: &sessions,
+                                        observation_frames: &frames,
+                                        blobs: &blobs,
+                                        geometry: &geometry,
+                                        realm_authority:
+                                            super::client_actions::ActionRealmAuthority::Enrolled(
+                                                &resource
+                                                    .runtime
+                                                    .as_ref()
+                                                    .ok_or(ProtocolError::ScopeUnavailable)?
+                                                    .enrollment,
+                                            ),
+                                    })
+                                    .await
+                                    .map_err(|failure| failure.error)?;
+                                Ok::<(), ProtocolError>(())
+                            },
                         )
-                        .await
-                        .map_err(|_| ProtocolError::BrowserFailure)?;
-                        let (revision, references) =
-                            observation.snapshot_for_action(&operation).await?;
-                        let sessions = frames
-                            .iter()
-                            .filter(|frame| frame.parent_frame_id.is_some())
-                            .map(|frame| {
-                                (frame.binding.frame.clone(), frame.binding.session.clone())
-                            })
-                            .collect();
-                        actions
-                            .recording_page_opened(super::client_actions::ActionContext {
-                                observation_after: None,
-                                observed_revision: 0,
-                                page: &page,
-                                operation: &operation,
-                                page_state: &resource.page_state,
-                                refs: &references,
-                                revision,
-                                iframe_sessions: &sessions,
-                                observation_frames: &frames,
-                                blobs: &blobs,
-                                geometry: &geometry,
-                                realm_authority:
-                                    super::client_actions::ActionRealmAuthority::Enrolled(
-                                        &resource
-                                            .runtime
-                                            .as_ref()
-                                            .ok_or(ProtocolError::ScopeUnavailable)?
-                                            .enrollment,
-                                    ),
-                            })
-                            .await
-                            .map_err(|failure| failure.error)?;
+                        .await??;
                     }
                 }
                 loop {
@@ -4070,7 +4246,7 @@ impl ClientBrowser {
                     .retire_owner_references();
                 // Exact terminal local cleanup has settled; this closes only the
                 // old socket. Host page/context ownership is never acquired.
-                resource.manager.client.close().await;
+                resource.manager.disconnect_transport().await;
                 check_lifecycle_budget(&operation)?;
                 let verified =
                     super::client_reconnect::reconnect(&request.endpoint, &retained, &operation)
@@ -4129,43 +4305,59 @@ impl ClientBrowser {
                             operation.cancellation.clone(),
                         )
                         .await?;
-                    let frames =
-                        super::client_observation_dispatch::verified_frames(&page, &operation)
-                            .await?;
-                    let geometry = super::client_geometry::GeometrySnapshot::capture(
-                        &page.client,
-                        &page.page_session_id,
-                        &frames,
+                    let debt = page
+                        .client
+                        .debt_ledger()
+                        .ok_or(ProtocolError::ScopeUnavailable)?;
+                    debt.initialization_work(
+                        super::client_debt::InitializationWork::Recording,
                         &operation,
+                        async {
+                            let frames = super::client_observation_dispatch::verified_frames(
+                                &page, &operation,
+                            )
+                            .await?;
+                            let geometry = super::client_geometry::GeometrySnapshot::capture(
+                                &page.client,
+                                &page.page_session_id,
+                                &frames,
+                                &operation,
+                            )
+                            .await
+                            .map_err(|_| ProtocolError::BrowserFailure)?;
+                            let (revision, references) =
+                                observation.snapshot_for_action(&operation).await?;
+                            let sessions = frames
+                                .iter()
+                                .filter(|frame| frame.parent_frame_id.is_some())
+                                .map(|frame| {
+                                    (frame.binding.frame.clone(), frame.binding.session.clone())
+                                })
+                                .collect();
+                            actions
+                                .recording_page_opened(super::client_actions::ActionContext {
+                                    observation_after: None,
+                                    observed_revision: 0,
+                                    page: &page,
+                                    operation: &operation,
+                                    page_state: &resource.page_state,
+                                    refs: &references,
+                                    revision,
+                                    iframe_sessions: &sessions,
+                                    observation_frames: &frames,
+                                    blobs: &blobs,
+                                    geometry: &geometry,
+                                    realm_authority:
+                                        super::client_actions::ActionRealmAuthority::Enrolled(
+                                            &runtime.enrollment,
+                                        ),
+                                })
+                                .await
+                                .map_err(|failure| failure.error)?;
+                            Ok::<(), ProtocolError>(())
+                        },
                     )
-                    .await
-                    .map_err(|_| ProtocolError::BrowserFailure)?;
-                    let (revision, references) =
-                        observation.snapshot_for_action(&operation).await?;
-                    let sessions = frames
-                        .iter()
-                        .filter(|frame| frame.parent_frame_id.is_some())
-                        .map(|frame| (frame.binding.frame.clone(), frame.binding.session.clone()))
-                        .collect();
-                    actions
-                        .recording_page_opened(super::client_actions::ActionContext {
-                            observation_after: None,
-                            observed_revision: 0,
-                            page: &page,
-                            operation: &operation,
-                            page_state: &resource.page_state,
-                            refs: &references,
-                            revision,
-                            iframe_sessions: &sessions,
-                            observation_frames: &frames,
-                            blobs: &blobs,
-                            geometry: &geometry,
-                            realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(
-                                &runtime.enrollment,
-                            ),
-                        })
-                        .await
-                        .map_err(|failure| failure.error)?;
+                    .await??;
                 }
                 loop {
                     check_lifecycle_budget(&operation)?;

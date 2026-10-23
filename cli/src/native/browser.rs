@@ -407,6 +407,8 @@ pub enum BrowserProcess {
     Chrome(ChromeProcess),
     Lightpanda(LightpandaProcess),
     Obscura(ObscuraProcess),
+    #[cfg(test)]
+    CleanupWitness(Arc<std::sync::atomic::AtomicBool>),
 }
 
 impl BrowserProcess {
@@ -415,6 +417,10 @@ impl BrowserProcess {
             BrowserProcess::Chrome(p) => p.kill(),
             BrowserProcess::Lightpanda(p) => p.kill(),
             BrowserProcess::Obscura(p) => p.kill(),
+            #[cfg(test)]
+            BrowserProcess::CleanupWitness(waited) => {
+                waited.store(true, std::sync::atomic::Ordering::SeqCst)
+            }
         }
     }
 
@@ -423,6 +429,10 @@ impl BrowserProcess {
             BrowserProcess::Chrome(p) => p.wait_or_kill(timeout),
             BrowserProcess::Lightpanda(p) => p.kill(),
             BrowserProcess::Obscura(p) => p.kill(),
+            #[cfg(test)]
+            BrowserProcess::CleanupWitness(waited) => {
+                waited.store(true, std::sync::atomic::Ordering::SeqCst)
+            }
         }
     }
 
@@ -432,12 +442,18 @@ impl BrowserProcess {
             BrowserProcess::Chrome(p) => p.has_exited(),
             BrowserProcess::Lightpanda(_) => false,
             BrowserProcess::Obscura(p) => p.has_exited(),
+            #[cfg(test)]
+            BrowserProcess::CleanupWitness(waited) => {
+                waited.load(std::sync::atomic::Ordering::SeqCst)
+            }
         }
     }
 }
 
 pub struct BrowserManager {
     pub client: Arc<CdpClient>,
+    // Only the lifecycle manager owns physical close and native owner installation.
+    native_control: Option<Arc<CdpClient>>,
     browser_process: Option<BrowserProcess>,
     ws_url: String,
     pages: Vec<PageInfo>,
@@ -705,6 +721,7 @@ impl BrowserManager {
             );
             let mut manager = Self {
                 client,
+                native_control: None,
                 browser_process: Some(process),
                 ws_url,
                 pages: Vec::new(),
@@ -833,6 +850,7 @@ impl BrowserManager {
         );
         let mut manager = Self {
             client,
+            native_control: None,
             browser_process: None,
             ws_url,
             pages: Vec::new(),
@@ -1485,8 +1503,39 @@ impl BrowserManager {
             .await
     }
 
+    pub(super) fn bind_native_owner(
+        &mut self,
+        ledger: Arc<super::client_debt::OwnerDebtLedger>,
+    ) -> Result<(), super::client_protocol::ProtocolError> {
+        let control = self
+            .native_control
+            .get_or_insert_with(|| self.client.clone());
+        control.install_debt_ledger(ledger.clone())?;
+        self.client = control.owner_view(ledger)?;
+        Ok(())
+    }
+
+    /// Physical connection authority stays with the lifecycle manager, never
+    /// with a page/network/enrollment callback's immutable scoped view.
+    pub(super) async fn disconnect_transport(&self) {
+        self.native_control
+            .as_ref()
+            .unwrap_or(&self.client)
+            .close()
+            .await;
+    }
+
     pub async fn close(&mut self) -> Result<(), String> {
         self.close_with_timeout(None).await
+    }
+
+    /// Test only: enter the real owned-process close branch without launching a browser.
+    #[cfg(test)]
+    pub(super) fn install_cleanup_process_witness(&mut self) -> Arc<std::sync::atomic::AtomicBool> {
+        assert!(self.browser_process.is_none());
+        let waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        self.browser_process = Some(BrowserProcess::CleanupWitness(waited.clone()));
+        waited
     }
 
     async fn close_with_timeout(
@@ -1497,7 +1546,14 @@ impl BrowserManager {
             // Only send Browser.close when we launched the browser ourselves.
             // For external connections (--auto-connect, --cdp) we just disconnect
             // without shutting down the user's browser.
-            let close = self.client.send_command_no_params("Browser.close", None);
+            let debt = self.client.debt_ledger();
+            let deadline =
+                Instant::now() + browser_close_timeout.unwrap_or(Duration::from_secs(30));
+            let close = self.client.send_owner_cleanup(
+                debt,
+                super::client_debt::OwnerCleanupCommand::CloseBrowser,
+                deadline,
+            );
             if let Some(timeout) = browser_close_timeout {
                 let _ = tokio::time::timeout(timeout, close).await;
             } else {
@@ -1505,7 +1561,7 @@ impl BrowserManager {
             }
         }
 
-        self.client.close().await;
+        self.disconnect_transport().await;
 
         if let Some(mut process) = self.browser_process.take() {
             let timeout = std::time::Duration::from_secs(5);
@@ -2685,6 +2741,7 @@ async fn initialize_lightpanda_manager(
 
         let mut manager = BrowserManager {
             client: Arc::new(client),
+            native_control: None,
             browser_process: None,
             ws_url: ws_url.clone(),
             pages: Vec::new(),
@@ -2794,6 +2851,7 @@ async fn initialize_obscura_manager(
 
         let mut manager = BrowserManager {
             client: Arc::new(client),
+            native_control: None,
             browser_process: None,
             ws_url: ws_url.clone(),
             pages: Vec::new(),
@@ -3589,6 +3647,7 @@ mod tests {
         let client = CdpClient::connect(&format!("ws://{}", addr)).await.unwrap();
         BrowserManager {
             client: Arc::new(client),
+            native_control: None,
             browser_process: None,
             ws_url: format!("ws://{}", addr),
             pages,
@@ -3649,6 +3708,7 @@ mod tests {
         let client = CdpClient::connect(&format!("ws://{}", addr)).await.unwrap();
         let mut manager = BrowserManager {
             client: Arc::new(client),
+            native_control: None,
             browser_process: None,
             ws_url: format!("ws://{}", addr),
             pages: Vec::new(),

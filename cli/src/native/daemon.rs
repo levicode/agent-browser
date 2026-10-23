@@ -952,6 +952,7 @@ mod tests {
         let ready: Value = serde_json::from_slice(&frame).unwrap();
         assert_eq!(ready["type"], "ready");
         let expected = vec![
+            "operation.continue-exact-owner/1",
             "browser.scope/1",
             "browser.lifecycle/1",
             "browser.evaluate/1",
@@ -972,7 +973,19 @@ mod tests {
             .into_iter()
             .chain(std::iter::once("acceptance.faults/1"))
             .collect::<Vec<_>>();
+        // Transport appends terminal closure after the executor capabilities,
+        // including after the feature-gated acceptance capability.
+        let expected = expected
+            .into_iter()
+            .chain(std::iter::once("terminal.close/1"))
+            .collect::<Vec<_>>();
         assert_eq!(ready["capabilities"], serde_json::json!(expected));
+        let capabilities = ready["capabilities"].as_array().unwrap();
+        let unique = capabilities
+            .iter()
+            .map(|capability| capability.as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), capabilities.len());
         assert!(gate.try_read().is_err());
 
         let (legacy, server) = tokio::io::duplex(8192);
