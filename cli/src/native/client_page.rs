@@ -10,9 +10,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::actions::{build_mouse_event_params, MouseState};
-use super::browser::evaluate_on;
+use super::browser::{evaluate_on, evaluate_public_on};
 use super::cdp::types::CdpEvent;
 use super::client_browser::BrowserExecutionLease;
+use super::client_debt::{
+    self, CleanupDisposition, CommandCategory, CommandStatusHandle, OperationJournalHandle,
+};
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
 use super::interaction::{char_to_key_info, key_text, named_key_info};
@@ -77,6 +80,7 @@ struct State {
     uncertain_scripts: BTreeSet<String>,
     configuration_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     input: InputState,
+    input_cleanup: Option<(Vec<CommandStatusHandle>, InputState)>,
     origins: BTreeSet<String>,
     requested_viewport: Option<(u32, u32)>,
     browser_is_mac: Option<bool>,
@@ -112,6 +116,13 @@ fn append_script(config: &mut Config, source: Arc<str>) -> Result<(), ProtocolEr
     Ok(())
 }
 
+fn configuration_incomplete(error: ProtocolError) -> ProtocolError {
+    if let Some(journal) = OperationJournalHandle::current() {
+        journal.record_cleanup_disposition(CleanupDisposition::IntegrityLost);
+    }
+    error
+}
+
 fn invalid<T>() -> Result<T, ProtocolError> {
     Err(ProtocolError::InvalidArguments)
 }
@@ -120,6 +131,9 @@ fn decode<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, ProtocolErr
 }
 fn check(page: &BrowserExecutionLease, op: &OperationLease) -> Result<(), ProtocolError> {
     page.permit.check()?;
+    if let Some(journal) = OperationJournalHandle::current() {
+        journal.check_application_submission()?;
+    }
     if *op.cancellation.borrow() != CancelSignal::None {
         return Err(ProtocolError::Cancelled);
     }
@@ -285,9 +299,20 @@ impl ClientPageState {
         Ok(())
     }
     fn state(&self) -> Result<MutexGuard<'_, State>, ProtocolError> {
-        self.state
+        let mut state = self
+            .state
             .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state
+            .input_cleanup
+            .as_ref()
+            .is_some_and(|(statuses, _)| statuses.iter().all(CommandStatusHandle::settled))
+        {
+            if let Some((_, input)) = state.input_cleanup.take() {
+                state.input = input;
+            }
+        }
+        Ok(state)
     }
     fn validate(
         &self,
@@ -689,7 +714,11 @@ impl ClientPageState {
                 let value = bounded(
                     page,
                     op,
-                    evaluate_on(&page.client, &page.page_session_id, expression),
+                    client_debt::command_scope(
+                        CommandCategory::ApplicationRead,
+                        false,
+                        evaluate_on(&page.client, &page.page_session_id, expression),
+                    ),
                 )
                 .await?;
                 if !value.is_string() {
@@ -710,7 +739,7 @@ impl ClientPageState {
                 let result = bounded(
                     page,
                     op,
-                    evaluate_on(&page.client, &page.page_session_id, &expression),
+                    evaluate_public_on(&page.client, &page.page_session_id, &expression),
                 )
                 .await?;
                 if !result.is_object() || result.get("value").is_none() {
@@ -803,9 +832,16 @@ impl ClientPageState {
                 let a: Source = decode(args)?;
                 {
                     let mut s = self.state()?;
-                    append_script(&mut s.config, Arc::from(a.source))?;
+                    let mut next = s.config.clone();
+                    append_script(&mut next, Arc::from(a.source))?;
+                    if let Some(journal) = OperationJournalHandle::current() {
+                        journal.mark_mutation_maybe_submitted()?;
+                    }
+                    s.config = next;
                 }
-                self.apply_existing(page, sessions, op).await?;
+                self.apply_existing(page, sessions, op)
+                    .await
+                    .map_err(configuration_incomplete)?;
                 Ok(Value::Null)
             }
             "context.media" => {
@@ -827,11 +863,15 @@ impl ClientPageState {
                 }
                 {
                     let mut s = self.state()?;
-                    s.config.revision = s
+                    let revision = s
                         .config
                         .revision
                         .checked_add(1)
                         .ok_or(ProtocolError::IdentifierExhausted)?;
+                    if let Some(journal) = OperationJournalHandle::current() {
+                        journal.mark_mutation_maybe_submitted()?;
+                    }
+                    s.config.revision = revision;
                     if a.color_scheme.is_some() {
                         s.config.color_scheme = a.color_scheme;
                     }
@@ -844,7 +884,9 @@ impl ClientPageState {
                 let ordered = std::iter::once(page.page_session_id.clone())
                     .chain(sessions.iter().cloned())
                     .collect::<Vec<_>>();
-                self.apply_existing(page, &ordered, op).await?;
+                self.apply_existing(page, &ordered, op)
+                    .await
+                    .map_err(configuration_incomplete)?;
                 Ok(Value::Null)
             }
             "context.viewport" => {
@@ -1035,7 +1077,11 @@ impl ClientPageState {
         let value = bounded(
             page,
             op,
-            evaluate_on(&page.client, &page.page_session_id, "location.href"),
+            client_debt::command_scope(
+                CommandCategory::ApplicationRead,
+                false,
+                evaluate_on(&page.client, &page.page_session_id, "location.href"),
+            ),
         )
         .await?;
         // Same-document navigation from an attached profile's initial page
@@ -1085,6 +1131,9 @@ impl ClientPageState {
         };
         let mut params = {
             let mut s = self.state()?;
+            if s.input_cleanup.is_some() {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
             bind_input_session(&mut s.input, &page.page_session_id)?;
             let repeat = s.input.keys.contains_key(&key.code);
             if down {
@@ -1219,6 +1268,9 @@ impl ClientPageState {
         let requested_bits = keys.iter().fold(0, |bits, key| bits | key.modifier);
         let previous = {
             let mut state = self.state()?;
+            if state.input_cleanup.is_some() {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
             bind_input_session(&mut state.input, &page.page_session_id)?;
             state
                 .input
@@ -1235,6 +1287,9 @@ impl ClientPageState {
         for key in keys {
             let held = {
                 let mut state = self.state()?;
+                if state.input_cleanup.is_some() {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
                 bind_input_session(&mut state.input, &page.page_session_id)?;
                 modifiers(&state.input)
             };
@@ -1300,6 +1355,9 @@ impl ClientPageState {
         }
         let params = {
             let mut state = self.state()?;
+            if state.input_cleanup.is_some() {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
             bind_input_session(&mut state.input, &page.page_session_id)?;
             let mods = modifiers(&state.input);
             build_mouse_event_params(
@@ -1398,61 +1456,94 @@ impl ClientPageState {
             return Ok(());
         }
         let session = session.to_owned();
-        let cleanup = async {
-            for key in input.keys.clone().into_values() {
-                input.keys.remove(&key.code);
-                client
-                    .send_command(
-                        "Input.dispatchKeyEvent",
-                        Some(key_params(&key, false, false, modifiers(&input), false)),
-                        Some(&session),
-                    )
-                    .await?;
+        let mut commands = Vec::new();
+        for key in input.keys.clone().into_values() {
+            input.keys.remove(&key.code);
+            commands.push((
+                "Input.dispatchKeyEvent",
+                key_params(&key, false, false, modifiers(&input), false),
+            ));
+        }
+        for (button, mask) in [
+            ("left", 1),
+            ("right", 2),
+            ("middle", 4),
+            ("back", 8),
+            ("forward", 16),
+        ] {
+            if input.mouse.buttons & mask == 0 {
+                continue;
             }
-            for (button, mask) in [
-                ("left", 1),
-                ("right", 2),
-                ("middle", 4),
-                ("back", 8),
-                ("forward", 16),
-            ] {
-                if input.mouse.buttons & mask == 0 {
-                    continue;
-                }
-                let params = build_mouse_event_params(
-                    &mut input.mouse,
-                    "mouseReleased",
-                    None,
-                    None,
-                    Some(button),
-                    None,
-                    Some(1),
-                    None,
-                    None,
-                    Some(0),
-                );
-                client
-                    .send_command(
-                        "Input.dispatchMouseEvent",
-                        Some(
-                            serde_json::to_value(params)
-                                .map_err(|_| "cleanup serialization".to_string())?,
-                        ),
-                        Some(&session),
-                    )
-                    .await?;
-            }
-            Ok::<(), String>(())
-        };
-        tokio::time::timeout_at(deadline.into(), cleanup)
-            .await
-            .map_err(|_| ProtocolError::CleanupFailed)?
-            .map_err(|_| ProtocolError::CleanupFailed)?;
-        self.state()?.input = InputState {
+            let params = build_mouse_event_params(
+                &mut input.mouse,
+                "mouseReleased",
+                None,
+                None,
+                Some(button),
+                None,
+                Some(1),
+                None,
+                None,
+                Some(0),
+            );
+            commands.push((
+                "Input.dispatchMouseEvent",
+                serde_json::to_value(params).map_err(|_| ProtocolError::CleanupFailed)?,
+            ));
+        }
+        let clean = InputState {
             mouse: input.mouse,
-            session: Some(session),
+            session: Some(session.clone()),
             ..InputState::default()
         };
+        if commands.is_empty() {
+            return Ok(());
+        }
+        let mut statuses = Vec::new();
+        // Reserve the whole bounded cleanup batch before any send. Failure to
+        // reserve even one required key/button is an actual cleanup failure.
+        let mut reserved = Vec::new();
+        for (method, params) in commands {
+            let reservation =
+                client_debt::command_scope(CommandCategory::CleanupInput, false, async {
+                    client.reserve_tracked_command(method, Some(&params), Some(&session))
+                })
+                .await
+                .map_err(|_| ProtocolError::CleanupFailed)?;
+            if let Some(reservation) = &reservation {
+                statuses.push(reservation.status());
+            }
+            reserved.push((method, params, reservation));
+        }
+        let tracked = statuses.len() == reserved.len();
+        let cleanup = futures_util::future::join_all(reserved.into_iter().map(
+            |(method, params, reservation)| {
+                client.send_reserved_command(method, Some(params), Some(&session), reservation)
+            },
+        ));
+        let result = tokio::time::timeout_at(deadline.into(), cleanup).await;
+        let all_acknowledged = matches!(&result, Ok(results) if results.iter().all(Result::is_ok));
+        if all_acknowledged {
+            self.state()?.input = clean;
+            self.state()?.input_cleanup = None;
+        } else if tracked
+            && statuses
+                .iter()
+                .all(|status| status.settled() || status.accountably_retained())
+            && client
+                .debt_ledger()
+                .is_some_and(|ledger| !ledger.snapshot().integrity_lost)
+        {
+            // Unacknowledged releases are remote input debt, not proof the
+            // browser is clean. Keep exact statuses so late reader ACKs can
+            // reconcile local held state before any later input uses it.
+            self.state()?.input_cleanup = Some((statuses, clean));
+            if let Some(journal) = OperationJournalHandle::current() {
+                journal.record_cleanup_disposition(CleanupDisposition::AccountedRemoteDebt);
+            }
+        } else {
+            return Err(ProtocolError::CleanupFailed);
+        }
         Ok(())
     }
 }
@@ -1890,6 +1981,104 @@ fn project_cookies(response: &Value) -> Result<Vec<Value>, ProtocolError> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn fixed_page_reads_and_public_evaluate_have_distinct_real_dispatch_journals() {
+        for (name, args, mutating) in [
+            ("page.title", json!({}), false),
+            ("page.url", json!({}), false),
+            (
+                "page.evaluate",
+                json!({"source":"()=>1","argument":null}),
+                true,
+            ),
+        ] {
+            let (page, log, server) = mock("hold-evaluate").await;
+            let state = ClientPageState::new("scope".into(), "context".into());
+            let ledger = client_debt::OwnerDebtLedger::new(1, "scope".into());
+            page.client.install_debt_ledger(ledger.clone()).unwrap();
+            let (mut op, _sender) = operation();
+            op.deadline = Instant::now() + Duration::from_millis(30);
+            let journal = ledger
+                .operation(
+                    client_debt::OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            journal.bind_operation(&op).unwrap();
+            assert_eq!(
+                journal
+                    .scope(state.execute(&page, &[], &op, name, &args))
+                    .await,
+                Err(ProtocolError::DeadlineExceeded)
+            );
+            assert_eq!(journal.snapshot().mutation_dispatched, mutating);
+            assert_eq!(ledger.snapshot().input_debt, u32::from(mutating));
+            let log = log.lock().unwrap();
+            assert_eq!(log.len(), 1);
+            assert_eq!(log[0]["method"], "Runtime.evaluate");
+            assert_eq!(log[0]["sessionId"], "page");
+            assert_eq!(log[0]["params"].get("userGesture").is_some(), mutating);
+            drop(log);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn repeated_evaluation_exceptions_release_handles_and_lost_release_retains_debt() {
+        for hold in [false, true] {
+            let (page, log, server) = mock(if hold {
+                "exception-handle-hold"
+            } else {
+                "exception-handle"
+            })
+            .await;
+            let state = ClientPageState::new("scope".into(), "context".into());
+            let ledger = client_debt::OwnerDebtLedger::new(1, "scope".into());
+            page.client.install_debt_ledger(ledger.clone()).unwrap();
+            let (op, _sender) = operation();
+            let journal = ledger
+                .operation(
+                    client_debt::OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            journal.bind_operation(&op).unwrap();
+            for _ in 0..if hold { 1 } else { 40 } {
+                assert_eq!(
+                    journal
+                        .scope(state.execute(
+                            &page,
+                            &[],
+                            &op,
+                            "page.evaluate",
+                            &json!({"source":"()=>{throw 1}","argument":null})
+                        ))
+                        .await,
+                    Err(ProtocolError::BrowserFailure)
+                );
+                assert_eq!(ledger.snapshot().object_debt, u32::from(hold));
+                assert!(!ledger.snapshot().integrity_lost);
+            }
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| r["method"] == "Runtime.releaseObject")
+                    .count(),
+                if hold { 1 } else { 40 }
+            );
+            assert_eq!(ledger.snapshot().input_debt, 0);
+            server.abort();
+        }
+    }
+
     use super::super::cdp::client::CdpClient;
     use super::super::client_browser::{ExecutionGate, OwnedBrowser};
     use super::*;
@@ -2020,6 +2209,12 @@ mod tests {
                 if mode == "hold-navigation" && method == "Page.navigate" {
                     continue;
                 }
+                if mode == "hold-evaluate" && method == "Runtime.evaluate" {
+                    continue;
+                }
+                if mode == "exception-handle-hold" && method == "Runtime.releaseObject" {
+                    continue;
+                }
                 let result = match method {
                     "Browser.getVersion" => json!({"userAgent":"Synthetic Chromium Linux"}),
                     "Page.getFrameTree" => {
@@ -2111,6 +2306,15 @@ mod tests {
                     "Page.getNavigationHistory" => {
                         json!({"currentIndex":if mode == "restore-back" { 1 } else { 0 },"entries":[{"id":1},{"id":2}]})
                     }
+                    "Runtime.evaluate" if mode == "malformed-evaluate" => {
+                        json!({"result":{"type":"object","value":{}}})
+                    }
+                    "Runtime.evaluate" if mode.starts_with("exception-handle") => {
+                        json!({"result":{"type":"undefined"},"exceptionDetails":{"text":"synthetic exception","exception":{"type":"object","description":"synthetic exception","objectId":"exception-handle"}}})
+                    }
+                    "Runtime.evaluate" if mode == "exception-evaluate" => {
+                        json!({"result":{"type":"undefined"},"exceptionDetails":{"text":"synthetic exception","exception":{"type":"object","description":"synthetic exception"}}})
+                    }
                     "Runtime.evaluate"
                         if request["params"]["expression"]
                             .as_str()
@@ -2129,7 +2333,7 @@ mod tests {
                 };
                 if ws
                     .send(Message::Text(
-                        json!({"id":request["id"],"result":result}).to_string(),
+                        json!({"id":request["id"],"sessionId":request["sessionId"],"result":result}).to_string(),
                     ))
                     .await
                     .is_err()
@@ -2156,6 +2360,217 @@ mod tests {
             task,
         )
     }
+    // Controlled transport evidence, deliberately not a recovery policy. The
+    // peer accepts every command but can withhold one reply while still serving
+    // cleanup and a later drain barrier on the same WebSocket.
+    async fn command_debt_peer(
+        cancel: watch::Sender<CancelSignal>,
+        hold_release: bool,
+    ) -> (BrowserExecutionLease, Log, Log, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let requests: Log = Arc::default();
+        let replies: Log = Arc::default();
+        let received = requests.clone();
+        let acknowledged = replies.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut held: Option<Value> = None;
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let request: Value = serde_json::from_str(&text).unwrap();
+                received.lock().unwrap().push(request.clone());
+                if (hold_release && request["params"]["type"] == "mouseReleased")
+                    || (!hold_release && request["method"] == "Runtime.evaluate")
+                {
+                    assert!(held.replace(request).is_none());
+                    if hold_release {
+                        cancel.send_replace(CancelSignal::Requested);
+                    }
+                    continue;
+                }
+                if request["method"] == "Browser.getVersion" {
+                    if let Some(late) = held.take() {
+                        socket
+                            .send(Message::Text(
+                                json!({"id":late["id"],"result":{}}).to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        acknowledged.lock().unwrap().push(late);
+                    }
+                }
+                socket
+                    .send(Message::Text(
+                        json!({"id":request["id"],"result":{}}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                acknowledged.lock().unwrap().push(request);
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let gate = Arc::new(ExecutionGate::default());
+        let page = BrowserExecutionLease {
+            client,
+            page_session_id: "page".into(),
+            target_id: "target".into(),
+            identity_scope: "scope".into(),
+            permit: gate.enter(false).unwrap(),
+            targets: super::super::client_targets::ClientTargets::new(
+                "context".into(),
+                "scope".into(),
+            ),
+        };
+        (page, requests, replies, server)
+    }
+
+    #[tokio::test]
+    async fn accepted_unacked_release_is_not_proved_clean_by_zero_local_buttons() {
+        let (op, cancel) = operation();
+        let (page, requests, replies, server) = command_debt_peer(cancel, true).await;
+        let state = ClientPageState::new("scope".into(), "context".into());
+        state
+            .pointer_event(&page, &op, "mouseMoved", Some((12., 20.)), None, None, None)
+            .await
+            .unwrap();
+        state
+            .pointer_event(
+                &page,
+                &op,
+                "mousePressed",
+                None,
+                Some("left"),
+                Some(1),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.mouse_state().unwrap().buttons, 1);
+        // A compound continuation must not run after the release wait cancels,
+        // even if its successful reply arrives later on this same connection.
+        let compound = async {
+            state
+                .pointer_event(
+                    &page,
+                    &op,
+                    "mouseReleased",
+                    None,
+                    Some("left"),
+                    Some(1),
+                    None,
+                )
+                .await?;
+            state
+                .pointer_event(
+                    &page,
+                    &op,
+                    "mousePressed",
+                    None,
+                    Some("left"),
+                    Some(2),
+                    None,
+                )
+                .await
+        }
+        .await;
+        assert_eq!(compound, Err(ProtocolError::Cancelled));
+        assert_eq!(state.mouse_state().unwrap().buttons, 0);
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        assert_eq!(replies.lock().unwrap().len(), 2);
+        assert_eq!(
+            requests.lock().unwrap()[2]["params"]["type"],
+            "mouseReleased"
+        );
+        // Current blind spot: no cleanup command is sent, yet this reports OK.
+        state.release_input(&page).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 3);
+        page.client
+            .send_command("Browser.getVersion", None, None)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        assert_eq!(replies.lock().unwrap().len(), 4);
+        assert_eq!(compound, Err(ProtocolError::Cancelled));
+        assert_eq!(
+            requests
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["params"]["type"] == "mousePressed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            state
+                .pointer_event(
+                    &page,
+                    &op,
+                    "mousePressed",
+                    None,
+                    Some("left"),
+                    Some(2),
+                    None
+                )
+                .await,
+            Err(ProtocolError::Cancelled)
+        );
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn all_input_acked_then_read_timeout_is_a_different_transport_fact() {
+        let (mut op, cancel) = operation();
+        let (page, requests, replies, server) = command_debt_peer(cancel, false).await;
+        let state = ClientPageState::new("scope".into(), "context".into());
+        for (kind, button) in [
+            ("mouseMoved", None),
+            ("mousePressed", Some("left")),
+            ("mouseReleased", Some("left")),
+        ] {
+            state
+                .pointer_event(
+                    &page,
+                    &op,
+                    kind,
+                    Some((12., 20.)),
+                    button,
+                    button.map(|_| 1),
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        op.deadline = Instant::now() + Duration::from_millis(50);
+        let postcondition = command(
+            &page,
+            &op,
+            Some("page"),
+            "Runtime.evaluate",
+            json!({"expression":"document.readyState","returnByValue":true}),
+        )
+        .await;
+        assert_eq!(postcondition, Err(ProtocolError::DeadlineExceeded));
+        assert_eq!(state.mouse_state().unwrap().buttons, 0);
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        assert_eq!(replies.lock().unwrap().len(), 3);
+        assert!(replies
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| r["method"] == "Input.dispatchMouseEvent"));
+        state.release_input(&page).await.unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 4);
+        page.client
+            .send_command("Browser.getVersion", None, None)
+            .await
+            .unwrap();
+        assert_eq!(requests.lock().unwrap().len(), 5);
+        assert_eq!(postcondition, Err(ProtocolError::DeadlineExceeded));
+        server.abort();
+    }
+
     #[tokio::test]
     async fn shared_pointer_secondary_double_click_and_cleanup_preserve_state() {
         let (page, log, task) = mock("normal").await;
@@ -2868,12 +3283,151 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result, json!({"value":{"ok":true,"value":null}}));
+        {
+            let requests = log.lock().unwrap();
+            let expression = requests[0]["params"]["expression"].as_str().unwrap();
+            assert!(expression.contains(&serde_json::to_string(&argument).unwrap()));
+            assert_eq!(requests[0]["params"]["awaitPromise"], true);
+            assert_eq!(requests[0]["params"]["returnByValue"], true);
+            assert_eq!(requests[0]["params"]["userGesture"], true);
+            assert_eq!(requests[0]["sessionId"], "page");
+            assert_eq!(requests.len(), 1);
+        }
+        // Public gesture authority never leaks into fixed title/url probes or
+        // the generic primitive, even on the same already-used connection.
+        state
+            .execute(
+                &page,
+                &["other-owned-session".into()],
+                &op,
+                "page.title",
+                &json!({}),
+            )
+            .await
+            .unwrap();
+        state
+            .execute(&page, &[], &op, "page.url", &json!({}))
+            .await
+            .unwrap();
+        evaluate_on(&page.client, &page.page_session_id, "location.href")
+            .await
+            .unwrap();
         let requests = log.lock().unwrap();
-        let expression = requests[0]["params"]["expression"].as_str().unwrap();
-        assert!(expression.contains(&serde_json::to_string(&argument).unwrap()));
-        assert_eq!(requests[0]["params"]["awaitPromise"], true);
-        assert_eq!(requests[0]["params"]["returnByValue"], true);
+        assert_eq!(requests.len(), 4);
+        for request in requests.iter().skip(1) {
+            assert!(request["params"].get("userGesture").is_none());
+            assert_eq!(request["sessionId"], "page");
+        }
         task.abort();
+    }
+    #[tokio::test]
+    async fn public_evaluate_invalid_cancelled_expired_or_stale_never_dispatches() {
+        let (page, log, task) = mock("normal").await;
+        let state = ClientPageState::new("scope".into(), "context".into());
+        let args = json!({"source":"value=>value","argument":null});
+        let (op, _sender) = operation();
+        assert_eq!(
+            state
+                .execute(
+                    &page,
+                    &[],
+                    &op,
+                    "page.evaluate",
+                    &json!({"source":"()=>1","argument":null,"extra":true})
+                )
+                .await,
+            Err(ProtocolError::InvalidArguments)
+        );
+        let (cancelled, sender) = operation();
+        sender.send_replace(CancelSignal::Requested);
+        assert_eq!(
+            state
+                .execute(&page, &[], &cancelled, "page.evaluate", &args)
+                .await,
+            Err(ProtocolError::Cancelled)
+        );
+        let (mut expired, _sender) = operation();
+        expired.deadline = Instant::now() - Duration::from_millis(1);
+        assert_eq!(
+            state
+                .execute(&page, &[], &expired, "page.evaluate", &args)
+                .await,
+            Err(ProtocolError::DeadlineExceeded)
+        );
+        let foreign = ClientPageState::new("foreign".into(), "context".into());
+        assert_eq!(
+            foreign
+                .execute(&page, &[], &op, "page.evaluate", &args)
+                .await,
+            Err(ProtocolError::StaleScope)
+        );
+        assert!(log.lock().unwrap().is_empty());
+        task.abort();
+    }
+    #[tokio::test]
+    async fn public_evaluate_held_reply_cancel_and_deadline_do_not_replay() {
+        for cancel in [false, true] {
+            let (page, log, server) = mock("hold-evaluate").await;
+            let state = ClientPageState::new("scope".into(), "context".into());
+            let (mut op, sender) = operation();
+            op.deadline = Instant::now() + Duration::from_millis(100);
+            let seen = log.clone();
+            let cancellation = tokio::spawn(async move {
+                if cancel {
+                    while seen.lock().unwrap().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                    sender.send_replace(CancelSignal::Requested);
+                } else {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                }
+            });
+            let result = state
+                .execute(
+                    &page,
+                    &["other".into()],
+                    &op,
+                    "page.evaluate",
+                    &json!({"source":"async()=>1","argument":null}),
+                )
+                .await;
+            assert_eq!(
+                result,
+                Err(if cancel {
+                    ProtocolError::Cancelled
+                } else {
+                    ProtocolError::DeadlineExceeded
+                })
+            );
+            cancellation.await.unwrap();
+            let requests = log.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["sessionId"], "page");
+            assert_eq!(requests[0]["params"]["userGesture"], true);
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn public_evaluate_keeps_malformed_and_exception_failures() {
+        for mode in ["malformed-evaluate", "exception-evaluate"] {
+            let (page, log, server) = mock(mode).await;
+            let state = ClientPageState::new("scope".into(), "context".into());
+            let (op, _sender) = operation();
+            assert_eq!(
+                state
+                    .execute(
+                        &page,
+                        &[],
+                        &op,
+                        "page.evaluate",
+                        &json!({"source":"()=>1","argument":null})
+                    )
+                    .await,
+                Err(ProtocolError::BrowserFailure)
+            );
+            assert_eq!(log.lock().unwrap().len(), 1);
+            server.abort();
+        }
     }
     #[tokio::test]
     async fn cookies_are_context_scoped_and_session_expiry_is_normalized() {

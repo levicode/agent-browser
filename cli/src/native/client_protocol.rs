@@ -1,6 +1,6 @@
 //! Explicitly negotiated client protocol. Legacy CLI envelopes are unchanged.
 //! Browser capabilities are advertised separately, only after implementation.
-use serde::{Deserialize, Serialize};
+use serde::{ser::SerializeStruct, Deserialize, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 pub const SOCKET_PREFACE: &[u8] = b"AGENT_BROWSER_SESSION/1\n";
@@ -205,8 +205,40 @@ pub enum ScopeState {
     Closed,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
+/// Same hard ceiling used by the complete author-query candidate inventory.
+pub const MAX_FRAME_SELECTION_COUNT: usize = 100_000;
+
+/// A checked original frame-chain ordinal, with no renderer or selector data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FrameSelectionIndex(u8);
+impl FrameSelectionIndex {
+    pub fn new(index: usize) -> Option<Self> {
+        u8::try_from(index)
+            .ok()
+            .filter(|index| *index < 64)
+            .map(Self)
+    }
+}
+
+/// Only true ambiguity can be constructed; count one is never a frame error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct FrameAmbiguity {
+    index: FrameSelectionIndex,
+    count: usize,
+}
+impl FrameAmbiguity {
+    pub fn new(index: usize, count: usize) -> Option<Self> {
+        if !(2..=MAX_FRAME_SELECTION_COUNT).contains(&count) {
+            return None;
+        }
+        Some(Self {
+            index: FrameSelectionIndex::new(index)?,
+            count,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProtocolError {
     InvalidFrame,
     UnsupportedProtocol,
@@ -240,10 +272,74 @@ pub enum ProtocolError {
     InterceptedPointer,
     CheckedStateUnchanged,
     CheckedControlReplaced,
+    FrameNotFound(FrameSelectionIndex),
+    FrameAmbiguous(FrameAmbiguity),
 }
 
-/// Server envelopes are strict and correlated. A result terminates an RPC;
-/// only scope_state describes whether native resources can be reused.
+// Scalar consumers (including acceptance traces) always receive closed strings.
+impl Serialize for ProtocolError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(match self {
+            Self::InvalidFrame => "invalid-frame",
+            Self::UnsupportedProtocol => "unsupported-protocol",
+            Self::UnsupportedCapability => "unsupported-capability",
+            Self::StaleGeneration => "stale-generation",
+            Self::ScopeUnavailable => "scope-unavailable",
+            Self::SequenceReused => "sequence-reused",
+            Self::InvalidSequence => "invalid-sequence",
+            Self::InvalidTimeout => "invalid-timeout",
+            Self::CapacityExceeded => "capacity-exceeded",
+            Self::OperationMissing => "operation-missing",
+            Self::DecisionMissing => "decision-missing",
+            Self::DecisionExpired => "decision-expired",
+            Self::DecisionKindMismatch => "decision-kind-mismatch",
+            Self::RegistryMissing => "registry-missing",
+            Self::RegistryInUse => "registry-in-use",
+            Self::IdentifierExhausted => "identifier-exhausted",
+            Self::UnsupportedCommand => "unsupported-command",
+            Self::DeadlineExceeded => "deadline-exceeded",
+            Self::Cancelled => "cancelled",
+            Self::InvalidArguments => "invalid-arguments",
+            Self::BrowserFailure => "browser-failure",
+            Self::StaleScope => "stale-scope",
+            Self::CleanupFailed => "cleanup-failed",
+            Self::StaleReference => "stale-reference",
+            Self::PolicyDenied => "policy-denied",
+            Self::NotActionable => "not-actionable",
+            Self::LocatorNotFound => "locator-not-found",
+            Self::ContentLengthMismatch => "content-length-mismatch",
+            Self::RedirectBodyUnavailable => "redirect-body-unavailable",
+            Self::InterceptedPointer => "intercepted-pointer",
+            Self::CheckedStateUnchanged => "checked-state-unchanged",
+            Self::CheckedControlReplaced => "checked-control-replaced",
+            Self::FrameNotFound(_) => "frame-not-found",
+            Self::FrameAmbiguous(_) => "frame-ambiguous",
+        })
+    }
+}
+
+/// A usable owner is not per-command admission or proof that debt is empty.
+/// Negotiation is required; legacy clients retain terminal uncertainty behavior.
+pub const EXACT_OWNER_CONTINUATION: &str = "operation.continue-exact-owner/1";
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RetentionProducerState {
+    Retired,
+    Retiring,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RetentionDescriptor {
+    pub version: u8,
+    pub retired_operation_seq: u64,
+    pub producer_state: RetentionProducerState,
+    /// Informational operation snapshot, including the cleanup input lane.
+    pub input_debt: u32,
+    /// Bounded native obligations (exact handles or native-exclusive groups),
+    /// never a physical DOM-node count or caller-chosen admission policy.
+    pub object_debt: u32,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ServerMessage {
@@ -269,6 +365,8 @@ pub enum ServerMessage {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<WireError>,
         effects: Effects,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retention: Option<RetentionDescriptor>,
         #[serde(rename = "scopeState")]
         scope_state: ScopeState,
     },
@@ -321,9 +419,30 @@ pub struct DecisionNotice {
 }
 
 /// No arbitrary diagnostic text: codes are static and cannot echo secrets.
-#[derive(Debug, Serialize)]
+#[derive(Debug)]
 pub struct WireError {
     pub code: ProtocolError,
+}
+impl Serialize for WireError {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let selection = match &self.code {
+            ProtocolError::FrameNotFound(index) => Some((*index, 0)),
+            ProtocolError::FrameAmbiguous(facts) => Some((facts.index, facts.count)),
+            _ => None,
+        };
+        let mut error =
+            serializer.serialize_struct("WireError", if selection.is_some() { 2 } else { 1 })?;
+        error.serialize_field("code", &self.code)?;
+        if let Some((index, count)) = selection {
+            #[derive(Serialize)]
+            struct Selection {
+                index: FrameSelectionIndex,
+                count: usize,
+            }
+            error.serialize_field("frameSelection", &Selection { index, count })?;
+        }
+        error.end()
+    }
 }
 
 /// Parse a single frame before any dispatch. Framing readers must impose this
@@ -378,6 +497,125 @@ pub fn validate_hello(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_serialization_preserves_every_legacy_shape_and_closed_scalar() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/client-protocol-v1.json"))
+                .unwrap();
+        let old = [
+            (ProtocolError::InvalidFrame, "invalid-frame"),
+            (ProtocolError::UnsupportedProtocol, "unsupported-protocol"),
+            (
+                ProtocolError::UnsupportedCapability,
+                "unsupported-capability",
+            ),
+            (ProtocolError::StaleGeneration, "stale-generation"),
+            (ProtocolError::ScopeUnavailable, "scope-unavailable"),
+            (ProtocolError::SequenceReused, "sequence-reused"),
+            (ProtocolError::InvalidSequence, "invalid-sequence"),
+            (ProtocolError::InvalidTimeout, "invalid-timeout"),
+            (ProtocolError::CapacityExceeded, "capacity-exceeded"),
+            (ProtocolError::OperationMissing, "operation-missing"),
+            (ProtocolError::DecisionMissing, "decision-missing"),
+            (ProtocolError::DecisionExpired, "decision-expired"),
+            (
+                ProtocolError::DecisionKindMismatch,
+                "decision-kind-mismatch",
+            ),
+            (ProtocolError::RegistryMissing, "registry-missing"),
+            (ProtocolError::RegistryInUse, "registry-in-use"),
+            (ProtocolError::IdentifierExhausted, "identifier-exhausted"),
+            (ProtocolError::UnsupportedCommand, "unsupported-command"),
+            (ProtocolError::DeadlineExceeded, "deadline-exceeded"),
+            (ProtocolError::Cancelled, "cancelled"),
+            (ProtocolError::InvalidArguments, "invalid-arguments"),
+            (ProtocolError::BrowserFailure, "browser-failure"),
+            (ProtocolError::StaleScope, "stale-scope"),
+            (ProtocolError::CleanupFailed, "cleanup-failed"),
+            (ProtocolError::StaleReference, "stale-reference"),
+            (ProtocolError::PolicyDenied, "policy-denied"),
+            (ProtocolError::NotActionable, "not-actionable"),
+            (ProtocolError::LocatorNotFound, "locator-not-found"),
+            (
+                ProtocolError::ContentLengthMismatch,
+                "content-length-mismatch",
+            ),
+            (
+                ProtocolError::RedirectBodyUnavailable,
+                "redirect-body-unavailable",
+            ),
+            (ProtocolError::InterceptedPointer, "intercepted-pointer"),
+            (
+                ProtocolError::CheckedStateUnchanged,
+                "checked-state-unchanged",
+            ),
+            (
+                ProtocolError::CheckedControlReplaced,
+                "checked-control-replaced",
+            ),
+        ];
+        assert_eq!(old.len(), vectors["errorCodes"].as_array().unwrap().len());
+        for (code, expected) in old {
+            assert!(vectors["errorCodes"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String(expected.into())));
+            assert_eq!(serde_json::to_value(&code).unwrap(), expected);
+            assert_eq!(
+                serde_json::to_value(WireError { code }).unwrap(),
+                serde_json::json!({"code":expected})
+            );
+        }
+    }
+
+    #[test]
+    fn frame_error_facts_are_checked_and_terminal_vectors_match() {
+        for index in [64, usize::MAX] {
+            assert!(FrameSelectionIndex::new(index).is_none());
+        }
+        for count in [0, 1, MAX_FRAME_SELECTION_COUNT + 1, usize::MAX] {
+            assert!(FrameAmbiguity::new(0, count).is_none());
+        }
+        assert!(FrameAmbiguity::new(64, 2).is_none());
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/client-protocol-v1.json"))
+                .unwrap();
+        for vector in vectors["frameErrors"].as_array().unwrap() {
+            let facts = &vector["error"]["frameSelection"];
+            let index = facts["index"].as_u64().unwrap() as usize;
+            let count = facts["count"].as_u64().unwrap() as usize;
+            let code = if count == 0 {
+                ProtocolError::FrameNotFound(FrameSelectionIndex::new(index).unwrap())
+            } else {
+                ProtocolError::FrameAmbiguous(FrameAmbiguity::new(index, count).unwrap())
+            };
+            assert_eq!(
+                serde_json::to_value(&code).unwrap(),
+                vector["error"]["code"]
+            );
+            let message = ServerMessage::Result {
+                retention: None,
+                id: "frame".into(),
+                generation: 1,
+                operation_seq: 1,
+                ok: false,
+                data: None,
+                error: Some(WireError { code }),
+                effects: if vector["effects"] == "unknown" {
+                    Effects::Unknown
+                } else {
+                    Effects::NotDispatched
+                },
+                scope_state: if vector["scopeState"] == "quarantined" {
+                    ScopeState::Quarantined
+                } else {
+                    ScopeState::Usable
+                },
+            };
+            assert_eq!(serde_json::to_value(message).unwrap(), *vector);
+        }
+    }
 
     #[test]
     fn shared_client_vectors_match_parser() {

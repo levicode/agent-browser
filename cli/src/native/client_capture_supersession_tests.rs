@@ -142,6 +142,8 @@ fn commit(
         &prepared.context.page,
         &prepared.operation,
         prepared.capture.as_ref(),
+        prepared.trace.as_ref(),
+        prepared.retirement_fence,
         publication,
         PublicationKind::Snapshot,
         revision,
@@ -311,7 +313,8 @@ async fn rejected_and_non_observe_requests_cannot_acquire_capture_authority() {
         })
     };
     for request in [
-        DispatchRequest::Screenshot(CaptureRequest {
+        DispatchRequest::Screenshot(ScreenshotRequest {
+            purpose: ScreenshotPurpose::PixelsOnly,
             secure_field_selector: "input[type=password]".into(),
         }),
         query(QueryPurpose::Fixture),
@@ -350,6 +353,7 @@ async fn retained_capacity_and_closing_reject_before_capture_admission() {
                 wait.await.unwrap();
                 (
                     NativeOutcome {
+                        retention: None,
                         result: Ok(Value::Null),
                         effects: Effects::Completed,
                     },
@@ -368,6 +372,7 @@ async fn retained_capacity_and_closing_reject_before_capture_admission() {
             Ok(async {
                 (
                     NativeOutcome {
+                        retention: None,
                         result: Ok(Value::Null),
                         effects: Effects::Completed,
                     },
@@ -391,6 +396,7 @@ async fn retained_capacity_and_closing_reject_before_capture_admission() {
             Ok(async {
                 (
                     NativeOutcome {
+                        retention: None,
                         result: Ok(Value::Null),
                         effects: Effects::Completed,
                     },
@@ -799,4 +805,630 @@ async fn chromium_cancelled_newer_admission_preserves_committed_observed_located
     }.await;
     browser.close().await.unwrap();
     result.unwrap();
+}
+
+fn trace_request() -> DispatchRequest {
+    DispatchRequest::Screenshot(ScreenshotRequest {
+        secure_field_selector: "input[type=password]".into(),
+        purpose: ScreenshotPurpose::Trace,
+    })
+}
+fn commit_trace(
+    dispatch: &ObservationDispatch,
+    prepared: &PreparedDispatch,
+    publication: &mut Publication,
+    revision: u64,
+    refs: RefMap,
+) -> Result<(), ProtocolError> {
+    dispatch.commit_staged(
+        &prepared.context.page,
+        &prepared.operation,
+        None,
+        prepared.trace.as_ref(),
+        prepared.retirement_fence,
+        publication,
+        PublicationKind::TraceViewport,
+        revision,
+        refs,
+    )
+}
+#[tokio::test]
+async fn first_trace_is_page_only_stable_and_failed_issuance_is_burned() {
+    let (owner, server) = peer().await;
+    let refs = Arc::new(Mutex::new(RefMap::new()));
+    let dispatch = ObservationDispatch::new(refs.clone());
+    let (op, _cancel) = operation(1);
+    let trace = dispatch
+        .prepare(owner.context(), trace_request(), op)
+        .unwrap();
+    assert!(trace.capture.is_none());
+    assert!(dispatch.captures.lock().unwrap().latest.is_empty());
+    let mut publication = dispatch.publication.lock().await;
+    let revision = publication
+        .stage_revision(PublicationKind::TraceViewport)
+        .unwrap();
+    assert_ne!(revision, 0);
+    let mut abandoned = refs.lock().unwrap().clone();
+    let burned = abandoned
+        .try_viewport_ref("scope", 1, "session", revision)
+        .unwrap()
+        .id
+        .clone();
+    // A staged failed transaction installs nothing and does not recycle its ID.
+    drop(abandoned);
+    assert!(!refs.lock().unwrap().is_viewport_ref(&burned));
+    let revision = publication
+        .stage_revision(PublicationKind::TraceViewport)
+        .unwrap();
+    let mut staged = refs.lock().unwrap().clone();
+    let viewport = staged
+        .try_viewport_ref("scope", 1, "session", revision)
+        .unwrap()
+        .clone();
+    assert_ne!(viewport.id, burned);
+    commit_trace(&dispatch, &trace, &mut publication, revision, staged).unwrap();
+    assert_eq!(publication.published_revision, 0);
+    assert_eq!(publication.observed_revision, 0);
+    assert!(refs.lock().unwrap().ref_ids().is_empty());
+    let next_revision = publication
+        .stage_revision(PublicationKind::TraceViewport)
+        .unwrap();
+    let mut next = refs.lock().unwrap().clone();
+    assert_eq!(
+        next.try_viewport_ref("scope", 1, "session", next_revision)
+            .unwrap(),
+        &viewport
+    );
+    commit_trace(&dispatch, &trace, &mut publication, next_revision, next).unwrap();
+    assert!(refs.lock().unwrap().matches_viewport_reference(
+        "scope",
+        1,
+        "session",
+        &viewport.id,
+        &revision.to_string()
+    ));
+    server.abort();
+}
+#[tokio::test]
+async fn trace_fences_none_and_some_without_superseding_observe_or_other_traces() {
+    let (owner, server) = peer().await;
+    let refs = Arc::new(Mutex::new(RefMap::new()));
+    let dispatch = ObservationDispatch::new(refs.clone());
+    let (op, _cancel) = operation(1);
+    let first = dispatch
+        .prepare(owner.context(), trace_request(), op)
+        .unwrap();
+    let (op, _cancel) = operation(2);
+    let observed = dispatch.prepare(owner.context(), observe(), op).unwrap();
+    let mut publication = dispatch.publication.lock().await;
+    let revision = publication
+        .stage_revision(PublicationKind::TraceViewport)
+        .unwrap();
+    assert_eq!(
+        commit_trace(
+            &dispatch,
+            &first,
+            &mut publication,
+            revision,
+            refs.lock().unwrap().clone()
+        ),
+        Err(ProtocolError::StaleReference)
+    );
+    let (op, _cancel) = operation(3);
+    let trace = dispatch
+        .prepare(owner.context(), trace_request(), op)
+        .unwrap();
+    let (op, _cancel) = operation(4);
+    let other = dispatch
+        .prepare(owner.context(), trace_request(), op)
+        .unwrap();
+    assert!(!*observed.capture.as_ref().unwrap().retired.borrow());
+    assert_eq!(dispatch.captures.lock().unwrap().latest.len(), 1);
+    // Observe may still publish, and traces cannot install staged node membership.
+    let semantic_revision = publication
+        .stage_revision(PublicationKind::Snapshot)
+        .unwrap();
+    let (semantic, id) = staged(&owner, &refs.lock().unwrap(), semantic_revision, 10);
+    commit(
+        &dispatch,
+        &observed,
+        &mut publication,
+        semantic_revision,
+        semantic,
+    )
+    .unwrap();
+    for trace in [&trace, &other] {
+        let revision = publication
+            .stage_revision(PublicationKind::TraceViewport)
+            .unwrap();
+        let mut copy = refs.lock().unwrap().clone();
+        copy.retire_all_references();
+        copy.try_viewport_ref("scope", 1, "session", revision)
+            .unwrap();
+        commit_trace(&dispatch, trace, &mut publication, revision, copy).unwrap();
+        assert!(refs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .unwrap()
+            .is_current_observed(semantic_revision));
+        assert_eq!(publication.published_revision, semantic_revision);
+        assert_eq!(publication.observed_revision, semantic_revision);
+    }
+    let (op, _cancel) = operation(5);
+    let _new = dispatch.prepare(owner.context(), observe(), op).unwrap();
+    let copy = refs.lock().unwrap().clone();
+    assert_eq!(
+        commit_trace(&dispatch, &trace, &mut publication, revision, copy),
+        Err(ProtocolError::StaleReference)
+    );
+    let (op, _cancel) = operation(5);
+    assert!(matches!(
+        dispatch.prepare(owner.context(), trace_request(), op),
+        Err(ProtocolError::StaleReference)
+    ));
+    server.abort();
+}
+#[tokio::test]
+async fn trace_requires_exact_scope_generation_and_attachment_owner() {
+    let (owner, server) = peer().await;
+    let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+    for mismatch in ["scope", "generation", "session"] {
+        let mut context = owner.context();
+        match mismatch {
+            "scope" => context.scope.identity_scope = "other".into(),
+            "generation" => context.scope.generation += 1,
+            "session" => context.page.page_session_id = "other".into(),
+            _ => unreachable!(),
+        }
+        let (op, _cancel) = operation(1);
+        assert!(
+            matches!(
+                dispatch.prepare(context, trace_request(), op),
+                Err(ProtocolError::StaleScope)
+            ),
+            "{mismatch}"
+        );
+        assert!(dispatch.captures.lock().unwrap().latest.is_empty());
+    }
+    server.abort();
+}
+#[test]
+fn screenshot_purpose_is_closed_and_defaults_to_plain_pixels() {
+    let request: ScreenshotRequest =
+        serde_json::from_value(json!({"secureFieldSelector":"input"})).unwrap();
+    assert_eq!(request.purpose, ScreenshotPurpose::PixelsOnly);
+    assert!(serde_json::from_value::<ScreenshotRequest>(
+        json!({"secureFieldSelector":"input", "purpose":"observe"})
+    )
+    .is_err());
+}
+
+// Full dispatcher coverage using the same empty-DOM/source-holder protocol as
+// the fallback fixture. These tests exercise real PNG decoding and journal
+// cleanup, but deliberately make no claim about renderer masking fidelity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureDispatchCase {
+    TraceMaskFailure,
+    TraceRestoreFailure,
+    TraceFenceAfterCapture,
+    InitialPressure,
+    FreshFallbackPressure,
+    ConfiguredOversize,
+}
+
+async fn capture_dispatch_case(case: CaptureDispatchCase) {
+    use crate::native::client_blobs::BlobLimits;
+    use base64::Engine;
+    use futures_util::SinkExt;
+    let pressure = matches!(
+        case,
+        CaptureDispatchCase::InitialPressure | CaptureDispatchCase::FreshFallbackPressure
+    );
+    let fallback = case == CaptureDispatchCase::FreshFallbackPressure;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let mut png = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgba8(10, 10)
+        .write_to(&mut png, image::ImageFormat::Png)
+        .unwrap();
+    let png = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+    let source = Arc::new(Mutex::new(Vec::new()));
+    let peer_source = source.clone();
+    let captures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let peer_captures = captures.clone();
+    let (capture_reached, capture_receipt) = oneshot::channel();
+    let (capture_release, capture_resume) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let mut capture_reached = Some(capture_reached);
+        let mut capture_resume = Some(capture_resume);
+        let mut verifies = 0;
+        while let Some(Ok(message)) = socket.next().await {
+            let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            let method = request["method"].as_str().unwrap();
+            let result = match method {
+                "Page.getFrameTree" => {
+                    json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"}}})
+                }
+                "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                "Animation.getPlaybackRate" => json!({"playbackRate":1}),
+                "Page.getLayoutMetrics" => {
+                    json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}})
+                }
+                "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":1}}),
+                "DOMSnapshot.captureSnapshot" => {
+                    json!({"strings":["frame"],"documents":[{"frameId":0,"nodes":{"nodeType":[],"backendNodeId":[]}}]})
+                }
+                "Runtime.evaluate" => {
+                    assert_eq!(request["params"]["contextId"], 1);
+                    assert!(request["params"]["objectGroup"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("capture-source-"));
+                    peer_source.lock().unwrap().push("holder");
+                    json!({"result":{"type":"object","objectId":"source-holder"}})
+                }
+                "Runtime.callFunctionOn" => {
+                    assert_eq!(request["params"]["objectId"], "source-holder");
+                    let phase = match request["params"]["functionDeclaration"].as_str().unwrap() {
+                        "function(){return this.verify()}" => {
+                            verifies += 1;
+                            "verify"
+                        }
+                        "function(){return this.remove()}" => "remove",
+                        other => panic!("unexpected source-holder call: {other}"),
+                    };
+                    peer_source.lock().unwrap().push(phase);
+                    json!({"result":{"type":"boolean","value":!(case == CaptureDispatchCase::TraceMaskFailure && phase == "verify" && verifies == 2)}})
+                }
+                "Runtime.releaseObjectGroup" => {
+                    assert!(request["params"]["objectGroup"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("capture-source-"));
+                    peer_source.lock().unwrap().push("release");
+                    json!({})
+                }
+                "Page.captureScreenshot" => {
+                    peer_captures.fetch_add(1, Ordering::SeqCst);
+                    if case == CaptureDispatchCase::TraceFenceAfterCapture {
+                        capture_reached.take().unwrap().send(()).unwrap();
+                        capture_resume.take().unwrap().await.unwrap();
+                    }
+                    json!({"data":png})
+                }
+                "Animation.enable" | "Animation.setPlaybackRate" | "Animation.disable" => json!({}),
+                other => panic!("unexpected capture command: {other}"),
+            };
+            let response = if case == CaptureDispatchCase::TraceRestoreFailure
+                && method == "Animation.setPlaybackRate"
+                && request["params"]["playbackRate"].as_f64() == Some(1.0)
+            {
+                json!({"id":request["id"],"sessionId":request["sessionId"],"error":{"code":-32000,"message":"synthetic restoration refusal"}})
+            } else {
+                json!({"id":request["id"],"sessionId":request["sessionId"],"result":result})
+            };
+            if socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    response.to_string(),
+                ))
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+    let mut owner = Owner::new(client, "session", "target", "scope").await;
+    let limit = if case == CaptureDispatchCase::ConfiguredOversize {
+        32
+    } else {
+        64 * 1024 * 1024
+    };
+    owner.blobs = Arc::new(
+        BlobStore::new(BlobLimits {
+            max_blob_bytes: limit,
+            max_total_bytes: if pressure {
+                128 * 1024 * 1024
+            } else {
+                2 * limit
+            },
+            max_handles: 8,
+        })
+        .unwrap(),
+    );
+    owner.blobs.activate_scope(owner.scope.clone()).unwrap();
+    // A tiny retained artifact is sufficient: 1 + 64 + 64 MiB exceeds the
+    // default 128 MiB total, whereas 1 + 64 + 32 MiB fits. Reservations allocate
+    // no giant buffers, and the protected screenshot itself is only 10 by 10.
+    let retained = owner
+        .blobs
+        .insert_sealed(owner.scope.clone(), b"v")
+        .unwrap();
+    let active = pressure.then(|| owner.blobs.reserve_producer(owner.scope.clone()).unwrap());
+    if pressure {
+        assert!(matches!(
+            owner.blobs.reserve_producer(owner.scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        drop(
+            owner
+                .blobs
+                .reserve_bounded_producer(owner.scope.clone(), client_capture::MAX_PNG_BYTES)
+                .unwrap(),
+        );
+    }
+    let refs = Arc::new(Mutex::new(RefMap::new()));
+    let dispatch = ObservationDispatch::new(refs.clone());
+    let (initial, observed) = staged(&owner, &refs.lock().unwrap(), 7, 10);
+    *refs.lock().unwrap() = initial;
+    let located = refs
+        .lock()
+        .unwrap()
+        .try_bind_located(
+            11,
+            "button",
+            owner.binding(),
+            LocatedIssuance {
+                identity_scope: "scope".into(),
+                generation: 1,
+                revision: 5,
+            },
+            None,
+        )
+        .unwrap();
+    {
+        let mut publication = dispatch.publication.lock().await;
+        publication.revision = 7;
+        publication.published_revision = 7;
+        publication.observed_revision = 7;
+    }
+    let prior_ids = refs.lock().unwrap().ref_ids();
+    // Existing authority must survive trace failures. The None -> Some fence
+    // case intentionally starts with no admission, despite committed refs.
+    let initial_admission = if !pressure && case != CaptureDispatchCase::TraceFenceAfterCapture {
+        let (op, _cancel) = operation(1);
+        Some(dispatch.prepare(owner.context(), observe(), op).unwrap())
+    } else {
+        None
+    };
+    if fallback {
+        // Reuse the scoped semantic failure seam: only the semantic outcome is
+        // injected; fresh producer admission, capture, restoration and publish run.
+        *dispatch.semantic_failure_for_test.lock().unwrap() =
+            Some(ObservationError::DeadlineExceeded);
+    }
+    let request = if fallback {
+        DispatchRequest::Observe(ObserveRequest {
+            options: ObserveFlags {
+                pixel_fallback: true,
+                ..Default::default()
+            },
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password]".into(),
+        })
+    } else {
+        trace_request()
+    };
+    let (op, _cancel) = operation(2);
+    let task = dispatch.clone().start(owner.context(), request, op);
+    let newer = if case == CaptureDispatchCase::TraceFenceAfterCapture {
+        tokio::time::timeout(Duration::from_secs(5), capture_receipt)
+            .await
+            .unwrap()
+            .unwrap();
+        let (op, _cancel) = operation(3);
+        let admitted = dispatch.prepare(owner.context(), observe(), op).unwrap();
+        capture_release.send(()).unwrap();
+        Some(admitted)
+    } else {
+        None
+    };
+    let result = tokio::time::timeout(Duration::from_secs(5), task.result)
+        .await
+        .unwrap()
+        .unwrap();
+    task.join.await.unwrap().unwrap();
+    assert_eq!(captures.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        *source.lock().unwrap(),
+        ["holder", "verify", "verify", "remove", "release"]
+    );
+    if pressure {
+        let output = result.unwrap();
+        let pixels = if fallback { &output["pixels"] } else { &output };
+        assert_eq!(pixels["width"], 10);
+        assert_eq!(pixels["height"], 10);
+        let handle = pixels["handle"].as_str().unwrap();
+        assert!(owner
+            .blobs
+            .read(&owner.scope, handle, 0, 8)
+            .unwrap()
+            .starts_with(b"\x89PNG"));
+        owner.blobs.release(&owner.scope, handle).unwrap();
+        assert_eq!(
+            owner.blobs.release(&owner.scope, handle),
+            Err(BlobError::Missing)
+        );
+        if fallback {
+            assert_eq!(output["treeUnavailable"], true);
+        }
+    } else {
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.error,
+            match case {
+                CaptureDispatchCase::TraceMaskFailure => ProtocolError::PolicyDenied,
+                CaptureDispatchCase::TraceRestoreFailure => ProtocolError::BrowserFailure,
+                CaptureDispatchCase::TraceFenceAfterCapture => ProtocolError::StaleReference,
+                CaptureDispatchCase::ConfiguredOversize => ProtocolError::CapacityExceeded,
+                _ => unreachable!(),
+            }
+        );
+        assert_eq!(
+            failure.cleanup_integrity_lost,
+            case == CaptureDispatchCase::TraceRestoreFailure
+        );
+    }
+    if !fallback {
+        let publication = dispatch.publication.lock().await;
+        assert_eq!(
+            (
+                publication.published_revision,
+                publication.observed_revision
+            ),
+            (7, 7)
+        );
+        let current = refs.lock().unwrap();
+        assert_eq!(current.ref_ids(), prior_ids);
+        assert!(current.get(&observed).unwrap().is_current_observed(7));
+        assert!(current
+            .get(&located)
+            .unwrap()
+            .matches_reference("scope", 1, "session", "5"));
+        if !pressure {
+            // No viewport existed before capture. Asking a disposable clone for
+            // one now must create a new issuance, not recover a leaked staging ID.
+            let mut copy = current.clone();
+            assert_eq!(
+                copy.try_viewport_ref("scope", 1, "session", 999)
+                    .unwrap()
+                    .issuance
+                    .revision,
+                999
+            );
+        }
+    }
+    for admitted in [initial_admission.as_ref(), newer.as_ref()]
+        .into_iter()
+        .flatten()
+    {
+        let ticket = admitted.capture.as_ref().unwrap();
+        assert!(!*ticket.retired.borrow());
+        let authority = dispatch.captures.lock().unwrap();
+        assert_eq!(authority.latest.len(), 1);
+        assert!(Arc::ptr_eq(&authority.latest[0], ticket));
+    }
+    assert_eq!(
+        owner.targets.inventory().is_err(),
+        case == CaptureDispatchCase::TraceRestoreFailure
+    );
+    assert_eq!(
+        owner
+            .blobs
+            .read(&owner.scope, &retained.handle, 0, 1)
+            .unwrap(),
+        b"v"
+    );
+    drop(active);
+    owner.blobs.release(&owner.scope, &retained.handle).unwrap();
+    // Fill the entire budget after the operation: a leaked producer OR finished
+    // blob would make the second reservation fail. Integrity rejects double free.
+    let first = owner.blobs.reserve_producer(owner.scope.clone()).unwrap();
+    let second = owner.blobs.reserve_producer(owner.scope.clone()).unwrap();
+    assert!(matches!(
+        owner.blobs.reserve_bounded_producer(owner.scope.clone(), 1),
+        Err(BlobError::QuotaExceeded)
+    ));
+    drop((first, second));
+    owner.blobs.check_budget_integrity().unwrap();
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn trace_dispatch_mask_failure_releases_source_and_preserves_observe() {
+    capture_dispatch_case(CaptureDispatchCase::TraceMaskFailure).await;
+}
+#[tokio::test]
+async fn trace_dispatch_restore_failure_seals_without_publishing_viewport() {
+    capture_dispatch_case(CaptureDispatchCase::TraceRestoreFailure).await;
+}
+#[tokio::test]
+async fn trace_dispatch_post_blob_fence_releases_blob_without_publishing_viewport() {
+    capture_dispatch_case(CaptureDispatchCase::TraceFenceAfterCapture).await;
+}
+#[tokio::test]
+async fn protected_initial_dispatch_fits_retained_video_and_active_producer_pressure() {
+    capture_dispatch_case(CaptureDispatchCase::InitialPressure).await;
+}
+#[tokio::test]
+async fn protected_fresh_fallback_dispatch_fits_retained_video_and_active_producer_pressure() {
+    capture_dispatch_case(CaptureDispatchCase::FreshFallbackPressure).await;
+}
+#[tokio::test]
+async fn protected_dispatch_configured_quota_oversize_restores_and_releases_every_charge() {
+    capture_dispatch_case(CaptureDispatchCase::ConfiguredOversize).await;
+}
+
+#[tokio::test]
+async fn uncertainty_retirement_fences_additive_trace_and_capture_without_recycling_refs() {
+    let (owner, server) = peer().await;
+    let refs = Arc::new(Mutex::new(RefMap::new()));
+    let dispatch = ObservationDispatch::new(refs.clone());
+    let (op, _cancel) = operation(1);
+    let capture = dispatch.prepare(owner.context(), observe(), op).unwrap();
+    let (op, _cancel) = operation(2);
+    let trace = dispatch
+        .prepare(owner.context(), trace_request(), op)
+        .unwrap();
+    let old_fence = capture.retirement_fence;
+    let (old_refs, old_node) = staged(&owner, &refs.lock().unwrap(), 1, 101);
+    *refs.lock().unwrap() = old_refs.clone();
+    let old_viewport = refs
+        .lock()
+        .unwrap()
+        .try_viewport_ref("scope", 1, "session", 1)
+        .unwrap()
+        .id
+        .clone();
+    let next_before = refs.lock().unwrap().try_allocate_ref().unwrap();
+    dispatch.retire_interaction().await.unwrap();
+    assert!(dispatch.publication_fence().unwrap() > old_fence);
+    assert!(!refs.lock().unwrap().is_viewport_ref(&old_viewport));
+    assert!(refs.lock().unwrap().get(&old_node).is_none());
+    let mut publication = dispatch.publication.lock().await;
+    assert_eq!(publication.observed_revision, 0);
+    assert_eq!(
+        commit(&dispatch, &capture, &mut publication, 1, old_refs.clone()),
+        Err(ProtocolError::StaleReference)
+    );
+    assert_eq!(
+        commit_trace(&dispatch, &trace, &mut publication, 1, old_refs.clone()),
+        Err(ProtocolError::StaleReference)
+    );
+    // Additive queries and pixels have no CaptureAdmission. They still cannot
+    // bypass the one retirement fence to publish old refs or artifacts.
+    for kind in [PublicationKind::AdditiveQuery, PublicationKind::PixelsOnly] {
+        assert_eq!(
+            dispatch.commit_staged(
+                &capture.context.page,
+                &capture.operation,
+                None,
+                None,
+                old_fence,
+                &mut publication,
+                kind,
+                1,
+                old_refs.clone()
+            ),
+            Err(ProtocolError::StaleReference)
+        );
+    }
+    drop(publication);
+    let next_after = refs.lock().unwrap().try_allocate_ref().unwrap();
+    assert_ne!(next_before, next_after);
+    assert_ne!(old_node, next_after);
+    assert_ne!(old_viewport, next_after);
+    // Owner/connection/attachment and service authority remain live.
+    owner.gate.enter(false).unwrap().check().unwrap();
+    assert!(owner.targets.inventory().is_ok());
+    drop(capture);
+    drop(trace);
+    drop(dispatch);
+    drop(owner);
+    server.abort();
 }

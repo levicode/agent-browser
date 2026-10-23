@@ -73,11 +73,26 @@ pub struct QueryRequest {
     pub options: QueryOptions,
     pub purpose: QueryPurpose,
 }
+/// Screenshot publication policy; omitted purpose preserves pixels-only behavior.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ScreenshotPurpose {
+    #[default]
+    PixelsOnly,
+    Trace,
+}
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ScreenshotRequest {
+    pub secure_field_selector: String,
+    #[serde(default)]
+    pub purpose: ScreenshotPurpose,
+}
 pub enum DispatchRequest {
     Correlate(CorrelateRequest),
     Observe(ObserveRequest),
     Query(QueryRequest),
-    Screenshot(CaptureRequest),
+    Screenshot(ScreenshotRequest),
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadPolicy {
@@ -112,6 +127,7 @@ enum PublicationKind {
     Snapshot,
     AdditiveQuery,
     PixelsOnly,
+    TraceViewport,
 }
 impl Publication {
     fn stage_revision(&mut self, kind: PublicationKind) -> Result<u64, ProtocolError> {
@@ -133,7 +149,9 @@ impl Publication {
         destination: &mut RefMap,
         staged: RefMap,
     ) {
-        if !matches!(kind, PublicationKind::PixelsOnly) {
+        if matches!(kind, PublicationKind::TraceViewport) {
+            destination.commit_viewport_from(&staged);
+        } else if !matches!(kind, PublicationKind::PixelsOnly) {
             *destination = staged;
             self.published_revision = revision;
             if matches!(kind, PublicationKind::Snapshot) {
@@ -206,15 +224,23 @@ struct CaptureAdmission {
 }
 #[derive(Default)]
 struct CaptureAuthority {
+    retirement_fence: u64,
     latest: Vec<Arc<CaptureAdmission>>,
+}
+// Optional traces observe the existing admission, but never own or replace it.
+struct TraceFence {
+    owner: CaptureOwner,
+    admission: Option<Arc<CaptureAdmission>>,
 }
 /// Created only by validated synchronous admission. Dropping an admitted
 /// request never restores its predecessor, even if this task never runs.
 pub(crate) struct PreparedDispatch {
+    retirement_fence: u64,
     context: DispatchContext,
     request: DispatchRequest,
     operation: OperationLease,
     capture: Option<Arc<CaptureAdmission>>,
+    trace: Option<TraceFence>,
 }
 pub struct ObservationDispatch {
     captures: Mutex<CaptureAuthority>,
@@ -246,6 +272,51 @@ impl ObservationDispatch {
             }),
         })
     }
+    /// The existing publication authority owns one retirement counter; this
+    /// never replaces scope generation, target tenure or the shared ref map.
+    pub(crate) fn publication_fence(&self) -> Result<u64, ProtocolError> {
+        self.captures
+            .lock()
+            .map(|authority| authority.retirement_fence)
+            .map_err(|_| ProtocolError::ScopeUnavailable)
+    }
+    pub(crate) fn check_publication_fence(&self, captured: u64) -> Result<(), ProtocolError> {
+        if self.publication_fence()? != captured {
+            return Err(ProtocolError::StaleReference);
+        }
+        Ok(())
+    }
+    /// Broker application admission is blocked before this call. Advance and
+    /// revoke under the short capture lock, release it before awaiting the
+    /// publication mutex, then use publication -> captures -> refs lock order.
+    /// In-flight publishers can restore sources but cannot commit old tickets.
+    pub(crate) async fn retire_interaction(&self) -> Result<(), ProtocolError> {
+        {
+            let mut authority = self
+                .captures
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            authority.retirement_fence = authority
+                .retirement_fence
+                .checked_add(1)
+                .ok_or(ProtocolError::IdentifierExhausted)?;
+            for capture in authority.latest.drain(..) {
+                capture.retired.send_replace(true);
+            }
+        }
+        let mut publication = self.publication.lock().await;
+        let _authority = self
+            .captures
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.refs
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .retire_interaction_references();
+        publication.observed_revision = 0;
+        Ok(())
+    }
+
     /// Caller holds the ordinary UI permit and exact scope lease. This is the
     /// sole current revision authority; a request's revision is never authority.
     pub async fn snapshot_for_action(
@@ -297,6 +368,7 @@ impl ObservationDispatch {
         request: DispatchRequest,
         operation: OperationLease,
     ) -> Result<PreparedDispatch, ProtocolError> {
+        let retirement_fence = self.publication_fence()?;
         if context.scope.identity_scope != context.page.identity_scope
             || context.scope.generation != operation.generation
         {
@@ -352,11 +424,37 @@ impl ObservationDispatch {
         } else {
             None
         };
+        let trace = if matches!(&request, DispatchRequest::Screenshot(r) if r.purpose == ScreenshotPurpose::Trace)
+        {
+            let authority = self
+                .captures
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            check(&context.page, &operation)?;
+            let owner = CaptureOwner::new(&context)?;
+            let admission = authority
+                .latest
+                .iter()
+                .find(|entry| entry.owner.matches(&context.page, operation.generation))
+                .cloned();
+            if admission
+                .as_ref()
+                .is_some_and(|entry| entry.sequence >= operation.sequence)
+            {
+                return Err(ProtocolError::StaleReference);
+            }
+            Some(TraceFence { owner, admission })
+        } else {
+            None
+        };
+        self.check_publication_fence(retirement_fence)?;
         Ok(PreparedDispatch {
+            retirement_fence,
             context,
             request,
             operation,
             capture,
+            trace,
         })
     }
     #[cfg(test)]
@@ -385,12 +483,17 @@ impl ObservationDispatch {
     }
     pub(crate) fn start_prepared(self: Arc<Self>, prepared: PreparedDispatch) -> DispatchTask {
         let PreparedDispatch {
+            retirement_fence,
             context,
             request,
             operation,
             capture,
+            trace,
         } = prepared;
         let (send, result) = oneshot::channel();
+        // Explicit inheritance only for this operation-local capture task.
+        // Durable owner services intentionally do not inherit task-local state.
+        let operation_journal = super::client_debt::OperationJournalHandle::current();
         let join = tokio::spawn(async move {
             let scope = context.scope.clone();
             let blobs = context.blobs.clone();
@@ -398,15 +501,27 @@ impl ObservationDispatch {
             let cancellation = operation.cancellation.clone();
             let retirement = capture
                 .as_ref()
+                .or_else(|| trace.as_ref().and_then(|fence| fence.admission.as_ref()))
                 .map(|ticket| observation::CaptureRetirement::new(ticket.retired.subscribe()));
             // Task-local context is installed inside the spawned task. Neither
             // the outer owner nor unrelated spawned work inherits it.
             #[cfg(test)]
             let observed_cleanup = self.observed_cleanup_for_test.load(Ordering::SeqCst);
-            let run = self.run(context, request, operation, capture);
+            let run = self.run(
+                context,
+                request,
+                operation,
+                capture,
+                trace,
+                retirement_fence,
+            );
             #[cfg(test)]
             let run = FALLBACK_OBSERVED_CLEANUP_FOR_TEST.scope(observed_cleanup, run);
-            let mut output = observation::with_capture_retirement(retirement, run).await;
+            let run = observation::with_capture_retirement(retirement, run);
+            let mut output = match operation_journal {
+                Some(journal) => journal.scope(run).await,
+                None => run.await,
+            };
             if let Err(failure) = &mut output {
                 // A cancellation already visible at this unsettled boundary
                 // wins over clean supersession, never over cleanup uncertainty.
@@ -455,6 +570,8 @@ impl ObservationDispatch {
         page: &BrowserExecutionLease,
         operation: &OperationLease,
         capture: Option<&Arc<CaptureAdmission>>,
+        trace: Option<&TraceFence>,
+        retirement_fence: u64,
         publication: &mut Publication,
         kind: PublicationKind,
         revision: u64,
@@ -465,6 +582,9 @@ impl ObservationDispatch {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         check(page, operation)?;
+        if authority.retirement_fence != retirement_fence {
+            return Err(ProtocolError::StaleReference);
+        }
         if let Some(capture) = capture {
             if !capture.owner.matches(page, operation.generation)
                 || capture.sequence != operation.sequence
@@ -477,6 +597,21 @@ impl ObservationDispatch {
             }
         } else if matches!(kind, PublicationKind::Snapshot) {
             return Err(ProtocolError::StaleReference);
+        }
+        if matches!(kind, PublicationKind::TraceViewport) {
+            let trace = trace.ok_or(ProtocolError::StaleReference)?;
+            let current = authority
+                .latest
+                .iter()
+                .find(|entry| entry.owner.matches(page, operation.generation));
+            let unchanged = match (&trace.admission, current) {
+                (Some(sampled), Some(current)) => Arc::ptr_eq(sampled, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !trace.owner.matches(page, operation.generation) || !unchanged {
+                return Err(ProtocolError::StaleReference);
+            }
         }
         let mut refs = self
             .refs
@@ -492,6 +627,8 @@ impl ObservationDispatch {
         request: DispatchRequest,
         operation: OperationLease,
         capture: Option<Arc<CaptureAdmission>>,
+        trace: Option<TraceFence>,
+        retirement_fence: u64,
     ) -> Result<Output, DispatchFailure> {
         let identity = context.page.identity_scope.clone();
         let observation_cleanup = AtomicBool::new(false);
@@ -545,6 +682,13 @@ impl ObservationDispatch {
             _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(failure(ProtocolError::DeadlineExceeded)),
         };
         check(&context.page, &operation).map_err(failure)?;
+        self.check_publication_fence(retirement_fence)
+            .map_err(failure)?;
+        if let Some(ledger) = context.page.client.debt_ledger() {
+            ledger
+                .check_admission(super::client_debt::AdmissionClass::Reference)
+                .map_err(failure)?;
+        }
         // Correlation reads committed authority only. It must return before any
         // revision staging, clone publication, pixel reservation or journal.
         if let DispatchRequest::Correlate(request) = &request {
@@ -558,6 +702,8 @@ impl ObservationDispatch {
             )
             .await
             .map_err(failure)?;
+            self.check_publication_fence(retirement_fence)
+                .map_err(failure)?;
             return Ok(Output {
                 value,
                 handles: vec![],
@@ -567,7 +713,13 @@ impl ObservationDispatch {
             DispatchRequest::Correlate(_) => return Err(failure(ProtocolError::InvalidArguments)),
             DispatchRequest::Observe(_) => PublicationKind::Snapshot,
             DispatchRequest::Query(_) => PublicationKind::AdditiveQuery,
-            DispatchRequest::Screenshot(_) => PublicationKind::PixelsOnly,
+            DispatchRequest::Screenshot(request) => {
+                if request.purpose == ScreenshotPurpose::Trace {
+                    PublicationKind::TraceViewport
+                } else {
+                    PublicationKind::PixelsOnly
+                }
+            }
         };
         let revision = publication
             .stage_revision(publication_kind)
@@ -584,7 +736,10 @@ impl ObservationDispatch {
             Some(
                 context
                     .blobs
-                    .reserve_producer(context.scope.clone())
+                    .reserve_bounded_producer(
+                        context.scope.clone(),
+                        client_capture::MAX_PNG_BYTES.min(context.blobs.producer_limit()),
+                    )
                     .map_err(|error| failure(blob_error(error)))?,
             )
         } else {
@@ -643,8 +798,16 @@ impl ObservationDispatch {
                 }
                 DispatchRequest::Screenshot(request) => {
                     let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
-                    let pixels = client_capture::capture_under_journal(&capture_context, &request, &operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(|error| capture_error(error.reason))?;
-                    Ok((Value::Null, Some(pixels), None))
+                    let value = if request.purpose == ScreenshotPurpose::Trace {
+                        let viewport_ref = staged.try_viewport_ref(&identity, operation.generation,
+                            &capture_context.page.page_session_id, revision).map_err(|_| ProtocolError::IdentifierExhausted)?;
+                        let viewport_ref = observation::NodeReference { id: format!("@{}", viewport_ref.id), revision: viewport_ref.issuance.revision.to_string() };
+                        json!({"identityScope":identity,"viewportRef":viewport_ref,
+                            "viewport":viewport(&capture_context.page, &operation).await?,
+                            "location":main_frame(&frozen)?.url})
+                    } else { Value::Null };
+                    let pixels = client_capture::capture_under_journal(&capture_context, &CaptureRequest { secure_field_selector: request.secure_field_selector }, &operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(|error| capture_error(error.reason))?;
+                    Ok((value, Some(pixels), None))
                 }
                 DispatchRequest::Observe(request) => {
                     let options = ObservationOptions { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector.clone(), ..ObservationOptions::default() };
@@ -769,7 +932,7 @@ impl ObservationDispatch {
             // under the same exact scope and unchanged operation budget.
             check(&capture_context.page, &operation).map_err(failure)?;
             if producer.is_none() {
-                producer = Some(context.blobs.reserve_producer(context.scope.clone())
+                producer = Some(context.blobs.reserve_bounded_producer(context.scope.clone(), client_capture::MAX_PNG_BYTES.min(context.blobs.producer_limit()))
                     .map_err(|error| failure(blob_error(error)))?);
             }
             let (fresh_value, fresh_pixels, fresh_journal) = fresh_fallback(
@@ -814,6 +977,8 @@ impl ObservationDispatch {
             let image = json!({"identityScope":identity,"handle":image.handle,"size":image.size,"sha256":image.sha256,"mediaType":"image/png","width":pixels.width,"height":pixels.height,"scale":pixels.scale,"maskedRegionCount":pixels.masked_region_count});
             if value.is_null() {
                 value = image;
+            } else if matches!(publication_kind, PublicationKind::TraceViewport) {
+                value.as_object_mut().ok_or_else(|| failure(ProtocolError::BrowserFailure))?.extend(image.as_object().ok_or_else(|| failure(ProtocolError::BrowserFailure))?.clone());
             } else {
                 value["maskedRegionCount"] = image["maskedRegionCount"].clone();
                 value["pixels"] = image;
@@ -825,7 +990,7 @@ impl ObservationDispatch {
             if let Some(journal) = &journal {
                 journal.check().map_err(protected_error)?;
             }
-            self.commit_staged(&capture_context.page, &operation, capture.as_ref(),
+            self.commit_staged(&capture_context.page, &operation, capture.as_ref(), trace.as_ref(), retirement_fence,
                 &mut publication, publication_kind, revision, staged)?;
             Ok::<(), ProtocolError>(())
         })();
@@ -1569,6 +1734,8 @@ fn observation_error(error: ObservationError) -> ProtocolError {
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::FrameNotFound(index) => ProtocolError::FrameNotFound(index),
+        ObservationError::FrameAmbiguous(facts) => ProtocolError::FrameAmbiguous(facts),
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::StaleReference | ObservationError::Superseded => {
             ProtocolError::StaleReference
@@ -1627,6 +1794,57 @@ fn capture_error(error: CaptureReason) -> ProtocolError {
 mod tests {
     use super::super::element::ExactBinding;
     use super::*;
+    #[test]
+    fn frame_failures_preserve_typed_facts_but_never_downgrade_cleanup_uncertainty() {
+        use super::super::client_protocol::{Effects, FrameAmbiguity, FrameSelectionIndex};
+        for observation in [
+            ObservationError::FrameNotFound(FrameSelectionIndex::new(1).unwrap()),
+            ObservationError::FrameAmbiguous(FrameAmbiguity::new(2, 2).unwrap()),
+        ] {
+            for dirty_dispatch in [false, true] {
+                for dirty_join in [false, true] {
+                    let cleanup = AtomicBool::new(false);
+                    let code = observation_error_with_cleanup(
+                        if dirty_dispatch {
+                            ObservationError::CleanupFailed {
+                                primary: Some(Box::new(observation.clone())),
+                            }
+                        } else {
+                            observation.clone()
+                        },
+                        &cleanup,
+                    );
+                    assert_eq!(code, observation_error(observation.clone()));
+                    assert_eq!(cleanup.load(Ordering::SeqCst), dirty_dispatch);
+                    let failure = |error, cleanup_integrity_lost| DispatchFailure {
+                        error,
+                        identity_scope: "scope".into(),
+                        cleanup_integrity_lost,
+                    };
+                    let (outcome, dirty) =
+                        super::super::client_browser::settle_observation_dispatch(
+                            Ok(Err(failure(code.clone(), dirty_dispatch))),
+                            Ok(if dirty_join {
+                                Err(failure(ProtocolError::CleanupFailed, true))
+                            } else {
+                                Ok(())
+                            }),
+                        );
+                    assert_eq!(outcome.result, Err(code));
+                    assert_eq!(dirty, dirty_dispatch || dirty_join);
+                    assert_eq!(
+                        outcome.effects,
+                        if dirty {
+                            Effects::Unknown
+                        } else {
+                            Effects::NotDispatched
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn observation_cleanup_preserves_primary_without_authorizing_fallback() {
         let cleanup = AtomicBool::new(false);
@@ -1899,7 +2117,8 @@ mod tests {
                         secure_field_selector: "input[type=password]".into(),
                     },
                 },
-                DispatchRequest::Screenshot(CaptureRequest {
+                DispatchRequest::Screenshot(ScreenshotRequest {
+                    purpose: ScreenshotPurpose::PixelsOnly,
                     secure_field_selector: "input[type=password]".into(),
                 }),
                 operation,
@@ -3524,14 +3743,16 @@ mod tests {
             test_id_attribute: "data-testid".into(),
             secure_field_selector: "input[type=password],.private".into(),
         };
-        let weaker = DispatchRequest::Screenshot(CaptureRequest {
+        let weaker = DispatchRequest::Screenshot(ScreenshotRequest {
+            purpose: ScreenshotPurpose::PixelsOnly,
             secure_field_selector: "input[type=password]".into(),
         });
         assert_eq!(
             validate_policy(&policy, &weaker),
             Err(ProtocolError::PolicyDenied)
         );
-        let exact = DispatchRequest::Screenshot(CaptureRequest {
+        let exact = DispatchRequest::Screenshot(ScreenshotRequest {
+            purpose: ScreenshotPurpose::PixelsOnly,
             secure_field_selector: policy.secure_field_selector.clone(),
         });
         validate_policy(&policy, &exact).unwrap();

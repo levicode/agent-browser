@@ -17,7 +17,18 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 
+use super::super::client_debt::{
+    current_operation, CommandReservation, OwnerDebtLedger, ReservedDisposal, SubmittedCommand,
+};
+use super::super::client_protocol::ProtocolError;
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
+
+type TrackedResponses = Arc<std::sync::Mutex<HashMap<u64, SubmittedCommand>>>;
+type DebtOwner = Arc<std::sync::Mutex<Option<Arc<OwnerDebtLedger>>>>;
+struct DisposalWork {
+    command: ReservedDisposal,
+    _bytes: EventBudgetLease,
+}
 
 type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
 type WsTx = Arc<
@@ -332,12 +343,15 @@ pub struct CdpClient {
     remote_closed: watch::Receiver<bool>,
     close_lock: Mutex<()>,
     cancel_tx: watch::Sender<bool>,
-    next_id: AtomicU64,
+    next_id: Arc<AtomicU64>,
     pending: PendingMap,
+    tracked_responses: TrackedResponses,
+    debt_owner: DebtOwner,
     event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     keepalive_handle: Mutex<Option<JoinHandle<()>>>,
+    disposal_handle: Mutex<Option<JoinHandle<()>>>,
     private_sessions: PrivateSessions,
     method_taps: MethodTaps,
     bounded_method_taps: BoundedMethodTaps,
@@ -442,7 +456,17 @@ impl CdpClient {
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx = Arc::new(Mutex::new(ws_tx));
 
+        let next_id = Arc::new(AtomicU64::new(1));
+        let (disposal_tx, mut disposal_rx) = mpsc::channel::<DisposalWork>(32);
+        let disposal_budget = Arc::new(EventBudget {
+            used: AtomicUsize::new(0),
+            maximum: 32 * 1024,
+        });
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let tracked_responses: TrackedResponses = Arc::default();
+        let debt_owner: DebtOwner = Arc::default();
+        let tracked_reader = tracked_responses.clone();
+        let debt_reader = debt_owner.clone();
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
         let closed = Arc::new(AtomicBool::new(false));
@@ -465,6 +489,62 @@ impl CdpClient {
         // Notify used to stop the keepalive task when the reader loop exits.
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
         let reader_cancel_tx = cancel_tx.clone();
+        let mut disposal_cancel = cancel_rx.clone();
+        let disposal_ws = ws_tx.clone();
+        let disposal_closed = closed.clone();
+        let disposal_tracked = tracked_responses.clone();
+        let disposal_next = next_id.clone();
+        // No Arc<CdpClient> is captured. The owning client closes/cancels and
+        // joins this bounded one-shot lane with its reader and keepalive.
+        let disposal_handle = tokio::spawn(async move {
+            loop {
+                let work = tokio::select! {
+                    biased;
+                    _ = disposal_cancel.changed() => break,
+                    work = disposal_rx.recv() => match work { Some(work) => work, None => break },
+                };
+                let write_deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+                let mut tx = tokio::select! {
+                    biased;
+                    _ = disposal_cancel.changed() => break,
+                    _ = tokio::time::sleep_until(write_deadline) => continue,
+                    tx = disposal_ws.lock() => tx,
+                };
+                if disposal_closed.load(Ordering::SeqCst) {
+                    break;
+                }
+                #[allow(deprecated)]
+                let Ok(id) = disposal_next
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+                else {
+                    break;
+                };
+                let DisposalWork { command, _bytes } = work;
+                let envelope = CdpCommand {
+                    id,
+                    method: command.method.into(),
+                    params: Some(command.params),
+                    session_id: command.session,
+                };
+                let Ok(json) = serde_json::to_string(&envelope) else {
+                    continue;
+                };
+                let Ok(submitted) = command.reservation.submit() else {
+                    continue;
+                };
+                disposal_tracked
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(id, submitted);
+                // Never await a response here, nor retry a failed/maybe write.
+                let _ = tokio::select! {
+                    biased;
+                    _ = disposal_cancel.changed() => break,
+                    _ = tokio::time::sleep_until(write_deadline) => continue,
+                    sent = tx.send(Message::Text(json)) => sent,
+                };
+            }
+        });
 
         let reader_handle = tokio::spawn(async move {
             while let Some(msg) = ws_rx.next().await {
@@ -518,6 +598,13 @@ impl CdpClient {
                             Ok(parsed) => parsed,
                             Err(error) => {
                                 if let Some(id) = extract_command_id(candidate) {
+                                    if let Some(tracked) = tracked_reader
+                                        .lock()
+                                        .unwrap_or_else(|error| error.into_inner())
+                                        .remove(&id)
+                                    {
+                                        tracked.malformed_response();
+                                    }
                                     let waiter = pending_clone.lock().await.remove(&id);
                                     if let Some(tx) = waiter {
                                         let _ = tx.send(CdpMessage {
@@ -544,10 +631,35 @@ impl CdpClient {
                 };
 
                 if let Some(id) = parsed.id {
-                    // Response to a command
-                    let mut pending = pending_clone.lock().await;
-                    if let Some(tx) = pending.remove(&id) {
-                        let _ = tx.send(parsed);
+                    let waiter = pending_clone.lock().await.remove(&id);
+                    // Parse/correlate/settle before waiter delivery. Queue only
+                    // exact disposal work, never the old application's next step.
+                    let tracked = tracked_reader
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .remove(&id);
+                    let disposals = tracked
+                        .map_or_else(Vec::new, |tracked| tracked.settle_for_delivery(&parsed));
+                    // Delivery itself is the authority: is_closed() alone races
+                    // receiver cancellation between inspection and send.
+                    let abandoned = waiter.is_none_or(|tx| tx.send(parsed).is_err());
+                    for disposal in disposals {
+                        if disposal.needed_after_delivery(abandoned) {
+                            if let Ok(command) = disposal.reserve() {
+                                let bytes = serde_json::to_vec(&command.params)
+                                    .map_or(usize::MAX, |value| value.len())
+                                    .saturating_add(command.session.as_ref().map_or(0, String::len))
+                                    .saturating_add(128);
+                                if let Some(charge) = disposal_budget.reserve(bytes) {
+                                    // Full/stopped queue drops only an unsubmitted
+                                    // reservation. Exact object/group debt remains.
+                                    let _ = disposal_tx.try_send(DisposalWork {
+                                        command,
+                                        _bytes: charge,
+                                    });
+                                }
+                            }
+                        }
                     }
                 } else if let Some(ref method) = parsed.method {
                     // Event
@@ -556,6 +668,13 @@ impl CdpClient {
                         params: parsed.params.clone().unwrap_or(Value::Null),
                         session_id: parsed.session_id.clone(),
                     };
+                    if let Some(ledger) = debt_reader
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .as_ref()
+                    {
+                        ledger.observe_event(&event);
+                    }
                     let routed = event.session_id.as_deref().is_some_and(|sid| {
                         let mut routes = private_clone.lock().unwrap_or_else(|e| e.into_inner());
                         match routes.get(sid) {
@@ -595,6 +714,17 @@ impl CdpClient {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clear();
+            if let Some(ledger) = debt_reader
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .as_ref()
+            {
+                ledger.connection_lost();
+            }
+            tracked_reader
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clear();
             pending_clone.lock().await.clear();
 
             // Stop the keepalive task because the connection is gone.
@@ -632,12 +762,15 @@ impl CdpClient {
             remote_closed,
             close_lock: Mutex::new(()),
             cancel_tx,
-            next_id: AtomicU64::new(1),
+            next_id,
             pending,
+            tracked_responses,
+            debt_owner,
             event_tx,
             raw_tx,
             reader_handle: Mutex::new(Some(reader_handle)),
             keepalive_handle: Mutex::new(Some(keepalive_handle)),
+            disposal_handle: Mutex::new(Some(disposal_handle)),
             private_sessions,
             method_taps,
             bounded_method_taps,
@@ -675,6 +808,7 @@ impl CdpClient {
 
         let _ = self.cancel_tx.send(true);
         Self::abort_task(&self.keepalive_handle).await;
+        Self::abort_task(&self.disposal_handle).await;
 
         let _ = tokio::time::timeout(TRANSPORT_CLOSE_TIMEOUT, async {
             let mut ws_tx = self.ws_tx.lock().await;
@@ -684,17 +818,101 @@ impl CdpClient {
 
         let _ = self.socket.shutdown(Shutdown::Both);
         Self::abort_task(&self.reader_handle).await;
+        if let Some(ledger) = self.debt_ledger() {
+            ledger.connection_lost();
+        }
+        self.tracked_responses
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
         self.pending.lock().await.clear();
         self.close_complete.store(true, Ordering::SeqCst);
     }
 
+    /// Install only on the concentrated owner path. Real lifecycle replacement
+    /// cannot reset old obligations; it requires their exact prior retirement.
+    pub(crate) fn install_debt_ledger(
+        &self,
+        ledger: Arc<OwnerDebtLedger>,
+    ) -> Result<(), ProtocolError> {
+        let mut owner = self
+            .debt_owner
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(previous) = owner.as_ref() {
+            if Arc::ptr_eq(previous, &ledger) {
+                return Ok(());
+            }
+            if previous.same_owner(&ledger) {
+                return Err(ProtocolError::StaleScope);
+            }
+            let old = previous.snapshot();
+            if old.outstanding_commands != 0 || old.object_debt != 0 {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+        }
+        *owner = Some(ledger);
+        Ok(())
+    }
+    pub(crate) fn debt_ledger(&self) -> Option<Arc<OwnerDebtLedger>> {
+        self.debt_owner.lock().ok().and_then(|owner| owner.clone())
+    }
+    pub(crate) fn reserve_tracked_command(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        session: Option<&str>,
+    ) -> Result<Option<CommandReservation>, String> {
+        let Some(ledger) = self.debt_ledger() else {
+            return Ok(None);
+        };
+        let journal = current_operation();
+        ledger
+            .reserve_command(journal.as_ref(), method, params, session)
+            .map(Some)
+            .map_err(|_| "Native CDP command admission refused".to_string())
+    }
+    fn next_command_id(&self) -> Result<u64, String> {
+        #[allow(deprecated)]
+        self.next_id
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |id| id.checked_add(1))
+            .map_err(|_| "CDP command identifier exhausted".to_string())
+    }
+    fn track_submission(
+        &self,
+        id: u64,
+        reservation: Option<CommandReservation>,
+    ) -> Result<(), String> {
+        if let Some(reservation) = reservation {
+            let submitted = reservation
+                .submit()
+                .map_err(|_| "Native CDP command admission revoked".to_string())?;
+            self.tracked_responses
+                .lock()
+                .map_err(|_| "Native CDP correlation unavailable".to_string())?
+                .insert(id, submitted);
+        }
+        Ok(())
+    }
     pub async fn send_command(
         &self,
         method: &str,
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let reservation = self.reserve_tracked_command(method, params.as_ref(), session_id)?;
+        self.send_reserved_command(method, params, session_id, reservation)
+            .await
+    }
+
+    pub(crate) async fn send_reserved_command(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        reservation: Option<CommandReservation>,
+    ) -> Result<Value, String> {
+        let id = self.next_command_id()?;
 
         let cmd = CdpCommand {
             id,
@@ -719,6 +937,7 @@ impl CdpClient {
             let mut ws_tx = self.ws_tx.lock().await;
             self.ensure_open()?;
             let mut pending = self.pending.lock().await;
+            self.track_submission(id, reservation)?;
             pending.insert(id, tx);
             drop(pending);
             if let Err(error) = ws_tx.send(Message::Text(json)).await {
@@ -913,7 +1132,8 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<(), String> {
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let reservation = self.reserve_tracked_command(method, params.as_ref(), session_id)?;
+        let id = self.next_command_id()?;
         let cmd = CdpCommand {
             id,
             method: method.to_string(),
@@ -926,6 +1146,7 @@ impl CdpClient {
 
         let mut ws_tx = self.ws_tx.lock().await;
         self.ensure_open()?;
+        self.track_submission(id, reservation)?;
         ws_tx
             .send(Message::Text(json))
             .await
@@ -935,6 +1156,9 @@ impl CdpClient {
     /// Send raw JSON through the WebSocket without tracking a response.
     /// Used by the inspect proxy to forward DevTools frontend messages.
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
+        if self.debt_ledger().is_some() {
+            return Err("Raw CDP writes are not admitted by the native owner".to_string());
+        }
         let mut ws_tx = self.ws_tx.lock().await;
         self.ensure_open()?;
         ws_tx
@@ -1009,6 +1233,84 @@ fn underlying_tcp_stream(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn dropped_waiter_keeps_reader_debt_and_late_handle_gets_one_original_session_release() {
+        use super::super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let (seen_tx, seen_rx) = oneshot::channel();
+        let (late_tx, late_rx) = oneshot::channel();
+        let log = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+        let requests = log.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let first: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            requests.lock().unwrap().push(first.clone());
+            seen_tx.send(()).unwrap();
+            late_rx.await.unwrap();
+            socket.send(Message::Text(json!({"id":first["id"],"sessionId":"page","result":{"object":{"objectId":"late-object"}}}).to_string())).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let request: Value = serde_json::from_str(text).unwrap();
+                requests.lock().unwrap().push(request.clone());
+                assert_eq!(request["method"], "Runtime.releaseObject");
+                assert_eq!(request["params"]["objectId"], "late-object");
+                assert_eq!(request["sessionId"], "page");
+                socket
+                    .send(Message::Text(
+                        json!({"id":request["id"],"sessionId":"page","result":{}}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        client.install_debt_ledger(ledger.clone()).unwrap();
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        let sender = client.clone();
+        let task = tokio::spawn(async move {
+            journal
+                .scope(sender.send_command(
+                    "DOM.resolveNode",
+                    Some(json!({"backendNodeId":1})),
+                    Some("page"),
+                ))
+                .await
+        });
+        seen_rx.await.unwrap();
+        task.abort();
+        let _ = task.await;
+        assert!(client.pending.lock().await.is_empty());
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        late_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ledger.snapshot().object_debt != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(log.lock().unwrap().len(), 2);
+        assert!(!ledger.snapshot().integrity_lost);
+        client.close().await;
+        server.abort();
+    }
+
     use super::*;
     use base64::Engine;
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};

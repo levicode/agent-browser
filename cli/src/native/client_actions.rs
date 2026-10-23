@@ -4,6 +4,7 @@
 //! Unknown effects before disposing the original context.
 use super::client_blobs::{ArtifactReservation, AttemptArtifacts, BlobLease, BlobScope, BlobStore};
 use super::client_browser::BrowserExecutionLease;
+use super::client_debt::{self, CommandCategory, OperationJournalHandle};
 use super::client_geometry::{GeometryError, GeometrySnapshot, Point as GeometryPoint};
 use super::client_observation::NodeReference;
 use super::client_page::ClientPageState;
@@ -215,6 +216,9 @@ pub struct ActionContext<'a> {
 impl ActionContext<'_> {
     fn check(&self) -> Result<(), ProtocolError> {
         self.page.permit.check()?;
+        if let Some(journal) = OperationJournalHandle::current() {
+            journal.check_application_submission()?;
+        }
         if *self.operation.cancellation.borrow() != CancelSignal::None {
             return Err(ProtocolError::Cancelled);
         }
@@ -253,12 +257,31 @@ impl ActionContext<'_> {
         if mutation {
             dispatch.mark_mutation(method == "DOM.scrollIntoViewIfNeeded");
         }
-        self.bounded(
+        let category = if method.starts_with("Input.") {
+            CommandCategory::ApplicationInput
+        } else if method.starts_with("DOM.") || method.starts_with("Runtime.") {
+            CommandCategory::ApplicationObject
+        } else {
+            CommandCategory::ApplicationRead
+        };
+        let command = client_debt::command_scope(
+            category,
+            mutation,
             self.page
                 .client
                 .send_command(method, Some(args), Some(session)),
-        )
-        .await
+        );
+        let mut cancel = self.operation.cancellation.clone();
+        tokio::select! {
+            value = command => {
+                // Transfer actual resource replies to their exact owning helper
+                // before a cancellation check can discard cleanup authority.
+                if !super::client_observation::produces_remote_objects(method) { self.check()?; }
+                value.map_err(|_| ProtocolError::BrowserFailure)
+            },
+            _ = cancel.changed() => Err(ProtocolError::Cancelled),
+            _ = tokio::time::sleep_until(self.operation.deadline.into()) => Err(ProtocolError::DeadlineExceeded),
+        }
     }
     async fn pause(&self, duration: Duration) -> Result<(), ProtocolError> {
         self.check()?;
@@ -484,6 +507,70 @@ fn reference<'a>(
     }
     Ok((entry, binding))
 }
+/// Only an exact, pre-reserved object-release command may become retained
+/// release debt. This helper is never used for source-mask/security restoration.
+pub(crate) async fn release_object_accounted(
+    client: &super::cdp::client::CdpClient,
+    session: &str,
+    object: &str,
+) -> bool {
+    release_accounted(
+        client,
+        session,
+        "Runtime.releaseObject",
+        json!({"objectId":object}),
+    )
+    .await
+}
+/// Ownership release only. Source-mask/security restoration must use strict ACKs.
+pub(crate) async fn release_group_accounted(
+    client: &super::cdp::client::CdpClient,
+    session: &str,
+    group: &str,
+) -> bool {
+    release_accounted(
+        client,
+        session,
+        "Runtime.releaseObjectGroup",
+        json!({"objectGroup":group}),
+    )
+    .await
+}
+async fn release_accounted(
+    client: &super::cdp::client::CdpClient,
+    session: &str,
+    method: &str,
+    params: Value,
+) -> bool {
+    client_debt::command_scope(
+        CommandCategory::CleanupObject,
+        false,
+        release_accounted_inner(client, session, method, params),
+    )
+    .await
+}
+async fn release_accounted_inner(
+    client: &super::cdp::client::CdpClient,
+    session: &str,
+    method: &str,
+    params: Value,
+) -> bool {
+    let reservation = match client.reserve_tracked_command(method, Some(&params), Some(session)) {
+        Ok(reservation) => reservation,
+        Err(_) => return false,
+    };
+    let status = reservation.as_ref().map(|reservation| reservation.status());
+    let result = tokio::time::timeout(
+        Duration::from_millis(250),
+        client.send_reserved_command(method, Some(params), Some(session), reservation),
+    )
+    .await;
+    matches!(result, Ok(Ok(_)))
+        || (status.is_some_and(|status| status.settled() || status.accountably_retained())
+            && client
+                .debt_ledger()
+                .is_some_and(|ledger| !ledger.snapshot().integrity_lost))
+}
 struct Resolved {
     realm: Option<super::client_enrollment::ExactRealmTicket>,
     object: String,
@@ -499,16 +586,7 @@ impl Resolved {
         {
             return Ok(());
         }
-        let released = tokio::time::timeout(
-            Duration::from_millis(250),
-            ctx.page.client.send_command(
-                "Runtime.releaseObject",
-                Some(json!({"objectId":self.object})),
-                Some(&self.session),
-            ),
-        )
-        .await;
-        if matches!(released, Ok(Ok(_))) {
+        if release_object_accounted(&ctx.page.client, &self.session, &self.object).await {
             return Ok(());
         }
         // Failed release is not evidence. Only the captured native realm's
@@ -569,18 +647,7 @@ async fn release_call_handles(
         if Some(object) == retained || !seen.insert(object) {
             continue;
         }
-        failed |= !matches!(
-            tokio::time::timeout(
-                Duration::from_millis(250),
-                ctx.page.client.send_command(
-                    "Runtime.releaseObject",
-                    Some(json!({"objectId":object})),
-                    Some(session)
-                )
-            )
-            .await,
-            Ok(Ok(_))
-        );
+        failed |= !release_object_accounted(&ctx.page.client, session, object).await;
     }
     if failed {
         d.cleanup.store(true, Ordering::SeqCst);
@@ -644,7 +711,11 @@ async fn resolve_action_object_in_realm(
         Err(primary) => match tokio::time::timeout(Duration::from_millis(250), &mut future).await {
             Ok(result) => (result, Some(primary)),
             Err(_) => {
-                d.cleanup.store(true, Ordering::SeqCst);
+                if !OperationJournalHandle::current()
+                    .is_some_and(|journal| journal.has_accounted_object_creation(&binding.session))
+                {
+                    d.cleanup.store(true, Ordering::SeqCst);
+                }
                 return Err(primary);
             }
         },
@@ -660,16 +731,7 @@ async fn resolve_action_object_in_realm(
         }
     };
     if let Some(primary) = interrupted.or_else(|| ctx.check().err()) {
-        let released = tokio::time::timeout(
-            Duration::from_millis(250),
-            ctx.page.client.send_command(
-                "Runtime.releaseObject",
-                Some(json!({"objectId":object})),
-                Some(&binding.session),
-            ),
-        )
-        .await;
-        if !matches!(released, Ok(Ok(_))) {
+        if !release_object_accounted(&ctx.page.client, &binding.session, &object).await {
             d.cleanup.store(true, Ordering::SeqCst);
         }
         return Err(primary);
@@ -691,9 +753,10 @@ fn live_query_error(
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
-        ObservationError::StaleReference | ObservationError::Superseded => {
-            ProtocolError::StaleReference
-        }
+        ObservationError::StaleReference
+        | ObservationError::Superseded
+        | ObservationError::FrameNotFound(_)
+        | ObservationError::FrameAmbiguous(_) => ProtocolError::StaleReference,
         ObservationError::Cancelled => ProtocolError::Cancelled,
         ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
         ObservationError::BackendFailure => ProtocolError::BrowserFailure,
@@ -760,16 +823,7 @@ async fn resolve(
         if let Err(primary) = ticket.verify_resolution_owner(ctx.operation).await {
             // Numeric context-ID reuse makes this handle's realm uncertain.
             // Do not attach the old ticket or waive release using its destruction.
-            let released = tokio::time::timeout(
-                Duration::from_millis(250),
-                ctx.page.client.send_command(
-                    "Runtime.releaseObject",
-                    Some(json!({"objectId":object})),
-                    Some(&binding.session),
-                ),
-            )
-            .await;
-            if !matches!(released, Ok(Ok(_))) {
+            if !release_object_accounted(&ctx.page.client, &binding.session, &object).await {
                 d.cleanup.store(true, Ordering::SeqCst);
             }
             return Err(primary);
@@ -819,6 +873,12 @@ impl ClientActions {
         let result = self.execute_inner(&ctx, &d, name, args).await;
         let settled_prefix = matches!(&result, Err(ProtocolError::Cancelled))
             && settle_replacement_cancellation(&ctx, &d).await;
+        if result.is_err()
+            && OperationJournalHandle::current().is_some()
+            && ctx.page_state.release_input(ctx.page).await.is_err()
+        {
+            d.cleanup.store(true, Ordering::SeqCst);
+        }
         finish_dispatch(&d, result).map_err(|mut failure| {
             if settled_prefix {
                 failure.effects = Effects::Completed;
@@ -874,6 +934,257 @@ impl ClientActions {
         }
         ctx.check()?;
         Ok(Value::Null)
+    }
+}
+
+/// The caller has admitted the exact page and owns both guards. There is no
+/// DOM-reference or renderer geometry authority in this direct-input context.
+pub(crate) struct DirectPointContext<'a> {
+    pub page: &'a BrowserExecutionLease,
+    pub operation: &'a OperationLease,
+    pub page_state: &'a ClientPageState,
+    pub journal: &'a OperationJournalHandle,
+    pub ui: super::client_ui::UiPermit,
+    pub input: tokio::sync::MutexGuard<'a, ()>,
+}
+struct DirectPointRunner<'a, 'b> {
+    context: &'a DirectPointContext<'b>,
+    attachment: super::client_targets::OwnedTarget,
+    dispatch: Dispatch,
+}
+impl DirectPointRunner<'_, '_> {
+    fn check(&self) -> Result<(), ProtocolError> {
+        let ctx = self.context;
+        ctx.page.permit.check()?;
+        ctx.journal.check_application_submission()?;
+        if ctx.journal.key().generation != ctx.operation.generation
+            || ctx.journal.key().operation_seq != ctx.operation.sequence
+            || ctx.page.identity_scope != ctx.page.targets.identity_scope
+            || !ctx
+                .page
+                .targets
+                .owned_target(&ctx.page.target_id)?
+                .same_attachment(&self.attachment)
+            || self.attachment.session_id != ctx.page.page_session_id
+            || !self.attachment.configured
+            || !self.attachment.resumed
+            || self.attachment.purpose != Some(super::client_targets::TargetPurpose::Application)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if *ctx.operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= ctx.operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+    async fn pause(&self, duration: Duration) -> Result<(), ProtocolError> {
+        self.check()?;
+        let mut cancel = self.context.operation.cancellation.clone();
+        tokio::select! {
+            _ = tokio::time::sleep(duration) => self.check(),
+            _ = cancel.changed() => Err(ProtocolError::Cancelled),
+            _ = tokio::time::sleep_until(self.context.operation.deadline.into()) => Err(ProtocolError::DeadlineExceeded),
+        }
+    }
+    async fn event(
+        &self,
+        kind: &str,
+        point: Point,
+        button: Option<&str>,
+        count: Option<i32>,
+    ) -> Result<(), ProtocolError> {
+        self.check()?;
+        self.dispatch.mark();
+        action_stage(match kind {
+            "mousePressed" => "input.press.dispatch",
+            "mouseReleased" => "input.release.dispatch",
+            _ => "input.move.dispatch",
+        });
+        self.context
+            .page_state
+            .pointer_event(
+                self.context.page,
+                self.context.operation,
+                kind,
+                Some((point.x, point.y)),
+                button,
+                count,
+                None,
+            )
+            .await?;
+        self.check()
+    }
+    async fn click(
+        &self,
+        point: Point,
+        button: &str,
+        count: i32,
+        hold: Duration,
+    ) -> Result<(), ProtocolError> {
+        self.event("mouseMoved", point, None, None).await?;
+        for click in 1..=count {
+            self.event("mousePressed", point, Some(button), Some(click))
+                .await?;
+            if !hold.is_zero() {
+                self.pause(hold).await?;
+            }
+            self.event("mouseReleased", point, Some(button), Some(click))
+                .await?;
+        }
+        Ok(())
+    }
+    async fn drag(
+        &self,
+        from: Point,
+        to: Point,
+        pace: Option<Duration>,
+    ) -> Result<(), ProtocolError> {
+        self.event("mouseMoved", from, None, None).await?;
+        self.event("mousePressed", from, Some("left"), Some(1))
+            .await?;
+        let steps = pace
+            .map(|pace| (pace.as_millis() / 16).max(2) as usize)
+            .unwrap_or(2);
+        let start = Instant::now();
+        for step in 1..=steps {
+            if let Some(pace) = pace {
+                let due = start + pace.mul_f64(step as f64 / steps as f64);
+                if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                    self.pause(wait).await?;
+                }
+            }
+            let fraction = step as f64 / steps as f64;
+            let point = Point {
+                x: from.x + (to.x - from.x) * fraction,
+                y: from.y + (to.y - from.y) * fraction,
+            }
+            .validate()?;
+            self.event("mouseMoved", point, None, None).await?;
+        }
+        self.event("mouseReleased", to, Some("left"), Some(1)).await
+    }
+}
+impl ClientActions {
+    pub(crate) fn is_direct_point(args: &Value) -> Result<bool, ProtocolError> {
+        let request: Pointer = decode(args)?;
+        request.point.validate()?;
+        match request.action {
+            PointerAction::Swipe { .. } => Ok(false),
+            PointerAction::LongPress { duration_ms } => {
+                duration(duration_ms, 500)?;
+                Ok(true)
+            }
+            PointerAction::DragTo { target } => {
+                target.validate()?;
+                Ok(true)
+            }
+            PointerAction::SwipeTo {
+                target,
+                duration_ms,
+            } => {
+                target.validate()?;
+                duration(duration_ms, 0)?;
+                Ok(true)
+            }
+            _ => Ok(true),
+        }
+    }
+    pub(crate) async fn execute_direct_point(
+        &self,
+        context: DirectPointContext<'_>,
+        args: &Value,
+    ) -> Result<Value, ActionFailure> {
+        // Taking guards by value keeps them alive through mandatory cleanup,
+        // even when the RPC receiver or original command future is gone.
+        let _guards = (&context.ui, &context.input);
+        let journal = context.journal.clone();
+        journal
+            .scope(async {
+                let d = Dispatch::default();
+                let request: Pointer = decode(args).map_err(|error| d.failure(error))?;
+                if request.identity_scope != context.page.identity_scope
+                    || !Self::is_direct_point(args).map_err(|error| d.failure(error))?
+                {
+                    return Err(d.failure(ProtocolError::InvalidArguments));
+                }
+                let attachment = context
+                    .page
+                    .targets
+                    .owned_target(&context.page.target_id)
+                    .map_err(|error| d.failure(error))?;
+                let runner = DirectPointRunner {
+                    context: &context,
+                    attachment,
+                    dispatch: d,
+                };
+                let result = async {
+                    runner.check()?;
+                    let point = request.point.validate()?;
+                    match request.action {
+                        PointerAction::Tap => {
+                            runner.click(point, "left", 1, Duration::ZERO).await?
+                        }
+                        PointerAction::DoubleTap => {
+                            runner.click(point, "left", 2, Duration::ZERO).await?
+                        }
+                        PointerAction::SecondaryTap => {
+                            runner.click(point, "right", 1, Duration::ZERO).await?
+                        }
+                        PointerAction::Hover => {
+                            runner.event("mouseMoved", point, None, None).await?
+                        }
+                        PointerAction::LongPress { duration_ms } => {
+                            runner
+                                .click(point, "left", 1, duration(duration_ms, 500)?)
+                                .await?
+                        }
+                        PointerAction::DragTo { target } => {
+                            runner.drag(point, target.validate()?, None).await?
+                        }
+                        PointerAction::SwipeTo {
+                            target,
+                            duration_ms,
+                        } => {
+                            runner
+                                .drag(
+                                    point,
+                                    target.validate()?,
+                                    duration_ms
+                                        .map(|value| duration(Some(value), 0))
+                                        .transpose()?,
+                                )
+                                .await?
+                        }
+                        PointerAction::Swipe { .. } => return Err(ProtocolError::InvalidArguments),
+                    }
+                    runner.check()?;
+                    Ok(Value::Null)
+                }
+                .await;
+                if result.is_err()
+                    && context
+                        .page_state
+                        .release_input(context.page)
+                        .await
+                        .is_err()
+                {
+                    runner.dispatch.cleanup.store(true, Ordering::SeqCst);
+                }
+                finish_dispatch(&runner.dispatch, result).map_err(|mut failure| {
+                    // The transport journal, not entering the helper, proves a
+                    // possible mutation. Reservations refused before send are clean.
+                    failure.effects = if context.journal.snapshot().mutation_dispatched {
+                        Effects::Unknown
+                    } else {
+                        Effects::NotDispatched
+                    };
+                    failure
+                })
+            })
+            .await
     }
 }
 
@@ -1281,11 +1592,21 @@ async fn center(
                 if d.preparation_enabled.load(Ordering::SeqCst)
                     && d.preparation_refusal.load(Ordering::SeqCst)
                     && !d.preparation_disqualified.load(Ordering::SeqCst)
-                    && preparation_classification_due(ctx.operation.deadline, longest_attempt)
                 {
-                    ctx.check()?;
-                    d.preparation_stopped.store(true, Ordering::SeqCst);
-                    return Err(ProtocolError::NotActionable);
+                    let remaining = ctx
+                        .operation
+                        .deadline
+                        .saturating_duration_since(Instant::now());
+                    if !preparation_has_classification_slack(remaining) {
+                        // Retire this ACKed refusal promptly, but do not grant
+                        // the classification receipt after its safe window.
+                        return Err(preparation_retirement_error(ctx.check()));
+                    }
+                    if preparation_classification_window(remaining, longest_attempt) {
+                        ctx.check()?;
+                        d.preparation_stopped.store(true, Ordering::SeqCst);
+                        return Err(ProtocolError::NotActionable);
+                    }
                 }
             }
             Err(ProtocolError::DeadlineExceeded) => return Err(ProtocolError::NotActionable),
@@ -1301,15 +1622,20 @@ async fn center(
 /// Leave the existing 250ms exact-handle cleanup budget plus a small positive
 /// classification window. Observed duration is only an admission estimate: any
 /// overrun still fails the original deadline/authority checks after cleanup.
-fn preparation_classification_due(deadline: Instant, longest_attempt: Duration) -> bool {
-    preparation_classification_window(
-        deadline.saturating_duration_since(Instant::now()),
-        longest_attempt,
-    )
+fn preparation_has_classification_slack(remaining: Duration) -> bool {
+    remaining >= Duration::from_millis(250 + 16)
 }
 fn preparation_classification_window(remaining: Duration, longest_attempt: Duration) -> bool {
-    remaining >= Duration::from_millis(250 + 16)
+    preparation_has_classification_slack(remaining)
         && remaining <= Duration::from_millis(16 + 250 + 16).saturating_add(longest_attempt)
+}
+fn preparation_retirement_error(check: Result<(), ProtocolError>) -> ProtocolError {
+    // Preserve center's existing deadline-to-refusal mapping without hiding
+    // cancellation or loss of the original permit during the final check.
+    match check {
+        Ok(()) | Err(ProtocolError::DeadlineExceeded) => ProtocolError::NotActionable,
+        Err(error) => error,
+    }
 }
 fn geometry_failure(d: &Dispatch, error: GeometryError) -> ProtocolError {
     match error {
@@ -2184,7 +2510,10 @@ impl RecordingLedger {
         // A failed native stop can still leave a valid finalized WebM. Retain
         // that artifact rather than discarding it because of the stop status.
         let had_capture = owned.state.capture_task.is_some();
-        let _stop = recording::stop_recording_task(&mut owned.state).await;
+        let stop = recording::stop_recording_task(&mut owned.state).await;
+        let acknowledgement_failed = stop
+            .as_ref()
+            .is_err_and(|error| error == recording::FRAME_ACK_UNAVAILABLE);
         if let Some(attachment) = owned.attachment.as_mut() {
             let clean = attachment.settle().await;
             self.cleanup_failed |= !clean;
@@ -2248,6 +2577,9 @@ impl RecordingLedger {
                     return Err(ProtocolError::CleanupFailed);
                 }
             }
+        }
+        if acknowledgement_failed {
+            return Err(ProtocolError::BrowserFailure);
         }
         Ok(())
     }
@@ -2517,6 +2849,9 @@ impl ClientActions {
             .ok_or(ProtocolError::BrowserFailure)?
             .to_owned();
         let mut state = RecordingState::new();
+        if let Some(journal) = OperationJournalHandle::current() {
+            journal.mark_mutation_maybe_submitted()?;
+        }
         recording::recording_start(&mut state, &path, RecordingOptions::default())
             .map_err(|_| ProtocolError::BrowserFailure)?;
         ledger.current = Some(OwnedRecording {
@@ -2648,6 +2983,11 @@ impl ClientActions {
     ) -> Result<Value, ProtocolError> {
         scope(ctx, &request.identity_scope)?;
         let mut ledger = self.recording.lock().await;
+        if ledger.armed || ledger.current.is_some() {
+            if let Some(journal) = OperationJournalHandle::current() {
+                journal.mark_mutation_maybe_submitted()?;
+            }
+        }
         ledger.armed = false;
         if ledger.current.is_some() {
             d.mark();
@@ -2728,9 +3068,10 @@ fn observation_action_error(
         }
         ObservationError::Cancelled => ProtocolError::Cancelled,
         ObservationError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
-        ObservationError::StaleReference | ObservationError::Superseded => {
-            ProtocolError::StaleReference
-        }
+        ObservationError::StaleReference
+        | ObservationError::Superseded
+        | ObservationError::FrameNotFound(_)
+        | ObservationError::FrameAmbiguous(_) => ProtocolError::StaleReference,
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
@@ -3028,6 +3369,7 @@ impl FixtureOperations {
             error,
             effects: outcome.effects,
             scope_state,
+            retention: None,
         })?;
         Ok(outcome)
     }
@@ -3041,6 +3383,28 @@ mod tests {
     };
     use super::*;
     use futures_util::{SinkExt, StreamExt};
+    #[test]
+    fn fresh_frame_facts_cannot_authorize_retained_actions() {
+        use super::super::client_observation::ObservationError;
+        use super::super::client_protocol::{FrameAmbiguity, FrameSelectionIndex};
+        for error in [
+            ObservationError::FrameNotFound(FrameSelectionIndex::new(0).unwrap()),
+            ObservationError::FrameAmbiguous(FrameAmbiguity::new(1, 2).unwrap()),
+        ] {
+            let dispatch = Dispatch::default();
+            assert_eq!(
+                live_query_error(&dispatch, error.clone()),
+                ProtocolError::StaleReference
+            );
+            assert_eq!(
+                observation_action_error(error, &dispatch),
+                ProtocolError::StaleReference
+            );
+            assert!(!dispatch.sent.load(Ordering::SeqCst));
+            assert!(!dispatch.cleanup.load(Ordering::SeqCst));
+        }
+    }
+
     type Log = Arc<std::sync::Mutex<Vec<Value>>>;
     // Hooks are keyed to one exact scope/generation/sequence, never a process-
     // wide next-action callback. Replacement hooks follow real keyboard ACKs;
@@ -3304,6 +3668,8 @@ mod tests {
             let mut preparation_scrolls = 0;
             let mut held_focus_probe: Option<Value> = None;
             let mut held_focus_release: Option<Value> = None;
+            let mut held_debt_release: Option<Value> = None;
+            let mut held_direct_press: Option<Value> = None;
             while let Some(Ok(message)) = socket.next().await {
                 let Ok(text) = message.to_text() else {
                     continue;
@@ -3311,9 +3677,43 @@ mod tests {
                 let request: Value = serde_json::from_str(text).unwrap();
                 captured.lock().unwrap().push(request.clone());
                 let method = request["method"].as_str().unwrap();
+                if mode == "direct-point-cancel"
+                    && method == "Input.dispatchMouseEvent"
+                    && request["params"]["type"] == "mousePressed"
+                {
+                    held_direct_press = Some(request.clone());
+                    server_cancel.send_replace(CancelSignal::Requested);
+                    continue;
+                }
+                if mode == "direct-point-cancel" && method == "Browser.getVersion" {
+                    if let Some(press) = held_direct_press.take() {
+                        socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":press["id"],"sessionId":press["sessionId"],"result":{}}).to_string())).await.unwrap();
+                    }
+                }
                 let source = request["params"]["functionDeclaration"]
                     .as_str()
                     .unwrap_or("");
+                if mode == "preparation-release-debt" && method == "Runtime.releaseObject" {
+                    assert_eq!(request["params"]["objectId"], "exact-node");
+                    assert_eq!(request["sessionId"], "page");
+                    assert!(held_debt_release.replace(request.clone()).is_none());
+                    continue;
+                }
+                if mode == "preparation-release-debt" && method == "Browser.getVersion" {
+                    if let Some(release) = held_debt_release.take() {
+                        let reply = json!({"id":release["id"],"result":{}});
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                reply.to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        sent_replies
+                            .lock()
+                            .unwrap()
+                            .push(json!({"request":release,"reply":reply}));
+                    }
+                }
                 // Preparation settlement cases withhold an exact reply, not the
                 // entire peer. Owned-handle cleanup must remain serviceable.
                 if mode.starts_with("preparation-") {
@@ -3620,7 +4020,7 @@ mod tests {
                     "Runtime.evaluate" => json!({"result":{"value":true}}),
                     _ => json!({}),
                 };
-                let reply = if (mode.starts_with("strict-query-cleanup")
+                let mut reply = if (mode.starts_with("strict-query-cleanup")
                     && query_reads > 1
                     && method == "Runtime.releaseObjectGroup"
                     && request["params"]["objectGroup"]
@@ -3646,6 +4046,9 @@ mod tests {
                 } else {
                     json!({"id":request["id"],"result":result})
                 };
+                if mode.starts_with("direct-point") {
+                    reply["sessionId"] = request["sessionId"].clone();
+                }
                 if method == "Runtime.releaseObject" {
                     if let Some(focus_request) = held_focus_probe.as_ref() {
                         assert_eq!(request["sessionId"], focus_request["sessionId"]);
@@ -3774,6 +4177,75 @@ mod tests {
             server,
         }
     }
+    #[tokio::test]
+    async fn direct_point_uses_only_exact_input_and_late_ack_never_resumes_double_tap() {
+        for cancelled in [false, true] {
+            let f = fixture(if cancelled {
+                "direct-point-cancel"
+            } else {
+                "direct-point"
+            })
+            .await;
+            f.page
+                .targets
+                .attached("context", "target".into(), "page".into(), "page".into())
+                .unwrap();
+            f.page.targets.configured("target").unwrap();
+            f.page
+                .targets
+                .resume_permit("target")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            let ledger = client_debt::OwnerDebtLedger::new(1, "scope".into());
+            f.page.client.install_debt_ledger(ledger.clone()).unwrap();
+            let journal = ledger
+                .operation(
+                    client_debt::OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            journal.bind_operation(&f.op).unwrap();
+            let gate = Arc::new(super::super::client_ui::UiGate::default());
+            let ui = gate
+                .enter(false, false, f.op.deadline, f.op.cancellation.clone())
+                .await
+                .unwrap();
+            let input = tokio::sync::Mutex::new(());
+            let result=ClientActions::default().execute_direct_point(DirectPointContext{page:&f.page,operation:&f.op,page_state:&f.state,journal:&journal,ui,input:input.lock().await},&json!({"identityScope":"scope","point":{"x":8,"y":9},"action":{"kind":"doubleTap"}})).await;
+            if cancelled {
+                assert!(result.is_err());
+                assert_eq!(ledger.snapshot().input_debt, 1);
+                f.page
+                    .client
+                    .send_command_no_params("Browser.getVersion", None)
+                    .await
+                    .unwrap();
+                assert_eq!(ledger.snapshot().input_debt, 0);
+            } else {
+                result.unwrap();
+            }
+            let log = f.log.lock().unwrap();
+            assert!(log.iter().all(|r| r["method"] == "Input.dispatchMouseEvent"
+                || r["method"] == "Browser.getVersion"));
+            let presses = log
+                .iter()
+                .filter(|r| r["params"]["type"] == "mousePressed")
+                .count();
+            assert_eq!(presses, if cancelled { 1 } else { 2 });
+            assert!(log
+                .iter()
+                .filter(|r| r["method"] == "Input.dispatchMouseEvent")
+                .all(|r| r["sessionId"] == "page"));
+            assert!(journal.snapshot().mutation_dispatched);
+        }
+    }
+
     fn live_query_frame(f: &Fixture) -> super::super::client_observation::ObservationFrame {
         super::super::client_observation::ObservationFrame {
             parent_frame_id: None,
@@ -5774,6 +6246,106 @@ mod tests {
         .unwrap();
     }
     #[tokio::test]
+    async fn ci18_recording_capture_pressure_after_real_finish_and_scope_rotation() {
+        use super::super::client_blobs::BlobError;
+
+        // Exercise both ordinary close and exact terminal settlement. These are
+        // synthetic bytes accepted by read_recording, not playable-video proof.
+        for terminal in [false, true] {
+            let mut f = fixture("normal").await;
+            let actions = ClientActions::default();
+            let bytes = [0x1a, 0x45, 0xdf, 0xa3];
+            assert_eq!(f.blobs.producer_limit(), 64 * 1024 * 1024);
+            if terminal {
+                seed_terminal_recording(&actions, &f).await;
+                disconnect_recording_fixture(&f).await;
+                actions
+                    .settle_terminal_recording(
+                        &f.page.client,
+                        &terminal_recording_proof(&f).unwrap().0,
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                seed_recording(&actions, &f, 1, Some(&bytes), false).await;
+            }
+            let old = f.context().blob_scope();
+            // Before rotation one recording and one capture fit exactly. No
+            // response blob or borrowed response is involved in this regression.
+            drop(f.blobs.reserve_producer(old.clone()).unwrap());
+            actions
+                .recording_page_closing(&old.identity_scope, &f.blobs)
+                .await
+                .unwrap();
+            {
+                let ledger = actions.recording.lock().await;
+                assert!(ledger.current.is_none());
+                assert!(ledger.lost.is_none());
+                assert!(!ledger.cleanup_failed);
+                assert_eq!(ledger.finished.len(), 1);
+                assert_eq!(ledger.finished[0].bytes.as_deref(), Some(bytes.as_slice()));
+                assert!(ledger.finished[0].reservation.is_some());
+                assert!(ledger.finished[0].directory.path.exists());
+            }
+            f.blobs.revoke_scope(&old).unwrap();
+            f.page.identity_scope = "replacement".into();
+            let next = f.context().blob_scope();
+            f.blobs.activate_scope(next.clone()).unwrap();
+            assert!(matches!(
+                f.blobs.reserve_producer(old),
+                Err(BlobError::StaleScope)
+            ));
+            // The existing fixture reserves through the same reserve_artifact
+            // path as begin_segment. It does not execute ffmpeg/page-open CDP.
+            // Admission proves finish_current shrank the old 64 MiB charge.
+            seed_recording(&actions, &f, 2, Some(&bytes), false).await;
+            assert!(matches!(
+                f.blobs.try_reserve_producer(next.clone()),
+                Err(BlobError::QuotaExceeded)
+            ));
+            // Protected capture owns its existing 32 MiB encoded-output ceiling,
+            // not the generic 64 MiB producer maximum. Neither video is lost.
+            let capture = f
+                .blobs
+                .reserve_bounded_producer(next.clone(), super::super::client_capture::MAX_PNG_BYTES)
+                .unwrap();
+            let image = f
+                .blobs
+                .finish_producer(capture, b"synthetic protected image".to_vec())
+                .unwrap();
+            f.blobs.release(&next, &image.handle).unwrap();
+            {
+                let ledger = actions.recording.lock().await;
+                assert!(ledger.current.as_ref().unwrap().reservation.is_some());
+                assert_eq!(ledger.finished[0].bytes.as_deref(), Some(bytes.as_slice()));
+                assert!(ledger.lost.is_none());
+            }
+            // Finishing the second segment, without deleting either segment,
+            // removes fixed pressure. Both retained byte charges still survive.
+            actions
+                .recording_page_closing(&next.identity_scope, &f.blobs)
+                .await
+                .unwrap();
+            drop(f.blobs.reserve_producer(next.clone()).unwrap());
+            {
+                let ledger = actions.recording.lock().await;
+                assert_eq!(ledger.finished.len(), 2);
+                for segment in &ledger.finished {
+                    assert_eq!(segment.bytes.as_deref(), Some(bytes.as_slice()));
+                    assert!(segment.reservation.is_some());
+                    assert!(segment.directory.path.exists());
+                }
+                assert!(ledger.lost.is_none());
+            }
+            actions.abandon_recording().await.unwrap();
+            // Exact teardown frees both artifact charges, not just handles.
+            let first = f.blobs.reserve_producer(next.clone()).unwrap();
+            let second = f.blobs.reserve_producer(next).unwrap();
+            drop((first, second));
+            f.blobs.check_budget_integrity().unwrap();
+        }
+    }
+    #[tokio::test]
     async fn terminal_recording_missing_file_retains_attempt_and_failed_start_ownership() {
         let f = fixture("normal").await;
         let actions = ClientActions::default();
@@ -6315,6 +6887,7 @@ mod tests {
             error: None,
             effects: Effects::Completed,
             scope_state: ScopeState::Usable,
+            retention: None,
         })
         .unwrap();
         let blobs = Arc::new(BlobStore::new(BlobLimits::default()).unwrap());
@@ -6364,6 +6937,92 @@ mod tests {
         assert!(targets[0].configured && targets[0].resumed);
         assert!(f.page.permit.check().is_ok());
         (owner, state, notices)
+    }
+
+    #[tokio::test]
+    async fn exact_release_timeout_retains_failure_but_not_a_reusable_debt_receipt() {
+        use super::super::client_session::ClientSession;
+        let f = fixture_scoped("preparation-release-debt", "release-debt").await;
+        let broker = Arc::new(ClientSession::new());
+        let (owner, state, _notices) = preparation_settlement_owner(&f, broker).await;
+        let ctx = ActionContext {
+            realm_authority: ActionRealmAuthority::Enrolled(&owner),
+            page_state: &state,
+            ..f.context()
+        };
+        let d = Dispatch::default();
+        // Uses the real enrolled resolution and perform cleanup, not a synthetic
+        // cleanup flag. Resolved owns the exact realm ticket until perform exits.
+        let result = ClientActions::default()
+            .execute_inner(
+                &ctx,
+                &d,
+                "browser.perform",
+                &json!({
+                    "identityScope":"release-debt", "ref":{"id":"@e1","revision":"1"},
+                    "action":{"kind":"tap"}
+                }),
+            )
+            .await;
+        assert_eq!(result, Err(ProtocolError::CleanupFailed));
+        assert!(d.cleanup.load(Ordering::SeqCst));
+        assert!(d.failure(ProtocolError::CleanupFailed).cleanup_failed);
+        let releases: Vec<Value> = f
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "Runtime.releaseObject")
+            .cloned()
+            .collect();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0]["params"]["objectId"], "exact-node");
+        assert_eq!(releases[0]["sessionId"], "page");
+        assert!(!f
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["request"] == releases[0]));
+        assert!(f
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["method"] == "DOM.resolveNode" && r["params"]["executionContextId"] == 1));
+        assert_eq!(state.mouse_state().unwrap().buttons, 0);
+        assert_eq!(f.inputs().len(), 3);
+        assert!(f.inputs().iter().all(|input| f
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|reply| reply["request"] == *input && reply["reply"].get("error").is_none())));
+        // No source-mask holder was ever installed. This is exact object-release
+        // debt, not evidence of an unrestored DOM mutation.
+        assert!(!f
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["params"]["functionDeclaration"] == "function(){return this.remove()}"));
+        let input_count = f.inputs().len();
+        f.page
+            .client
+            .send_command("Browser.getVersion", None, None)
+            .await
+            .unwrap();
+        assert!(f
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["request"] == releases[0]));
+        assert_eq!(f.inputs().len(), input_count);
+        // A late transport ACK cannot clear this already-returned failure, and
+        // this test deliberately does not implement a new settlement policy.
+        assert!(d.failure(ProtocolError::CleanupFailed).cleanup_failed);
+        owner.close().await.unwrap();
     }
 
     async fn assert_preparation_effect_settlement(mode: &'static str) {
@@ -6452,6 +7111,7 @@ mod tests {
                 let outcome = NativeOutcome {
                     result: Err(error),
                     effects: failure.effects,
+                    retention: None,
                 };
                 let cleanup_failed = failure.cleanup_failed;
                 *action_evidence.lock().unwrap() = Some(PreparationSettlementEvidence {
@@ -6733,6 +7393,7 @@ mod tests {
                 let outcome = NativeOutcome {
                     result: Err(error),
                     effects: failure.effects,
+                    retention: None,
                 };
                 let cleanup_failed = failure.cleanup_failed;
                 *action_evidence.lock().unwrap() = Some(PreparationSettlementEvidence {
@@ -7126,6 +7787,49 @@ mod tests {
         );
         assert_eq!(closed, Ok(()));
         assert!(joined.is_err_and(|error| error.is_cancelled()));
+    }
+
+    #[test]
+    fn preparation_low_slack_retires_without_extending_the_classification_window() {
+        let ms = Duration::from_millis;
+        for (remaining, longest_attempt, has_slack, classify) in [
+            (0, 0, false, false),
+            (239, 0, false, false),
+            (265, 0, false, false),
+            (266, 0, true, true),
+            (272, 0, true, true),
+            (282, 0, true, true),
+            (283, 0, true, false),
+            (302, 20, true, true),
+            (303, 20, true, false),
+            (265, 900, false, false),
+        ] {
+            assert_eq!(
+                preparation_has_classification_slack(ms(remaining)),
+                has_slack,
+                "remaining={remaining}, longest_attempt={longest_attempt}"
+            );
+            assert_eq!(
+                preparation_classification_window(ms(remaining), ms(longest_attempt)),
+                classify,
+                "remaining={remaining}, longest_attempt={longest_attempt}"
+            );
+        }
+    }
+
+    #[test]
+    fn preparation_low_slack_retirement_preserves_cancellation_and_stale_permit_priority() {
+        for (check, expected) in [
+            (Ok(()), ProtocolError::NotActionable),
+            (
+                Err(ProtocolError::DeadlineExceeded),
+                ProtocolError::NotActionable,
+            ),
+            (Err(ProtocolError::Cancelled), ProtocolError::Cancelled),
+            (Err(ProtocolError::StaleScope), ProtocolError::StaleScope),
+        ] {
+            assert_eq!(preparation_retirement_error(check), expected);
+        }
     }
 
     #[test]

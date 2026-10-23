@@ -426,6 +426,28 @@ impl BlobStore {
         &self,
         scope: BlobScope,
     ) -> Result<Option<BlobProducer>, BlobError> {
+        self.try_reserve_bounded_producer(scope, self.limits.max_blob_bytes)
+    }
+
+    /// Reserve a producer's known encoded-output ceiling, never available headroom.
+    /// The final payload must still fit this exact owned charge at publication.
+    pub fn reserve_bounded_producer(
+        &self,
+        scope: BlobScope,
+        size: usize,
+    ) -> Result<BlobProducer, BlobError> {
+        self.try_reserve_bounded_producer(scope, size)?
+            .ok_or(BlobError::QuotaExceeded)
+    }
+
+    fn try_reserve_bounded_producer(
+        &self,
+        scope: BlobScope,
+        size: usize,
+    ) -> Result<Option<BlobProducer>, BlobError> {
+        if size == 0 || size > self.limits.max_blob_bytes {
+            return Err(BlobError::InvalidInput);
+        }
         let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
         if inner.closed {
             return Err(BlobError::Closed);
@@ -437,7 +459,6 @@ impl BlobStore {
         if budget.corrupt {
             return Err(BlobError::Closed);
         }
-        let size = self.limits.max_blob_bytes;
         if budget.handles >= self.limits.max_handles {
             return Err(BlobError::QuotaExceeded);
         }
@@ -860,6 +881,93 @@ impl BlobStore {
 mod tests {
     use super::*;
     #[test]
+    fn bounded_producer_owns_exact_ceiling_and_oversize_releases_charge() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 8,
+        })
+        .unwrap();
+        let scope = scope();
+        store.activate_scope(scope.clone()).unwrap();
+        for size in [0, 9] {
+            assert!(matches!(
+                store.reserve_bounded_producer(scope.clone(), size),
+                Err(BlobError::InvalidInput)
+            ));
+        }
+        let retained = store.insert_sealed(scope.clone(), b"12345").unwrap();
+        let full = store.reserve_producer(scope.clone()).unwrap();
+        let exact = store.reserve_bounded_producer(scope.clone(), 3).unwrap();
+        assert!(matches!(
+            store.reserve_bounded_producer(scope.clone(), 1),
+            Err(BlobError::QuotaExceeded)
+        ));
+        assert!(matches!(
+            store.finish_producer(exact, vec![0; 4]),
+            Err(BlobError::QuotaExceeded)
+        ));
+        let exact = store.reserve_bounded_producer(scope.clone(), 3).unwrap();
+        let info = store.finish_producer(exact, vec![0; 3]).unwrap();
+        assert_eq!(info.size, 3);
+        store.release(&scope, &info.handle).unwrap();
+        drop(full);
+        store.release(&scope, &retained.handle).unwrap();
+        let budget = store.budget.lock().unwrap();
+        assert_eq!(
+            (
+                budget.bytes,
+                budget.handles,
+                budget.producers.len(),
+                budget.corrupt
+            ),
+            (0, 0, 0, false)
+        );
+    }
+
+    #[test]
+    fn bounded_producer_keeps_scope_and_handle_limits() {
+        let store = BlobStore::new(BlobLimits {
+            max_blob_bytes: 8,
+            max_total_bytes: 16,
+            max_handles: 1,
+        })
+        .unwrap();
+        let old = scope();
+        store.activate_scope(old.clone()).unwrap();
+        let producer = store.reserve_bounded_producer(old.clone(), 4).unwrap();
+        assert!(matches!(
+            store.reserve_bounded_producer(old.clone(), 1),
+            Err(BlobError::QuotaExceeded)
+        ));
+        store.revoke_scope(&old).unwrap();
+        let next = BlobScope {
+            generation: old.generation,
+            identity_scope: "new".into(),
+        };
+        store.activate_scope(next.clone()).unwrap();
+        assert!(matches!(
+            store.finish_producer(producer, vec![0; 4]),
+            Err(BlobError::StaleScope)
+        ));
+        assert!(matches!(
+            store.reserve_bounded_producer(old, 4),
+            Err(BlobError::StaleScope)
+        ));
+        drop(store.reserve_bounded_producer(next, 4).unwrap());
+        let budget = store.budget.lock().unwrap();
+        assert_eq!(
+            (
+                budget.bytes,
+                budget.handles,
+                budget.producers.len(),
+                budget.corrupt
+            ),
+            (0, 0, 0, false)
+        );
+    }
+
+    #[test]
     fn budget_integrity_is_not_ordinary_scope_closure() {
         let store = store();
         store.close().unwrap();
@@ -1007,6 +1115,235 @@ mod tests {
             store.try_reserve_producer(scope),
             Err(BlobError::Closed)
         ));
+    }
+
+    // These are deterministic accounting witnesses, not a reconstruction of the
+    // CI18 after-reconnect refusal: that run did not retain its quota ledger.
+    // Use the production defaults without allocating maximum-size byte buffers.
+    fn recording_pressure_store() -> BlobStore {
+        let limits = BlobLimits::default();
+        assert_eq!(limits.max_blob_bytes, 64 * 1024 * 1024);
+        assert_eq!(limits.max_total_bytes, 128 * 1024 * 1024);
+        assert_eq!(limits.max_handles, 128);
+        let store = BlobStore::new(limits).unwrap();
+        store.activate_scope(scope()).unwrap();
+        store
+    }
+
+    fn assert_recording_pressure_ledger(
+        store: &BlobStore,
+        bytes: usize,
+        handles: usize,
+        producers: &[(&BlobScope, usize)],
+    ) {
+        let budget = store.budget.lock().unwrap();
+        assert_eq!(budget.bytes, bytes);
+        assert_eq!(budget.handles, handles);
+        assert_eq!(
+            budget.producers,
+            producers
+                .iter()
+                .map(|(scope, size)| ((**scope).clone(), *size))
+                .collect::<HashMap<_, _>>()
+        );
+        assert!(!budget.corrupt);
+    }
+
+    #[test]
+    fn recording_and_retained_response_refuse_capture_until_last_borrow_drops() {
+        let store = recording_pressure_store();
+        let scope = scope();
+        let maximum = store.producer_limit();
+        let authority = store.begin_artifact_attempt(&scope).unwrap();
+        let recording = store.reserve_artifact(&authority, &scope).unwrap();
+        assert_recording_pressure_ledger(&store, maximum, 1, &[]);
+
+        let response = store.reserve_producer(scope.clone()).unwrap();
+        assert_recording_pressure_ledger(&store, 2 * maximum, 2, &[(&scope, maximum)]);
+        let response = store.finish_producer(response, b"x".to_vec()).unwrap();
+        assert_recording_pressure_ledger(&store, maximum + 1, 2, &[]);
+        let mut changes = store.budget_changes().unwrap();
+        changes.borrow_and_update();
+
+        // The recorder owns fixed capacity, not a response producer that can
+        // finish and shrink. A capture must refuse instead of waiting on it.
+        assert!(matches!(
+            store.try_reserve_producer(scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        assert_recording_pressure_ledger(&store, maximum + 1, 2, &[]);
+        assert!(!changes.has_changed().unwrap());
+
+        let first = store.borrow_sealed(&scope, &response.handle).unwrap();
+        let last = store.borrow_sealed(&scope, &response.handle).unwrap();
+        store.release(&scope, &response.handle).unwrap();
+        assert_eq!(
+            store.read(&scope, &response.handle, 0, 1),
+            Err(BlobError::Missing)
+        );
+        assert_eq!(last.bytes(), b"x");
+        drop(first);
+        assert_recording_pressure_ledger(&store, maximum + 1, 2, &[]);
+        assert!(!changes.has_changed().unwrap());
+        assert!(matches!(
+            store.try_reserve_producer(scope.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+
+        drop(last);
+        assert!(changes.has_changed().unwrap());
+        assert_recording_pressure_ledger(&store, maximum, 1, &[]);
+        let capture = store.try_reserve_producer(scope.clone()).unwrap().unwrap();
+        assert_recording_pressure_ledger(&store, 2 * maximum, 2, &[(&scope, maximum)]);
+        drop(capture); // Cancellation before publication returns exactly its charge.
+        assert_recording_pressure_ledger(&store, maximum, 1, &[]);
+        drop(recording);
+        assert_recording_pressure_ledger(&store, 0, 0, &[]);
+    }
+
+    #[test]
+    fn response_producer_pressure_can_shrink_at_the_same_accounted_byte_count() {
+        let store = recording_pressure_store();
+        let scope = scope();
+        let maximum = store.producer_limit();
+        let retained = store.reserve_producer(scope.clone()).unwrap();
+        let retained = store.finish_producer(retained, b"x".to_vec()).unwrap();
+        let response = store.reserve_producer(scope.clone()).unwrap();
+        assert_recording_pressure_ledger(&store, maximum + 1, 2, &[(&scope, maximum)]);
+        let mut changes = store.budget_changes().unwrap();
+        changes.borrow_and_update();
+
+        // Same bytes and handles as the recording case, but this live response
+        // producer is genuine same-scope progress authority.
+        assert!(store.try_reserve_producer(scope.clone()).unwrap().is_none());
+        assert!(!changes.has_changed().unwrap());
+        assert_recording_pressure_ledger(&store, maximum + 1, 2, &[(&scope, maximum)]);
+        let response = store.finish_producer(response, b"y".to_vec()).unwrap();
+        assert!(changes.has_changed().unwrap());
+        assert_recording_pressure_ledger(&store, 2, 2, &[]);
+
+        let capture = store.try_reserve_producer(scope.clone()).unwrap().unwrap();
+        assert_recording_pressure_ledger(&store, maximum + 2, 3, &[(&scope, maximum)]);
+        drop(capture);
+        store.release(&scope, &retained.handle).unwrap();
+        store.release(&scope, &response.handle).unwrap();
+        assert_recording_pressure_ledger(&store, 0, 0, &[]);
+    }
+
+    #[test]
+    fn fixed_recording_pressure_survives_rotation_without_old_publication_authority() {
+        let store = recording_pressure_store();
+        let old = scope();
+        let maximum = store.producer_limit();
+        let authority = store.begin_artifact_attempt(&old).unwrap();
+        let recording = store.reserve_artifact(&authority, &old).unwrap();
+        let response = store.reserve_producer(old.clone()).unwrap();
+        let response = store.finish_producer(response, b"x".to_vec()).unwrap();
+        let lease = store.borrow_sealed(&old, &response.handle).unwrap();
+        store.revoke_scope(&old).unwrap();
+        let next = BlobScope {
+            identity_scope: "recording-next".into(),
+            ..old.clone()
+        };
+        store.activate_scope(next.clone()).unwrap();
+        assert_recording_pressure_ledger(&store, maximum + 1, 2, &[]);
+        assert_eq!(
+            store.read(&next, &response.handle, 0, 1),
+            Err(BlobError::Missing)
+        );
+        assert!(matches!(
+            store.try_reserve_producer(old.clone()),
+            Err(BlobError::StaleScope)
+        ));
+        assert!(matches!(
+            store.try_reserve_producer(next.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+
+        drop(lease);
+        assert_recording_pressure_ledger(&store, maximum, 1, &[]);
+        let capture = store.reserve_producer(next.clone()).unwrap();
+        store.revoke_scope(&next).unwrap();
+        let current = BlobScope {
+            identity_scope: "recording-current".into(),
+            ..old.clone()
+        };
+        store.activate_scope(current.clone()).unwrap();
+        assert_recording_pressure_ledger(&store, 2 * maximum, 2, &[(&next, maximum)]);
+        // A producer from the retired scope is not progress authority either.
+        assert!(matches!(
+            store.try_reserve_producer(current.clone()),
+            Err(BlobError::QuotaExceeded)
+        ));
+        assert_eq!(
+            store.finish_producer(capture, b"late".to_vec()),
+            Err(BlobError::StaleScope)
+        );
+        assert_recording_pressure_ledger(&store, maximum, 1, &[]);
+
+        // Failure returns private artifact ownership intact, without rebinding
+        // an old handle or granting its scope publication authority.
+        let (error, returned) = store
+            .finish_artifact_batch(vec![(recording, b"v".to_vec())], old.clone())
+            .unwrap_err();
+        assert_eq!(error, BlobError::StaleScope);
+        assert_eq!(returned.len(), 1);
+        assert!(store.inner.lock().unwrap().entries.is_empty());
+        assert_recording_pressure_ledger(&store, maximum, 1, &[]);
+        let published = store
+            .finish_artifact_batch(returned, current.clone())
+            .unwrap_or_else(|(error, _)| panic!("current artifact publication failed: {error:?}"));
+        assert_eq!(published.len(), 1);
+        assert_recording_pressure_ledger(&store, 1, 1, &[]);
+        assert_eq!(
+            store.read(&old, &published[0].handle, 0, 1),
+            Err(BlobError::StaleScope)
+        );
+        assert_eq!(
+            store.read(&current, &published[0].handle, 0, 1).unwrap(),
+            b"v"
+        );
+        store.release(&current, &published[0].handle).unwrap();
+        assert_recording_pressure_ledger(&store, 0, 0, &[]);
+    }
+
+    #[test]
+    fn retired_recording_authority_keeps_ownership_but_cannot_publish_or_shrink() {
+        for explicit_retirement in [false, true] {
+            let store = recording_pressure_store();
+            let scope = scope();
+            let maximum = store.producer_limit();
+            let mut authority = Some(store.begin_artifact_attempt(&scope).unwrap());
+            let mut recording = store
+                .reserve_artifact(authority.as_ref().unwrap(), &scope)
+                .unwrap();
+            if explicit_retirement {
+                authority.as_ref().unwrap().retire().unwrap();
+            } else {
+                drop(authority.take());
+            }
+            assert_recording_pressure_ledger(&store, maximum, 1, &[]);
+            assert_eq!(
+                store.shrink_artifact(&mut recording, 1),
+                Err(BlobError::StaleScope)
+            );
+            assert_recording_pressure_ledger(&store, maximum, 1, &[]);
+            assert_eq!(
+                store.finish_artifact(recording, scope.clone(), b"late".to_vec()),
+                Err(BlobError::StaleScope)
+            );
+            assert_recording_pressure_ledger(&store, 0, 0, &[]);
+            assert!(store.inner.lock().unwrap().entries.is_empty());
+            if let Some(authority) = authority {
+                assert!(matches!(
+                    store.reserve_artifact(&authority, &scope),
+                    Err(BlobError::StaleScope)
+                ));
+            }
+            let capture = store.reserve_producer(scope).unwrap();
+            drop(capture);
+            assert_recording_pressure_ledger(&store, 0, 0, &[]);
+        }
     }
 
     fn scope() -> BlobScope {

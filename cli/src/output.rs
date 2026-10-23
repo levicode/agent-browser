@@ -3982,6 +3982,8 @@ Sessions:
   session                    Show current session name
   session list               List active sessions
   session connect --json     Persistent protocol; explicit one-use --session required
+                             Negotiated trace captures do not publish semantic observations
+                             terminal.close/1: cleanup-only close after quarantine
 
 MCP:
   mcp                        Start an MCP stdio server exposing agent-browser tools

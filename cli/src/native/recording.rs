@@ -1788,9 +1788,9 @@ pub(crate) fn spawn_recording_task_with_session_proof(
         };
         let streamed = streamed?;
         let contact_sheet_count = contact_sheet_count?;
-        captured?;
         shared_count.store(streamed, Ordering::Relaxed);
         shared_contact_sheet_count.store(contact_sheet_count, Ordering::Relaxed);
+        captured?;
 
         Ok(())
     })
@@ -1814,17 +1814,31 @@ pub async fn capture_initial_image_with_options(
     options: CaptureOptions,
 ) -> Result<InitialRecordingFrame, String> {
     let options = options.validate()?;
-    let viewport = client
-        .send_command(
+    let viewport = super::client_debt::command_scope(
+        super::client_debt::CommandCategory::ApplicationRead,
+        false,
+        client.send_command(
             "Runtime.evaluate",
             Some(json!({
                 "expression": "[window.innerWidth, window.innerHeight]",
                 "returnByValue": true,
             })),
             Some(session_id),
-        )
-        .await
-        .map_err(|error| format!("Failed to read initial recording viewport: {error}"))?;
+        ),
+    )
+    .await
+    .map_err(|error| format!("Failed to read initial recording viewport: {error}"))?;
+    for handle in [
+        viewport["result"]["objectId"].as_str(),
+        viewport["exceptionDetails"]["exception"]["objectId"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !super::client_actions::release_object_accounted(client, session_id, handle).await {
+            return Err("Initial recording viewport handle cleanup unavailable".into());
+        }
+    }
     let dimensions = viewport
         .pointer("/result/value")
         .and_then(Value::as_array)
@@ -1834,8 +1848,10 @@ pub async fn capture_initial_image_with_options(
             width.is_finite() && *width > 0.0 && height.is_finite() && *height > 0.0
         })
         .ok_or_else(|| "Initial recording viewport returned invalid dimensions".to_string())?;
-    let result = client
-        .send_command(
+    let result = super::client_debt::command_scope(
+        super::client_debt::CommandCategory::ApplicationRead,
+        false,
+        client.send_command(
             "Page.captureScreenshot",
             Some({
                 let mut params =
@@ -1846,9 +1862,10 @@ pub async fn capture_initial_image_with_options(
                 params
             }),
             Some(session_id),
-        )
-        .await
-        .map_err(|error| format!("Failed to capture initial recording frame: {error}"))?;
+        ),
+    )
+    .await
+    .map_err(|error| format!("Failed to capture initial recording frame: {error}"))?;
     let image_data = decode_frame_data(&result)
         .ok_or_else(|| "Initial recording screenshot returned no image data".to_string())?;
     Ok(InitialRecordingFrame {
@@ -1878,13 +1895,14 @@ async fn collect_frames(
                 let Some(event) = event else { break };
                 if event.method == "Page.screencastFrame" {
                     if let Some(sid) = event.params.get("sessionId").and_then(Value::as_i64) {
-                        let _ = client
+                        client
                             .send_command_no_wait(
                                 "Page.screencastFrameAck",
                                 Some(json!({ "sessionId": sid })),
                                 Some(capture_session),
                             )
-                            .await;
+                            .await
+                            .map_err(|_| FRAME_ACK_UNAVAILABLE.to_string())?;
                     }
                     let decoded = decode_frame_data(&event.params);
                     if let Some(bytes) = decoded {
@@ -2218,6 +2236,8 @@ fn cursor_for_video_frame(
         animated
     }
 }
+
+pub(crate) const FRAME_ACK_UNAVAILABLE: &str = "Recording frame acknowledgement unavailable";
 
 pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), String> {
     if let Some(tx) = state.cancel_tx.take() {

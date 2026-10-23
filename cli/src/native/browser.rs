@@ -505,17 +505,74 @@ pub async fn evaluate_on(
     session_id: &str,
     script: &str,
 ) -> Result<Value, String> {
-    let result: EvaluateResult = client
-        .send_command_typed(
-            "Runtime.evaluate",
-            &EvaluateParams {
-                expression: script.to_string(),
-                return_by_value: Some(true),
-                await_promise: Some(true),
-            },
-            Some(session_id),
-        )
+    evaluate_with_gesture(client, session_id, script, None).await
+}
+
+/// Explicit trusted page.evaluate follows Chromium's public evaluation contract.
+/// This is per-request authority, never sticky activation for internal probes.
+pub(super) async fn evaluate_public_on(
+    client: &CdpClient,
+    session_id: &str,
+    script: &str,
+) -> Result<Value, String> {
+    evaluate_with_gesture(client, session_id, script, Some(true)).await
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EvaluationRequest {
+    #[serde(flatten)]
+    params: EvaluateParams,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_gesture: Option<bool>,
+}
+
+async fn evaluate_with_gesture(
+    client: &CdpClient,
+    session_id: &str,
+    script: &str,
+    user_gesture: Option<bool>,
+) -> Result<Value, String> {
+    let params = serde_json::to_value(&EvaluationRequest {
+        params: EvaluateParams {
+            expression: script.to_string(),
+            return_by_value: Some(true),
+            await_promise: Some(true),
+        },
+        user_gesture,
+    })
+    .map_err(|e| format!("Failed to serialize params: {}", e))?;
+    let raw = client
+        .send_command("Runtime.evaluate", Some(params), Some(session_id))
         .await?;
+    // The public contract returns by value. Renderer handles in exceptional or
+    // malformed envelopes are never caller authority and still require release.
+    let mut released = true;
+    let mut seen = std::collections::HashSet::new();
+    for handle in [
+        raw["result"]["objectId"].as_str(),
+        raw["exceptionDetails"]["exception"]["objectId"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if seen.insert(handle) {
+            released &=
+                super::client_actions::release_object_accounted(client, session_id, handle).await;
+        }
+    }
+    if !released {
+        if let Some(journal) = super::client_debt::OperationJournalHandle::current() {
+            journal
+                .record_cleanup_disposition(super::client_debt::CleanupDisposition::IntegrityLost);
+        }
+    }
+    let result: EvaluateResult = serde_json::from_value(raw).map_err(|e| {
+        format!(
+            "Failed to deserialize CDP response for Runtime.evaluate: {}",
+            e
+        )
+    })?;
 
     if let Some(ref details) = result.exception_details {
         let msg = details
@@ -526,6 +583,9 @@ pub async fn evaluate_on(
         return Err(format!("Evaluation error: {}", msg));
     }
 
+    if !released {
+        return Err("Evaluation handle cleanup unavailable".into());
+    }
     Ok(result.result.value.unwrap_or(Value::Null))
 }
 

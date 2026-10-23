@@ -758,6 +758,8 @@ fn tool_profile_summaries() -> Vec<Value> {
     .collect()
 }
 
+// Protected session trace captures are integration-only: the MCP screenshot
+// keeps pixels-only behavior, with no trace-purpose flag or separate tool.
 // Intentionally no session-connect MCP tool: a one-shot tool result cannot
 // proxy a persistent bidirectional JSON-line connection. Existing MCP tools
 // retain canonical one-shot command behavior; session clients use the CLI.
@@ -4224,6 +4226,8 @@ fn write_json_line(stdout: &mut io::Stdout, value: &Value) -> io::Result<()> {
 mod tests {
     #[test]
     fn persistent_session_transport_is_not_a_one_shot_mcp_tool() {
+        // terminal.close/1 is a correlated control on the persistent session,
+        // not a new one-shot cleanup command or a public recovery operation.
         assert!(tools().iter().all(|tool| !matches!(
             tool["name"].as_str(),
             Some("session_connect" | "browser_session_connect")

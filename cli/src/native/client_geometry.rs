@@ -678,9 +678,15 @@ async fn command(
     operation: &OperationLease,
 ) -> Result<Value, GeometryError> {
     check(operation)?;
-    super::client_observation::retained_read_command(client, session, method, params, operation)
-        .await
-        .map_err(hidden_proof_error)
+    super::client_debt::command_scope(
+        super::client_debt::CommandCategory::ApplicationObject,
+        false,
+        super::client_observation::retained_read_command(
+            client, session, method, params, operation,
+        ),
+    )
+    .await
+    .map_err(hidden_proof_error)
 }
 fn quad_points(value: &Value) -> Result<[Point; 4], GeometryError> {
     let values = value
@@ -982,7 +988,9 @@ fn session_transform(
 }
 fn hidden_proof_error(error: ObservationError) -> GeometryError {
     match error {
-        ObservationError::StaleReference => GeometryError::StaleIdentity,
+        ObservationError::StaleReference
+        | ObservationError::FrameNotFound(_)
+        | ObservationError::FrameAmbiguous(_) => GeometryError::StaleIdentity,
         ObservationError::Cancelled => GeometryError::Cancelled,
         ObservationError::Superseded => GeometryError::Superseded,
         ObservationError::DeadlineExceeded => GeometryError::DeadlineExceeded,
@@ -1511,9 +1519,14 @@ async fn read_exact_box_impl(
         None => match tokio::time::timeout(Duration::from_millis(250), &mut resolution).await {
             Ok(result) => result,
             Err(_) => {
+                if super::client_debt::OperationJournalHandle::current()
+                    .is_some_and(|journal| journal.has_accounted_object_creation(&binding.session))
+                {
+                    return Err(interrupted.unwrap_or(GeometryError::Cancelled));
+                }
                 return Err(GeometryError::CleanupFailed {
                     primary: interrupted.map(Box::new),
-                })
+                });
             }
         },
     };
@@ -1530,16 +1543,9 @@ async fn read_exact_box_impl(
         },
     })?;
     if let Some(primary) = interrupted {
-        let released = tokio::time::timeout(
-            Duration::from_millis(250),
-            client.send_command(
-                "Runtime.releaseObject",
-                Some(json!({"objectId":object})),
-                Some(&binding.session),
-            ),
-        )
-        .await;
-        return if matches!(released, Ok(Ok(_))) {
+        return if super::client_actions::release_object_accounted(client, &binding.session, &object)
+            .await
+        {
             Err(primary)
         } else {
             Err(GeometryError::CleanupFailed {
@@ -1598,14 +1604,8 @@ async fn read_exact_box_impl(
     let released = tokio::time::timeout(Duration::from_millis(250), async {
         let mut complete = true;
         for object in owned_objects {
-            if client
-                .send_command(
-                    "Runtime.releaseObject",
-                    Some(json!({"objectId":object})),
-                    Some(&binding.session),
-                )
+            if !super::client_actions::release_object_accounted(client, &binding.session, &object)
                 .await
-                .is_err()
             {
                 complete = false;
             }

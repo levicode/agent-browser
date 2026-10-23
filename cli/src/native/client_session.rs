@@ -1,7 +1,7 @@
 //! Browser-independent control broker. No method acquires DaemonState or
 //! BrowserManager locks. Browser integration must report real settlement before
 //! reuse; accepting cancellation never asserts that browser effects stopped.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -193,6 +193,8 @@ struct Inner {
     registries: HashMap<u64, Registry>,
     registry_high_water: u64,
     released_registries: Vec<u64>,
+    publication_retiring: HashSet<u64>,
+    publication_retired: HashSet<u64>,
     registry_scopes: HashMap<u64, String>,
 }
 
@@ -201,6 +203,7 @@ struct Inner {
 pub struct ClientSession {
     pub id: String,
     inner: Mutex<Inner>,
+    publication_changed: tokio::sync::Notify,
 }
 
 impl Default for ClientSession {
@@ -213,6 +216,7 @@ impl ClientSession {
     pub fn new() -> Self {
         Self {
             id: Uuid::new_v4().to_string(),
+            publication_changed: tokio::sync::Notify::new(),
             inner: Mutex::new(Inner {
                 generation: 1,
                 health: ScopeState::Usable,
@@ -222,6 +226,8 @@ impl ClientSession {
                 registries: HashMap::new(),
                 registry_high_water: 0,
                 released_registries: Vec::new(),
+                publication_retiring: HashSet::new(),
+                publication_retired: HashSet::new(),
                 registry_scopes: HashMap::new(),
             }),
         }
@@ -372,6 +378,97 @@ impl ClientSession {
         sequence: u64,
         effects: Effects,
     ) -> Result<ScopeState, ProtocolError> {
+        self.settle_with_retention(generation, sequence, effects, None)
+    }
+
+    /// Block new application dispatch, then revoke the exact operation tree and
+    /// its source callback token under the broker lock. No browser lock/await.
+    pub(crate) fn begin_operation_retirement(
+        &self,
+        key: super::client_debt::OperationKey,
+        proof: &super::client_operation_state::OperationRetentionProof,
+    ) -> Result<(), ProtocolError> {
+        if !proof.matches(key) {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        let mut inner = self.lock()?;
+        Self::check(&inner, key.generation)?;
+        if !inner.operations.contains_key(&key.operation_seq) {
+            return Err(ProtocolError::OperationMissing);
+        }
+        inner.publication_retiring.insert(key.operation_seq);
+        Self::revoke_uncertain_operation(&mut inner, key.operation_seq);
+        Ok(())
+    }
+    pub(crate) fn finish_operation_publication(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Result<(), ProtocolError> {
+        let mut inner = self.lock()?;
+        Self::check(&inner, key.generation)?;
+        if !inner.publication_retiring.remove(&key.operation_seq) {
+            return Err(ProtocolError::OperationMissing);
+        }
+        inner.publication_retired.insert(key.operation_seq);
+        self.publication_changed.notify_waiters();
+        Ok(())
+    }
+    pub(crate) fn check_application_publication(
+        &self,
+        generation: u64,
+    ) -> Result<bool, ProtocolError> {
+        let inner = self.lock()?;
+        Self::check(&inner, generation)?;
+        Ok(inner.publication_retiring.is_empty())
+    }
+    pub(crate) async fn wait_application_publication(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let mut cancellation = operation.cancellation.clone();
+        loop {
+            let changed = self.publication_changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if *cancellation.borrow() != CancelSignal::None {
+                return Err(ProtocolError::Cancelled);
+            }
+            if Instant::now() >= operation.deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if self.check_application_publication(operation.generation)? {
+                return Ok(());
+            }
+            tokio::select! { biased;
+                _=cancellation.changed()=>return Err(ProtocolError::Cancelled),
+                _=tokio::time::sleep_until(operation.deadline.into())=>return Err(ProtocolError::DeadlineExceeded),
+                _=&mut changed=>{},
+            }
+        }
+    }
+    fn revoke_uncertain_operation(inner: &mut Inner, sequence: u64) {
+        let source = inner
+            .operations
+            .get(&sequence)
+            .and_then(|operation| operation.callback_token.clone());
+        Self::cancel_tree(inner, sequence);
+        if let Some(token) = source {
+            // Scope-owned tokens are not descendants of the child operation.
+            // Discard any selected decision and cancel sibling child authority.
+            Self::cancel_token_children(inner, &token);
+            if let Some(pending) = inner.decisions.remove(&token) {
+                Self::release_registry(inner, pending.registry);
+                let _ = pending.sender.send(DecisionOutcome::Cancelled);
+            }
+        }
+    }
+    pub(crate) fn settle_with_retention(
+        &self,
+        generation: u64,
+        sequence: u64,
+        effects: Effects,
+        proof: Option<&super::client_operation_state::OperationRetentionProof>,
+    ) -> Result<ScopeState, ProtocolError> {
         let mut inner = self.lock()?;
         if inner.generation != generation {
             return Err(ProtocolError::StaleGeneration);
@@ -379,14 +476,31 @@ impl ClientSession {
         if !inner.operations.contains_key(&sequence) {
             return Err(ProtocolError::OperationMissing);
         }
-        Self::cancel_tree(&mut inner, sequence);
+        let retained = effects == Effects::Unknown
+            && proof.is_some_and(|proof| {
+                proof.matches(super::client_debt::OperationKey {
+                    generation,
+                    operation_seq: sequence,
+                })
+            })
+            && inner.publication_retired.remove(&sequence);
+        inner.publication_retiring.remove(&sequence);
+        self.publication_changed.notify_waiters();
+        if effects == Effects::Unknown {
+            Self::revoke_uncertain_operation(&mut inner, sequence);
+        } else {
+            Self::cancel_tree(&mut inner, sequence);
+        }
         let operation = inner
             .operations
             .remove(&sequence)
             .ok_or(ProtocolError::OperationMissing)?;
         Self::cancel_decisions(&mut inner, sequence);
-        if effects == Effects::Unknown && inner.health != ScopeState::Closed {
-            Self::seal(&mut inner, ScopeState::Quarantined);
+        if effects == Effects::Unknown {
+            if !retained && inner.health != ScopeState::Closed {
+                Self::seal(&mut inner, ScopeState::Quarantined);
+            }
+            // Never apply the old selected decision after an uncertain child.
         } else if let Some(token) = operation.callback_token {
             let has_children = inner
                 .operations
@@ -396,7 +510,7 @@ impl ClientSession {
                 if let Some(decision) = inner
                     .decisions
                     .get_mut(&token)
-                    .and_then(|p| p.selected.take())
+                    .and_then(|pending| pending.selected.take())
                 {
                     let _ = Self::apply_selected(&mut inner, generation, &token, decision);
                 }
@@ -2030,5 +2144,124 @@ mod tests {
             background.outcome.await.unwrap(),
             DecisionOutcome::Selected(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod exact_retention_tests {
+    use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+    use super::super::client_operation_state::OperationRegistry;
+    use super::*;
+    fn retired_proof(
+        sequence: u64,
+    ) -> super::super::client_operation_state::OperationRetentionProof {
+        let key = OperationKey {
+            generation: 1,
+            operation_seq: sequence,
+        };
+        let journal = OwnerDebtLedger::new(1, "scope".into())
+            .operation(key, "target".into(), "session".into())
+            .unwrap();
+        let registry = OperationRegistry::default();
+        registry.register(journal).unwrap();
+        registry.retire(key);
+        registry.finish(key, false);
+        registry.status(key).proof().unwrap()
+    }
+    #[tokio::test]
+    async fn uncertain_scope_callback_child_revokes_only_its_exact_token_and_siblings() {
+        let broker = ClientSession::new();
+        broker
+            .register_routes(1, 1, vec!["configured-route".into()])
+            .unwrap();
+        let mut old = broker
+            .decision(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                5000,
+                Some(1),
+            )
+            .unwrap();
+        let unrelated = broker
+            .decision(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Authentication,
+                5000,
+                None,
+            )
+            .unwrap();
+        let first = broker.admit_callback(1, 1, 5000, Some(&old.token)).unwrap();
+        let sibling = broker.admit_callback(1, 2, 5000, Some(&old.token)).unwrap();
+        broker.resolve(1, &old.token, Decision::Abort {}).unwrap();
+        assert!(matches!(
+            old.outcome.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let key = OperationKey {
+            generation: 1,
+            operation_seq: 1,
+        };
+        let proof = retired_proof(1);
+        broker.begin_operation_retirement(key, &proof).unwrap();
+        assert!(!broker.check_application_publication(1).unwrap());
+        assert_eq!(*first.cancellation.borrow(), CancelSignal::Requested);
+        assert_eq!(*sibling.cancellation.borrow(), CancelSignal::Requested);
+        assert!(matches!(
+            old.outcome.await.unwrap(),
+            DecisionOutcome::Cancelled
+        ));
+        assert_eq!(
+            broker.resolve(1, &old.token, Decision::Abort {}),
+            Err(ProtocolError::DecisionMissing)
+        );
+        // The owner-service lane never enters the publication barrier.
+        broker
+            .resolve(1, &unrelated.token, Decision::CancelAuth {})
+            .unwrap();
+        assert!(matches!(
+            unrelated.outcome.await.unwrap(),
+            DecisionOutcome::Selected(Decision::CancelAuth {})
+        ));
+        broker.finish_operation_publication(key).unwrap();
+        assert_eq!(
+            broker
+                .settle_with_retention(1, 1, Effects::Unknown, Some(&proof))
+                .unwrap(),
+            ScopeState::Usable
+        );
+        assert_eq!(broker.health().unwrap(), (1, ScopeState::Usable));
+        broker.settle(1, 2, Effects::NotDispatched).unwrap();
+        let fresh = broker
+            .decision(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Request,
+                5000,
+                Some(1),
+            )
+            .unwrap();
+        assert_eq!(
+            fresh.registrations.to_vec(),
+            vec!["configured-route".to_owned()]
+        );
+        broker.resolve(1, &fresh.token, Decision::Abort {}).unwrap();
+        assert!(matches!(
+            fresh.outcome.await.unwrap(),
+            DecisionOutcome::Selected(Decision::Abort {})
+        ));
+    }
+    #[test]
+    fn exact_proof_without_completed_publication_barrier_is_terminal() {
+        let broker = ClientSession::new();
+        broker.admit(1, 1, 1000).unwrap();
+        let proof = retired_proof(1);
+        assert_eq!(
+            broker
+                .settle_with_retention(1, 1, Effects::Unknown, Some(&proof))
+                .unwrap(),
+            ScopeState::Quarantined
+        );
     }
 }

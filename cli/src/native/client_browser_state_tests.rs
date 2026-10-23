@@ -39,6 +39,7 @@ impl ClientExecutor for StagedFixture {
         assert!(self.broker.start(lease.generation, lease.sequence).unwrap());
         if command == "synthetic.noop" {
             return NativeOutcome {
+                retention: None,
                 result: Ok(Value::Null),
                 effects: Effects::Completed,
             };
@@ -50,6 +51,7 @@ impl ClientExecutor for StagedFixture {
         assert_eq!(staged.is_publication_pending(), Ok(true));
         *self.staged.lock().unwrap() = Some(staged);
         NativeOutcome {
+            retention: None,
             result: if self.fail {
                 Err(ProtocolError::InvalidArguments)
             } else {
@@ -470,6 +472,7 @@ impl ClientExecutor for RequestFixture {
         }
         .await;
         NativeOutcome {
+            retention: None,
             result,
             effects: Effects::Completed,
         }
@@ -651,3 +654,6 @@ document.getElementById('token').textContent = localStorage.getItem('token') ?? 
         "HTTP navigation bypassed the production callback bridge"
     );
 }
+
+#[path = "client_browser_restart_transport_tests.rs"]
+mod restart_transport_tests;

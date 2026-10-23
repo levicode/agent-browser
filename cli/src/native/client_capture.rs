@@ -1,6 +1,7 @@
 //! Native-only protected pixel transaction. Raw pixels stay inside this module;
 //! cleanup integrity is part of the outcome, even for optional screenshots.
 use super::client_browser::BrowserExecutionLease;
+use super::client_debt::{self, CommandCategory};
 use super::client_geometry::{GeometryError, GeometrySnapshot, Polygon, Viewport};
 use super::client_observation::ObservationFrame;
 use super::client_protected_read::{ProtectedReadJournal, ProtectedReadReason};
@@ -13,7 +14,9 @@ use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 
 const MAX_PIXELS: u64 = 16_777_216;
-const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
+// Encoded PNG payload ceiling, not a total working-memory budget. Raster and
+// transport allocations retain their independent existing limits.
+pub(super) const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DOM_NODES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -121,12 +124,49 @@ async fn command(
     method: &str,
     args: Value,
 ) -> Result<Value, CaptureReason> {
+    let group = args["objectGroup"]
+        .as_str()
+        .filter(|group| {
+            ["capture-source", "capture-owner", "capture"]
+                .iter()
+                .any(|prefix| group.starts_with(&format!("{prefix}-{}-", operation.sequence)))
+        })
+        .map(str::to_owned);
+    let mutation = method == "Animation.setPlaybackRate"
+        || args["expression"].as_str() == Some(SOURCE_MASK_HOLDER)
+        || args["functionDeclaration"].as_str()
+            == Some("function(selector,...nodes){return this.install(selector,nodes)}");
+    let category = if super::client_observation::produces_remote_objects(method) {
+        CommandCategory::ApplicationObject
+    } else {
+        CommandCategory::ApplicationRead
+    };
+    client_debt::command_scope(category, mutation, async {
+        if let Some(group) = group {
+            client_debt::native_object_group(
+                &group,
+                command_inner(context, operation, session, method, args),
+            )
+            .await
+        } else {
+            command_inner(context, operation, session, method, args).await
+        }
+    })
+    .await
+}
+async fn command_inner(
+    context: &CaptureContext,
+    operation: &OperationLease,
+    session: &str,
+    method: &str,
+    args: Value,
+) -> Result<Value, CaptureReason> {
     check(context, operation)?;
     if !super::client_observation::capture_retirement_active() {
         let mut cancellation = operation.cancellation.clone();
         return tokio::select! {
             result = context.page.client.send_command(method, Some(args), Some(session)) => {
-                check(context, operation)?;
+                if !super::client_observation::produces_remote_objects(method) { check(context, operation)?; }
                 result.map_err(|_| CaptureReason::BrowserFailure)
             }
             _ = cancellation.changed() => Err(CaptureReason::Cancelled),
@@ -162,7 +202,16 @@ pub fn start_capture(
     request: CaptureRequest,
     operation: OperationLease,
 ) -> tokio::task::JoinHandle<Result<MaskedCapture, CaptureFailure>> {
-    tokio::spawn(async move { capture_transaction(context, request, operation).await })
+    let operation_journal = client_debt::OperationJournalHandle::current();
+    tokio::spawn(async move {
+        if let Some(journal) = operation_journal {
+            journal
+                .scope(capture_transaction(context, request, operation))
+                .await
+        } else {
+            capture_transaction(context, request, operation).await
+        }
+    })
 }
 
 async fn capture_transaction(
@@ -814,21 +863,15 @@ async fn masks(
                 }
                 Ok(())
             }.await;
-            // Observe drains started acquisitions before exact group release.
-            // Its missing release ACK is cleanup loss, never clean stale.
-            // Standalone capture retains its existing best-effort behavior.
-            let released = tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                context.page.client.send_command(
-                    "Runtime.releaseObjectGroup",
-                    Some(json!({"objectGroup":group})),
-                    Some(&owned.binding.session),
-                ),
+            // This group owns read-only handles, not installed source masks.
+            // Exact submitted release debt may remain on the stable owner.
+            let released = super::client_actions::release_group_accounted(
+                &context.page.client,
+                &owned.binding.session,
+                &group,
             )
             .await;
-            if super::client_observation::capture_retirement_active()
-                && !matches!(released, Ok(Ok(_)))
-            {
+            if super::client_observation::capture_retirement_active() && !released {
                 return Err(CaptureReason::CleanupFailed);
             }
             gathered?;
@@ -859,16 +902,13 @@ async fn verify_owner_paint(
             if response.get("exceptionDetails").is_some() || response["result"]["value"] != true { return Err(CaptureReason::UnsafeGeometry); }
             Ok(())
         }.await;
-        let cleanup = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            context.page.client.send_command(
-                "Runtime.releaseObjectGroup",
-                Some(json!({"objectGroup":group})),
-                Some(&binding.session),
-            ),
+        if !super::client_actions::release_group_accounted(
+            &context.page.client,
+            &binding.session,
+            &group,
         )
-        .await;
-        if !matches!(cleanup, Ok(Ok(_))) {
+        .await
+        {
             return Err(CaptureReason::CleanupFailed);
         }
         result?;

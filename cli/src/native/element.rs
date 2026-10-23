@@ -711,6 +711,12 @@ impl RefMap {
     }
 
     pub fn retire_owner_references(&mut self) {
+        self.retire_interaction_references();
+    }
+
+    /// Retire document and viewport authority without recycling any issued ID.
+    /// The stable owner, its artifacts and the shared allocator are unchanged.
+    pub fn retire_interaction_references(&mut self) {
         self.invalidate_all_documents();
         self.viewport_ref = None;
     }
@@ -856,6 +862,11 @@ impl RefMap {
             });
         }
         Ok(self.viewport_ref.as_ref().expect("staged viewport"))
+    }
+
+    /// Commit only the staged Page capability, never semantic/node membership.
+    pub(crate) fn commit_viewport_from(&mut self, staged: &Self) {
+        self.viewport_ref = staged.viewport_ref.clone();
     }
 
     pub fn is_viewport_ref(&self, reference: &str) -> bool {
@@ -1614,9 +1625,9 @@ pub async fn resolve_exact_object_in_realm_typed(
         .to_string();
     let proof: Result<(), ExactResolutionError> = async {
         check_capture_retirement()?;
-        let result = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
+        let result = super::client_debt::command_scope(super::client_debt::CommandCategory::ApplicationRead, false, client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
             "objectId": object, "functionDeclaration": "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }", "returnByValue": true
-        })), Some(&binding.session)).await?;
+        })), Some(&binding.session))).await?;
         let mut seen = std::collections::HashSet::new();
         let mut cleanup_failed = false;
         for handle in [result["result"]["objectId"].as_str(), result["exceptionDetails"]["exception"]["objectId"].as_str()].into_iter().flatten() {
@@ -1642,19 +1653,11 @@ pub async fn resolve_exact_object_in_realm_typed(
     Ok(object)
 }
 async fn release_exact_handle(client: &CdpClient, session: &str, object: &str) -> bool {
-    matches!(
-        tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            client.send_command(
-                "Runtime.releaseObject",
-                Some(serde_json::json!({"objectId":object})),
-                Some(session),
-            ),
-        )
-        .await,
-        Ok(Ok(_))
-    )
+    // Only exact reader-accounted object disposal may survive a missing ACK.
+    // Mask/security restoration remains on its existing strict cleanup path.
+    super::client_actions::release_object_accounted(client, session, object).await
 }
+
 pub async fn validate_exact_binding(
     client: &CdpClient,
     page_session: &str,

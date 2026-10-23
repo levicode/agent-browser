@@ -175,7 +175,7 @@ async fn command(
     check(operation)?;
     let mut cancelled = operation.cancellation.clone();
     tokio::select! {
-        value = client.send_command(method, Some(args), session) => { check(operation)?; value.map_err(|_| StateError::BrowserFailure) },
+        value = client.send_command(method, Some(args), session) => { if !super::client_observation::produces_remote_objects(method) { check(operation)?; } value.map_err(|_| StateError::BrowserFailure) },
         _ = cancelled.changed() => Err(StateError::Cancelled),
         _ = tokio::time::sleep_until(operation.deadline.into()) => Err(StateError::Deadline),
     }
@@ -545,6 +545,7 @@ async fn evaluate(
     context: &NativeStateContext<'_>,
     page: &Bootstrap,
     expression: String,
+    read_only: bool,
     operation: &OperationLease,
 ) -> Result<Value, StateError> {
     let tree = command(
@@ -569,16 +570,43 @@ async fn evaluate(
     let realm = world["executionContextId"]
         .as_i64()
         .ok_or(StateError::BrowserFailure)?;
-    let result = command(
+    let result = super::client_debt::command_scope(super::client_debt::CommandCategory::ApplicationObject, !read_only, command(
         context.client,
         Some(&page.session),
         "Runtime.evaluate",
         json!({"expression":expression,"contextId":realm,"awaitPromise":true,"returnByValue":true}),
         operation,
-    )
+    ))
     .await?;
+    let mut released = true;
+    let mut seen = std::collections::HashSet::new();
+    for handle in [
+        result["result"]["objectId"].as_str(),
+        result["exceptionDetails"]["exception"]["objectId"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if seen.insert(handle) {
+            released &= super::client_actions::release_object_accounted(
+                context.client,
+                &page.session,
+                handle,
+            )
+            .await;
+        }
+    }
+    if !released {
+        if let Some(journal) = super::client_debt::OperationJournalHandle::current() {
+            journal
+                .record_cleanup_disposition(super::client_debt::CleanupDisposition::IntegrityLost);
+        }
+    }
     if result.get("exceptionDetails").is_some() {
         return Err(StateError::UnsupportedValue);
+    }
+    if !released {
+        return Err(StateError::BrowserFailure);
     }
     result["result"]
         .get("value")
@@ -617,6 +645,7 @@ pub async fn export_state(
             context,
             &page,
             format!("({STATE_SCRIPT})('export', null)"),
+            true,
             operation,
         )
         .await;
@@ -671,6 +700,7 @@ pub async fn import_state(
             context,
             &page,
             format!("({STATE_SCRIPT})('import', {payload})"),
+            false,
             operation,
         )
         .await;
@@ -1704,6 +1734,7 @@ mod tests {
                 .stage_until_result(&operation, &owner.identity_scope)
                 .unwrap();
             sink.acknowledge_result_for_test(&ServerMessage::Result {
+                retention: None,
                 id: "synthetic-state-fixture".into(),
                 generation: operation.generation,
                 operation_seq: operation.sequence,

@@ -19,6 +19,8 @@ pub mod client_browser;
 #[allow(dead_code)]
 pub mod client_capture;
 #[allow(dead_code)]
+pub mod client_debt;
+#[allow(dead_code)]
 pub mod client_enrollment;
 #[allow(dead_code)]
 pub mod client_geometry;
@@ -28,6 +30,8 @@ pub mod client_network;
 pub mod client_observation;
 #[allow(dead_code)] // Executor wiring and capabilities are separately reviewed.
 pub mod client_observation_dispatch;
+#[allow(dead_code)]
+pub(crate) mod client_operation_state;
 #[allow(dead_code)]
 pub mod client_page;
 #[allow(dead_code)]

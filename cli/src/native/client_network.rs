@@ -3585,6 +3585,7 @@ mod bridge_tests {
             .stage_until_result(&stage_op, &scope.identity_scope)
             .unwrap();
         sink.acknowledge_result_for_test(&ServerMessage::Result {
+            retention: None,
             id: "initial".into(),
             generation: 1,
             operation_seq: 900,
@@ -4502,6 +4503,7 @@ mod bridge_tests {
         assert!(events.try_recv().is_err());
         source
             .acknowledge_result_for_test(&ServerMessage::Result {
+                retention: None,
                 id: "restart".into(),
                 generation: 1,
                 operation_seq: operation.sequence,

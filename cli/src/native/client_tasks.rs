@@ -12,7 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex};
 use tokio::task::JoinSet;
 
-const MAX_RETAINED: usize = 64;
+const MAX_RETAINED: usize = super::client_operation_state::MAX_RETAINED_OPERATIONS;
 
 pub struct RetainedCompletion {
     pub identity_scope: String,
@@ -28,6 +28,7 @@ struct Tasks {
 #[derive(Default)]
 pub struct RetainedTasks {
     inner: Mutex<Tasks>,
+    operations: Arc<super::client_operation_state::OperationRegistry>,
 }
 impl Tasks {
     fn record(&mut self, result: Result<RetainedCompletion, tokio::task::JoinError>) {
@@ -43,6 +44,173 @@ impl Tasks {
     }
 }
 impl RetainedTasks {
+    pub(crate) fn operation_retention_status(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> super::client_operation_state::OperationRetentionStatus {
+        self.operations.status(key)
+    }
+
+    pub(crate) fn cancel_operation_producer(&self, key: super::client_debt::OperationKey) {
+        self.operations.retire(key);
+    }
+
+    pub(crate) fn fix_operation_result(&self, key: super::client_debt::OperationKey) {
+        self.operations.fix_result(key);
+    }
+
+    pub(crate) fn check_input_dispatch(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Result<(), ProtocolError> {
+        if self.operations.input_dispatch_ready(key)? {
+            Ok(())
+        } else {
+            Err(ProtocolError::ScopeUnavailable)
+        }
+    }
+
+    /// Owner services do not enter this gate. New application work waits only
+    /// for positively retained local producers, under its own original budget.
+    pub(crate) async fn wait_application(
+        &self,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let mut cancellation = operation.cancellation.clone();
+        loop {
+            let changed = self.operations.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if *cancellation.borrow() != super::client_session::CancelSignal::None {
+                return Err(ProtocolError::Cancelled);
+            }
+            if std::time::Instant::now() >= operation.deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if self.operations.application_ready()? {
+                return Ok(());
+            }
+            tokio::select! { biased;
+                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                _ = &mut changed => {},
+            }
+        }
+    }
+
+    pub(crate) async fn start_operation<F>(
+        &self,
+        identity_scope: String,
+        targets: Arc<ClientTargets>,
+        broker: Arc<super::client_session::ClientSession>,
+        journal: super::client_debt::OperationJournalHandle,
+        cancellation: tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+        future: F,
+    ) -> Result<oneshot::Receiver<NativeOutcome>, ProtocolError>
+    where
+        F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
+    {
+        self.start_operation_prepared(
+            identity_scope,
+            targets,
+            broker,
+            journal,
+            cancellation,
+            || Ok(future),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_operation_prepared<F, P>(
+        &self,
+        identity_scope: String,
+        targets: Arc<ClientTargets>,
+        broker: Arc<super::client_session::ClientSession>,
+        journal: super::client_debt::OperationJournalHandle,
+        cancellation: tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+        prepare: P,
+    ) -> Result<oneshot::Receiver<NativeOutcome>, ProtocolError>
+    where
+        F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
+        P: FnOnce() -> Result<F, ProtocolError>,
+    {
+        let operations = self.operations.clone();
+        let task_targets = targets.clone();
+        self.start_prepared(identity_scope, targets, move || {
+            operations.register(journal.clone())?;
+            let future = match prepare() {
+                Ok(future) => future,
+                Err(error) => {
+                    operations.abandon_unstarted(journal.key());
+                    return Err(error);
+                }
+            };
+            Ok(async move {
+                let key = journal.key();
+                operations.running(key);
+                let monitor_registry = operations.clone();
+                let monitor_targets = task_targets.clone();
+                let mut cancellation = cancellation;
+                let monitor_broker = broker.clone();
+                let monitor = tokio::spawn(async move {
+                    if *cancellation.borrow() == super::client_session::CancelSignal::None {
+                        let _ = cancellation.changed().await;
+                    }
+                    if let Some(deadline) = monitor_registry.retire(key) {
+                        tokio::time::sleep_until(deadline.into()).await;
+                        if monitor_registry.expire(key, std::time::Instant::now()) {
+                            monitor_targets.seal();
+                            let _ = monitor_broker.quarantine();
+                        }
+                    }
+                });
+                let result = AssertUnwindSafe(journal.scope(future)).catch_unwind().await;
+                let (mut outcome, dirty) = match result {
+                    Ok(value) => value,
+                    Err(_) => (
+                        NativeOutcome {
+                            retention: None,
+                            result: Err(ProtocolError::BrowserFailure),
+                            effects: Effects::Unknown,
+                        },
+                        true,
+                    ),
+                };
+                let snapshot = journal.snapshot();
+                let dirty = dirty
+                    || matches!(&outcome.result, Err(ProtocolError::CleanupFailed))
+                    || snapshot.integrity_lost
+                    || task_targets.inventory().is_err();
+                if !dirty && outcome.result.is_err() {
+                    // Executor entry and current debt count are not dispatch
+                    // evidence. Preserve a completed prefix, but never invent a
+                    // mutation while waiting for UI/geometry/quota admission.
+                    if outcome.effects == Effects::Unknown && !snapshot.mutation_dispatched {
+                        outcome.effects = Effects::NotDispatched;
+                    } else if outcome.effects == Effects::NotDispatched
+                        && snapshot.mutation_dispatched
+                    {
+                        outcome.effects = Effects::Unknown;
+                    }
+                }
+                if outcome.effects == Effects::Unknown {
+                    operations.retire(key);
+                }
+                let dirty = operations.finish(key, dirty) || dirty;
+                if dirty {
+                    task_targets.seal();
+                    let _ = broker.quarantine();
+                }
+                monitor.abort(); // Timer only; never aborts action/cleanup work.
+                if outcome.effects == Effects::Unknown && !dirty {
+                    outcome.retention = operations.status(key).proof();
+                }
+                (outcome, dirty)
+            })
+        })
+        .await
+    }
+
     pub async fn start<F>(
         &self,
         identity_scope: String,
@@ -90,6 +258,7 @@ impl RetainedTasks {
                     Ok(result) => result,
                     Err(_) => (
                         NativeOutcome {
+                            retention: None,
                             result: Err(ProtocolError::BrowserFailure),
                             effects: Effects::Unknown,
                         },
@@ -150,6 +319,7 @@ mod tests {
 
     fn complete() -> NativeOutcome {
         NativeOutcome {
+            retention: None,
             result: Ok(serde_json::Value::Null),
             effects: Effects::Completed,
         }
@@ -188,7 +358,14 @@ mod tests {
         let receive = tasks
             .start("captured-scope".into(), captured.clone(), async move {
                 let _lease = lease;
-                (NativeOutcome { result, effects }, cleanup_integrity_lost)
+                (
+                    NativeOutcome {
+                        retention: None,
+                        result,
+                        effects,
+                    },
+                    cleanup_integrity_lost,
+                )
             })
             .await
             .unwrap();

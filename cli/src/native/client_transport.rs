@@ -24,10 +24,30 @@ macro_rules! settlement_trace {
 pub struct NativeOutcome {
     pub result: Result<serde_json::Value, ProtocolError>,
     pub effects: Effects,
+    pub(crate) retention: Option<super::client_operation_state::OperationRetentionProof>,
 }
 
 pub trait ClientExecutor: Send + Sync + 'static {
     fn capabilities(&self) -> Vec<String>;
+    fn operation_retention_status(
+        &self,
+        _key: super::client_debt::OperationKey,
+    ) -> super::client_operation_state::OperationRetentionStatus {
+        super::client_operation_state::OperationRetentionStatus::NotRegistered
+    }
+    /// Short-lock cancellation hook fixes the native retirement deadline before
+    /// the cleanup grace. It never drops or aborts the retained producer.
+    fn cancel_operation_producer(&self, _key: super::client_debt::OperationKey) {}
+    fn fix_operation_result(&self, _key: super::client_debt::OperationKey) {}
+    /// Independent publication retirement. The broker barrier is already set;
+    /// implementations must not acquire lifecycle, action, input or owner locks.
+    fn retire_operation_publication(
+        &self,
+        _key: super::client_debt::OperationKey,
+    ) -> impl std::future::Future<Output = Result<(), ProtocolError>> + Send {
+        async { Err(ProtocolError::UnsupportedCapability) }
+    }
+
     fn set_event_sink(&self, _sink: ClientEventSink) -> Result<(), ProtocolError> {
         Ok(())
     }
@@ -913,7 +933,22 @@ where
     if let Ok(mut ids) = outstanding.lock() {
         ids.insert(id.clone(), false);
     }
-    let capabilities = executor.capabilities();
+    let terminal_close_negotiated = required_capabilities
+        .iter()
+        .any(|capability| capability == "terminal.close/1");
+    let mut capabilities = executor.capabilities();
+    if !capabilities
+        .iter()
+        .any(|capability| capability == "terminal.close/1")
+    {
+        capabilities.push("terminal.close/1".into());
+    }
+    let continuation_negotiated = required_capabilities
+        .iter()
+        .any(|capability| capability == EXACT_OWNER_CONTINUATION)
+        && capabilities
+            .iter()
+            .any(|capability| capability == EXACT_OWNER_CONTINUATION);
     let supported: Vec<_> = capabilities.iter().map(String::as_str).collect();
     let validation = validate_hello(&protocol, &required_capabilities, &supported)
         .and_then(|()| executor.set_event_sink(sink.clone()));
@@ -946,9 +981,11 @@ where
     let mut operations = tokio::task::JoinSet::<(u64, NativeOutcome)>::new();
     let mut pending = std::collections::HashMap::<u64, (String, u64)>::new();
     let mut closing_id = None;
+    let mut terminal_control = false;
+    // Retained across both phases: cancelling a read must not discard its prefix.
+    let mut incoming_frame = Vec::new();
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(25));
     if valid && ready_queued {
-        let mut incoming_frame = Vec::new();
         loop {
             #[cfg(feature = "acceptance-faults")]
             let reading =
@@ -961,24 +998,35 @@ where
                 _ = timer.tick() => {
                     let _ = broker.expire_decisions();
                     if sink.expire_publications().is_err() { settlement_trace!(0, PublicationExpired); let _ = broker.quarantine(); break; }
-                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { settlement_trace!(0, HealthFailed); break; }
+                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) {
+                        if terminal_close_negotiated && !operations.is_empty() { continue; }
+                        settlement_trace!(0, HealthFailed); break;
+                    }
                     for (version,identity_scope) in broker.take_released_registry_events(16).unwrap_or_default() {
                         let mut payload=serde_json::json!({ "registryVersion": version });
                         if let Some(scope)=identity_scope { payload["identityScope"]=serde_json::json!(scope); }
                         if sink.emit("registry-released".into(), payload, None).is_err() { break; }
                     }
-                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) { settlement_trace!(0, HealthFailed); break; }
+                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) {
+                        if terminal_close_negotiated && !operations.is_empty() { continue; }
+                        settlement_trace!(0, HealthFailed); break;
+                    }
                     continue;
                 },
                 completion = operations.join_next(), if !operations.is_empty() => {
                     let Some(Ok((sequence, outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
                     settlement_trace!(sequence, CompletionJoined);
                     let Some((id, generation)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
-                    let state = broker.settle(generation, sequence, outcome.effects).unwrap_or(ScopeState::Quarantined);
+                    let state = broker.settle_with_retention(generation, sequence, outcome.effects,
+                        if continuation_negotiated { outcome.retention.as_ref() } else { None }).unwrap_or(ScopeState::Quarantined);
+                    executor.fix_operation_result(super::client_debt::OperationKey { generation, operation_seq: sequence });
                     let unknown = outcome.effects == Effects::Unknown;
                     if !enqueue(&sender, result_message(id, generation, sequence, outcome, state), &broker) { settlement_trace!(sequence, ResultQueueFailed); break; }
                     settlement_trace!(sequence, ResultQueued);
-                    if unknown { settlement_trace!(sequence, UnknownOutcome); break; }
+                    if (unknown && state != ScopeState::Usable) || state == ScopeState::Quarantined {
+                        terminal_control = terminal_close_negotiated;
+                        settlement_trace!(sequence, UnknownOutcome); break;
+                    }
                     continue;
                 },
             };
@@ -1080,7 +1128,15 @@ where
                             operations.spawn(async move {
                                 (
                                     operation_seq,
-                                    execute_bounded(executor, broker, command, args, lease).await,
+                                    execute_bounded(
+                                        executor,
+                                        broker,
+                                        command,
+                                        args,
+                                        lease,
+                                        continuation_negotiated,
+                                    )
+                                    .await,
                                 )
                             });
                         }
@@ -1096,6 +1152,7 @@ where
                                     generation,
                                     operation_seq,
                                     NativeOutcome {
+                                        retention: None,
                                         result: Err(code),
                                         effects: Effects::NotDispatched,
                                     },
@@ -1103,6 +1160,10 @@ where
                                 ),
                                 &broker,
                             ) {
+                                break;
+                            }
+                            if state == ScopeState::Quarantined {
+                                terminal_control = terminal_close_negotiated;
                                 break;
                             }
                         }
@@ -1114,7 +1175,12 @@ where
                         .is_ok_and(|(current, _)| current == generation) =>
                 {
                     settlement_trace!(0, CloseReceived);
+                    // Claim terminal authority before any other admitted task
+                    // can submit a new application command on this generation.
+                    let _ = broker.quarantine();
+                    sink.close_publications();
                     closing_id = Some(id);
+                    terminal_control = terminal_close_negotiated;
                     break;
                 }
                 other => {
@@ -1141,20 +1207,154 @@ where
     sink.close_publications();
     let _ = broker.quarantine();
     operations.abort_all();
-    // Aborting schedules cancellation; joining proves execution guards dropped.
-    let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        while operations.join_next().await.is_some() {}
-    })
-    .await
-    .is_ok();
-    let teardown_proven = if drained {
-        matches!(
-            tokio::time::timeout(std::time::Duration::from_secs(5), executor.shutdown()).await,
-            Ok(Ok(()))
-        )
-    } else {
-        false
+    // Shutdown and control share one cutoff, never renewed by incoming traffic.
+    // The executor starts even if the peer never asks for its receipt.
+    let cutoff = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let shutdown = async {
+        // Aborting schedules cancellation; joining proves execution guards dropped.
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while operations.join_next().await.is_some() {}
+        })
+        .await
+        .is_ok();
+        drained
+            && matches!(
+                tokio::time::timeout_at(
+                    cutoff.min(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
+                    executor.shutdown()
+                )
+                .await,
+                Ok(Ok(()))
+            )
     };
+    tokio::pin!(shutdown);
+    let mut shutdown_outcome = None;
+    let mut control_trusted = true;
+    if terminal_control {
+        loop {
+            if shutdown_outcome.is_some() && closing_id.is_some() {
+                break;
+            }
+            #[cfg(feature = "acceptance-faults")]
+            let reading =
+                read_frame_retained(&mut reader, &mut incoming_frame, Some(&mut frame_trace));
+            #[cfg(not(feature = "acceptance-faults"))]
+            let reading = read_frame_retained(&mut reader, &mut incoming_frame);
+            let frame = tokio::select! {
+                biased;
+                outcome = &mut shutdown, if shutdown_outcome.is_none() => {
+                    shutdown_outcome = Some(outcome);
+                    continue;
+                },
+                _ = tokio::time::sleep_until(cutoff) => { break; },
+                frame = reading => frame,
+            };
+            let message = match frame {
+                Ok(Some(bytes)) => match parse_frame(&bytes) {
+                    Ok(message) => message,
+                    Err(_) => {
+                        control_trusted = false;
+                        break;
+                    }
+                },
+                _ => {
+                    control_trusted = false;
+                    break;
+                }
+            };
+            let generation = broker
+                .health()
+                .map(|(generation, _)| generation)
+                .unwrap_or(1);
+            let response = match message {
+                ClientMessage::Close {
+                    id,
+                    generation: requested,
+                } if requested == generation => {
+                    // Only one cleanup exchange owns the receipt. A repeated
+                    // identical Close does not extend the cutoff or send twice.
+                    if closing_id.as_ref().is_none_or(|owned| owned == &id) {
+                        closing_id = Some(id);
+                        continue;
+                    }
+                    ServerMessage::Error {
+                        id: Some(id),
+                        error: WireError {
+                            code: ProtocolError::ScopeUnavailable,
+                        },
+                        scope_state: ScopeState::Quarantined,
+                    }
+                }
+                ClientMessage::Cancel {
+                    id,
+                    generation: requested,
+                    operation_seq,
+                } => {
+                    // Correlation only; never admit an operation or a callback.
+                    let result = broker.cancel(requested, operation_seq);
+                    ServerMessage::ControlResult {
+                        id,
+                        generation,
+                        accepted: result.is_ok(),
+                        error: result.err().map(|code| WireError { code }),
+                        scope_state: ScopeState::Quarantined,
+                    }
+                }
+                ClientMessage::Request {
+                    id,
+                    generation: requested,
+                    operation_seq,
+                    ..
+                } => result_message(
+                    id,
+                    requested,
+                    operation_seq,
+                    NativeOutcome {
+                        retention: None,
+                        result: Err(if requested == generation {
+                            ProtocolError::ScopeUnavailable
+                        } else {
+                            ProtocolError::StaleGeneration
+                        }),
+                        effects: Effects::NotDispatched,
+                    },
+                    ScopeState::Quarantined,
+                ),
+                ClientMessage::Decision { id, .. } => ServerMessage::ControlResult {
+                    id,
+                    generation,
+                    accepted: false,
+                    error: Some(WireError {
+                        code: ProtocolError::ScopeUnavailable,
+                    }),
+                    scope_state: ScopeState::Quarantined,
+                },
+                ClientMessage::Close { id, .. } => ServerMessage::Error {
+                    id: Some(id),
+                    error: WireError {
+                        code: ProtocolError::StaleGeneration,
+                    },
+                    scope_state: ScopeState::Quarantined,
+                },
+                ClientMessage::Hello { .. } => {
+                    control_trusted = false;
+                    break;
+                }
+            };
+            // Terminal refusals/ACKs cannot overtake the original Unknown.
+            if sender.results.try_send(response).is_err() {
+                control_trusted = false;
+                break;
+            }
+        }
+    }
+    let teardown_proven = match shutdown_outcome {
+        Some(outcome) => outcome,
+        None => shutdown.await,
+    };
+    if !control_trusted {
+        closing_id = None;
+    }
     #[cfg(feature = "acceptance-faults")]
     if teardown_proven {
         settlement_trace!(0, ShutdownProven);
@@ -1175,6 +1375,7 @@ where
                 generation,
                 sequence,
                 NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::Cancelled),
                     effects,
                 },
@@ -1246,10 +1447,16 @@ fn result_message(
         Ok(data) => (true, Some(data), None),
         Err(code) => (false, None, Some(WireError { code })),
     };
+    let retention = if outcome.effects == Effects::Unknown && scope_state == ScopeState::Usable {
+        outcome.retention.as_ref().map(|proof| proof.descriptor())
+    } else {
+        None
+    };
     ServerMessage::Result {
         id,
         generation,
         operation_seq,
+        retention,
         ok,
         data,
         error,
@@ -1259,6 +1466,62 @@ fn result_message(
 }
 
 async fn execute_bounded<E: ClientExecutor>(
+    executor: std::sync::Arc<E>,
+    broker: std::sync::Arc<ClientSession>,
+    command: String,
+    args: serde_json::Map<String, serde_json::Value>,
+    lease: OperationLease,
+    continuation_negotiated: bool,
+) -> NativeOutcome {
+    let key = super::client_debt::OperationKey {
+        generation: lease.generation,
+        operation_seq: lease.sequence,
+    };
+    let mut outcome =
+        execute_until_deadline(executor.clone(), broker.clone(), command, args, lease).await;
+    if outcome.effects != Effects::Unknown || !continuation_negotiated {
+        outcome.retention = None;
+        return outcome;
+    }
+    let Some(proof) = outcome
+        .retention
+        .as_ref()
+        .filter(|proof| proof.matches(key))
+        .cloned()
+    else {
+        outcome.retention = None;
+        return outcome;
+    };
+    // This runs on the retained operation completion lane, never the control
+    // reader. Events and exact native security fallback keep being serviced.
+    let retirement = async {
+        if std::time::Instant::now() >= proof.retirement_deadline() {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        broker.begin_operation_retirement(key, &proof)?;
+        executor.retire_operation_publication(key).await?;
+        if std::time::Instant::now() >= proof.retirement_deadline() {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        if matches!(
+            executor.operation_retention_status(key),
+            super::client_operation_state::OperationRetentionStatus::IntegrityLost(_)
+        ) {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        broker.finish_operation_publication(key)
+    };
+    if !matches!(
+        tokio::time::timeout_at(proof.retirement_deadline().into(), retirement).await,
+        Ok(Ok(()))
+    ) {
+        outcome.retention = None;
+        let _ = broker.quarantine();
+    }
+    outcome
+}
+
+async fn execute_until_deadline<E: ClientExecutor>(
     executor: std::sync::Arc<E>,
     broker: std::sync::Arc<ClientSession>,
     command: String,
@@ -1279,6 +1542,10 @@ async fn execute_bounded<E: ClientExecutor>(
         _ = tokio::time::sleep_until(deadline) => { settlement_trace!(sequence, DeadlineObserved); ProtocolError::DeadlineExceeded },
     };
     let _ = broker.cancel(generation, sequence);
+    executor.cancel_operation_producer(super::client_debt::OperationKey {
+        generation,
+        operation_seq: sequence,
+    });
     if let Ok(outcome) =
         tokio::time::timeout(std::time::Duration::from_millis(250), &mut execution).await
     {
@@ -1286,13 +1553,26 @@ async fn execute_bounded<E: ClientExecutor>(
         return outcome;
     }
     settlement_trace!(sequence, GraceExpired);
+    let status = executor.operation_retention_status(super::client_debt::OperationKey {
+        generation,
+        operation_seq: sequence,
+    });
+    let effects = match status.mutation_dispatched() {
+        Some(false) => Effects::NotDispatched,
+        Some(true) => Effects::Unknown,
+        // An incapable executor or missing journal retains the legacy terminal
+        // behavior. Executor entry is never promoted into reusable proof.
+        None if !broker.has_started(sequence) => Effects::NotDispatched,
+        None => Effects::Unknown,
+    };
     NativeOutcome {
-        result: Err(reason),
-        effects: if broker.has_started(sequence) {
-            Effects::Unknown
+        retention: if effects == Effects::Unknown {
+            status.proof()
         } else {
-            Effects::NotDispatched
+            None
         },
+        result: Err(reason),
+        effects,
     }
 }
 
@@ -1326,6 +1606,7 @@ fn respond<E: ClientExecutor>(
             };
             (
                 ServerMessage::Result {
+                    retention: None,
                     id,
                     generation,
                     operation_seq,
@@ -1345,6 +1626,12 @@ fn respond<E: ClientExecutor>(
         } => {
             settlement_trace!(operation_seq, CancelReceived);
             let result = broker.cancel(requested_generation, operation_seq);
+            if result.is_ok() {
+                executor.cancel_operation_producer(super::client_debt::OperationKey {
+                    generation: requested_generation,
+                    operation_seq,
+                });
+            }
             #[cfg(feature = "acceptance-faults")]
             super::client_settlement_trace::record(
                 operation_seq,
@@ -1472,6 +1759,7 @@ mod tests {
             1,
             7,
             NativeOutcome {
+                retention: None,
                 result: if ok {
                     Ok(serde_json::json!({"identityScope":"same-scope"}))
                 } else {
@@ -1495,6 +1783,7 @@ mod tests {
             1,
             sequence,
             NativeOutcome {
+                retention: None,
                 result: Ok(serde_json::json!({"identityScope":scope})),
                 effects: Effects::Completed,
             },
@@ -1674,6 +1963,7 @@ mod tests {
             1,
             8,
             NativeOutcome {
+                retention: None,
                 result: Ok(serde_json::json!({"identityScope":"same-scope"})),
                 effects: Effects::Completed,
             },
@@ -1866,6 +2156,471 @@ mod tests {
             Err(ProtocolError::Cancelled)
         );
     }
+    struct TerminalCloseExecutor {
+        broker: std::sync::Arc<ClientSession>,
+        calls: std::sync::atomic::AtomicUsize,
+        shutdown_started: tokio::sync::Notify,
+        shutdown_release: tokio::sync::Notify,
+        shutdown_done: tokio::sync::Notify,
+        fail: bool,
+    }
+    impl ClientExecutor for TerminalCloseExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        fn prepare_decision(&self, _: u64, _: &str, _: &Decision) -> Result<(), ProtocolError> {
+            panic!("terminal callback authority must never reach the executor");
+        }
+        async fn execute(
+            &self,
+            _: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            lease: OperationLease,
+        ) -> NativeOutcome {
+            assert!(self.broker.start(lease.generation, lease.sequence).unwrap());
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            NativeOutcome {
+                retention: None,
+                result: Err(ProtocolError::BrowserFailure),
+                effects: Effects::Unknown,
+            }
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            self.shutdown_started.notify_one();
+            self.shutdown_release.notified().await;
+            self.shutdown_done.notify_one();
+            if self.fail {
+                Err(ProtocolError::CleanupFailed)
+            } else {
+                Ok(())
+            }
+        }
+    }
+    async fn terminal_close_peer(
+        fail: bool,
+    ) -> (
+        tokio::io::BufReader<tokio::io::DuplexStream>,
+        std::sync::Arc<TerminalCloseExecutor>,
+        tokio::task::JoinHandle<bool>,
+    ) {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let executor = std::sync::Arc::new(TerminalCloseExecutor {
+            broker: broker.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            shutdown_started: tokio::sync::Notify::new(),
+            shutdown_release: tokio::sync::Notify::new(),
+            shutdown_done: tokio::sync::Notify::new(),
+            fail,
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec!["terminal.close/1".into()],
+            },
+            broker,
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        let ready = settlement_frame(&mut peer).await;
+        assert!(ready["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "terminal.close/1"));
+        peer.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":1,\"timeoutMs\":1000,\"command\":\"uncertain\",\"args\":{}}\n").await.unwrap();
+        let result = settlement_frame(&mut peer).await;
+        assert_eq!(result["id"], "r");
+        assert_eq!(result["effects"], "unknown");
+        assert_eq!(result["scopeState"], "quarantined");
+        assert_eq!(result["error"]["code"], "browser-failure");
+        executor.shutdown_started.notified().await;
+        (peer, executor, serving)
+    }
+    #[tokio::test]
+    async fn terminal_close_after_shutdown_uses_cached_proof_without_request_revival() {
+        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        executor.shutdown_release.notify_one();
+        executor.shutdown_done.notified().await;
+        peer.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"late\",\"generation\":1,\"operationSeq\":2,\"timeoutMs\":1000,\"command\":\"scope.reconnect\",\"args\":{}}\n{\"type\":\"close\",\"id\":\"stale\",\"generation\":2}\n").await.unwrap();
+        let refusal = settlement_frame(&mut peer).await;
+        assert_eq!(refusal["id"], "late");
+        assert_eq!(refusal["effects"], "not-dispatched");
+        assert_eq!(refusal["scopeState"], "quarantined");
+        let stale = settlement_frame(&mut peer).await;
+        assert_eq!(stale["error"]["code"], "stale-generation");
+        peer.get_mut().write_all(b"{\"type\":\"decision\",\"id\":\"d\",\"generation\":1,\"token\":\"retired\",\"decision\":{\"kind\":\"abort\"}}\n").await.unwrap();
+        let decision = settlement_frame(&mut peer).await;
+        assert_eq!(decision["type"], "control-result");
+        assert_eq!(decision["id"], "d");
+        assert_eq!(decision["accepted"], false);
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        let closed = settlement_frame(&mut peer).await;
+        assert_eq!(closed["type"], "closed");
+        assert_eq!(closed["id"], "z");
+        assert_eq!(closed["generation"], 1);
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn terminal_close_before_shutdown_preserves_partial_cancel_and_single_receipt() {
+        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        peer.get_mut()
+            .write_all(b"{\"type\":\"cancel\",\"id\":\"c\",")
+            .await
+            .unwrap();
+        peer.get_mut().write_all(b"\"generation\":1,\"operationSeq\":1}\n{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n").await.unwrap();
+        let ack = settlement_frame(&mut peer).await;
+        assert_eq!(ack["type"], "control-result");
+        assert_eq!(ack["id"], "c");
+        assert_eq!(ack["accepted"], false);
+        assert_eq!(ack["scopeState"], "quarantined");
+        executor.shutdown_release.notify_one();
+        let closed = settlement_frame(&mut peer).await;
+        assert_eq!(closed["type"], "closed");
+        assert_eq!(closed["id"], "z");
+        assert!(read_frame(&mut peer).await.unwrap().is_none());
+        assert!(serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn terminal_close_cleanup_failure_is_correlated_after_unknown() {
+        let (mut peer, executor, serving) = terminal_close_peer(true).await;
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        executor.shutdown_release.notify_one();
+        let failure = settlement_frame(&mut peer).await;
+        assert_eq!(failure["type"], "error");
+        assert_eq!(failure["id"], "z");
+        assert_eq!(failure["error"]["code"], "cleanup-failed");
+        assert!(!serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn terminal_close_malformed_input_cannot_authorize_success_receipt() {
+        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        peer.get_mut().write_all(b"invalid\n").await.unwrap();
+        peer.get_mut().shutdown().await.unwrap();
+        executor.shutdown_release.notify_one();
+        assert!(read_frame(&mut peer).await.unwrap().is_none());
+        assert!(serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn terminal_close_eof_in_partial_frame_still_shuts_down_without_receipt() {
+        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",")
+            .await
+            .unwrap();
+        peer.get_mut().shutdown().await.unwrap();
+        executor.shutdown_release.notify_one();
+        assert!(read_frame(&mut peer).await.unwrap().is_none());
+        assert!(serving.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn terminal_close_retains_partial_cancel_across_unknown_phase_change() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let (started, mut running) = tokio::sync::watch::channel(None);
+        let executor = std::sync::Arc::new(DeadlineSettlementExecutor {
+            broker: broker.clone(),
+            started,
+            responsive: false,
+            shutdown_release: Some(tokio::sync::Notify::new()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let (count, mut consumed) = tokio::sync::watch::channel(0usize);
+        let serving = tokio::spawn(serve_with_executor(
+            CountedReader {
+                inner: tokio::io::BufReader::new(reader),
+                consumed: count,
+            },
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec!["terminal.close/1".into()],
+            },
+            broker,
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        settlement_frame(&mut peer).await;
+        let request = b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":1,\"timeoutMs\":100,\"command\":\"wait-for-native-stop\",\"args\":{}}\n";
+        let prefix = b"{\"type\":\"cancel\",\"id\":\"c\",";
+        peer.get_mut().write_all(request).await.unwrap();
+        running.wait_for(Option::is_some).await.unwrap();
+        peer.get_mut().write_all(prefix).await.unwrap();
+        consumed
+            .wait_for(|count| *count >= request.len() + prefix.len())
+            .await
+            .unwrap();
+        let unknown = settlement_frame(&mut peer).await;
+        assert_eq!(unknown["id"], "r");
+        assert_eq!(unknown["effects"], "unknown");
+        peer.get_mut().write_all(b"\"generation\":1,\"operationSeq\":1}\n{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n").await.unwrap();
+        let ack = settlement_frame(&mut peer).await;
+        assert_eq!(ack["id"], "c");
+        assert_eq!(ack["type"], "control-result");
+        assert_eq!(ack["accepted"], false);
+        executor.shutdown_release.as_ref().unwrap().notify_one();
+        let closed = settlement_frame(&mut peer).await;
+        assert_eq!(closed["type"], "closed");
+        assert_eq!(closed["id"], "z");
+        assert!(serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn terminal_close_no_close_fixed_cutoff_never_implies_receipt() {
+        let (mut peer, executor, serving) = terminal_close_peer(false).await;
+        let began = tokio::time::Instant::now();
+        executor.shutdown_release.notify_one();
+        executor.shutdown_done.notified().await;
+        // Cached successful shutdown does not itself produce Closed. Continual
+        // requests are refused and cannot extend the original control cutoff.
+        let mut sequence = 2;
+        loop {
+            let request = format!("{{\"type\":\"request\",\"id\":\"late{sequence}\",\"generation\":1,\"operationSeq\":{sequence},\"timeoutMs\":1000,\"command\":\"fresh\",\"args\":{{}}}}\n");
+            if peer.get_mut().write_all(request.as_bytes()).await.is_err() {
+                break;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(12), read_frame(&mut peer))
+                .await
+                .unwrap()
+                .unwrap()
+            {
+                None => break,
+                Some(bytes) => {
+                    let frame: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(frame["type"], "result");
+                    assert_eq!(frame["effects"], "not-dispatched");
+                }
+            }
+            sequence += 1;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(began.elapsed() < std::time::Duration::from_secs(12));
+        assert!(serving.await.unwrap());
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    struct FailingFrameWriter<W> {
+        inner: W,
+        frame_type: &'static [u8],
+        failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+    impl<W: AsyncWrite + Unpin> AsyncWrite for FailingFrameWriter<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if bytes
+                .windows(self.frame_type.len())
+                .any(|part| part == self.frame_type)
+            {
+                self.failed.store(true, std::sync::atomic::Ordering::SeqCst);
+                return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "injected terminal frame write failure",
+                )));
+            }
+            std::pin::Pin::new(&mut self.inner).poll_write(cx, bytes)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+    async fn terminal_close_lost_frame(frame_type: &'static [u8], cancel: bool) {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let executor = std::sync::Arc::new(TerminalCloseExecutor {
+            broker: broker.clone(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            shutdown_started: tokio::sync::Notify::new(),
+            shutdown_release: tokio::sync::Notify::new(),
+            shutdown_done: tokio::sync::Notify::new(),
+            fail: false,
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            FailingFrameWriter {
+                inner: writer,
+                frame_type,
+                failed: failed.clone(),
+            },
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec!["terminal.close/1".into()],
+            },
+            broker.clone(),
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        settlement_frame(&mut peer).await;
+        peer.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":1,\"timeoutMs\":1000,\"command\":\"uncertain\",\"args\":{}}\n").await.unwrap();
+        let unknown = settlement_frame(&mut peer).await;
+        assert_eq!(unknown["id"], "r");
+        assert_eq!(unknown["effects"], "unknown");
+        assert_eq!(unknown["error"]["code"], "browser-failure");
+        executor.shutdown_started.notified().await;
+        if cancel {
+            peer.get_mut()
+                .write_all(
+                    b"{\"type\":\"cancel\",\"id\":\"c\",\"generation\":1,\"operationSeq\":1}\n",
+                )
+                .await
+                .unwrap();
+        }
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        executor.shutdown_release.notify_one();
+        // The original precise Unknown reached the peer. Neither a lost cancel
+        // ACK nor a failed Closed write can be substituted by the ensuing EOF.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), read_frame(&mut peer))
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none()
+        );
+        assert!(failed.load(std::sync::atomic::Ordering::SeqCst));
+        // The server's boolean is internal retained-owner proof, deliberately
+        // distinct from the missing correlated wire receipt at this peer.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), serving)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn terminal_close_writer_failure_after_unknown_cannot_emit_closed() {
+        terminal_close_lost_frame(b"\"type\":\"closed\"", false).await;
+    }
+    #[tokio::test]
+    async fn terminal_close_missing_cancel_ack_preserves_unknown_without_cleanup_receipt() {
+        terminal_close_lost_frame(b"\"type\":\"control-result\"", true).await;
+    }
+    struct PendingTerminalExecutor {
+        broker: std::sync::Arc<ClientSession>,
+        entered: tokio::sync::watch::Sender<usize>,
+    }
+    impl ClientExecutor for PendingTerminalExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        async fn execute(
+            &self,
+            command: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            lease: OperationLease,
+        ) -> NativeOutcome {
+            if command != "not-started" {
+                assert!(self.broker.start(lease.generation, lease.sequence).unwrap());
+            }
+            self.entered.send_modify(|count| *count += 1);
+            if command == "terminal" {
+                NativeOutcome {
+                    retention: None,
+                    result: Err(ProtocolError::BrowserFailure),
+                    effects: Effects::Unknown,
+                }
+            } else {
+                std::future::pending().await
+            }
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+    #[tokio::test]
+    async fn terminal_close_preserves_each_pending_started_classification_before_receipt() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let (entered, mut running) = tokio::sync::watch::channel(0usize);
+        let executor = std::sync::Arc::new(PendingTerminalExecutor {
+            broker: broker.clone(),
+            entered,
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec!["terminal.close/1".into()],
+            },
+            broker,
+            executor,
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        settlement_frame(&mut peer).await;
+        for (sequence, command) in [(1, "started"), (2, "not-started"), (3, "terminal")] {
+            let request = format!("{{\"type\":\"request\",\"id\":\"r{sequence}\",\"generation\":1,\"operationSeq\":{sequence},\"timeoutMs\":5000,\"command\":\"{command}\",\"args\":{{}}}}\n");
+            peer.get_mut().write_all(request.as_bytes()).await.unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                running.wait_for(|count| *count >= sequence),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        }
+        let original = settlement_frame(&mut peer).await;
+        assert_eq!(original["id"], "r3");
+        assert_eq!(original["effects"], "unknown");
+        assert_eq!(original["error"]["code"], "browser-failure");
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        let mut outcomes = std::collections::HashMap::new();
+        for _ in 0..2 {
+            let result = settlement_frame(&mut peer).await;
+            assert_eq!(result["type"], "result");
+            assert_eq!(result["scopeState"], "quarantined");
+            assert_eq!(result["error"]["code"], "cancelled");
+            outcomes.insert(
+                result["id"].as_str().unwrap().to_owned(),
+                result["effects"].as_str().unwrap().to_owned(),
+            );
+        }
+        assert_eq!(outcomes.get("r1").map(String::as_str), Some("unknown"));
+        assert_eq!(
+            outcomes.get("r2").map(String::as_str),
+            Some("not-dispatched")
+        );
+        let closed = settlement_frame(&mut peer).await;
+        assert_eq!(closed["type"], "closed");
+        assert_eq!(closed["id"], "z");
+        assert!(serving.await.unwrap());
+    }
+
     struct PublishingExecutor {
         sink: std::sync::Mutex<Option<ClientEventSink>>,
     }
@@ -1899,6 +2654,7 @@ mod tests {
             )
             .unwrap();
             NativeOutcome {
+                retention: None,
                 result: Ok(serde_json::json!({"identityScope":"same-scope"})),
                 effects: Effects::Completed,
             }
@@ -2075,6 +2831,7 @@ mod tests {
             _: OperationLease,
         ) -> NativeOutcome {
             NativeOutcome {
+                retention: None,
                 result: Err(ProtocolError::BrowserFailure),
                 effects: Effects::Unknown,
             }
@@ -2348,6 +3105,7 @@ mod tests {
             self.broker.start(lease.generation, lease.sequence).unwrap();
             self.finish.notified().await;
             NativeOutcome {
+                retention: None,
                 result: Ok(serde_json::Value::Null),
                 effects: Effects::NotDispatched,
             }
@@ -2449,6 +3207,7 @@ mod tests {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if command == "fresh" {
                 return NativeOutcome {
+                    retention: None,
                     result: Ok(serde_json::json!({"fresh": true})),
                     effects: Effects::Completed,
                 };
@@ -2466,6 +3225,7 @@ mod tests {
                 cancellation.changed().await.unwrap();
             }
             NativeOutcome {
+                retention: None,
                 result: Err(if std::time::Instant::now() >= lease.deadline {
                     ProtocolError::DeadlineExceeded
                 } else {
@@ -2937,6 +3697,7 @@ mod tests {
             _: OperationLease,
         ) -> NativeOutcome {
             NativeOutcome {
+                retention: None,
                 result: Err(ProtocolError::UnsupportedCommand),
                 effects: Effects::NotDispatched,
             }
@@ -3106,3 +3867,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "client_operation_retention_tests.rs"]
+mod operation_retention_tests;

@@ -3219,11 +3219,23 @@ impl ClientEnrollment {
     async fn contain_owned_before(&self, deadline: Instant) -> Result<(), ProtocolError> {
         match &self.ownership {
             ScopeOwnership::IsolatedContext => {
+                // Capture this exact owner's ledger before yielding. A later
+                // replacement on the shared transport cannot be cleared by the
+                // old disposal ACK. Identity and context binding are native-only.
+                let debt = self.client.debt_ledger();
+                if debt.as_ref().is_some_and(|ledger| {
+                    !ledger.matches_owner(self.generation, &self.targets.identity_scope)
+                }) {
+                    return Err(ProtocolError::StaleScope);
+                }
                 self.cleanup_command(
                     "Target.disposeBrowserContext",
                     json!({"browserContextId":self.targets.context_id}),
                 )
                 .await?;
+                if let Some(debt) = debt {
+                    debt.retire_after_context_destroy(&self.targets.context_id)?;
+                }
                 self.cleanup
                     .lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
@@ -4904,6 +4916,7 @@ mod tests {
             error: None,
             effects: super::super::client_protocol::Effects::Completed,
             scope_state: super::super::client_protocol::ScopeState::Usable,
+            retention: None,
         })
         .unwrap();
         let sink = scoped_sink;

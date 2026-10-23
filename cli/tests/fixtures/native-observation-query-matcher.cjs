@@ -197,3 +197,44 @@ const stale = new Element('div', 'stale'); stale.connected = false;
 assert.deepEqual(run(filter(selector('stale'), str('x')), [stale]), { error: 'stale-reference' });
 assert.match(source, /Some\("resource-limit"\)=>return Err\(ObservationError::ResourceLimit\)/);
 console.log('PASS: lazy/cached text acquisition, bounded per-root/aggregate length/depth/pending work, stale identity and typed resource-limit mapping');
+
+// Semantic text selection reads the same private fact, not rendered DTO text.
+const textQuery = (pattern, visible = false, scope) => ({ kind: 'query', query: { kind: 'text', value: pattern, ...(visible ? { visible: true } : {}) }, ...(scope ? { scope } : {}) });
+const hiddenTwin = new Element('p', 'hidden-twin').append(text('Decorative twin'));
+const visibleTwin = new Element('p', 'visible-twin').append(text('Decorative twin'));
+const twinNodes = [hiddenTwin, visibleTwin];
+const twinMetadata = [semantic({ text: '', states: { hidden: true } }), semantic({ text: 'Decorative twin' })];
+for (const node of twinNodes) { forbid(node, 'innerText'); forbid(node, 'textContent'); }
+const allTwins = textQuery(str('Decorative twin', true));
+const visibleTwins = textQuery(str('Decorative twin', true), true);
+assert.deepEqual(matched(allTwins, twinNodes, twinMetadata), [0, 1]);
+assert.deepEqual(matched(index(allTwins, 'first'), twinNodes, twinMetadata), [0]);
+for (const position of ['first', 'last', 0]) assert.deepEqual(matched(index(visibleTwins, position), twinNodes, twinMetadata), [1]);
+assert.deepEqual(matched(index(visibleTwins, 1), twinNodes, twinMetadata), []);
+assert.deepEqual(matched(filter(visibleTwins, str('twin')), twinNodes, twinMetadata), [1]);
+assert.equal(twinMetadata[0].text, '');
+assert.equal(JSON.stringify(run(allTwins, twinNodes, twinMetadata)).includes('Decorative'), false);
+const scopedPanel = new Element('section', 'panel').append(hiddenTwin, visibleTwin);
+assert.deepEqual(matched(textQuery(str('Decorative twin', true), true, selector('panel')), [scopedPanel, ...twinNodes], [semantic(), ...twinMetadata]), [2]);
+const hasVisibleTwin = { kind: 'filter', source: selector('panel'), has: visibleTwins };
+assert.deepEqual(matched(hasVisibleTwin, [scopedPanel, ...twinNodes], [semantic(), ...twinMetadata]), [0]);
+// Retained expressions reevaluate current candidate order after insertion.
+const insertedTwin = new Element('p', 'inserted-twin').append(text('Decorative twin'));
+assert.deepEqual(matched(index(visibleTwins, 'first'), [insertedTwin, ...twinNodes], [semantic(), ...twinMetadata]), [0]);
+for (const pattern of [str('A b\u200c\u200d C', true), regexp('^  A\\u200b\\u00ad\\t b\\u200c\\u200d\\nC  $', 'u')]) assert.deepEqual(matched(textQuery(pattern), [raw]), [0]);
+assert.deepEqual(matched(textQuery(str('A b C', true)), [raw]), []);
+// Immediate matching descendants suppress their parent even when hidden. A
+// closed-root match never suppresses a matching light-domain host.
+const visibleParent = new Element('div', 'visible-parent').append(new Element('span').append(text('Only text')));
+assert.deepEqual(matched(textQuery(str('Only text', true), true), [visibleParent, visibleParent.childNodes[0]], [semantic(), semantic({ states: { hidden: true } })]), []);
+const closedTextHost = new Element('div').append(text('Same text'));
+const closedTextRoot = closedTextHost.attachShadow('closed');
+const closedTextChild = new Element('span').append(text('Same text')); closedTextRoot.append(closedTextChild);
+assert.deepEqual(matched(textQuery(str('Same text', true)), [closedTextHost, closedTextChild]), [0, 1]);
+const openTextHost = new Element('div'); openTextHost.attachShadow('open').append(new Element('span').append(text('Open only')));
+assert.deepEqual(matched(textQuery(str('Open only', true)), [openTextHost]), []);
+for (const pattern of [str(''), regexp('.*'), regexp('^(?!never)')]) {
+  assert.deepEqual(matched(textQuery(pattern), [password]), []);
+  assert.deepEqual(matched(textQuery(pattern), [nativeAncestor], [semantic()], [true]), []);
+}
+console.log('PASS: private semantic text covers hidden twins, exact/regex, scope/filter/index/live reevaluation and open/closed/security boundaries');

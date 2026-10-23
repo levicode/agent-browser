@@ -968,3 +968,62 @@ console.log('PASS: shared native root acquisition follows one bounded author foc
   }
 }
 console.log('PASS: shared metadata keeps focus and selection aligned, withholding secure, collapsed, unfocused, and outside-editor selections');
+
+// td keeps the enclosing table's authored role as a private scalar; Rust uses
+// the same concrete-token parser as the receiver, not substring matching.
+for (const role of [null, '', 'grid', 'treegrid', 'unknown grid', 'region grid', 'unknown\u00a0grid']) {
+  const cell = new Element(); cell.localName = 'td'; cell.innerText = '';
+  cell.closest = selector => { assert.equal(selector, 'table'); return { getAttribute: name => { assert.equal(name, 'role'); return role; } }; };
+  for (const bounded of [false, true]) assert.equal(read.call(cell, 'data-testid', '.secure', bounded).cellTableRole, role);
+}
+const detachedCell = new Element(); detachedCell.localName = 'td'; detachedCell.closest = () => null;
+assert.equal(read.call(detachedCell, 'data-testid', '.secure', true).cellTableRole, null);
+console.log('PASS: public table-cell role facts preserve first-token source and no-table absence');
+
+// CI18: the same bounded content proof handles the five heading receivers,
+// preserving the intentional alert-content exception rather than axe's value.
+Node.prototype.contains = function(other) { return this === other || this.childNodes?.some(child => Node.prototype.contains.call(child, other)) || false; };
+document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+const heading = wrapper(); heading.localName = 'h2';
+const input = attributes(new InputControl('text', false), { 'aria-labelledby': 't1label', 'aria-label': 'ARIA Label' }); input.value = 'the value';
+const reference = wrapper([new Text('This is a ', null), wrapper([new Text('label', null)])]); reference.localName = 'div';
+const priorLookup = document.getElementById;
+document.getElementById = id => id === 't1label' ? reference : null;
+const headingFact = (inventory = true) => read.call(heading, 'data-testid', '.secure', true, false, inventory).completeContentNameFact;
+for (const [content, attrs, suffix] of [[[], { title: 'italics' }, ' italics'], [[], {}, ''], [[new Text('everything', null)], {role:'alert'}, ' everything'], [[new Text('everything', null)], {}, ' everything']]) {
+  const child = wrapper(content, attrs); child.localName = 'i';
+  heading.childNodes = [new Text('This is ', heading), input, new Text(' of ', heading), child];
+  assert.deepEqual(headingFact(), { source: 'heading', name: 'This is This is a label of' + suffix });
+}
+assert.equal(headingFact(false), null);
+attributes(input, {}); input.value = ''; input.labels = [wrapper([new Text('My form input', null)])];
+heading.childNodes = [input]; assert.deepEqual(headingFact(), { source: 'heading', name: '' });
+for (const type of ['password', 'number', 'file']) { input.type = type; assert.equal(headingFact(), null); }
+input.type = 'text'; input.secure = true;
+Object.defineProperty(input, 'value', { configurable: true, get() { throw Error('Secure value read'); } });
+assert.equal(headingFact(), null); input.secure = false;
+Object.defineProperty(input, 'value', { configurable: true, writable: true, value: 'value' });
+attributes(input, { 'aria-labelledby': 't1label' }); reference.nameDisplay = 'none';
+assert.equal(headingFact(), null); delete reference.nameDisplay;
+reference.childNodes.push(Object.assign(wrapper([new Text('Hidden', null)]), { nameDisplay: 'none' }));
+assert.equal(headingFact(), null); reference.childNodes.pop();
+attributes(input, { 'aria-labelledby': 't1label t1label' }); assert.equal(headingFact(), null);
+attributes(input, { 'aria-labelledby': 't1label' }); input.generated = '"generated"'; assert.equal(headingFact(), null); delete input.generated;
+attributes(heading, { 'aria-label': 'Explicit' }); assert.equal(headingFact(), null); attributes(heading, {});
+heading.childNodes = [new Text('x'.repeat(513), heading)]; assert.equal(headingFact(), null);
+document.getElementById = priorLookup;
+for (const role of ['alert', 'status']) {
+  const notice = wrapper([new Text('Application notice', null)], {role});
+  const noticeFact = local => read.call(notice, 'data-testid', '.secure', true, false, false, false, local).completeContentNameFact;
+  assert.equal(noticeFact(false), null);
+  assert.deepEqual(noticeFact(true), {source: role, name:'Application notice'});
+  notice.shadowRoot = {}; assert.equal(noticeFact(true), null); delete notice.shadowRoot;
+  attributes(notice, { role, 'aria-label':'Explicit' }); assert.equal(noticeFact(true), null);
+}
+const announcer = wrapper(); announcer.localName = 'next-route-announcer';
+const priorMatches = Element.prototype.matches;
+Element.prototype.matches = function(selector) { return selector.split(',').includes(this.localName) || priorMatches.call(this, selector); };
+assert.equal(read.call(announcer, 'data-testid', '.secure', true).author.suppress, true);
+Element.prototype.matches = priorMatches;
+document.defaultView.getComputedStyle = nameStyle;
+console.log('PASS: bounded heading names preserve alert content and empty values; local alert/status proof, explicit/security/hidden/budget negatives and announcer suppression');

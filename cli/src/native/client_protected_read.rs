@@ -2,6 +2,7 @@
 //! the existence of this module does not advertise a protected capability.
 
 use super::client_browser::BrowserExecutionLease;
+use super::client_debt::{command_scope, CommandCategory};
 use super::client_session::{CancelSignal, OperationLease};
 use super::client_targets::{ProtectedTargetBarrier, TargetPurpose};
 use serde_json::{json, Value};
@@ -175,6 +176,19 @@ impl<'a> ProtectedReadJournal<'a> {
         }
         result
     }
+    async fn read_command(
+        &self,
+        session: &str,
+        method: &str,
+        args: Value,
+    ) -> Result<Value, ProtectedReadReason> {
+        command_scope(
+            CommandCategory::ApplicationRead,
+            false,
+            self.command(session, method, args),
+        )
+        .await
+    }
     pub async fn stabilize_animations(&mut self) -> Result<(), ProtectedReadReason> {
         if self.started || self.restored {
             return Err(ProtectedReadReason::StaleScope);
@@ -184,7 +198,7 @@ impl<'a> ProtectedReadJournal<'a> {
             self.command(&session, "Animation.enable", json!({}))
                 .await?;
             let rate = self
-                .command(&session, "Animation.getPlaybackRate", json!({}))
+                .read_command(&session, "Animation.getPlaybackRate", json!({}))
                 .await?["playbackRate"]
                 .as_f64()
                 .filter(|rate| rate.is_finite())
@@ -246,7 +260,7 @@ impl<'a> ProtectedReadJournal<'a> {
             let object = object
                 .as_ref()
                 .ok_or(ProtectedReadReason::IncompleteInventory)?;
-            let response=self.command(session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":"function(){return this.verify()}","returnByValue":true,"objectGroup":group})).await?;
+            let response=self.read_command(session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":"function(){return this.verify()}","returnByValue":true,"objectGroup":group})).await?;
             if response.get("exceptionDetails").is_some() || response["result"]["value"] != true {
                 return Err(ProtectedReadReason::BrowserFailure);
             }
@@ -266,7 +280,7 @@ impl<'a> ProtectedReadJournal<'a> {
         let attempts = self.source_masks.clone();
         for (session, object, group) in attempts.into_iter().rev() {
             if let Some(handle) = &object {
-                let result=tokio::time::timeout_at(deadline.into(),self.page.client.send_command("Runtime.callFunctionOn",Some(json!({"objectId":handle,"functionDeclaration":"function(){return this.remove()}","returnByValue":true,"objectGroup":group})),Some(&session))).await;
+                let result=tokio::time::timeout_at(deadline.into(),command_scope(CommandCategory::CleanupOther,false,self.page.client.send_command("Runtime.callFunctionOn",Some(json!({"objectId":handle,"functionDeclaration":"function(){return this.remove()}","returnByValue":true,"objectGroup":group})),Some(&session)))).await;
                 let removed = matches!(&result,Ok(Ok(value)) if value.get("exceptionDetails").is_none() && value["result"]["value"]==true);
                 if !removed {
                     continue;
@@ -318,10 +332,14 @@ impl<'a> ProtectedReadJournal<'a> {
             complete &= matches!(
                 tokio::time::timeout_at(
                     command_deadline.into(),
-                    self.page.client.send_command(
-                        "Animation.setPlaybackRate",
-                        Some(json!({"playbackRate":rate})),
-                        Some(session)
+                    command_scope(
+                        CommandCategory::CleanupOther,
+                        false,
+                        self.page.client.send_command(
+                            "Animation.setPlaybackRate",
+                            Some(json!({"playbackRate":rate})),
+                            Some(session)
+                        )
                     )
                 )
                 .await,
@@ -557,6 +575,45 @@ mod tests {
         journal.check().unwrap();
         journal.restore().await.unwrap();
         assert_eq!(journal.check(), Err(super::ProtectedReadReason::StaleScope));
+        drop(journal);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_mask_removal_retains_mutation_owner_not_just_release_debt() {
+        let (page, operation, _sender, server, records) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
+        journal
+            .reserve_source_group("session".into(), "mutation-owner".into())
+            .unwrap();
+        journal
+            .bind_source_holder("session", "mutation-owner", "fail-remove".into())
+            .unwrap();
+        journal.verify_source_masks().await.unwrap();
+        let failure = journal.restore().await.unwrap_err();
+        assert!(failure.cleanup_integrity_lost);
+        assert!(!journal.restored);
+        assert_eq!(
+            journal.source_masks,
+            vec![(
+                "session".into(),
+                Some("fail-remove".into()),
+                "mutation-owner".into()
+            )]
+        );
+        let requests = records.lock().unwrap();
+        assert!(requests
+            .iter()
+            .any(|r| r["method"] == "Runtime.callFunctionOn"
+                && r["params"]["objectId"] == "fail-remove"
+                && r["params"]["functionDeclaration"] == "function(){return this.remove()}"));
+        // Releasing the object group would discard the cleanup owner without
+        // proving the source mutation was undone. Production correctly keeps it.
+        assert!(!requests
+            .iter()
+            .any(|r| r["method"] == "Runtime.releaseObjectGroup"));
+        drop(requests);
         drop(journal);
         server.abort();
     }

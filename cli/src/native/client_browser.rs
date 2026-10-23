@@ -899,6 +899,15 @@ impl OwnedBrowser {
         if self.runtime.is_some() || (!self.owns_context && self.borrowed_targets.is_none()) {
             return Err(ProtocolError::PolicyDenied);
         }
+        let debt = super::client_debt::OwnerDebtLedger::new(
+            operation.generation,
+            self.identity_scope.clone(),
+        );
+        // A borrowed default context has no context-destruction authority.
+        if !self.context_id.is_empty() {
+            debt.bind_context(&self.context_id)?;
+        }
+        self.manager.client.install_debt_ledger(debt)?;
         let seeded = replacement.is_some();
         if let Some(seed) = &replacement {
             self.page_state = Arc::new(super::client_page::ClientPageState::from_config_snapshot(
@@ -1204,6 +1213,7 @@ impl OwnedBrowser {
         }
         self.ui.seal();
         self.targets.seal();
+        let debt = self.manager.client.debt_ledger();
         self.manager
             .client
             .send_command(
@@ -1213,6 +1223,9 @@ impl OwnedBrowser {
             )
             .await
             .map_err(|_| ProtocolError::CleanupFailed)?;
+        if let Some(ledger) = debt {
+            ledger.retire_after_context_destroy(&self.context_id)?;
+        }
         self.manager.forget_disposed_targets(&ids);
         if retained_cleanup_failed {
             Err(ProtocolError::CleanupFailed)
@@ -1257,6 +1270,7 @@ impl OwnedBrowser {
                 Err(ProtocolError::CleanupFailed)
             };
         }
+        let debt = self.manager.client.debt_ledger();
         let disposed = self
             .manager
             .client
@@ -1266,8 +1280,15 @@ impl OwnedBrowser {
                 None,
             )
             .await;
+        let debt_retired = if disposed.is_ok() {
+            debt.map(|ledger| ledger.retire_after_context_destroy(&self.context_id))
+                .transpose()
+        } else {
+            Ok(None)
+        };
         let closed = self.manager.close().await;
-        if disposed.is_err() || closed.is_err() || retained_cleanup_failed {
+        if disposed.is_err() || closed.is_err() || retained_cleanup_failed || debt_retired.is_err()
+        {
             Err(ProtocolError::CleanupFailed)
         } else {
             Ok(())
@@ -1470,6 +1491,7 @@ pub(super) fn settle_observation_dispatch(
         || matches!(&output, Ok(Err(failure)) if failure.cleanup_integrity_lost);
     let outcome = match output {
         Ok(Ok(value)) if !cleanup_failed => NativeOutcome {
+            retention: None,
             result: Ok(value),
             effects: Effects::Completed,
         },
@@ -1480,11 +1502,13 @@ pub(super) fn settle_observation_dispatch(
                 Effects::NotDispatched
             };
             NativeOutcome {
+                retention: None,
                 result: Err(failure.error),
                 effects,
             }
         }
         _ => NativeOutcome {
+            retention: None,
             result: Err(ProtocolError::CleanupFailed),
             effects: Effects::Unknown,
         },
@@ -1494,7 +1518,37 @@ pub(super) fn settle_observation_dispatch(
     (outcome, cleanup_failed)
 }
 
+/// Exact-key test observation only. It cannot grant admission or release a lock.
+#[cfg(test)]
+struct GenericAdmissionProbe {
+    key: super::client_debt::OperationKey,
+    reached: tokio::sync::oneshot::Sender<()>,
+}
+
+#[cfg(test)]
+async fn observe_generic_guard_wait<'a>(
+    gate: &'a tokio::sync::Mutex<()>,
+    key: super::client_debt::OperationKey,
+    probe: &Arc<Mutex<Option<GenericAdmissionProbe>>>,
+) -> tokio::sync::MutexGuard<'a, ()> {
+    let lock = gate.lock();
+    tokio::pin!(lock);
+    std::future::poll_fn(|cx| {
+        let polled = std::future::Future::poll(lock.as_mut(), cx);
+        if polled.is_pending() {
+            let mut probe = probe.lock().unwrap();
+            if probe.as_ref().is_some_and(|probe| probe.key == key) {
+                let _ = probe.take().unwrap().reached.send(());
+            }
+        }
+        polled
+    })
+    .await
+}
+
 pub struct ClientBrowser {
+    #[cfg(test)]
+    generic_admission_probe: Arc<Mutex<Option<GenericAdmissionProbe>>>,
     broker: Arc<super::client_session::ClientSession>,
     event_sink: std::sync::OnceLock<super::client_transport::ClientEventSink>,
     gate: Arc<ExecutionGate>,
@@ -1518,6 +1572,8 @@ impl ClientBrowser {
         let observation =
             super::client_observation_dispatch::ObservationDispatch::new(refs.clone());
         Self {
+            #[cfg(test)]
+            generic_admission_probe: Arc::new(Mutex::new(None)),
             broker,
             event_sink: std::sync::OnceLock::new(),
             gate: Arc::new(ExecutionGate::default()),
@@ -1844,6 +1900,27 @@ impl ClientBrowser {
         Ok(())
     }
 
+    fn operation_journal(
+        page: &BrowserExecutionLease,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<super::client_debt::OperationJournalHandle, ProtocolError> {
+        page.permit.check()?;
+        let ledger = page
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        let journal = ledger.operation(
+            super::client_debt::OperationKey {
+                generation: operation.generation,
+                operation_seq: operation.sequence,
+            },
+            page.target_id.clone(),
+            page.page_session_id.clone(),
+        )?;
+        journal.bind_operation(operation)?;
+        Ok(journal)
+    }
+
     async fn page_lease(
         &self,
         callback_child: bool,
@@ -1859,6 +1936,25 @@ impl ClientBrowser {
 }
 
 impl super::client_transport::ClientExecutor for ClientBrowser {
+    fn operation_retention_status(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> super::client_operation_state::OperationRetentionStatus {
+        self.tasks.operation_retention_status(key)
+    }
+    fn cancel_operation_producer(&self, key: super::client_debt::OperationKey) {
+        self.tasks.cancel_operation_producer(key);
+    }
+    fn fix_operation_result(&self, key: super::client_debt::OperationKey) {
+        self.tasks.fix_operation_result(key);
+    }
+    async fn retire_operation_publication(
+        &self,
+        _key: super::client_debt::OperationKey,
+    ) -> Result<(), ProtocolError> {
+        self.observation.retire_interaction().await
+    }
+
     fn set_event_sink(
         &self,
         sink: super::client_transport::ClientEventSink,
@@ -1909,6 +2005,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         // Capabilities describe implemented, wired candidate contracts. External
         // acceptance evidence separately determines release readiness.
         let capabilities = [
+            super::client_protocol::EXACT_OWNER_CONTINUATION,
             "browser.scope/1",
             "browser.lifecycle/1",
             "browser.evaluate/1",
@@ -1961,6 +2058,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Some(value) => value.to_owned(),
                 None => {
                     return NativeOutcome {
+                        retention: None,
                         result: Err(ProtocolError::InvalidArguments),
                         effects: Effects::NotDispatched,
                     }
@@ -1975,6 +2073,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 != Some(scope.as_str())
             {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::StaleScope),
                     effects: Effects::NotDispatched,
                 };
@@ -2036,6 +2135,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             }
             "scope.end" => {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::InvalidArguments),
                     effects: Effects::NotDispatched,
                 }
@@ -2094,12 +2194,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             | "scope.restart"
             | "scope.reset" => {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::InvalidArguments),
                     effects: Effects::NotDispatched,
                 }
             }
             _ => {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::UnsupportedCommand),
                     effects: Effects::NotDispatched,
                 }
@@ -2109,21 +2211,38 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             Ok(value) => value,
             Err(_) => {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::InvalidArguments),
                     effects: Effects::NotDispatched,
                 }
             }
         };
+        if command != "scope.end" {
+            let admission = async {
+                self.broker.wait_application_publication(&lease).await?;
+                self.tasks.wait_application(&lease).await
+            }
+            .await;
+            if let Err(error) = admission {
+                return NativeOutcome {
+                    retention: None,
+                    result: Err(error),
+                    effects: Effects::NotDispatched,
+                };
+            }
+        }
         match self.broker.start(lease.generation, lease.sequence) {
             Ok(true) => {}
             Ok(false) => {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::Cancelled),
                     effects: Effects::NotDispatched,
                 }
             }
             Err(error) => {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(error),
                     effects: Effects::NotDispatched,
                 }
@@ -2145,6 +2264,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     Ok(request) => request,
                     Err(_) => {
                         return NativeOutcome {
+                            retention: None,
                             result: Err(ProtocolError::InvalidArguments),
                             effects: Effects::NotDispatched,
                         }
@@ -2199,7 +2319,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             } else {
                 Effects::NotDispatched
             };
-            return NativeOutcome { result, effects };
+            return NativeOutcome {
+                retention: None,
+                result,
+                effects,
+            };
         }
         if command == "scope.configure" {
             let request: ConfigureRequest =
@@ -2207,6 +2331,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     Ok(request) => request,
                     Err(_) => {
                         return NativeOutcome {
+                            retention: None,
                             result: Err(ProtocolError::InvalidArguments),
                             effects: Effects::NotDispatched,
                         }
@@ -2240,12 +2365,23 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Ok(value) => value,
                 Err(error) => {
                     return NativeOutcome {
+                        retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
                     }
                 }
             };
-            let receive = self.tasks.start(page.identity_scope.clone(), page.targets.clone(), async move {
+            let journal = match Self::operation_journal(&page, &lease) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let receive = self.tasks.start_operation(page.identity_scope.clone(), page.targets.clone(), self.broker.clone(), journal.clone(), lease.cancellation.clone(), async move {
                 let mut dispatched = false;
                 let result = async {
                     page.permit.check()?;
@@ -2286,7 +2422,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 let failed = result.is_err() && dispatched;
                 if failed { page.targets.seal(); }
                 let effects = if failed { Effects::Unknown } else if result.is_err() { Effects::NotDispatched } else { Effects::Completed };
-                (NativeOutcome { result, effects }, failed)
+                (NativeOutcome { retention: None, result, effects }, failed)
             }).await;
             return await_retained(receive).await;
         }
@@ -2325,6 +2461,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Ok(request) => request,
                 Err(_) => {
                     return NativeOutcome {
+                        retention: None,
                         result: Err(ProtocolError::InvalidArguments),
                         effects: Effects::NotDispatched,
                     }
@@ -2374,6 +2511,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Ok(context) => context,
                 Err(error) => {
                     return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let journal = match Self::operation_journal(&context.page, &lease) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
                     }
@@ -2382,9 +2530,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let observation = self.observation.clone();
             let receive = self
                 .tasks
-                .start_prepared(
+                .start_operation_prepared(
                     context.scope.identity_scope.clone(),
                     context.page.targets.clone(),
+                    self.broker.clone(),
+                    journal,
+                    lease.cancellation.clone(),
                     move || {
                         // The registry has accepted capacity, but has not spawned
                         // work. Exact-owner/policy validation and Observe ticket
@@ -2460,57 +2611,132 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Ok(value) => value,
                 Err(error) => {
                     return NativeOutcome {
+                        retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
                     }
                 }
             };
-            // The action helper validates an internal captured identity, not a
-            // purpose or authority chosen in the command payload.
+            // Direct coordinates carry exact page authority, not DOM/viewport
+            // reference authority. Validate them before any renderer preflight.
             args.insert("identityScope".into(), page.identity_scope.clone().into());
+            let args = serde_json::Value::Object(args);
+            let direct_point = if command == "browser.pointer" {
+                match super::client_actions::ClientActions::is_direct_point(&args) {
+                    Ok(direct) => direct,
+                    Err(error) => {
+                        return NativeOutcome {
+                            retention: None,
+                            result: Err(error),
+                            effects: Effects::NotDispatched,
+                        }
+                    }
+                }
+            } else {
+                false
+            };
             let observation = self.observation.clone();
-            let receive = self.tasks.start(page.identity_scope.clone(), page.targets.clone(), async move {
+            let publication_fence = match observation.publication_fence() {
+                Ok(fence) => fence,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let attachment = match page.targets.owned_target(&page.target_id) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let journal = match Self::operation_journal(&page, &lease) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let action_broker = self.broker.clone();
+            let action_tasks = self.tasks.clone();
+            let receive = self.tasks.start_operation(page.identity_scope.clone(), page.targets.clone(), self.broker.clone(), journal.clone(), lease.cancellation.clone(), async move {
                 let mut activation_dispatched = false;
-                let preflight = async {
+                let admission = async {
                     page.permit.check()?;
                     let ui_permit = ui.enter(false, lease.is_callback, lease.deadline, lease.cancellation.clone()).await?;
                     page.permit.check()?;
                     let mut cancellation = lease.cancellation.clone();
                     if *cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
-                    let input_permit = tokio::select! {
-                        biased;
+                    let input_permit = tokio::select! { biased;
                         _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
                         guard = tokio::time::timeout_at(lease.deadline.into(), input_gate.lock()) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
                     };
                     page.permit.check()?;
+                    if !attachment.same_attachment(&page.targets.owned_target(&page.target_id)?) {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    if !action_broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
+                    action_tasks.check_input_dispatch(journal.key())?;
+                    let ledger = page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?;
+                    ledger.check_admission(if direct_point { super::client_debt::AdmissionClass::Input } else { super::client_debt::AdmissionClass::Reference })?;
+                    if !direct_point { observation.check_publication_fence(publication_fence)?; }
                     if command == "recording.start" {
-                        super::client_actions::ClientActions::validate_recording_start(&page.identity_scope, &serde_json::Value::Object(args.clone()))?;
+                        super::client_actions::ClientActions::validate_recording_start(&page.identity_scope, &args)?;
                         activation.ensure(&page, &lease, &mut activation_dispatched).await?;
                     }
-                    let frames = super::client_observation_dispatch::verified_frames(&page, &lease).await?;
-                    let geometry = super::client_geometry::GeometrySnapshot::capture(&page.client, &page.page_session_id, &frames, &lease).await.map_err(|error| {
-                        use super::client_geometry::GeometryError;
-                        match error {
-                            GeometryError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
-                            GeometryError::Cancelled => ProtocolError::Cancelled,
-                            GeometryError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
-                            GeometryError::StaleIdentity => ProtocolError::StaleScope,
-                            _ => ProtocolError::BrowserFailure,
-                        }
-                    })?;
-                    let (revision, refs, observed_revision) = observation.snapshot_with_observation(&lease).await?;
-                    let sessions = frames.iter().filter(|frame| frame.parent_frame_id.is_some())
-                        .map(|frame| (frame.binding.frame.clone(), frame.binding.session.clone())).collect::<std::collections::HashMap<_,_>>();
-                    Ok((ui_permit, input_permit, revision, refs, frames, sessions, geometry, observed_revision))
+                    Ok((ui_permit, input_permit))
                 }.await;
-                let (_ui, _input, revision, refs, frames, sessions, geometry, observed_revision) = match preflight {
+                let (ui_permit, input_permit) = match admission {
                     Ok(value) => value,
-                    Err(error) => { let cleanup_failed = error == ProtocolError::CleanupFailed; return (NativeOutcome { result: Err(error), effects: if activation_dispatched { Effects::Unknown } else { Effects::NotDispatched } }, cleanup_failed); },
+                    Err(error) => { let dirty = error == ProtocolError::CleanupFailed; return (NativeOutcome { retention: None, result: Err(error), effects: if activation_dispatched { Effects::Unknown } else { Effects::NotDispatched } }, dirty); },
                 };
-                match actions.execute(super::client_actions::ActionContext { observation_after, observed_revision, page:&page, operation:&lease, page_state:&page_state, refs:&refs, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }, &command, &serde_json::Value::Object(args)).await {
+                let outcome = if direct_point {
+                    // No RefMap, verified_frames, GeometrySnapshot or fabricated
+                    // viewport reaches this branch. Guards outlive input cleanup.
+                    actions.execute_direct_point(super::client_actions::DirectPointContext {
+                        page: &page, operation: &lease, page_state: &page_state, journal: &journal,
+                        ui: ui_permit, input: input_permit,
+                    }, &args).await
+                } else {
+                    let _ui = ui_permit;
+                    let _input = input_permit;
+                    let preflight = async {
+                        let frames = super::client_observation_dispatch::verified_frames(&page, &lease).await?;
+                        let geometry = super::client_geometry::GeometrySnapshot::capture(&page.client, &page.page_session_id, &frames, &lease).await.map_err(|error| {
+                            use super::client_geometry::GeometryError;
+                            match error {
+                                GeometryError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
+                                GeometryError::Cancelled => ProtocolError::Cancelled,
+                                GeometryError::DeadlineExceeded => ProtocolError::DeadlineExceeded,
+                                GeometryError::StaleIdentity => ProtocolError::StaleScope,
+                                _ => ProtocolError::BrowserFailure,
+                            }
+                        })?;
+                        let (revision, refs, observed_revision) = observation.snapshot_with_observation(&lease).await?;
+                        observation.check_publication_fence(publication_fence)?;
+                        let sessions = frames.iter().filter(|frame| frame.parent_frame_id.is_some())
+                            .map(|frame| (frame.binding.frame.clone(), frame.binding.session.clone())).collect::<std::collections::HashMap<_,_>>();
+                        Ok((revision, refs, frames, sessions, geometry, observed_revision))
+                    }.await;
+                    let (revision, refs, frames, sessions, geometry, observed_revision) = match preflight {
+                        Ok(value) => value,
+                        Err(error) => { let dirty = error == ProtocolError::CleanupFailed; return (NativeOutcome { retention: None, result: Err(error), effects: if activation_dispatched { Effects::Unknown } else { Effects::NotDispatched } }, dirty); },
+                    };
+                    actions.execute(super::client_actions::ActionContext { observation_after, observed_revision, page:&page, operation:&lease, page_state:&page_state, refs:&refs, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }, &command, &args).await
+                };
+                match outcome {
                     Ok(value) => {
                         if command == "recording.start" { page_active.store(true, std::sync::atomic::Ordering::SeqCst); }
-                        (NativeOutcome { result: Ok(value), effects: Effects::Completed }, false)
+                        (NativeOutcome { retention: None, result: Ok(value), effects: Effects::Completed }, false)
                     },
                     Err(failure) => {
                         if command == "recording.start" && failure.effects != Effects::NotDispatched { page_active.store(true, std::sync::atomic::Ordering::SeqCst); }
@@ -2521,7 +2747,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             Some(ActionReason::ControlReplacedAfterClick) => ProtocolError::CheckedControlReplaced,
                             _ => failure.error,
                         };
-                        (NativeOutcome { result: Err(error), effects: if activation_dispatched && failure.effects == Effects::NotDispatched { Effects::Completed } else { failure.effects } }, failure.cleanup_failed)
+                        (NativeOutcome { retention: None, result: Err(error), effects: if activation_dispatched && failure.effects == Effects::NotDispatched { Effects::Completed } else { failure.effects } }, failure.cleanup_failed)
                     }
                 }
             }).await;
@@ -2564,6 +2790,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Ok(value) => value,
                 Err(error) => {
                     return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let journal = match Self::operation_journal(&page, &lease) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
                     }
@@ -2571,9 +2808,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             };
             let receive = self
                 .tasks
-                .start(
+                .start_operation(
                     page.identity_scope.clone(),
                     page.targets.clone(),
+                    self.broker.clone(),
+                    journal,
+                    lease.cancellation.clone(),
                     async move {
                         use super::client_state_dispatch::CapturedStateContext;
                         let admission = async {
@@ -2594,6 +2834,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                 eprintln!("state.capture phase=pre-attestation error={error:?}");
                                 return (
                                     NativeOutcome {
+                                        retention: None,
                                         result: Err(error),
                                         effects: Effects::NotDispatched,
                                     },
@@ -2618,6 +2859,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             Err(failure) => {
                                 return (
                                     NativeOutcome {
+                                        retention: None,
                                         result: Err(failure.error),
                                         effects: Effects::NotDispatched,
                                     },
@@ -2636,6 +2878,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         match exported {
                             Err(failure) => (
                                 NativeOutcome {
+                                    retention: None,
                                     result: Err(failure.error),
                                     effects: Effects::NotDispatched,
                                 },
@@ -2664,6 +2907,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                 match checked {
                                     Ok(value) => (
                                         NativeOutcome {
+                                            retention: None,
                                             result: Ok(value),
                                             effects: Effects::Completed,
                                         },
@@ -2674,6 +2918,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                             blobs.release(&scope, &captured.blob.handle).is_err();
                                         (
                                             NativeOutcome {
+                                                retention: None,
                                                 result: Err(error),
                                                 effects: Effects::NotDispatched,
                                             },
@@ -2718,21 +2963,36 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Ok(captured) => captured,
                 Err(error) => {
                     return NativeOutcome {
+                        retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
                     }
                 }
             };
             let broker = self.broker.clone();
+            let journal = match Self::operation_journal(&page, &lease) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
             let receive = self
                 .tasks
-                .start(
+                .start_operation(
                     page.identity_scope.clone(),
                     page.targets.clone(),
+                    self.broker.clone(),
+                    journal,
+                    lease.cancellation.clone(),
                     async move {
                         if let Err(error) = page.permit.check() {
                             return (
                                 NativeOutcome {
+                                    retention: None,
                                     result: Err(error),
                                     effects: Effects::NotDispatched,
                                 },
@@ -2753,6 +3013,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         .await
                         {
                             Ok(value) => NativeOutcome {
+                                retention: None,
                                 result: Ok(value),
                                 effects: Effects::Completed,
                             },
@@ -2764,6 +3025,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                     let _ = broker.quarantine();
                                 }
                                 NativeOutcome {
+                                    retention: None,
                                     result: Err(failure.error),
                                     effects: failure.effects,
                                 }
@@ -2803,12 +3065,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Ok(page) if captured_scope.as_deref() == Some(page.identity_scope.as_str()) => page,
                 Ok(_) => {
                     return NativeOutcome {
+                        retention: None,
                         result: Err(ProtocolError::StaleScope),
                         effects: Effects::NotDispatched,
                     }
                 }
                 Err(error) => {
                     return NativeOutcome {
+                        retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
                     }
@@ -2848,14 +3112,38 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             )) = captured
             else {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::StaleScope),
                     effects: Effects::NotDispatched,
                 };
             };
             let broker = self.broker.clone();
-            let receive = self.tasks.start(page.identity_scope.clone(), page.targets.clone(), async move {
+            let dispatch_tasks = self.tasks.clone();
+            #[cfg(test)]
+            let admission_probe = self.generic_admission_probe.clone();
+            let attachment = match page.targets.owned_target(&page.target_id) {
+                Ok(attachment) => attachment,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let journal = match Self::operation_journal(&page, &lease) {
+                Ok(journal) => journal,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+            let receive = self.tasks.start_operation(page.identity_scope.clone(), page.targets.clone(), self.broker.clone(), journal.clone(), lease.cancellation.clone(), async move {
                 if let Err(error) = page.permit.check() {
-                    return (NativeOutcome { result: Err(error), effects: Effects::NotDispatched }, false);
+                    return (NativeOutcome { retention: None, result: Err(error), effects: Effects::NotDispatched }, false);
                 }
                 let mut dispatched = false;
                 let result = async {
@@ -2871,6 +3159,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             )
                             .await?;
                         page.permit.check()?;
+                        if !broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
+                        if !matches!(command.as_str(), "page.title" | "page.url" | "session.environment" | "context.cookies.get") {
+                            dispatch_tasks.check_input_dispatch(journal.key())?;
+                        }
+                        page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?.check_admission(
+                            if matches!(command.as_str(), "page.title" | "page.url" | "session.environment" | "context.cookies.get") {
+                                super::client_debt::AdmissionClass::FixedRead
+                            } else { super::client_debt::AdmissionClass::Input }
+                        )?;
                         // Enrollment and context changes share only this narrow
                         // configuration boundary; navigation and callback reads
                         // must never hold it while waiting on application work.
@@ -2882,10 +3179,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             if *cancellation.borrow() != super::client_session::CancelSignal::None {
                                 return Err(ProtocolError::Cancelled);
                             }
+                            #[cfg(not(test))]
+                            let guard = config_gate.lock();
+                            #[cfg(test)]
+                            let guard = observe_generic_guard_wait(&config_gate, journal.key(), &admission_probe);
                             Some(tokio::select! {
                                 biased;
                                 _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
-                                result = tokio::time::timeout_at(lease.deadline.into(), config_gate.lock()) =>
+                                result = tokio::time::timeout_at(lease.deadline.into(), guard) =>
                                     result.map_err(|_| ProtocolError::DeadlineExceeded)?,
                             })
                         } else {
@@ -2895,12 +3196,30 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let _input = if matches!(command.as_str(), "input.keyboard" | "input.mouse") {
                             let mut cancellation = lease.cancellation.clone();
                             if *cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
+                            #[cfg(not(test))]
+                            let guard = input_gate.lock();
+                            #[cfg(test)]
+                            let guard = observe_generic_guard_wait(&input_gate, journal.key(), &admission_probe);
                             Some(tokio::select! {
                                 biased;
                                 _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
-                                guard = tokio::time::timeout_at(lease.deadline.into(), input_gate.lock()) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
+                                guard = tokio::time::timeout_at(lease.deadline.into(), guard) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
                             })
                         } else { None };
+                        // Admission before a mutex wait is not dispatch authority.
+                        // Cleanup can retain debt or retire publication while this
+                        // command waits for the configuration/input guard.
+                        page.permit.check()?;
+                        if !attachment.same_attachment(&page.targets.owned_target(&page.target_id)?) {
+                            return Err(ProtocolError::StaleScope);
+                        }
+                        if !broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
+                        let fixed_read = matches!(command.as_str(), "page.title" | "page.url" | "session.environment" | "context.cookies.get");
+                        if !fixed_read { dispatch_tasks.check_input_dispatch(journal.key())?; }
+                        page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?.check_admission(
+                            if fixed_read { super::client_debt::AdmissionClass::FixedRead }
+                            else { super::client_debt::AdmissionClass::Input }
+                        )?;
                         if command == "session.environment" {
                             return environment_facts(&page, &lease, configured_user_agent.as_deref()).await;
                         }
@@ -2959,11 +3278,10 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 let effects = if !dispatched || matches!(result, Err(ProtocolError::InvalidArguments | ProtocolError::UnsupportedCommand)) {
                     Effects::NotDispatched
                 } else if expired || (result.is_err() && mutating) {
-                    let _ = broker.quarantine();
                     Effects::Unknown
                 } else { Effects::Completed };
                 let result = if expired { Err(ProtocolError::Cancelled) } else { result };
-                (NativeOutcome { result, effects }, cleanup_failed)
+                (NativeOutcome { retention: None, result, effects }, cleanup_failed)
             }).await;
             return await_retained(receive).await;
         };
@@ -2973,6 +3291,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         {
             let _ = self.broker.quarantine();
             return NativeOutcome {
+                retention: None,
                 result: Err(ProtocolError::Cancelled),
                 effects: Effects::Unknown,
             };
@@ -2988,7 +3307,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         } else {
             Effects::Completed
         };
-        NativeOutcome { result, effects }
+        NativeOutcome {
+            retention: None,
+            result,
+            effects,
+        }
     }
 
     async fn shutdown(&self) -> Result<(), ProtocolError> {
@@ -3104,10 +3427,12 @@ async fn await_retained(
     use super::client_transport::NativeOutcome;
     match receiver {
         Ok(receiver) => receiver.await.unwrap_or(NativeOutcome {
+            retention: None,
             result: Err(ProtocolError::CleanupFailed),
             effects: Effects::Unknown,
         }),
         Err(error) => NativeOutcome {
+            retention: None,
             result: Err(error),
             effects: Effects::NotDispatched,
         },
@@ -3155,6 +3480,7 @@ impl ClientBrowser {
             Ok(value) => value,
             Err(error) => {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(error),
                     effects: Effects::NotDispatched,
                 }
@@ -3169,6 +3495,7 @@ impl ClientBrowser {
             Some(sink) => sink,
             None => {
                 return NativeOutcome {
+                    retention: None,
                     result: Err(ProtocolError::ScopeUnavailable),
                     effects: Effects::NotDispatched,
                 }
@@ -3235,7 +3562,7 @@ impl ClientBrowser {
             dirty |= effects && result.is_err();
             if dirty { targets.seal(); }
             let effect = if result.is_ok() { Effects::Completed } else if effects { Effects::Unknown } else { Effects::NotDispatched };
-            (NativeOutcome { result, effects:effect }, dirty)
+            (NativeOutcome { retention: None, result, effects:effect }, dirty)
         }).await;
         await_retained(receive).await
     }
@@ -3271,6 +3598,7 @@ impl ClientBrowser {
         use super::client_transport::NativeOutcome;
         if operation.is_callback {
             return NativeOutcome {
+                retention: None,
                 result: Err(ProtocolError::InvalidArguments),
                 effects: Effects::NotDispatched,
             };
@@ -3278,16 +3606,17 @@ impl ClientBrowser {
         let mut cancellation = operation.cancellation.clone();
         if let Err(error) = check_lifecycle_budget(&operation) {
             return NativeOutcome {
+                retention: None,
                 result: Err(error),
                 effects: Effects::NotDispatched,
             };
         }
         let transition = tokio::select! {
             biased;
-            _ = cancellation.changed() => return NativeOutcome { result:Err(ProtocolError::Cancelled), effects:Effects::NotDispatched },
+            _ = cancellation.changed() => return NativeOutcome { retention: None, result:Err(ProtocolError::Cancelled), effects:Effects::NotDispatched },
             value = tokio::time::timeout_at(operation.deadline.into(), self.lifecycle.clone().lock_owned()) => match value {
                 Ok(value) => value,
-                Err(_) => return NativeOutcome { result:Err(ProtocolError::DeadlineExceeded), effects:Effects::NotDispatched },
+                Err(_) => return NativeOutcome { retention: None, result:Err(ProtocolError::DeadlineExceeded), effects:Effects::NotDispatched },
             },
         };
         let mut slot = self.startup_task.lock().await;
@@ -3302,6 +3631,7 @@ impl ClientBrowser {
         let uncertain = self.startup_uncertain.clone();
         let Some(sink) = self.event_sink.get().cloned() else {
             return NativeOutcome {
+                retention: None,
                 result: Err(ProtocolError::ScopeUnavailable),
                 effects: Effects::NotDispatched,
             };
@@ -3566,10 +3896,15 @@ impl ClientBrowser {
             } else {
                 Effects::NotDispatched
             };
-            let _ = send.send(NativeOutcome { result, effects });
+            let _ = send.send(NativeOutcome {
+                retention: None,
+                result,
+                effects,
+            });
         }));
         drop(slot);
         receive.await.unwrap_or(NativeOutcome {
+            retention: None,
             result: Err(ProtocolError::CleanupFailed),
             effects: Effects::Unknown,
         })
@@ -3598,12 +3933,14 @@ impl ClientBrowser {
             .any(|v| v.is_empty() || v.len() > 1024)
         {
             return NativeOutcome {
+                retention: None,
                 result: Err(ProtocolError::InvalidArguments),
                 effects: Effects::NotDispatched,
             };
         }
         if let Err(error) = check_lifecycle_budget(&operation) {
             return NativeOutcome {
+                retention: None,
                 result: Err(error),
                 effects: Effects::NotDispatched,
             };
@@ -3611,14 +3948,15 @@ impl ClientBrowser {
         let mut cancellation = operation.cancellation.clone();
         let transition = tokio::select! {
             biased;
-            _ = cancellation.changed() => return NativeOutcome { result: Err(ProtocolError::Cancelled), effects: Effects::NotDispatched },
+            _ = cancellation.changed() => return NativeOutcome { retention: None, result: Err(ProtocolError::Cancelled), effects: Effects::NotDispatched },
             result = tokio::time::timeout_at(operation.deadline.into(), self.lifecycle.clone().lock_owned()) => match result {
                 Ok(guard) => guard,
-                Err(_) => return NativeOutcome { result: Err(ProtocolError::DeadlineExceeded), effects: Effects::NotDispatched },
+                Err(_) => return NativeOutcome { retention: None, result: Err(ProtocolError::DeadlineExceeded), effects: Effects::NotDispatched },
             },
         };
         let Some(sink) = self.event_sink.get().cloned() else {
             return NativeOutcome {
+                retention: None,
                 result: Err(ProtocolError::ScopeUnavailable),
                 effects: Effects::NotDispatched,
             };
@@ -3882,10 +4220,12 @@ impl ClientBrowser {
         drop(slot);
         match receive.await {
             Ok(Ok(value)) => NativeOutcome {
+                retention: None,
                 result: Ok(value),
                 effects: Effects::Completed,
             },
             Ok(Err((error, accepted))) => NativeOutcome {
+                retention: None,
                 result: Err(error),
                 effects: if accepted {
                     Effects::Unknown
@@ -3894,6 +4234,7 @@ impl ClientBrowser {
                 },
             },
             Err(_) => NativeOutcome {
+                retention: None,
                 result: Err(ProtocolError::CleanupFailed),
                 effects: Effects::Unknown,
             },
