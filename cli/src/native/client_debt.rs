@@ -88,6 +88,21 @@ pub(crate) enum ScopeCleanupCommand {
     Inventory,
 }
 impl ScopeCleanupCommand {
+    pub(crate) fn diagnostic_component(&self) -> super::client_settlement_trace::CleanupComponent {
+        use super::client_settlement_trace::CleanupComponent as C;
+        match self {
+            Self::DismissDialog { .. } => C::Dialog,
+            Self::FailRequest { .. }
+            | Self::CancelAuth { .. }
+            | Self::DisableFetch { .. }
+            | Self::DisableNetwork { .. } => C::Interception,
+            Self::RemoveScript { .. } => C::Script,
+            Self::Detach { .. } => C::Detach,
+            Self::DisableAutoAttach { .. } | Self::ResumeDebugger { .. } => C::Release,
+            Self::Inventory => C::Containment,
+        }
+    }
+
     pub(crate) fn envelope(self) -> Result<(&'static str, Value, Option<String>), ProtocolError> {
         use serde_json::json;
         let result = match self {
@@ -614,6 +629,7 @@ pub(crate) struct OwnerDebtLedger {
     generation: u64,
     identity_scope: String,
     state: Mutex<LedgerState>,
+    pub(crate) cleanup_diagnostics: Arc<super::client_settlement_trace::CleanupDiagnostics>,
 }
 impl OwnerDebtLedger {
     /// A replacement route transfer belongs to the original unpublished request,
@@ -936,6 +952,9 @@ impl OwnerDebtLedger {
         Arc::new(Self {
             generation,
             identity_scope,
+            cleanup_diagnostics: super::client_settlement_trace::CleanupDiagnostics::new(
+                generation,
+            ),
             state: Mutex::new(LedgerState {
                 integrity_lost: invalid,
                 eof_integrity_cause: if invalid {

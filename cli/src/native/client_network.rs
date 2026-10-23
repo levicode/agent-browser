@@ -1921,6 +1921,7 @@ impl ClientNetwork {
         proof: Option<&super::client_enrollment::NativeTerminalProof>,
         final_local: Option<&super::client_enrollment::FinalLocalEofProof>,
     ) -> Result<(), ProtocolError> {
+        let diagnostics = self.client.cleanup_observer();
         let mut state = self.close_gate.lock().await;
         // Only the EOF supervisor starts this once. Cached ordinary close is
         // not evidence that the final-local callback fence was performed.
@@ -1965,7 +1966,9 @@ impl ClientNetwork {
             let terminal = proof.cloned();
             let final_local = final_local.cloned();
             *state = NetworkCloseState::Running(tokio::spawn(async move {
-                network.close_retained(failed, terminal, final_local).await
+                network
+                    .close_retained(failed, terminal, final_local, diagnostics)
+                    .await
             }));
         }
         let result = match &mut *state {
@@ -1994,6 +1997,7 @@ impl ClientNetwork {
         mut failed: bool,
         terminal: Option<super::client_enrollment::NativeTerminalProof>,
         final_local: Option<super::client_enrollment::FinalLocalEofProof>,
+        diagnostics: Option<super::client_settlement_trace::CleanupObserver>,
     ) -> Result<(), ProtocolError> {
         // Cleanup failure never short-circuits owned-task drainage. In
         // particular spawn_blocking cannot be canceled by dropping its handle.
@@ -2010,6 +2014,9 @@ impl ClientNetwork {
         while let Some(result) = tasks.join_next().await {
             if let Err(error) = result {
                 if !error.is_cancelled() {
+                    if let Some(cell) = &diagnostics {
+                        cell.failure(super::client_settlement_trace::CleanupComponent::Callback);
+                    }
                     failed = true;
                 }
             }

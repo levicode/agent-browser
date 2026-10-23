@@ -1911,6 +1911,99 @@ fn frame_has_hidden_owner(
     Ok(skipped_frames.contains(parent) || hidden_owners.contains(&(parent.clone(), backend)))
 }
 
+// Failure-only hosted-test evidence for one semantic capture invocation. Only
+// these closed stage/frame categories can reach the log, never renderer data,
+// errors, identities, or a previously visited frame's mutable stage. Inventory
+// and final publication are main-observation work; joins are explicitly Child.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticCaptureStage {
+    FrameProof,
+    Ax,
+    SecurityInventory,
+    AuthorDom,
+    AuthorGraph,
+    Metadata,
+    Compact,
+    FrameJoin,
+    Finalize,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SemanticCaptureFrameKind {
+    Main,
+    Child,
+}
+
+#[cfg(test)]
+impl SemanticCaptureFrameKind {
+    fn of(frame: &ObservationFrame) -> Self {
+        if frame.parent_frame_id.is_some() {
+            Self::Child
+        } else {
+            Self::Main
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SemanticCaptureFailure {
+    stage: SemanticCaptureStage,
+    frame_kind: SemanticCaptureFrameKind,
+}
+
+#[cfg(test)]
+impl std::fmt::Display for SemanticCaptureFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "native-observe-semantic-first-failure stage={:?} frameKind={:?}",
+            self.stage, self.frame_kind
+        )
+    }
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct SemanticCaptureWitness {
+    first_failure: Option<SemanticCaptureFailure>,
+}
+
+#[cfg(test)]
+impl SemanticCaptureWitness {
+    fn record_result<T, E>(
+        &mut self,
+        stage: SemanticCaptureStage,
+        frame_kind: SemanticCaptureFrameKind,
+        result: Result<T, E>,
+    ) -> Result<T, E> {
+        if result.is_err() && self.first_failure.is_none() {
+            let failure = SemanticCaptureFailure { stage, frame_kind };
+            self.first_failure = Some(failure);
+            eprintln!("{failure}");
+        }
+        result
+    }
+}
+
+// Outside tests this is exactly the original Result expression. In tests the
+// expression is evaluated once, before recording, and its error is unchanged.
+macro_rules! semantic_capture_stage {
+    ($witness:ident, $stage:ident, $frame_kind:expr, $result:expr) => {{
+        #[cfg(test)]
+        {
+            let result = $result;
+            $witness.record_result(SemanticCaptureStage::$stage, $frame_kind, result)
+        }
+        #[cfg(not(test))]
+        {
+            $result
+        }
+    }};
+}
+
 /// Capture all requested frames to staging state. A late failure never publishes
 /// a partial tree or reference registry. Reserved IDs remain consumed.
 pub async fn observe(
@@ -1925,44 +2018,97 @@ pub async fn observe(
     if frames.is_empty() || options.max_nodes == 0 || options.max_nodes > 100000 {
         return Err(ObservationError::InvalidArguments);
     }
+    #[cfg(test)]
+    let mut witness = SemanticCaptureWitness::default();
     let mut staged = refs.clone();
     staged.begin_observation(identity_scope, lease.generation, revision);
     let mut frame_roots: HashMap<String, Vec<SemanticNode>> = HashMap::new();
     let mut count = 0;
     let mut truncated = false;
-    let ordered_frames = observation_frame_order(frames)?;
+    let ordered_frames = semantic_capture_stage!(
+        witness,
+        FrameProof,
+        SemanticCaptureFrameKind::Main,
+        observation_frame_order(frames)
+    )?;
     let mut hidden_owners = std::collections::HashSet::new();
     let mut skipped_frames = std::collections::HashSet::new();
     for frame in ordered_frames {
-        check(lease)?;
-        if frame_has_hidden_owner(frame, &hidden_owners, &skipped_frames)? {
+        #[cfg(test)]
+        let frame_kind = SemanticCaptureFrameKind::of(frame);
+        semantic_capture_stage!(witness, FrameProof, frame_kind, check(lease))?;
+        if semantic_capture_stage!(
+            witness,
+            FrameProof,
+            frame_kind,
+            frame_has_hidden_owner(frame, &hidden_owners, &skipped_frames)
+        )? {
             skipped_frames.insert(frame.binding.frame.clone());
             continue;
         }
-        validate_frame(client, frame, lease).await?;
-        let value = command(
-            client,
-            &frame.binding.session,
-            "Accessibility.getFullAXTree",
-            json!({"frameId":frame.binding.frame}),
-            lease,
-        )
-        .await?;
-        let tree: GetFullAXTreeResult =
-            serde_json::from_value(value).map_err(|_| ObservationError::BackendFailure)?;
-        let security = security_inventory(client, frame, options, lease).await?;
-        let dom = frame_dom(client, frame, lease).await?;
-        let graph = author_projection::Graph::read(&dom["root"])?;
+        semantic_capture_stage!(
+            witness,
+            FrameProof,
+            frame_kind,
+            validate_frame(client, frame, lease).await
+        )?;
+        let value = semantic_capture_stage!(
+            witness,
+            Ax,
+            frame_kind,
+            command(
+                client,
+                &frame.binding.session,
+                "Accessibility.getFullAXTree",
+                json!({"frameId":frame.binding.frame}),
+                lease,
+            )
+            .await
+        )?;
+        let tree: GetFullAXTreeResult = semantic_capture_stage!(
+            witness,
+            Ax,
+            frame_kind,
+            serde_json::from_value(value).map_err(|_| ObservationError::BackendFailure)
+        )?;
+        let security = semantic_capture_stage!(
+            witness,
+            SecurityInventory,
+            frame_kind,
+            security_inventory(client, frame, options, lease).await
+        )?;
+        let dom = semantic_capture_stage!(
+            witness,
+            AuthorDom,
+            frame_kind,
+            frame_dom(client, frame, lease).await
+        )?;
+        let graph = semantic_capture_stage!(
+            witness,
+            AuthorGraph,
+            frame_kind,
+            author_projection::Graph::read(&dom["root"])
+        )?;
         if graph
             .ids
             .iter()
             .any(|id| security.browser_internal.contains(id))
         {
-            return Err(ObservationError::BackendFailure);
+            return semantic_capture_stage!(
+                witness,
+                AuthorGraph,
+                frame_kind,
+                Err(ObservationError::BackendFailure)
+            );
         }
-        staged
-            .check_exact_admission(&frame.binding, &graph.ids)
-            .map_err(reference_allocation_error)?;
+        semantic_capture_stage!(
+            witness,
+            AuthorGraph,
+            frame_kind,
+            staged
+                .check_exact_admission(&frame.binding, &graph.ids)
+                .map_err(reference_allocation_error)
+        )?;
         let ax_by_backend: HashMap<i64, &AXNode> = tree
             .nodes
             .iter()
@@ -1991,37 +2137,55 @@ pub async fn observe(
             .collect();
         let mut nodes = HashMap::new();
         for chunk in candidates.chunks(64) {
-            let batch = read_batch(
-                client,
-                frame,
-                &chunk.iter().collect::<Vec<_>>(),
-                &mut staged,
-                revision,
-                options,
-                lease,
-                true,
-                &security,
-            )
-            .await?;
+            let batch = semantic_capture_stage!(
+                witness,
+                Metadata,
+                frame_kind,
+                read_batch(
+                    client,
+                    frame,
+                    &chunk.iter().collect::<Vec<_>>(),
+                    &mut staged,
+                    revision,
+                    options,
+                    lease,
+                    true,
+                    &security,
+                )
+                .await
+            )?;
             for (ax, mut node) in chunk.iter().zip(batch) {
-                let id = ax
-                    .backend_d_o_m_node_id
-                    .ok_or(ObservationError::BackendFailure)?;
+                let id = semantic_capture_stage!(
+                    witness,
+                    Metadata,
+                    frame_kind,
+                    ax.backend_d_o_m_node_id
+                        .ok_or(ObservationError::BackendFailure)
+                )?;
                 apply_security(&mut node, id, &security);
                 nodes.insert(id, node);
             }
         }
         // Publish this proof only after revalidating the exact parent loader.
         // The key is the native owner backend ID, never a selector/name match.
-        validate_frame(client, frame, lease).await?;
+        semantic_capture_stage!(
+            witness,
+            FrameProof,
+            frame_kind,
+            validate_frame(client, frame, lease).await
+        )?;
         hidden_owners.extend(
             nodes
                 .iter()
                 .filter(|(_, node)| proven_hidden_iframe(node))
                 .map(|(id, _)| (frame.binding.frame.clone(), *id)),
         );
-        let (roots, frame_truncated) =
-            author_projection::compact(&graph, nodes, options.max_nodes - count)?;
+        let (roots, frame_truncated) = semantic_capture_stage!(
+            witness,
+            Compact,
+            frame_kind,
+            author_projection::compact(&graph, nodes, options.max_nodes - count)
+        )?;
         let mut pending = roots.iter().collect::<Vec<_>>();
         while let Some(node) = pending.pop() {
             count += 1;
@@ -2029,7 +2193,12 @@ pub async fn observe(
         }
         truncated |= frame_truncated;
         frame_roots.insert(frame.binding.frame.clone(), roots);
-        validate_frame(client, frame, lease).await?;
+        semantic_capture_stage!(
+            witness,
+            FrameProof,
+            frame_kind,
+            validate_frame(client, frame, lease).await
+        )?;
     }
     let mut pending: Vec<&ObservationFrame> = frames.iter().collect();
     pending.sort_by_key(|f| std::cmp::Reverse(f.frame_path.len()));
@@ -2038,7 +2207,12 @@ pub async fn observe(
         .filter(|f| f.parent_frame_id.is_some() && !skipped_frames.contains(&f.binding.frame))
     {
         let parent = child.parent_frame_id.as_ref().unwrap();
-        let backend = child.owner_backend_id.ok_or("Missing native frame owner")?;
+        let backend = semantic_capture_stage!(
+            witness,
+            FrameJoin,
+            SemanticCaptureFrameKind::Child,
+            child.owner_backend_id.ok_or("Missing native frame owner")
+        )?;
         let owner = staged
             .durable_ref(&child.binding.page_session, Some(parent), backend)
             .map(|id| format!("@{id}"));
@@ -2065,7 +2239,12 @@ pub async fn observe(
                 .is_some_and(|nodes| attach(nodes, id, &mut Some(children)))
         });
         if !attached && !truncated {
-            return Err("Frame owner absent from native observation".into());
+            return semantic_capture_stage!(
+                witness,
+                FrameJoin,
+                SemanticCaptureFrameKind::Child,
+                Err("Frame owner absent from native observation".into())
+            );
         }
     }
     let mut roots = Vec::new();
@@ -2075,14 +2254,26 @@ pub async fn observe(
     for root in &mut roots {
         scrub_sensitive_ancestors(root);
     }
-    let viewport = staged
-        .try_viewport_ref(
-            identity_scope,
-            lease.generation,
-            &query_root(frames)?.binding.page_session,
-            revision,
-        )
-        .map_err(|_| ObservationError::BackendFailure)?;
+    let viewport = semantic_capture_stage!(
+        witness,
+        Finalize,
+        SemanticCaptureFrameKind::Main,
+        staged
+            .try_viewport_ref(
+                identity_scope,
+                lease.generation,
+                &semantic_capture_stage!(
+                    witness,
+                    Finalize,
+                    SemanticCaptureFrameKind::Main,
+                    query_root(frames)
+                )?
+                .binding
+                .page_session,
+                revision,
+            )
+            .map_err(|_| ObservationError::BackendFailure)
+    )?;
     let viewport_ref = NodeReference {
         id: format!("@{}", viewport.id),
         revision: viewport.issuance.revision.to_string(),
@@ -2093,15 +2284,28 @@ pub async fn observe(
     let mut published = std::collections::HashSet::new();
     let mut pending = roots.iter().collect::<Vec<_>>();
     while let Some(node) = pending.pop() {
-        let id = super::element::parse_ref(&node.reference.id)
-            .ok_or(ObservationError::BackendFailure)?;
+        let id = semantic_capture_stage!(
+            witness,
+            Finalize,
+            SemanticCaptureFrameKind::Main,
+            super::element::parse_ref(&node.reference.id).ok_or(ObservationError::BackendFailure)
+        )?;
         published.insert(id);
         pending.extend(node.children.iter());
     }
     staged.retain_snapshot_entries(refs, &published);
-    let hidden_frame_proof =
-        HiddenFrameProof::new(frames, &hidden_owners, skipped_frames, options)?;
-    check(lease)?;
+    let hidden_frame_proof = semantic_capture_stage!(
+        witness,
+        Finalize,
+        SemanticCaptureFrameKind::Main,
+        HiddenFrameProof::new(frames, &hidden_owners, skipped_frames, options)
+    )?;
+    semantic_capture_stage!(
+        witness,
+        Finalize,
+        SemanticCaptureFrameKind::Main,
+        check(lease)
+    )?;
     *refs = staged;
     Ok(Observation {
         hidden_frame_proof,
@@ -7241,6 +7445,131 @@ mod tests {
         assert!(validate_expression(&bad, 0).is_err());
         assert!(serde_json::from_value::<QueryOptions>(json!({"expression":{"kind":"query","query":{"kind":"role","states":{"script":true},"value":{"kind":"string","value":"button","exact":true}}}})).is_err());
     }
+    #[test]
+    fn semantic_capture_failure_schema_is_closed_and_value_free() {
+        use SemanticCaptureFrameKind::{Child, Main};
+        use SemanticCaptureStage::*;
+        for (stage, label) in [
+            (FrameProof, "FrameProof"),
+            (Ax, "Ax"),
+            (SecurityInventory, "SecurityInventory"),
+            (AuthorDom, "AuthorDom"),
+            (AuthorGraph, "AuthorGraph"),
+            (Metadata, "Metadata"),
+            (Compact, "Compact"),
+            (FrameJoin, "FrameJoin"),
+            (Finalize, "Finalize"),
+        ] {
+            for (frame_kind, kind) in [(Main, "Main"), (Child, "Child")] {
+                let failure = SemanticCaptureFailure { stage, frame_kind };
+                assert_eq!(
+                    failure.to_string(),
+                    format!("native-observe-semantic-first-failure stage={label} frameKind={kind}")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_capture_witness_preserves_first_failure_per_invocation() {
+        use SemanticCaptureFrameKind::{Child, Main};
+        use SemanticCaptureStage::*;
+        let mut first = SemanticCaptureWitness::default();
+        let mut second = SemanticCaptureWitness::default();
+        assert_eq!(
+            semantic_capture_stage!(first, Metadata, Child, Ok::<_, ObservationError>(42)),
+            Ok(42)
+        );
+        assert_eq!(first.first_failure, None);
+        assert_eq!(
+            semantic_capture_stage!(
+                first,
+                AuthorGraph,
+                Child,
+                Err::<(), _>(ObservationError::BackendFailure)
+            ),
+            Err(ObservationError::BackendFailure)
+        );
+        assert_eq!(
+            semantic_capture_stage!(
+                first,
+                Finalize,
+                Main,
+                Err::<(), _>(ObservationError::Cancelled)
+            ),
+            Err(ObservationError::Cancelled)
+        );
+        assert_eq!(
+            first.first_failure,
+            Some(SemanticCaptureFailure {
+                stage: AuthorGraph,
+                frame_kind: Child
+            })
+        );
+        assert_eq!(second.first_failure, None);
+        assert_eq!(
+            semantic_capture_stage!(second, FrameJoin, Child, Ok::<_, ObservationError>(())),
+            Ok(())
+        );
+        assert_eq!(
+            semantic_capture_stage!(
+                second,
+                Finalize,
+                Main,
+                Err::<(), _>(ObservationError::ResourceLimit)
+            ),
+            Err(ObservationError::ResourceLimit)
+        );
+        assert_eq!(
+            second.first_failure,
+            Some(SemanticCaptureFailure {
+                stage: Finalize,
+                frame_kind: Main
+            })
+        );
+    }
+
+    #[test]
+    fn semantic_capture_stage_evaluates_once_and_returns_the_original_error() {
+        let mut witness = SemanticCaptureWitness::default();
+        let mut evaluations = 0;
+        let original = Box::new(ObservationError::CleanupFailed {
+            primary: Some(Box::new(ObservationError::StaleReference)),
+        });
+        let original_address = std::ptr::from_ref(original.as_ref());
+        let result =
+            semantic_capture_stage!(witness, FrameProof, SemanticCaptureFrameKind::Main, {
+                evaluations += 1;
+                Err::<(), _>(original)
+            });
+        assert_eq!(evaluations, 1);
+        let returned = result.unwrap_err();
+        assert_eq!(std::ptr::from_ref(returned.as_ref()), original_address);
+        assert_eq!(
+            *returned,
+            ObservationError::CleanupFailed {
+                primary: Some(Box::new(ObservationError::StaleReference))
+            }
+        );
+    }
+
+    #[test]
+    fn semantic_capture_frame_kind_uses_only_parent_presence() {
+        let frames = hidden_proof_frames();
+        assert_eq!(
+            SemanticCaptureFrameKind::of(&frames[0]),
+            SemanticCaptureFrameKind::Main
+        );
+        assert_eq!(
+            SemanticCaptureFrameKind::of(&frames[1]),
+            SemanticCaptureFrameKind::Child
+        );
+        assert_eq!(
+            SemanticCaptureFrameKind::of(&frames[2]),
+            SemanticCaptureFrameKind::Child
+        );
+    }
+
     #[test]
     fn diagnostic_labels_never_echo_renderer_source() {
         assert_eq!(

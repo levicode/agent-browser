@@ -1,4 +1,6 @@
-//! Acceptance-only, closed-schema diagnostics. No payload or arbitrary strings.
+//! Closed-schema diagnostics. No payload or arbitrary strings.
+//! Acceptance phases remain opt-in behind their feature. Production cleanup
+//! capture has its own explicit environment opt-in and no protocol authority.
 //! The existing runner-owned append file is shared by the real proxy and daemon.
 //! Lock contention drops observations, never waits. Missing records are unknown.
 use std::cell::Cell;
@@ -6,16 +8,18 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
 
 use super::client_protocol::{ClientMessage, Effects, ProtocolError, ScopeState};
 // Acceptance-only diagnostics: closed phases and native operation sequence only.
 // Never serialize requests, IDs, browser values, or error descriptions.
-#[cfg(feature = "acceptance-faults")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 pub(crate) enum SettlementPhase {
+    CleanupStarted,
+    CleanupFirstFailure,
+    CleanupResult,
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -74,6 +78,7 @@ pub(crate) enum SettlementPhase {
 pub(crate) use SettlementPhase as Phase;
 
 const PATH_ENV: &str = "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE";
+const CLEANUP_PATH_ENV: &str = "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE";
 const MAX_RECORDS: usize = 2048;
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_RECORD_BYTES: usize = 512;
@@ -152,6 +157,16 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_owner: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_attempt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_lifecycle: Option<CleanupLifecycle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_component: Option<CleanupComponent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_result: Option<CleanupResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub effects: Option<Effects>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_state: Option<ScopeState>,
@@ -189,6 +204,8 @@ impl Facts {
     fn clamp(&mut self, overflow: &mut bool) {
         for value in [
             &mut self.generation,
+            &mut self.cleanup_owner,
+            &mut self.cleanup_attempt,
             &mut self.length,
             &mut self.total,
             &mut self.calls,
@@ -296,10 +313,15 @@ pub(crate) fn proxy_record(phase: Phase, facts: Facts) {
     record_source(Source::Proxy, 0, phase, facts);
 }
 
-fn record_source(source: Source, operation_seq: u64, phase: Phase, mut facts: Facts) {
+fn record_source(source: Source, operation_seq: u64, phase: Phase, facts: Facts) {
     let Some(capture) = capture(source) else {
         return;
     };
+    record_capture(capture, operation_seq, phase, facts);
+}
+
+fn record_capture(capture: &Capture, operation_seq: u64, phase: Phase, mut facts: Facts) {
+    let source = capture.source;
     let counters = &capture.counters;
     let ordinal = increment(&counters.attempted, 1, &counters.overflow);
     let mut overflow = counters.overflow.load(Ordering::Relaxed);
@@ -322,6 +344,289 @@ fn record_source(source: Source, operation_seq: u64, phase: Phase, mut facts: Fa
         facts,
     };
     emit(&capture.sink, record, counters);
+}
+
+// This cell is diagnostic data only: it owns no client, task, native identity,
+// resource or authority. Hooks are atomics-only; cleanup never performs file I/O.
+// An attempt is activated only by a native lifecycle owner and is never used to
+// admit, retry, retire or classify the product result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CleanupLifecycle {
+    ScopeEnd,
+    Restart,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub(crate) enum CleanupComponent {
+    Callback = 1,
+    Dialog,
+    Interception,
+    Script,
+    Detach,
+    Recording,
+    Upload,
+    Containment,
+    Release,
+    Input,
+    Download,
+    Blob,
+    EnrollmentFallback,
+    RetainedTaskFallback,
+    OwnerFallback,
+}
+impl CleanupComponent {
+    fn from_code(value: u8) -> Option<Self> {
+        use CleanupComponent::*;
+        [
+            Callback,
+            Dialog,
+            Interception,
+            Script,
+            Detach,
+            Recording,
+            Upload,
+            Containment,
+            Release,
+            Input,
+            Download,
+            Blob,
+            EnrollmentFallback,
+            RetainedTaskFallback,
+            OwnerFallback,
+        ]
+        .into_iter()
+        .find(|component| *component as u8 == value)
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CleanupResult {
+    Passed,
+    Failed,
+}
+
+static CLEANUP_SINK: OnceLock<Option<Capture>> = OnceLock::new();
+static CLEANUP_OWNERS: AtomicU64 = AtomicU64::new(0);
+const MAX_CLEANUP_ATTEMPT: u64 = SAFE_INTEGER >> 8;
+
+pub(super) fn initialize_cleanup() {
+    let mut created = false;
+    let capture = CLEANUP_SINK.get_or_init(|| {
+        created = true;
+        cleanup_capture(
+            std::env::var_os(CLEANUP_PATH_ENV)
+                .map(PathBuf::from)
+                .as_deref(),
+        )
+    });
+    if created {
+        if let Some(capture) = capture {
+            record_capture(capture, 0, Phase::CaptureStarted, Facts::default());
+        }
+    }
+}
+fn cleanup_capture(path: Option<&Path>) -> Option<Capture> {
+    Some(Capture {
+        source: Source::Native,
+        sink: Mutex::new(AppendSink::open(path?, MAX_RECORDS, MAX_BYTES).ok()?),
+        counters: Counters::default(),
+    })
+}
+// Exhaustion disables observation instead of aliasing a previous identity.
+#[allow(deprecated)]
+fn next_cleanup_ordinal(counter: &AtomicU64, limit: u64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            (old < limit).then(|| old + 1)
+        })
+        .ok()
+        .map(|old| old + 1)
+}
+pub(crate) struct CleanupDiagnostics {
+    generation: u64,
+    owner: u64,
+    attempts: AtomicU64,
+    // attempt in the upper bits, first component in the low byte; one CAS binds
+    // the component to its exact attempt even across a later lifecycle boundary.
+    active: AtomicU64,
+}
+impl CleanupDiagnostics {
+    pub(crate) fn new(generation: u64) -> Arc<Self> {
+        Arc::new(Self {
+            generation,
+            owner: next_cleanup_ordinal(&CLEANUP_OWNERS, SAFE_INTEGER).unwrap_or(0),
+            attempts: AtomicU64::new(0),
+            active: AtomicU64::new(0),
+        })
+    }
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        lifecycle: CleanupLifecycle,
+        sequence: u64,
+    ) -> Option<CleanupAttempt> {
+        self.begin_enabled(
+            lifecycle,
+            sequence,
+            CLEANUP_SINK.get().is_some_and(Option::is_some),
+        )
+    }
+    fn begin_enabled(
+        self: &Arc<Self>,
+        lifecycle: CleanupLifecycle,
+        sequence: u64,
+        enabled: bool,
+    ) -> Option<CleanupAttempt> {
+        if !enabled || self.owner == 0 {
+            return None;
+        }
+        let ordinal = next_cleanup_ordinal(&self.attempts, MAX_CLEANUP_ATTEMPT)?;
+        self.active
+            .compare_exchange(0, ordinal << 8, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()?;
+        Some(CleanupAttempt {
+            cell: self.clone(),
+            ordinal,
+            lifecycle,
+            sequence,
+        })
+    }
+    pub(crate) fn observer(self: &Arc<Self>) -> Option<CleanupObserver> {
+        let ordinal = self.active.load(Ordering::Relaxed) >> 8;
+        (ordinal != 0).then(|| CleanupObserver {
+            cell: self.clone(),
+            ordinal,
+        })
+    }
+    fn failure_for(&self, ordinal: u64, component: CleanupComponent) {
+        let active = self.active.load(Ordering::Relaxed);
+        if ordinal != 0 && active >> 8 == ordinal && active & 255 == 0 {
+            let _ = self.active.compare_exchange(
+                active,
+                active | component as u64,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+    #[cfg(test)]
+    fn failure(&self, component: CleanupComponent) {
+        self.failure_for(self.active.load(Ordering::Relaxed) >> 8, component);
+    }
+}
+#[derive(Clone)]
+pub(crate) struct CleanupObserver {
+    cell: Arc<CleanupDiagnostics>,
+    ordinal: u64,
+}
+impl CleanupObserver {
+    pub(crate) fn failure(&self, component: CleanupComponent) {
+        self.cell.failure_for(self.ordinal, component);
+    }
+    pub(crate) fn observe<T, E>(&self, component: CleanupComponent, result: &Result<T, E>) {
+        if result.is_err() {
+            self.failure(component);
+        }
+    }
+}
+pub(crate) fn observe_cleanup<T, E>(
+    observer: &Option<CleanupObserver>,
+    component: CleanupComponent,
+    result: &Result<T, E>,
+) {
+    if let Some(observer) = observer {
+        observer.observe(component, result);
+    }
+}
+pub(crate) struct CleanupAttempt {
+    cell: Arc<CleanupDiagnostics>,
+    ordinal: u64,
+    lifecycle: CleanupLifecycle,
+    sequence: u64,
+}
+impl CleanupAttempt {
+    pub(crate) fn observer(&self) -> CleanupObserver {
+        CleanupObserver {
+            cell: self.cell.clone(),
+            ordinal: self.ordinal,
+        }
+    }
+    // The caller has already settled its cleanup obligations and saved the
+    // original product result. Sink failures cannot change either. A hung or
+    // killed attempt has no completed snapshot and must remain unknown.
+    pub(crate) fn finish<T>(self, result: &Result<T, ProtocolError>) {
+        self.finish_into(result, CLEANUP_SINK.get().and_then(Option::as_ref));
+    }
+    fn finish_into<T>(self, result: &Result<T, ProtocolError>, capture: Option<&Capture>) {
+        let state = self.cell.active.swap(0, Ordering::Relaxed);
+        if state >> 8 != self.ordinal {
+            return;
+        }
+        let Some(capture) = capture else {
+            return;
+        };
+        let facts = || Facts {
+            generation: Some(self.cell.generation),
+            cleanup_owner: Some(self.cell.owner),
+            cleanup_attempt: Some(self.ordinal),
+            cleanup_lifecycle: Some(self.lifecycle),
+            ..Facts::default()
+        };
+        record_capture(capture, self.sequence, Phase::CleanupStarted, facts());
+        if let Some(component) = CleanupComponent::from_code((state & 255) as u8) {
+            record_capture(
+                capture,
+                self.sequence,
+                Phase::CleanupFirstFailure,
+                Facts {
+                    cleanup_component: Some(component),
+                    ..facts()
+                },
+            );
+        }
+        record_capture(
+            capture,
+            self.sequence,
+            Phase::CleanupResult,
+            Facts {
+                cleanup_result: Some(if result.is_ok() {
+                    CleanupResult::Passed
+                } else {
+                    CleanupResult::Failed
+                }),
+                error: result.as_ref().err().cloned(),
+                ..facts()
+            },
+        );
+    }
+}
+
+impl CleanupAttempt {
+    fn clear_abandoned(&self, mut state: u64) {
+        // At most one same-attempt transition can race us: zero component to
+        // first component. Two CAS attempts suffice; never clear a newer run.
+        for _ in 0..2 {
+            if state >> 8 != self.ordinal {
+                return;
+            }
+            match self
+                .cell
+                .active
+                .compare_exchange(state, 0, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(current) => state = current,
+            }
+        }
+    }
+}
+impl Drop for CleanupAttempt {
+    fn drop(&mut self) {
+        // Losing a waiter loses observation only. Retained cleanup is neither
+        // cancelled nor prolonged, and an old observer cannot tag a later run.
+        self.clear_abandoned(self.cell.active.load(Ordering::Relaxed));
+    }
 }
 
 fn suppress(source: Source) {
@@ -1089,3 +1394,7 @@ mod tests {
         assert!(std::fs::read(file.path()).unwrap().is_empty());
     }
 }
+
+#[cfg(test)]
+#[path = "client_cleanup_diagnostic_tests.rs"]
+mod cleanup_tests;

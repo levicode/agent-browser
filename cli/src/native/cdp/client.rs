@@ -1045,6 +1045,17 @@ impl CdpClient {
                 .and_then(|owner| owner.clone())
         })
     }
+    pub(crate) fn cleanup_diagnostics(
+        &self,
+    ) -> Option<Arc<super::super::client_settlement_trace::CleanupDiagnostics>> {
+        self.debt_ledger()
+            .map(|owner| owner.cleanup_diagnostics.clone())
+    }
+    pub(crate) fn cleanup_observer(
+        &self,
+    ) -> Option<super::super::client_settlement_trace::CleanupObserver> {
+        self.cleanup_diagnostics().and_then(|cell| cell.observer())
+    }
     /// Constructed only by the native lifecycle owner, never by a callback.
     pub(crate) fn owner_view(
         &self,
@@ -1089,29 +1100,41 @@ impl CdpClient {
         command: OwnerCleanupCommand,
         deadline: std::time::Instant,
     ) -> Result<Value, String> {
-        self.check_cleanup_owner(&expected)
-            .map_err(|_| "Native cleanup owner changed".to_string())?;
-        if std::time::Instant::now() >= deadline {
-            return Err("Native cleanup deadline expired".into());
-        }
-        let reservation = expected
+        let diagnostics = expected
             .as_ref()
-            .map(|ledger| ledger.reserve_owner_cleanup(command))
-            .transpose()
-            .map_err(|_| "Native cleanup admission refused".to_string())?;
-        let (method, params) = command.envelope();
-        tokio::time::timeout_at(
-            deadline.into(),
-            self.send_reserved_command_bound(
-                method,
-                params,
-                None,
-                reservation,
-                Some((expected, deadline)),
-            ),
-        )
-        .await
-        .map_err(|_| "Native cleanup deadline expired".to_string())?
+            .and_then(|owner| owner.cleanup_diagnostics.observer());
+        let result = async {
+            self.check_cleanup_owner(&expected)
+                .map_err(|_| "Native cleanup owner changed".to_string())?;
+            if std::time::Instant::now() >= deadline {
+                return Err("Native cleanup deadline expired".into());
+            }
+            let reservation = expected
+                .as_ref()
+                .map(|ledger| ledger.reserve_owner_cleanup(command))
+                .transpose()
+                .map_err(|_| "Native cleanup admission refused".to_string())?;
+            let (method, params) = command.envelope();
+            tokio::time::timeout_at(
+                deadline.into(),
+                self.send_reserved_command_bound(
+                    method,
+                    params,
+                    None,
+                    reservation,
+                    Some((expected, deadline)),
+                ),
+            )
+            .await
+            .map_err(|_| "Native cleanup deadline expired".to_string())?
+        }
+        .await;
+        super::super::client_settlement_trace::observe_cleanup(
+            &diagnostics,
+            super::super::client_settlement_trace::CleanupComponent::Release,
+            &result,
+        );
+        result
     }
     /// Called only from native cleanup owners after selecting their exact retained
     /// resource. No generic envelope, inherited category, or renewed app budget.
@@ -1121,36 +1144,45 @@ impl CdpClient {
         deadline: std::time::Instant,
     ) -> Result<Value, String> {
         let expected = self.debt_ledger();
-        self.check_cleanup_owner(&expected)
-            .map_err(|_| "Native cleanup owner changed".to_string())?;
-        if expected.is_some() && self.owner.is_none() {
-            return Err("Native cleanup requires an owner-bound view".into());
-        }
-        let (method, params, session) = command
-            .envelope()
-            .map_err(|_| "Invalid native cleanup identity".to_string())?;
-        if std::time::Instant::now() >= deadline {
-            return Err("Native cleanup deadline expired".into());
-        }
-        let reservation = expected
+        let diagnostics = expected
             .as_ref()
-            .map(|ledger| {
-                ledger.reserve_scope_cleanup(method, &params, session.as_deref(), deadline)
-            })
-            .transpose()
-            .map_err(|_| "Native cleanup admission refused".to_string())?;
-        tokio::time::timeout_at(
-            deadline.into(),
-            self.send_reserved_command_bound(
-                method,
-                Some(params),
-                session.as_deref(),
-                reservation,
-                Some((expected, deadline)),
-            ),
-        )
-        .await
-        .map_err(|_| "Native cleanup deadline expired".to_string())?
+            .and_then(|owner| owner.cleanup_diagnostics.observer());
+        let component = command.diagnostic_component();
+        let result = async {
+            self.check_cleanup_owner(&expected)
+                .map_err(|_| "Native cleanup owner changed".to_string())?;
+            if expected.is_some() && self.owner.is_none() {
+                return Err("Native cleanup requires an owner-bound view".into());
+            }
+            let (method, params, session) = command
+                .envelope()
+                .map_err(|_| "Invalid native cleanup identity".to_string())?;
+            if std::time::Instant::now() >= deadline {
+                return Err("Native cleanup deadline expired".into());
+            }
+            let reservation = expected
+                .as_ref()
+                .map(|ledger| {
+                    ledger.reserve_scope_cleanup(method, &params, session.as_deref(), deadline)
+                })
+                .transpose()
+                .map_err(|_| "Native cleanup admission refused".to_string())?;
+            tokio::time::timeout_at(
+                deadline.into(),
+                self.send_reserved_command_bound(
+                    method,
+                    Some(params),
+                    session.as_deref(),
+                    reservation,
+                    Some((expected, deadline)),
+                ),
+            )
+            .await
+            .map_err(|_| "Native cleanup deadline expired".to_string())?
+        }
+        .await;
+        super::super::client_settlement_trace::observe_cleanup(&diagnostics, component, &result);
+        result
     }
     pub(crate) fn reserve_tracked_command(
         &self,

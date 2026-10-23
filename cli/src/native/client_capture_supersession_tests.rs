@@ -7,6 +7,9 @@ use crate::native::client_targets::ClientTargets;
 use crate::native::element::{ExactBinding, LocatedIssuance};
 use futures_util::StreamExt;
 
+#[path = "client_capture_metadata_deadline_tests.rs"]
+mod metadata_deadline_tests;
+
 struct Owner {
     client: Arc<CdpClient>,
     targets: Arc<ClientTargets>,

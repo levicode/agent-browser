@@ -21,6 +21,7 @@ use super::stream::{IdleActivity, StreamServer};
 use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
 
 pub async fn run_daemon(session: &str) {
+    super::client_settlement_trace::initialize_cleanup();
     #[cfg(feature = "acceptance-faults")]
     super::client_settlement_trace::initialize();
     let socket_dir = get_daemon_socket_dir();

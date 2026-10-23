@@ -105,7 +105,7 @@ mod parity_tests;
 #[allow(dead_code)]
 pub mod client_test_faults;
 
-#[cfg(feature = "acceptance-faults")]
+#[allow(dead_code)]
 pub(crate) mod client_settlement_trace;
 
 #[allow(dead_code)]

@@ -2310,8 +2310,17 @@ impl ClientActions {
         }
     }
     pub async fn cleanup(&self) -> Result<(), ProtocolError> {
+        self.cleanup_with_diagnostics(&None).await
+    }
+    pub(crate) async fn cleanup_with_diagnostics(
+        &self,
+        diagnostics: &Option<super::client_settlement_trace::CleanupObserver>,
+    ) -> Result<(), ProtocolError> {
+        use super::client_settlement_trace::{observe_cleanup, CleanupComponent};
         let recording = self.abandon_recording().await;
+        observe_cleanup(diagnostics, CleanupComponent::Recording, &recording);
         let uploads = self.cleanup_scope_uploads().await;
+        observe_cleanup(diagnostics, CleanupComponent::Upload, &uploads);
         if recording.is_err() || uploads.is_err() {
             Err(ProtocolError::CleanupFailed)
         } else {
@@ -3934,21 +3943,23 @@ mod tests {
                     held_drag_releases.push(request.clone());
                     continue;
                 }
-                if mode == "strict-query-drag-cleanup-debt" && method == "Browser.getVersion" {
-                    if !held_drag_releases.is_empty() {
-                        let release = held_drag_releases.remove(0);
-                        let reply = json!({"id":release["id"],"sessionId":release["sessionId"],"result":{}});
-                        socket
-                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                reply.to_string(),
-                            ))
-                            .await
-                            .unwrap();
-                        sent_replies
-                            .lock()
-                            .unwrap()
-                            .push(json!({"request":release,"reply":reply}));
-                    }
+                if mode == "strict-query-drag-cleanup-debt"
+                    && method == "Browser.getVersion"
+                    && !held_drag_releases.is_empty()
+                {
+                    let release = held_drag_releases.remove(0);
+                    let reply =
+                        json!({"id":release["id"],"sessionId":release["sessionId"],"result":{}});
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            reply.to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                    sent_replies
+                        .lock()
+                        .unwrap()
+                        .push(json!({"request":release,"reply":reply}));
                 }
                 if mode == "direct-point-cancel"
                     && method == "Input.dispatchMouseEvent"

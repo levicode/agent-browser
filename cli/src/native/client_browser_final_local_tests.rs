@@ -85,6 +85,7 @@ async fn missing_borrowed_root_can_end_only_after_exact_debt_free_remote_eof() {
         "registry-poison",
         "file-failure",
     ] {
+        eprintln!("final-local fixture case={case}");
         let (endpoint, log, emit, peer) = final_local_peer().await;
         let broker = Arc::new(ClientSession::new());
         let browser = ClientBrowser::new(broker.clone());
@@ -215,6 +216,11 @@ async fn missing_borrowed_root_can_end_only_after_exact_debt_free_remote_eof() {
                 .close()
                 .await
                 .unwrap();
+            // Local transport closure is not remote EOF evidence, even before
+            // the fixture begins the real seal-before-drain teardown.
+            assert!(!*client.remote_connection_closed().borrow(), "{case}");
+            assert!(enrollment.final_local_connection_proof().is_err(), "{case}");
+            enrollment.seal();
         } else {
             emit.send(Message::Close(None)).await.unwrap();
             let mut closed = client.remote_connection_closed();
@@ -232,7 +238,7 @@ async fn missing_borrowed_root_can_end_only_after_exact_debt_free_remote_eof() {
         }
         let drained = tokio::time::timeout(Duration::from_secs(2), enrollment.drain())
             .await
-            .unwrap();
+            .unwrap_or_else(|error| panic!("{case}: enrollment drain did not finish: {error}"));
         if matches!(case, "clean" | "clean-child" | "file-failure") {
             drained.unwrap();
             assert!(matches!(
@@ -272,7 +278,7 @@ async fn missing_borrowed_root_can_end_only_after_exact_debt_free_remote_eof() {
             assert!(enrollment.final_local_connection_proof().is_err());
             assert!(ledger.check_admission(AdmissionClass::Input).is_err());
         }
-        let ended = browser.end_scope(scope).await;
+        let ended = browser.end_scope(scope, 0).await;
         if matches!(case, "clean" | "clean-child") {
             assert_eq!(ended, Ok(Value::Null));
             assert!(browser.owner.lock().await.is_none());

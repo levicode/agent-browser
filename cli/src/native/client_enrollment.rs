@@ -1486,6 +1486,30 @@ impl ClientEnrollment {
         // If admission advanced in between, conservatively refuse this capture.
         self.check_capture_snapshot(watermark, snapshot, op)
     }
+    async fn fence_capture_result<T>(
+        &self,
+        watermark: &BoundedEventWatermark,
+        snapshot: &CaptureSnapshot,
+        op: &OperationLease,
+        result: Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        // A session retirement may settle its raw waiter before the supervisor
+        // applies the event. Retain both success and failure until the ORIGINAL
+        // capture authority has caught up; never retry or snapshot a replacement.
+        let drained = self.drain_capture_watermark(watermark, op).await;
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        // Poison stores its cause before cancelling the owner. Do not let the
+        // drain's cancellation precheck hide that exact coordinator failure.
+        if let Some(error) = &index.failure {
+            return Err(error.clone());
+        }
+        drained?;
+        self.check_capture_snapshot_locked(&index, watermark, snapshot, op)?;
+        result
+    }
     #[cfg(test)]
     async fn pause_capture_at(
         &self,
@@ -1531,6 +1555,9 @@ impl ClientEnrollment {
         // prove absence. Enumeration grants no ownership and is still mandatory.
         let inventory = self
             .command(op, None, "Target.getTargets", json!({"filter":[{}]}))
+            .await;
+        let inventory = self
+            .fence_capture_result(&watermark, &snapshot, op, inventory)
             .await?;
         let infos = inventory
             .get("targetInfos")
@@ -1609,9 +1636,14 @@ impl ClientEnrollment {
             self.check_capture_snapshot(&watermark, &snapshot, op)?;
             let reply = self
                 .command(op, Some(&entry.session), "Target.getTargetInfo", json!({}))
-                .await?;
+                .await;
             #[cfg(test)]
-            self.pause_capture_at(CaptureTestPoint::AfterInfoAck, op)
+            if reply.is_ok() {
+                self.pause_capture_at(CaptureTestPoint::AfterInfoAck, op)
+                    .await?;
+            }
+            let reply = self
+                .fence_capture_result(&watermark, &snapshot, op, reply)
                 .await?;
             let info = reply.get("targetInfo").ok_or(ProtocolError::InvalidFrame)?;
             validate_capture_target_info(entry, info, &self.targets.context_id, true)?;
@@ -1628,6 +1660,9 @@ impl ClientEnrollment {
             self.check_restart_operation(op)?;
             let tree = self
                 .command(op, Some(&entry.session), "Page.getFrameTree", json!({}))
+                .await;
+            let tree = self
+                .fence_capture_result(&watermark, &snapshot, op, tree)
                 .await?;
             capture_frame_fingerprint(
                 &entry.session,
@@ -1670,9 +1705,14 @@ impl ClientEnrollment {
         }
         self.fence_capture_snapshot(&previous.watermark, &previous.snapshot, op)
             .await?;
-        let current = self.attest_capture(op).await?;
+        let current = self.attest_capture(op).await;
         #[cfg(test)]
-        self.pause_capture_at(CaptureTestPoint::AfterFreshAttestation, op)
+        if current.is_ok() {
+            self.pause_capture_at(CaptureTestPoint::AfterFreshAttestation, op)
+                .await?;
+        }
+        let current = self
+            .fence_capture_result(&previous.watermark, &previous.snapshot, op, current)
             .await?;
         // Retain and recheck ORIGINAL tickets, even when a replacement has become
         // enumerable and the fresh attestation could prove only its newer tenure.
@@ -2705,6 +2745,15 @@ impl ClientEnrollment {
             if let Some(tree) = tree.get("frameTree") {
                 self.frame_tree(&entry, tree, 0)?;
             }
+        }
+        // Runtime.enable creates the paused popup's main world before its first
+        // init registration. Chromium runs registrations immediately for paused
+        // new windows; creating the world inside that first registration can
+        // re-enter new-document injection and execute only script zero twice.
+        // Runtime events are already subscribed, and the target stays paused.
+        self.command(op, Some(&entry.session), "Runtime.enable", json!({}))
+            .await?;
+        if page_target {
             let revision = self
                 .page
                 .apply_to_new_session(&lease, &entry.session, op)
@@ -2713,10 +2762,6 @@ impl ClientEnrollment {
                 return Err(ProtocolError::StaleScope);
             }
         }
-        // Runtime event routing is already subscribed on the same retained tap.
-        // Enable before resume so first-script console/errors are observable.
-        self.command(op, Some(&entry.session), "Runtime.enable", json!({}))
-            .await?;
         // Autoattach is recursive. Install it while this target is paused.
         self.command(
             op,
@@ -3296,6 +3341,7 @@ impl ClientEnrollment {
         .map_err(|_| ProtocolError::CleanupFailed)
     }
     async fn perform_containment(self: &Arc<Self>) -> Result<(), ProtocolError> {
+        let diagnostics = self.client.cleanup_observer();
         let mut state = self.containment.lock().await;
         if let Some(result) = &state.result {
             return result.clone();
@@ -3315,6 +3361,11 @@ impl ClientEnrollment {
             .and_then(|result| result);
         state.task = None;
         state.result = Some(result.clone());
+        super::client_settlement_trace::observe_cleanup(
+            &diagnostics,
+            super::client_settlement_trace::CleanupComponent::Containment,
+            &result,
+        );
         result
     }
     async fn contain_with_events(&self) -> Result<(), ProtocolError> {
@@ -3434,6 +3485,7 @@ impl ClientEnrollment {
         Ok(())
     }
     async fn contain_borrowed(&self, deadline: Instant) -> Result<(), ProtocolError> {
+        let diagnostics = self.client.cleanup_observer();
         let session_deadline = deadline
             .checked_sub(Duration::from_secs(2))
             .unwrap_or(deadline);
@@ -3494,6 +3546,11 @@ impl ClientEnrollment {
                         config_deadline,
                     )
                     .await
+                    .inspect_err(|_| {
+                        if let Some(cell) = &diagnostics {
+                            cell.failure(super::client_settlement_trace::CleanupComponent::Input);
+                        }
+                    })
                     .is_err();
                 failed |= self
                     .network
@@ -3503,6 +3560,13 @@ impl ClientEnrollment {
                         config_deadline,
                     )
                     .await
+                    .inspect_err(|_| {
+                        if let Some(cell) = &diagnostics {
+                            cell.failure(
+                                super::client_settlement_trace::CleanupComponent::Interception,
+                            );
+                        }
+                    })
                     .is_err();
                 failed |= self
                     .page
@@ -3513,6 +3577,11 @@ impl ClientEnrollment {
                         config_deadline,
                     )
                     .await
+                    .inspect_err(|_| {
+                        if let Some(cell) = &diagnostics {
+                            cell.failure(super::client_settlement_trace::CleanupComponent::Script);
+                        }
+                    })
                     .is_err();
             }
             // Do not release a debugger pause by closing the host page.
@@ -5249,12 +5318,28 @@ mod tests {
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"target closed"}}).to_string())).await.unwrap();continue;
                         }
                         if mode=="delayed-dispose" && method=="Target.disposeBrowserContext" {tokio::time::sleep(Duration::from_millis(40)).await;}
+                        if mode=="popup-held-dispose" {
+                            if method=="Runtime.evaluate" && request["sessionId"]=="initial" && request["params"]["expression"]=="window.open('https://synthetic.test/first')" {
+                                socket.send(Message::Text(json!({"method":"Target.attachedToTarget","params":{"sessionId":"popup-session","waitingForDebugger":true,"targetInfo":{"targetId":"popup-target","browserContextId":"owned-context","type":"page","openerId":"initial-target"}}}).to_string())).await.unwrap();
+                                // Keep the raw opener reply pending until exact detach.
+                                continue;
+                            }
+                            if method=="Target.disposeBrowserContext" {
+                                assert_eq!(request["params"]["browserContextId"], "owned-context");
+                                socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"initial","targetId":"initial-target"}}).to_string())).await.unwrap();
+                                // Detach wakes only the opener waiter. The test alone
+                                // supplies the independent browser-context disposal ACK.
+                                continue;
+                            }
+                        }
                         if method=="Target.detachFromTarget" {detach_count+=1;}
                         if mode=="hold-timezone" && method=="Emulation.setTimezoneOverride" { continue; }
+                        if mode=="popup-runtime-held" && method=="Runtime.enable" && request["sessionId"]=="popup-session" { continue; }
                         let settings_error = match (mode, method) {
                             ("locale-already", "Emulation.setLocaleOverride") => Some("Another locale override is already in effect"),
                             ("timezone-already", "Emulation.setTimezoneOverride") => Some("Timezone override is already in effect"),
                             ("invalid-timezone", "Emulation.setTimezoneOverride") => Some("Invalid timezone"),
+                            ("popup-held-dispose", "Emulation.setTimezoneOverride") if request["sessionId"]=="popup-session" => Some("Invalid timezone"),
                             (_, "Target.setAutoAttach") if request["params"]["autoAttach"]==false && request["params"].get("filter").and_then(Value::as_array).is_some_and(|v|!v.is_empty()) => Some("Target filter should be empty when disabling auto-attach"),
                             _=>None,
                         };
@@ -5268,7 +5353,7 @@ mod tests {
                         if (mode=="fail-remove-script" && method=="Page.removeScriptToEvaluateOnNewDocument") || (mode=="fail-fetch" && method=="Fetch.enable") || (mode=="detach-fallback" && method=="Target.detachFromTarget" && detach_count==1) {
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic injected failure"}}).to_string())).await.unwrap();continue;
                         }
-                        if (mode=="first-request" || mode=="large-first-request" || mode=="hold-timezone") && method=="Fetch.enable" {
+                        if (mode=="first-request" || mode=="large-first-request" || mode=="hold-timezone" || (mode=="popup-held-dispose" && request["sessionId"]=="popup-session")) && method=="Fetch.enable" {
                             let body=if mode=="large-first-request" {"b".repeat(1536*1024)} else {String::new()};
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
                         }
@@ -7018,10 +7103,12 @@ mod tests {
             }
             let result = task.await.unwrap().map(|_| ());
             if case == "transport" {
-                // Connection retirement can win the bounded command cancellation.
+                // EOF removes the original watermark route, so its lost proof
+                // wins over the raw waiter error. Actual owner-stop cancellation
+                // may win first; neither outcome proves target/session retirement.
                 assert!(matches!(
                     result,
-                    Err(ProtocolError::BrowserFailure | ProtocolError::Cancelled)
+                    Err(ProtocolError::ScopeUnavailable | ProtocolError::Cancelled)
                 ));
             } else {
                 assert_eq!(result, Err(expected), "{case}");
@@ -7118,6 +7205,275 @@ mod tests {
         }
     }
 
+    // Failed reads and malformed ACKs are subordinate to the original capture
+    // authority, but keep their own error class when that authority is intact.
+    #[tokio::test]
+    async fn capture_owned_inventory_read_errors_fence_original_authority() {
+        for (method, session) in [
+            ("Target.getTargets", ""),
+            ("Target.getTargetInfo", "missing-session-a"),
+            ("Page.getFrameTree", "initial"),
+        ] {
+            for changed in [false, true] {
+                for protocol_failure in [false, true] {
+                    let f = CaptureWireFixture::new(false).await;
+                    if method == "Target.getTargetInfo" {
+                        f.attach("missing-a", "missing-session-a", "browser_ui")
+                            .await;
+                    }
+                    f.held
+                        .lock()
+                        .unwrap()
+                        .insert((method.into(), session.into()));
+                    let reads = f.requests(method).len();
+                    let inventories = f.requests("Target.getTargets").len();
+                    let before = f.log.lock().unwrap().len();
+                    let original = f.owner.targets.owned_target("target").unwrap();
+                    let watermark = f.owner.realm_watermark().unwrap();
+                    let task = f.capture(f.owner.operation());
+                    let request = f.request(method, reads + 1).await;
+                    if changed {
+                        realm_emit(
+                            &f.owner,
+                            &f.emit,
+                            json!({"method":"Target.targetInfoChanged", "params":{
+                                "targetInfo":capture_info("target", "page")
+                            }}),
+                        )
+                        .await;
+                    }
+                    f.emit
+                        .send(if protocol_failure {
+                            json!({"id":request["id"], "error":{
+                                "code":-32000, "message":"synthetic capture read failure"
+                            }})
+                        } else {
+                            json!({"id":request["id"], "result":{}})
+                        })
+                        .await
+                        .unwrap();
+                    let result = tokio::time::timeout(Duration::from_secs(2), task)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .map(|_| ());
+                    assert_eq!(
+                        result,
+                        Err(if changed {
+                            ProtocolError::StaleScope
+                        } else if protocol_failure {
+                            ProtocolError::BrowserFailure
+                        } else {
+                            ProtocolError::InvalidFrame
+                        }),
+                        "{method}: changed={changed}, protocol_failure={protocol_failure}"
+                    );
+                    // Protocol errors on a live wire do not retire capture
+                    // authority or become blanket stale-scope failures.
+                    assert!(watermark.received().is_ok());
+                    assert!(f.owner.index.lock().unwrap().failure.is_none());
+                    assert_eq!(f.requests(method).len(), reads + 1);
+                    assert_eq!(f.requests("Target.getTargets").len(), inventories + 1);
+                    assert_eq!(request["sessionId"].as_str().unwrap_or(""), session);
+                    assert!(f
+                        .owner
+                        .targets
+                        .owned_target("target")
+                        .unwrap()
+                        .same_attachment(&original));
+                    f.assert_no_capture_mutations(before);
+                    f.finish().await;
+                }
+            }
+        }
+    }
+
+    // Distinguish remote EOF from a protocol error on the still-live stream.
+    // Hold supervisor application so only the original route's loss decides.
+    #[tokio::test]
+    async fn capture_owned_inventory_eof_refuses_lost_original_stream() {
+        for (method, session) in [
+            ("Target.getTargets", ""),
+            ("Target.getTargetInfo", "missing-session-a"),
+            ("Page.getFrameTree", "initial"),
+        ] {
+            let f = CaptureWireFixture::new(false).await;
+            if method == "Target.getTargetInfo" {
+                f.attach("missing-a", "missing-session-a", "browser_ui")
+                    .await;
+            }
+            f.held
+                .lock()
+                .unwrap()
+                .insert((method.into(), session.into()));
+            let reads = f.requests(method).len();
+            let inventories = f.requests("Target.getTargets").len();
+            let before = f.log.lock().unwrap().len();
+            let watermark = f.owner.realm_watermark().unwrap();
+            let (_sender, cancellation) = watch::channel(CancelSignal::None);
+            let mut op = f.owner.operation();
+            op.cancellation = cancellation.clone();
+            let task = f.capture(op);
+            let request = f.request(method, reads + 1).await;
+            let event = f.gate(CaptureTestPoint::BeforeEventApply);
+            f.emit
+                .send(json!({"method":"Target.targetInfoChanged", "params":{
+                    "targetInfo":capture_info("unrelated", "browser_ui")
+                }}))
+                .await
+                .unwrap();
+            event.wait_entered().await;
+            f.emit.send(json!({"fixtureClose":true})).await.unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .map(|_| ()),
+                Err(ProtocolError::ScopeUnavailable),
+                "{method}"
+            );
+            assert!(*f.owner.client.remote_connection_closed().borrow());
+            assert!(watermark.received().is_err());
+            assert_eq!(*cancellation.borrow(), CancelSignal::None);
+            assert!(f.owner.index.lock().unwrap().failure.is_none());
+            assert_eq!(f.requests(method).len(), reads + 1);
+            assert_eq!(f.requests("Target.getTargets").len(), inventories + 1);
+            assert_eq!(request["sessionId"].as_str().unwrap_or(""), session);
+            f.assert_no_capture_mutations(before);
+            event.release();
+            f.finish().await;
+        }
+    }
+
+    // An error reply still drains pending events on the ORIGINAL operation.
+    // It cannot skip cancellation/deadline or renew the lease while fencing.
+    #[tokio::test]
+    async fn capture_owned_inventory_failed_read_drain_keeps_operation_bounds() {
+        for (method, session) in [
+            ("Target.getTargets", ""),
+            ("Target.getTargetInfo", "missing-session-a"),
+            ("Page.getFrameTree", "initial"),
+        ] {
+            for cancel in [false, true] {
+                let f = CaptureWireFixture::new(false).await;
+                if method == "Target.getTargetInfo" {
+                    f.attach("missing-a", "missing-session-a", "browser_ui")
+                        .await;
+                }
+                f.held
+                    .lock()
+                    .unwrap()
+                    .insert((method.into(), session.into()));
+                let reads = f.requests(method).len();
+                let (sender, cancellation) = watch::channel(CancelSignal::None);
+                let mut op = f.owner.operation();
+                op.cancellation = cancellation;
+                op.deadline = Instant::now() + Duration::from_secs(3);
+                let deadline = op.deadline;
+                let task = f.capture(op);
+                let request = f.request(method, reads + 1).await;
+                let event = f.gate(CaptureTestPoint::BeforeEventApply);
+                f.emit
+                    .send(json!({"method":"Target.targetInfoChanged", "params":{
+                        "targetInfo":capture_info("target", "page")
+                    }}))
+                    .await
+                    .unwrap();
+                event.wait_entered().await;
+                let draining = f.gate(CaptureTestPoint::DrainWaiting);
+                f.emit
+                    .send(json!({"id":request["id"], "error":{
+                        "code":-32000, "message":"synthetic capture read failure"
+                    }}))
+                    .await
+                    .unwrap();
+                draining.wait_entered().await;
+                assert!(
+                    !task.is_finished(),
+                    "{method}: failed read skipped its drain"
+                );
+                let at_drain = f.log.lock().unwrap().len();
+                if cancel {
+                    sender.send_replace(CancelSignal::Requested);
+                } else {
+                    tokio::time::sleep_until(deadline.into()).await;
+                }
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), task)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .map(|_| ()),
+                    Err(if cancel {
+                        ProtocolError::Cancelled
+                    } else {
+                        ProtocolError::DeadlineExceeded
+                    }),
+                    "{method}: cancel={cancel}"
+                );
+                assert_eq!(f.log.lock().unwrap().len(), at_drain);
+                assert_eq!(f.requests(method).len(), reads + 1);
+                event.release();
+                f.finish().await;
+            }
+        }
+    }
+
+    // poison() cancels owner operations as well as storing a cause. The cause,
+    // not that secondary cancellation or a raw command error, remains visible.
+    #[tokio::test]
+    async fn capture_owned_inventory_failed_read_preserves_coordinator_failure() {
+        for (method, session) in [
+            ("Target.getTargets", ""),
+            ("Target.getTargetInfo", "missing-session-a"),
+            ("Page.getFrameTree", "initial"),
+        ] {
+            for failure in [ProtocolError::CleanupFailed, ProtocolError::BrowserFailure] {
+                for independent_cancel in [false, true] {
+                    let f = CaptureWireFixture::new(false).await;
+                    if method == "Target.getTargetInfo" {
+                        f.attach("missing-a", "missing-session-a", "browser_ui")
+                            .await;
+                    }
+                    f.held
+                        .lock()
+                        .unwrap()
+                        .insert((method.into(), session.into()));
+                    let reads = f.requests(method).len();
+                    let inventories = f.requests("Target.getTargets").len();
+                    let (_sender, cancellation) = watch::channel(CancelSignal::None);
+                    let mut op = f.owner.operation();
+                    if independent_cancel {
+                        op.cancellation = cancellation;
+                    }
+                    let task = f.capture(op);
+                    let request = f.request(method, reads + 1).await;
+                    f.owner.poison(failure.clone());
+                    f.emit
+                        .send(json!({"id":request["id"], "error":{
+                            "code":-32000, "message":"synthetic capture read failure"
+                        }}))
+                        .await
+                        .unwrap();
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(2), task)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .map(|_| ()),
+                        Err(failure.clone()),
+                        "{method}: failure={failure:?}, independent_cancel={independent_cancel}"
+                    );
+                    assert_eq!(f.requests(method).len(), reads + 1);
+                    assert_eq!(f.requests("Target.getTargets").len(), inventories + 1);
+                    assert_eq!(request["sessionId"].as_str().unwrap_or(""), session);
+                    f.finish().await;
+                }
+            }
+        }
+    }
+
     // 7. Detach is reconciled before an old positive ACK can count as coverage.
     #[tokio::test]
     async fn capture_owned_inventory_detach_before_ack_and_dead_session_refuse() {
@@ -7141,11 +7497,7 @@ mod tests {
             }
             assert_eq!(
                 task.await.unwrap().map(|_| ()),
-                Err(if protocol_failure {
-                    ProtocolError::BrowserFailure
-                } else {
-                    ProtocolError::StaleScope
-                })
+                Err(ProtocolError::StaleScope)
             );
             assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
             assert_eq!(request["sessionId"], "missing-session-a");
@@ -7803,6 +8155,138 @@ mod tests {
         fresh_completed.release();
         assert_eq!(verify.await.unwrap(), Err(ProtocolError::StaleScope));
         f.finish().await;
+    }
+
+    // A failed fresh attestation still checks the PREVIOUS proof. Replacing
+    // only registry tenure before the fresh snapshot isolates this outer fence.
+    #[tokio::test]
+    async fn capture_owned_inventory_failed_fresh_attestation_keeps_original_ticket() {
+        for replace in [false, true] {
+            for protocol_failure in [false, true] {
+                let f = CaptureWireFixture::new(false).await;
+                f.attach("missing-a", "missing-session-a", "browser_ui")
+                    .await;
+                let first = f.capture(f.owner.operation());
+                let request = f.request("Target.getTargetInfo", 1).await;
+                f.reply(&request, capture_info("missing-a", "browser_ui"))
+                    .await;
+                let proof = tokio::time::timeout(Duration::from_secs(2), first)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                let original = f.owner.targets.owned_target("missing-a").unwrap();
+                let epoch = f.owner.index.lock().unwrap().application_epoch;
+                let inventories = f.requests("Target.getTargets").len();
+                let frames = f.requests("Page.getFrameTree").len();
+                f.inventory
+                    .lock()
+                    .unwrap()
+                    .push(capture_info("missing-a", "browser_ui"));
+                f.held
+                    .lock()
+                    .unwrap()
+                    .insert(("Target.getTargets".into(), "".into()));
+                let before_snapshot = f.gate(CaptureTestPoint::AfterInitialDrain);
+                let owner = f.owner.clone();
+                let task = tokio::spawn(async move {
+                    owner
+                        .verify_capture_attestation(&proof, &owner.operation())
+                        .await
+                });
+                before_snapshot.wait_entered().await;
+                if replace {
+                    // No index/epoch edits and no session redirect: only an
+                    // authoritative reinsertion of the identical target/session.
+                    f.owner.targets.detach("missing-a").unwrap();
+                    f.owner
+                        .targets
+                        .attached(
+                            "owned-context",
+                            "missing-a".into(),
+                            "missing-session-a".into(),
+                            "browser_ui".into(),
+                        )
+                        .unwrap();
+                    f.owner.targets.configured("missing-a").unwrap();
+                    f.owner
+                        .targets
+                        .resume_permit("missing-a")
+                        .await
+                        .unwrap()
+                        .complete()
+                        .unwrap();
+                }
+                assert_eq!(
+                    f.owner
+                        .targets
+                        .owned_target("missing-a")
+                        .unwrap()
+                        .same_attachment(&original),
+                    !replace
+                );
+                assert_eq!(f.owner.index.lock().unwrap().application_epoch, epoch);
+                before_snapshot.release();
+                let request = f.request("Target.getTargets", inventories + 1).await;
+                f.emit
+                    .send(if protocol_failure {
+                        json!({"id":request["id"], "error":{
+                            "code":-32000, "message":"synthetic fresh inventory failure"
+                        }})
+                    } else {
+                        json!({"id":request["id"], "result":{}})
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), task)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    Err(if replace {
+                        ProtocolError::StaleScope
+                    } else if protocol_failure {
+                        ProtocolError::BrowserFailure
+                    } else {
+                        ProtocolError::InvalidFrame
+                    }),
+                    "replace={replace}, protocol_failure={protocol_failure}"
+                );
+                assert_eq!(f.requests("Target.getTargets").len(), inventories + 1);
+                assert_eq!(f.requests("Target.getTargetInfo").len(), 1);
+                assert_eq!(f.requests("Page.getFrameTree").len(), frames);
+                assert_eq!(f.owner.index.lock().unwrap().application_epoch, epoch);
+                f.finish().await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn capture_owned_inventory_failed_fresh_attestation_preserves_coordinator_failure() {
+        for failure in [ProtocolError::CleanupFailed, ProtocolError::BrowserFailure] {
+            let f = CaptureWireFixture::new(false).await;
+            let proof = f.owner.attest_capture(&f.owner.operation()).await.unwrap();
+            let inventories = f.requests("Target.getTargets").len();
+            let before_snapshot = f.gate(CaptureTestPoint::AfterInitialDrain);
+            let owner = f.owner.clone();
+            let task = tokio::spawn(async move {
+                owner
+                    .verify_capture_attestation(&proof, &owner.operation())
+                    .await
+            });
+            before_snapshot.wait_entered().await;
+            f.owner.poison(failure.clone());
+            before_snapshot.release();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                Err(failure)
+            );
+            assert_eq!(f.requests("Target.getTargets").len(), inventories);
+            f.finish().await;
+        }
     }
 
     // 15. Unknown same-context and observer-only omissions never gain ownership.
@@ -11339,6 +11823,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn popup_runtime_ack_precedes_every_script_and_failure_never_resumes() {
+        for fail in [false, true] {
+            let (owner, _notices, log, emit, server) = fixture("popup-runtime-held").await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let lease = owner.lease(&initial).unwrap();
+            for ordinal in 0..4 {
+                owner
+                    .page
+                    .execute(
+                        &lease,
+                        &["initial".into()],
+                        &owner.operation(),
+                        "context.init-script",
+                        &json!({"source":format!("window.syntheticTrail.push({ordinal})")}),
+                    )
+                    .await
+                    .unwrap();
+            }
+            log.lock().unwrap().clear();
+            let task_owner = owner.clone();
+            let task = tokio::spawn(async move {
+                task_owner
+                    .attached(attach(
+                        "owned-context",
+                        "popup",
+                        "popup-session",
+                        "page",
+                        None,
+                    ))
+                    .await
+            });
+            let runtime = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(request) = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|request| request["method"] == "Runtime.enable")
+                        .cloned()
+                    {
+                        break request;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!task.is_finished());
+            assert!(!log.lock().unwrap().iter().any(|request| matches!(
+                request["method"].as_str(),
+                Some("Page.addScriptToEvaluateOnNewDocument" | "Runtime.runIfWaitingForDebugger")
+            )));
+            let response = if fail {
+                json!({"id":runtime["id"],"error":{"code":-32000,"message":"synthetic runtime refusal"}})
+            } else {
+                json!({"id":runtime["id"],"result":{}})
+            };
+            emit.send(response).await.unwrap();
+            let result = task.await.unwrap();
+            let commands = log.lock().unwrap().clone();
+            let scripts: Vec<_> = commands
+                .iter()
+                .filter(|request| request["method"] == "Page.addScriptToEvaluateOnNewDocument")
+                .collect();
+            if fail {
+                assert!(result.is_err());
+                assert!(scripts.is_empty());
+                assert!(!commands
+                    .iter()
+                    .any(|request| request["method"] == "Runtime.runIfWaitingForDebugger"));
+            } else {
+                result.unwrap();
+                assert_eq!(scripts.len(), 4);
+                for (ordinal, request) in scripts.iter().enumerate() {
+                    assert_eq!(
+                        request["params"]["source"],
+                        format!("window.syntheticTrail.push({ordinal})")
+                    );
+                }
+                let runtime_pos = commands
+                    .iter()
+                    .position(|request| request["method"] == "Runtime.enable")
+                    .unwrap();
+                let resume_pos = commands
+                    .iter()
+                    .position(|request| request["method"] == "Runtime.runIfWaitingForDebugger")
+                    .unwrap();
+                for (position, request) in commands.iter().enumerate() {
+                    if request["method"] == "Page.addScriptToEvaluateOnNewDocument" {
+                        assert!(runtime_pos < position && position < resume_pos);
+                    }
+                }
+            }
+            drop(lease);
+            let _ = owner.close().await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn protected_registration_policy_uses_single_context_init_inventory() {
         let (mut owner, _notices, log, _emit, server) = fixture("normal").await;
         Arc::get_mut(&mut owner)
@@ -11516,6 +12104,185 @@ mod tests {
         );
         owner.release_after_containment(proof).await.unwrap();
         server.abort();
+    }
+    #[tokio::test]
+    async fn popup_opener_detach_does_not_prove_context_disposal() {
+        for ack in ["success", "error", "missing"] {
+            let (mut owner, _notices, log, emit, server) = fixture("popup-held-dispose").await;
+            Arc::get_mut(&mut owner).unwrap().config.timezone_id = Some("UTC".into());
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let opener = owner.index.lock().unwrap().sessions["initial"].clone();
+            let mut events = owner
+                .client
+                .subscribe_bounded_methods(
+                    &["Target.attachedToTarget", "Test.disposalReplyBarrier"],
+                    8,
+                    8192,
+                )
+                .unwrap();
+            let client = owner.client.clone();
+            let evaluation = tokio::spawn(async move {
+                client.send_command(
+                    "Runtime.evaluate",
+                    Some(json!({"expression":"window.open('https://synthetic.test/first')","returnByValue":true})),
+                    Some("initial"),
+                ).await
+            });
+            let attached = tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(attached.method, "Target.attachedToTarget");
+            assert_eq!(attached.params["sessionId"], "popup-session");
+            assert_eq!(attached.params["targetInfo"]["targetId"], "popup-target");
+            assert_eq!(attached.params["targetInfo"]["openerId"], "initial-target");
+            assert_eq!(
+                attached.params["targetInfo"]["browserContextId"],
+                "owned-context"
+            );
+            assert_eq!(attached.params["waitingForDebugger"], true);
+            let error = tokio::time::timeout(Duration::from_secs(1), evaluation)
+                .await
+                .expect(
+                    "exact opener detach must wake the raw evaluation before its command timeout",
+                )
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(error, "CDP response channel closed");
+            let dispose = log
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|request| request["method"] == "Target.disposeBrowserContext")
+                .cloned()
+                .expect("failed popup initialization must request containment");
+            assert_eq!(dispose["params"]["browserContextId"], "owned-context");
+            let popup = owner.index.lock().unwrap().sessions["popup-session"].clone();
+            assert_eq!(popup.target, "popup-target");
+            assert!(popup.application && !popup.resumed);
+            assert!(owner.sealed.load(Ordering::Acquire));
+            assert!(owner.lease(&opener).is_err());
+            let outcome = owner.cleanup_outcome().unwrap();
+            assert!(!outcome.isolated_context_disposed);
+            assert!(!outcome.owned_resources_contained);
+            assert!(!outcome.autoattach_disabled);
+
+            // Retain the real drain and proof futures. A failed raw waiter must
+            // not complete either while the exact disposal reply is withheld.
+            let drain = owner.drain();
+            tokio::pin!(drain);
+            assert!(futures_util::poll!(&mut drain).is_pending());
+            let containment = owner.contain_owned_resources();
+            tokio::pin!(containment);
+            assert!(futures_util::poll!(&mut containment).is_pending());
+            emit.send(json!({"id":dispose["id"].as_u64().unwrap() + 1_000_000,"result":{}}))
+                .await
+                .unwrap();
+            emit.send(json!({"method":"Test.disposalReplyBarrier","params":{}}))
+                .await
+                .unwrap();
+            // Ordered read-side barrier proves the wrong ACK was consumed;
+            // neither elapsed time nor sending it is acknowledgment evidence.
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .method,
+                "Test.disposalReplyBarrier"
+            );
+            assert!(futures_util::poll!(&mut drain).is_pending());
+            assert!(futures_util::poll!(&mut containment).is_pending());
+            let outcome = owner.cleanup_outcome().unwrap();
+            assert!(!outcome.isolated_context_disposed);
+            assert!(!outcome.owned_resources_contained);
+            assert!(!outcome.autoattach_disabled);
+            assert!(!log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["method"] == "Target.setAutoAttach"
+                    && request["params"]["autoAttach"] == false));
+
+            match ack {
+                "success" => emit.send(json!({"id":dispose["id"],"result":{}})).await.unwrap(),
+                "error" => emit.send(json!({"id":dispose["id"],"error":{"code":-32000,"message":"synthetic disposal rejection"}})).await.unwrap(),
+                "missing" => {},
+                _ => unreachable!(),
+            }
+            assert!(tokio::time::timeout(Duration::from_secs(3), &mut drain)
+                .await
+                .expect("disposal error or missing ACK must settle fail-closed")
+                .is_err());
+            let proof = tokio::time::timeout(Duration::from_secs(1), &mut containment)
+                .await
+                .expect("proof must settle after the retained drain");
+            if ack == "success" {
+                let proof = proof.unwrap();
+                assert!(Arc::ptr_eq(&proof.registry, &owner.targets));
+                assert_eq!(proof.identity_scope, "owned-scope");
+                assert_eq!(proof.generation, owner.generation);
+                let outcome = owner.cleanup_outcome().unwrap();
+                assert!(outcome.isolated_context_disposed && outcome.owned_resources_contained);
+                assert!(!outcome.autoattach_disabled);
+                owner.release_after_containment(proof).await.unwrap();
+                assert!(owner.cleanup_outcome().unwrap().autoattach_disabled);
+            } else {
+                assert!(matches!(proof, Err(ProtocolError::CleanupFailed)));
+                let outcome = owner.cleanup_outcome().unwrap();
+                assert!(!outcome.isolated_context_disposed);
+                assert!(!outcome.owned_resources_contained);
+                assert!(!outcome.autoattach_disabled);
+                assert!(owner.contain_owned_resources().await.is_err());
+            }
+            // Even an exact successful cleanup ACK authorizes only retirement,
+            // never reuse of this failed application's admission or popup pause.
+            assert!(owner.sealed.load(Ordering::Acquire));
+            assert!(owner.lease(&opener).is_err());
+            assert!(owner
+                .enroll_existing(
+                    "replacement",
+                    "replacement-session",
+                    "page",
+                    &owner.operation()
+                )
+                .await
+                .is_err());
+            let commands = log.lock().unwrap().clone();
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|request| request["method"] == "Target.disposeBrowserContext")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                commands
+                    .iter()
+                    .filter(|request| request["method"] == "Target.setAutoAttach"
+                        && request["params"]["autoAttach"] == false)
+                    .count(),
+                usize::from(ack == "success")
+            );
+            assert!(!commands
+                .iter()
+                .any(|request| request["sessionId"] == "popup-session"
+                    && matches!(
+                        request["method"].as_str(),
+                        Some("Runtime.runIfWaitingForDebugger" | "Fetch.continueRequest")
+                    )));
+            assert!(owner
+                .client
+                .send_command("Browser.getVersion", Some(json!({})), None)
+                .await
+                .is_ok());
+            owner.client.close().await;
+            server.abort();
+        }
     }
     #[tokio::test]
     async fn containment_proof_cannot_release_another_scope() {
@@ -12481,6 +13248,13 @@ mod tests {
     #[tokio::test]
     #[ignore = "requires hosted Chromium: two tenants and first-request initialization"]
     async fn e2e_enrollment_two_tenants_and_popup_first_script() {
+        // Both modes are required: a policy at registry ordinal zero is
+        // idempotent and can hide a first-registration-only double execution.
+        for block_service_workers in [true, false] {
+            hosted_popup_first_script(block_service_workers).await;
+        }
+    }
+    async fn hosted_popup_first_script(block_service_workers: bool) {
         use super::super::cdp::chrome::{launch_chrome, LaunchOptions};
         let mut chrome = launch_chrome(&LaunchOptions {
             headless: true,
@@ -12538,7 +13312,7 @@ mod tests {
         Arc::get_mut(&mut owner)
             .unwrap()
             .config
-            .block_service_workers = true;
+            .block_service_workers = block_service_workers;
         let policy = tokio::spawn(async move {
             while let Some(message) = notices.recv().await {
                 if let ServerMessage::Event {
@@ -12727,7 +13501,7 @@ mod tests {
         eprintln!(
             "native popup synthetic witness: {}",
             json!({
-                "registrationAckOrdinals":acks, "executions":records,
+                "blockServiceWorkers":block_service_workers, "registrationAckOrdinals":acks, "executions":records,
                 "bootTrail":boot["result"]["value"]
             })
         );
@@ -12736,7 +13510,10 @@ mod tests {
             json!([[0, 0, false], [1, 0, false], [2, 0, false], [3, 0, false]])
         );
         // Policy, then four scripts; script 0 retains the original =41 effect.
-        assert_eq!(acks, vec![0, 1, 2, 3, 4]);
+        assert_eq!(
+            acks,
+            (0..if block_service_workers { 5 } else { 4 }).collect::<Vec<usize>>()
+        );
         assert_eq!(popup.root, popup.session);
         assert_eq!(*owner.active_root.lock().unwrap(), session);
         assert!(!owner
@@ -13053,20 +13830,15 @@ mod tests {
                     serde_json::to_string(&url).unwrap()
                 );
                 let opener_client = client.clone();
-                let opener_owner = owner.clone();
                 let opener_session = popup_parent.as_ref().unwrap().1.clone();
                 opener_evaluation = Some(tokio::spawn(async move {
                     // window.open may remain blocked while its child is paused.
                     // Failed child configuration can dispose this opener before
                     // its evaluate reply. Retain the command concurrently rather
                     // than making that reply a prerequisite for containment.
-                    let result = opener_client.send_command("Runtime.evaluate",
+                    opener_client.send_command("Runtime.evaluate",
                         Some(json!({"expression":expression,"userGesture":true,"returnByValue":true})),
-                        Some(&opener_session)).await;
-                    let disposed_at_reply = opener_owner
-                        .cleanup_outcome()
-                        .is_ok_and(|outcome| outcome.isolated_context_disposed);
-                    (result, disposed_at_reply)
+                        Some(&opener_session)).await
                 }));
                 let parent = &popup_parent.as_ref().unwrap().0;
                 tokio::time::timeout(Duration::from_secs(5), async {
@@ -13124,7 +13896,7 @@ mod tests {
         let outcome = owner.cleanup_outcome().unwrap();
         assert!(outcome.isolated_context_disposed && outcome.autoattach_disabled);
         if let Some(evaluation) = opener_evaluation {
-            let (result, disposed_at_reply) = evaluation
+            let result = evaluation
                 .await
                 .expect("retained opener evaluation task failed");
             match result {
@@ -13140,23 +13912,20 @@ mod tests {
                     eprintln!("popup opener evaluation: successful non-null handle");
                 }
                 Err(error) => {
-                    // Do not accept timeout alone as creation evidence: exact
-                    // popup/opener attribution and failed unresumed enrollment
-                    // were independently required above. Unexpected failures
-                    // before acknowledged containment still fail this fixture.
-                    assert!(
-                        disposed_at_reply,
-                        "opener evaluation failed before acknowledged context containment: {error}"
-                    );
+                    // Exact opener detach may wake this raw waiter before the
+                    // disposal ACK publishes cleanup. Its error proves neither
+                    // creation nor containment: exact popup/opener attribution,
+                    // failed unresumed enrollment, and this owner's actual
+                    // containment proof and phase-two release are required above.
                     let expected = error.contains("timed out")
                         || error.contains("closed")
                         || error.contains("Session with given id not found")
                         || error.contains("Cannot find context with specified id");
                     assert!(
                         expected,
-                        "unexpected post-containment opener failure: {error}"
+                        "unexpected opener failure after verifying containment: {error}"
                     );
-                    eprintln!("popup opener evaluation: expected closed/timeout outcome after acknowledged context disposal");
+                    eprintln!("popup opener evaluation: expected closed/timeout outcome; exact context disposal independently acknowledged");
                 }
             }
         }

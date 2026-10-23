@@ -1446,6 +1446,30 @@ async fn verified_frames_with_cleanup(
     operation: &OperationLease,
     cleanup: Option<&AtomicBool>,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+    Ok(
+        verified_frame_inventory_with_cleanup(page, operation, cleanup)
+            .await?
+            .frames,
+    )
+}
+/// Frames and renderer roots from the same verified native inventory. A frame
+/// with a parent is not necessarily a renderer root: same-process descendants
+/// inherit their parent's session, including descendants within an OOPIF.
+pub(crate) struct VerifiedFrameInventory {
+    pub frames: Vec<ObservationFrame>,
+    pub iframe_sessions: HashMap<String, String>,
+}
+pub(crate) async fn verified_frame_inventory(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+) -> Result<VerifiedFrameInventory, ProtocolError> {
+    verified_frame_inventory_with_cleanup(page, operation, None).await
+}
+async fn verified_frame_inventory_with_cleanup(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+) -> Result<VerifiedFrameInventory, ProtocolError> {
     check(page, operation)?;
     let (revision, targets) = page.targets.inventory()?;
     let main = targets
@@ -1525,10 +1549,10 @@ async fn verified_frames_with_cleanup(
     {
         return Err(ProtocolError::StaleScope);
     }
-    for (frame, session) in mapping {
+    for (frame, session) in &mapping {
         if !frames.iter().any(|candidate| {
-            candidate.binding.frame == frame
-                && candidate.binding.session == session
+            &candidate.binding.frame == frame
+                && &candidate.binding.session == session
                 && candidate.parent_frame_id.is_some()
         }) {
             return Err(ProtocolError::UnsupportedCapability);
@@ -1536,7 +1560,10 @@ async fn verified_frames_with_cleanup(
     }
     page.targets.check_revision(revision)?;
     check(page, operation)?;
-    Ok(frames)
+    Ok(VerifiedFrameInventory {
+        frames,
+        iframe_sessions: mapping,
+    })
 }
 /// Page roots and renderer roots are different identities. Merge exact native
 /// parent edges first, then attribute every renderer root to one owned page.
@@ -3877,3 +3904,7 @@ mod tests {
         assert!(!flags.pixels);
     }
 }
+
+#[cfg(test)]
+#[path = "client_frame_inventory_tests.rs"]
+mod frame_inventory_tests;

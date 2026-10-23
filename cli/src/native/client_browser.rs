@@ -5,6 +5,7 @@ use tokio::sync::Notify;
 
 use super::cdp::client::CdpClient;
 use super::client_protocol::ProtocolError;
+use super::client_settlement_trace::{self as cleanup_trace, CleanupComponent as CleanupPart};
 
 #[derive(Default)]
 struct GateState {
@@ -620,23 +621,29 @@ impl OwnedRuntime {
                 return Err(ProtocolError::CleanupFailed);
             }
         };
+        let diagnostics = client.cleanup_observer();
         self.enrollment.seal();
         let drained = self.enrollment.drain().await;
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::EnrollmentFallback, &drained);
         let network = self.network.close_for_remote_disconnect(&proof).await;
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::OwnerFallback, &network);
         let terminal_recording = self.actions.settle_terminal_recording(client, &proof).await;
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Recording, &terminal_recording);
         let actions = if preserve_recording {
             let recording = self
                 .actions
                 .recording_page_closing(&self.scope.identity_scope, &self.blobs)
                 .await;
+            cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Recording, &recording);
             let uploads = self.actions.cleanup_scope_uploads().await;
+            cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Upload, &uploads);
             if recording.is_err() || uploads.is_err() {
                 Err(ProtocolError::CleanupFailed)
             } else {
                 Ok(())
             }
         } else {
-            self.actions.cleanup().await
+            self.actions.cleanup_with_diagnostics(&diagnostics).await
         };
         let retired = if preserve_recording {
             Ok(())
@@ -644,11 +651,14 @@ impl OwnedRuntime {
             self.network.close().await
         };
         let directory = if drained.is_ok() && network.is_ok() {
-            self.remove_download_directory().await
+            let directory = self.remove_download_directory().await;
+            cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Download, &directory);
+            directory
         } else {
             Err(ProtocolError::CleanupFailed)
         };
         let blobs = self.blobs.revoke_scope(&self.scope);
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Blob, &blobs);
         if drained.is_err()
             || network.is_err()
             || terminal_recording.is_err()
@@ -666,8 +676,10 @@ impl OwnedRuntime {
         &self,
         client: &Arc<super::cdp::client::CdpClient>,
     ) -> Result<(), ProtocolError> {
+        let diagnostics = client.cleanup_observer();
         self.enrollment.seal();
         let drained = self.enrollment.drain().await;
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::EnrollmentFallback, &drained);
         let proof = self
             .enrollment
             .final_local_connection_proof()
@@ -678,13 +690,17 @@ impl OwnedRuntime {
         // Every local obligation is still joined, even when proof is refused.
         // No recording detach/stop failure is reclassified using transport EOF.
         let network = self.network.close().await;
-        let actions = self.actions.cleanup().await;
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::OwnerFallback, &network);
+        let actions = self.actions.cleanup_with_diagnostics(&diagnostics).await;
         let directory = if drained.is_ok() && network.is_ok() {
-            self.remove_download_directory().await
+            let directory = self.remove_download_directory().await;
+            cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Download, &directory);
+            directory
         } else {
             Err(ProtocolError::CleanupFailed)
         };
         let blobs = self.blobs.revoke_scope(&self.scope);
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Blob, &blobs);
         let exact = proof.and_then(|proof| {
             proof.check_client(client)?;
             proof.check_network(&self.network)
@@ -708,29 +724,42 @@ impl OwnedRuntime {
         &self,
         preserve_recording: bool,
     ) -> Result<(), ProtocolError> {
+        let diagnostics = self.network.client.cleanup_observer();
         self.enrollment.seal();
-        let drain_failed = self.enrollment.drain().await.is_err();
+        let drained = self.enrollment.drain().await;
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::EnrollmentFallback, &drained);
+        let drain_failed = drained.is_err();
         let action_cleanup_failed = if preserve_recording {
             let recording = self
                 .actions
                 .recording_page_closing(&self.scope.identity_scope, &self.blobs)
                 .await;
+            cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Recording, &recording);
             let uploads = self.actions.cleanup_scope_uploads().await;
+            cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Upload, &uploads);
             recording.is_err() || uploads.is_err()
         } else {
-            self.actions.cleanup().await.is_err()
+            self.actions
+                .cleanup_with_diagnostics(&diagnostics)
+                .await
+                .is_err()
         };
         let contained = self.enrollment.contain_owned_resources().await;
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Containment, &contained);
         let release = match contained {
             Ok(proof) => self.enrollment.release_after_containment(proof).await,
             Err(error) => Err(error),
         };
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Release, &release);
         let directory_failed = if !drain_failed && release.is_ok() {
-            self.remove_download_directory().await.is_err()
+            let directory = self.remove_download_directory().await;
+            cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Download, &directory);
+            directory.is_err()
         } else {
             false
         };
         let revoked = self.blobs.revoke_scope(&self.scope);
+        cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::Blob, &revoked);
         if drain_failed
             || action_cleanup_failed
             || release.is_err()
@@ -1316,11 +1345,17 @@ impl OwnedBrowser {
     }
 
     async fn cleanup_replacement_actions(&mut self) -> Result<(), ProtocolError> {
+        let diagnostics = self.manager.client.cleanup_observer();
         let mut failed = false;
         if let Some(routes) = &mut self.disconnected_routes {
             if routes.retire().is_ok() {
                 self.disconnected_routes = None;
             } else {
+                cleanup_trace::observe_cleanup(
+                    &diagnostics,
+                    CleanupPart::OwnerFallback,
+                    &Err::<(), _>(ProtocolError::CleanupFailed),
+                );
                 failed = true;
             }
         }
@@ -1328,13 +1363,23 @@ impl OwnedBrowser {
             if routes.retire().is_ok() {
                 self.replacement_routes = None;
             } else {
+                cleanup_trace::observe_cleanup(
+                    &diagnostics,
+                    CleanupPart::OwnerFallback,
+                    &Err::<(), _>(ProtocolError::CleanupFailed),
+                );
                 failed = true;
             }
         }
         if let Some(actions) = &self.replacement_actions {
-            if actions.cleanup().await.is_ok() {
+            if actions.cleanup_with_diagnostics(&diagnostics).await.is_ok() {
                 self.replacement_actions = None;
             } else {
+                cleanup_trace::observe_cleanup(
+                    &diagnostics,
+                    CleanupPart::OwnerFallback,
+                    &Err::<(), _>(ProtocolError::CleanupFailed),
+                );
                 failed = true;
             }
         }
@@ -2070,18 +2115,23 @@ impl ClientBrowser {
 
     /// A retained supervisor owns teardown even when the RPC future is dropped.
     /// The same browser process can be reused only after context disposal proof.
-    async fn end_scope(&self, identity_scope: String) -> Result<serde_json::Value, ProtocolError> {
+    async fn end_scope(
+        &self,
+        identity_scope: String,
+        operation_seq: u64,
+    ) -> Result<serde_json::Value, ProtocolError> {
         let transition = self.lifecycle.clone().lock_owned().await;
-        if self
-            .owner
-            .lock()
-            .await
-            .as_ref()
-            .map(|scope| scope.identity_scope.as_str())
-            != Some(identity_scope.as_str())
-        {
-            return Err(ProtocolError::StaleScope);
-        }
+        let diagnostics = {
+            let owner = self.owner.lock().await;
+            if owner.as_ref().map(|scope| scope.identity_scope.as_str())
+                != Some(identity_scope.as_str())
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            owner
+                .as_ref()
+                .and_then(|owner| owner.manager.client.cleanup_diagnostics())
+        };
         self.stop_enrollment(false)?;
         #[cfg(feature = "acceptance-faults")]
         self.faults.retire_scope(&identity_scope)?;
@@ -2096,11 +2146,23 @@ impl ClientBrowser {
         let refs = self.refs.clone();
         let tasks = self.tasks.clone();
         let uncertain = self.startup_uncertain.clone();
+        let diagnostic_attempt = diagnostics
+            .as_ref()
+            .and_then(|cell| cell.begin(cleanup_trace::CleanupLifecycle::ScopeEnd, operation_seq));
+        let diagnostics = diagnostic_attempt
+            .as_ref()
+            .map(|attempt| attempt.observer());
         let (send, receive) = tokio::sync::oneshot::channel();
         *slot = Some(tokio::spawn(async move {
             let _transition = transition;
             let result = async {
-                let task_cleanup_failed = tasks.drain().await.is_err();
+                let task_cleanup = tasks.drain().await;
+                cleanup_trace::observe_cleanup(
+                    &diagnostics,
+                    CleanupPart::RetainedTaskFallback,
+                    &task_cleanup,
+                );
+                let task_cleanup_failed = task_cleanup.is_err();
                 // Revoke exact authority while the resource is still journaled.
                 // A poisoned map must not drop a live browser manager.
                 refs.lock()
@@ -2132,10 +2194,15 @@ impl ClientBrowser {
                 Ok(serde_json::Value::Null)
             }
             .await;
+            cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::OwnerFallback, &result);
             let _ = send.send(result);
         }));
         drop(slot);
-        receive.await.map_err(|_| ProtocolError::CleanupFailed)?
+        let result = receive.await.map_err(|_| ProtocolError::CleanupFailed)?;
+        if let Some(attempt) = diagnostic_attempt {
+            attempt.finish(&result);
+        }
+        result
     }
 
     fn stop_enrollment(&self, permanent: bool) -> Result<(), ProtocolError> {
@@ -2956,7 +3023,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     let _ui = ui_permit;
                     let _input = input_permit;
                     let preflight = async {
-                        let frames = super::client_observation_dispatch::verified_frames(&page, &lease).await?;
+                        let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&page, &lease).await?;
                         let geometry = super::client_geometry::GeometrySnapshot::capture(&page.client, &page.page_session_id, &frames, &lease).await.map_err(|error| {
                             use super::client_geometry::GeometryError;
                             match error {
@@ -2969,8 +3036,6 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         })?;
                         let (revision, refs, observed_revision) = observation.snapshot_with_observation(&lease).await?;
                         observation.check_publication_fence(publication_fence)?;
-                        let sessions = frames.iter().filter(|frame| frame.parent_frame_id.is_some())
-                            .map(|frame| (frame.binding.frame.clone(), frame.binding.session.clone())).collect::<std::collections::HashMap<_,_>>();
                         Ok((revision, refs, frames, sessions, geometry, observed_revision))
                     }.await;
                     let (revision, refs, frames, sessions, geometry, observed_revision) = match preflight {
@@ -3304,6 +3369,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     .as_str()
                     .unwrap_or_default()
                     .to_owned(),
+                lease.sequence,
             )
             .await
         } else {
@@ -3747,6 +3813,13 @@ impl ClientBrowser {
                 }
             }
         };
+        let diagnostics = page.client.cleanup_diagnostics();
+        let diagnostic_attempt = diagnostics.as_ref().and_then(|cell| {
+            cell.begin(cleanup_trace::CleanupLifecycle::Restart, operation.sequence)
+        });
+        let diagnostics = diagnostic_attempt
+            .as_ref()
+            .map(|attempt| attempt.observer());
         let receive = self.tasks.start(scope.clone(), targets.clone(), async move {
             let _transition = transition;
             let mut effects = false;
@@ -3770,15 +3843,18 @@ impl ClientBrowser {
                 }.with_staged_sink(staged);
                 // Capture/encoder resources settle before any old page closes.
                 effects = true;
-                page_state.release_input(&page).await.inspect_err(|_| { dirty = true; })?;
-                actions.recording_page_closing(&scope, &blobs).await.inspect_err(|_| { dirty = true; })?;
+                page_state.release_input(&page).await.inspect_err(|_| { dirty = true; if let Some(cell) = &diagnostics { cell.failure(CleanupPart::Input); } })?;
+                actions.recording_page_closing(&scope, &blobs).await.inspect_err(|_| { dirty = true; if let Some(cell) = &diagnostics { cell.failure(CleanupPart::Recording); } })?;
                 refs.lock().map_err(|_| ProtocolError::ScopeUnavailable)?.retire_owner_references();
                 let replacement = super::client_restart::replace_pages(&context).await.map_err(|failure| {
+                    if failure.cleanup_integrity_lost {
+                        if let Some(cell) = &diagnostics { cell.failure(CleanupPart::OwnerFallback); }
+                    }
                     dirty |= failure.cleanup_integrity_lost || failure.effects_started;
                     failure.error
                 })?;
                 replacement.validate(&context)?;
-                actions.cleanup_scope_uploads().await.inspect_err(|_| { dirty = true; })?;
+                actions.cleanup_scope_uploads().await.inspect_err(|_| { dirty = true; if let Some(cell) = &diagnostics { cell.failure(CleanupPart::Upload); } })?;
                 let (next, recovery_identity) = {
                     let mut owner = owner.lock().await;
                     let owner = owner.as_mut().ok_or(ProtocolError::StaleScope)?;
@@ -3792,10 +3868,9 @@ impl ClientBrowser {
                 };
                 active.store(true, std::sync::atomic::Ordering::SeqCst);
                 if actions.is_recording_armed().await? {
-                    let frames = super::client_observation_dispatch::verified_frames(&next, &operation).await?;
+                    let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
                     let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
-                    let sessions = frames.iter().filter(|frame| frame.parent_frame_id.is_some()).map(|frame| (frame.binding.frame.clone(), frame.binding.session.clone())).collect();
                     actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
                 }
                 if *operation.cancellation.borrow() != super::client_session::CancelSignal::None { return Err(ProtocolError::Cancelled); }
@@ -3810,7 +3885,11 @@ impl ClientBrowser {
             let effect = if result.is_ok() { Effects::Completed } else if effects { Effects::Unknown } else { Effects::NotDispatched };
             (NativeOutcome { retention: None, result, effects:effect }, dirty)
         }).await;
-        await_retained(receive).await
+        let outcome = await_retained(receive).await;
+        if let Some(attempt) = diagnostic_attempt {
+            attempt.finish(&outcome.result);
+        }
+        outcome
     }
 }
 
@@ -4063,7 +4142,10 @@ impl ClientBrowser {
                             super::client_debt::InitializationWork::Recording,
                             &operation,
                             async {
-                                let frames = super::client_observation_dispatch::verified_frames(
+                                let super::client_observation_dispatch::VerifiedFrameInventory {
+                                    frames,
+                                    iframe_sessions: sessions,
+                                } = super::client_observation_dispatch::verified_frame_inventory(
                                     &page, &operation,
                                 )
                                 .await?;
@@ -4077,13 +4159,6 @@ impl ClientBrowser {
                                 .map_err(|_| ProtocolError::BrowserFailure)?;
                                 let (revision, references) =
                                     observation.snapshot_for_action(&operation).await?;
-                                let sessions = frames
-                                    .iter()
-                                    .filter(|frame| frame.parent_frame_id.is_some())
-                                    .map(|frame| {
-                                        (frame.binding.frame.clone(), frame.binding.session.clone())
-                                    })
-                                    .collect();
                                 actions
                                     .recording_page_opened(super::client_actions::ActionContext {
                                         observation_after: None,
@@ -4409,7 +4484,10 @@ impl ClientBrowser {
                         super::client_debt::InitializationWork::Recording,
                         &operation,
                         async {
-                            let frames = super::client_observation_dispatch::verified_frames(
+                            let super::client_observation_dispatch::VerifiedFrameInventory {
+                                frames,
+                                iframe_sessions: sessions,
+                            } = super::client_observation_dispatch::verified_frame_inventory(
                                 &page, &operation,
                             )
                             .await?;
@@ -4423,13 +4501,6 @@ impl ClientBrowser {
                             .map_err(|_| ProtocolError::BrowserFailure)?;
                             let (revision, references) =
                                 observation.snapshot_for_action(&operation).await?;
-                            let sessions = frames
-                                .iter()
-                                .filter(|frame| frame.parent_frame_id.is_some())
-                                .map(|frame| {
-                                    (frame.binding.frame.clone(), frame.binding.session.clone())
-                                })
-                                .collect();
                             actions
                                 .recording_page_opened(super::client_actions::ActionContext {
                                     observation_after: None,
@@ -5314,7 +5385,7 @@ mod tests {
             .manager
             .get_cdp_url()
             .to_owned();
-        browser.end_scope(first_scope.clone()).await.unwrap();
+        browser.end_scope(first_scope.clone(), 0).await.unwrap();
         assert!(browser.owner.lock().await.is_none());
         assert!(browser.page_lease(false).await.is_err());
         let contexts = host
@@ -5348,7 +5419,7 @@ mod tests {
             retained_endpoint
         );
         assert_eq!(
-            browser.end_scope(first_scope).await.unwrap_err(),
+            browser.end_scope(first_scope, 0).await.unwrap_err(),
             ProtocolError::StaleScope
         );
         {
