@@ -232,16 +232,17 @@ mod restart_readiness {
             let replacement = f.owner.targets.owned_target("target").unwrap();
             let mut op = f.owner.operation();
             match case {
-                "unknown" => f
-                    .owner
-                    .targets
-                    .attached(
-                        "owned-context",
-                        "unknown".into(),
-                        "unknown-session".into(),
-                        "browser-ui".into(),
-                    )
-                    .unwrap(),
+                "unknown" => {
+                    f.owner
+                        .targets
+                        .attached(
+                            "owned-context",
+                            "unknown".into(),
+                            "unknown-session".into(),
+                            "browser-ui".into(),
+                        )
+                        .unwrap();
+                }
                 "reattached" => {
                     f.owner.targets.detach("target").unwrap();
                     f.owner
