@@ -4348,7 +4348,10 @@ impl ClientEnrollment {
                 .cloned();
             if entry.is_some_and(|entry| entry.application) {
                 self.bump_application_epoch()?;
-                self.targets.invalidate_inventory()?;
+                self.targets.invalidate_inventory_for(
+                    super::client_settlement_trace::InventoryRevisionEvent::Info,
+                    target,
+                )?;
             }
             return Ok(());
         }
@@ -4447,7 +4450,10 @@ impl ClientEnrollment {
             }
             "Page.frameNavigated" => {
                 self.bump_application_epoch()?;
-                self.targets.invalidate_inventory()?;
+                self.targets.invalidate_inventory_for(
+                    super::client_settlement_trace::InventoryRevisionEvent::Navigate,
+                    &entry.target,
+                )?;
                 self.record_frame(
                     &entry,
                     event
@@ -4459,11 +4465,17 @@ impl ClientEnrollment {
             }
             "Page.navigatedWithinDocument" => {
                 self.bump_application_epoch()?;
-                self.targets.invalidate_inventory()?;
+                self.targets.invalidate_inventory_for(
+                    super::client_settlement_trace::InventoryRevisionEvent::SameDocument,
+                    &entry.target,
+                )?;
             }
             "Page.frameDetached" => {
                 self.bump_application_epoch()?;
-                self.targets.invalidate_inventory()?;
+                self.targets.invalidate_inventory_for(
+                    super::client_settlement_trace::InventoryRevisionEvent::FrameDetach,
+                    &entry.target,
+                )?;
                 let frame = field(&event.params, "frameId")?;
                 let mut index = self
                     .index

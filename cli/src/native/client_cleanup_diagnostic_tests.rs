@@ -649,7 +649,7 @@ fn screenshot_failure_maximal_closed_record_fits_existing_bound() {
             ..Facts::default()
         },
     };
-    assert!(serde_json::to_vec(&record).unwrap().len() + 1 <= MAX_RECORD_BYTES);
+    assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
 }
 
 #[test]
@@ -736,7 +736,108 @@ fn readonly_prepare_failure_maximal_closed_record_fits_existing_bound() {
     };
     let bytes = serde_json::to_vec(&record).unwrap();
     assert_eq!(bytes.len() + 1, 505);
-    assert!(bytes.len() + 1 <= MAX_RECORD_BYTES);
+    assert!(bytes.len() < MAX_RECORD_BYTES);
     record.facts.error = Some(ProtocolError::UnsupportedCapability);
     assert_eq!(serde_json::to_vec(&record).unwrap().len() + 1, 502);
+}
+
+fn atomic_inventory_failure() -> FrameInventoryRejection {
+    FrameInventoryRejection {
+        pass: FrameInventoryPass::Protected,
+        sealed: false,
+        revision_mismatch: true,
+        reservations: false,
+        delta: Some(1),
+        events: Some([0, 0, 1, 0, 0, 0, 0]),
+        exact: true,
+        last_event: InventoryRevisionEvent::Info,
+        last_target: InventoryRevisionTarget::Other,
+    }
+}
+#[test]
+fn atomic_inventory_rejection_uses_production_sink_without_payload_or_cleanup_pair() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+    frame_inventory_rejection_into(&capture, 1, 11, atomic_inventory_failure());
+    let rows = records(&file);
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[1]["phase"], "FrameInventoryRejection");
+    assert_eq!(rows[1]["events"], json!([0, 0, 1, 0, 0, 0, 0]));
+    assert_eq!(
+        keys(&rows[1]),
+        [
+            "delta",
+            "droppedBefore",
+            "emittedBefore",
+            "events",
+            "exact",
+            "generation",
+            "lastEvent",
+            "lastTarget",
+            "operationSeq",
+            "overflow",
+            "pass",
+            "phase",
+            "pid",
+            "record",
+            "reservations",
+            "revisionMismatch",
+            "schemaVersion",
+            "sealed",
+            "source",
+            "suppressedBefore"
+        ]
+    );
+    assert!(cleanup_capture(None).is_none());
+}
+#[test]
+fn atomic_inventory_rejection_maximal_record_is_507_bytes_and_missing_counts_stay_missing() {
+    let record = Record {
+        schema_version: 2,
+        source: Source::Native,
+        pid: u32::MAX,
+        record: SAFE_INTEGER,
+        operation_seq: SAFE_INTEGER,
+        phase: Phase::FrameInventoryRejection,
+        dropped_before: SAFE_INTEGER,
+        emitted_before: SAFE_INTEGER,
+        suppressed_before: SAFE_INTEGER,
+        overflow: false,
+        facts: Facts {
+            generation: Some(SAFE_INTEGER),
+            frame_pass: Some(FrameInventoryPass::Protected),
+            sealed: Some(false),
+            revision_mismatch: Some(true),
+            reservations: Some(false),
+            delta: Some(u16::MAX),
+            events: Some([u16::MAX; 7]),
+            exact: Some(false),
+            last_event: Some(InventoryRevisionEvent::SameDocument),
+            last_target: Some(InventoryRevisionTarget::Unknown),
+            ..Facts::default()
+        },
+    };
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert_eq!(bytes.len() + 1, 507);
+    assert!(bytes.len() < MAX_RECORD_BYTES);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    frame_inventory_rejection_into(
+        &capture,
+        1,
+        11,
+        FrameInventoryRejection {
+            delta: None,
+            events: None,
+            exact: false,
+            last_event: InventoryRevisionEvent::Unknown,
+            last_target: InventoryRevisionTarget::Unknown,
+            ..atomic_inventory_failure()
+        },
+    );
+    let rows = records(&file);
+    assert!(rows[0].get("delta").is_none());
+    assert!(rows[0].get("events").is_none());
+    assert_eq!(rows[0]["exact"], false);
 }

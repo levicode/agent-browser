@@ -103,6 +103,7 @@ struct ScreenshotFailureState {
     stage: ScreenshotStage,
     first: Option<(ScreenshotStage, ScreenshotCapturePhase, ProtocolError)>,
     revision: Option<u64>,
+    inventory_rejection: Option<diagnostic::FrameInventoryRejection>,
 }
 impl ScreenshotFailureWitness {
     fn new(request: &DispatchRequest, operation: &OperationLease, enabled: bool) -> Option<Self> {
@@ -113,6 +114,7 @@ impl ScreenshotFailureWitness {
                 stage: ScreenshotStage::PrepareScope,
                 first: None,
                 revision: None,
+                inventory_rejection: None,
             }),
         })
     }
@@ -132,6 +134,30 @@ impl ScreenshotFailureWitness {
                     error.clone(),
                 ));
             }
+        }
+    }
+    fn inventory_failure(
+        &self,
+        failure: Option<diagnostic::FrameInventoryRejection>,
+        error: &ProtocolError,
+    ) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() {
+                state.first = Some((
+                    ScreenshotStage::FrameInventoryFence,
+                    ScreenshotCapturePhase::NotEntered,
+                    error.clone(),
+                ));
+                state.inventory_rejection = failure;
+            }
+        }
+    }
+    fn frame_pass(&self) -> diagnostic::FrameInventoryPass {
+        use diagnostic::FrameInventoryPass;
+        match self.state.lock().ok().map(|state| state.stage) {
+            Some(ScreenshotStage::ProtectedFrames) => FrameInventoryPass::Protected,
+            Some(ScreenshotStage::FinalFrames) => FrameInventoryPass::Final,
+            _ => FrameInventoryPass::Initial,
         }
     }
     fn capture_failure(&self, failure: CaptureAttemptFailure) {
@@ -170,6 +196,14 @@ impl ScreenshotFailureWitness {
             targets.and_then(|targets| targets.inventory().ok().map(|(revision, _)| revision))
         }) {
             diagnostic::screenshot_failure(self.generation, self.sequence, failure);
+            let inventory = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|mut state| state.inventory_rejection.take());
+            if let Some(inventory) = inventory {
+                diagnostic::frame_inventory_rejection(self.generation, self.sequence, inventory);
+            }
         }
     }
     fn take_failure(&self, after: impl FnOnce() -> Option<u64>) -> Option<ScreenshotFailure> {
@@ -1812,7 +1846,9 @@ async fn verified_frame_inventory_with_diagnostic(
     screenshot: Option<&ScreenshotFailureWitness>,
 ) -> Result<VerifiedFrameInventory, ProtocolError> {
     check(page, operation)?;
-    let (revision, targets) = page.targets.inventory()?;
+    let (revision, targets, inventory_before) = page
+        .targets
+        .inventory_with_diagnostic(screenshot.is_some())?;
     if let Some(witness) = screenshot {
         witness.revision(revision);
     }
@@ -1902,12 +1938,17 @@ async fn verified_frame_inventory_with_diagnostic(
             return Err(ProtocolError::UnsupportedCapability);
         }
     }
-    page.targets.check_revision(revision).inspect_err(|error| {
-        if let Some(witness) = screenshot {
-            witness.enter(ScreenshotStage::FrameInventoryFence);
-            witness.failure(error);
-        }
-    })?;
+    if let Some(witness) = screenshot {
+        let (result, rejection) = page.targets.check_revision_with_diagnostic(
+            revision,
+            inventory_before.as_ref(),
+            main,
+            witness.frame_pass(),
+        );
+        result.inspect_err(|error| witness.inventory_failure(rejection, error))?;
+    } else {
+        page.targets.check_revision(revision)?;
+    }
     check(page, operation)?;
     Ok(VerifiedFrameInventory {
         frames,
@@ -4537,6 +4578,47 @@ mod tests {
         let flags: ObserveFlags = serde_json::from_value(json!({"pixelFallback":true})).unwrap();
         assert!(flags.pixel_fallback);
         assert!(!flags.pixels);
+    }
+    #[test]
+    fn atomic_inventory_first_failure_survives_cleanup_and_is_consumed_once() {
+        let witness =
+            ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
+        let fact = diagnostic::FrameInventoryRejection {
+            pass: diagnostic::FrameInventoryPass::Protected,
+            sealed: false,
+            revision_mismatch: true,
+            reservations: false,
+            delta: Some(1),
+            events: Some([0, 0, 1, 0, 0, 0, 0]),
+            exact: true,
+            last_event: diagnostic::InventoryRevisionEvent::Info,
+            last_target: diagnostic::InventoryRevisionTarget::Same,
+        };
+        witness.inventory_failure(Some(fact), &ProtocolError::StaleScope);
+        witness.enter(ScreenshotStage::Restoration);
+        witness.failure(&ProtocolError::CleanupFailed);
+        witness.inventory_failure(
+            Some(diagnostic::FrameInventoryRejection {
+                sealed: true,
+                ..fact
+            }),
+            &ProtocolError::CleanupFailed,
+        );
+        let first = witness.take_failure(|| None).unwrap();
+        assert_eq!(first.stage, ScreenshotStage::FrameInventoryFence);
+        assert_eq!(first.error, ProtocolError::StaleScope);
+        assert_eq!(
+            witness.state.lock().unwrap().inventory_rejection.take(),
+            Some(fact)
+        );
+        assert!(witness.take_failure(|| None).is_none());
+        assert!(witness
+            .state
+            .lock()
+            .unwrap()
+            .inventory_rejection
+            .take()
+            .is_none());
     }
 }
 

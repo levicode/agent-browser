@@ -22,6 +22,7 @@ pub(crate) enum SettlementPhase {
     CleanupResult,
     InventorySnapshot,
     ScreenshotFirstFailure,
+    FrameInventoryRejection,
     ReadonlyPrepareFailure,
     ExecuteStarted,
     ExecuteReturned,
@@ -173,6 +174,24 @@ pub(crate) struct Facts {
     pub inventory_unconfigured: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot_stage: Option<ScreenshotStage>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "pass")]
+    pub frame_pass: Option<FrameInventoryPass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_mismatch: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservations: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<[u16; 7]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<InventoryRevisionEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_target: Option<InventoryRevisionTarget>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_phase: Option<ScreenshotCapturePhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -635,6 +654,92 @@ fn readonly_prepare_failure_into(
             zero_input: Some(failure.zero_input),
             cleanup: Some(failure.cleanup),
             error: Some(failure.error),
+            ..Facts::default()
+        },
+    );
+}
+// One atomic frame-inventory rejection, emitted only after its screenshot settles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum FrameInventoryPass {
+    Initial,
+    Protected,
+    Final,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryRevisionEvent {
+    Attach,
+    Detach,
+    Info,
+    Navigate,
+    SameDocument,
+    FrameDetach,
+    Unknown,
+    None,
+}
+impl InventoryRevisionEvent {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Attach => 0,
+            Self::Detach => 1,
+            Self::Info => 2,
+            Self::Navigate => 3,
+            Self::SameDocument => 4,
+            Self::FrameDetach => 5,
+            Self::Unknown | Self::None => 6,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum InventoryRevisionTarget {
+    Same,
+    Other,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameInventoryRejection {
+    pub pass: FrameInventoryPass,
+    pub sealed: bool,
+    pub revision_mismatch: bool,
+    pub reservations: bool,
+    pub delta: Option<u16>,
+    pub events: Option<[u16; 7]>,
+    pub exact: bool,
+    pub last_event: InventoryRevisionEvent,
+    pub last_target: InventoryRevisionTarget,
+}
+pub(crate) fn frame_inventory_rejection(
+    generation: u64,
+    sequence: u64,
+    failure: FrameInventoryRejection,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        frame_inventory_rejection_into(capture, generation, sequence, failure);
+    }
+}
+fn frame_inventory_rejection_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: FrameInventoryRejection,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::FrameInventoryRejection,
+        Facts {
+            generation: Some(generation),
+            frame_pass: Some(failure.pass),
+            sealed: Some(failure.sealed),
+            revision_mismatch: Some(failure.revision_mismatch),
+            reservations: Some(failure.reservations),
+            delta: failure.delta,
+            events: failure.events,
+            exact: Some(failure.exact),
+            last_event: Some(failure.last_event),
+            last_target: Some(failure.last_target),
             ..Facts::default()
         },
     );

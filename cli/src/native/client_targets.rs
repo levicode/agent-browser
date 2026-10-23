@@ -2,6 +2,7 @@
 //! waits on this registry before configuration/resume; no URL or timing guess
 //! assigns a bootstrap target to a generic request handler.
 use super::client_protocol::ProtocolError;
+use super::client_settlement_trace as diagnostic;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
@@ -47,6 +48,7 @@ impl OwnedTarget {
 #[derive(Default)]
 struct Registry {
     revision: u64,
+    revision_history: Option<RevisionHistory>,
     sealed: bool,
     integrity_lost: bool,
     owner_retirement_inventory: Option<bool>,
@@ -63,7 +65,127 @@ struct Registry {
     auxiliary_sequence: u64,
     auxiliary: HashMap<u64, AuxiliaryAttachment>,
 }
+// Opt-in scalar history belongs to this registry only. The empty identity token
+// detects cross-registry/reset samples; attachment tokens contain no native IDs.
+#[derive(Default)]
+struct RevisionHistory {
+    identity: Arc<RevisionHistoryIdentity>,
+    counts: [u64; 7],
+    overflow: bool,
+    last_revision: u64,
+    last: Option<(
+        diagnostic::InventoryRevisionEvent,
+        Option<Arc<AttachmentTenure>>,
+    )>,
+}
+#[derive(Default)]
+struct RevisionHistoryIdentity;
+#[derive(Clone)]
+pub(crate) struct RevisionSnapshot {
+    identity: Arc<RevisionHistoryIdentity>,
+    counts: [u64; 7],
+    overflow: bool,
+}
 impl Registry {
+    fn note_revision_enabled(
+        &mut self,
+        event: diagnostic::InventoryRevisionEvent,
+        attachment: Option<Arc<AttachmentTenure>>,
+    ) {
+        let history = self
+            .revision_history
+            .get_or_insert_with(RevisionHistory::default);
+        let counter = &mut history.counts[event.index()];
+        match counter.checked_add(1) {
+            Some(next) => *counter = next,
+            None => history.overflow = true,
+        }
+        history.last_revision = self.revision;
+        history.last = Some((event, attachment));
+    }
+    fn revision_snapshot(&mut self) -> RevisionSnapshot {
+        let history = self
+            .revision_history
+            .get_or_insert_with(RevisionHistory::default);
+        RevisionSnapshot {
+            identity: history.identity.clone(),
+            counts: history.counts,
+            overflow: history.overflow,
+        }
+    }
+    fn revision_result(&self, expected: u64) -> Result<(), ProtocolError> {
+        if self.sealed || self.revision != expected || self.reservations != 0 {
+            Err(ProtocolError::StaleScope)
+        } else {
+            Ok(())
+        }
+    }
+    fn revision_rejection(
+        &self,
+        expected: u64,
+        before: Option<&RevisionSnapshot>,
+        selected: &OwnedTarget,
+        pass: diagnostic::FrameInventoryPass,
+    ) -> diagnostic::FrameInventoryRejection {
+        use diagnostic::{InventoryRevisionEvent as Event, InventoryRevisionTarget as Target};
+        let delta = self.revision.checked_sub(expected);
+        let history = self.revision_history.as_ref().filter(|history| {
+            before.is_some_and(|before| {
+                Arc::ptr_eq(&history.identity, &before.identity)
+                    && !before.overflow
+                    && !history.overflow
+            })
+        });
+        let counts = history.zip(before).and_then(|(history, before)| {
+            let mut counts = [0; 7];
+            for (index, count) in counts.iter_mut().enumerate() {
+                *count = history.counts[index].checked_sub(before.counts[index])?;
+            }
+            Some(counts)
+        });
+        let exact = delta.is_some_and(|delta| delta <= u16::MAX as u64)
+            && counts.is_some_and(|counts| {
+                counts[6] == 0
+                    && counts.iter().all(|count| *count <= u16::MAX as u64)
+                    && counts
+                        .iter()
+                        .try_fold(0u64, |sum, count| sum.checked_add(*count))
+                        == delta
+            });
+        let (last_event, last_target) = if delta == Some(0) && counts.is_some() {
+            (Event::None, Target::Unknown)
+        } else if delta.is_some_and(|delta| delta > 0) && counts.is_some() {
+            history
+                .filter(|history| history.last_revision == self.revision)
+                .and_then(|history| history.last.as_ref())
+                .map_or((Event::Unknown, Target::Unknown), |(event, attachment)| {
+                    (
+                        *event,
+                        attachment.as_ref().map_or(Target::Unknown, |attachment| {
+                            if Arc::ptr_eq(attachment, &selected.tenure) {
+                                Target::Same
+                            } else {
+                                Target::Other
+                            }
+                        }),
+                    )
+                })
+        } else {
+            (Event::Unknown, Target::Unknown)
+        };
+        diagnostic::FrameInventoryRejection {
+            pass,
+            sealed: self.sealed,
+            revision_mismatch: self.revision != expected,
+            reservations: self.reservations != 0,
+            delta: delta.map(|delta| delta.min(u16::MAX as u64) as u16),
+            events: counts.map(|counts| counts.map(|count| count.min(u16::MAX as u64) as u16)),
+            exact,
+            last_event,
+            last_target,
+        }
+    }
+
     fn inventory_complete(&self) -> bool {
         self.reservations == 0
             && self
@@ -640,6 +762,8 @@ impl ClientTargets {
             .revision
             .checked_add(1)
             .ok_or(ProtocolError::IdentifierExhausted)?;
+        let tenure = Arc::new(AttachmentTenure);
+        let observed_tenure = diagnostic::inventory_enabled().then(|| tenure.clone());
         state.targets.insert(
             target_id.clone(),
             OwnedTarget {
@@ -650,9 +774,12 @@ impl ClientTargets {
                 configured: false,
                 resumed: false,
                 resume_pending: false,
-                tenure: Arc::new(AttachmentTenure),
+                tenure,
             },
         );
+        if let Some(tenure) = observed_tenure {
+            state.note_revision_enabled(diagnostic::InventoryRevisionEvent::Attach, Some(tenure));
+        }
         drop(state);
         self.changed.notify_waiters();
         Ok(true)
@@ -813,17 +940,41 @@ impl ClientTargets {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.targets.remove(target_id).is_some() {
+        let removed = state.targets.remove(target_id);
+        if removed.is_some() {
             state.revision = state
                 .revision
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
+            if diagnostic::inventory_enabled() {
+                state.note_revision_enabled(
+                    diagnostic::InventoryRevisionEvent::Detach,
+                    removed.as_ref().map(|target| target.tenure.clone()),
+                );
+            }
         }
         drop(state);
         self.changed.notify_waiters();
         Ok(())
     }
     pub fn invalidate_inventory(&self) -> Result<(), ProtocolError> {
+        self.invalidate_inventory_inner(diagnostic::InventoryRevisionEvent::Unknown, None)
+    }
+    pub(crate) fn invalidate_inventory_for(
+        &self,
+        event: diagnostic::InventoryRevisionEvent,
+        target: &str,
+    ) -> Result<(), ProtocolError> {
+        if event == diagnostic::InventoryRevisionEvent::Unknown {
+            return self.invalidate_inventory();
+        }
+        self.invalidate_inventory_inner(event, Some(target))
+    }
+    fn invalidate_inventory_inner(
+        &self,
+        event: diagnostic::InventoryRevisionEvent,
+        target: Option<&str>,
+    ) -> Result<(), ProtocolError> {
         let mut state = self
             .state
             .lock()
@@ -835,28 +986,61 @@ impl ClientTargets {
             .revision
             .checked_add(1)
             .ok_or(ProtocolError::IdentifierExhausted)?;
+        if diagnostic::inventory_enabled() {
+            let attachment = target
+                .and_then(|target| state.targets.get(target))
+                .map(|target| target.tenure.clone());
+            state.note_revision_enabled(event, attachment);
+        }
         Ok(())
     }
     pub fn inventory(&self) -> Result<(u64, Vec<OwnedTarget>), ProtocolError> {
-        let state = self
+        self.inventory_with_diagnostic(false)
+            .map(|(revision, targets, _)| (revision, targets))
+    }
+    pub(crate) fn inventory_with_diagnostic(
+        &self,
+        observe: bool,
+    ) -> Result<(u64, Vec<OwnedTarget>, Option<RevisionSnapshot>), ProtocolError> {
+        let mut state = self
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if state.sealed || !state.inventory_complete() {
             return Err(ProtocolError::ScopeUnavailable);
         }
-        Ok((state.revision, state.targets.values().cloned().collect()))
+        let snapshot = observe.then(|| state.revision_snapshot());
+        Ok((
+            state.revision,
+            state.targets.values().cloned().collect(),
+            snapshot,
+        ))
     }
     pub fn check_revision(&self, revision: u64) -> Result<(), ProtocolError> {
         let state = self
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed || state.revision != revision || state.reservations != 0 {
-            Err(ProtocolError::StaleScope)
-        } else {
-            Ok(())
-        }
+        state.revision_result(revision)
+    }
+    pub(crate) fn check_revision_with_diagnostic(
+        &self,
+        revision: u64,
+        before: Option<&RevisionSnapshot>,
+        selected: &OwnedTarget,
+        pass: diagnostic::FrameInventoryPass,
+    ) -> (
+        Result<(), ProtocolError>,
+        Option<diagnostic::FrameInventoryRejection>,
+    ) {
+        let Ok(state) = self.state.lock() else {
+            return (Err(ProtocolError::ScopeUnavailable), None);
+        };
+        let result = state.revision_result(revision);
+        let failure = result
+            .is_err()
+            .then(|| state.revision_rejection(revision, before, selected, pass));
+        (result, failure)
     }
     pub fn seal(&self) {
         if let Ok(mut state) = self.state.lock() {
@@ -2142,5 +2326,203 @@ mod tests {
         drop(gate.enter(false).unwrap());
         gate.seal();
         assert!(registry.publish_initialization(&authority).is_err());
+    }
+}
+
+#[cfg(test)]
+mod atomic_revision_diagnostic_tests {
+    use super::*;
+    use diagnostic::{
+        FrameInventoryPass as Pass, InventoryRevisionEvent as Event,
+        InventoryRevisionTarget as Target,
+    };
+    fn selected() -> OwnedTarget {
+        OwnedTarget {
+            target_id: "private-target".into(),
+            session_id: "private-session".into(),
+            kind: "page".into(),
+            purpose: Some(TargetPurpose::Application),
+            configured: true,
+            resumed: true,
+            resume_pending: false,
+            tenure: Arc::new(AttachmentTenure),
+        }
+    }
+    fn advance(state: &mut Registry, event: Event, target: Option<&OwnedTarget>) {
+        state.revision += 1;
+        state.note_revision_enabled(event, target.map(|target| target.tenure.clone()));
+    }
+    #[test]
+    fn atomic_revision_causes_keep_original_result_and_snapshot() {
+        for mask in 0..8 {
+            let registry = ClientTargets::new("private-context".into(), "private-scope".into());
+            let target = selected();
+            registry
+                .state
+                .lock()
+                .unwrap()
+                .targets
+                .insert(target.target_id.clone(), target.clone());
+            let (revision, _, before) = registry.inventory_with_diagnostic(true).unwrap();
+            {
+                let mut state = registry.state.lock().unwrap();
+                state.sealed = mask & 1 != 0;
+                if mask & 2 != 0 {
+                    advance(&mut state, Event::Navigate, Some(&target));
+                }
+                state.reservations = usize::from(mask & 4 != 0);
+            }
+            let original = registry.check_revision(revision);
+            let (result, fact) = registry.check_revision_with_diagnostic(
+                revision,
+                before.as_ref(),
+                &target,
+                Pass::Protected,
+            );
+            assert_eq!(result, original);
+            assert_eq!(fact.is_some(), mask != 0);
+            if let Some(fact) = fact {
+                assert_eq!(
+                    (fact.sealed, fact.revision_mismatch, fact.reservations),
+                    (mask & 1 != 0, mask & 2 != 0, mask & 4 != 0)
+                );
+                assert!(fact.exact);
+                assert_eq!(fact.pass, Pass::Protected);
+                registry.state.lock().unwrap().reservations = 0;
+                assert_eq!(fact.reservations, mask & 4 != 0);
+            }
+        }
+    }
+    #[test]
+    fn atomic_revision_events_include_every_bucket_and_same_target() {
+        for event in [
+            Event::Attach,
+            Event::Detach,
+            Event::Info,
+            Event::Navigate,
+            Event::SameDocument,
+            Event::FrameDetach,
+            Event::Unknown,
+        ] {
+            let mut state = Registry::default();
+            let target = selected();
+            let before = state.revision_snapshot();
+            advance(
+                &mut state,
+                event,
+                (event != Event::Unknown).then_some(&target),
+            );
+            let fact = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
+            let mut expected = [0; 7];
+            expected[event.index()] = 1;
+            assert_eq!(fact.events, Some(expected));
+            assert_eq!(fact.delta, Some(1));
+            assert_eq!(fact.last_event, event);
+            assert_eq!(
+                fact.last_target,
+                if event == Event::Unknown {
+                    Target::Unknown
+                } else {
+                    Target::Same
+                }
+            );
+            assert_eq!(fact.exact, event != Event::Unknown);
+        }
+    }
+    #[test]
+    fn atomic_revision_multi_event_window_keeps_other_last_target() {
+        let mut state = Registry::default();
+        let target = selected();
+        let other = selected();
+        let before = state.revision_snapshot();
+        advance(&mut state, Event::Attach, Some(&other));
+        advance(&mut state, Event::Navigate, Some(&target));
+        advance(&mut state, Event::Info, Some(&other));
+        let fact = state.revision_rejection(0, Some(&before), &target, Pass::Final);
+        assert_eq!(fact.events, Some([1, 0, 1, 1, 0, 0, 0]));
+        assert_eq!(fact.delta, Some(3));
+        assert!(fact.exact);
+        assert_eq!(fact.last_target, Target::Other);
+        assert_eq!(fact.last_event, Event::Info);
+        state.revision += 1;
+        let lost = state.revision_rejection(0, Some(&before), &target, Pass::Final);
+        assert!(!lost.exact);
+        assert_eq!(lost.last_event, Event::Unknown);
+        assert_eq!(lost.last_target, Target::Unknown);
+    }
+    #[test]
+    fn atomic_revision_missing_reset_and_overflow_are_unknown_not_zero() {
+        let target = selected();
+        for mode in ["missing", "reset", "overflow", "underflow", "reverse"] {
+            let mut state = Registry::default();
+            let mut before = state.revision_snapshot();
+            advance(&mut state, Event::Info, Some(&target));
+            if mode == "underflow" {
+                before.counts[2] = 2;
+            }
+            if mode == "reset" {
+                state.revision_history = Some(RevisionHistory::default());
+            }
+            if mode == "overflow" {
+                state.revision_history.as_mut().unwrap().overflow = true;
+            }
+            let fact = state.revision_rejection(
+                if mode == "reverse" { 2 } else { 0 },
+                (mode != "missing").then_some(&before),
+                &target,
+                Pass::Initial,
+            );
+            assert!(!fact.exact);
+            if mode != "reverse" {
+                assert_eq!(fact.events, None);
+            } else {
+                assert_eq!(fact.delta, None);
+            }
+            assert_eq!(fact.last_event, Event::Unknown);
+            assert_eq!(fact.last_target, Target::Unknown);
+        }
+    }
+    #[test]
+    fn atomic_revision_bounds_and_counter_overflow_are_explicit() {
+        let target = selected();
+        let mut state = Registry::default();
+        let before = state.revision_snapshot();
+        state.revision = 65_536;
+        state.revision_history.as_mut().unwrap().counts[2] = 65_535;
+        state.note_revision_enabled(Event::Info, Some(target.tenure.clone()));
+        let fact = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
+        assert!(!fact.exact);
+        assert_eq!(fact.delta, Some(65_535));
+        assert_eq!(fact.events, Some([0, 0, 65_535, 0, 0, 0, 0]));
+        state.revision_history.as_mut().unwrap().counts[2] = u64::MAX;
+        state.note_revision_enabled(Event::Info, Some(target.tenure.clone()));
+        assert!(state.revision_history.as_ref().unwrap().overflow);
+        assert_eq!(
+            state
+                .revision_rejection(0, Some(&before), &target, Pass::Initial)
+                .events,
+            None
+        );
+    }
+    #[test]
+    fn atomic_revision_disabled_inventory_keeps_no_history() {
+        let registry = ClientTargets::new("private-context".into(), "private-scope".into());
+        let target = selected();
+        registry
+            .state
+            .lock()
+            .unwrap()
+            .targets
+            .insert(target.target_id.clone(), target);
+        for _ in 0..3 {
+            assert!(registry
+                .inventory_with_diagnostic(false)
+                .unwrap()
+                .2
+                .is_none());
+            assert!(registry.inventory().is_ok());
+            assert_eq!(registry.check_revision(0), Ok(()));
+        }
+        assert!(registry.state.lock().unwrap().revision_history.is_none());
     }
 }
