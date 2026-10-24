@@ -16,23 +16,25 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PeerMode {
+pub(super) enum PeerMode {
     Original,
+    HoldInput,
+    ReconnectCandidate,
     WrongContext,
     RefuseTargetInfo,
     HoldAfterAttach,
     Verified,
 }
 
-struct Peer {
-    endpoint: String,
-    commands: Arc<Mutex<Vec<Value>>>,
-    received: mpsc::UnboundedReceiver<String>,
-    emit: mpsc::Sender<Message>,
-    task: tokio::task::JoinHandle<()>,
+pub(super) struct Peer {
+    pub(super) endpoint: String,
+    pub(super) commands: Arc<Mutex<Vec<Value>>>,
+    pub(super) received: mpsc::UnboundedReceiver<String>,
+    pub(super) emit: mpsc::Sender<Message>,
+    pub(super) task: tokio::task::JoinHandle<()>,
 }
 
-async fn peer(mode: PeerMode) -> Peer {
+pub(super) async fn peer(mode: PeerMode) -> Peer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let commands = Arc::new(Mutex::new(Vec::new()));
@@ -43,6 +45,7 @@ async fn peer(mode: PeerMode) -> Peer {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
         let mut attached = false;
+        let mut loader = "host-loader";
         let mut target = json!({"targetId":"host-page","type":"page",
             "browserContextId":"host-context","url":"about:blank","title":""});
         if mode == PeerMode::WrongContext {
@@ -62,7 +65,14 @@ async fn peer(mode: PeerMode) -> Peer {
                     let method = request["method"].as_str().unwrap();
                     let _ = send.send(method.to_owned());
                     let session = request["sessionId"].as_str().unwrap_or("");
-                    if mode != PeerMode::Original {
+                    if mode == PeerMode::ReconnectCandidate {
+                        assert!(!matches!(method,
+                            "Page.navigate" | "Target.createTarget" | "Target.createBrowserContext"),
+                            "reconnect candidate replaced or navigated retained objects: {request}");
+                    }
+                    if !matches!(mode,
+                        PeerMode::Original | PeerMode::HoldInput | PeerMode::ReconnectCandidate)
+                    {
                         assert!(matches!(method,
                             "Target.getBrowserContexts" | "Target.getTargetInfo"
                             | "Target.attachToTarget" | "Target.detachFromTarget"),
@@ -73,6 +83,11 @@ async fn peer(mode: PeerMode) -> Peer {
                     {
                         // This request follows a successful attach ACK and the
                         // strict adopt helper's exact-page recheck.
+                        continue;
+                    }
+                    if mode == PeerMode::HoldInput && method == "Input.dispatchMouseEvent" {
+                        // The test closes this real socket only after observing
+                        // submission in the native operation registry. No ACK.
                         continue;
                     }
                     let mut response = if mode == PeerMode::RefuseTargetInfo
@@ -98,8 +113,18 @@ async fn peer(mode: PeerMode) -> Peer {
                                 json!({"sessionId":"host-session"})
                             }
                             "Page.getFrameTree" => json!({"frameTree":{"frame":{
-                                "id":format!("frame-{session}"),"loaderId":"host-loader",
+                                "id":format!("frame-{session}"),"loaderId":loader,
                                 "url":"about:blank"}}}),
+                            "Page.navigate" => {
+                                assert_eq!(request["params"]["url"], "about:blank");
+                                loader = "host-activation-loader";
+                                json!({"frameId":format!("frame-{session}"),
+                                    "loaderId":"host-activation-loader"})
+                            }
+                            "Runtime.evaluate" => {
+                                assert_eq!(request["params"]["expression"], "location.href");
+                                json!({"result":{"type":"string","value":"about:blank"}})
+                            }
                             "Page.addScriptToEvaluateOnNewDocument" => json!({"identifier":"host-script"}),
                             "Page.enable" | "Runtime.enable" | "Network.enable" | "WebMCP.enable"
                             | "DOM.enable" | "DOM.disable" | "Network.setBypassServiceWorker"
@@ -114,6 +139,18 @@ async fn peer(mode: PeerMode) -> Peer {
                     };
                     if !session.is_empty() { response["sessionId"] = session.into(); }
                     if socket.send(Message::Text(response.to_string())).await.is_err() { break; }
+                    if method == "Page.navigate" {
+                        for event in [
+                            json!({"method":"Page.frameNavigated","sessionId":session,"params":{
+                                "frame":{"id":format!("frame-{session}"),"loaderId":"host-activation-loader",
+                                    "url":"about:blank","securityOrigin":"null"}}}),
+                            json!({"method":"Page.lifecycleEvent","sessionId":session,"params":{
+                                "frameId":format!("frame-{session}"),"loaderId":"host-activation-loader",
+                                "name":"DOMContentLoaded"}}),
+                        ] {
+                            if socket.send(Message::Text(event.to_string())).await.is_err() { return; }
+                        }
+                    }
                 }
             }
         }

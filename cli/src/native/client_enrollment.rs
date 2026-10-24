@@ -6000,6 +6000,7 @@ mod tests {
     type Notices = tokio::sync::mpsc::Receiver<ServerMessage>;
     include!("client_restart_readiness_tests.rs");
     include!("client_viewport_replacement_tests.rs");
+    include!("client_eval_network_watermark_tests.rs");
     fn coordinator(
         client: Arc<CdpClient>,
         context: &str,
@@ -6261,7 +6262,7 @@ mod tests {
                             "Target.getTargets" if mode=="observer-detached-live"=>json!({"targetInfos":[{"targetId":"other-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="observer-controlled-acks" && request["params"]==json!({})=>json!({"targetInfos":[{"targetId":"other-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="borrowed-capture"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"},{"targetId":"unadopted-host","type":"page","browserContextId":"owned-context"}]}),
-                            "Target.getTargets" if mode=="borrowed-initial"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"}]}),
+                            "Target.getTargets" if mode=="borrowed-initial" || mode=="eval-network-watermark"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode.starts_with("attestation-complete")=>complete_capture_inventory(mode, &request, inventory_reads),
                             "Target.getTargets" if mode=="attestation-missing-target" && inventory_reads>1=>json!({"targetInfos":[]}),
                             "Target.getTargets" if mode=="attestation-missing-context" && inventory_reads>1=>json!({"targetInfos":[{"targetId":"target","type":"page"}]}),
@@ -6275,7 +6276,7 @@ mod tests {
                         };
                         if method=="Target.getTargets" {if let Some(infos)=result.get_mut("targetInfos").and_then(Value::as_array_mut) {infos.retain(|info|!closed_targets.contains(info["targetId"].as_str().unwrap()) && !(mode=="late-popup" && info["targetId"]=="queued-popup" && !closed_targets.contains("initial-target")));}}
                         let mut response = json!({"id":request["id"],"result":result});
-                        if (mode.starts_with("sw-startup-") || mode=="observer-controlled-acks") && request.get("sessionId").is_some() {
+                        if (mode.starts_with("sw-startup-") || mode=="observer-controlled-acks" || mode=="eval-network-watermark") && request.get("sessionId").is_some() {
                             response["sessionId"] = request["sessionId"].clone();
                         }
                         if socket.send(Message::Text(response.to_string())).await.is_err(){break;}

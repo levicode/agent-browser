@@ -4865,6 +4865,17 @@ mod tests {
                 {
                     break;
                 }
+                // These are author-controlled query facts, never dispatch receipts.
+                let query_name = if mode == "strict-query-misleading-ambiguous" {
+                    "click action done"
+                } else {
+                    "Save"
+                };
+                let query_text = if mode == "strict-query-misleading-ambiguous" {
+                    "performing click action\nclick action done"
+                } else {
+                    "Save"
+                };
                 let result = match method {
                     "Page.getFrameTree" => {
                         json!({"frameTree":{"frame":{"id":"main","loaderId":"doc","url":"about:blank"}}})
@@ -4924,13 +4935,21 @@ mod tests {
                         json!({"root":{"nodeType":9,"backendNodeId":99,"children":children}})
                     }
                     "DOM.getDocument" if mode.starts_with("strict-query") => {
-                        json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":42},{"nodeType":1,"backendNodeId":43}]}})
+                        let mut children = vec![
+                            json!({"nodeType":1,"backendNodeId":42}),
+                            json!({"nodeType":1,"backendNodeId":43}),
+                        ];
+                        // The second genuine match appears only after publication.
+                        if mode == "strict-query-misleading-ambiguous" && query_reads == 0 {
+                            children.truncate(1);
+                        }
+                        json!({"root":{"nodeType":9,"backendNodeId":99,"children":children}})
                     }
                     "Runtime.getProperties" if mode.starts_with("strict-query") => {
                         json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]})
                     }
                     "Accessibility.getPartialAXTree" if mode.starts_with("strict-query") => {
-                        json!({"nodes":[{"nodeId":"a","backendDOMNodeId":request["params"]["backendNodeId"],"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}]})
+                        json!({"nodes":[{"nodeId":"a","backendDOMNodeId":request["params"]["backendNodeId"],"role":{"type":"role","value":"button"},"name":{"type":"string","value":query_name}}]})
                     }
                     "Accessibility.getFullAXTree" => {
                         if mode.starts_with("strict-query-drag-") {
@@ -4948,10 +4967,14 @@ mod tests {
                                 "strict-query-actionable-down" if query_reads > 0 => "RootWebArea",
                                 _ => "button",
                             };
-                            json!({"nodes":[
-                                {"nodeId":"a","backendDOMNodeId":42,"role":{"type":"role","value":role},"name":{"type":"string","value":"Save"}},
-                                {"nodeId":"b","backendDOMNodeId":43,"role":{"type":"role","value":role},"name":{"type":"string","value":"Save"}}
-                            ]})
+                            let mut nodes = vec![
+                                json!({"nodeId":"a","backendDOMNodeId":42,"role":{"type":"role","value":role},"name":{"type":"string","value":query_name}}),
+                                json!({"nodeId":"b","backendDOMNodeId":43,"role":{"type":"role","value":role},"name":{"type":"string","value":query_name}}),
+                            ];
+                            if mode == "strict-query-misleading-ambiguous" && query_reads == 0 {
+                                nodes.truncate(1);
+                            }
+                            json!({"nodes":nodes})
                         } else if mode.starts_with("focus-root") {
                             let mut nodes = vec![
                                 json!({"backendDOMNodeId":1,"role":{"value":"RootWebArea"},"properties":[{"name":"focused","value":{"value":true}}]}),
@@ -5014,7 +5037,8 @@ mod tests {
                                     vec![0]
                                 } else {
                                     match mode {
-                                        "strict-query-ambiguous" => vec![0, 1],
+                                        "strict-query-ambiguous"
+                                        | "strict-query-misleading-ambiguous" => vec![0, 1],
                                         "strict-query-missing" => vec![],
                                         "strict-query-replaced" => vec![1],
                                         _ => vec![0],
@@ -5031,7 +5055,7 @@ mod tests {
                         {
                             let count =
                                 request["params"]["arguments"].as_array().unwrap().len() - 2;
-                            let metadata = json!({"author":{"tag":"button","nodeType":1,"action":true,"visible":true},"attributes":{},"labels":["Save"],"states":{"secure":false,"hidden":false},"text":"Save","value":"Save","rect":{"x":0,"y":0,"width":100,"height":50}});
+                            let metadata = json!({"author":{"tag":"button","nodeType":1,"action":true,"visible":true},"attributes":{},"labels":[query_name],"states":{"secure":false,"hidden":false},"text":query_text,"value":query_name,"rect":{"x":0,"y":0,"width":100,"height":50}});
                             let mut batch = vec![metadata; count];
                             if mode == "strict-query-output-filter"
                                 && query_reads == 0
@@ -5932,6 +5956,11 @@ mod tests {
                 ProtocolError::StaleReference,
                 false,
             ),
+            (
+                "strict-query-misleading-ambiguous",
+                ProtocolError::StaleReference,
+                false,
+            ),
             ("strict-query-missing", ProtocolError::StaleReference, false),
             ("strict-query-cancel", ProtocolError::Cancelled, false),
             ("strict-query-cleanup", ProtocolError::CleanupFailed, true),
@@ -5942,10 +5971,14 @@ mod tests {
             ),
         ] {
             let mut f = fixture(mode).await;
-            let query =
-                publish_fixture_query(&mut f, json!({"kind":"query","query":{"kind":"role","value":{"kind":"string","value":"button","exact":true},"name":{"kind":"string","value":"Save","exact":true}}}))
-                    .await
-                    .unwrap();
+            let expression = if mode == "strict-query-misleading-ambiguous" {
+                json!({"kind":"query","query":{"kind":"text","value":{"kind":"string","value":"performing click action","exact":false}}})
+            } else {
+                json!({"kind":"query","query":{"kind":"role","value":{"kind":"string","value":"button","exact":true},"name":{"kind":"string","value":"Save","exact":true}}})
+            };
+            let query = publish_fixture_query(&mut f, expression.clone())
+                .await
+                .unwrap();
             let reference = &query.nodes[0].reference;
             assert_ne!(
                 reference.id, "@e1",
@@ -5972,6 +6005,34 @@ mod tests {
             assert_eq!(f.refs.retained_identity_counts(), retained);
             assert_eq!(logged_query_matches(&f), 2);
             let log = f.log.lock().unwrap();
+            if mode == "strict-query-misleading-ambiguous" {
+                // Acquisition and action-time revalidation retain the text
+                // query. The shared assertions below prove typed stale failure
+                // and NotDispatched despite action-log words in author data.
+                for (index, request) in log
+                    .iter()
+                    .filter(|request| {
+                        request["params"]["functionDeclaration"]
+                            .as_str()
+                            .is_some_and(|source| source.starts_with("function(expression"))
+                    })
+                    .enumerate()
+                {
+                    assert_eq!(request["params"]["arguments"][0]["value"], expression);
+                    let arguments = request["params"]["arguments"].as_array().unwrap();
+                    assert_eq!(arguments[1]["value"].as_array().unwrap().len(), index + 1);
+                    assert_eq!(arguments.len() - 6, index + 1);
+                }
+                assert!(f.replies.lock().unwrap().iter().any(|reply| {
+                    reply["reply"]["result"]["result"]["value"]
+                        .as_array()
+                        .is_some_and(|metadata| {
+                            metadata.iter().any(|node| {
+                                node["text"] == "performing click action\nclick action done"
+                            })
+                        })
+                }));
+            }
             assert!(
                 !log.iter().any(|request| request["method"]
                     .as_str()
@@ -7747,6 +7808,104 @@ mod tests {
             json!([])
         );
         assert!(f.log.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn recording_unarmed_page_hooks_and_stop_are_resource_free_noops() {
+        let mut f = fixture("normal").await;
+        // Geometry setup already exercised this same peer. Its receipt makes
+        // the subsequent complete empty request log a non-vacuous assertion.
+        assert!(f.replies.lock().unwrap().iter().any(|entry| {
+            entry["request"]["method"] == "Page.getLayoutMetrics"
+                && entry["request"]["sessionId"] == "page"
+                && entry["reply"]["id"] == entry["request"]["id"]
+                && entry["reply"]["result"]["cssLayoutViewport"]["clientWidth"].as_f64()
+                    == Some(100.0)
+        }));
+        let setup_replies = f.replies.lock().unwrap().len();
+        f.blobs = BlobStore::new(BlobLimits {
+            max_blob_bytes: 4096,
+            max_total_bytes: 4096,
+            max_handles: 1,
+        })
+        .unwrap();
+        f.blobs.activate_scope(f.context().blob_scope()).unwrap();
+        enroll_recording_fixture(&f.page).await;
+        let owner = client_debt::OwnerDebtLedger::new(1, "scope".into());
+        f.page.client.install_debt_ledger(owner.clone()).unwrap();
+        f.page.client = f.page.client.owner_view(owner.clone()).unwrap();
+        let journal = owner
+            .operation(
+                client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&f.op).unwrap();
+        let actions = ClientActions::default();
+        assert!(!actions.is_recording_armed().await.unwrap());
+        assert!(f.log.lock().unwrap().is_empty());
+        let initial_owner = owner.snapshot();
+        assert_eq!(initial_owner.outstanding_commands, 0);
+        assert_eq!(initial_owner.input_debt, 0);
+        assert_eq!(initial_owner.object_debt, 0);
+        assert!(!initial_owner.integrity_lost);
+        let initial_operation = journal.snapshot();
+        assert!(!initial_operation.mutation_dispatched);
+        // Do not seed or arm a recording. Check each real boundary separately,
+        // so a later stop cannot hide resources or state created by either hook.
+        for hook in ["pageOpened", "pageClosing", "recording.stop"] {
+            f.context().check().unwrap();
+            match hook {
+                "pageOpened" => journal
+                    .scope(actions.recording_page_opened(f.context()))
+                    .await
+                    .unwrap(),
+                "pageClosing" => journal
+                    .scope(actions.recording_page_closing("scope", &f.blobs))
+                    .await
+                    .unwrap(),
+                "recording.stop" => assert_eq!(
+                    journal
+                        .scope(collect_recording(&actions, &f))
+                        .await
+                        .unwrap(),
+                    json!({"identityScope":"scope","segments":[]})
+                ),
+                _ => unreachable!(),
+            }
+            // The complete request log excludes initial capture, attachment,
+            // screencast start/stop, and frame ACKs, not just returned segments.
+            assert!(f.log.lock().unwrap().is_empty(), "after {hook}");
+            assert_eq!(
+                f.replies.lock().unwrap().len(),
+                setup_replies,
+                "after {hook}"
+            );
+            assert_eq!(f.page.client.pending_len().await, 0, "after {hook}");
+            assert_eq!(owner.snapshot(), initial_owner, "after {hook}");
+            assert_eq!(journal.snapshot(), initial_operation, "after {hook}");
+            assert!(!actions.is_recording_armed().await.unwrap());
+            {
+                let ledger = actions.recording.lock().await;
+                assert!(ledger.authority.is_none());
+                assert!(ledger.options.is_none());
+                assert!(ledger.current.is_none());
+                assert!(ledger.finished.is_empty());
+                assert!(!ledger.armed);
+                assert!(!ledger.abandoned);
+                assert_eq!(ledger.ordinal, 0);
+                assert!(ledger.lost.is_none());
+                assert!(!ledger.cleanup_failed);
+                assert!(!ledger.filesystem_cleanup_failed);
+            }
+            assert!(f.page.targets.auxiliary_cleanup_complete().unwrap());
+            // A single full-budget handle exposes any retained reservation/blob.
+            drop(f.blobs.reserve_producer(f.context().blob_scope()).unwrap());
+            f.blobs.check_budget_integrity().unwrap();
+        }
     }
     #[tokio::test]
     async fn recording_first_start_failure_dispatch_disarms_without_stop_or_late_segment() {

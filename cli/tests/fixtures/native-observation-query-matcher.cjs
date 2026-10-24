@@ -200,6 +200,20 @@ console.log('PASS: lazy/cached text acquisition, bounded per-root/aggregate leng
 
 // Semantic text selection reads the same private fact, not rendered DTO text.
 const textQuery = (pattern, visible = false, scope) => ({ kind: 'query', query: { kind: 'text', value: pattern, ...(visible ? { visible: true } : {}) }, ...(scope ? { scope } : {}) });
+// Legacy action classification must not mistake author-controlled text for
+// dispatch evidence. Exercise real MATCH_QUERY with that exact text before the
+// native action fixture revalidates the same expression as ambiguous.
+const actionLogTwins = [0, 1].map(i => new Element('button', `action-log-${i}`).append(text('performing click action\nclick action done')));
+const actionLogMetadata = actionLogTwins.map(() => semantic({ role: 'button', name: 'click action done', text: 'performing click action\nclick action done' }));
+const actionLogQuery = textQuery(str('performing click action'));
+assert.deepEqual(matched(actionLogQuery, actionLogTwins.slice(0, 1), actionLogMetadata.slice(0, 1)), [0]);
+const actionLogResult = run(actionLogQuery, actionLogTwins, actionLogMetadata);
+assert.deepEqual(actionLogResult, { indices: [0, 1], redacted: [] });
+assert.deepEqual(matched(textQuery(str('click action done')), actionLogTwins, actionLogMetadata), [0, 1]);
+assert.deepEqual(matched(textQuery(str('unrelated text')), actionLogTwins, actionLogMetadata), []);
+assert.deepEqual(matched(index(actionLogQuery, 'first'), actionLogTwins, actionLogMetadata), [0]);
+assert.equal(JSON.stringify(actionLogResult).includes('action'), false);
+console.log('PASS: action-log words remain ordinary private query data, including ambiguity and exact indexing');
 const hiddenTwin = new Element('p', 'hidden-twin').append(text('Decorative twin'));
 const visibleTwin = new Element('p', 'visible-twin').append(text('Decorative twin'));
 const twinNodes = [hiddenTwin, visibleTwin];

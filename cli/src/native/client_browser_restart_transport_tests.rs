@@ -479,6 +479,10 @@ mod input_waiter_tests;
 #[path = "client_browser_interruption_reason_tests.rs"]
 mod interruption_reason_tests;
 
+#[cfg(feature = "acceptance-faults")]
+#[path = "client_browser_trace_retirement_tests.rs"]
+mod trace_retirement_tests;
+
 #[path = "client_browser_point_debt_tests.rs"]
 mod point_debt_tests;
 

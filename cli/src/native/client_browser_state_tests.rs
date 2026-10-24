@@ -146,6 +146,13 @@ struct FramedFixture {
 }
 impl FramedFixture {
     fn new<E: ClientExecutor>(broker: Arc<ClientSession>, executor: Arc<E>) -> Self {
+        Self::with_capabilities(broker, executor, Vec::new())
+    }
+    fn with_capabilities<E: ClientExecutor>(
+        broker: Arc<ClientSession>,
+        executor: Arc<E>,
+        required_capabilities: Vec<String>,
+    ) -> Self {
         let (client, server) = tokio::io::duplex(64 * 1024);
         let (reader, writer) = tokio::io::split(server);
         let server = tokio::spawn(serve_with_executor(
@@ -154,7 +161,7 @@ impl FramedFixture {
             ClientMessage::Hello {
                 id: "fixture-hello".into(),
                 protocol: PROTOCOL.into(),
-                required_capabilities: vec![],
+                required_capabilities,
             },
             broker,
             executor,
