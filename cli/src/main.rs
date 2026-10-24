@@ -34,8 +34,8 @@ use windows_sys::Win32::System::Threading::OpenProcess;
 
 use commands::{attach_ca_cert_to_launch_command, gen_id, parse_command, ParseError};
 use connection::{
-    cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir, is_pid_alive,
-    send_command, walk_daemons, DaemonOptions, Response,
+    cleanup_stale_files, daemon_unreachable, ensure_daemon, get_socket_dir,
+    is_agent_browser_process, is_pid_alive, send_command, walk_daemons, DaemonOptions, Response,
 };
 use flags::{clean_args, parse_flags, split_launch_args, Flags};
 use install::run_install;
@@ -1160,6 +1160,7 @@ fn run_dashboard_start(port: u16, allowed_origins: Vec<String>, json_mode: bool)
         use std::os::windows::process::CommandExt;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
         const DETACHED_PROCESS: u32 = 0x00000008;
+        connection::prevent_stdio_handle_inheritance();
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     }
 
@@ -1269,6 +1270,18 @@ fn run_dashboard_stop(json_mode: bool) {
         }
     };
 
+    if !is_agent_browser_process(pid) {
+        remove_dashboard_sidecars();
+        if json_mode {
+            print_json_value(
+                json!({ "success": true, "data": { "stopped": false, "reason": "not running" } }),
+            );
+        } else {
+            println!("Dashboard is not running");
+        }
+        return;
+    }
+
     #[cfg(unix)]
     {
         unsafe {
@@ -1345,16 +1358,18 @@ fn run_close_all(flags: &Flags) {
                 // Daemon is unreachable despite its process existing.
                 // Force-kill the process and clean up stale files so future
                 // sessions are not poisoned.
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(*pid as i32, libc::SIGKILL);
-                }
-                #[cfg(windows)]
-                unsafe {
-                    let handle = OpenProcess(1, 0, *pid); // PROCESS_TERMINATE = 1
-                    if handle != 0 {
-                        windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
-                        CloseHandle(handle);
+                if is_agent_browser_process(*pid) {
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::kill(*pid as i32, libc::SIGKILL);
+                    }
+                    #[cfg(windows)]
+                    unsafe {
+                        let handle = OpenProcess(1, 0, *pid); // PROCESS_TERMINATE = 1
+                        if handle != 0 {
+                            windows_sys::Win32::System::Threading::TerminateProcess(handle, 1);
+                            CloseHandle(handle);
+                        }
                     }
                 }
                 cleanup_stale_files(session);

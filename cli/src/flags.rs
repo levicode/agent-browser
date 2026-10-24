@@ -365,6 +365,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
     None
 }
 
+/// Load merged configuration; the auto-discovered project file cannot set executablePath, args or plugins.
 pub fn load_config(args: &[String]) -> Result<Config, String> {
     let explicit = extract_config_path(args)
         .map(|p| ("--config", p))
@@ -392,9 +393,34 @@ pub fn load_config(args: &[String]) -> Result<Config, String> {
     let project_config = read_config_file(&PathBuf::from(PROJECT_CONFIG_FILENAME));
 
     Ok(match project_config {
-        Some(project) => user_config.merge(project),
+        Some(project) => merge_project_config(user_config, project),
         None => user_config,
     })
+}
+
+fn merge_project_config(user: Config, mut project: Config) -> Config {
+    let mut ignored = Vec::new();
+    if project.executable_path.take().is_some() {
+        ignored.push("executablePath");
+    }
+    if project.args.take().is_some() {
+        ignored.push("args");
+    }
+    if project.plugins.take().is_some_and(|p| !p.is_empty()) {
+        ignored.push("plugins");
+    }
+    if !ignored.is_empty() {
+        eprintln!(
+            "{} ignoring {} from ./{} (a project file cannot set what runs programs). Set them in ~/{}/{}, env vars such as AGENT_BROWSER_ARGS, CLI flags, or trust the file with --config ./{}",
+            color::warning_indicator(),
+            ignored.join(", "),
+            PROJECT_CONFIG_FILENAME,
+            CONFIG_DIR,
+            CONFIG_FILENAME,
+            PROJECT_CONFIG_FILENAME
+        );
+    }
+    user.merge(project)
 }
 
 pub struct Flags {
@@ -1790,6 +1816,30 @@ mod tests {
         assert_eq!(merged.proxy.as_deref(), Some("http://project-proxy:9090")); // overridden by project
         assert_eq!(merged.profile.as_deref(), Some("/user/profile")); // kept from user
         assert_eq!(merged.debug, Some(true)); // added by project
+    }
+
+    #[test]
+    fn test_project_config_cannot_set_executable_path_args_or_plugins() {
+        let user = Config {
+            executable_path: Some("/user/chrome".to_string()),
+            ..Config::default()
+        };
+        let project = Config {
+            executable_path: Some("/project/chrome".to_string()),
+            args: Some("--no-sandbox".to_string()),
+            plugins: Some(vec![PluginConfig {
+                name: "captcha".to_string(),
+                command: "npx".to_string(),
+                ..PluginConfig::default()
+            }]),
+            headed: Some(true),
+            ..Config::default()
+        };
+        let merged = merge_project_config(user, project);
+        assert_eq!(merged.executable_path.as_deref(), Some("/user/chrome"));
+        assert!(merged.args.is_none());
+        assert!(merged.plugins.is_none());
+        assert_eq!(merged.headed, Some(true));
     }
 
     #[test]

@@ -3616,6 +3616,10 @@ Chat Options:
 Each tool call runs one agent-browser command. Chat can load bundled skills
 (skills get <name>) and use page WebMCP tools, fetching a tool's schema with
 webmcp list <tool> --frame <frame-id> --json before invoking it in that frame.
+Chat runs in the session you select and cannot create or switch sessions. To use
+another engine, open the session first with
+agent-browser --session <name> --engine <engine> open <url>, then pass --session <name> to chat.
+Chat commands cannot set global flags other than --json and --annotate.
 
 Global Options:
   --json                 Structured JSON output per turn
@@ -3671,7 +3675,12 @@ Common tools include:
   agent_browser_close      Close the browser session
 
 Each tool has typed fields such as url, selector, text, key, and session.
-Each tool also accepts extraArgs for advanced CLI flags and exact CLI parity.
+Each tool also accepts extraArgs for per-command options and display or emulation
+flags such as --engine. Global flags that change network, file, policy, or host
+access (such as --allowed-domains, --action-policy, --executable-path, --args,
+and --config) are rejected in extraArgs and must be set in the MCP server's
+environment or config, and structured allowedDomains is rejected when the server
+already sets allowed domains.
 Tool discovery is paginated and includes read-only/open-world annotations so
 modern MCP clients can load the large typed surface incrementally.
 Use agent_browser_snapshot after navigation to get fresh refs before clicking.
@@ -3751,9 +3760,12 @@ Subcommands:
   show <name>              Show one configured plugin
   run <name> <type>        Run a command.run or custom plugin request
 
-Plugins are configured in agent-browser.json. A plugin entry declares a name,
-an executable command, optional args, and capabilities. Plugins run as
-external processes over the agent-browser.plugin.v1 stdio JSON protocol.
+Plugins are configured in ~/.agent-browser/config.json or a file loaded with
+--config. A plugin entry declares a name, an executable command, optional args,
+and capabilities. Plugins run as external processes over the
+agent-browser.plugin.v1 stdio JSON protocol.
+plugin add writes ~/.agent-browser/config.json by default; use --project for
+./agent-browser.json (only used with --config).
 
 Add sources:
   <name>                   npm package, e.g. agent-browser-plugin-captcha
@@ -3763,7 +3775,7 @@ Add sources:
 Add options:
   --name <name>            Override the configured plugin name
   --capability <name>      Declare a capability if the plugin has no manifest
-  --global                 Write ~/.agent-browser/config.json instead of ./agent-browser.json
+  --project                Write ./agent-browser.json instead of ~/.agent-browser/config.json
   --no-manifest            Skip plugin.manifest discovery
 
 plugin add asks the package for plugin.manifest to discover name and
@@ -4117,6 +4129,7 @@ Configuration:
 
   Use --config <path> to load a specific config file instead of the defaults.
   If --config points to a missing or invalid file, agent-browser exits with an error.
+  The auto-discovered ./agent-browser.json cannot set executablePath, args or plugins (they are ignored with a warning); set them in ~/.agent-browser/config.json, env vars or flags, or load the file explicitly with --config ./agent-browser.json.
 
   Boolean flags accept an optional true/false value to override config:
     --headed           (same as --headed true)
