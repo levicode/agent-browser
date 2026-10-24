@@ -2861,7 +2861,7 @@ pub(crate) mod sw_causal {
                 .unwrap()
                 .lines()
                 .map(|line| {
-                    assert!(line.len() + 1 <= MAX_RECORD_BYTES);
+                    assert!(line.len() < MAX_RECORD_BYTES);
                     serde_json::from_str(line).unwrap()
                 })
                 .collect()
