@@ -23,6 +23,7 @@ use super::super::client_debt::{
     WorkerStartupStatusProvenance,
 };
 use super::super::client_protocol::ProtocolError;
+use super::super::client_settlement_trace::sw_causal;
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
 
 type TrackedResponses = Arc<std::sync::Mutex<HashMap<u64, SubmittedCommand>>>;
@@ -35,6 +36,7 @@ struct DisposalWork {
 struct PendingResponse {
     sender: oneshot::Sender<CommandReply>,
     session: Option<String>,
+    causal: Option<(sw_causal::CommandToken, Option<CommandStatusHandle>)>,
 }
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 
@@ -930,6 +932,17 @@ impl CdpClient {
                                     }
                                     let waiter = pending_clone.lock().await.remove(&id);
                                     if let Some(tx) = waiter {
+                                        if let Some((token, status)) = &tx.causal {
+                                            token.reply(
+                                                false,
+                                                false,
+                                                None,
+                                                false,
+                                                status
+                                                    .as_ref()
+                                                    .map(|status| status.snapshot() as u8),
+                                            );
+                                        }
                                         let _ = tx.sender.send(CommandReply::LocalFailure(
                                             CdpMessage {
                                                 id: Some(id),
@@ -992,6 +1005,18 @@ impl CdpClient {
                         .remove(&id);
                     let disposals = tracked
                         .map_or_else(Vec::new, |tracked| tracked.settle_for_delivery(&parsed));
+                    if let Some((token, status)) = waiter.as_ref().and_then(|tx| tx.causal.as_ref())
+                    {
+                        token.reply(
+                            valid_envelope,
+                            waiter
+                                .as_ref()
+                                .is_some_and(|tx| tx.session == parsed.session_id),
+                            parsed.error.as_ref().and_then(|error| error.code),
+                            parsed.error.is_some(),
+                            status.as_ref().map(|status| status.snapshot() as u8),
+                        );
+                    }
                     // Delivery itself is the authority: is_closed() alone races
                     // receiver cancellation between inspection and send.
                     let abandoned = waiter.is_none_or(|tx| {
@@ -1030,11 +1055,40 @@ impl CdpClient {
                         params: parsed.params.clone().unwrap_or(Value::Null),
                         session_id: parsed.session_id.clone(),
                     };
+                    let causal_event = if sw_causal::enabled() {
+                        match event.method.as_str() {
+                            "Target.detachedFromTarget" => Some((
+                                40,
+                                event.params.get("sessionId").and_then(Value::as_str),
+                                event.params.get("targetId").and_then(Value::as_str),
+                            )),
+                            "Target.targetDestroyed" => Some((
+                                41,
+                                None,
+                                event.params.get("targetId").and_then(Value::as_str),
+                            )),
+                            _ => None,
+                        }
+                    } else {
+                        None
+                    };
+                    let mut causal_point = None;
                     let eval_publication = debt_reader
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())
                         .as_ref()
-                        .and_then(|ledger| ledger.observe_event_for_publication(&event));
+                        .and_then(|ledger| {
+                            if causal_event.is_some() {
+                                ledger.observe_event_for_publication_observed(
+                                    &event,
+                                    &mut causal_point,
+                                )
+                            } else {
+                                ledger.observe_event_for_publication(&event)
+                            }
+                        });
+                    // Only emit after the existing owner/ledger guards are gone.
+                    sw_causal::publish(causal_point);
                     let routed = event.session_id.as_deref().is_some_and(|sid| {
                         let mut routes = private_clone.lock().unwrap_or_else(|e| e.into_inner());
                         match routes.get(sid) {
@@ -1051,6 +1105,9 @@ impl CdpClient {
                     publish_bounded(&bounded_taps_clone, &event, msg.len());
                     if let Some(publication) = eval_publication {
                         publication.complete();
+                    }
+                    if let Some((kind, session, target)) = causal_event {
+                        sw_causal::point(kind + 2, session, target, None, None);
                     }
                     // Register the lifecycle watermark before waking a failed
                     // caller, so a following operation cannot outrun admission.
@@ -1494,7 +1551,7 @@ impl CdpClient {
         bypass_service_worker: bool,
         deadline: std::time::Instant,
     ) -> Result<ServiceWorkerStartupOutcome, ServiceWorkerStartupFailure> {
-        if session.is_empty() {
+        if sw_causal::test(12, session.is_empty()) {
             return Err("Service-worker initialization requires an exact session".into());
         }
         let expected = self.debt_ledger();
@@ -1554,7 +1611,8 @@ impl CdpClient {
             }
         }
         let submitted_count = responses.len();
-        let complete = submitted_count == 3 + usize::from(bypass_service_worker);
+        let complete =
+            sw_causal::test(0, submitted_count == 3 + usize::from(bypass_service_worker));
         let initialization = responses
             .first()
             .and_then(|(_, _, budget, _)| budget.clone());
@@ -1566,6 +1624,7 @@ impl CdpClient {
                     (Some((a, x)), Some((b, y))) => a == b && x.same_channel(y),
                     _ => false,
                 });
+        sw_causal::test(1, same_budget);
         // Every submitted sibling is joined, including after a local submission
         // failure. Reader-owned debt and Destroyed's causal cutoff are unchanged.
         let results = futures_util::future::join_all(responses.into_iter().map(
@@ -1613,7 +1672,8 @@ impl CdpClient {
         let mut destroyed = false;
         let mut error_ack = false;
         let mut statuses = Vec::with_capacity(4);
-        for (method, reply, status) in results {
+        let mut status_match_mask = 0u64;
+        for (index, (method, reply, status)) in results.into_iter().enumerate() {
             if let Some(error) = reply.error(method) {
                 errors.push(format!("{method}: {error}"));
             }
@@ -1634,6 +1694,7 @@ impl CdpClient {
                 }
             };
             if let Some(status) = status.filter(|status| status.snapshot() == required) {
+                status_match_mask |= 1 << index;
                 statuses.push((status, required));
             } else {
                 eligible = false;
@@ -1641,32 +1702,53 @@ impl CdpClient {
         }
         // Preserve every delivered real error/local failure before considering
         // retirement or a later owner/connection change.
-        if disqualifying_failure {
+        let batch_flags = || {
+            u64::from(complete)
+                | (u64::from(same_budget) << 1)
+                | (u64::from(error_ack) << 2)
+                | (u64::from(destroyed) << 3)
+                | (u64::from(disqualifying_failure) << 4)
+                | (status_match_mask << 8)
+        };
+        if sw_causal::test(2, disqualifying_failure) {
+            sw_causal::batch(
+                1,
+                submitted_count,
+                3 + usize::from(bypass_service_worker),
+                batch_flags(),
+            );
             return Err(errors.join("; ").into());
         }
-        if self.check_cleanup_owner(&expected).is_err() {
+        if sw_causal::test(3, self.check_cleanup_owner(&expected).is_err()) {
             errors.push("Native CDP owner changed".into());
             eligible = false;
         }
-        if let Err(error) = self.ensure_open() {
+        let open = self.ensure_open();
+        sw_causal::test(4, open.is_err());
+        if let Err(error) = open {
             errors.push(error);
             eligible = false;
         }
-        if initialization.as_ref().is_some_and(|(_, cancel)| {
-            *cancel.borrow() != super::super::client_session::CancelSignal::None
-        }) {
+        if sw_causal::test(
+            5,
+            initialization.as_ref().is_some_and(|(_, cancel)| {
+                *cancel.borrow() != super::super::client_session::CancelSignal::None
+            }),
+        ) {
             errors.push("Native initialization cancelled".into());
             eligible = false;
         }
-        if std::time::Instant::now()
-            >= initialization
-                .as_ref()
-                .map_or(deadline, |(bound, _)| deadline.min(*bound))
-        {
+        if sw_causal::test(
+            6,
+            std::time::Instant::now()
+                >= initialization
+                    .as_ref()
+                    .map_or(deadline, |(bound, _)| deadline.min(*bound)),
+        ) {
             errors.push("Native initialization deadline expired".into());
             eligible = false;
         }
-        if expected.is_some() && statuses.len() != submitted_count {
+        if sw_causal::test(7, expected.is_some() && statuses.len() != submitted_count) {
             errors.push("Service-worker startup reservation lost".into());
             eligible = false;
         }
@@ -1677,12 +1759,18 @@ impl CdpClient {
         // session may carry retire-only responsibility to enrollment; a live
         // error cannot wait here for some arbitrary future detach.
         if error_ack {
-            let retirement = if eligible
-                && expected.as_ref().is_some_and(|owner| {
-                    owner
-                        .worker_startup_session_unbound(session)
-                        .unwrap_or(false)
-                }) {
+            let retirement = if sw_causal::test(8, eligible)
+                && sw_causal::test(
+                    11,
+                    expected.as_ref().is_some_and(|owner| {
+                        let unbound = owner.worker_startup_session_unbound(session);
+                        sw_causal::test(9, unbound.is_ok());
+                        match unbound {
+                            Ok(value) => sw_causal::test(10, value),
+                            Err(_) => false,
+                        }
+                    }),
+                ) {
                 expected.map(|owner| WorkerStartupRetirement {
                     owner,
                     session: session.into(),
@@ -1694,6 +1782,12 @@ impl CdpClient {
             } else {
                 None
             };
+            sw_causal::batch(
+                if retirement.is_some() { 3 } else { 2 },
+                submitted_count,
+                3 + usize::from(bypass_service_worker),
+                batch_flags() | (u64::from(eligible) << 5),
+            );
             return Err(ServiceWorkerStartupFailure {
                 message: errors.join("; "),
                 error: ProtocolError::BrowserFailure,
@@ -1701,6 +1795,12 @@ impl CdpClient {
             });
         }
         if errors.is_empty() && complete {
+            sw_causal::batch(
+                4,
+                submitted_count,
+                3 + usize::from(bypass_service_worker),
+                batch_flags() | (u64::from(eligible) << 5),
+            );
             return Ok(ServiceWorkerStartupOutcome::Ready(expected.map(|owner| {
                 WorkerStartupRetirement {
                     owner,
@@ -1714,6 +1814,12 @@ impl CdpClient {
         }
         if eligible && destroyed {
             if let Some(owner) = expected {
+                sw_causal::batch(
+                    5,
+                    submitted_count,
+                    3 + usize::from(bypass_service_worker),
+                    batch_flags() | (u64::from(eligible) << 5),
+                );
                 return Ok(ServiceWorkerStartupOutcome::Retired(
                     WorkerStartupRetirement {
                         owner,
@@ -1726,6 +1832,12 @@ impl CdpClient {
                 ));
             }
         }
+        sw_causal::batch(
+            6,
+            submitted_count,
+            3 + usize::from(bypass_service_worker),
+            batch_flags() | (u64::from(eligible) << 5),
+        );
         Err(errors.join("; ").into())
     }
 
@@ -1740,25 +1852,29 @@ impl CdpClient {
         commit: impl FnOnce(bool) -> Result<T, ProtocolError>,
     ) -> Result<WorkerStartupProof<T>, ProtocolError> {
         let (target, session) = binding;
-        retirement.check_bound()?;
-        if retirement.session != session || retirement.deadline != operation.deadline {
+        sw_causal::checked(4, retirement.check_bound())?;
+        if sw_causal::test(13, retirement.session != session)
+            || sw_causal::test(14, retirement.deadline != operation.deadline)
+        {
             return Err(ProtocolError::StaleScope);
         }
-        targets.require_eval_owner(&retirement.owner)?;
+        sw_causal::checked(5, targets.require_eval_owner(&retirement.owner))?;
         let current = self
             .transport
             .debt_owner
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if self.transport.closed.load(Ordering::SeqCst)
-            || current
-                .as_ref()
-                .is_none_or(|owner| !Arc::ptr_eq(owner, &retirement.owner))
-            || self
-                .owner
-                .as_ref()
-                .is_some_and(|owner| !Arc::ptr_eq(owner, &retirement.owner))
-        {
+        if sw_causal::test(
+            15,
+            self.transport.closed.load(Ordering::SeqCst)
+                || current
+                    .as_ref()
+                    .is_none_or(|owner| !Arc::ptr_eq(owner, &retirement.owner))
+                || self
+                    .owner
+                    .as_ref()
+                    .is_some_and(|owner| !Arc::ptr_eq(owner, &retirement.owner)),
+        ) {
             return Err(ProtocolError::StaleScope);
         }
         retirement.owner.with_worker_startup_proof(
@@ -1969,58 +2085,81 @@ impl CdpClient {
         reservation: Option<CommandReservation>,
         owner_deadline: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
     ) -> Result<CommandResponse, String> {
-        let id = self.next_command_id()?;
+        let causal = sw_causal::command(method, session_id);
+        let causal_status = causal
+            .as_ref()
+            .and_then(|_| reservation.as_ref().map(CommandReservation::status));
+        let result = async {
+            let id = self.next_command_id()?;
+            if let Some(token) = &causal {
+                token.id(id);
+            }
 
-        let cmd = CdpCommand {
-            id,
-            method: method.to_string(),
-            params,
-            session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
-        };
+            let cmd = CdpCommand {
+                id,
+                method: method.to_string(),
+                params,
+                session_id: session_id.filter(|s| !s.is_empty()).map(|s| s.to_string()),
+            };
 
-        let json = serde_json::to_string(&cmd)
-            .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
+            let json = serde_json::to_string(&cmd)
+                .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
-        let (tx, rx) = oneshot::channel();
+            let (tx, rx) = oneshot::channel();
 
-        // Cleans up the pending entry if this future is cancelled mid-await (#1528).
-        let mut guard = PendingGuard {
-            pending: self.transport.pending.clone(),
-            id,
-            done: false,
-        };
+            // Cleans up the pending entry if this future is cancelled mid-await (#1528).
+            let mut guard = PendingGuard {
+                pending: self.transport.pending.clone(),
+                id,
+                done: false,
+            };
 
-        {
-            let mut ws_tx = self.transport.ws_tx.lock().await;
-            self.ensure_open()?;
-            let mut pending = self.transport.pending.lock().await;
-            if let Some((expected, deadline)) = &owner_deadline {
-                self.check_cleanup_owner(expected)
-                    .map_err(|_| "Native cleanup owner changed".to_string())?;
-                if std::time::Instant::now() >= *deadline {
-                    return Err("Native cleanup deadline expired".into());
+            {
+                let mut ws_tx = self.transport.ws_tx.lock().await;
+                self.ensure_open()?;
+                let mut pending = self.transport.pending.lock().await;
+                if let Some((expected, deadline)) = &owner_deadline {
+                    self.check_cleanup_owner(expected)
+                        .map_err(|_| "Native cleanup owner changed".to_string())?;
+                    if std::time::Instant::now() >= *deadline {
+                        return Err("Native cleanup deadline expired".into());
+                    }
+                }
+                self.track_submission(id, reservation)?;
+                if let Some(token) = &causal {
+                    token.tracked();
+                }
+                pending.insert(
+                    id,
+                    PendingResponse {
+                        sender: tx,
+                        session: cmd.session_id.clone(),
+                        causal: causal.clone().map(|token| (token, causal_status)),
+                    },
+                );
+                drop(pending);
+                if let Err(error) = ws_tx.send(Message::Text(json)).await {
+                    self.transport.pending.lock().await.remove(&id);
+                    guard.done = true;
+                    return Err(format!("Failed to send CDP command: {}", error));
+                }
+                if let Some(token) = &causal {
+                    token.submitted();
                 }
             }
-            self.track_submission(id, reservation)?;
-            pending.insert(
-                id,
-                PendingResponse {
-                    sender: tx,
-                    session: cmd.session_id.clone(),
-                },
-            );
-            drop(pending);
-            if let Err(error) = ws_tx.send(Message::Text(json)).await {
-                self.transport.pending.lock().await.remove(&id);
-                guard.done = true;
-                return Err(format!("Failed to send CDP command: {}", error));
+
+            Ok(CommandResponse {
+                receiver: rx,
+                guard,
+            })
+        }
+        .await;
+        if result.is_err() {
+            if let Some(token) = &causal {
+                token.local_failure();
             }
         }
-
-        Ok(CommandResponse {
-            receiver: rx,
-            guard,
-        })
+        result
     }
 
     async fn await_command_response(
@@ -5081,6 +5220,7 @@ mod tests {
                 PendingResponse {
                     sender,
                     session: session.map(str::to_owned),
+                    causal: None,
                 },
             );
             receivers.push(receiver);

@@ -11,6 +11,7 @@ use super::client_network::{ApplicationSession, ClientNetwork};
 use super::client_page::ClientPageState;
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
+use super::client_settlement_trace::sw_causal::{self, Stage};
 use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
 use serde_json::{json, Value};
@@ -1274,13 +1275,22 @@ impl ClientEnrollment {
         Ok(())
     }
     fn poison(&self, error: ProtocolError) {
+        let mut observed = None;
+        let mut cause = None;
         if let Ok(mut index) = self.index.lock() {
             self.revoke_eval_authority();
+            if index.failure.is_none() {
+                observed = sw_causal::mark(24, None, None, None, None);
+                if observed.is_some() {
+                    cause = Some(error.clone());
+                }
+            }
             index.failure.get_or_insert(error);
             for entry in index.sessions.values() {
                 let _ = self.page.network_incomplete(&entry.root);
             }
         }
+        sw_causal::publish_error(observed, cause);
         self.targets.seal();
         self.sealed.store(true, Ordering::Release);
         self.stop.send_replace(CancelSignal::SessionClosed);
@@ -1371,7 +1381,11 @@ impl ClientEnrollment {
         index.pending_enrollment.insert(session.clone());
         Ok(Some(session))
     }
-    fn mark_event_applied(&self, sequence: u64) -> Result<(), ProtocolError> {
+    fn mark_event_applied(
+        &self,
+        sequence: u64,
+        causal_lifecycle: bool,
+    ) -> Result<(), ProtocolError> {
         let mut index = self
             .index
             .lock()
@@ -1385,6 +1399,19 @@ impl ClientEnrollment {
             return Err(ProtocolError::StaleScope);
         }
         index.applied_watermark = sequence;
+        let observed = if causal_lifecycle {
+            sw_causal::mark(
+                23,
+                None,
+                None,
+                Some(sequence),
+                Some(index.applied_watermark),
+            )
+        } else {
+            None
+        };
+        drop(index);
+        sw_causal::publish(observed);
         Ok(())
     }
     /// Always index -> ledger, never called by ledger.submit.
@@ -2978,6 +3005,33 @@ impl ClientEnrollment {
         op: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
     ) -> Result<InitializationOutcome, ProtocolError> {
+        let trace = if entry.kind == "service_worker" {
+            sw_causal::begin(op.generation, &entry.target, &entry.session)
+        } else {
+            None
+        };
+        sw_causal::scope(trace, async {
+            sw_causal::stage(Stage::Initialize);
+            let result = self.initialize_observed_inner(entry, op, admission).await;
+            // Only the actual observed return is terminal. A local startup/gate
+            // error can still be recovered by existing marked-page retirement.
+            match &result {
+                Ok(InitializationOutcome::Initialized) => sw_causal::finish(1, None),
+                Ok(InitializationOutcome::FailedRetired(failure)) => {
+                    sw_causal::finish(2, Some(failure.error()));
+                }
+                Err(error) => sw_causal::finish(3, Some(error.clone())),
+            }
+            result
+        })
+        .await
+    }
+    async fn initialize_observed_inner(
+        &self,
+        entry: Attribution,
+        op: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
+    ) -> Result<InitializationOutcome, ProtocolError> {
         // Retain only the existing bounded diagnostic fields before an event
         // can remove this attachment. Diagnostics grant no retirement authority.
         let diagnostic = super::client_settlement_trace::inventory_enabled()
@@ -3123,7 +3177,9 @@ impl ClientEnrollment {
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             == entry.root;
         if entry.kind == "service_worker" {
-            self.network
+            sw_causal::stage(Stage::Prepare);
+            let prepared = self
+                .network
                 .prepare_service_worker_session(
                     ApplicationSession {
                         session_id: entry.session.clone(),
@@ -3133,41 +3189,58 @@ impl ClientEnrollment {
                     op,
                     admission,
                 )
-                .await?;
+                .await;
+            sw_causal::result(Stage::Prepare, &prepared);
+            prepared?;
             // Browser-side controls and descendant attachment are installed
             // before startup. Renderer-domain replies may depend on the
             // browser-side resume callback, so they form one retained batch.
-            self.command(
-                op,
-                Some(&entry.session),
-                "Target.setAutoAttach",
-                autoattach(true),
-            )
-            .await?;
+            sw_causal::stage(Stage::AutoAttach);
+            let attached = self
+                .command(
+                    op,
+                    Some(&entry.session),
+                    "Target.setAutoAttach",
+                    autoattach(true),
+                )
+                .await;
+            sw_causal::result(Stage::AutoAttach, &attached);
+            attached?;
+            sw_causal::stage(Stage::Permit);
             let permit = bounded(
                 op,
                 self.targets
                     .service_worker_startup_permit(&entry.target, &entry.session),
             )
-            .await?;
+            .await;
+            sw_causal::result(Stage::Permit, &permit);
+            let permit = permit?;
+            sw_causal::point(20, Some(&entry.session), Some(&entry.target), None, None);
             // Fetch policy is installed and this exact attachment owns startup.
             // Its main-script request must pass the normal route/auth handlers
             // before Chromium can create the renderer that acknowledges domains.
             // This opens only network callbacks, not target readiness or capture.
-            self.network.configuration_committed(&entry.session, op)?;
+            sw_causal::stage(Stage::ConfigCommitted);
+            let committed = self.network.configuration_committed(&entry.session, op);
+            sw_causal::result(Stage::ConfigCommitted, &committed);
+            committed?;
+            sw_causal::stage(Stage::Batch);
             let startup = bounded(op, async {
                 Ok(self
                     .network
                     .initialize_service_worker_observation(&entry.session, op)
                     .await)
             })
-            .await?;
-            let outcome = match startup {
+            .await;
+            sw_causal::result(Stage::Batch, &startup);
+            let outcome = match startup? {
                 Ok(outcome) => outcome,
                 Err(mut failure) => {
                     let Some(retirement) = failure.take_retirement() else {
+                        sw_causal::result(Stage::Batch, &Err::<(), _>(failure.error()));
                         return Err(failure.error());
                     };
+                    sw_causal::stage(Stage::Retirement);
                     let retired = self
                         .finish_retired_worker_startup(&entry, retirement, permit, op)
                         .await;
@@ -3180,10 +3253,16 @@ impl ClientEnrollment {
             };
             match outcome {
                 super::cdp::client::ServiceWorkerStartupOutcome::Ready(receipt) => {
+                    sw_causal::stage(Stage::Ready);
+                    sw_causal::reset_gate();
                     #[cfg(test)]
                     self.pause_capture_at(CaptureTestPoint::BeforeWorkerReadyCommit, op)
                         .await?;
-                    lease.permit.check()?;
+                    let execution = sw_causal::checked(43, lease.permit.check());
+                    if execution.is_err() {
+                        sw_causal::gate_result(&execution);
+                    }
+                    execution?;
                     if let Some(receipt) = receipt {
                         return self
                             .finish_acknowledged_worker_startup(
@@ -3200,6 +3279,7 @@ impl ClientEnrollment {
                     permit.complete()?;
                 }
                 super::cdp::client::ServiceWorkerStartupOutcome::Retired(retirement) => {
+                    sw_causal::stage(Stage::Retirement);
                     return self
                         .finish_retired_worker_startup(&entry, retirement, permit, op)
                         .await
@@ -3334,54 +3414,72 @@ impl ClientEnrollment {
         execution: &super::client_browser::ScopePermit,
     ) -> Result<(), ProtocolError> {
         use super::cdp::client::WorkerStartupDecision;
+        sw_causal::stage(Stage::Ready);
         loop {
+            sw_causal::reset_gate();
             let result = (|| {
-                self.check_restart_operation(op)?;
-                self.network.check_worker_startup(op)?;
-                receipt.check_bound()?;
-                execution.check()?;
-                let mut index = self
-                    .index
-                    .lock()
-                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                sw_causal::checked(33, self.check_restart_operation(op))?;
+                sw_causal::checked(34, self.network.check_worker_startup(op))?;
+                sw_causal::checked(35, receipt.check_bound())?;
+                sw_causal::checked(43, execution.check())?;
+                let mut index = sw_causal::checked(
+                    36,
+                    self.index
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable),
+                )?;
                 if let Some(error) = &index.failure {
+                    sw_causal::test(16, true);
                     return Err(error.clone());
                 }
-                if self.sealed.load(Ordering::Acquire) || op.generation != self.generation {
-                    return Err(ProtocolError::StaleScope);
-                }
-                if *op.cancellation.borrow() != CancelSignal::None {
-                    return Err(ProtocolError::Cancelled);
-                }
-                if Instant::now() >= op.deadline {
-                    return Err(ProtocolError::DeadlineExceeded);
-                }
-                let Some(current) = index.sessions.get(&entry.session) else {
-                    return Ok(WorkerStartupDecision::AwaitDetach(receipt));
-                };
-                if current.target != entry.target
-                    || current.kind != "service_worker"
-                    || current.resumed
+                sw_causal::test(16, false);
+                if sw_causal::test(17, self.sealed.load(Ordering::Acquire))
+                    || sw_causal::test(18, op.generation != self.generation)
                 {
                     return Err(ProtocolError::StaleScope);
                 }
-                let decision = self.client.try_finish_acknowledged_worker_startup(
-                    receipt,
-                    &self.targets,
-                    &mut permit,
-                    op,
-                    &entry.target,
-                    &entry.session,
+                if sw_causal::test(19, *op.cancellation.borrow() != CancelSignal::None) {
+                    return Err(ProtocolError::Cancelled);
+                }
+                if sw_causal::test(20, Instant::now() >= op.deadline) {
+                    return Err(ProtocolError::DeadlineExceeded);
+                }
+                let Some(current) = index.sessions.get(&entry.session) else {
+                    sw_causal::test(29, false);
+                    return Ok(WorkerStartupDecision::AwaitDetach(receipt));
+                };
+                sw_causal::test(29, true);
+                if sw_causal::test(30, current.target != entry.target)
+                    || sw_causal::test(31, current.kind != "service_worker" || current.resumed)
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let decision = sw_causal::checked(
+                    44,
+                    self.client.try_finish_acknowledged_worker_startup(
+                        receipt,
+                        &self.targets,
+                        &mut permit,
+                        op,
+                        &entry.target,
+                        &entry.session,
+                    ),
                 )?;
                 if matches!(&decision, WorkerStartupDecision::ReadyCommitted(_)) {
                     // Proof locks are gone; retain only index through the
                     // original final network check and resumed publication.
-                    self.network.configuration_committed(&entry.session, op)?;
-                    index
-                        .sessions
-                        .get_mut(&entry.session)
-                        .ok_or(ProtocolError::StaleReference)?
-                        .resumed = true;
+                    sw_causal::checked(
+                        45,
+                        self.network.configuration_committed(&entry.session, op),
+                    )?;
+                    sw_causal::checked(
+                        46,
+                        index
+                            .sessions
+                            .get_mut(&entry.session)
+                            .ok_or(ProtocolError::StaleReference),
+                    )?
+                    .resumed = true;
                     #[cfg(test)]
                     self.trace_capture_registry(
                         CaptureLifecycleStep::Resumed,
@@ -3401,17 +3499,21 @@ impl ClientEnrollment {
                     receipt = pending;
                     // All synchronous proof/index guards have left. A wakeup
                     // restarts normal-versus-detach selection with this receipt.
-                    if let Err(error) = self
-                        .client
-                        .wait_worker_startup_publication(&mut receipt, op)
-                        .await
-                    {
+                    if let Err(error) = sw_causal::checked(
+                        42,
+                        self.client
+                            .wait_worker_startup_publication(&mut receipt, op)
+                            .await,
+                    ) {
+                        let rejected: Result<(), ProtocolError> = Err(error.clone());
+                        sw_causal::gate_result(&rejected);
                         drop(permit);
                         self.changed.notify_waiters();
                         return Err(error);
                     }
                 }
                 Ok(WorkerStartupDecision::ReadyCommitted(observed)) => {
+                    sw_causal::gate_result(&Ok::<(), ProtocolError>(()));
                     if let Some(value) = observed {
                         super::client_settlement_trace::target_lifecycle(
                             value.generation,
@@ -3425,11 +3527,15 @@ impl ClientEnrollment {
                     return Ok(());
                 }
                 Ok(WorkerStartupDecision::RetiredCommitted) => {
+                    let rejected: Result<(), ProtocolError> = Err(ProtocolError::StaleScope);
+                    sw_causal::gate_result(&rejected);
                     drop(permit);
                     self.changed.notify_waiters();
                     return Err(ProtocolError::StaleScope);
                 }
                 Err(error) => {
+                    let rejected: Result<(), ProtocolError> = Err(error.clone());
+                    sw_causal::gate_result(&rejected);
                     drop(permit);
                     self.changed.notify_waiters();
                     return Err(error);
@@ -3446,48 +3552,63 @@ impl ClientEnrollment {
         mut permit: super::client_targets::ResumePermit,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
-        let watermark = self.realm_watermark()?;
+        sw_causal::stage(Stage::Retirement);
+        let watermark = sw_causal::checked(32, self.realm_watermark());
+        if watermark.is_err() {
+            sw_causal::reset_gate();
+            sw_causal::gate_result(&watermark);
+        }
+        let watermark = watermark?;
         let result = bounded(op, async {
             loop {
+                sw_causal::reset_gate();
                 let mut publication_pending = false;
                 let changed = self.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                self.check_restart_operation(op)?;
-                self.network.check_worker_startup(op)?;
-                retirement.check_bound()?;
+                sw_causal::checked(33, self.check_restart_operation(op))?;
+                sw_causal::checked(34, self.network.check_worker_startup(op))?;
+                sw_causal::checked(35, retirement.check_bound())?;
                 {
-                    let index = self.index.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
-                    if let Some(error) = &index.failure { return Err(error.clone()); }
-                    if self.sealed.load(Ordering::Acquire) || op.generation != self.generation {
+                    let index = sw_causal::checked(36, self.index.lock().map_err(|_| ProtocolError::ScopeUnavailable))?;
+                    if let Some(error) = &index.failure {
+                        sw_causal::test(16, true);
+                        return Err(error.clone());
+                    }
+                    sw_causal::test(16, false);
+                    if sw_causal::test(17, self.sealed.load(Ordering::Acquire))
+                        || sw_causal::test(18, op.generation != self.generation) {
                         return Err(ProtocolError::StaleScope);
                     }
-                    if *op.cancellation.borrow() != CancelSignal::None { return Err(ProtocolError::Cancelled); }
-                    if Instant::now() >= op.deadline { return Err(ProtocolError::DeadlineExceeded); }
-                    if self.event_watermark.lock().map_err(|_| ProtocolError::ScopeUnavailable)?
-                        .as_ref().is_none_or(|current| !watermark.same_subscription(current)) {
+                    if sw_causal::test(19, *op.cancellation.borrow() != CancelSignal::None) { return Err(ProtocolError::Cancelled); }
+                    if sw_causal::test(20, Instant::now() >= op.deadline) { return Err(ProtocolError::DeadlineExceeded); }
+                    if sw_causal::test(21, sw_causal::checked(37, self.event_watermark.lock().map_err(|_| ProtocolError::ScopeUnavailable))?
+                        .as_ref().is_none_or(|current| !watermark.same_subscription(current))) {
                         return Err(ProtocolError::StaleScope);
                     }
                     // received() releases its short routes lock before taking
                     // transport owner -> ledger -> targets. No readiness or
                     // application authority is published by this completion.
-                    let received = watermark.received().map_err(|_| ProtocolError::ScopeUnavailable)?;
-                    if index.applied_watermark >= received {
-                        if index.sessions.contains_key(&entry.session)
-                            || index.sessions.values().any(|current| current.target == entry.target) {
+                    let received = sw_causal::checked(38, watermark.received().map_err(|_| ProtocolError::ScopeUnavailable))?;
+                    sw_causal::scalar(0, received);
+                    sw_causal::scalar(1, index.applied_watermark);
+                    if sw_causal::test(22, index.applied_watermark >= received) {
+                        if sw_causal::test(23, index.sessions.contains_key(&entry.session))
+                            || sw_causal::test(24, index.sessions.values().any(|current| current.target == entry.target)) {
                             // A reader may unbind just after the earlier index
                             // snapshot but before its event enters this pump.
                             // Wait only for the original tenure; never a reused ID.
-                            if retirement.failed_terminal() && retirement.publication_pending()? {
+                            if sw_causal::test(25, retirement.failed_terminal())
+                                && sw_causal::test(26, sw_causal::checked(39, retirement.publication_pending())?) {
                                 publication_pending = true;
-                            } else if !retirement.all_acknowledged()
-                                || !permit.original_worker_attachment_present()? {
+                            } else if sw_causal::test(27, !retirement.all_acknowledged())
+                                || sw_causal::test(28, !sw_causal::checked(40, permit.original_worker_attachment_present())?) {
                                 return Err(ProtocolError::StaleReference);
                             }
                         } else {
-                            match self.client.finish_retired_worker_startup(
+                            match sw_causal::checked(41, self.client.finish_retired_worker_startup(
                                 retirement, &self.targets, &mut permit, op, &entry.target, &entry.session,
-                            )? {
+                            ))? {
                                 super::cdp::client::WorkerStartupDecision::RetiredCommitted => return Ok(()),
                                 super::cdp::client::WorkerStartupDecision::AwaitPublication(pending) => {
                                     retirement = pending;
@@ -3501,7 +3622,7 @@ impl ClientEnrollment {
                 if publication_pending {
                     // Neither receipt provenance bypasses an in-flight event.
                     // Retry applied watermark and final proof after the wakeup.
-                    self.client.wait_worker_startup_publication(&mut retirement, op).await?;
+                    sw_causal::checked(42, self.client.wait_worker_startup_publication(&mut retirement, op).await)?;
                     continue;
                 }
                 let deadline = retirement.deadline();
@@ -3512,6 +3633,7 @@ impl ClientEnrollment {
                 }
             }
         }).await;
+        sw_causal::gate_result(&result);
         // Permit::drop relocks the ledger to release resuming. All outer index,
         // transport-owner and ledger guards must have gone before it runs.
         drop(permit);
@@ -3804,6 +3926,7 @@ impl ClientEnrollment {
                         Err(_) => break Err(ProtocolError::CapacityExceeded),
                     };
                     let sequence=event.sequence();
+                    let causal_lifecycle = matches!(event.method.as_str(), "Target.detachedFromTarget" | "Target.targetDestroyed");
                     #[cfg(test)]
                     self.trace_capture_event(&event, sequence);
                     #[cfg(test)]
@@ -3822,7 +3945,7 @@ impl ClientEnrollment {
                             drop(event); result
                         });
                     } else if let Err(error) = self.event_internal(&event, Some(event.budget_lease())) { break Err(error); }
-                    if let Err(error)=self.mark_event_applied(sequence) { break Err(error); }
+                    if let Err(error)=self.mark_event_applied(sequence, causal_lifecycle) { break Err(error); }
                     self.changed.notify_waiters();
                 }
             }
@@ -5034,7 +5157,10 @@ impl ClientEnrollment {
     ) -> Result<(), ProtocolError> {
         if event.method == "Target.detachedFromTarget" {
             let session = field(&event.params, "sessionId")?;
-            let entries: Vec<_> = {
+            let mut detach_observed = None;
+            let mut identity_observed = None;
+            let mut removal_observed = None;
+            let entries = (|| {
                 let mut index = self
                     .index
                     .lock()
@@ -5045,11 +5171,36 @@ impl ClientEnrollment {
                         // malformed supplied value cannot prove exact detach.
                         if let Some(target) = event.params.get("targetId") {
                             if target.as_str() != Some(entry.target.as_str()) {
+                                identity_observed = sw_causal::mark(
+                                    25,
+                                    Some(session),
+                                    Some(&entry.target),
+                                    Some(if target.is_string() { 2 } else { 3 }),
+                                    None,
+                                );
                                 return Err(ProtocolError::InvalidFrame);
                             }
+                            identity_observed = sw_causal::mark(
+                                25,
+                                Some(session),
+                                Some(&entry.target),
+                                Some(1),
+                                None,
+                            );
+                        } else {
+                            identity_observed = sw_causal::mark(
+                                25,
+                                Some(session),
+                                Some(&entry.target),
+                                Some(0),
+                                None,
+                            );
                         }
-                        self.targets
-                            .observe_worker_detach(&entry.target, &entry.session)?;
+                        self.targets.observe_worker_detach_observed(
+                            &entry.target,
+                            &entry.session,
+                            &mut detach_observed,
+                        )?;
                     }
                 }
                 let mut removed = Vec::new();
@@ -5063,6 +5214,18 @@ impl ClientEnrollment {
                             .map(|entry| entry.session.clone()),
                     );
                     if let Some(entry) = index.sessions.remove(&id) {
+                        if id == session
+                            && entry.kind == "service_worker"
+                            && !entry.observation_only
+                        {
+                            removal_observed = sw_causal::mark(
+                                26,
+                                Some(session),
+                                Some(&entry.target),
+                                Some(1),
+                                None,
+                            );
+                        }
                         index.realm_sessions.remove(&id);
                         index.realms.retain(|(session, _), _| session != &id);
                         index.popup_opened.remove(&entry.session);
@@ -5117,9 +5280,12 @@ impl ClientEnrollment {
                 for entry in &removed {
                     self.trace_capture_registry(CaptureLifecycleStep::Removed, entry, &index);
                 }
-                removed
-            };
-            for entry in entries {
+                Ok(removed)
+            })();
+            sw_causal::publish(identity_observed);
+            sw_causal::publish(detach_observed);
+            sw_causal::publish(removal_observed);
+            for entry in entries? {
                 if !entry.observation_only {
                     self.targets.detach(&entry.target)?;
                 }

@@ -30,6 +30,7 @@ pub(crate) enum SettlementPhase {
     FrameInventoryRejection,
     ReadonlyPrepareFailure,
     ServiceWorkerAdmission,
+    ServiceWorkerCausal,
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -164,6 +165,8 @@ pub(crate) enum MessageKind {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sw: Option<sw_causal::Row>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment_ordinal: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2340,3 +2343,735 @@ mod tests {
 #[cfg(test)]
 #[path = "client_cleanup_diagnostic_tests.rs"]
 mod cleanup_tests;
+
+/// Temporary SW-only evidence. No business state, authorization, payloads or
+/// deadlines. Remove this module and its call sites with the diagnostic patch.
+pub(crate) mod sw_causal {
+    use super::*;
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+    use std::sync::atomic::AtomicI64;
+
+    const MAX_TRACES: u64 = 8;
+    const MAX_TRACE_RECORDS: u64 = 32;
+    const MAX_POINTS: u64 = 64;
+    static TRACES: AtomicU64 = AtomicU64::new(0);
+    static POINTS: AtomicU64 = AtomicU64::new(0);
+    static ORDER: AtomicU64 = AtomicU64::new(0);
+    static HASHER: OnceLock<RandomState> = OnceLock::new();
+    tokio::task_local! { static ACTIVE: Arc<Trace>; }
+
+    #[derive(Clone, Copy)]
+    #[repr(u8)]
+    pub(crate) enum Stage {
+        Initialize = 1,
+        Prepare,
+        AutoAttach,
+        Permit,
+        ConfigCommitted,
+        Batch,
+        Ready,
+        Retirement,
+    }
+    // All fields are closed integers/fixed arrays. h=1 means run-local hash:
+    // collisions are NOT excluded, so identity equality is not proof.
+    #[derive(Default, Serialize)]
+    pub(crate) struct Row {
+        o: u64,
+        k: u8,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        n: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        g: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        h: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        s: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        t: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        st: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        m: Option<u8>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        so: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ro: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        c: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        f: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        e: Option<[u32; 2]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        v: Option<[u32; 2]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        a: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        b: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        w: Option<[Option<u64>; 3]>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        d: Option<u64>,
+    }
+    #[derive(Default)]
+    struct Command {
+        used: AtomicBool,
+        id: AtomicU64,
+        session: AtomicU64,
+        submitted: AtomicU64,
+        replied: AtomicU64,
+        code: AtomicI64,
+        flags: AtomicU64,
+    }
+    pub(crate) struct Trace {
+        n: u64,
+        records: AtomicU64,
+        ended: AtomicBool,
+        stage: AtomicU64,
+        evaluated: AtomicU64,
+        values: AtomicU64,
+        gate_order: AtomicU64,
+        known: AtomicU64,
+        scalars: [AtomicU64; 3],
+        commands: [Command; 6],
+        cause: AtomicU64,
+        decision_read: AtomicU64,
+    }
+    fn capture() -> Option<&'static Capture> {
+        CLEANUP_SINK.get().and_then(Option::as_ref)
+    }
+    fn order(c: &Capture) -> u64 {
+        let previous = ORDER.fetch_add(1, Ordering::Relaxed);
+        if previous >= SAFE_INTEGER {
+            c.counters.overflow.store(true, Ordering::Relaxed);
+            SAFE_INTEGER
+        } else {
+            previous + 1
+        }
+    }
+    fn hash(value: &str) -> Option<u64> {
+        HASHER
+            .get()
+            .map(|hasher| hasher.hash_one(value) & SAFE_INTEGER)
+    }
+    pub(crate) fn enabled() -> bool {
+        capture().is_some() && TRACES.load(Ordering::Relaxed) != 0
+    }
+    fn current() -> Option<Arc<Trace>> {
+        ACTIVE.try_with(Arc::clone).ok()
+    }
+    fn split(value: u64) -> [u32; 2] {
+        [value as u32, (value >> 32) as u32]
+    }
+    fn emit_into(c: &Capture, row: Row, error: Option<ProtocolError>) {
+        record_capture(
+            c,
+            0,
+            Phase::ServiceWorkerCausal,
+            Facts {
+                sw: Some(row),
+                error,
+                ..Facts::default()
+            },
+        );
+    }
+    fn limited(c: &Capture) {
+        increment(&c.counters.suppressed, 1, &c.counters.overflow);
+    }
+    impl Trace {
+        fn new(n: u64) -> Self {
+            Self {
+                n,
+                records: AtomicU64::new(0),
+                ended: AtomicBool::new(false),
+                stage: AtomicU64::new(Stage::Initialize as u64),
+                evaluated: AtomicU64::new(0),
+                values: AtomicU64::new(0),
+                gate_order: AtomicU64::new(0),
+                decision_read: AtomicU64::new(0),
+                cause: AtomicU64::new(0),
+                known: AtomicU64::new(0),
+                scalars: std::array::from_fn(|_| AtomicU64::new(0)),
+                commands: std::array::from_fn(|_| Command::default()),
+            }
+        }
+        fn emit(&self, mut row: Row, error: Option<ProtocolError>) {
+            if let Some(c) = capture() {
+                self.emit_into(c, &mut row, error);
+            }
+        }
+        fn emit_into(&self, c: &Capture, row: &mut Row, error: Option<ProtocolError>) {
+            if self.records.fetch_add(1, Ordering::Relaxed) >= MAX_TRACE_RECORDS {
+                limited(c);
+                return;
+            }
+            row.n = Some(self.n);
+            emit_into(c, std::mem::take(row), error);
+        }
+        fn snapshot(&self, c: &Capture, kind: u8) -> Row {
+            let known = self.known.load(Ordering::Relaxed);
+            Row {
+                o: order(c),
+                k: kind,
+                st: Some(self.stage.load(Ordering::Relaxed) as u8),
+                e: Some(split(self.evaluated.load(Ordering::Relaxed))),
+                v: Some(split(self.values.load(Ordering::Relaxed))),
+                b: (self.cause.load(Ordering::Relaxed) != 0)
+                    .then(|| self.cause.load(Ordering::Relaxed)),
+                a: (self.gate_order.load(Ordering::Relaxed) != 0)
+                    .then(|| self.gate_order.load(Ordering::Relaxed)),
+                w: Some(std::array::from_fn(|i| {
+                    (known & (1 << i) != 0).then(|| self.scalars[i].load(Ordering::Relaxed))
+                })),
+                ..Row::default()
+            }
+        }
+        fn summaries(&self, c: &Capture) {
+            for (index, command) in self.commands.iter().enumerate() {
+                if !command.used.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let f = command.flags.load(Ordering::Acquire);
+                let mut row = Row {
+                    o: order(c),
+                    k: 3,
+                    m: Some(index as u8 + 1),
+                    id: (f & 1 != 0).then(|| command.id.load(Ordering::Relaxed)),
+                    so: (f & 4 != 0).then(|| command.submitted.load(Ordering::Relaxed)),
+                    ro: (f & 8 != 0).then(|| command.replied.load(Ordering::Relaxed)),
+                    c: (f & 64 != 0).then(|| command.code.load(Ordering::Relaxed)),
+                    s: (f & 16384 != 0).then(|| command.session.load(Ordering::Relaxed)),
+                    h: Some(1),
+                    f: Some(f),
+                    ..Row::default()
+                };
+                self.emit_into(c, &mut row, None);
+            }
+        }
+    }
+    pub(crate) fn begin(generation: u64, target: &str, session: &str) -> Option<Arc<Trace>> {
+        let c = capture()?;
+        HASHER.get_or_init(RandomState::new);
+        let n = TRACES.fetch_add(1, Ordering::Relaxed);
+        if n >= MAX_TRACES {
+            limited(c);
+            return None;
+        }
+        let trace = Arc::new(Trace::new(n + 1));
+        trace.emit(
+            Row {
+                o: order(c),
+                k: 1,
+                g: Some(generation),
+                h: Some(1),
+                s: hash(session),
+                t: hash(target),
+                ..Row::default()
+            },
+            None,
+        );
+        Some(trace)
+    }
+    pub(crate) async fn scope<T>(
+        trace: Option<Arc<Trace>>,
+        future: impl std::future::Future<Output = T>,
+    ) -> T {
+        match trace {
+            Some(trace) => ACTIVE.scope(trace, future).await,
+            None => future.await,
+        }
+    }
+    pub(crate) fn stage(stage: Stage) {
+        let _ = ACTIVE.try_with(|t| t.stage.store(stage as u64, Ordering::Relaxed));
+    }
+    pub(crate) fn result<T>(stage: Stage, result: &Result<T, ProtocolError>) {
+        self::stage(stage);
+        if let (Some(t), Some(c)) = (current(), capture()) {
+            t.emit(
+                Row {
+                    o: order(c),
+                    k: 2,
+                    st: Some(stage as u8),
+                    f: Some(u64::from(result.is_ok())),
+                    ..Row::default()
+                },
+                result.as_ref().err().cloned(),
+            );
+        }
+    }
+    /// In-lock hook: only diagnostic atomics, no sink access, I/O, or lock.
+    /// Preserve short circuiting by wrapping only the expression already run.
+    pub(crate) fn test(bit: u8, value: bool) -> bool {
+        let _ = ACTIVE.try_with(|t| {
+            let mask = 1u64 << bit;
+            t.evaluated.fetch_or(mask, Ordering::Relaxed);
+            if value {
+                t.values.fetch_or(mask, Ordering::Relaxed);
+            } else {
+                t.values.fetch_and(!mask, Ordering::Relaxed);
+            }
+            if let Some(c) = capture() {
+                t.gate_order.store(order(c), Ordering::Relaxed);
+            }
+        });
+        value
+    }
+    pub(crate) fn scalar(slot: u8, value: u64) {
+        let _ = ACTIVE.try_with(|t| {
+            if let Some(cell) = t.scalars.get(usize::from(slot)) {
+                cell.store(value, Ordering::Relaxed);
+                t.known.fetch_or(1 << slot, Ordering::Relaxed);
+            }
+        });
+    }
+    /// Closed call-site number for an actual typed ? failure; no formatted text.
+    pub(crate) fn checked<T>(
+        code: u8,
+        result: Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        if result.is_err() {
+            let _ = ACTIVE.try_with(|t| {
+                let _ = t.cause.compare_exchange(
+                    0,
+                    u64::from(code),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                );
+            });
+        }
+        result
+    }
+    pub(crate) fn reset_gate() {
+        let _ = ACTIVE.try_with(|t| {
+            t.evaluated.fetch_and((1 << 13) - 1, Ordering::Relaxed);
+            t.values.fetch_and((1 << 13) - 1, Ordering::Relaxed);
+            t.known.store(0, Ordering::Relaxed);
+            t.gate_order.store(0, Ordering::Relaxed);
+        });
+    }
+    /// Called under the ORIGINAL ledger guard, ordered with reader unbinding.
+    pub(crate) fn unbound(value: bool) -> bool {
+        let _ = ACTIVE.try_with(|t| {
+            if let Some(c) = capture() {
+                t.decision_read.store(order(c), Ordering::Relaxed);
+            }
+        });
+        value
+    }
+    pub(crate) fn gate_result<T>(result: &Result<T, ProtocolError>) {
+        if let (Some(t), Some(c)) = (current(), capture()) {
+            t.emit(t.snapshot(c, 5), result.as_ref().err().cloned());
+        }
+    }
+    // k=4 fixed batch outcome: 1 disqualifying,2 ErrorAck/no receipt,
+    // 3 ErrorAck/receipt,4 Ready,5 Retired,6 final failure. No string parsing.
+    pub(crate) fn batch(outcome: u8, submitted: usize, expected: usize, flags: u64) {
+        if let (Some(t), Some(c)) = (current(), capture()) {
+            t.emit(
+                Row {
+                    o: order(c),
+                    k: 4,
+                    st: Some(outcome),
+                    a: Some(submitted as u64),
+                    b: Some(expected as u64),
+                    f: Some(flags),
+                    d: (t.decision_read.load(Ordering::Relaxed) != 0)
+                        .then(|| t.decision_read.load(Ordering::Relaxed)),
+                    e: Some(split(t.evaluated.load(Ordering::Relaxed))),
+                    v: Some(split(t.values.load(Ordering::Relaxed))),
+                    ..Row::default()
+                },
+                None,
+            );
+        }
+    }
+    pub(crate) fn finish(outcome: u8, error: Option<ProtocolError>) {
+        if let (Some(t), Some(c)) = (current(), capture()) {
+            t.finish_into(c, outcome, error);
+        }
+    }
+    impl Trace {
+        fn finish_into(&self, c: &Capture, outcome: u8, error: Option<ProtocolError>) {
+            if self.ended.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            self.summaries(c);
+            let mut row = self.snapshot(c, 6);
+            row.f = Some(u64::from(outcome));
+            self.emit_into(c, &mut row, error);
+            // Snapshot AFTER prior attempts. Concurrent later work and a missing
+            // last marker remain unknown; never add a wait or retry for logging.
+            let mut row = Row {
+                o: order(c),
+                k: 7,
+                a: Some(c.counters.attempted.load(Ordering::Relaxed)),
+                b: Some(self.records.load(Ordering::Relaxed)),
+                ..Row::default()
+            };
+            self.emit_into(c, &mut row, None);
+        }
+    }
+    pub(crate) struct Point(Row);
+    pub(crate) fn mark(
+        kind: u8,
+        session: Option<&str>,
+        target: Option<&str>,
+        a: Option<u64>,
+        b: Option<u64>,
+    ) -> Option<Point> {
+        let c = capture()?;
+        if !matches!(kind, 20..=26 | 40..=43)
+            || (kind == 24 && current().is_none())
+            || TRACES.load(Ordering::Relaxed) == 0
+        {
+            return None;
+        }
+        if POINTS.fetch_add(1, Ordering::Relaxed) >= MAX_POINTS {
+            limited(c);
+            return None;
+        }
+        Some(Point(Row {
+            o: order(c),
+            k: kind,
+            n: current().map(|t| t.n),
+            h: Some(1),
+            s: session.and_then(hash),
+            t: target.and_then(hash),
+            a,
+            b,
+            ..Row::default()
+        }))
+    }
+    pub(crate) fn publish(point: Option<Point>) {
+        publish_error(point, None);
+    }
+    pub(crate) fn publish_error(point: Option<Point>, error: Option<ProtocolError>) {
+        if let (Some(Point(row)), Some(c)) = (point, capture()) {
+            emit_into(c, row, error);
+        }
+    }
+    pub(crate) fn point(
+        kind: u8,
+        session: Option<&str>,
+        target: Option<&str>,
+        a: Option<u64>,
+        b: Option<u64>,
+    ) {
+        publish(mark(kind, session, target, a, b));
+    }
+    #[derive(Clone)]
+    pub(crate) struct CommandToken {
+        trace: Arc<Trace>,
+        slot: usize,
+    }
+    pub(crate) fn command(method: &str, session: Option<&str>) -> Option<CommandToken> {
+        let trace = current()?;
+        let slot = match method {
+            "Fetch.enable" => 0,
+            "Target.setAutoAttach" => 1,
+            "Network.enable" => 2,
+            "Network.setBypassServiceWorker" => 3,
+            "Runtime.enable" => 4,
+            "Runtime.runIfWaitingForDebugger" => 5,
+            _ => return None,
+        };
+        if trace.commands[slot].used.swap(true, Ordering::Relaxed) {
+            trace.commands[slot].flags.fetch_or(128, Ordering::Relaxed);
+            return None;
+        }
+        if let Some(session_hash) = session.and_then(hash) {
+            trace.commands[slot]
+                .session
+                .store(session_hash, Ordering::Relaxed);
+            trace.commands[slot]
+                .flags
+                .fetch_or(16384, Ordering::Relaxed);
+        }
+        Some(CommandToken { trace, slot })
+    }
+    impl CommandToken {
+        pub(crate) fn id(&self, id: u64) {
+            let c = &self.trace.commands[self.slot];
+            c.id.store(id, Ordering::Relaxed);
+            c.flags.fetch_or(1, Ordering::Release);
+        }
+        pub(crate) fn tracked(&self) {
+            self.trace.commands[self.slot]
+                .flags
+                .fetch_or(2, Ordering::Release);
+        }
+        pub(crate) fn submitted(&self) {
+            if let Some(c) = capture() {
+                self.submitted_into(c);
+            }
+        }
+        fn submitted_into(&self, capture: &Capture) {
+            let c = &self.trace.commands[self.slot];
+            c.submitted.store(order(capture), Ordering::Relaxed);
+            c.flags.fetch_or(4, Ordering::Release);
+        }
+        pub(crate) fn local_failure(&self) {
+            self.trace.commands[self.slot]
+                .flags
+                .fetch_or(256, Ordering::Release);
+        }
+        pub(crate) fn reply(
+            &self,
+            valid: bool,
+            exact: bool,
+            code: Option<i64>,
+            error: bool,
+            status: Option<u8>,
+        ) {
+            if let Some(c) = capture() {
+                self.reply_into(c, valid, exact, code, error, status);
+            }
+        }
+        fn reply_into(
+            &self,
+            capture: &Capture,
+            valid: bool,
+            exact: bool,
+            code: Option<i64>,
+            error: bool,
+            status: Option<u8>,
+        ) {
+            let c = &self.trace.commands[self.slot];
+            c.replied.store(order(capture), Ordering::Relaxed);
+            if let Some(code) = code {
+                c.code.store(code, Ordering::Relaxed);
+            }
+            let flags = 8
+                | (u64::from(valid) << 4)
+                | (u64::from(exact) << 5)
+                | (u64::from(code.is_some()) << 6)
+                | (u64::from(error) << 9)
+                | status.map_or(0, |status| 1024 | (u64::from(status) << 11));
+            c.flags.fetch_or(flags, Ordering::Release);
+        }
+    }
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        fn values(path: &Path) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .map(|line| {
+                    assert!(line.len() + 1 <= MAX_RECORD_BYTES);
+                    serde_json::from_str(line).unwrap()
+                })
+                .collect()
+        }
+        fn token(trace: &Arc<Trace>, slot: usize, id: u64) -> CommandToken {
+            trace.commands[slot].used.store(true, Ordering::Relaxed);
+            let token = CommandToken {
+                trace: trace.clone(),
+                slot,
+            };
+            token.id(id);
+            token.tracked();
+            token
+        }
+        #[test]
+        fn sw_causal_success_real_emit_control_and_final_counts() {
+            fn send_sync<T: Send + Sync>() {}
+            send_sync::<Trace>();
+            send_sync::<CommandToken>();
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let capture = cleanup_capture(Some(file.path())).unwrap();
+            let trace = Arc::new(Trace::new(1));
+            for slot in 0..6 {
+                let token = token(&trace, slot, 100 + slot as u64);
+                token.submitted_into(&capture);
+                token.reply_into(&capture, true, true, None, false, Some(2));
+            }
+            trace.finish_into(&capture, 1, None);
+            let rows = values(file.path());
+            assert_eq!(rows.len(), 8);
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(row["record"], i as u64);
+                assert_eq!(row["emittedBefore"], i as u64);
+                assert_eq!(row["droppedBefore"], 0);
+                assert_eq!(row["suppressedBefore"], 0);
+                assert_eq!(row["overflow"], false);
+            }
+            for (slot, row) in rows.iter().take(6).enumerate() {
+                assert_eq!(row["sw"]["id"], 100 + slot as u64);
+                assert_eq!(row["sw"]["m"], slot as u64 + 1);
+                assert!(row["sw"]["ro"].as_u64().unwrap() > row["sw"]["so"].as_u64().unwrap());
+                assert!(row["sw"]["c"].is_null());
+            }
+            assert_eq!(rows[7]["sw"]["k"], 7);
+            assert_eq!(rows[7]["sw"]["a"], 7);
+            trace.finish_into(&capture, 3, Some(ProtocolError::BrowserFailure));
+            assert_eq!(values(file.path()).len(), 8);
+        }
+        #[test]
+        fn sw_causal_typed_error_retained_through_real_emit_contention() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let capture = cleanup_capture(Some(file.path())).unwrap();
+            let trace = Arc::new(Trace::new(1));
+            let token = token(&trace, 2, 987);
+            token.submitted_into(&capture);
+            let held = capture.sink.lock().unwrap();
+            token.reply_into(&capture, true, true, Some(-32000), true, Some(2));
+            trace.emit_into(
+                &capture,
+                &mut Row {
+                    o: order(&capture),
+                    k: 2,
+                    ..Row::default()
+                },
+                None,
+            );
+            assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 1);
+            drop(held);
+            trace.finish_into(&capture, 3, Some(ProtocolError::BrowserFailure));
+            let rows = values(file.path());
+            assert_eq!(rows.len(), 3);
+            assert_eq!(rows[0]["sw"]["id"], 987);
+            assert_eq!(rows[0]["sw"]["c"], -32000);
+            assert_eq!(rows[0]["droppedBefore"], 1);
+            assert_eq!(rows[2]["sw"]["a"], 3);
+            assert_eq!(rows[2]["droppedBefore"], 1);
+            // A final contended emit is itself missing, not a false all-clear.
+            let held = capture.sink.lock().unwrap();
+            emit_into(
+                &capture,
+                Row {
+                    o: order(&capture),
+                    k: 7,
+                    ..Row::default()
+                },
+                None,
+            );
+            drop(held);
+            assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 2);
+            assert_eq!(values(file.path()).len(), 3);
+            emit_into(
+                &capture,
+                Row {
+                    o: order(&capture),
+                    k: 7,
+                    a: Some(capture.counters.attempted.load(Ordering::Relaxed)),
+                    ..Row::default()
+                },
+                None,
+            );
+            let rows = values(file.path());
+            assert_eq!(rows.last().unwrap()["droppedBefore"], 2);
+            assert_eq!(rows.last().unwrap()["sw"]["a"], 5);
+        }
+        #[tokio::test]
+        async fn sw_causal_short_circuit_unknown_and_typed_result_are_preserved() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let capture = cleanup_capture(Some(file.path())).unwrap();
+            let trace = Arc::new(Trace::new(1));
+            scope(Some(trace.clone()), async {
+                assert!(!(test(16, false) && test(17, true)));
+                let original: Result<(), ProtocolError> = Err(ProtocolError::Cancelled);
+                assert_eq!(checked(32, original.clone()), original);
+                let _ = checked(33, Err::<(), _>(ProtocolError::DeadlineExceeded));
+                scalar(0, 19);
+            })
+            .await;
+            let row = trace.snapshot(&capture, 5);
+            assert_eq!(row.e, Some([1 << 16, 0]));
+            assert_eq!(row.v, Some([0, 0]));
+            assert_eq!(row.w, Some([Some(19), None, None]));
+            assert_eq!(row.b, Some(32));
+        }
+        #[test]
+        fn sw_causal_reply_and_lifecycle_origin_order_is_not_file_order() {
+            // Synthetic fact-storage test only, not a browser retirement proof.
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let capture = cleanup_capture(Some(file.path())).unwrap();
+            for detach_first in [false, true] {
+                let trace = Arc::new(Trace::new(1));
+                let token = token(&trace, 4, 42);
+                token.submitted_into(&capture);
+                let earlier_detach = detach_first.then(|| order(&capture));
+                token.reply_into(&capture, true, true, Some(-32000), true, Some(2));
+                let reply = trace.commands[4].replied.load(Ordering::Relaxed);
+                let decision = order(&capture);
+                let detach = earlier_detach.unwrap_or_else(|| order(&capture));
+                // Deliberately emit the later-created summary before lifecycle.
+                trace.finish_into(&capture, 3, Some(ProtocolError::BrowserFailure));
+                emit_into(
+                    &capture,
+                    Row {
+                        o: detach,
+                        k: 40,
+                        ..Row::default()
+                    },
+                    None,
+                );
+                assert!(reply < decision);
+                assert_eq!(detach < decision, detach_first);
+            }
+            let rows = values(file.path());
+            assert!(rows.iter().any(|row| row["sw"]["k"] == 40));
+            // targetDestroyed is a distinct closed kind and never exact detach.
+            emit_into(
+                &capture,
+                Row {
+                    o: order(&capture),
+                    k: 41,
+                    ..Row::default()
+                },
+                None,
+            );
+            assert_eq!(values(file.path()).last().unwrap()["sw"]["k"], 41);
+        }
+        #[test]
+        fn sw_causal_record_cap_suppression_and_maximum_rows_use_real_emit() {
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let capture = cleanup_capture(Some(file.path())).unwrap();
+            let trace = Trace::new(MAX_TRACES);
+            for _ in 0..MAX_TRACE_RECORDS + 1 {
+                trace.emit_into(
+                    &capture,
+                    &mut Row {
+                        o: SAFE_INTEGER,
+                        k: 5,
+                        n: Some(SAFE_INTEGER),
+                        st: Some(9),
+                        e: Some([u32::MAX; 2]),
+                        v: Some([u32::MAX; 2]),
+                        a: Some(SAFE_INTEGER),
+                        b: Some(255),
+                        w: Some([Some(SAFE_INTEGER); 3]),
+                        ..Row::default()
+                    },
+                    Some(ProtocolError::DeadlineExceeded),
+                );
+            }
+            assert_eq!(values(file.path()).len(), MAX_TRACE_RECORDS as usize);
+            assert_eq!(capture.counters.suppressed.load(Ordering::Relaxed), 1);
+            emit_into(
+                &capture,
+                Row {
+                    o: SAFE_INTEGER,
+                    k: 3,
+                    m: Some(6),
+                    id: Some(u64::MAX),
+                    so: Some(SAFE_INTEGER),
+                    ro: Some(SAFE_INTEGER),
+                    c: Some(i64::MIN),
+                    f: Some(32767),
+                    s: Some(SAFE_INTEGER),
+                    h: Some(1),
+                    ..Row::default()
+                },
+                None,
+            );
+            let rows = values(file.path());
+            assert_eq!(rows.len(), MAX_TRACE_RECORDS as usize + 1);
+            assert_eq!(rows.last().unwrap()["suppressedBefore"], 1);
+        }
+    }
+}

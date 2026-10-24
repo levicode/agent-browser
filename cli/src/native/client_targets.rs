@@ -3,6 +3,7 @@
 //! assigns a bootstrap target to a generic request handler.
 use super::client_protocol::ProtocolError;
 use super::client_settlement_trace as diagnostic;
+use super::client_settlement_trace::sw_causal;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -362,25 +363,34 @@ impl ResumePermit {
     /// Observation only: distinguish the retained original attachment from a
     /// reused identity while waiting for its already-received detach to apply.
     pub(super) fn original_worker_attachment_present(&self) -> Result<bool, ProtocolError> {
-        let state = self
-            .registry
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed || state.integrity_lost || !self.worker_startup || self.completed {
+        let state = sw_causal::checked(
+            64,
+            self.registry
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable),
+        )?;
+        if sw_causal::test(37, state.sealed)
+            || sw_causal::test(38, state.integrity_lost)
+            || sw_causal::test(33, !self.worker_startup)
+            || sw_causal::test(34, self.completed)
+        {
             return Err(ProtocolError::StaleScope);
         }
         match state.targets.get(&self.target_id) {
             Some(target)
-                if target.session_id == self.session_id
-                    && Arc::ptr_eq(&target.tenure, &self.tenure) =>
+                if sw_causal::test(43, target.session_id == self.session_id)
+                    && sw_causal::test(44, Arc::ptr_eq(&target.tenure, &self.tenure)) =>
             {
                 Ok(true)
             }
-            None if !state
-                .targets
-                .values()
-                .any(|target| target.session_id == self.session_id) =>
+            None if sw_causal::test(
+                45,
+                !state
+                    .targets
+                    .values()
+                    .any(|target| target.session_id == self.session_id),
+            ) =>
             {
                 Ok(false)
             }
@@ -396,11 +406,11 @@ impl ResumePermit {
         session: &str,
         check_bounds: impl FnOnce() -> Result<(), ProtocolError>,
     ) -> Result<(), ProtocolError> {
-        if !Arc::ptr_eq(&self.registry, registry)
-            || !self.worker_startup
-            || self.completed
-            || self.target_id != target
-            || self.session_id != session
+        if sw_causal::test(32, !Arc::ptr_eq(&self.registry, registry))
+            || sw_causal::test(33, !self.worker_startup)
+            || sw_causal::test(34, self.completed)
+            || sw_causal::test(35, self.target_id != target)
+            || sw_causal::test(36, self.session_id != session)
         {
             return Err(ProtocolError::StaleScope);
         }
@@ -408,25 +418,31 @@ impl ResumePermit {
         if let Some(entered) = registry.retirement_before_lock.lock().unwrap().take() {
             let _ = entered.send(());
         }
-        let state = registry
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed
-            || state.integrity_lost
-            || state.protected_read
-            || state.resuming == 0
-            || !self.tenure.observed_detach.load(Ordering::Acquire)
-            || state
-                .targets
-                .values()
-                .any(|entry| entry.target_id == target || entry.session_id == session)
+        let state = sw_causal::checked(
+            65,
+            registry
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable),
+        )?;
+        if sw_causal::test(37, state.sealed)
+            || sw_causal::test(38, state.integrity_lost)
+            || sw_causal::test(39, state.protected_read)
+            || sw_causal::test(40, state.resuming == 0)
+            || sw_causal::test(41, !self.tenure.observed_detach.load(Ordering::Acquire))
+            || sw_causal::test(
+                42,
+                state
+                    .targets
+                    .values()
+                    .any(|entry| entry.target_id == target || entry.session_id == session),
+            )
         {
             return Err(ProtocolError::StaleScope);
         }
         // Retirement publishes neither configured nor resumed. Drop releases the
         // original resuming reservation after the outer locks have all gone.
-        check_bounds()?;
+        sw_causal::checked(66, check_bounds())?;
         self.completed = true;
         Ok(())
     }
@@ -508,7 +524,11 @@ impl ResumePermit {
                 .lock()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
             self.complete_locked(&mut state, || Ok(()))
-        })?;
+        });
+        if self.worker_startup {
+            sw_causal::gate_result(&observed);
+        }
+        let observed = observed?;
         if let Some(value) = observed {
             diagnostic::target_lifecycle(value.generation, 0, value, None);
         }
@@ -518,6 +538,7 @@ impl ResumePermit {
 impl Drop for ResumePermit {
     fn drop(&mut self) {
         let registry = self.registry.clone();
+        let mut observed_state = None;
         registry.eval_invalidation(|revoke| {
             revoke();
             if let Ok(mut state) = self.registry.state.lock() {
@@ -532,9 +553,23 @@ impl Drop for ResumePermit {
                 if !self.completed {
                     state.lose_integrity();
                 }
+                observed_state = Some((state.resuming as u64, state.integrity_lost));
             }
             self.registry.changed.notify_waiters();
-        })
+        });
+        if self.worker_startup {
+            sw_causal::point(
+                21,
+                Some(&self.session_id),
+                Some(&self.target_id),
+                Some(
+                    u64::from(self.completed)
+                        | (u64::from(observed_state.is_some()) << 1)
+                        | (u64::from(observed_state.is_some_and(|(_, lost)| lost)) << 2),
+                ),
+                observed_state.map(|(resuming, _)| resuming),
+            );
+        }
     }
 }
 impl ClientTargets {
@@ -716,19 +751,24 @@ impl ClientTargets {
             tokio::pin!(changed);
             changed.as_mut().enable();
             {
-                let mut state = self
-                    .state
-                    .lock()
-                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                if state.sealed {
+                let mut state = sw_causal::checked(
+                    67,
+                    self.state
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable),
+                )?;
+                if sw_causal::test(37, state.sealed) {
                     return Err(ProtocolError::StaleScope);
                 }
-                let target = state
-                    .targets
-                    .get(target_id)
-                    .ok_or(ProtocolError::StaleReference)?;
+                let target = sw_causal::checked(
+                    68,
+                    state
+                        .targets
+                        .get(target_id)
+                        .ok_or(ProtocolError::StaleReference),
+                )?;
                 if let Some(expected) = &expected_tenure {
-                    if !Arc::ptr_eq(expected, &target.tenure) {
+                    if !sw_causal::test(44, Arc::ptr_eq(expected, &target.tenure)) {
                         return Err(ProtocolError::StaleScope);
                     }
                 } else {
@@ -743,21 +783,29 @@ impl ClientTargets {
                     }
                     None => target.configured,
                 };
-                if !eligible || target.resumed || target.resume_pending {
+                if !sw_causal::test(46, eligible)
+                    || sw_causal::test(47, target.resumed || target.resume_pending)
+                {
                     return Err(ProtocolError::InvalidArguments);
                 }
-                if !state.protected_read {
+                if !sw_causal::test(39, state.protected_read) {
                     let session_id = target.session_id.clone();
                     let tenure = target.tenure.clone();
-                    let resuming = state
-                        .resuming
-                        .checked_add(1)
-                        .ok_or(ProtocolError::CapacityExceeded)?;
-                    state
-                        .targets
-                        .get_mut(target_id)
-                        .ok_or(ProtocolError::StaleReference)?
-                        .resume_pending = true;
+                    let resuming = sw_causal::checked(
+                        69,
+                        state
+                            .resuming
+                            .checked_add(1)
+                            .ok_or(ProtocolError::CapacityExceeded),
+                    )?;
+                    sw_causal::checked(
+                        70,
+                        state
+                            .targets
+                            .get_mut(target_id)
+                            .ok_or(ProtocolError::StaleReference),
+                    )?
+                    .resume_pending = true;
                     state.resuming = resuming;
                     return Ok(ResumePermit {
                         registry: self.clone(),
@@ -1299,14 +1347,42 @@ impl ClientTargets {
         target: &str,
         session: &str,
     ) -> Result<(), ProtocolError> {
+        // Non-enrollment callers retain the original result-only interface.
+        self.observe_worker_detach_inner(target, session, None)
+    }
+    pub(super) fn observe_worker_detach_observed(
+        &self,
+        target: &str,
+        session: &str,
+        observed: &mut Option<sw_causal::Point>,
+    ) -> Result<(), ProtocolError> {
+        self.observe_worker_detach_inner(target, session, Some(observed))
+    }
+    fn observe_worker_detach_inner(
+        &self,
+        target: &str,
+        session: &str,
+        observed: Option<&mut Option<sw_causal::Point>>,
+    ) -> Result<(), ProtocolError> {
         let state = self
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let mut applied = false;
         if let Some(entry) = state.targets.get(target) {
             if entry.kind == "service_worker" && entry.session_id == session {
                 entry.tenure.observed_detach.store(true, Ordering::Release);
+                applied = true;
             }
+        }
+        if let Some(observed) = observed {
+            *observed = sw_causal::mark(
+                22,
+                Some(session),
+                Some(target),
+                Some(u64::from(applied)),
+                None,
+            );
         }
         Ok(())
     }

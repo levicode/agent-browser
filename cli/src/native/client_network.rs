@@ -15,7 +15,7 @@ use super::client_session::{
     CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
     OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
 };
-use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
+use super::client_settlement_trace::{sw_causal, ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_transport::ClientEventSink;
 use base64::Engine;
 use serde_json::{json, Value};
@@ -559,7 +559,7 @@ impl ClientNetwork {
         super::cdp::client::ServiceWorkerStartupOutcome,
         super::cdp::client::ServiceWorkerStartupFailure,
     > {
-        self.check_worker_startup(operation)?;
+        sw_causal::checked(1, self.check_worker_startup(operation))?;
         let bypass_service_worker = self
             .policy
             .lock()
@@ -581,13 +581,16 @@ impl ClientNetwork {
                     Err(failure.error())
                 };
                 if let Err(error) = check {
-                    let error = self.broker.quarantine().err().unwrap_or(error);
+                    let error = sw_causal::checked(2, self.broker.quarantine())
+                        .err()
+                        .unwrap_or(error);
+                    sw_causal::result(sw_causal::Stage::Batch, &Err::<(), _>(error.clone()));
                     return Err(failure.fail_closed(error));
                 }
                 Err(failure)
             }
             Ok(outcome) => {
-                self.check_worker_startup(operation)?;
+                sw_causal::checked(3, self.check_worker_startup(operation))?;
                 Ok(outcome)
             }
         }

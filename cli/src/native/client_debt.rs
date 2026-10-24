@@ -4,6 +4,7 @@
 use super::cdp::types::{CdpEvent, CdpMessage};
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
+use super::client_settlement_trace::sw_causal;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
@@ -921,57 +922,78 @@ impl OwnerDebtLedger {
         commit: impl FnOnce(bool) -> Result<T, ProtocolError>,
     ) -> Result<WorkerStartupProof<T>, ProtocolError> {
         let (target, session) = binding;
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if !self.matches_owner(generation, &targets.identity_scope)
-            || state.retired
-            || state.integrity_lost
-            || state.context_id.as_deref() != Some(targets.context_id.as_str())
-            || statuses.is_empty()
-            || statuses.len() > 4
-            || match provenance {
-                WorkerStartupStatusProvenance::FailedTerminal => !statuses
-                    .iter()
-                    .any(|(_, expected)| *expected == CommandStatus::Acknowledged),
-                WorkerStartupStatusProvenance::AllAcknowledged => statuses
-                    .iter()
-                    .any(|(_, expected)| *expected != CommandStatus::Acknowledged),
-                WorkerStartupStatusProvenance::IncludesDestroyed => !statuses
-                    .iter()
-                    .any(|(_, expected)| *expected == CommandStatus::Destroyed),
-            }
-            || statuses.iter().any(|(status, expected)| {
-                !matches!(
-                    expected,
-                    CommandStatus::Acknowledged | CommandStatus::Destroyed
-                ) || status.snapshot() != *expected
-            })
+        let mut state = sw_causal::checked(
+            80,
+            self.state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable),
+        )?;
+        if sw_causal::test(48, !self.matches_owner(generation, &targets.identity_scope))
+            || sw_causal::test(49, state.retired)
+            || sw_causal::test(50, state.integrity_lost)
+            || sw_causal::test(
+                51,
+                state.context_id.as_deref() != Some(targets.context_id.as_str()),
+            )
+            || sw_causal::test(52, statuses.is_empty())
+            || sw_causal::test(53, statuses.len() > 4)
+            || sw_causal::test(
+                54,
+                match provenance {
+                    WorkerStartupStatusProvenance::FailedTerminal => !statuses
+                        .iter()
+                        .any(|(_, expected)| *expected == CommandStatus::Acknowledged),
+                    WorkerStartupStatusProvenance::AllAcknowledged => statuses
+                        .iter()
+                        .any(|(_, expected)| *expected != CommandStatus::Acknowledged),
+                    WorkerStartupStatusProvenance::IncludesDestroyed => !statuses
+                        .iter()
+                        .any(|(_, expected)| *expected == CommandStatus::Destroyed),
+                },
+            )
+            || sw_causal::test(
+                55,
+                statuses.iter().any(|(status, expected)| {
+                    !matches!(
+                        expected,
+                        CommandStatus::Acknowledged | CommandStatus::Destroyed
+                    ) || status.snapshot() != *expected
+                }),
+            )
         {
             return Err(ProtocolError::StaleScope);
         }
         let bound = match state.targets.get(session) {
             Some(known)
-                if known == target
-                    && !state
-                        .targets
-                        .iter()
-                        .any(|(other, known)| other != session && known == target) =>
+                if sw_causal::test(56, known == target)
+                    && sw_causal::test(
+                        57,
+                        !state
+                            .targets
+                            .iter()
+                            .any(|(other, known)| other != session && known == target),
+                    ) =>
             {
                 true
             }
-            None if !state.targets.values().any(|known| known == target) => false,
+            None if sw_causal::test(58, !state.targets.values().any(|known| known == target)) => {
+                false
+            }
             _ => return Err(ProtocolError::StaleScope),
         };
-        if bound && provenance != WorkerStartupStatusProvenance::AllAcknowledged {
+        if sw_causal::test(59, bound)
+            && sw_causal::test(
+                60,
+                provenance != WorkerStartupStatusProvenance::AllAcknowledged,
+            )
+        {
             return Err(ProtocolError::StaleScope);
         }
-        if state.eval_publication_pending {
+        if sw_causal::test(61, state.eval_publication_pending) {
             return Ok(WorkerStartupProof::AwaitPublication);
         }
         invalidate_eval(&mut state);
-        commit(bound).map(WorkerStartupProof::Committed)
+        sw_causal::checked(81, commit(bound)).map(WorkerStartupProof::Committed)
     }
     /// Candidate classification only. Absence cannot complete retirement:
     /// enrollment still requires its exact applied detach and original tenure.
@@ -986,7 +1008,7 @@ impl OwnerDebtLedger {
         if state.retired || state.integrity_lost {
             return Err(ProtocolError::StaleScope);
         }
-        Ok(!state.targets.contains_key(session))
+        Ok(sw_causal::unbound(!state.targets.contains_key(session)))
     }
     pub(super) fn worker_startup_publication_notifier(&self) -> Arc<tokio::sync::Notify> {
         self.changed.clone()
@@ -2475,16 +2497,29 @@ impl OwnerDebtLedger {
     }
     #[cfg(test)]
     pub(crate) fn observe_event(&self, event: &CdpEvent) {
-        self.observe_event_inner(event, false);
+        self.observe_event_inner(event, false, None);
     }
     pub(crate) fn observe_event_for_publication(
         self: &Arc<Self>,
         event: &CdpEvent,
     ) -> Option<EvalEventPublication> {
-        self.observe_event_inner(event, true)
+        self.observe_event_inner(event, true, None)
             .then(|| EvalEventPublication(self.clone()))
     }
-    fn observe_event_inner(&self, event: &CdpEvent, publication: bool) -> bool {
+    pub(crate) fn observe_event_for_publication_observed(
+        self: &Arc<Self>,
+        event: &CdpEvent,
+        observed: &mut Option<sw_causal::Point>,
+    ) -> Option<EvalEventPublication> {
+        self.observe_event_inner(event, true, Some(observed))
+            .then(|| EvalEventPublication(self.clone()))
+    }
+    fn observe_event_inner(
+        &self,
+        event: &CdpEvent,
+        publication: bool,
+        observed: Option<&mut Option<sw_causal::Point>>,
+    ) -> bool {
         if !matches!(
             event.method.as_str(),
             "Runtime.executionContextCreated"
@@ -2584,6 +2619,17 @@ impl OwnerDebtLedger {
                         |provenance| provenance.session.as_deref() == Some(session),
                         true,
                     );
+                    if let Some(observed) = observed {
+                        // The same ledger guard orders this mutation against
+                        // the startup decision's unbound read. No sink I/O.
+                        *observed = sw_causal::mark(
+                            40,
+                            Some(session),
+                            event.params.get("targetId").and_then(Value::as_str),
+                            Some(u64::from(affects_eval && publication)),
+                            Some(u64::from(state.eval_publication_pending)),
+                        );
+                    }
                 }
             }
             "Target.targetDestroyed" => {
@@ -2606,6 +2652,15 @@ impl OwnerDebtLedger {
                         |provenance| provenance.target.as_deref() == Some(target),
                         true,
                     );
+                    if let Some(observed) = observed {
+                        *observed = sw_causal::mark(
+                            41,
+                            None,
+                            Some(target),
+                            Some(u64::from(affects_eval && publication)),
+                            Some(u64::from(state.eval_publication_pending)),
+                        );
+                    }
                 }
             }
             _ => {}
