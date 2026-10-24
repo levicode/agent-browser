@@ -159,6 +159,26 @@ fn observation_reply(request: &Value) -> Option<Value> {
                 json!({"result":{"value":values}})
             } else if declaration.contains("frameOwner") {
                 json!({"result":{"value":{"connected":true,"frameOwner":false}}})
+            } else if declaration
+                == "function(selector,...nodes){return this.install(selector,nodes)}"
+            {
+                // Source protection includes document roots, not only elements.
+                assert_eq!(request["params"]["objectId"], "source-holder");
+                assert_eq!(request["params"]["returnByValue"], true);
+                assert_eq!(
+                    request["params"]["arguments"],
+                    json!([
+                        {"value":FIXTURE_SECURE_SELECTOR}, {"objectId":"node-1"}
+                    ])
+                );
+                let sequence = request["params"]["objectGroup"]
+                    .as_str()
+                    .and_then(|group| group.strip_prefix("capture-source-"))
+                    .and_then(|group| group.strip_suffix("-frame-session-1"))
+                    .and_then(|sequence| sequence.parse::<u64>().ok())
+                    .expect("install must belong to this native source-mask group");
+                assert!(sequence > 0);
+                json!({"result":{"type":"boolean","value":true}})
             } else {
                 assert!(
                     declaration == "function(){return this.verify()}"

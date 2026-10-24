@@ -468,6 +468,12 @@ impl ClientNetwork {
         }
         Ok(())
     }
+    pub(crate) fn check_broker(&self, broker: &Arc<ClientSession>) -> Result<(), ProtocolError> {
+        if !Arc::ptr_eq(&self.broker, broker) {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
     /// Enrollment is supplied by the scope owner. This module never discovers
     /// targets, changes purposes, adopts bootstrap pages, or resumes execution.
     /// Lifecycle selects only the default for targets enrolled after this
@@ -1893,18 +1899,25 @@ impl ClientNetwork {
             .registry
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        self.check()?;
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let (generation, health) = self.broker.health()?;
+        if generation != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        match health {
+            super::client_protocol::ScopeState::Usable => {}
+            super::client_protocol::ScopeState::Quarantined => {
+                proof.check_local_retirement_owner(&self.broker)?;
+            }
+            super::client_protocol::ScopeState::Closed => return Err(ProtocolError::StaleScope),
+        }
         if self.routes_frozen.load(Ordering::Acquire) {
             return Err(ProtocolError::RegistryInUse);
         }
         let registry = current
-            .map(|version| {
-                self.broker.park_registry(
-                    self.scope.generation,
-                    version,
-                    &self.scope.identity_scope,
-                )
-            })
+            .map(|version| self.broker.park_registry_after_terminal(proof, version))
             .transpose()?;
         self.routes_frozen.store(true, Ordering::Release);
         *current = None;
@@ -2141,8 +2154,13 @@ impl ClientNetwork {
                     self.retirement_sink
                         .retire_callbacks_after_terminal_drain(&proof)
                 });
-            if retired.is_err() {
-                failed = true;
+            match retired {
+                Ok(super::client_transport::NativeCallbackRetirement::NoticeQueued)
+                | Ok(super::client_transport::NativeCallbackRetirement::LocalOnlyTerminal) => {
+                    // Both establish only the native callback fence. LocalOnly
+                    // makes no notification claim; readers must still join below.
+                }
+                Err(_) => failed = true,
             }
         }
         if let Some(proof) = final_local {
@@ -4037,6 +4055,8 @@ mod bridge_tests {
             NetworkPolicy::default(),
         ))
     }
+    include!("client_terminal_cleanup_tests.rs");
+
     struct TerminalFixture {
         source: Arc<ClientNetwork>,
         targets: Arc<super::super::client_targets::ClientTargets>,

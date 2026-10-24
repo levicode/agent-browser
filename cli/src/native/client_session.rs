@@ -787,6 +787,7 @@ impl ClientSession {
     /// Terminal owner calls this before revoking the disconnected source. No
     /// operation is admitted or fabricated at EOF, and a retired registry can
     /// never be reconstructed from its version or registration IDs.
+    #[cfg(test)]
     pub(crate) fn park_registry(
         self: &Arc<Self>,
         generation: u64,
@@ -800,6 +801,28 @@ impl ClientSession {
         }
         Ok(ParkedRouteRegistry {
             held: self.hold_registry(&mut inner, version, source_scope, None)?,
+        })
+    }
+    /// Preserve only this terminal owner's existing route hold. Quarantine
+    /// closes business admission, not exact local deauthorization. This grants
+    /// no reconnect operation and cannot reconstruct a retired registry.
+    pub(crate) fn park_registry_after_terminal(
+        self: &Arc<Self>,
+        proof: &super::client_enrollment::NativeTerminalProof,
+        version: u64,
+    ) -> Result<ParkedRouteRegistry, ProtocolError> {
+        proof.check_broker(self)?;
+        let mut inner = self.lock()?;
+        if inner.generation != proof.generation() {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        match inner.health {
+            ScopeState::Usable => {}
+            ScopeState::Quarantined => proof.check_local_retirement_owner(self)?,
+            ScopeState::Closed => return Err(ProtocolError::StaleScope),
+        }
+        Ok(ParkedRouteRegistry {
+            held: self.hold_registry(&mut inner, version, &proof.targets().identity_scope, None)?,
         })
     }
     fn hold_registry(

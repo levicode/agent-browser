@@ -119,6 +119,28 @@ impl NativeTerminalProof {
         self.check_network(&network)?;
         network.check_event_sink(sink)
     }
+    pub(crate) fn check_broker(
+        &self,
+        broker: &Arc<super::client_session::ClientSession>,
+    ) -> Result<(), ProtocolError> {
+        let network = self.network.upgrade().ok_or(ProtocolError::StaleScope)?;
+        self.check_network(&network)?;
+        network.check_broker(broker)
+    }
+    /// Exact old-owner identity for local deauthorization after business
+    /// admission has closed. Neither EOF nor this check settles any debt.
+    pub(crate) fn check_local_retirement_owner(
+        &self,
+        broker: &Arc<super::client_session::ClientSession>,
+    ) -> Result<(), ProtocolError> {
+        self.check_broker(broker)?;
+        let debt = self.client.debt_ledger().ok_or(ProtocolError::StaleScope)?;
+        if !debt.matches_owner(self.generation, &self.identity_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.targets.require_eval_owner(&debt)?;
+        self.client.check_cleanup_owner(&Some(debt))
+    }
     pub(crate) fn targets(&self) -> &Arc<ClientTargets> {
         &self.targets
     }

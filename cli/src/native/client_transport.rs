@@ -112,6 +112,13 @@ struct StagedEvent {
     bytes: usize,
     decision_deadline: Option<std::time::Instant>,
 }
+/// Native authority retirement only. Queue acceptance is not writer flush or
+/// peer receipt, and local-only retirement makes no notification claim at all.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum NativeCallbackRetirement {
+    NoticeQueued,
+    LocalOnlyTerminal,
+}
 /// Reliable bounded event lane. A replacement producer receives a distinct
 /// operation-bound clone; old callback producers retain their live clone.
 #[derive(Clone)]
@@ -430,10 +437,14 @@ impl ClientEventSink {
     pub(crate) fn retire_callbacks_after_terminal_drain(
         &self,
         proof: &super::client_enrollment::NativeTerminalProof,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<NativeCallbackRetirement, ProtocolError> {
         proof.check_event_sink(self)?;
         proof.check_targets(proof.targets())?;
-        self.retire_scope_callbacks(proof.generation(), &proof.targets().identity_scope)
+        self.retire_scope_callbacks_checked(
+            proof.generation(),
+            &proof.targets().identity_scope,
+            Some(proof),
+        )
     }
     pub(crate) fn retire_callbacks_after_final_local_drain(
         &self,
@@ -443,6 +454,15 @@ impl ClientEventSink {
         self.retire_scope_callbacks(proof.generation(), proof.identity_scope())
     }
     fn retire_scope_callbacks(&self, generation: u64, scope: &str) -> Result<(), ProtocolError> {
+        self.retire_scope_callbacks_checked(generation, scope, None)
+            .map(|_| ())
+    }
+    fn retire_scope_callbacks_checked(
+        &self,
+        generation: u64,
+        scope: &str,
+        terminal: Option<&super::client_enrollment::NativeTerminalProof>,
+    ) -> Result<NativeCallbackRetirement, ProtocolError> {
         let barrier = self.barrier.as_ref().ok_or(ProtocolError::StaleScope)?;
         if barrier.key.0 != generation || barrier.identity_scope != scope {
             return Err(ProtocolError::StaleScope);
@@ -452,8 +472,22 @@ impl ClientEventSink {
                 .sequence
                 .lock()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
-            if self.check_open()? != generation {
+            // Preserve the ordinary/final-local error contract. Only a checked
+            // NativeTerminalProof may take the local-only retirement branch.
+            if terminal.is_none() {
+                self.check_open()?;
+            }
+            let (current, health) = self.broker.health()?;
+            if current != generation {
                 return Err(ProtocolError::StaleGeneration);
+            }
+            if !order
+                .scope_gates
+                .get(&(generation, scope.to_owned()))
+                .and_then(std::sync::Weak::upgrade)
+                .is_some_and(|gate| std::sync::Arc::ptr_eq(&gate, &barrier.scope_gate))
+            {
+                return Err(ProtocolError::StaleScope);
             }
             if barrier
                 .scope_gate
@@ -475,11 +509,30 @@ impl ClientEventSink {
             ) {
                 return Err(ProtocolError::StaleScope);
             }
-            // Seal before enqueue. Queue failure must never reopen old producers.
+            // Live is the existing witness that this exact scope's successful
+            // result was flushed. It excludes the initial open=false state:
+            // startup's sole open=true write precedes every production Live.
+            // Under this same mutex, sealing the shared gate fences every old
+            // scope clone, even if quarantine precedes close_publications.
+            let local_only = !self.open.load(std::sync::atomic::Ordering::Acquire)
+                || health == ScopeState::Quarantined;
+            if health == ScopeState::Closed {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            if local_only {
+                terminal
+                    .ok_or(ProtocolError::ScopeUnavailable)?
+                    .check_local_retirement_owner(&self.broker)?;
+            }
+            // Seal before enqueue. Queue failure must never reopen old producers
+            // or be reclassified as successful local-only retirement.
             barrier
                 .scope_gate
                 .closed
                 .store(true, std::sync::atomic::Ordering::Release);
+            if local_only {
+                return Ok(NativeCallbackRetirement::LocalOnlyTerminal);
+            }
             let through = order.sequence;
             self.enqueue_event(&mut order, ServerMessage::Event {
                 generation, sequence: MAX_SAFE_SEQUENCE,
@@ -487,11 +540,16 @@ impl ClientEventSink {
                 payload: serde_json::json!({"identityScope":scope,"throughEventSequence":through}),
                 decision: None,
             })
+            .map(|()| NativeCallbackRetirement::NoticeQueued)
         })();
         if result.is_err() && result != Err(ProtocolError::StaleScope) {
             let _ = self.broker.quarantine();
         }
         result
+    }
+    #[cfg(test)]
+    pub(crate) fn close_publications_for_test(&self) {
+        self.close_publications();
     }
     #[cfg(test)]
     pub(crate) fn acknowledge_result_for_test(
@@ -1805,6 +1863,64 @@ mod tests {
         .unwrap();
         staged
     }
+    #[test]
+    fn terminal_callback_cut_requires_registered_gate_and_explicit_owner() {
+        let (root, mut events) =
+            ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let old = live_scope_sink(&root, 7, "old");
+        // Even a genuine published barrier cannot fence an unregistered scope
+        // gate. This structural corruption grants no replacement authority.
+        let key = (1, "old".to_owned());
+        let registered = root
+            .sequence
+            .lock()
+            .unwrap()
+            .scope_gates
+            .remove(&key)
+            .unwrap();
+        assert_eq!(
+            old.retire_scope_callbacks(1, "old"),
+            Err(ProtocolError::StaleScope)
+        );
+        root.sequence
+            .lock()
+            .unwrap()
+            .scope_gates
+            .insert(key, registered);
+        root.close_publications();
+        assert_eq!(
+            old.retire_scope_callbacks_checked(1, "old", None),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        assert!(!old
+            .barrier
+            .as_ref()
+            .unwrap()
+            .scope_gate
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[test]
+    fn terminal_callback_cut_never_treats_unpublished_false_as_terminal_proof() {
+        let (root, mut events) =
+            ClientEventSink::test_channel(std::sync::Arc::new(ClientSession::new()));
+        let (_sender, operation) = publication_operation();
+        let pending = root.stage_until_result(&operation, "old").unwrap();
+        root.open.store(false, std::sync::atomic::Ordering::Release);
+        assert_eq!(
+            pending.retire_scope_callbacks_checked(1, "old", None),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        root.close_publications();
+        assert_eq!(
+            pending.retire_scope_callbacks_checked(1, "old", None),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        assert!(events.try_recv().is_err());
+    }
+
     #[test]
     fn terminal_callback_cut_fences_all_same_scope_clones_but_not_sibling() {
         let (root, mut events) =

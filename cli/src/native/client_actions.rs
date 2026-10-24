@@ -6009,6 +6009,8 @@ mod tests {
                 // Acquisition and action-time revalidation retain the text
                 // query. The shared assertions below prove typed stale failure
                 // and NotDispatched despite action-log words in author data.
+                let mut serialized_expression = expression.clone();
+                serialized_expression["query"]["states"] = json!({});
                 for (index, request) in log
                     .iter()
                     .filter(|request| {
@@ -6018,7 +6020,10 @@ mod tests {
                     })
                     .enumerate()
                 {
-                    assert_eq!(request["params"]["arguments"][0]["value"], expression);
+                    assert_eq!(
+                        request["params"]["arguments"][0]["value"],
+                        serialized_expression
+                    );
                     let arguments = request["params"]["arguments"].as_array().unwrap();
                     assert_eq!(arguments[1]["value"].as_array().unwrap().len(), index + 1);
                     assert_eq!(arguments.len() - 6, index + 1);
