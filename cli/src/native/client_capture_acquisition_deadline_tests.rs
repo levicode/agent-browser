@@ -389,14 +389,20 @@ async fn acquisition_deadline(boundary: Boundary) {
         .any(|r| r["method"] == "Runtime.releaseObjectGroup"
             && r["params"]["objectGroup"] == held_group));
 
+    let release_started_at = Instant::now();
+    let mut first_ack_at = None;
+    let mut sibling_fence_at = None;
+    let mut second_ack_at = None;
     if boundary != Boundary::MissingAck {
         release.send(1).unwrap();
         assert_eq!(acked.recv().await, Some(1));
+        first_ack_at = Some(Instant::now());
         if boundary == Boundary::StartedSiblings {
             // A real transport roundtrip acknowledges delivery of the first
             // late reply while its already-started sibling is still withheld.
             // No timed sleep or injected backend error stands in for drainage.
             fence(&client).await;
+            sibling_fence_at = Some(Instant::now());
             assert!(matches!(
                 task.result.try_recv(),
                 Err(oneshot::error::TryRecvError::Empty)
@@ -410,6 +416,7 @@ async fn acquisition_deadline(boundary: Boundary) {
                     && r["params"]["objectGroup"] == held_group));
             release.send(7).unwrap();
             assert_eq!(acked.recv().await, Some(7));
+            second_ack_at = Some(Instant::now());
         }
     }
     // This is only a deadlock watchdog. Success must still finish before the
@@ -427,7 +434,18 @@ async fn acquisition_deadline(boundary: Boundary) {
     if fallback {
         assert!(
             completed < original_deadline,
-            "fresh fallback must fit the unchanged 80 ms budget"
+            "fresh fallback must fit the unchanged 80 ms budget: completed_us={} acquisitions_us={} semantic_bound_us={} release_us={} first_ack_us={:?} sibling_fence_us={:?} second_ack_us={:?} captures={} commands={} result_ok={} dirty={}",
+            completed.duration_since(started).as_micros(),
+            acquisitions_started_at.duration_since(started).as_micros(),
+            semantic_deadline_bound.duration_since(started).as_micros(),
+            release_started_at.duration_since(started).as_micros(),
+            first_ack_at.map(|at| at.duration_since(started).as_micros()),
+            sibling_fence_at.map(|at| at.duration_since(started).as_micros()),
+            second_ack_at.map(|at| at.duration_since(started).as_micros()),
+            captures.load(Ordering::SeqCst),
+            commands.lock().unwrap().len(),
+            settled.result.is_ok(),
+            dirty
         );
         assert_eq!(settled.effects, Effects::Completed);
         let value = settled.result.unwrap();

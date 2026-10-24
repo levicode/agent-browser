@@ -163,9 +163,12 @@ fn union_frame_paths_are_exact_and_stripped_before_matching() {
     let expression: LocatorExpression = serde_json::from_value(expression).unwrap();
     let (path, stripped) = split_frame_expression(&expression).unwrap();
     assert_eq!(path, chain);
+    // Compare canonical ASTs, including the semantic query's default states.
+    let expected: LocatorExpression =
+        serde_json::from_value(union(ordinary(), query_kind("label"))).unwrap();
     assert_eq!(
         serde_json::to_value(stripped).unwrap(),
-        union(ordinary(), query_kind("label"))
+        serde_json::to_value(expected).unwrap()
     );
     for other in [
         vec![],

@@ -1370,6 +1370,9 @@ async fn test_obscura_e2e_unlaunchable_binary_does_not_attach_to_inherited_cdp()
             "--nocapture",
         ])
         .kill_on_drop(true);
+    if let Some(stack) = std::env::var_os("RUST_MIN_STACK") {
+        command.env("RUST_MIN_STACK", stack);
+    }
     let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
         .await
         .expect("Obscura false-binary probe must terminate")

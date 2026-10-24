@@ -26,6 +26,9 @@ impl Session {
             .current_dir(self.dir.path())
             .args(["--config", "config.json", "--session", "o", "--json"])
             .stdin(Stdio::null());
+        if let Some(stack) = std::env::var_os("RUST_MIN_STACK") {
+            command.env("RUST_MIN_STACK", stack);
+        }
         command
     }
 
