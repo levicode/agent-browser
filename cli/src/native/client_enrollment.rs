@@ -7456,7 +7456,11 @@ mod tests {
                                 "Target.closeTarget" => json!({"success":true}),
                                 _ => json!({}),
                             };
-                            if socket.send(Message::Text(json!({"id":request["id"], "result":result}).to_string())).await.is_err() { break; }
+                            let mut response = json!({"id":request["id"], "result":result});
+                            if let Some(session) = request.get("sessionId") {
+                                response["sessionId"] = session.clone();
+                            }
+                            if socket.send(Message::Text(response.to_string())).await.is_err() { break; }
                         }
                     }
                 }
