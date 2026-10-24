@@ -82,7 +82,7 @@ impl WorkerStartupReply {
 pub(crate) struct ServiceWorkerStartupFailure {
     message: String,
     error: ProtocolError,
-    retirement: Option<WorkerStartupRetirement>,
+    retirement: Option<Box<WorkerStartupRetirement>>,
 }
 impl ServiceWorkerStartupFailure {
     pub(crate) fn error(&self) -> ProtocolError {
@@ -97,7 +97,7 @@ impl ServiceWorkerStartupFailure {
         self.retirement.is_some()
     }
     pub(crate) fn take_retirement(&mut self) -> Option<WorkerStartupRetirement> {
-        self.retirement.take()
+        self.retirement.take().map(|retirement| *retirement)
     }
 }
 impl From<String> for ServiceWorkerStartupFailure {
@@ -1697,7 +1697,7 @@ impl CdpClient {
             return Err(ServiceWorkerStartupFailure {
                 message: errors.join("; "),
                 error: ProtocolError::BrowserFailure,
-                retirement,
+                retirement: retirement.map(Box::new),
             });
         }
         if errors.is_empty() && complete {

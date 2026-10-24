@@ -12846,11 +12846,13 @@ mod tests {
         // quarantine or release the original pending enrollment/permit.
         let still_pending = tokio::time::timeout(Duration::from_millis(20), async {
             loop {
-                let index = owner.index.lock().unwrap();
-                if index.failure.is_some() || !index.pending_enrollment.contains("worker-session") {
+                let finished = {
+                    let index = owner.index.lock().unwrap();
+                    index.failure.is_some() || !index.pending_enrollment.contains("worker-session")
+                };
+                if finished {
                     break;
                 }
-                drop(index);
                 tokio::task::yield_now().await;
             }
         })
