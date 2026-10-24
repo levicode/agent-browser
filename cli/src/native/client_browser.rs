@@ -4452,6 +4452,7 @@ impl ClientBrowser {
         *slot = Some(tokio::spawn(async move {
             let _transition = transition;
             let mut accepted = false;
+            let mut candidate: Option<super::client_reconnect::VerifiedReconnect> = None;
             let result = async {
                 check_lifecycle_budget(&operation)?;
                 let mut journal = owner.lock().await;
@@ -4503,6 +4504,21 @@ impl ClientBrowser {
                 if resource.disconnected_routes.is_some() || resource.replacement_routes.is_some() {
                     return Err(ProtocolError::CleanupFailed);
                 }
+                // Verify the one unpublished candidate before retiring the old
+                // runtime. This attaches only the exact retained page; domain
+                // setup, parked-route adoption, and publication still follow
+                // the old owner's independent terminal cleanup below.
+                let identity_scope = uuid::Uuid::new_v4().to_string();
+                candidate = Some(
+                    super::client_reconnect::reconnect(
+                        &request.endpoint,
+                        &retained,
+                        &operation,
+                        &identity_scope,
+                    )
+                    .await?,
+                );
+                check_lifecycle_budget(&operation)?;
                 resource.replacement_actions = Some(actions.clone());
                 accepted = true;
                 uncertain.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4546,14 +4562,7 @@ impl ClientBrowser {
                 // old socket. Host page/context ownership is never acquired.
                 resource.manager.disconnect_transport().await;
                 check_lifecycle_budget(&operation)?;
-                let identity_scope = uuid::Uuid::new_v4().to_string();
-                let verified = super::client_reconnect::reconnect(
-                    &request.endpoint,
-                    &retained,
-                    &operation,
-                    &identity_scope,
-                )
-                .await?;
+                let verified = candidate.take().ok_or(ProtocolError::ScopeUnavailable)?;
                 let (manager, context_id, target_id, proof) = verified.into_parts();
                 // Journal the new transport before any initialization await.
                 resource.manager = manager;
@@ -4706,6 +4715,12 @@ impl ClientBrowser {
                         }
                     }
                 }
+            }
+            // Until transfer into the owner journal, only this retained task
+            // owns the candidate. Settle its transport even after cancellation
+            // or old-runtime cleanup failure; Drop is not a cleanup proof.
+            if let Some(candidate) = candidate.take() {
+                candidate.manager.disconnect_transport().await;
             }
             let _ = send.send(result.map_err(|error| (error, accepted)));
         }));
@@ -5593,3 +5608,11 @@ mod state_lifecycle_tests;
 #[cfg(test)]
 #[path = "client_browser_final_local_tests.rs"]
 mod final_local_tests;
+
+#[cfg(test)]
+#[path = "client_browser_borrowed_cleanup_tests.rs"]
+mod borrowed_cleanup_tests;
+
+#[cfg(test)]
+#[path = "client_browser_reconnect_tests.rs"]
+mod reconnect_tests;

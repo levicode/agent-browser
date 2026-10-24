@@ -877,6 +877,46 @@ impl OwnerDebtLedger {
             window.integrity_lost = true;
         }
     }
+    /// Restricted synchronous retirement commit. The caller holds the original
+    /// transport owner; commit may touch only that owner's existing target
+    /// registry. It must not await, relock this ledger, or call the index back.
+    pub(super) fn finish_worker_startup_retirement(
+        &self,
+        generation: u64,
+        targets: &super::client_targets::ClientTargets,
+        binding: (&str, &str),
+        statuses: &[(CommandStatusHandle, CommandStatus)],
+        commit: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        let (target, session) = binding;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !self.matches_owner(generation, &targets.identity_scope)
+            || state.retired
+            || state.integrity_lost
+            || state.eval_publication_pending
+            || state.context_id.as_deref() != Some(targets.context_id.as_str())
+            || state.targets.contains_key(session)
+            || state.targets.values().any(|known| known == target)
+            || statuses.is_empty()
+            || statuses.len() > 4
+            || !statuses
+                .iter()
+                .any(|(_, expected)| *expected == CommandStatus::Destroyed)
+            || statuses.iter().any(|(status, expected)| {
+                !matches!(
+                    expected,
+                    CommandStatus::Acknowledged | CommandStatus::Destroyed
+                ) || status.snapshot() != *expected
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        invalidate_eval(&mut state);
+        commit()
+    }
     /// Central target mutation follows the existing ledger -> targets ordering.
     /// The closure may only lock and mutate the exact target registry, never await.
     pub(crate) fn with_eval_target_invalidation<T>(
@@ -3024,15 +3064,18 @@ fn unpublished_admits(
     let state_session = session.is_some_and(|session| {
         state.lifecycle_sessions.get(session) == Some(&LifecycleSessionPurpose::StateBootstrap)
     });
-    if session.is_some_and(|session| {
+    let observer_session = session.is_some_and(|session| {
         state.lifecycle_sessions.get(session) == Some(&LifecycleSessionPurpose::Observer)
-    }) && !matches!(
-        method,
-        "Page.enable"
-            | "Page.getFrameTree"
-            | "Target.setAutoAttach"
-            | "Runtime.runIfWaitingForDebugger"
-    ) {
+    });
+    if observer_session
+        && !matches!(
+            method,
+            "Page.enable"
+                | "Page.getFrameTree"
+                | "Target.setAutoAttach"
+                | "Runtime.runIfWaitingForDebugger"
+        )
+    {
         return false;
     }
     let exact_context = p["browserContextId"]
@@ -3082,7 +3125,8 @@ fn unpublished_admits(
         "Target.setAutoAttach" => {
             (session.is_none() || known_session)
                 && p["autoAttach"] == true
-                && p["waitForDebuggerOnStart"] == true
+                && (p["waitForDebuggerOnStart"] == true
+                    || (observer_session && p["waitForDebuggerOnStart"] == false))
                 && p["flatten"] == true
         }
         "Browser.setDownloadBehavior" => session.is_none() && exact_context,
@@ -3589,6 +3633,75 @@ fn classify(method: &str, _params: Option<&Value>, operation: bool) -> Classific
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn unpublished_non_pausing_autoattach_is_exact_observer_only() {
+        let mut state = LedgerState::default();
+        for (session, purpose) in [
+            ("observer", Some(LifecycleSessionPurpose::Observer)),
+            ("bootstrap", Some(LifecycleSessionPurpose::StateBootstrap)),
+            ("recording", Some(LifecycleSessionPurpose::Recording)),
+            ("page", None),
+            ("iframe", None),
+            ("worker", None),
+            ("service-worker", None),
+            ("observer-labelled-application", None),
+        ] {
+            state
+                .targets
+                .insert(session.into(), format!("{session}-target"));
+            if let Some(purpose) = purpose {
+                state.lifecycle_sessions.insert(session.into(), purpose);
+            }
+        }
+        // A purpose alone, or an Observer-looking name, is not a bound session.
+        state.lifecycle_sessions.insert(
+            "unbound-observer".into(),
+            LifecycleSessionPurpose::Observer,
+        );
+        for session in [
+            None,
+            Some("observer"),
+            Some("page"),
+            Some("iframe"),
+            Some("worker"),
+            Some("service-worker"),
+            Some("bootstrap"),
+            Some("recording"),
+            Some("observer-labelled-application"),
+            Some("unbound-observer"),
+            Some("foreign"),
+        ] {
+            for wait in [false, true] {
+                let params = json!({"autoAttach":true,"waitForDebuggerOnStart":wait,"flatten":true});
+                let known = session.is_none_or(|id| state.targets.contains_key(id));
+                assert_eq!(
+                    unpublished_admits(&state, "Target.setAutoAttach", Some(&params), session, None),
+                    known && (wait || session == Some("observer")),
+                    "{session:?} wait={wait}"
+                );
+            }
+        }
+        for invalid in [
+            json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}),
+            json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":false}),
+            json!({"autoAttach":true,"flatten":true}),
+            json!({"autoAttach":true,"waitForDebuggerOnStart":"false","flatten":true}),
+        ] {
+            assert!(!unpublished_admits(
+                &state, "Target.setAutoAttach", Some(&invalid), Some("observer"), None
+            ));
+        }
+        for method in [
+            "Fetch.enable",
+            "Runtime.enable",
+            "Emulation.setLocaleOverride",
+            "Page.addScriptToEvaluateOnNewDocument",
+        ] {
+            assert!(!unpublished_admits(
+                &state, method, Some(&json!({})), Some("observer"), None
+            ));
+        }
+    }
     fn owner() -> (Arc<OwnerDebtLedger>, OperationJournalHandle) {
         let ledger = OwnerDebtLedger::new(7, "scope".into());
         let journal = ledger

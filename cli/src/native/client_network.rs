@@ -535,17 +535,28 @@ impl ClientNetwork {
             .await
     }
 
+    pub(crate) fn check_worker_startup(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check()?;
+        if operation.generation != self.scope.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
     pub(crate) async fn initialize_service_worker_observation(
         &self,
         session: &str,
         operation: &OperationLease,
-    ) -> Result<(), ProtocolError> {
-        self.check()?;
-        if operation.generation != self.scope.generation
-            || *operation.cancellation.borrow() != CancelSignal::None
-        {
-            return Err(ProtocolError::Cancelled);
-        }
+    ) -> Result<super::cdp::client::ServiceWorkerStartupOutcome, ProtocolError> {
+        self.check_worker_startup(operation)?;
         let bypass_service_worker = self
             .policy
             .lock()
@@ -557,11 +568,16 @@ impl ClientNetwork {
             bypass_service_worker,
             operation.deadline,
         ).await;
-        if result.is_err() {
-            self.broker.quarantine()?;
-            return Err(ProtocolError::BrowserFailure);
+        match result {
+            Err(_) => {
+                self.broker.quarantine()?;
+                Err(ProtocolError::BrowserFailure)
+            }
+            Ok(outcome) => {
+                self.check_worker_startup(operation)?;
+                Ok(outcome)
+            }
         }
-        self.check()
     }
 
     async fn prepare_session(
