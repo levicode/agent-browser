@@ -1062,6 +1062,49 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    singleCellHeader=!!table&&typeof table.rows?.length==='number'&&table.rows.length<=1;
  }
 
+ // Per-receiver role conflict facts only; native AX remains the role source.
+ // Match the public role contract's numeric tabindex and global ARIA rules.
+ const nameProhibitedRoles=['caption','code','deletion','emphasis','generic','insertion','paragraph','presentation','strong','subscript','superscript'];
+ const nameProhibitedTagRoles={caption:'caption',code:'code',del:'deletion',em:'emphasis',ins:'insertion',p:'paragraph',strong:'strong',sub:'subscript',sup:'superscript'};
+ function hasGlobalAria(role) {
+   return ['aria-atomic','aria-busy','aria-controls','aria-current','aria-describedby','aria-details','aria-dropeffect','aria-flowto','aria-grabbed','aria-hidden','aria-keyshortcuts','aria-live','aria-owns','aria-relevant'].some(name=>e.hasAttribute(name))||
+     !nameProhibitedRoles.includes(role)&&['aria-label','aria-labelledby'].some(name=>e.hasAttribute(name))||
+     role!=='generic'&&e.hasAttribute('aria-roledescription');
+ }
+ const numericTabIndex=!!e&&!Number.isNaN(Number(String(e.getAttribute('tabindex'))));
+ const disabledControl=!!e&&['button','input','select','textarea','option','optgroup'].includes(tag)&&Element.prototype.matches.call(e,':disabled');
+ const focusable=!!e&&!disabledControl&&(numericTabIndex||['button','details','select','textarea'].includes(tag)||
+   ['a','area'].includes(tag)&&e.hasAttribute('href')||tag==='input'&&!e.hidden);
+ const presentationConflict=!!e&&(focusable||hasGlobalAria(nameProhibitedTagRoles[tag]??null));
+ const decorativeImage=tag==='img'&&e.getAttribute('alt')===''&&!e.getAttribute('title')&&!hasGlobalAria(null)&&!numericTabIndex;
+ const selectListbox=tag==='select'&&(e.hasAttribute('multiple')||e.size>1);
+ const inputDatalist=tag==='input'&&e instanceof HTMLInputElement&&e.list!==null&&['text','search','tel','url','email'].includes(e.type);
+ // A presentation conflict can leave this receiver absent from AX. Only local
+ // neighbors contribute this scalar fallback; no table/name reader is added.
+ let conflictHeaderRole=null;
+ if(tag==='th'&&presentationConflict&&!singleCellHeader&&!['row','rowgroup','col','colgroup'].includes((e.getAttribute('scope')||'').toLowerCase())){
+   const previous=e.previousElementSibling,next=e.nextElementSibling;
+   let populated=false;
+   if(previous?.localName!=='th'||next?.localName!=='th'){
+     let remaining=16384;
+     for(const cell of [previous,next]){
+       if(cell?.localName!=='td')continue;
+       if(cell.children.length>0){populated=true;break;}
+       if(cell.childNodes.length>512)return {__nativeStatus:'resource-limit'};
+       for(const node of cell.childNodes){
+         if(node.nodeType!==3)continue;
+         const text=node.nodeValue||'',prefix=text.slice(0,remaining);
+         if(/\S/u.test(prefix)){populated=true;break;}
+         if(text.length>remaining)return {__nativeStatus:'resource-limit'};
+         remaining-=text.length;
+       }
+       if(populated)break;
+     }
+   }
+   conflictHeaderRole=populated?'rowheader':'columnheader';
+ }
+
+
  const editingHost=!!e&&e instanceof HTMLElement&&e.isContentEditable&&
    !['svg','math','canvas','video','audio','iframe','img','hr','br','wbr','area','a','button','input','textarea','select'].includes(tag)&&
    !(e.parentElement instanceof HTMLElement&&e.parentElement.isContentEditable);
@@ -1086,7 +1129,14 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const inline=!!style&&(style.display.startsWith('inline')||style.display.startsWith('ruby')||style.display==='contents');
  const breaking=!!e&&(Element.prototype.matches.call(e,'br,input,textarea,select,button,iframe')||e.isContentEditable);
  const action=!!e&&(e.hasAttribute('onclick')||tag==='a'||/^\s*[-+]?\d/.test(e.getAttribute('tabindex')||''));
- const suppress=!!e&&(Element.prototype.matches.call(e,'script,style,head,template,noscript,next-route-announcer')||(e.getAttribute('aria-hidden')||'').toLowerCase()==='true'||e.hasAttribute('inert')||style.display==='none');
+ // Closed details excludes the body, but not the first summary's descendants.
+ // Bound this per-receiver fact; do not invent visibility from a zero box.
+ let inClosedDetails=false;
+ if(e){let branch=e,depth=0;for(let p=e.parentElement;p;branch=p,p=p.parentElement){
+   if(++depth>256)return {__nativeStatus:'resource-limit'};
+   if(p.localName==='details'&&!p.open&&Element.prototype.querySelector.call(p,':scope > summary')!==branch){inClosedDetails=true;break;}
+ }}
+ const suppress=!!e&&(inClosedDetails||Element.prototype.matches.call(e,'script,style,head,template,noscript,next-route-announcer')||(e.getAttribute('aria-hidden')||'').toLowerCase()==='true'||e.hasAttribute('inert')||style.getPropertyValue('interactivity')==='inert'||style.display==='none');
  let textVisible=false;
  if(this.nodeType===3&&!secure){
    const parent=this.parentElement||this.getRootNode()?.host;
@@ -1115,7 +1165,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  if(nativeOption)controlStates.selected=e.selected;
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
  const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
- return {author,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
+ return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure||(boundedObservation&&checkable)?null:editingHost?editorValue:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
@@ -1235,22 +1285,26 @@ fn project_node_with_refs(
                 .map_err(|_| ObservationError::BackendFailure)
         })
         .transpose()?;
+    // Presentation is ineffective on focusable/global-ARIA receivers. Reuse
+    // the same effective absence for all implicit tag and editor projections.
+    let authored = authored_role(&data["attributes"]);
+    let presentation_ignored =
+        matches!(authored, Some("none" | "presentation")) && data["presentationConflict"] == true;
+    let explicit_role = authored.filter(|_| !presentation_ignored);
     // The original public reader uses the first concrete authored token even
     // when AX omits or demotes an unnamed landmark. This is semantic projection,
     // not native identity or a fallback for arbitrary/abstract tokens.
     if data["__nativeReadonlyPseudo"] != true && author.is_some() {
-        if let Some(authored) = authored_role(&data["attributes"]) {
+        if let Some(authored) = explicit_role {
             role = Some(if authored == "img" { "image" } else { authored }.into());
         }
     }
     if author.is_some()
         // Incidental AX roles are not public unless concretely authored.
         // ARIA token separation is ASCII whitespace, not Unicode whitespace.
-        && !data["attributes"]["role"].as_str().is_some_and(|authored| {
-            authored.split_ascii_whitespace().any(|token| {
-                Some(token) == role.as_deref()
-                    && !matches!(token, "LabelText" | "sectionheader" | "sectionfooter")
-            })
+        && !explicit_role.is_some_and(|authored| {
+            Some(authored) == role.as_deref()
+                && !matches!(authored, "LabelText" | "sectionheader" | "sectionfooter")
         })
         && matches!(
             role.as_deref(),
@@ -1276,7 +1330,7 @@ fn project_node_with_refs(
     if author
         .as_ref()
         .is_some_and(|facts| matches!(facts.tag.as_str(), "summary" | "dt" | "dd"))
-        && authored_role(&data["attributes"]).is_none()
+        && explicit_role.is_none()
     {
         role = None;
     }
@@ -1287,11 +1341,11 @@ fn project_node_with_refs(
         && author
             .as_ref()
             .is_some_and(|facts| matches!(facts.tag.as_str(), "header" | "footer"))
-        && authored_role(&data["attributes"]).is_none()
+        && explicit_role.is_none()
     {
         role = None;
     }
-    if data["__nativeReadonlyPseudo"] != true && authored_role(&data["attributes"]).is_none() {
+    if data["__nativeReadonlyPseudo"] != true && explicit_role.is_none() {
         match author.as_ref().map(|facts| facts.tag.as_str()) {
             // The public reader derives HTML heading semantics from the tag,
             // even when AX omits an inert/hidden descendant. Observation's
@@ -1302,6 +1356,16 @@ fn project_node_with_refs(
             Some("thead" | "tbody" | "tfoot") => role = Some("rowgroup".into()),
             Some("canvas") => role = None,
             Some("svg") => role = Some("image".into()),
+            Some("img") => {
+                role = Some(
+                    if data["decorativeImage"] == true {
+                        "presentation"
+                    } else {
+                        "image"
+                    }
+                    .into(),
+                )
+            }
             Some("td") => {
                 let table_attributes = json!({"role":data["cellTableRole"]});
                 role = Some(
@@ -1331,9 +1395,81 @@ fn project_node_with_refs(
             _ => {}
         }
     }
+    // An exact CSS read can acquire an AX-omitted receiver. Restore bounded
+    // native HTML facts for a conflicting presentation role even in that case;
+    // this does not change the receiver's identity, visibility, or security.
+    if data["__nativeReadonlyPseudo"] != true
+        && presentation_ignored
+        && matches!(role.as_deref(), None | Some("none" | "presentation"))
+    {
+        role = match author.as_ref().map(|facts| facts.tag.as_str()) {
+            Some("a") if data["attributes"].get("href").is_some() => Some("link"),
+            Some("button") => Some("button"),
+            Some("select") => Some(if data["selectListbox"] == true {
+                "listbox"
+            } else {
+                "combobox"
+            }),
+            Some("textarea") => Some("textbox"),
+            Some("input") if data["inputDatalist"] == true => Some("combobox"),
+            Some("input") => match data["attributes"]["type"]
+                .as_str()
+                .unwrap_or("")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "button" | "submit" | "reset" | "image" | "file" => Some("button"),
+                "checkbox" => Some("checkbox"),
+                "radio" => Some("radio"),
+                "range" => Some("slider"),
+                "number" => Some("spinbutton"),
+                "search" => Some("searchbox"),
+                "hidden" => None,
+                _ => Some("textbox"),
+            },
+            Some("nav") => Some("navigation"),
+            Some("main") => Some("main"),
+            Some("aside") => Some("complementary"),
+            Some("header") if data["pageLevelLandmark"] == true => Some("banner"),
+            Some("footer") if data["pageLevelLandmark"] == true => Some("contentinfo"),
+            Some("section")
+                if ["aria-label", "aria-labelledby", "title"]
+                    .iter()
+                    .any(|name| {
+                        data["attributes"][*name].as_str().is_some_and(|value| {
+                            !value.trim_matches(ecmascript_whitespace).is_empty()
+                        })
+                    }) =>
+            {
+                Some("region")
+            }
+            Some("article") => Some("article"),
+            Some("figure") => Some("figure"),
+            Some("hr") => Some("separator"),
+            Some("progress") => Some("progressbar"),
+            Some("meter") => Some("meter"),
+            Some("menu" | "ul" | "ol") => Some("list"),
+            Some("fieldset" | "details" | "optgroup" | "address") => Some("group"),
+            Some("option") => Some("option"),
+            Some("li") => Some("listitem"),
+            Some("table") => Some("table"),
+            Some("tr") => Some("row"),
+            Some("th") if data["singleCellHeader"] != true => {
+                match data["conflictHeaderRole"].as_str() {
+                    Some("rowheader") => Some("rowheader"),
+                    Some("columnheader") => Some("columnheader"),
+                    _ => None,
+                }
+            }
+            Some("dialog") => Some("dialog"),
+            Some("output") => Some("status"),
+            _ => None,
+        }
+        .map(str::to_owned);
+    }
     if data["editingHost"] == true {
         role = Some(
-            match authored_role(&data["attributes"]) {
+            match explicit_role {
                 Some("img") => "image",
                 Some(role) => role,
                 None => "textbox",
@@ -2394,6 +2530,10 @@ pub enum LocatorExpression {
     Selector {
         selector: String,
     },
+    Union {
+        left: Box<LocatorExpression>,
+        right: Box<LocatorExpression>,
+    },
     Frame {
         selector: String,
         source: Box<LocatorExpression>,
@@ -2733,6 +2873,7 @@ const MATCH_QUERY: &str = r#"function(expression, data, labels, safeNames, secur
     candidates=candidates.filter(i=>semantic(x.query,i));
     return candidates;
    }
+   case 'union': {const matches=new Set([...evaluate(x.left,scope),...evaluate(x.right,scope)]);return scope.filter(i=>matches.has(i));}
    case 'filter': return evaluate(x.source,scope).filter(i=>(!x.hasText||matchFilterText(x.hasText,elements[i]))&&(!x.has||evaluate(x.has,scope.filter(j=>contains(i,j))).length>0));
    case 'index': {const a=evaluate(x.source,scope);const i=x.index==='first'?0:x.index==='last'?a.length-1:x.index;return i>=0&&i<a.length?[a[i]]:[];}
    case 'frame': throw new Error('Frame expression must be resolved by native frame scope');
@@ -2907,7 +3048,7 @@ fn query_uses_pinned_handles(expression: &LocatorExpression) -> bool {
         LocatorExpression::Filter { source, .. }
         | LocatorExpression::Index { source, .. }
         | LocatorExpression::Frame { source, .. } => query_uses_pinned_handles(source),
-        LocatorExpression::Selector { .. } => false,
+        LocatorExpression::Selector { .. } | LocatorExpression::Union { .. } => false,
     }
 }
 
@@ -4102,13 +4243,27 @@ pub async fn enumerate_frames(
 }
 
 /// Validate natively before acquisition and return the effective display-value
-/// provenance. Child queries reset provenance; refinements preserve it.
+/// provenance. Child queries and unions reset provenance; refinements preserve it.
 pub(crate) fn validate_expression(
     expression: &LocatorExpression,
     depth: usize,
 ) -> Result<bool, ObservationError> {
+    validate_expression_with_budget(expression, depth, &mut 0)
+}
+
+fn validate_expression_with_budget(
+    expression: &LocatorExpression,
+    depth: usize,
+    visited: &mut usize,
+) -> Result<bool, ObservationError> {
     if depth > 64 {
         return Err(ObservationError::InvalidArguments);
+    }
+    // Match the client diagnostic bound so every admitted framed expression
+    // can retain frame-error evidence. Count occurrences, not shared values.
+    *visited += 1;
+    if *visited > 4096 {
+        return Err(ObservationError::ResourceLimit);
     }
     match expression {
         LocatorExpression::Query { query, scope } => {
@@ -4118,23 +4273,31 @@ pub(crate) fn validate_expression(
                 return Err(ObservationError::InvalidArguments);
             }
             if let Some(scope) = scope {
-                if validate_expression(scope, depth + 1)? {
+                if validate_expression_with_budget(scope, depth + 1, visited)? {
                     return Err(ObservationError::UnsupportedCapability);
                 }
             }
             Ok(matches!(query.kind, QueryKind::DisplayValue))
         }
         LocatorExpression::Filter { source, has, .. } => {
-            let display_value = validate_expression(source, depth + 1)?;
+            let display_value = validate_expression_with_budget(source, depth + 1, visited)?;
             if let Some(has) = has {
-                if validate_expression(has, depth + 1)? {
+                if validate_expression_with_budget(has, depth + 1, visited)? {
                     return Err(ObservationError::UnsupportedCapability);
                 }
             }
             Ok(display_value)
         }
         LocatorExpression::Index { source, .. } | LocatorExpression::Frame { source, .. } => {
-            validate_expression(source, depth + 1)
+            validate_expression_with_budget(source, depth + 1, visited)
+        }
+        LocatorExpression::Union { left, right } => {
+            let left_display_value = validate_expression_with_budget(left, depth + 1, visited)?;
+            let right_display_value = validate_expression_with_budget(right, depth + 1, visited)?;
+            if left_display_value || right_display_value {
+                return Err(ObservationError::UnsupportedCapability);
+            }
+            Ok(false)
         }
         LocatorExpression::Selector { selector } => {
             if selector.is_empty() {
@@ -4152,6 +4315,20 @@ fn split_frame_expression(
             let (mut path, expr) = split_frame_expression(source)?;
             path.insert(0, selector.clone());
             Ok((path, expr))
+        }
+        LocatorExpression::Union { left, right } => {
+            let (left_path, left) = split_frame_expression(left)?;
+            let (right_path, right) = split_frame_expression(right)?;
+            if left_path != right_path {
+                return Err(ObservationError::UnsupportedCapability);
+            }
+            Ok((
+                left_path,
+                LocatorExpression::Union {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                },
+            ))
         }
         LocatorExpression::Index { source, index } => {
             let (path, expr) = split_frame_expression(source)?;
@@ -6385,6 +6562,203 @@ mod tests {
                 .unwrap();
                 assert_eq!(authored.role.as_deref(), Some("region"));
             }
+        }
+    }
+
+    #[test]
+    fn effective_presentation_role_preserves_native_controls_and_implicit_tags() {
+        for bounded in [false, true] {
+            for (tag, native_role, expected) in [
+                ("button", "button", "button"),
+                ("a", "link", "link"),
+                ("h2", "none", "heading"),
+                ("tbody", "none", "rowgroup"),
+            ] {
+                for authored in ["none", "presentation"] {
+                    let mut data = metadata();
+                    data["author"]["tag"] = json!(tag);
+                    data["attributes"]["role"] = json!(authored);
+                    data["presentationConflict"] = json!(true);
+                    let mut native = ax("role", 42, &[]);
+                    native.role.as_mut().unwrap().value = Some(json!(native_role));
+                    let mut refs = observed_refs();
+                    let node =
+                        project_node(&frame(), 42, &native, &mut refs, 1, &data, bounded).unwrap();
+                    assert_eq!(node.role.as_deref(), Some(expected), "{tag}/{authored}");
+                    let entry = refs
+                        .get(&super::super::element::parse_ref(&node.reference.id).unwrap())
+                        .unwrap();
+                    assert_eq!(entry.backend_node_id, Some(42));
+                    assert_eq!(entry.exact_binding.as_ref().unwrap().frame, "main");
+                    data["presentationConflict"] = json!(false);
+                    let node = project_node(
+                        &frame(),
+                        42,
+                        &native,
+                        &mut observed_refs(),
+                        1,
+                        &data,
+                        bounded,
+                    )
+                    .unwrap();
+                    assert_eq!(node.role.as_deref(), Some(authored));
+                }
+            }
+            let mut data = metadata();
+            data["editingHost"] = json!(true);
+            data["attributes"]["role"] = json!("none");
+            data["presentationConflict"] = json!(true);
+            assert_eq!(
+                project_node(
+                    &frame(),
+                    42,
+                    &ax("editor", 42, &[]),
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    bounded
+                )
+                .unwrap()
+                .role
+                .as_deref(),
+                Some("textbox")
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_presentation_restores_controls_even_when_ax_omits_the_receiver() {
+        for (tag, attributes, extra, expected) in [
+            ("button", json!({}), json!({}), Some("button")),
+            ("a", json!({"href":"/"}), json!({}), Some("link")),
+            ("a", json!({}), json!({}), None),
+            (
+                "select",
+                json!({}),
+                json!({"selectListbox":false}),
+                Some("combobox"),
+            ),
+            (
+                "select",
+                json!({}),
+                json!({"selectListbox":true}),
+                Some("listbox"),
+            ),
+            ("textarea", json!({}), json!({}), Some("textbox")),
+            (
+                "input",
+                json!({"type":"CHECKBOX"}),
+                json!({}),
+                Some("checkbox"),
+            ),
+            (
+                "input",
+                json!({"type":"text"}),
+                json!({"inputDatalist":true}),
+                Some("combobox"),
+            ),
+            ("input", json!({"type":"hidden"}), json!({}), None),
+            (
+                "section",
+                json!({"aria-label":"Named"}),
+                json!({}),
+                Some("region"),
+            ),
+            ("details", json!({}), json!({}), Some("group")),
+            ("div", json!({"aria-label":"Named"}), json!({}), None),
+        ] {
+            let mut data = metadata();
+            data["author"]["tag"] = json!(tag);
+            data["attributes"] = attributes;
+            data["attributes"]["role"] = json!("none");
+            data["presentationConflict"] = json!(true);
+            for (key, value) in extra.as_object().unwrap() {
+                data[key] = value.clone();
+            }
+            let mut native = ax("omitted", 42, &[]);
+            native.role = None;
+            for bounded in [false, true] {
+                let node = project_node(
+                    &frame(),
+                    42,
+                    &native,
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    bounded,
+                )
+                .unwrap();
+                assert_eq!(node.role.as_deref(), expected, "{tag}");
+            }
+        }
+    }
+
+    #[test]
+    fn ignored_presentation_uses_bounded_header_neighbor_fact_without_ax() {
+        for expected in ["rowheader", "columnheader"] {
+            let mut data = metadata();
+            data["author"]["tag"] = json!("th");
+            data["attributes"]["role"] = json!("presentation");
+            data["presentationConflict"] = json!(true);
+            data["conflictHeaderRole"] = json!(expected);
+            let mut native = ax("omitted-header", 42, &[]);
+            native.role = None;
+            let node =
+                project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false).unwrap();
+            assert_eq!(node.role.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn ignored_presentation_header_fallback_preserves_single_cell_suppression() {
+        let mut data = metadata();
+        data["author"]["tag"] = json!("th");
+        data["attributes"]["role"] = json!("none");
+        data["presentationConflict"] = json!(true);
+        data["singleCellHeader"] = json!(true);
+        data["conflictHeaderRole"] = json!("columnheader");
+        let mut native = ax("single-header", 42, &[]);
+        native.role = None;
+        assert_eq!(
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false)
+                .unwrap()
+                .role,
+            None
+        );
+    }
+
+    #[test]
+    fn decorative_image_fact_only_changes_implicit_image_semantics() {
+        for decorative in [false, true] {
+            let mut data = metadata();
+            data["author"]["tag"] = json!("img");
+            data["decorativeImage"] = json!(decorative);
+            let node = project_node(
+                &frame(),
+                42,
+                &ax("image", 42, &[]),
+                &mut observed_refs(),
+                1,
+                &data,
+                true,
+            )
+            .unwrap();
+            assert_eq!(
+                node.role.as_deref(),
+                Some(if decorative { "presentation" } else { "image" })
+            );
+            data["attributes"]["role"] = json!("button");
+            let node = project_node(
+                &frame(),
+                42,
+                &ax("image", 42, &[]),
+                &mut observed_refs(),
+                1,
+                &data,
+                true,
+            )
+            .unwrap();
+            assert_eq!(node.role.as_deref(), Some("button"));
         }
     }
 

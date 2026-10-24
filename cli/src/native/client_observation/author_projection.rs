@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 const LIMIT: usize = 100_000;
 const TEXT_LIMIT: usize = 512;
+const MAX_SELECT_OPTIONS: usize = 60;
 
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -47,6 +48,7 @@ struct Entry {
     assigned_slot: Option<i64>,
     distributed: Option<Vec<i64>>,
     children: Vec<i64>,
+    light_children: Vec<i64>,
     rendered: Vec<i64>,
 }
 #[derive(Debug)]
@@ -96,6 +98,7 @@ impl Graph {
             } else {
                 children.clone()
             };
+            let light_children = children.clone();
             children.extend(shadow);
             let distributed = node
                 .get("distributedNodes")
@@ -152,6 +155,7 @@ impl Graph {
                         assigned_slot,
                         distributed,
                         children,
+                        light_children,
                         rendered,
                     },
                 )
@@ -420,17 +424,54 @@ pub(super) fn compact(
             0,
         )?;
     }
-    let options: HashSet<i64> = graph
-        .entries
-        .values()
-        .filter(|entry| {
+    // Closed selects offer native-owned descendants even without layout boxes.
+    // Flatten only the public projection, never the graph or exact references.
+    // Exclusions precede the per-select cap; disabled/visibility:hidden choices
+    // remain offered. The global publication budget is applied later by emit.
+    fn offered_options(
+        id: i64,
+        graph: &Graph,
+        nodes: &HashMap<i64, SemanticNode>,
+        offered: &mut Vec<i64>,
+        depth: usize,
+    ) -> Result<(), ObservationError> {
+        if depth > 256 {
+            return Err(ObservationError::BackendFailure);
+        }
+        let entry = &graph.entries[&id];
+        let f = facts(nodes.get(&id).ok_or(ObservationError::BackendFailure)?)?;
+        if f.suppress || f.tag == "select" || offered.len() == MAX_SELECT_OPTIONS {
+            return Ok(());
+        }
+        if f.tag == "option" {
+            offered.push(id);
+            return Ok(());
+        }
+        for child in &entry.light_children {
+            offered_options(*child, graph, nodes, offered, depth + 1)?;
+        }
+        Ok(())
+    }
+    let mut select_options = HashMap::new();
+    for entry in graph.entries.values() {
+        let f = facts(
             nodes
                 .get(&entry.id)
-                .and_then(|node| node.author.as_ref())
-                .is_some_and(|f| f.tag == "select" && f.visible && !f.suppress)
-        })
-        .flat_map(|entry| entry.children.iter().copied())
-        .collect();
+                .ok_or(ObservationError::BackendFailure)?,
+        )?;
+        if f.tag == "select" && f.visible && !f.suppress {
+            let mut offered = Vec::new();
+            for child in &entry.light_children {
+                offered_options(*child, graph, &nodes, &mut offered, 0)?;
+            }
+            select_options.insert(entry.id, offered);
+        }
+    }
+    let options: HashSet<i64> = select_options.values().flatten().copied().collect();
+    // A select lists each offered option itself, not arbitrary option content.
+    for id in &options {
+        select_options.insert(*id, Vec::new());
+    }
     let mut retained = HashSet::new();
     for id in &graph.ids {
         let entry = &graph.entries[id];
@@ -473,7 +514,9 @@ pub(super) fn compact(
             || node.test_id.is_some()
             || node.name.is_some()
             || (f.action && coverage[id] && node.text.is_some());
-        if f.visible && !f.suppress && (independent || (owns && !coverage[id])) {
+        if options.contains(id)
+            || f.visible && !f.suppress && (independent || (owns && !coverage[id]))
+        {
             retained.insert(*id);
         }
     }
@@ -485,6 +528,7 @@ pub(super) fn compact(
         graph: &Graph,
         nodes: &mut HashMap<i64, SemanticNode>,
         retained: &HashSet<i64>,
+        select_options: &HashMap<i64, Vec<i64>>,
         count: &mut usize,
         limit: usize,
         truncated: &mut bool,
@@ -507,12 +551,14 @@ pub(super) fn compact(
             *count += 1;
         }
         let mut children = Vec::new();
-        for child in &entry.children {
+        let public_children = select_options.get(&id).unwrap_or(&entry.children);
+        for child in public_children {
             children.extend(emit(
                 *child,
                 graph,
                 nodes,
                 retained,
+                select_options,
                 count,
                 limit,
                 truncated,
@@ -533,6 +579,7 @@ pub(super) fn compact(
             graph,
             &mut nodes,
             &retained,
+            &select_options,
             &mut count,
             limit,
             &mut truncated,
@@ -775,13 +822,112 @@ mod tests {
         let nodes = f.run(vec![unowned, select.clone()]);
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].reference.id, reference(&select));
-        assert_eq!(nodes[0].children[0].reference.id, reference(&group));
+        assert_eq!(nodes[0].children.len(), 1);
+        assert_eq!(nodes[0].children[0].reference.id, reference(&grouped));
+        // Public topology flattens the optgroup without issuing a group ref
+        // for the option or broadening the exception to unowned nodes.
+    }
+
+    #[test]
+    fn offered_choices_flatten_groups_and_cap_after_exclusions_per_select() {
+        let mut f = Fixture::default();
+        let mut children = Vec::new();
+        for _ in 0..65 {
+            let excluded = f.el("option", Some("option"), vec![]);
+            f.facts_mut(&excluded).suppress = true;
+            children.push(excluded);
+        }
+        let excluded = f.el("option", Some("option"), vec![]);
+        let hidden_group = f.el("optgroup", Some("group"), vec![excluded]);
+        f.facts_mut(&hidden_group).suppress = true;
+        children.push(hidden_group);
+        let mut offered = Vec::new();
+        for index in 0..65 {
+            let option = f.el("option", Some("option"), vec![]);
+            f.facts_mut(&option).visible = false;
+            let id = option["backendNodeId"].as_i64().unwrap();
+            let node = f.nodes.get_mut(&id).unwrap();
+            node.states.insert("hidden".into(), true);
+            node.states.insert("disabled".into(), index == 0);
+            node.states.insert("selected".into(), index == 0);
+            node.value = Some(format!("private-{index}"));
+            offered.push(option);
+        }
+        let group = f.el("optgroup", Some("group"), offered.clone());
+        f.facts_mut(&group).visible = false; // visibility:hidden is not exclusion.
+        children.push(group);
+        let select = f.el("select", Some("combobox"), children);
+        let separate_option = f.el("option", Some("option"), vec![]);
+        f.facts_mut(&separate_option).visible = false;
+        let separate = f.el("select", Some("combobox"), vec![separate_option.clone()]);
+        let raw_nodes = f.nodes.clone();
+        let nodes = f.run(vec![select.clone(), separate.clone()]);
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0].reference.id, reference(&select));
         assert_eq!(
-            nodes[0].children[0].children[0].reference.id,
-            reference(&grouped)
+            nodes[0]
+                .children
+                .iter()
+                .map(|n| n.reference.id.clone())
+                .collect::<Vec<_>>(),
+            offered
+                .iter()
+                .take(MAX_SELECT_OPTIONS)
+                .map(reference)
+                .collect::<Vec<_>>()
         );
-        // This correction does not flatten optgroups or broaden the existing
-        // direct-option exception to unrelated native ownership branches.
+        assert_eq!(
+            nodes[1].children[0].reference.id,
+            reference(&separate_option)
+        );
+        assert_eq!(nodes[0].children[0].states.get("disabled"), Some(&true));
+        assert_eq!(nodes[0].children[0].states.get("selected"), Some(&true));
+        for node in &nodes[0].children {
+            assert_eq!(node.states.get("hidden"), Some(&false));
+            assert_eq!(node.value, None);
+        }
+        for option in offered {
+            let original = &raw_nodes[&option["backendNodeId"].as_i64().unwrap()];
+            assert_eq!(original.states.get("hidden"), Some(&true));
+            assert!(original.value.is_some());
+        }
+    }
+
+    #[test]
+    fn closed_details_exclusion_precedes_the_offered_choice_budget() {
+        let mut f = Fixture::default();
+        let excluded = f.el("option", Some("option"), vec![]);
+        // METADATA's bounded closed-details proof supplies suppression for the
+        // body even when the select itself remains visible.
+        f.facts_mut(&excluded).suppress = true;
+        let details = f.el("details", Some("group"), vec![excluded.clone()]);
+        let first = f.el("option", Some("option"), vec![]);
+        f.facts_mut(&first).visible = false;
+        let select = f.el("select", Some("combobox"), vec![details, first.clone()]);
+        let nodes = f.run(vec![select]);
+        assert_eq!(nodes[0].children.len(), 1);
+        assert_eq!(nodes[0].children[0].reference.id, reference(&first));
+        assert!(!flat(&nodes)
+            .iter()
+            .any(|node| node.reference.id == reference(&excluded)));
+    }
+
+    #[test]
+    fn offered_choices_use_native_light_ownership_and_do_not_publish_option_children() {
+        let mut f = Fixture::default();
+        let content = f.el("button", Some("button"), vec![]);
+        let option = f.el("option", Some("presentation"), vec![content]);
+        f.facts_mut(&option).visible = false;
+        let shadow_option = f.el("option", Some("option"), vec![]);
+        let mut host = f.el("div", None, vec![]);
+        host["shadowRoots"] =
+            json!([{"nodeType":11,"shadowRootType":"closed","children":[shadow_option]}]);
+        let select = f.el("select", Some("combobox"), vec![host, option.clone()]);
+        let nodes = f.run(vec![select]);
+        assert_eq!(nodes[0].children.len(), 1);
+        assert_eq!(nodes[0].children[0].reference.id, reference(&option));
+        assert!(nodes[0].children[0].children.is_empty());
+        assert_eq!(nodes[0].children[0].role.as_deref(), Some("presentation"));
     }
 
     #[test]

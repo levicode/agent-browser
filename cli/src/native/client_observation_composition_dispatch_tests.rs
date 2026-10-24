@@ -1,4 +1,4 @@
-//! Both public query purposes refuse before acquiring browser facts or IDs.
+//! Both public query purposes refuse unsupported/oversized compositions before browser facts or IDs.
 use super::*;
 use crate::native::cdp::client::CdpClient;
 use crate::native::client_browser::ExecutionGate;
@@ -60,7 +60,14 @@ async fn unsupported_composition_never_dispatches_cdp_or_stages_references() {
     let (_sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
     let mut sequence = 0;
     for purpose in [QueryPurpose::Fixture, QueryPurpose::Protected] {
-        for expression in observation::composition_tests::unsupported_expressions() {
+        let refusals = observation::composition_tests::unsupported_expressions()
+            .into_iter()
+            .map(|expression| (expression, ProtocolError::UnsupportedCapability))
+            .chain(std::iter::once((
+                observation::composition_tests::oversized_expression(),
+                ProtocolError::CapacityExceeded,
+            )));
+        for (expression, expected_error) in refusals {
             sequence += 1;
             let operation = OperationLease {
                 generation: 1,
@@ -102,7 +109,7 @@ async fn unsupported_composition_never_dispatches_cdp_or_stages_references() {
             );
             let failure = task.result.await.unwrap().unwrap_err();
             task.join.await.unwrap().unwrap();
-            assert_eq!(failure.error, ProtocolError::UnsupportedCapability);
+            assert_eq!(failure.error, expected_error);
             assert!(!failure.cleanup_integrity_lost);
             let after = {
                 let refs = refs.lock().unwrap();
