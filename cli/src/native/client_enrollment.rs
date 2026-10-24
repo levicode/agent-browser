@@ -12923,6 +12923,162 @@ mod tests {
         );
     }
 
+    // Architecture diagnostic RED, not a changed failed-live contract: the
+    // original error and no-receipt decision stay fixed while real exact detach
+    // catches up within the original deadline. No new business work is admitted.
+    #[tokio::test]
+    async fn service_worker_failed_live_exact_detach_after_decision_keeps_owner_healthy() {
+        let (owner, _notices, log, emit, mut server, _broker, connection) =
+            fixture_with_client("sw-startup-observer-fails", true).await;
+        let ledger = owner.client.debt_ledger().unwrap();
+        let (decided, release) = owner.client.hold_worker_startup_no_receipt();
+        let ready_gate = CaptureTestGate::new();
+        owner.capture_test_gates.lock().unwrap().insert(
+            CaptureTestPoint::BeforeWorkerReadyCommit,
+            ready_gate.clone(),
+        );
+        owner.ensure_supervisor().await.unwrap();
+        let attached = attach(
+            "owned-context",
+            "worker-target",
+            "worker-session",
+            "service_worker",
+            None,
+        );
+        emit.send(json!({"method":attached.method,"params":attached.params}))
+            .await
+            .unwrap();
+        let (joined_error, deadline) = tokio::time::timeout(Duration::from_secs(2), decided)
+            .await
+            .unwrap()
+            .unwrap();
+        // The existing peer emits one real typed Runtime ErrorAck and two
+        // successful replies. All three are settled before the fixed decision.
+        assert!(joined_error.contains("Runtime.enable: CDP error (Runtime.enable)"));
+        assert!(joined_error.contains("synthetic observer failure"));
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(!ledger
+            .worker_startup_session_unbound("worker-session")
+            .unwrap());
+        let original = owner.targets.owned_target("worker-target").unwrap();
+        assert!(!original.configured && !original.resumed);
+        assert!(owner.index.lock().unwrap().failure.is_none());
+        owner
+            .network
+            .check_worker_startup(&owner.operation())
+            .unwrap();
+        let watermark = owner.realm_watermark().unwrap();
+        let before = watermark.received().unwrap();
+        emit.send(json!({"method":"Target.detachedFromTarget","params":{
+            "sessionId":"worker-session","targetId":"worker-target"
+        }}))
+        .await
+        .unwrap();
+        tokio::time::timeout_at(deadline.into(), async {
+            loop {
+                let changed = owner.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let applied = {
+                    let index = owner.index.lock().unwrap();
+                    let received = watermark.received().unwrap();
+                    received > before
+                        && index.applied_watermark >= received
+                        && !index.sessions.contains_key("worker-session")
+                };
+                if applied {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("exact detach must really apply within the original deadline");
+        assert!(Instant::now() < deadline);
+        assert!(ledger
+            .worker_startup_session_unbound("worker-session")
+            .unwrap());
+        assert!(owner.targets.owned_target("worker-target").is_err());
+        assert!(owner
+            .index
+            .lock()
+            .unwrap()
+            .pending_enrollment
+            .contains("worker-session"));
+        // Release the already-fixed None unchanged. This is not a retry, a
+        // fabricated detach, a receipt grant, or a delayed business command.
+        release.send(()).unwrap();
+        tokio::time::timeout_at(deadline.into(), async {
+            loop {
+                let changed = owner.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if !owner
+                    .index
+                    .lock()
+                    .unwrap()
+                    .pending_enrollment
+                    .contains("worker-session")
+                {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap();
+        let failure = owner.index.lock().unwrap().failure.clone();
+        let health = owner.targets.check_settlement_integrity();
+        let network = owner.network.check_worker_startup(&owner.operation());
+        let debt = ledger.snapshot();
+        let ready_gate_unused = ready_gate.entered.try_acquire().is_err();
+        let methods: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["sessionId"] == "worker-session")
+            .map(|request| request["method"].as_str().unwrap().to_owned())
+            .collect();
+        // Save primary state and finish the owned synthetic peer before the
+        // intentional RED assertion, so RED cannot masquerade as leaked cleanup.
+        let cleanup = owner.close().await;
+        connection.close().await;
+        let peer = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        if peer.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        eprintln!("failed-live exact-detach after decision: joined_error={joined_error}; failure={failure:?}; health={health:?}; network={network:?}; debt={debt:?}; cleanup={cleanup:?}; peer={peer:?}");
+        assert!(ready_gate_unused);
+        assert_eq!(debt.outstanding_commands, 0);
+        assert_eq!(
+            methods,
+            [
+                "Fetch.enable",
+                "Target.setAutoAttach",
+                "Network.enable",
+                "Runtime.enable",
+                "Runtime.runIfWaitingForDebugger"
+            ]
+        );
+        assert!(
+            matches!(peer, Ok(Ok(()))),
+            "owned peer did not finish: {peer:?}"
+        );
+        // Current-behavior characterization, separate from the desired RED.
+        // A future production fix must move/remove this old-behavior assertion
+        // and instead prove the retained error in its failed-retired outcome.
+        assert_eq!(failure, Some(ProtocolError::BrowserFailure));
+        // A future design must retain that error/obligation until exact proof,
+        // never turn a still-live ErrorAck into Ready or wait past its budget.
+        assert_eq!(failure, None, "desired architectural RED: exact detach applied after the fixed no-receipt decision, but the whole owner was poisoned");
+        assert_eq!(health, Ok(()));
+        assert_eq!(network, Ok(()));
+        assert!(!debt.integrity_lost);
+        assert_eq!(cleanup, Ok(()));
+    }
+
     #[tokio::test]
     async fn service_worker_detach_rejects_conflicting_target_identity() {
         let (owner, _notices, _log, _emit, server) = fixture("normal").await;

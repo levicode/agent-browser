@@ -642,6 +642,13 @@ struct CdpTransport {
     #[cfg(test)]
     worker_startup_decision_gate:
         std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+    #[cfg(test)]
+    worker_startup_no_receipt_gate: std::sync::Mutex<
+        Option<(
+            oneshot::Sender<(String, std::time::Instant)>,
+            oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
@@ -1153,6 +1160,8 @@ impl CdpClient {
                 next_tap_id: AtomicU64::new(1),
                 #[cfg(test)]
                 worker_startup_decision_gate: std::sync::Mutex::new(None),
+                #[cfg(test)]
+                worker_startup_no_receipt_gate: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -1694,6 +1703,21 @@ impl CdpClient {
             } else {
                 None
             };
+            #[cfg(test)]
+            if retirement.is_none() {
+                // The ErrorAck decision is already fixed. Let a test deliver
+                // exact detach before return, without reclassifying this failure.
+                let gate = self
+                    .transport
+                    .worker_startup_no_receipt_gate
+                    .lock()
+                    .unwrap()
+                    .take();
+                if let Some((entered, release)) = gate {
+                    let _ = entered.send((errors.join("; "), deadline));
+                    let _ = tokio::time::timeout_at(deadline.into(), release).await;
+                }
+            }
             return Err(ServiceWorkerStartupFailure {
                 message: errors.join("; "),
                 error: ProtocolError::BrowserFailure,
@@ -2297,6 +2321,23 @@ impl CdpClient {
         let (entered, observed) = oneshot::channel();
         let (release, waiting) = oneshot::channel();
         *self.transport.worker_startup_decision_gate.lock().unwrap() = Some((entered, waiting));
+        (observed, release)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_worker_startup_no_receipt(
+        &self,
+    ) -> (
+        oneshot::Receiver<(String, std::time::Instant)>,
+        oneshot::Sender<()>,
+    ) {
+        let (entered, observed) = oneshot::channel();
+        let (release, waiting) = oneshot::channel();
+        *self
+            .transport
+            .worker_startup_no_receipt_gate
+            .lock()
+            .unwrap() = Some((entered, waiting));
         (observed, release)
     }
 
