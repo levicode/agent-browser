@@ -3858,6 +3858,9 @@ mod tests {
     };
     use super::*;
     use futures_util::{SinkExt, StreamExt};
+    mod legacy_locator_dispatch {
+        include!("client_actions_locator_dispatch_tests.rs");
+    }
     #[test]
     fn readonly_timing_is_silent_when_disabled_tap_success_or_mutated() {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -4586,6 +4589,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let observed_since = Instant::now();
             let mut checked_reads = 0;
             let mut query_reads = 0;
             let mut drag_pressed = false;
@@ -4605,7 +4609,13 @@ mod tests {
                     continue;
                 };
                 let request: Value = serde_json::from_str(text).unwrap();
-                captured.lock().unwrap().push(request.clone());
+                let observed = legacy_locator_dispatch::observed_request(
+                    mode,
+                    &request,
+                    observed_since.elapsed(),
+                )
+                .await;
+                captured.lock().unwrap().push(observed.clone());
                 let method = request["method"].as_str().unwrap();
                 // Mutate the fixture only when the real action presses. Query
                 // count alone must not manufacture the post-press boundary.
@@ -4930,6 +4940,9 @@ mod tests {
                         } else {
                             json!({"nodes":[{"backendDOMNodeId":42,"properties":[{"name":"focused","value":{"value":true}}]}]})
                         }
+                    }
+                    "Runtime.callFunctionOn" if observed.get("legacyScriptResult").is_some() => {
+                        json!({"result":{"value":observed["legacyScriptResult"]["result"]}})
                     }
                     "Runtime.callFunctionOn" => {
                         if mode.starts_with("strict-query")
