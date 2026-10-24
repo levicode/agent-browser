@@ -573,6 +573,9 @@ struct CdpTransport {
     method_taps: MethodTaps,
     bounded_method_taps: BoundedMethodTaps,
     next_tap_id: AtomicU64,
+    #[cfg(test)]
+    worker_startup_decision_gate:
+        std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
@@ -1082,6 +1085,8 @@ impl CdpClient {
                 method_taps,
                 bounded_method_taps,
                 next_tap_id: AtomicU64::new(1),
+                #[cfg(test)]
+                worker_startup_decision_gate: std::sync::Mutex::new(None),
             }),
         })
     }
@@ -1524,6 +1529,19 @@ impl CdpClient {
                 (method, reply, status)
             }
         )).await;
+        #[cfg(test)]
+        {
+            let gate = self
+                .transport
+                .worker_startup_decision_gate
+                .lock()
+                .unwrap()
+                .take();
+            if let Some((entered, release)) = gate {
+                let _ = entered.send(());
+                let _ = tokio::time::timeout_at(deadline.into(), release).await;
+            }
+        }
         let mut disqualifying_failure = !errors.is_empty() || !complete;
         let mut eligible = errors.is_empty() && complete && same_budget;
         let mut destroyed = false;
@@ -2172,6 +2190,16 @@ impl CdpClient {
             .send(Message::Text(json))
             .await
             .map_err(|e| format!("Failed to send raw CDP message: {}", e))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_worker_startup_decision(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered, observed) = oneshot::channel();
+        let (release, waiting) = oneshot::channel();
+        *self.transport.worker_startup_decision_gate.lock().unwrap() = Some((entered, waiting));
+        (observed, release)
     }
 
     /// Test-only: count of in-flight commands still awaiting a response, so a

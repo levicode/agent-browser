@@ -12696,6 +12696,131 @@ mod tests {
         ready_then_exact_detach_case(true).await;
     }
 
+    // This test applies unchanged to formal production: only the reader's
+    // joined-batch decision is gated, never its reply/debt accounting.
+    #[tokio::test]
+    async fn service_worker_failed_retired_waits_for_applied_detach_without_poison() {
+        let (owner, _notices, log, emit, mut server, _broker, connection) =
+            fixture_with_client("sw-startup-observer-fails", true).await;
+        let ledger = owner.client.debt_ledger().unwrap();
+        let (deciding, release_decision) = owner.client.hold_worker_startup_decision();
+        let ready_gate = CaptureTestGate::new();
+        owner.capture_test_gates.lock().unwrap().insert(
+            CaptureTestPoint::BeforeWorkerReadyCommit,
+            ready_gate.clone(),
+        );
+        owner.ensure_supervisor().await.unwrap();
+        let attached = attach(
+            "owned-context",
+            "worker-target",
+            "worker-session",
+            "service_worker",
+            None,
+        );
+        emit.send(json!({"method":attached.method,"params":attached.params}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), deciding)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        let original = owner.targets.owned_target("worker-target").unwrap();
+        assert!(!original.configured && !original.resumed);
+        let apply = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeEventApply, apply.clone());
+        emit.send(json!({"method":"Target.detachedFromTarget","params":{
+            "sessionId":"worker-session","targetId":"worker-target"
+        }}))
+        .await
+        .unwrap();
+        apply.wait_entered().await;
+        let watermark = owner.realm_watermark().unwrap();
+        assert!(owner.index.lock().unwrap().applied_watermark < watermark.received().unwrap());
+        release_decision.send(()).unwrap();
+        // The real error is already joined. Reader retirement alone must not
+        // quarantine or release the original pending enrollment/permit.
+        let still_pending = tokio::time::timeout(Duration::from_millis(20), async {
+            loop {
+                let index = owner.index.lock().unwrap();
+                if index.failure.is_some() || !index.pending_enrollment.contains("worker-session") {
+                    break;
+                }
+                drop(index);
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err();
+        apply.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_enrollment
+                .contains("worker-session")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let failure = owner.index.lock().unwrap().failure.clone();
+        let health = owner.targets.check_settlement_integrity();
+        let network = owner.network.check_worker_startup(&owner.operation());
+        let debt = ledger.snapshot();
+        let absent = !owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("worker-session")
+            && owner.targets.owned_target("worker-target").is_err();
+        let ready_gate_unused = ready_gate.entered.try_acquire().is_err();
+        let methods: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["sessionId"] == "worker-session")
+            .map(|request| request["method"].as_str().unwrap().to_owned())
+            .collect();
+        let cleanup = owner.close().await;
+        connection.close().await;
+        let peer = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        if peer.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        assert!(still_pending, "joined failed startup must remain pending until exact detach applies; failure={failure:?}; health={health:?}");
+        assert_eq!(failure, None);
+        assert_eq!(health, Ok(()));
+        assert_eq!(network, Ok(()));
+        assert!(absent && ready_gate_unused);
+        assert_eq!(debt.outstanding_commands, 0);
+        assert!(!debt.integrity_lost);
+        assert_eq!(
+            methods,
+            [
+                "Fetch.enable",
+                "Target.setAutoAttach",
+                "Network.enable",
+                "Runtime.enable",
+                "Runtime.runIfWaitingForDebugger"
+            ]
+        );
+        assert_eq!(cleanup, Ok(()));
+        assert!(
+            matches!(peer, Ok(Ok(()))),
+            "owned peer did not finish: {peer:?}"
+        );
+    }
+
     #[tokio::test]
     async fn service_worker_error_ack_never_reaches_ready_commit_gate() {
         let (owner, _notices, log, emit, mut server, _broker, connection) =
