@@ -4599,10 +4599,12 @@ mod tests {
             let mut drag_objects = 0;
             let mut preparation_scrolls = 0;
             let mut readonly_probes = 0;
+            let mut layout_metrics_reads = 0;
             let mut held_focus_probe: Option<Value> = None;
             let mut held_focus_release: Option<Value> = None;
             let mut held_debt_release: Option<Value> = None;
             let mut held_direct_press: Option<Value> = None;
+            let mut held_original_pointer_reply: Option<(Value, Value)> = None;
             let mut held_drag_releases: Vec<Value> = Vec::new();
             while let Some(Ok(message)) = socket.next().await {
                 if mode.starts_with("preparation-readonly-") && message.is_close() {
@@ -4618,11 +4620,23 @@ mod tests {
                     observed_since.elapsed(),
                 )
                 .await;
-                if mode == direct_point_clicks::MODE {
+                if mode == direct_point_clicks::MODE || direct_point_clicks::is_pointer_mode(mode) {
                     direct_point_clicks::record_receipt(&mut observed, observed_since.elapsed());
                 }
                 captured.lock().unwrap().push(observed.clone());
                 let method = request["method"].as_str().unwrap();
+                if mode == direct_point_clicks::CANCEL_MODE
+                    && method == "Input.dispatchMouseEvent"
+                    && request["params"]["type"] == "mouseMoved"
+                    && request["params"]["x"].as_f64() == Some(30.0)
+                {
+                    // Cancel only after the real first paced move is submitted,
+                    // before its ACK can let the producer submit another move.
+                    server_cancel.send_replace(CancelSignal::Requested);
+                }
+                if method == "Page.getLayoutMetrics" {
+                    layout_metrics_reads += 1;
+                }
                 // Mutate the fixture only when the real action presses. Query
                 // count alone must not manufacture the post-press boundary.
                 if mode.starts_with("strict-query-drag-")
@@ -4889,6 +4903,9 @@ mod tests {
                         json!({"model":{"border":[x,0,x+100,0,x+100,50,x,50]}})
                     }
                     "DOM.getBoxModel" => json!({"model":{"border":[0,0,100,0,100,50,0,50]}}),
+                    "Page.getLayoutMetrics" if mode == direct_point_clicks::WHEEL_MODE => {
+                        json!({"cssVisualViewport":{"clientWidth":800.,"clientHeight":600.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":800.,"clientHeight":600.}})
+                    }
                     "Page.getLayoutMetrics" if mode.starts_with("strict-query-drag-") => {
                         json!({"cssVisualViewport":{"clientWidth":400.,"clientHeight":200.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":400.,"clientHeight":200.}})
                     }
@@ -5146,7 +5163,13 @@ mod tests {
                     "Runtime.evaluate" => json!({"result":{"value":true}}),
                     _ => json!({}),
                 };
-                let mut reply = if (mode == "strict-query-drag-release-failed"
+                let mut reply = if mode == "recording-first-start-error-ack"
+                    && method == "Page.getLayoutMetrics"
+                    && layout_metrics_reads > 1
+                {
+                    // Let fixture geometry initialize; refuse the actual start.
+                    json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic recording startup failure"}})
+                } else if (mode == "strict-query-drag-release-failed"
                     && drag_pressed
                     && method == "Runtime.releaseObject"
                     && request["params"]["objectId"]
@@ -5181,11 +5204,31 @@ mod tests {
                 } else {
                     json!({"id":request["id"],"result":result})
                 };
-                if mode.starts_with("direct-point")
+                if mode == "recording-first-start-error-ack"
+                    || mode.starts_with("direct-point")
                     || mode == "strict-query-drag-cleanup-debt"
                     || mode.starts_with("preparation-readonly-")
                 {
                     reply["sessionId"] = request["sessionId"].clone();
+                }
+                if direct_point_clicks::holds_pointer_reply(mode, &request) {
+                    assert!(held_original_pointer_reply
+                        .replace((request, reply))
+                        .is_none());
+                    continue;
+                }
+                if method == "Browser.getVersion" {
+                    if let Some((held, held_reply)) = held_original_pointer_reply.take() {
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                held_reply.to_string(),
+                            ))
+                            .await
+                            .unwrap();
+                        sent_replies.lock().unwrap().push(json!({
+                            "request":held, "reply":held_reply, "heldUntilRequest":request
+                        }));
+                    }
                 }
                 if method == "Runtime.releaseObject" {
                     if let Some(focus_request) = held_focus_probe.as_ref() {
@@ -5221,6 +5264,7 @@ mod tests {
                         }));
                     }
                 }
+                let ack_started = observed_since.elapsed();
                 if socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
                         reply.to_string(),
@@ -5230,10 +5274,12 @@ mod tests {
                 {
                     break;
                 }
-                sent_replies
-                    .lock()
-                    .unwrap()
-                    .push(json!({"request":request,"reply":reply}));
+                let mut observed_reply = json!({"request":request,"reply":reply});
+                if direct_point_clicks::is_pointer_mode(mode) {
+                    observed_reply["directPointPeerAckStartNanos"] =
+                        json!(u64::try_from(ack_started.as_nanos()).unwrap());
+                }
+                sent_replies.lock().unwrap().push(observed_reply);
             }
         });
         let client = Arc::new(CdpClient::connect(&url).await.unwrap());
@@ -5752,6 +5798,87 @@ mod tests {
                 .any(|request| request["method"] == "DOM.resolveNode"
                     && request["params"]["backendNodeId"] == 44));
         }
+    }
+
+    #[tokio::test]
+    async fn pointer_original_down_swipe_800x600_waits_for_post_wheel_render_ack() {
+        let (f, ledger, journal) =
+            direct_point_clicks::owned_pointer_fixture(direct_point_clicks::WHEEL_MODE).await;
+        let actions = ClientActions::default();
+        let args = json!({"identityScope":"scope", "point":{"x":10,"y":20},
+            "action":{"kind":"swipe","direction":"down"}});
+        let action = journal.scope(actions.execute(f.context(), "browser.pointer", &args));
+        tokio::pin!(action);
+        let render = tokio::select! {
+            result = &mut action => panic!("wheel action settled before its render ACK: {result:?}"),
+            request = direct_point_clicks::wait_for_held_pointer_request(
+                &f, direct_point_clicks::WHEEL_MODE,
+            ) => request,
+        };
+        assert_eq!(render["sessionId"], "page");
+        assert_eq!(render["params"]["awaitPromise"], true);
+        assert_eq!(render["params"]["returnByValue"], true);
+        assert_eq!(render["params"]["expression"],
+            "document.hidden?true:new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(()=>resolve(true))))");
+        assert!(tokio::time::timeout(Duration::from_millis(5), &mut action)
+            .await
+            .is_err());
+        let inputs = f.inputs();
+        assert_eq!(inputs.len(), 2);
+        assert_eq!(inputs[0]["params"]["type"], "mouseMoved");
+        assert_eq!(inputs[1]["params"]["type"], "mouseWheel");
+        for request in &inputs {
+            assert_eq!(request["sessionId"], "page");
+            assert_eq!(request["params"]["x"].as_f64(), Some(10.0));
+            assert_eq!(request["params"]["y"].as_f64(), Some(20.0));
+            assert_eq!(request["params"]["modifiers"], 0);
+            direct_point_clicks::exact_pointer_ack(&f, request);
+        }
+        assert_eq!(inputs[1]["params"]["deltaX"].as_f64(), Some(0.0));
+        assert_eq!(inputs[1]["params"]["deltaY"].as_f64(), Some(300.0));
+        let log = f.log.lock().unwrap().clone();
+        let methods: Vec<_> = log
+            .iter()
+            .map(|request| request["method"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "Page.getLayoutMetrics",
+                "Input.dispatchMouseEvent",
+                "Input.dispatchMouseEvent",
+                "Runtime.evaluate"
+            ]
+        );
+        let metrics = direct_point_clicks::exact_pointer_ack(&f, &log[0]);
+        assert_eq!(
+            metrics["reply"]["result"]["cssLayoutViewport"],
+            json!({"clientWidth":800.0,"clientHeight":600.0})
+        );
+        assert!(!f
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["request"]["id"] == render["id"]));
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        assert_eq!(journal.snapshot().input_debt, 0);
+        f.page
+            .client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        assert_eq!(action.await.unwrap(), Value::Null);
+        let ack = direct_point_clicks::exact_pointer_ack(&f, &render);
+        assert_eq!(ack["heldUntilRequest"]["method"], "Browser.getVersion");
+        assert_eq!(ack["reply"]["result"], json!({"result":{"value":true}}));
+        assert_eq!(
+            f.inputs(),
+            inputs,
+            "render settlement must not replay input"
+        );
+        assert_eq!(f.log.lock().unwrap().len(), 5);
+        direct_point_clicks::assert_pointer_settled(&f, &ledger, &journal);
     }
 
     #[tokio::test]
@@ -7620,6 +7747,101 @@ mod tests {
             json!([])
         );
         assert!(f.log.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn recording_first_start_failure_dispatch_disarms_without_stop_or_late_segment() {
+        let mut f = fixture("recording-first-start-error-ack").await;
+        // One full-budget handle makes any retained blob or reservation visible.
+        f.blobs = BlobStore::new(BlobLimits {
+            max_blob_bytes: 4096,
+            max_total_bytes: 4096,
+            max_handles: 1,
+        })
+        .unwrap();
+        f.blobs.activate_scope(f.context().blob_scope()).unwrap();
+        enroll_recording_fixture(&f.page).await;
+        let owner = client_debt::OwnerDebtLedger::new(1, "scope".into());
+        f.page.client.install_debt_ledger(owner.clone()).unwrap();
+        f.page.client = f.page.client.owner_view(owner.clone()).unwrap();
+        let journal = owner
+            .operation(
+                client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&f.op).unwrap();
+        let actions = ClientActions::default();
+        assert!(actions.recording.lock().await.authority.is_none());
+        assert!(!actions.is_recording_armed().await.unwrap());
+        // No size: the real dispatch must reach begin_segment's read-only CDP
+        // probe before ffmpeg, filesystem output, or capture ownership exists.
+        let failure = journal
+            .scope(actions.execute(
+                f.context(),
+                "recording.start",
+                &json!({"identityScope":f.page.identity_scope}),
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error, ProtocolError::BrowserFailure);
+        assert_eq!(failure.effects, Effects::NotDispatched);
+        assert!(!failure.cleanup_failed);
+        assert_eq!(failure.reason, None);
+        assert!(!journal.snapshot().mutation_dispatched);
+        let requests = f.log.lock().unwrap().clone();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "Page.getLayoutMetrics");
+        assert_eq!(requests[0]["sessionId"], "page");
+        assert_eq!(requests[0]["params"], json!({}));
+        assert!(f.replies.lock().unwrap().iter().any(|entry| {
+            entry["request"] == requests[0]
+                && entry["reply"]
+                    == json!({"id":requests[0]["id"],"sessionId":"page",
+                        "error":{"code":-32000,"message":"synthetic recording startup failure"}})
+        }));
+        // The real reader acknowledged the error. NotDispatched means no
+        // mutation, not no request, nor an unacknowledged command being forgiven.
+        assert_eq!(f.page.client.pending_len().await, 0);
+        let settled = owner.snapshot();
+        assert_eq!(settled.outstanding_commands, 0);
+        assert_eq!(settled.input_debt, 0);
+        assert_eq!(settled.object_debt, 0);
+        assert!(!settled.integrity_lost);
+        {
+            let ledger = actions.recording.lock().await;
+            assert!(!ledger.armed);
+            assert!(ledger.current.is_none());
+            assert!(ledger.finished.is_empty());
+            assert_eq!(ledger.ordinal, 0);
+            assert!(ledger.lost.is_none());
+            assert!(!ledger.cleanup_failed);
+            assert!(!ledger.filesystem_cleanup_failed);
+            // Lightweight attempt authority/options are not segment ownership.
+            assert!(ledger.authority.is_some());
+        }
+        assert!(f.page.targets.auxiliary_cleanup_complete().unwrap());
+        drop(f.blobs.reserve_producer(f.context().blob_scope()).unwrap());
+        actions.recording_page_opened(f.context()).await.unwrap();
+        assert_eq!(*f.log.lock().unwrap(), requests);
+        assert_eq!(
+            collect_recording(&actions, &f).await.unwrap(),
+            json!({"identityScope":"scope","segments":[]})
+        );
+        // Neither failed-start cleanup, the late hook, nor explicit collection
+        // may start or stop a capture that never existed.
+        assert_eq!(*f.log.lock().unwrap(), requests);
+        assert!(!actions.is_recording_armed().await.unwrap());
+        assert!(actions.recording.lock().await.current.is_none());
+        assert!(actions.recording.lock().await.finished.is_empty());
+        assert!(f.page.targets.auxiliary_cleanup_complete().unwrap());
+        assert_eq!(f.page.client.pending_len().await, 0);
+        assert_eq!(owner.snapshot(), settled);
+        drop(f.blobs.reserve_producer(f.context().blob_scope()).unwrap());
+        f.blobs.check_budget_integrity().unwrap();
     }
     async fn enroll_recording_fixture(page: &BrowserExecutionLease) {
         page.targets
