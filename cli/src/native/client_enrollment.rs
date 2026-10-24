@@ -785,6 +785,22 @@ impl SettledInputAuthority {
     }
 }
 
+/// A failed worker is never initialized. Only its independently proven gone
+/// attachment can release responsibility without poisoning unrelated targets.
+#[derive(Debug)]
+enum InitializationOutcome {
+    Initialized,
+    FailedRetired(super::cdp::client::ServiceWorkerStartupFailure),
+}
+impl InitializationOutcome {
+    fn result(self) -> Result<(), ProtocolError> {
+        match self {
+            Self::Initialized => Ok(()),
+            Self::FailedRetired(failure) => Err(failure.error()),
+        }
+    }
+}
+
 #[derive(Default)]
 struct ContainmentState {
     task: Option<JoinHandle<Result<(), ProtocolError>>>,
@@ -2818,11 +2834,11 @@ impl ClientEnrollment {
             super::client_settlement_trace::DiagnosticTargetOrigin::InitialDiscovery,
             op.sequence,
         );
-        let result = self.initialize(entry, op).await;
+        let result = self.initialize_observed(entry, op, None).await;
         if let Err(error) = &result {
             self.poison(error.clone());
         }
-        result
+        result.and_then(InitializationOutcome::result)
     }
     fn diagnostic_registration(
         &self,
@@ -2946,22 +2962,57 @@ impl ClientEnrollment {
         self.changed.notify_waiters();
         Ok(Some(entry))
     }
+    #[cfg(test)]
     async fn initialize(
         &self,
         entry: Attribution,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
-        self.initialize_observed(entry, op, None).await
+        self.initialize_observed(entry, op, None)
+            .await
+            .and_then(InitializationOutcome::result)
     }
     async fn initialize_observed(
         &self,
         entry: Attribution,
         op: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<InitializationOutcome, ProtocolError> {
+        // Retain only the existing bounded diagnostic fields before an event
+        // can remove this attachment. Diagnostics grant no retirement authority.
+        let diagnostic = super::client_settlement_trace::inventory_enabled()
+            .then(|| {
+                self.targets
+                    .owned_target(&entry.target)
+                    .ok()
+                    .and_then(|target| target.diagnostic_snapshot())
+            })
+            .flatten();
         let result = self.initialize_inner(entry.clone(), op, admission).await;
-        let Err(error) = result else {
-            return Ok(());
+        let error = match result {
+            Ok(InitializationOutcome::Initialized) => {
+                return Ok(InitializationOutcome::Initialized)
+            }
+            Ok(InitializationOutcome::FailedRetired(failure)) => {
+                if let Some(mut value) = diagnostic {
+                    value.generation = op.generation;
+                    value.stage =
+                        super::client_settlement_trace::DiagnosticTargetStage::ConfigureFailed;
+                    super::client_settlement_trace::target_lifecycle(
+                        op.generation,
+                        op.sequence,
+                        value,
+                        Some(failure.error()),
+                    );
+                } else if super::client_settlement_trace::inventory_enabled() {
+                    super::client_settlement_trace::target_observation_lost(
+                        op.generation,
+                        op.sequence,
+                    );
+                }
+                return Ok(InitializationOutcome::FailedRetired(failure));
+            }
+            Err(error) => error,
         };
         self.targets.diagnostic_step(
             &entry.target,
@@ -2997,7 +3048,7 @@ impl ClientEnrollment {
                 if index.retired_page_sessions.contains(&entry.root)
                     && !index.sessions.contains_key(&entry.session)
                 {
-                    return Ok(());
+                    return Ok(InitializationOutcome::Initialized);
                 }
             }
             // A close attempt alone is not proof. Only an observed detach of
@@ -3018,7 +3069,7 @@ impl ClientEnrollment {
         mut entry: Attribution,
         op: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<InitializationOutcome, ProtocolError> {
         self.targets.diagnostic_step(
             &entry.target,
             (op.generation, op.sequence),
@@ -3032,7 +3083,7 @@ impl ClientEnrollment {
         )
         .await?;
         if purpose == TargetPurpose::StateBootstrap {
-            return Ok(());
+            return Ok(InitializationOutcome::Initialized);
         }
         let lease = self.lease(&entry)?;
         let _config = ServiceWorkerAdmission::observe(
@@ -3104,13 +3155,30 @@ impl ClientEnrollment {
             // before Chromium can create the renderer that acknowledges domains.
             // This opens only network callbacks, not target readiness or capture.
             self.network.configuration_committed(&entry.session, op)?;
-            match bounded(
-                op,
-                self.network
-                    .initialize_service_worker_observation(&entry.session, op),
-            )
-            .await?
-            {
+            let startup = bounded(op, async {
+                Ok(self
+                    .network
+                    .initialize_service_worker_observation(&entry.session, op)
+                    .await)
+            })
+            .await?;
+            let outcome = match startup {
+                Ok(outcome) => outcome,
+                Err(mut failure) => {
+                    let Some(retirement) = failure.take_retirement() else {
+                        return Err(failure.error());
+                    };
+                    let retired = self
+                        .finish_retired_worker_startup(&entry, retirement, permit, op)
+                        .await;
+                    if let Err(error) = retired {
+                        self.network.quarantine_worker_startup()?;
+                        return Err(error);
+                    }
+                    return Ok(InitializationOutcome::FailedRetired(failure));
+                }
+            };
+            match outcome {
                 super::cdp::client::ServiceWorkerStartupOutcome::Ready(receipt) => {
                     #[cfg(test)]
                     self.pause_capture_at(CaptureTestPoint::BeforeWorkerReadyCommit, op)
@@ -3125,7 +3193,8 @@ impl ClientEnrollment {
                                 op,
                                 &lease.permit,
                             )
-                            .await;
+                            .await
+                            .map(|()| InitializationOutcome::Initialized);
                     }
                     // Unmanaged mock/CDP callers have no retirement authority.
                     permit.complete()?;
@@ -3133,7 +3202,8 @@ impl ClientEnrollment {
                 super::cdp::client::ServiceWorkerStartupOutcome::Retired(retirement) => {
                     return self
                         .finish_retired_worker_startup(&entry, retirement, permit, op)
-                        .await;
+                        .await
+                        .map(|()| InitializationOutcome::Initialized);
                 }
             }
         } else {
@@ -3250,7 +3320,7 @@ impl ClientEnrollment {
             }
         }
         self.changed.notify_waiters();
-        Ok(())
+        Ok(InitializationOutcome::Initialized)
     }
     /// Preserve the all-success proof until a non-consuming final decision.
     /// Normal readiness and the enrollment resumed bit share the index fence;
@@ -3408,7 +3478,9 @@ impl ClientEnrollment {
                             // A reader may unbind just after the earlier index
                             // snapshot but before its event enters this pump.
                             // Wait only for the original tenure; never a reused ID.
-                            if !retirement.all_acknowledged()
+                            if retirement.failed_terminal() && retirement.publication_pending()? {
+                                publication_pending = true;
+                            } else if !retirement.all_acknowledged()
                                 || !permit.original_worker_attachment_present()? {
                                 return Err(ProtocolError::StaleReference);
                             }
@@ -3712,7 +3784,7 @@ impl ClientEnrollment {
                     break Ok(());
                 },
                 completed = tasks.join_next(), if !tasks.is_empty() => {
-                    match completed { Some(Ok(Ok(()))) => {}, Some(Ok(Err(error))) => break Err(error), Some(Err(_)) => break Err(ProtocolError::BrowserFailure), None=>{} }
+                    match completed { Some(Ok(Ok(InitializationOutcome::Initialized))) => {}, Some(Ok(Ok(InitializationOutcome::FailedRetired(_failure)))) => {}, Some(Ok(Err(error))) => break Err(error), Some(Err(_)) => break Err(ProtocolError::BrowserFailure), None=>{} }
                 },
                 event = events.recv() => {
                     let event = match event {
@@ -3741,7 +3813,7 @@ impl ClientEnrollment {
                         let pending=match self.register_pending_event(&event) { Ok(pending)=>pending, Err(error)=>break Err(error) };
                         let owner = self.clone();
                         tasks.spawn(async move {
-                            let result = owner.attached((*event).clone()).await;
+                            let result = owner.attached_observed((*event).clone()).await;
                             if let Err(error)=&result { owner.poison(error.clone()); }
                             if let Some(session)=pending {
                                 owner.index.lock().map_err(|_|ProtocolError::ScopeUnavailable)?.pending_enrollment.remove(&session);
@@ -3800,8 +3872,12 @@ impl ClientEnrollment {
             None
         };
         while let Some(completed) = tasks.join_next().await {
-            if !matches!(completed, Ok(Ok(())) | Ok(Err(ProtocolError::Cancelled)))
-                && result.is_ok()
+            if !matches!(
+                completed,
+                Ok(Ok(
+                    InitializationOutcome::Initialized | InitializationOutcome::FailedRetired(_)
+                )) | Ok(Err(ProtocolError::Cancelled))
+            ) && result.is_ok()
             {
                 self.poison(ProtocolError::CleanupFailed);
             }
@@ -4404,7 +4480,16 @@ impl ClientEnrollment {
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             .clone())
     }
+    #[cfg(test)]
     async fn attached(&self, event: CdpEvent) -> Result<(), ProtocolError> {
+        self.attached_observed(event)
+            .await
+            .and_then(InitializationOutcome::result)
+    }
+    async fn attached_observed(
+        &self,
+        event: CdpEvent,
+    ) -> Result<InitializationOutcome, ProtocolError> {
         #[cfg(test)]
         self.pause_capture_at(
             CaptureTestPoint::BeforeAttachedProcessing,
@@ -4473,7 +4558,8 @@ impl ClientEnrollment {
             if pending_blank && !blank_matches {
                 return self
                     .detach_foreign(&session, event.session_id.as_deref())
-                    .await;
+                    .await
+                    .map(|()| InitializationOutcome::Initialized);
             }
             if matches!(self.ownership, ScopeOwnership::BorrowedTargets(_)) {
                 if let Err(error) = bounded(
@@ -4485,7 +4571,7 @@ impl ClientEnrollment {
                     self.detach_foreign(&session, event.session_id.as_deref())
                         .await?;
                     return if error == ProtocolError::Cancelled {
-                        Ok(())
+                        Ok(InitializationOutcome::Initialized)
                     } else {
                         Err(error)
                     };
@@ -4516,7 +4602,8 @@ impl ClientEnrollment {
             // root. Detach this connection's session, never adopt it as new.
             return self
                 .detach_foreign(&session, event.session_id.as_deref())
-                .await;
+                .await
+                .map(|()| InitializationOutcome::Initialized);
         }
         if context == self.targets.context_id
             && matches!(self.ownership, ScopeOwnership::BorrowedTargets(_))
@@ -4538,7 +4625,8 @@ impl ClientEnrollment {
                         .get("waitingForDebugger")
                         .and_then(Value::as_bool),
                 )
-                .await;
+                .await
+                .map(|()| InitializationOutcome::Initialized);
         }
         if context != self.targets.context_id
             || !self.authorized(
@@ -4549,7 +4637,8 @@ impl ClientEnrollment {
         {
             return self
                 .detach_foreign(&session, event.session_id.as_deref())
-                .await;
+                .await
+                .map(|()| InitializationOutcome::Initialized);
         }
         // Stored scope failure takes precedence over retirement cancellation.
         // Foreign cleanup above must remain live even for a poisoned scope.
@@ -4576,7 +4665,9 @@ impl ClientEnrollment {
         )
         .await?;
         match auxiliary {
-            super::client_targets::AuxiliaryDisposition::RecorderOwned => return Ok(()),
+            super::client_targets::AuxiliaryDisposition::RecorderOwned => {
+                return Ok(InitializationOutcome::Initialized)
+            }
             super::client_targets::AuxiliaryDisposition::Ordinary => {}
         }
         #[cfg(test)]
@@ -4603,10 +4694,11 @@ impl ClientEnrollment {
                     .sessions
                     .contains_key(&session);
                 if same {
-                    Ok(())
+                    Ok(InitializationOutcome::Initialized)
                 } else {
                     self.detach_foreign(&session, event.session_id.as_deref())
                         .await
+                        .map(|()| InitializationOutcome::Initialized)
                 }
             }
         }
@@ -4949,6 +5041,13 @@ impl ClientEnrollment {
                     .map_err(|_| ProtocolError::ScopeUnavailable)?;
                 if let Some(entry) = index.sessions.get(session) {
                     if entry.kind == "service_worker" && !entry.observation_only {
+                        // An omitted targetId is valid CDP; a conflicting or
+                        // malformed supplied value cannot prove exact detach.
+                        if let Some(target) = event.params.get("targetId") {
+                            if target.as_str() != Some(entry.target.as_str()) {
+                                return Err(ProtocolError::InvalidFrame);
+                            }
+                        }
                         self.targets
                             .observe_worker_detach(&entry.target, &entry.session)?;
                     }
@@ -12815,6 +12914,120 @@ mod tests {
             ]
         );
         assert_eq!(cleanup, Ok(()));
+        assert!(
+            matches!(peer, Ok(Ok(()))),
+            "owned peer did not finish: {peer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_worker_detach_rejects_conflicting_target_identity() {
+        let (owner, _notices, _log, _emit, server) = fixture("normal").await;
+        owner
+            .register(
+                "owned-context",
+                "worker-target",
+                "worker-session",
+                "service_worker",
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let original = owner.targets.owned_target("worker-target").unwrap();
+        for target in [json!("other-target"), json!(null), json!(17)] {
+            assert_eq!(
+                owner.event(&CdpEvent {
+                    method: "Target.detachedFromTarget".into(),
+                    session_id: None,
+                    params: json!({"sessionId":"worker-session", "targetId":target}),
+                }),
+                Err(ProtocolError::InvalidFrame)
+            );
+            assert!(original.same_attachment(&owner.targets.owned_target("worker-target").unwrap()));
+            assert!(owner
+                .index
+                .lock()
+                .unwrap()
+                .sessions
+                .contains_key("worker-session"));
+        }
+        // The protocol's omitted optional targetId remains an exact-session detach.
+        owner
+            .event(&CdpEvent {
+                method: "Target.detachedFromTarget".into(),
+                session_id: None,
+                params: json!({"sessionId":"worker-session"}),
+            })
+            .unwrap();
+        assert!(owner.targets.owned_target("worker-target").is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn service_worker_failed_terminal_target_destroyed_alone_fails_promptly() {
+        let (owner, _notices, _log, emit, mut server, _broker, connection) =
+            fixture_with_client("sw-startup-observer-fails", true).await;
+        let ledger = owner.client.debt_ledger().unwrap();
+        let (deciding, release) = owner.client.hold_worker_startup_decision();
+        owner.ensure_supervisor().await.unwrap();
+        let attached = attach(
+            "owned-context",
+            "worker-target",
+            "worker-session",
+            "service_worker",
+            None,
+        );
+        emit.send(json!({"method":attached.method,"params":attached.params}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), deciding)
+            .await
+            .unwrap()
+            .unwrap();
+        let watermark = owner.realm_watermark().unwrap();
+        let before = watermark.received().unwrap();
+        emit.send(json!({"method":"Target.targetDestroyed","params":{"targetId":"worker-target"}}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let received = watermark.received().unwrap();
+                if received > before && owner.index.lock().unwrap().applied_watermark >= received {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        release.send(()).unwrap();
+        // A caught-up unrelated retirement cannot wait until some later exact
+        // detach makes this error harmless. No such detach is ever supplied.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while owner.index.lock().unwrap().failure.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unproven failed retirement must fail promptly");
+        assert!(owner.targets.check_settlement_integrity().is_err());
+        assert!(owner
+            .network
+            .check_worker_startup(&owner.operation())
+            .is_err());
+        assert!(!owner
+            .targets
+            .owned_target("worker-target")
+            .is_ok_and(|target| target.capture_ready()));
+        let _ = owner.close().await;
+        connection.close().await;
+        let peer = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        if peer.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
         assert!(
             matches!(peer, Ok(Ok(()))),
             "owned peer did not finish: {peer:?}"

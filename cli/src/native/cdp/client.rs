@@ -76,6 +76,66 @@ impl WorkerStartupReply {
     }
 }
 
+/// A real startup failure remains an error even when its exact attachment
+/// may retire. The optional non-cloneable receipt grants no readiness authority.
+#[derive(Debug)]
+pub(crate) struct ServiceWorkerStartupFailure {
+    message: String,
+    error: ProtocolError,
+    retirement: Option<WorkerStartupRetirement>,
+}
+impl ServiceWorkerStartupFailure {
+    pub(crate) fn error(&self) -> ProtocolError {
+        self.error.clone()
+    }
+    pub(crate) fn fail_closed(mut self, error: ProtocolError) -> Self {
+        self.error = error;
+        self.retirement = None;
+        self
+    }
+    pub(crate) fn has_retirement(&self) -> bool {
+        self.retirement.is_some()
+    }
+    pub(crate) fn take_retirement(&mut self) -> Option<WorkerStartupRetirement> {
+        self.retirement.take()
+    }
+}
+impl From<String> for ServiceWorkerStartupFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            error: ProtocolError::BrowserFailure,
+            retirement: None,
+        }
+    }
+}
+impl From<&str> for ServiceWorkerStartupFailure {
+    fn from(message: &str) -> Self {
+        message.to_owned().into()
+    }
+}
+impl From<ProtocolError> for ServiceWorkerStartupFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self {
+            message: format!("{error:?}"),
+            error,
+            retirement: None,
+        }
+    }
+}
+impl std::fmt::Display for ServiceWorkerStartupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+#[cfg(test)]
+impl std::ops::Deref for ServiceWorkerStartupFailure {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.message
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum ServiceWorkerStartupOutcome {
     Ready(Option<WorkerStartupRetirement>),
@@ -110,6 +170,12 @@ impl std::fmt::Debug for WorkerStartupRetirement {
     }
 }
 impl WorkerStartupRetirement {
+    pub(crate) fn failed_terminal(&self) -> bool {
+        self.provenance == WorkerStartupStatusProvenance::FailedTerminal
+    }
+    pub(crate) fn publication_pending(&self) -> Result<bool, ProtocolError> {
+        self.owner.worker_startup_publication_pending()
+    }
     pub(crate) fn all_acknowledged(&self) -> bool {
         self.provenance == WorkerStartupStatusProvenance::AllAcknowledged
     }
@@ -1427,7 +1493,7 @@ impl CdpClient {
         network_params: Value,
         bypass_service_worker: bool,
         deadline: std::time::Instant,
-    ) -> Result<ServiceWorkerStartupOutcome, String> {
+    ) -> Result<ServiceWorkerStartupOutcome, ServiceWorkerStartupFailure> {
         if session.is_empty() {
             return Err("Service-worker initialization requires an exact session".into());
         }
@@ -1517,8 +1583,8 @@ impl CdpClient {
                     if *cancellation.borrow() != super::super::client_session::CancelSignal::None {
                         WorkerStartupReply::Cancelled
                     } else {
-                        // A cancellation racing a buffered error ACK may be
-                        // the reported hard failure. Neither outcome can retire.
+                        // Cancellation racing a buffered error ACK remains a
+                        // hard failure, never a retirement candidate.
                         tokio::select! { biased;
                             _ = cancellation.changed() => WorkerStartupReply::Cancelled,
                             _ = tokio::time::sleep_until(bound.into()) => WorkerStartupReply::Deadline,
@@ -1545,6 +1611,7 @@ impl CdpClient {
         let mut disqualifying_failure = !errors.is_empty() || !complete;
         let mut eligible = errors.is_empty() && complete && same_budget;
         let mut destroyed = false;
+        let mut error_ack = false;
         let mut statuses = Vec::with_capacity(4);
         for (method, reply, status) in results {
             if let Some(error) = reply.error(method) {
@@ -1552,6 +1619,10 @@ impl CdpClient {
             }
             let required = match reply {
                 WorkerStartupReply::Success => CommandStatus::Acknowledged,
+                WorkerStartupReply::ErrorAck(_) => {
+                    error_ack = true;
+                    CommandStatus::Acknowledged
+                }
                 WorkerStartupReply::ChannelClosed => {
                     destroyed = true;
                     CommandStatus::Destroyed
@@ -1571,7 +1642,7 @@ impl CdpClient {
         // Preserve every delivered real error/local failure before considering
         // retirement or a later owner/connection change.
         if disqualifying_failure {
-            return Err(errors.join("; "));
+            return Err(errors.join("; ").into());
         }
         if self.check_cleanup_owner(&expected).is_err() {
             errors.push("Native CDP owner changed".into());
@@ -1602,6 +1673,33 @@ impl CdpClient {
         if !same_budget {
             errors.push("Service-worker startup initialization budget changed".into());
         }
+        // The joined batch still fails. Only an already unbound original
+        // session may carry retire-only responsibility to enrollment; a live
+        // error cannot wait here for some arbitrary future detach.
+        if error_ack {
+            let retirement = if eligible
+                && expected.as_ref().is_some_and(|owner| {
+                    owner
+                        .worker_startup_session_unbound(session)
+                        .unwrap_or(false)
+                }) {
+                expected.map(|owner| WorkerStartupRetirement {
+                    owner,
+                    session: session.into(),
+                    statuses,
+                    deadline,
+                    initialization,
+                    provenance: WorkerStartupStatusProvenance::FailedTerminal,
+                })
+            } else {
+                None
+            };
+            return Err(ServiceWorkerStartupFailure {
+                message: errors.join("; "),
+                error: ProtocolError::BrowserFailure,
+                retirement,
+            });
+        }
         if errors.is_empty() && complete {
             return Ok(ServiceWorkerStartupOutcome::Ready(expected.map(|owner| {
                 WorkerStartupRetirement {
@@ -1628,7 +1726,7 @@ impl CdpClient {
                 ));
             }
         }
-        Err(errors.join("; "))
+        Err(errors.join("; ").into())
     }
 
     /// Synchronous owner/status fence shared by normal Ready completion and
@@ -2843,7 +2941,7 @@ mod tests {
         requests: &mut mpsc::UnboundedReceiver<Value>,
         deadline: std::time::Instant,
     ) -> (
-        JoinHandle<Result<ServiceWorkerStartupOutcome, String>>,
+        JoinHandle<Result<ServiceWorkerStartupOutcome, ServiceWorkerStartupFailure>>,
         Vec<Value>,
     ) {
         let startup = tokio::spawn(async move {
@@ -3960,6 +4058,101 @@ mod tests {
         assert!(requests.try_recv().is_err());
         client.close().await;
         peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_worker_failed_terminal_preserves_errors_and_refuses_ready_authority() {
+        use crate::native::client_session::OperationLease;
+        use crate::native::client_targets::ClientTargets;
+        for detached in [false, true] {
+            let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (view, ledger, cancel) = service_worker_test_owner(&client, deadline);
+            let targets = ClientTargets::new("worker-context".into(), "worker-owner".into());
+            targets.bind_eval_owner(&ledger, 1).unwrap();
+            targets
+                .attached(
+                    "worker-context",
+                    "worker-target".into(),
+                    "worker-session".into(),
+                    "service_worker".into(),
+                )
+                .unwrap();
+            let mut permit = targets
+                .service_worker_startup_permit("worker-target", "worker-session")
+                .await
+                .unwrap();
+            let (deciding, release) = client.hold_worker_startup_decision();
+            let (startup, sent) =
+                service_worker_retirement_batch(view.clone(), &mut requests, deadline).await;
+            for request in &sent {
+                replies
+                    .send(service_worker_response(request, true))
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), deciding)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(ledger.snapshot().outstanding_commands, 0);
+            if detached {
+                let mut events = client.subscribe();
+                service_worker_retirement_event(&replies, &mut events,
+                    json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})).await;
+            }
+            release.send(()).unwrap();
+            let mut failure = tokio::time::timeout(Duration::from_secs(2), startup)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            for method in [
+                "Network.enable",
+                "Runtime.enable",
+                "Runtime.runIfWaitingForDebugger",
+            ] {
+                assert!(
+                    failure.contains(&format!("{method}: CDP error ({method})")),
+                    "{failure}"
+                );
+            }
+            assert!(failure.contains("observation failed"));
+            assert_eq!(failure.has_retirement(), detached);
+            if let Some(receipt) = failure.take_retirement() {
+                assert!(receipt.failed_terminal());
+                assert!(!receipt.all_acknowledged());
+                assert!(receipt.statuses.iter().all(|(status, expected)| *expected
+                    == CommandStatus::Acknowledged
+                    && status.snapshot() == *expected));
+                assert_eq!(
+                    view.try_finish_acknowledged_worker_startup(
+                        receipt,
+                        &targets,
+                        &mut permit,
+                        &OperationLease {
+                            is_callback: false,
+                            generation: 1,
+                            sequence: 0,
+                            deadline,
+                            cancellation: cancel.subscribe()
+                        },
+                        "worker-target",
+                        "worker-session"
+                    )
+                    .err(),
+                    Some(ProtocolError::StaleScope)
+                );
+            }
+            assert!(!targets
+                .owned_target("worker-target")
+                .unwrap()
+                .capture_ready());
+            drop(permit);
+            assert!(!ledger.snapshot().integrity_lost);
+            assert!(requests.try_recv().is_err());
+            client.close().await;
+            peer.await.unwrap();
+        }
     }
 
     #[tokio::test]

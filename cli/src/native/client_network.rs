@@ -555,7 +555,10 @@ impl ClientNetwork {
         &self,
         session: &str,
         operation: &OperationLease,
-    ) -> Result<super::cdp::client::ServiceWorkerStartupOutcome, ProtocolError> {
+    ) -> Result<
+        super::cdp::client::ServiceWorkerStartupOutcome,
+        super::cdp::client::ServiceWorkerStartupFailure,
+    > {
         self.check_worker_startup(operation)?;
         let bypass_service_worker = self
             .policy
@@ -569,15 +572,29 @@ impl ClientNetwork {
             operation.deadline,
         ).await;
         match result {
-            Err(_) => {
-                self.broker.quarantine()?;
-                Err(ProtocolError::BrowserFailure)
+            Err(failure) => {
+                // Defer quarantine only for a still-valid failed-terminal
+                // candidate. Never clear quarantine or replace its CDP message.
+                let check = if failure.has_retirement() {
+                    self.check_worker_startup(operation)
+                } else {
+                    Err(failure.error())
+                };
+                if let Err(error) = check {
+                    let error = self.broker.quarantine().err().unwrap_or(error);
+                    return Err(failure.fail_closed(error));
+                }
+                Err(failure)
             }
             Ok(outcome) => {
                 self.check_worker_startup(operation)?;
                 Ok(outcome)
             }
         }
+    }
+
+    pub(crate) fn quarantine_worker_startup(&self) -> Result<(), ProtocolError> {
+        self.broker.quarantine()
     }
 
     async fn prepare_session(

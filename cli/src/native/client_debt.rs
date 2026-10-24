@@ -651,6 +651,7 @@ pub(crate) enum CommandStatus {
 pub(super) enum WorkerStartupStatusProvenance {
     AllAcknowledged,
     IncludesDestroyed,
+    FailedTerminal,
 }
 /// One synchronous proof decision; pending publication grants no authority.
 pub(super) enum WorkerStartupProof<T> {
@@ -931,6 +932,9 @@ impl OwnerDebtLedger {
             || statuses.is_empty()
             || statuses.len() > 4
             || match provenance {
+                WorkerStartupStatusProvenance::FailedTerminal => !statuses
+                    .iter()
+                    .any(|(_, expected)| *expected == CommandStatus::Acknowledged),
                 WorkerStartupStatusProvenance::AllAcknowledged => statuses
                     .iter()
                     .any(|(_, expected)| *expected != CommandStatus::Acknowledged),
@@ -960,7 +964,7 @@ impl OwnerDebtLedger {
             None if !state.targets.values().any(|known| known == target) => false,
             _ => return Err(ProtocolError::StaleScope),
         };
-        if bound && provenance == WorkerStartupStatusProvenance::IncludesDestroyed {
+        if bound && provenance != WorkerStartupStatusProvenance::AllAcknowledged {
             return Err(ProtocolError::StaleScope);
         }
         if state.eval_publication_pending {
@@ -968,6 +972,21 @@ impl OwnerDebtLedger {
         }
         invalidate_eval(&mut state);
         commit(bound).map(WorkerStartupProof::Committed)
+    }
+    /// Candidate classification only. Absence cannot complete retirement:
+    /// enrollment still requires its exact applied detach and original tenure.
+    pub(super) fn worker_startup_session_unbound(
+        &self,
+        session: &str,
+    ) -> Result<bool, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired || state.integrity_lost {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(!state.targets.contains_key(session))
     }
     pub(super) fn worker_startup_publication_notifier(&self) -> Arc<tokio::sync::Notify> {
         self.changed.clone()

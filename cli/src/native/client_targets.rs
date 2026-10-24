@@ -32,7 +32,7 @@ struct AttachmentTenure {
     observed_detach: AtomicBool,
 }
 impl OwnedTarget {
-    fn diagnostic_snapshot(&self) -> Option<diagnostic::DiagnosticAttachment> {
+    pub(super) fn diagnostic_snapshot(&self) -> Option<diagnostic::DiagnosticAttachment> {
         let mut value = self.diagnostic?;
         value.kind = diagnostic::DiagnosticTargetKind::from_native(&self.kind);
         value.purpose = match self.purpose {
