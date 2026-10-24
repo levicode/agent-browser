@@ -39,10 +39,11 @@ mod restart_readiness {
     }
 
     async fn acknowledge(f: &CaptureWireFixture, request: &Value) {
-        f.emit
-            .send(json!({"id":request["id"], "result":{}}))
-            .await
-            .unwrap();
+        let mut response = json!({"id":request["id"], "result":{}});
+        if let Some(session) = request.get("sessionId") {
+            response["sessionId"] = session.clone();
+        }
+        f.emit.send(response).await.unwrap();
     }
 
     fn publish(
@@ -190,7 +191,11 @@ mod restart_readiness {
         let waiting = f.gate(CaptureTestPoint::RestartWaiting);
         let task = publish(&f, op, published.clone());
         waiting.wait_entered().await;
-        f.emit.send(json!({"id":request["id"], "error":{"code":-32000,"message":"synthetic configure failure"}})).await.unwrap();
+        let mut response = json!({"id":request["id"], "error":{"code":-32000,"message":"synthetic configure failure"}});
+        if let Some(session) = request.get("sessionId") {
+            response["sessionId"] = session.clone();
+        }
+        f.emit.send(response).await.unwrap();
         assert_eq!(task.await.unwrap(), Err(ProtocolError::BrowserFailure));
         assert!(!published.load(Ordering::SeqCst));
         assert!(f.owner.targets.inventory_diagnostic().sealed);

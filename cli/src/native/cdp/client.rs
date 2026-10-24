@@ -18,8 +18,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 
 use super::super::client_debt::{
-    current_operation, CommandReservation, OwnerCleanupCommand, OwnerDebtLedger, ReservedDisposal,
-    SubmittedCommand,
+    current_operation, CommandReservation, CommandStatus, CommandStatusHandle, OwnerCleanupCommand,
+    OwnerDebtLedger, ReservedDisposal, SubmittedCommand, WorkerStartupProof,
+    WorkerStartupStatusProvenance,
 };
 use super::super::client_protocol::ProtocolError;
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
@@ -32,10 +33,129 @@ struct DisposalWork {
 }
 
 struct PendingResponse {
-    sender: oneshot::Sender<CdpMessage>,
+    sender: oneshot::Sender<CommandReply>,
     session: Option<String>,
 }
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+
+// Only the real reader constructs ErrorAck. Local decoder failures retain their
+// old public String projection, but cannot masquerade as a remote error ACK.
+#[derive(Debug)]
+enum CommandReply {
+    Success(Value),
+    ErrorAck(CdpError),
+    LocalFailure(CdpMessage),
+}
+enum CommandWaitFailure {
+    ChannelClosed,
+    Deadline,
+}
+enum WorkerStartupReply {
+    Success,
+    ErrorAck(CdpError),
+    ChannelClosed,
+    ResponseDeadline,
+    Deadline,
+    Cancelled,
+    Unknown(CdpMessage),
+}
+impl WorkerStartupReply {
+    fn error(&self, method: &str) -> Option<String> {
+        Some(match self {
+            Self::Success => return None,
+            Self::ErrorAck(error) => format!("CDP error ({method}): {error}"),
+            Self::ChannelClosed => "CDP response channel closed".into(),
+            Self::ResponseDeadline => format!("CDP command timed out: {method}"),
+            Self::Deadline => "Native initialization deadline expired".into(),
+            Self::Cancelled => "Native initialization cancelled".into(),
+            Self::Unknown(response) => match &response.error {
+                Some(error) => format!("CDP error ({method}): {error}"),
+                None => format!("Unverified CDP response ({method})"),
+            },
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ServiceWorkerStartupOutcome {
+    Ready(Option<WorkerStartupRetirement>),
+    Retired(WorkerStartupRetirement),
+}
+/// Local decisions only; an in-flight publication is distinct from detach.
+#[derive(Debug)]
+pub(crate) enum WorkerStartupDecision {
+    ReadyCommitted(Option<super::super::client_settlement_trace::DiagnosticAttachment>),
+    RetiredCommitted,
+    AwaitDetach(WorkerStartupRetirement),
+    AwaitPublication(WorkerStartupRetirement),
+}
+
+/// A candidate, not enrollment completion or script success. Only the fixed
+/// startup batch can mint this original-owner receipt. It cannot be cloned.
+pub(crate) struct WorkerStartupRetirement {
+    owner: Arc<OwnerDebtLedger>,
+    session: String,
+    statuses: Vec<(CommandStatusHandle, CommandStatus)>,
+    deadline: std::time::Instant,
+    initialization: Option<(
+        std::time::Instant,
+        watch::Receiver<super::super::client_session::CancelSignal>,
+    )>,
+    provenance: WorkerStartupStatusProvenance,
+}
+impl std::fmt::Debug for WorkerStartupRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WorkerStartupRetirement")
+            .finish_non_exhaustive()
+    }
+}
+impl WorkerStartupRetirement {
+    pub(crate) fn all_acknowledged(&self) -> bool {
+        self.provenance == WorkerStartupStatusProvenance::AllAcknowledged
+    }
+    fn check_operation(
+        &self,
+        operation: &super::super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check_bound()?;
+        if *operation.cancellation.borrow() != super::super::client_session::CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+    pub(crate) fn deadline(&self) -> std::time::Instant {
+        self.initialization
+            .as_ref()
+            .map_or(self.deadline, |(deadline, _)| self.deadline.min(*deadline))
+    }
+    pub(crate) fn check_bound(&self) -> Result<(), ProtocolError> {
+        if self
+            .initialization
+            .as_ref()
+            .is_some_and(|(_, cancellation)| {
+                *cancellation.borrow() != super::super::client_session::CancelSignal::None
+            })
+        {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= self.deadline() {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        Ok(())
+    }
+    pub(crate) async fn cancelled(&mut self) {
+        if let Some((_, cancellation)) = &mut self.initialization {
+            if *cancellation.borrow() == super::super::client_session::CancelSignal::None {
+                let _ = cancellation.changed().await;
+            }
+        } else {
+            std::future::pending::<()>().await;
+        }
+    }
+}
 
 /// Only read-side EOF or peer-reset evidence may preserve EOF-only integrity.
 /// Timeouts, local/resource failures, and ambiguous aborts are not remote EOF.
@@ -199,6 +319,12 @@ pub struct BoundedEventWatermark {
     failed: Arc<AtomicBool>,
 }
 impl BoundedEventWatermark {
+    pub(crate) fn same_subscription(&self, other: &Self) -> bool {
+        self.id == other.id
+            && std::sync::Weak::ptr_eq(&self.routes, &other.routes)
+            && Arc::ptr_eq(&self.received, &other.received)
+            && Arc::ptr_eq(&self.failed, &other.failed)
+    }
     pub fn received(&self) -> Result<u64, &'static str> {
         self.with_received(|received| received)
     }
@@ -477,7 +603,7 @@ impl Drop for PendingGuard {
 /// A submitted command keeps its waiter guard until its real response is read.
 /// Dropping the waiter never removes the reader-owned submission/debt record.
 struct CommandResponse {
-    receiver: oneshot::Receiver<CdpMessage>,
+    receiver: oneshot::Receiver<CommandReply>,
     guard: PendingGuard,
 }
 
@@ -735,21 +861,23 @@ impl CdpClient {
                                     }
                                     let waiter = pending_clone.lock().await.remove(&id);
                                     if let Some(tx) = waiter {
-                                        let _ = tx.sender.send(CdpMessage {
-                                            id: Some(id),
-                                            result: None,
-                                            error: Some(CdpError {
-                                                code: None,
-                                                message: format!(
-                                                    "Malformed CDP response: {}",
-                                                    error
-                                                ),
-                                                data: None,
-                                            }),
-                                            method: None,
-                                            params: None,
-                                            session_id: None,
-                                        });
+                                        let _ = tx.sender.send(CommandReply::LocalFailure(
+                                            CdpMessage {
+                                                id: Some(id),
+                                                result: None,
+                                                error: Some(CdpError {
+                                                    code: None,
+                                                    message: format!(
+                                                        "Malformed CDP response: {}",
+                                                        error
+                                                    ),
+                                                    data: None,
+                                                }),
+                                                method: None,
+                                                params: None,
+                                                session_id: None,
+                                            },
+                                        ));
                                     }
                                 }
                                 continue;
@@ -797,7 +925,17 @@ impl CdpClient {
                         .map_or_else(Vec::new, |tracked| tracked.settle_for_delivery(&parsed));
                     // Delivery itself is the authority: is_closed() alone races
                     // receiver cancellation between inspection and send.
-                    let abandoned = waiter.is_none_or(|tx| tx.sender.send(parsed).is_err());
+                    let abandoned = waiter.is_none_or(|tx| {
+                        let reply = if valid_envelope && tx.session == parsed.session_id {
+                            match parsed.error {
+                                Some(error) => CommandReply::ErrorAck(error),
+                                None => CommandReply::Success(parsed.result.unwrap_or(Value::Null)),
+                            }
+                        } else {
+                            CommandReply::LocalFailure(parsed)
+                        };
+                        tx.sender.send(reply).is_err()
+                    });
                     for disposal in disposals {
                         if disposal.needed_after_delivery(abandoned) {
                             if let Ok(command) = disposal.reserve() {
@@ -1284,7 +1422,7 @@ impl CdpClient {
         network_params: Value,
         bypass_service_worker: bool,
         deadline: std::time::Instant,
-    ) -> Result<(), String> {
+    ) -> Result<ServiceWorkerStartupOutcome, String> {
         if session.is_empty() {
             return Err("Service-worker initialization requires an exact session".into());
         }
@@ -1313,6 +1451,7 @@ impl CdpClient {
                     .map_err(|_| "Native CDP owner changed".to_string())?;
                 let reservation =
                     self.reserve_tracked_command(method, Some(&params), Some(session))?;
+                let status = reservation.as_ref().map(CommandReservation::status);
                 let budget = reservation
                     .as_ref()
                     .and_then(CommandReservation::initialization_budget);
@@ -1327,39 +1466,297 @@ impl CdpClient {
                     ),
                 )
                 .await?;
-                Ok((response, budget))
+                Ok((response, budget, status))
             };
             let submitted = tokio::time::timeout_at(deadline.into(), submission)
                 .await
                 .map_err(|_| "Service-worker initialization deadline expired".to_string())
                 .and_then(|result| result);
             match submitted {
-                Ok((response, budget)) => responses.push((method, response, budget)),
+                Ok((response, budget, status)) => {
+                    responses.push((method, response, budget, status))
+                }
                 Err(error) => {
                     errors.push(format!("{method}: {error}"));
-                    // Never resume after an earlier local submission failure.
                     break;
                 }
             }
         }
-        // Do not try_join: one failed observation must not discard a sibling
-        // that was already submitted. Cancellation/drop still retains CDP debt.
+        let submitted_count = responses.len();
+        let complete = submitted_count == 3 + usize::from(bypass_service_worker);
+        let initialization = responses
+            .first()
+            .and_then(|(_, _, budget, _)| budget.clone());
+        let same_budget =
+            responses
+                .iter()
+                .all(|(_, _, budget, _)| match (&initialization, budget) {
+                    (None, None) => true,
+                    (Some((a, x)), Some((b, y))) => a == b && x.same_channel(y),
+                    _ => false,
+                });
+        // Every submitted sibling is joined, including after a local submission
+        // failure. Reader-owned debt and Destroyed's causal cutoff are unchanged.
         let results = futures_util::future::join_all(responses.into_iter().map(
-            |(method, response, budget)| async move {
-                within_initialization(
-                    budget,
-                    self.await_command_response(method, response, Some(deadline)),
-                )
-                .await
-                .map_err(|error| format!("{method}: {error}"))
+            |(method, response, budget, status)| async move {
+                let reply = async {
+                    match self.await_command_reply(response, Some(deadline)).await {
+                        Ok(CommandReply::Success(_)) => WorkerStartupReply::Success,
+                        Ok(CommandReply::ErrorAck(error)) => WorkerStartupReply::ErrorAck(error),
+                        Ok(CommandReply::LocalFailure(response)) => WorkerStartupReply::Unknown(response),
+                        Err(CommandWaitFailure::ChannelClosed) => WorkerStartupReply::ChannelClosed,
+                        Err(CommandWaitFailure::Deadline) => WorkerStartupReply::ResponseDeadline,
+                    }
+                };
+                let reply = if let Some((bound, mut cancellation)) = budget {
+                    if *cancellation.borrow() != super::super::client_session::CancelSignal::None {
+                        WorkerStartupReply::Cancelled
+                    } else {
+                        // A cancellation racing a buffered error ACK may be
+                        // the reported hard failure. Neither outcome can retire.
+                        tokio::select! { biased;
+                            _ = cancellation.changed() => WorkerStartupReply::Cancelled,
+                            _ = tokio::time::sleep_until(bound.into()) => WorkerStartupReply::Deadline,
+                            reply = reply => reply,
+                        }
+                    }
+                } else { reply.await };
+                (method, reply, status)
+            }
+        )).await;
+        let mut disqualifying_failure = !errors.is_empty() || !complete;
+        let mut eligible = errors.is_empty() && complete && same_budget;
+        let mut destroyed = false;
+        let mut statuses = Vec::with_capacity(4);
+        for (method, reply, status) in results {
+            if let Some(error) = reply.error(method) {
+                errors.push(format!("{method}: {error}"));
+            }
+            let required = match reply {
+                WorkerStartupReply::Success => CommandStatus::Acknowledged,
+                WorkerStartupReply::ChannelClosed => {
+                    destroyed = true;
+                    CommandStatus::Destroyed
+                }
+                _ => {
+                    eligible = false;
+                    disqualifying_failure = true;
+                    continue;
+                }
+            };
+            if let Some(status) = status.filter(|status| status.snapshot() == required) {
+                statuses.push((status, required));
+            } else {
+                eligible = false;
+            }
+        }
+        // Preserve every delivered real error/local failure before considering
+        // retirement or a later owner/connection change.
+        if disqualifying_failure {
+            return Err(errors.join("; "));
+        }
+        if self.check_cleanup_owner(&expected).is_err() {
+            errors.push("Native CDP owner changed".into());
+            eligible = false;
+        }
+        if let Err(error) = self.ensure_open() {
+            errors.push(error);
+            eligible = false;
+        }
+        if initialization.as_ref().is_some_and(|(_, cancel)| {
+            *cancel.borrow() != super::super::client_session::CancelSignal::None
+        }) {
+            errors.push("Native initialization cancelled".into());
+            eligible = false;
+        }
+        if std::time::Instant::now()
+            >= initialization
+                .as_ref()
+                .map_or(deadline, |(bound, _)| deadline.min(*bound))
+        {
+            errors.push("Native initialization deadline expired".into());
+            eligible = false;
+        }
+        if expected.is_some() && statuses.len() != submitted_count {
+            errors.push("Service-worker startup reservation lost".into());
+            eligible = false;
+        }
+        if !same_budget {
+            errors.push("Service-worker startup initialization budget changed".into());
+        }
+        if errors.is_empty() && complete {
+            return Ok(ServiceWorkerStartupOutcome::Ready(expected.map(|owner| {
+                WorkerStartupRetirement {
+                    owner,
+                    session: session.into(),
+                    statuses,
+                    deadline,
+                    initialization,
+                    provenance: WorkerStartupStatusProvenance::AllAcknowledged,
+                }
+            })));
+        }
+        if eligible && destroyed {
+            if let Some(owner) = expected {
+                return Ok(ServiceWorkerStartupOutcome::Retired(
+                    WorkerStartupRetirement {
+                        owner,
+                        session: session.into(),
+                        statuses,
+                        deadline,
+                        initialization,
+                        provenance: WorkerStartupStatusProvenance::IncludesDestroyed,
+                    },
+                ));
+            }
+        }
+        Err(errors.join("; "))
+    }
+
+    /// Synchronous owner/status fence shared by normal Ready completion and
+    /// exact retirement. Caller holds the enrollment index; no I/O runs here.
+    fn with_worker_startup_proof<T>(
+        &self,
+        retirement: &WorkerStartupRetirement,
+        targets: &Arc<super::super::client_targets::ClientTargets>,
+        operation: &super::super::client_session::OperationLease,
+        binding: (&str, &str),
+        commit: impl FnOnce(bool) -> Result<T, ProtocolError>,
+    ) -> Result<WorkerStartupProof<T>, ProtocolError> {
+        let (target, session) = binding;
+        retirement.check_bound()?;
+        if retirement.session != session || retirement.deadline != operation.deadline {
+            return Err(ProtocolError::StaleScope);
+        }
+        targets.require_eval_owner(&retirement.owner)?;
+        let current = self
+            .transport
+            .debt_owner
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if self.transport.closed.load(Ordering::SeqCst)
+            || current
+                .as_ref()
+                .is_none_or(|owner| !Arc::ptr_eq(owner, &retirement.owner))
+            || self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !Arc::ptr_eq(owner, &retirement.owner))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        retirement.owner.with_worker_startup_proof(
+            operation.generation,
+            targets,
+            (target, session),
+            &retirement.statuses,
+            retirement.provenance,
+            commit,
+        )
+    }
+
+    /// Retains the same all-ACK receipt across publication and applied detach.
+    /// The caller emits the existing lifecycle observation after index unlock.
+    pub(crate) fn try_finish_acknowledged_worker_startup(
+        &self,
+        receipt: WorkerStartupRetirement,
+        targets: &Arc<super::super::client_targets::ClientTargets>,
+        permit: &mut super::super::client_targets::ResumePermit,
+        operation: &super::super::client_session::OperationLease,
+        target: &str,
+        session: &str,
+    ) -> Result<WorkerStartupDecision, ProtocolError> {
+        if !receipt.all_acknowledged() {
+            return Err(ProtocolError::StaleScope);
+        }
+        let committed = self.with_worker_startup_proof(
+            &receipt,
+            targets,
+            operation,
+            (target, session),
+            |bound| {
+                if !bound {
+                    return Ok(None);
+                }
+                permit
+                    .complete_acknowledged_worker_startup(targets, target, session, || {
+                        receipt.check_operation(operation)
+                    })
+                    .map(Some)
             },
-        ))
-        .await;
-        errors.extend(results.into_iter().filter_map(Result::err));
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(errors.join("; "))
+        )?;
+        match committed {
+            WorkerStartupProof::Committed(Some(observed)) => {
+                Ok(WorkerStartupDecision::ReadyCommitted(observed))
+            }
+            WorkerStartupProof::Committed(None) => Ok(WorkerStartupDecision::AwaitDetach(receipt)),
+            WorkerStartupProof::AwaitPublication => {
+                Ok(WorkerStartupDecision::AwaitPublication(receipt))
+            }
+        }
+    }
+
+    /// Consumes either trusted provenance only after applied exact detach.
+    /// Permit Drop must occur after all index/owner/ledger/target guards leave.
+    pub(crate) fn finish_retired_worker_startup(
+        &self,
+        retirement: WorkerStartupRetirement,
+        targets: &Arc<super::super::client_targets::ClientTargets>,
+        permit: &mut super::super::client_targets::ResumePermit,
+        operation: &super::super::client_session::OperationLease,
+        target: &str,
+        session: &str,
+    ) -> Result<WorkerStartupDecision, ProtocolError> {
+        let decision = self.with_worker_startup_proof(
+            &retirement,
+            targets,
+            operation,
+            (target, session),
+            |bound| {
+                if bound {
+                    return Err(ProtocolError::StaleScope);
+                }
+                permit.finish_retired_worker_startup(targets, target, session, || {
+                    retirement.check_operation(operation)
+                })
+            },
+        )?;
+        Ok(match decision {
+            WorkerStartupProof::Committed(()) => WorkerStartupDecision::RetiredCommitted,
+            WorkerStartupProof::AwaitPublication => {
+                WorkerStartupDecision::AwaitPublication(retirement)
+            }
+        })
+    }
+
+    /// Registers the existing ledger notification before checking its condition.
+    /// No index/owner/ledger/targets guard may be held across this wait. Every
+    /// caller must retry its full final proof after waking; this grants no commit.
+    pub(crate) async fn wait_worker_startup_publication(
+        &self,
+        retirement: &mut WorkerStartupRetirement,
+        operation: &super::super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let notifier = retirement.owner.worker_startup_publication_notifier();
+        let mut cancellation = operation.cancellation.clone();
+        loop {
+            let changed = notifier.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            retirement.check_operation(operation)?;
+            self.check_cleanup_owner(&Some(retirement.owner.clone()))
+                .map_err(|_| ProtocolError::StaleScope)?;
+            self.ensure_open().map_err(|_| ProtocolError::StaleScope)?;
+            if !retirement.owner.worker_startup_publication_pending()? {
+                return Ok(());
+            }
+            let deadline = retirement.deadline().min(operation.deadline);
+            tokio::select! { biased;
+                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                _ = retirement.cancelled() => return Err(ProtocolError::Cancelled),
+                _ = tokio::time::sleep_until(deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                _ = changed => {},
+            }
         }
     }
 
@@ -1516,6 +1913,22 @@ impl CdpClient {
         response: CommandResponse,
         deadline: Option<std::time::Instant>,
     ) -> Result<Value, String> {
+        match self.await_command_reply(response, deadline).await {
+            Ok(CommandReply::Success(value)) => Ok(value),
+            Ok(CommandReply::ErrorAck(error)) => Err(format!("CDP error ({}): {}", method, error)),
+            Ok(CommandReply::LocalFailure(response)) => match response.error {
+                Some(error) => Err(format!("CDP error ({}): {}", method, error)),
+                None => Ok(response.result.unwrap_or(Value::Null)),
+            },
+            Err(CommandWaitFailure::ChannelClosed) => Err("CDP response channel closed".into()),
+            Err(CommandWaitFailure::Deadline) => Err(format!("CDP command timed out: {}", method)),
+        }
+    }
+    async fn await_command_reply(
+        &self,
+        response: CommandResponse,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<CommandReply, CommandWaitFailure> {
         let CommandResponse {
             receiver,
             mut guard,
@@ -1524,31 +1937,23 @@ impl CdpClient {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), receiver).await,
             None => tokio::time::timeout(Duration::from_secs(30), receiver).await,
         };
-        let response = match received {
-            Ok(Ok(resp)) => {
+        match received {
+            Ok(Ok(reply)) => {
                 guard.done = true;
-                resp
+                Ok(reply)
             }
             Ok(Err(_)) => {
                 guard.done = true;
-                return Err("CDP response channel closed".to_string());
+                Err(CommandWaitFailure::ChannelClosed)
             }
             Err(_) => {
                 if deadline.is_none() {
                     guard.done = true;
                     self.transport.pending.lock().await.remove(&guard.id);
                 }
-                // An explicit operation deadline also bounds waiter cleanup.
-                // Keep its guard armed rather than await a contended map here.
-                return Err(format!("CDP command timed out: {}", method));
+                Err(CommandWaitFailure::Deadline)
             }
-        };
-
-        if let Some(error) = response.error {
-            return Err(format!("CDP error ({}): {}", method, error));
         }
-
-        Ok(response.result.unwrap_or(Value::Null))
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
@@ -2147,7 +2552,10 @@ mod tests {
                         "{error}"
                     );
                 } else {
-                    result.unwrap();
+                    assert!(matches!(
+                        result.unwrap(),
+                        ServiceWorkerStartupOutcome::Ready(Some(_))
+                    ));
                 }
                 assert_eq!(client.pending_len().await, 0);
                 assert_eq!(ledger.snapshot().outstanding_commands, 0);
@@ -2392,6 +2800,1206 @@ mod tests {
             .lock()
             .unwrap()
             .is_empty());
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    // These characterize the reader/debt boundary of a main-script failure.
+    // The peer models an exact detach before renderer-domain ACKs;
+    // this does not establish the observed HTTP 500 event sequence. No HTTP
+    // fixture, coordinator quarantine, or ResumePermit is exercised.
+    async fn service_worker_retirement_batch(
+        view: Arc<CdpClient>,
+        requests: &mut mpsc::UnboundedReceiver<Value>,
+        deadline: std::time::Instant,
+    ) -> (
+        JoinHandle<Result<ServiceWorkerStartupOutcome, String>>,
+        Vec<Value>,
+    ) {
+        let startup = tokio::spawn(async move {
+            view.initialize_service_worker_domains("worker-session", json!({}), false, deadline)
+                .await
+        });
+        let mut sent = Vec::new();
+        for method in [
+            "Network.enable",
+            "Runtime.enable",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            let request = service_worker_request(requests).await;
+            assert_eq!(request["method"], method);
+            assert_eq!(request["sessionId"], "worker-session");
+            sent.push(request);
+        }
+        assert!(!startup.is_finished());
+        assert!(requests.try_recv().is_err());
+        (startup, sent)
+    }
+
+    async fn service_worker_retirement_event(
+        replies: &mpsc::UnboundedSender<Value>,
+        events: &mut broadcast::Receiver<CdpEvent>,
+        event: Value,
+    ) {
+        replies.send(event.clone()).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("reader did not publish the lifecycle barrier")
+            .unwrap();
+        assert_eq!(Some(observed.method.as_str()), event["method"].as_str());
+        assert_eq!(observed.params, event["params"]);
+        assert_eq!(observed.session_id.as_deref(), event["sessionId"].as_str());
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_exact_detach_creates_retired_candidate_without_an_ack() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let mut events = client.subscribe();
+        let (startup, sent) = service_worker_retirement_batch(view, &mut requests, deadline).await;
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        // Resume succeeded, but the main script never created a renderer able
+        // to acknowledge Network.enable or Runtime.enable.
+        replies
+            .send(service_worker_response(&sent[2], false))
+            .unwrap();
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Target.detachedFromTarget", "sessionId":"worker-session",
+                "params":{"sessionId":"foreign-session","targetId":"foreign-target"}}),
+        )
+        .await;
+        assert_eq!(client.pending_len().await, 2);
+        assert_eq!(ledger.snapshot().outstanding_commands, 2);
+        assert!(
+            !startup.is_finished(),
+            "the parent envelope is not the detached child"
+        );
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Target.detachedFromTarget", "sessionId":"parent-session",
+                "params":{"sessionId":"worker-session","targetId":"worker-target"}}),
+        )
+        .await;
+        let outcome = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .expect("exact detach must wake startup before its deadline")
+            .unwrap()
+            .unwrap();
+        let ServiceWorkerStartupOutcome::Retired(retirement) = outcome else {
+            panic!("Destroyed waiters must not be advertised as Ready")
+        };
+        assert!(Arc::ptr_eq(&retirement.owner, &ledger));
+        assert_eq!(retirement.session, "worker-session");
+        assert_eq!(retirement.statuses.len(), 3);
+        assert_eq!(
+            retirement
+                .statuses
+                .iter()
+                .filter(|(_, expected)| *expected == CommandStatus::Destroyed)
+                .count(),
+            2
+        );
+        assert_eq!(
+            retirement
+                .statuses
+                .iter()
+                .filter(|(_, expected)| *expected == CommandStatus::Acknowledged)
+                .count(),
+            1
+        );
+        assert!(retirement
+            .statuses
+            .iter()
+            .all(|(status, expected)| status.snapshot() == *expected));
+        assert_eq!(client.pending_len().await, 0);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert_eq!(client.transport.tracked_responses.lock().unwrap().len(), 2);
+        // Debt retirement is not a fabricated ACK. Reader correlation remains
+        // until late replies arrive, without reviving or replaying startup.
+        for request in &sent[..2] {
+            replies
+                .send(service_worker_response(request, false))
+                .unwrap();
+        }
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Test.workerLateReplies", "params":{}}),
+        )
+        .await;
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_worker_retirement_malformed_or_unverified_reply_is_not_an_error_ack_or_retirement(
+    ) {
+        for malformed in [true, false] {
+            let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (view, _ledger, _cancel) = service_worker_test_owner(&client, deadline);
+            let mut events = client.subscribe();
+            let (startup, sent) =
+                service_worker_retirement_batch(view, &mut requests, deadline).await;
+            let response = if malformed {
+                json!({"id":sent[0]["id"],"sessionId":"worker-session","error":{"code":"not-an-integer","message":"synthetic"}})
+            } else {
+                json!({"id":sent[0]["id"],"sessionId":"worker-session","result":{},"error":{"code":-32000,"message":"synthetic ambiguous envelope"}})
+            };
+            replies.send(response).unwrap();
+            service_worker_retirement_event(
+                &replies,
+                &mut events,
+                json!({"method":"Test.workerMalformedBarrier","params":{}}),
+            )
+            .await;
+            service_worker_retirement_event(&replies, &mut events,
+                json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})).await;
+            let error = tokio::time::timeout(Duration::from_secs(2), startup)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap_err();
+            assert!(error.contains("Network.enable:"), "{error}");
+            assert!(
+                error.contains(if malformed {
+                    "Malformed CDP response"
+                } else {
+                    "synthetic ambiguous envelope"
+                }),
+                "{error}"
+            );
+            assert!(requests.try_recv().is_err());
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_retirement_wrong_session_ancestor_or_target_destroyed_is_insufficient()
+    {
+        for event in [
+            json!({"method":"Target.detachedFromTarget","sessionId":"worker-session","params":{"sessionId":"other-session"}}),
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"parent-session"}}),
+            json!({"method":"Target.targetDestroyed","params":{"targetId":"worker-target"}}),
+        ] {
+            let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (view, _ledger, cancel) = service_worker_test_owner(&client, deadline);
+            let mut events = client.subscribe();
+            let (mut startup, _sent) =
+                service_worker_retirement_batch(view, &mut requests, deadline).await;
+            service_worker_retirement_event(&replies, &mut events, event).await;
+            assert_eq!(client.pending_len().await, 3);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut startup)
+                    .await
+                    .is_err()
+            );
+            cancel
+                .send(crate::native::client_session::CancelSignal::Requested)
+                .unwrap();
+            assert!(startup.await.unwrap().unwrap_err().contains("cancelled"));
+            assert!(requests.try_recv().is_err());
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_retirement_final_consumer_rechecks_original_owner_generation_and_bound()
+    {
+        use crate::native::client_targets::ClientTargets;
+        for scenario in [
+            "exact",
+            "owner-replaced",
+            "generation-replaced",
+            "cancelled",
+            "sealed",
+        ] {
+            let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (view, ledger, cancel) = service_worker_test_owner(&client, deadline);
+            let targets = ClientTargets::new("worker-context".into(), "worker-owner".into());
+            targets.bind_eval_owner(&ledger, 1).unwrap();
+            targets
+                .attached(
+                    "worker-context",
+                    "worker-target".into(),
+                    "worker-session".into(),
+                    "service_worker".into(),
+                )
+                .unwrap();
+            let mut permit = targets
+                .service_worker_startup_permit("worker-target", "worker-session")
+                .await
+                .unwrap();
+            let mut events = client.subscribe();
+            let (startup, _sent) =
+                service_worker_retirement_batch(view.clone(), &mut requests, deadline).await;
+            service_worker_retirement_event(&replies,&mut events,
+                json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})).await;
+            let ServiceWorkerStartupOutcome::Retired(retirement) = startup.await.unwrap().unwrap()
+            else {
+                panic!("expected candidate");
+            };
+            targets
+                .observe_worker_detach("worker-target", "worker-session")
+                .unwrap();
+            targets.detach("worker-target").unwrap();
+            match scenario {
+                "owner-replaced" => {
+                    *client.transport.debt_owner.lock().unwrap() =
+                        Some(OwnerDebtLedger::new(2, "other".into()))
+                }
+                "cancelled" => {
+                    cancel
+                        .send(crate::native::client_session::CancelSignal::Requested)
+                        .unwrap();
+                }
+                "sealed" => targets.seal(),
+                _ => {}
+            }
+            let result = view.finish_retired_worker_startup(
+                retirement,
+                &targets,
+                &mut permit,
+                &crate::native::client_session::OperationLease {
+                    is_callback: false,
+                    generation: if scenario == "generation-replaced" {
+                        2
+                    } else {
+                        1
+                    },
+                    sequence: 0,
+                    deadline,
+                    cancellation: cancel.subscribe(),
+                },
+                "worker-target",
+                "worker-session",
+            );
+            assert_eq!(
+                result.is_ok(),
+                scenario == "exact",
+                "{scenario}: {result:?}"
+            );
+            drop(permit);
+            assert_eq!(
+                targets.check_settlement_integrity().is_ok(),
+                scenario == "exact",
+                "{scenario}"
+            );
+            assert!(targets.owned_target("worker-target").is_err());
+            assert!(requests.try_recv().is_err());
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_retirement_final_lock_rechecks_operation_and_bootstrap_bounds() {
+        use crate::native::client_session::{CancelSignal, OperationLease};
+        use crate::native::client_targets::ClientTargets;
+        for scenario in [
+            "published-cancel",
+            "published-deadline",
+            "bootstrap-cancel",
+            "bootstrap-deadline",
+        ] {
+            let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+            let now = std::time::Instant::now();
+            let deadline = now
+                + if scenario == "published-deadline" {
+                    Duration::from_millis(500)
+                } else {
+                    Duration::from_secs(5)
+                };
+            let bootstrap_deadline = if scenario == "bootstrap-deadline" {
+                now + Duration::from_millis(500)
+            } else {
+                deadline
+            };
+            let published = scenario.starts_with("published-");
+            let (view, ledger, bootstrap_cancel) = if published {
+                let ledger = OwnerDebtLedger::new(1, "worker-owner".into());
+                ledger.bind_context("worker-context").unwrap();
+                ledger
+                    .bind_session("worker-context", "worker-target", "worker-session")
+                    .unwrap();
+                client.install_debt_ledger(ledger.clone()).unwrap();
+                let (cancel, _) = watch::channel(CancelSignal::None);
+                (client.owner_view(ledger.clone()).unwrap(), ledger, cancel)
+            } else {
+                service_worker_test_owner(&client, bootstrap_deadline)
+            };
+            let targets = ClientTargets::new("worker-context".into(), "worker-owner".into());
+            targets.bind_eval_owner(&ledger, 1).unwrap();
+            targets
+                .attached(
+                    "worker-context",
+                    "worker-target".into(),
+                    "worker-session".into(),
+                    "service_worker".into(),
+                )
+                .unwrap();
+            let mut permit = targets
+                .service_worker_startup_permit("worker-target", "worker-session")
+                .await
+                .unwrap();
+            let mut events = client.subscribe();
+            let (startup, _) =
+                service_worker_retirement_batch(view.clone(), &mut requests, deadline).await;
+            service_worker_retirement_event(&replies,&mut events,
+                json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})).await;
+            let ServiceWorkerStartupOutcome::Retired(retirement) = startup.await.unwrap().unwrap()
+            else {
+                panic!("expected original batch receipt");
+            };
+            assert_eq!(retirement.initialization.is_none(), published, "{scenario}");
+            targets
+                .observe_worker_detach("worker-target", "worker-session")
+                .unwrap();
+            targets.detach("worker-target").unwrap();
+            let (operation_cancel, cancellation) = watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 0,
+                deadline,
+                cancellation,
+            };
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let mut finisher = None;
+            targets.with_worker_retirement_lock_for_test(entered_tx, || {
+                let held_targets = targets.clone();
+                finisher = Some(std::thread::spawn(move || {
+                    let result = view.finish_retired_worker_startup(
+                        retirement,
+                        &held_targets,
+                        &mut permit,
+                        &operation,
+                        "worker-target",
+                        "worker-session",
+                    );
+                    drop(permit);
+                    result
+                }));
+                // The real receipt passed its earlier checks and holds owner
+                // plus ledger. The last targets mutex remains owned by us.
+                entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                assert!(!finisher.as_ref().unwrap().is_finished());
+                match scenario {
+                    "published-cancel" => {
+                        operation_cancel.send(CancelSignal::Requested).unwrap();
+                    }
+                    "bootstrap-cancel" => {
+                        bootstrap_cancel.send(CancelSignal::Requested).unwrap();
+                    }
+                    _ => std::thread::sleep(
+                        bootstrap_deadline
+                            .min(deadline)
+                            .saturating_duration_since(std::time::Instant::now())
+                            + Duration::from_millis(5),
+                    ),
+                }
+            });
+            let result = finisher.unwrap().join().unwrap();
+            assert_eq!(
+                result.map(|_| ()),
+                Err(if scenario.ends_with("cancel") {
+                    ProtocolError::Cancelled
+                } else {
+                    ProtocolError::DeadlineExceeded
+                }),
+                "{scenario}"
+            );
+            assert!(targets.check_settlement_integrity().is_err());
+            assert_eq!(ledger.snapshot().outstanding_commands, 0);
+            assert!(requests.try_recv().is_err());
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_all_ack_final_lock_rechecks_operation_and_bootstrap_bounds() {
+        use crate::native::client_session::{CancelSignal, OperationLease};
+        use crate::native::client_targets::ClientTargets;
+        for retire in [false, true] {
+            for scenario in [
+                "published-cancel",
+                "published-deadline",
+                "bootstrap-cancel",
+                "bootstrap-deadline",
+            ] {
+                let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+                let now = std::time::Instant::now();
+                let deadline = now
+                    + if scenario == "published-deadline" {
+                        Duration::from_millis(500)
+                    } else {
+                        Duration::from_secs(5)
+                    };
+                let bootstrap_deadline = if scenario == "bootstrap-deadline" {
+                    now + Duration::from_millis(500)
+                } else {
+                    deadline
+                };
+                let published = scenario.starts_with("published-");
+                let (view, ledger, bootstrap_cancel) = if published {
+                    let ledger = OwnerDebtLedger::new(1, "worker-owner".into());
+                    ledger.bind_context("worker-context").unwrap();
+                    ledger
+                        .bind_session("worker-context", "worker-target", "worker-session")
+                        .unwrap();
+                    client.install_debt_ledger(ledger.clone()).unwrap();
+                    let (cancel, _) = watch::channel(CancelSignal::None);
+                    (client.owner_view(ledger.clone()).unwrap(), ledger, cancel)
+                } else {
+                    service_worker_test_owner(&client, bootstrap_deadline)
+                };
+                let targets = ClientTargets::new("worker-context".into(), "worker-owner".into());
+                targets.bind_eval_owner(&ledger, 1).unwrap();
+                targets
+                    .attached(
+                        "worker-context",
+                        "worker-target".into(),
+                        "worker-session".into(),
+                        "service_worker".into(),
+                    )
+                    .unwrap();
+                let mut permit = targets
+                    .service_worker_startup_permit("worker-target", "worker-session")
+                    .await
+                    .unwrap();
+                let mut events = client.subscribe();
+                let (startup, sent) =
+                    service_worker_retirement_batch(view.clone(), &mut requests, deadline).await;
+                for request in &sent {
+                    replies
+                        .send(service_worker_response(request, false))
+                        .unwrap();
+                }
+                let ServiceWorkerStartupOutcome::Ready(Some(retirement)) =
+                    startup.await.unwrap().unwrap()
+                else {
+                    panic!("expected all-success batch receipt");
+                };
+                assert!(retirement.all_acknowledged());
+                assert!(retirement
+                    .statuses
+                    .iter()
+                    .all(
+                        |(status, expected)| *expected == CommandStatus::Acknowledged
+                            && status.snapshot() == CommandStatus::Acknowledged
+                    ));
+                if retire {
+                    service_worker_retirement_event(&replies,&mut events,
+                    json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})).await;
+                }
+                assert!(retirement
+                    .statuses
+                    .iter()
+                    .all(|(status, expected)| status.snapshot() == *expected));
+                assert_eq!(retirement.initialization.is_none(), published, "{scenario}");
+                if retire {
+                    targets
+                        .observe_worker_detach("worker-target", "worker-session")
+                        .unwrap();
+                    targets.detach("worker-target").unwrap();
+                }
+                let (operation_cancel, cancellation) = watch::channel(CancelSignal::None);
+                let operation = OperationLease {
+                    is_callback: false,
+                    generation: 1,
+                    sequence: 0,
+                    deadline,
+                    cancellation,
+                };
+                let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+                let mut finisher = None;
+                targets.with_worker_retirement_lock_for_test(entered_tx, || {
+                    let held_targets = targets.clone();
+                    finisher = Some(std::thread::spawn(move || {
+                        let result = if retire {
+                            view.finish_retired_worker_startup(
+                                retirement,
+                                &held_targets,
+                                &mut permit,
+                                &operation,
+                                "worker-target",
+                                "worker-session",
+                            )
+                        } else {
+                            view.try_finish_acknowledged_worker_startup(
+                                retirement,
+                                &held_targets,
+                                &mut permit,
+                                &operation,
+                                "worker-target",
+                                "worker-session",
+                            )
+                        };
+                        drop(permit);
+                        result
+                    }));
+                    // The real receipt passed its earlier checks and holds owner
+                    // plus ledger. The last targets mutex remains owned by us.
+                    entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                    assert!(!finisher.as_ref().unwrap().is_finished());
+                    match scenario {
+                        "published-cancel" => {
+                            operation_cancel.send(CancelSignal::Requested).unwrap();
+                        }
+                        "bootstrap-cancel" => {
+                            bootstrap_cancel.send(CancelSignal::Requested).unwrap();
+                        }
+                        _ => std::thread::sleep(
+                            bootstrap_deadline
+                                .min(deadline)
+                                .saturating_duration_since(std::time::Instant::now())
+                                + Duration::from_millis(5),
+                        ),
+                    }
+                });
+                let result = finisher.unwrap().join().unwrap();
+                assert_eq!(
+                    result.map(|_| ()),
+                    Err(if scenario.ends_with("cancel") {
+                        ProtocolError::Cancelled
+                    } else {
+                        ProtocolError::DeadlineExceeded
+                    }),
+                    "{scenario}"
+                );
+                assert!(targets.check_settlement_integrity().is_err());
+                assert_eq!(ledger.snapshot().outstanding_commands, 0);
+                assert!(requests.try_recv().is_err());
+                client.close().await;
+                peer.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_all_ack_consumer_rejects_owner_replaced_while_waiting() {
+        use crate::native::client_session::{CancelSignal, OperationLease};
+        use crate::native::client_targets::ClientTargets;
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let ledger = OwnerDebtLedger::new(1, "worker-owner".into());
+        ledger.bind_context("worker-context").unwrap();
+        ledger
+            .bind_session("worker-context", "worker-target", "worker-session")
+            .unwrap();
+        client.install_debt_ledger(ledger.clone()).unwrap();
+        let view = client.owner_view(ledger.clone()).unwrap();
+        let targets = ClientTargets::new("worker-context".into(), "worker-owner".into());
+        targets.bind_eval_owner(&ledger, 1).unwrap();
+        targets
+            .attached(
+                "worker-context",
+                "worker-target".into(),
+                "worker-session".into(),
+                "service_worker".into(),
+            )
+            .unwrap();
+        let mut permit = targets
+            .service_worker_startup_permit("worker-target", "worker-session")
+            .await
+            .unwrap();
+        let (startup, sent) =
+            service_worker_retirement_batch(view.clone(), &mut requests, deadline).await;
+        for request in &sent {
+            replies
+                .send(service_worker_response(request, false))
+                .unwrap();
+        }
+        let ServiceWorkerStartupOutcome::Ready(Some(receipt)) = startup.await.unwrap().unwrap()
+        else {
+            panic!("expected all-success receipt");
+        };
+        assert!(receipt.initialization.is_none());
+        let mut events = client.subscribe();
+        service_worker_retirement_event(&replies, &mut events,
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})).await;
+        assert!(receipt.statuses.iter().all(|(status, expected)| *expected
+            == CommandStatus::Acknowledged
+            && status.snapshot() == *expected));
+        targets
+            .observe_worker_detach("worker-target", "worker-session")
+            .unwrap();
+        targets.detach("worker-target").unwrap();
+        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 0,
+            deadline,
+            cancellation,
+        };
+        let replacement = OwnerDebtLedger::new(2, "replacement-owner".into());
+        // The consumer cannot pass this actual owner fence until released.
+        // Once it holds that guard, owner replacement instead waits for it;
+        // the final-target-lock cases separately exercise cancellation there.
+        let finisher = {
+            let mut owner = client.transport.debt_owner.lock().unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let held_targets = targets.clone();
+            let finisher = std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                let result = view.finish_retired_worker_startup(
+                    receipt,
+                    &held_targets,
+                    &mut permit,
+                    &operation,
+                    "worker-target",
+                    "worker-session",
+                );
+                drop(permit);
+                result
+            });
+            entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(!finisher.is_finished());
+            *owner = Some(replacement.clone());
+            finisher
+        };
+        assert_eq!(
+            finisher.join().unwrap().map(|_| ()),
+            Err(ProtocolError::StaleScope)
+        );
+        assert!(targets.check_settlement_integrity().is_err());
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(replacement.snapshot().outstanding_commands, 0);
+        assert!(!replacement.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        drop(cancel);
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    async fn worker_startup_reader_publication_case(
+        retired: bool,
+        detach_during_publication: bool,
+        interruption: Option<&str>,
+    ) {
+        use crate::native::client_session::{CancelSignal, OperationLease};
+        use crate::native::client_targets::ClientTargets;
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now()
+            + if interruption == Some("deadline") {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(5)
+            };
+        let (view, ledger, bootstrap_cancel) = if interruption == Some("bootstrap-cancel") {
+            service_worker_test_owner(&client, deadline)
+        } else {
+            let ledger = OwnerDebtLedger::new(1, "worker-owner".into());
+            ledger.bind_context("worker-context").unwrap();
+            ledger
+                .bind_session("worker-context", "worker-target", "worker-session")
+                .unwrap();
+            client.install_debt_ledger(ledger.clone()).unwrap();
+            let (cancel, _) = watch::channel(CancelSignal::None);
+            (client.owner_view(ledger.clone()).unwrap(), ledger, cancel)
+        };
+        ledger
+            .bind_session("worker-context", "other-target", "other-session")
+            .unwrap();
+        let targets = ClientTargets::new("worker-context".into(), "worker-owner".into());
+        targets.bind_eval_owner(&ledger, 1).unwrap();
+        targets
+            .attached(
+                "worker-context",
+                "worker-target".into(),
+                "worker-session".into(),
+                "service_worker".into(),
+            )
+            .unwrap();
+        let mut permit = targets
+            .service_worker_startup_permit("worker-target", "worker-session")
+            .await
+            .unwrap();
+        let (startup, sent) =
+            service_worker_retirement_batch(view.clone(), &mut requests, deadline).await;
+        if retired {
+            replies
+                .send(service_worker_response(&sent[2], false))
+                .unwrap();
+            let mut events = client.subscribe();
+            service_worker_retirement_event(&replies, &mut events,
+                json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})).await;
+        } else {
+            for request in &sent {
+                replies
+                    .send(service_worker_response(request, false))
+                    .unwrap();
+            }
+        }
+        let outcome = startup.await.unwrap().unwrap();
+        let receipt = match outcome {
+            ServiceWorkerStartupOutcome::Ready(Some(receipt)) if !retired => receipt,
+            ServiceWorkerStartupOutcome::Retired(receipt) if retired => receipt,
+            other => panic!("unexpected startup provenance: {other:?}"),
+        };
+        assert_eq!(receipt.all_acknowledged(), !retired);
+        assert!(ledger
+            .capture_eval_revision("other-session", "other-target")
+            .is_ok());
+        if !retired {
+            assert!(ledger
+                .capture_eval_revision("worker-session", "worker-target")
+                .is_ok());
+        }
+        let methods: &'static [&'static str] = if detach_during_publication {
+            &["Target.detachedFromTarget"]
+        } else {
+            &["Runtime.executionContextsCleared"]
+        };
+        let mut events = client.subscribe_bounded_methods(methods, 4, 65536).unwrap();
+        let watermark = events.watermark();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_at_deadline = interruption == Some("deadline");
+        let held = std::thread::spawn(move || {
+            watermark
+                .with_received(|received| {
+                    entered_tx.send(received).unwrap();
+                    if release_at_deadline {
+                        assert!(matches!(
+                            release_rx.recv_timeout(
+                                deadline.saturating_duration_since(std::time::Instant::now())
+                            ),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        ));
+                        assert!(std::time::Instant::now() >= deadline);
+                        true
+                    } else {
+                        release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                        false
+                    }
+                })
+                .unwrap()
+        });
+        assert_eq!(entered_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 0);
+        replies.send(if detach_during_publication {
+            json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})
+        } else {
+            json!({"method":"Runtime.executionContextsCleared","sessionId":"other-session","params":{}})
+        }).unwrap();
+        // The only newly injected lifecycle event is observed by the real
+        // reader before it blocks on routes. No pending flag or hook is added.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ledger
+                .capture_eval_revision("other-session", "other-target")
+                .is_ok()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!ledger.snapshot().integrity_lost);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(receipt
+            .statuses
+            .iter()
+            .all(|(status, expected)| status.snapshot() == *expected));
+        assert!(!*client.remote_connection_closed().borrow());
+        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 0,
+            deadline,
+            cancellation,
+        };
+        let decision = if retired {
+            view.finish_retired_worker_startup(
+                receipt,
+                &targets,
+                &mut permit,
+                &operation,
+                "worker-target",
+                "worker-session",
+            )
+        } else {
+            view.try_finish_acknowledged_worker_startup(
+                receipt,
+                &targets,
+                &mut permit,
+                &operation,
+                "worker-target",
+                "worker-session",
+            )
+        };
+        let original_error = decision.as_ref().err().cloned();
+        let receipt_retained = matches!(&decision, Ok(WorkerStartupDecision::AwaitPublication(_)));
+        let readiness_before_release = targets.check_settlement_integrity();
+        assert!(!targets
+            .owned_target("worker-target")
+            .unwrap()
+            .capture_ready());
+        let mut release = Some(release_tx);
+        let mut wait_error = None;
+        let mut after_publication = "not-run";
+        if let Ok(WorkerStartupDecision::AwaitPublication(mut receipt)) = decision {
+            {
+                let waiting = view.wait_worker_startup_publication(&mut receipt, &operation);
+                tokio::pin!(waiting);
+                assert!(matches!(
+                    futures_util::poll!(waiting.as_mut()),
+                    std::task::Poll::Pending
+                ));
+                // The wait is now actually registered while publication is
+                // blocked. Completion must notify; an earlier observe is past.
+                match interruption {
+                    Some("cancel") => {
+                        cancel.send_replace(CancelSignal::Requested);
+                    }
+                    Some("bootstrap-cancel") => {
+                        bootstrap_cancel.send_replace(CancelSignal::Requested);
+                    }
+                    Some("owner") => {
+                        *client.transport.debt_owner.lock().unwrap() =
+                            Some(OwnerDebtLedger::new(2, "replacement".into()));
+                    }
+                    Some("integrity") => ledger.connection_lost(),
+                    Some("deadline") | None => {}
+                    Some(other) => panic!("unknown test interruption {other}"),
+                }
+                if matches!(interruption, None | Some("owner")) {
+                    release.take().unwrap().send(()).unwrap();
+                }
+                wait_error = waiting.await.err();
+            }
+            if interruption.is_none() && wait_error.is_none() {
+                after_publication = match if retired {
+                    view.finish_retired_worker_startup(
+                        receipt,
+                        &targets,
+                        &mut permit,
+                        &operation,
+                        "worker-target",
+                        "worker-session",
+                    )
+                } else {
+                    view.try_finish_acknowledged_worker_startup(
+                        receipt,
+                        &targets,
+                        &mut permit,
+                        &operation,
+                        "worker-target",
+                        "worker-session",
+                    )
+                } {
+                    Ok(WorkerStartupDecision::ReadyCommitted(_)) => "ready",
+                    Ok(WorkerStartupDecision::AwaitDetach(_)) => "await-detach",
+                    // Low-level tests deliberately do not apply enrollment's
+                    // exact detach proof or mutate the targets directly.
+                    Err(ProtocolError::StaleScope) if retired => "unapplied-detach-rejected",
+                    other => panic!("unexpected post-publication decision {other:?}"),
+                };
+            }
+        }
+        if !release_at_deadline {
+            if let Some(release) = release.take() {
+                release.send(()).unwrap();
+            }
+        }
+        assert_eq!(held.join().unwrap(), release_at_deadline);
+        drop(release);
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.method, methods[0]);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(
+            requests.try_recv().is_err(),
+            "startup batch must never replay"
+        );
+        if interruption.is_none() {
+            assert!(!ledger.snapshot().integrity_lost);
+        }
+        assert!(!targets
+            .owned_target("worker-target")
+            .unwrap()
+            .capture_ready());
+        drop(permit);
+        let capture_ready = targets
+            .owned_target("worker-target")
+            .map(|target| target.capture_ready());
+        drop(cancel);
+        drop(bootstrap_cancel);
+        client.close().await;
+        let peer = peer.await;
+        eprintln!("reader-publication retired={retired} detach={detach_during_publication} interruption={interruption:?}: original_error={original_error:?}; receipt_retained={receipt_retained}; readiness_before_release={readiness_before_release:?}; after={after_publication}; wait_error={wait_error:?}; peer={peer:?}");
+        assert_eq!(
+            original_error, None,
+            "healthy reader publication must retain the original startup receipt"
+        );
+        assert!(receipt_retained);
+        // This is pending readiness, not an independent integrity assertion.
+        assert_eq!(
+            readiness_before_release,
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        match interruption {
+            Some("cancel" | "bootstrap-cancel") => {
+                assert_eq!(wait_error, Some(ProtocolError::Cancelled))
+            }
+            Some("deadline") => assert_eq!(wait_error, Some(ProtocolError::DeadlineExceeded)),
+            Some("owner" | "integrity") => assert_eq!(wait_error, Some(ProtocolError::StaleScope)),
+            None => {
+                assert_eq!(wait_error, None);
+                assert_eq!(
+                    after_publication,
+                    if retired {
+                        "unapplied-detach-rejected"
+                    } else if detach_during_publication {
+                        "await-detach"
+                    } else {
+                        "ready"
+                    }
+                );
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(
+            capture_ready,
+            if interruption.is_none() && !retired && !detach_during_publication {
+                Ok(true)
+            } else {
+                Err(ProtocolError::StaleScope)
+            }
+        );
+        peer.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_worker_all_ack_reader_publication_retains_startup_receipt() {
+        worker_startup_reader_publication_case(false, true, None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_worker_other_owned_publication_rechecks_normal_ready() {
+        worker_startup_reader_publication_case(false, false, None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_worker_retired_reader_publication_retains_original_proof() {
+        worker_startup_reader_publication_case(true, false, None).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn service_worker_publication_wait_preserves_bounds_and_owner() {
+        for retired in [false, true] {
+            for interruption in [
+                "cancel",
+                "bootstrap-cancel",
+                "deadline",
+                "owner",
+                "integrity",
+            ] {
+                worker_startup_reader_publication_case(retired, false, Some(interruption)).await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_connection_loss_does_not_prove_worker_retirement() {
+        let (client, mut requests, _replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let (startup, _sent) = service_worker_retirement_batch(view, &mut requests, deadline).await;
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        // Close the actual peer socket, without sending a detach or a reply.
+        peer.abort();
+        assert!(peer.await.unwrap_err().is_cancelled());
+        let error = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .expect("reader EOF must wake submitted startup waiters")
+            .unwrap()
+            .unwrap_err();
+        for method in [
+            "Network.enable",
+            "Runtime.enable",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            assert!(
+                error.contains(&format!("{method}: CDP response channel closed")),
+                "{error}"
+            );
+        }
+        assert_eq!(client.pending_len().await, 0);
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        assert!(ledger.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_replacement_detach_cannot_settle_original_owner_debt() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let mut events = client.subscribe();
+        let (startup, sent) =
+            service_worker_retirement_batch(view.clone(), &mut requests, deadline).await;
+        let replacement = OwnerDebtLedger::new(2, "replacement-owner".into());
+        replacement.bind_context("replacement-context").unwrap();
+        replacement
+            .bind_session("replacement-context", "worker-target", "worker-session")
+            .unwrap();
+        assert!(client.install_debt_ledger(replacement.clone()).is_err());
+        // Fault injection only: normal owner adoption above rejects old debt.
+        // Model a stale view after transport ownership changes, without editing
+        // any ledger or command state. Reused labels cannot confer authority.
+        *client.transport.debt_owner.lock().unwrap() = Some(replacement.clone());
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Target.detachedFromTarget",
+                "params":{"sessionId":"worker-session","targetId":"worker-target"}}),
+        )
+        .await;
+        let error = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("CDP response channel closed"), "{error}");
+        assert_eq!(client.pending_len().await, 0);
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        assert_eq!(replacement.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(!replacement.snapshot().integrity_lost);
+        assert_eq!(client.transport.tracked_responses.lock().unwrap().len(), 3);
+        assert!(view.check_cleanup_owner(&Some(ledger.clone())).is_err());
+        let error = view
+            .initialize_service_worker_domains("worker-session", json!({}), false, deadline)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Native CDP owner changed"), "{error}");
+        assert!(requests.try_recv().is_err());
+        // Late replies are correlated to the original SubmittedCommand ledger,
+        // not the owner currently installed on the transport.
+        for request in &sent {
+            replies
+                .send(service_worker_response(request, false))
+                .unwrap();
+        }
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Test.workerLateReplies", "params":{}}),
+        )
+        .await;
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(replacement.snapshot().outstanding_commands, 0);
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(!replacement.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_error_ack_is_not_pardoned_by_sibling_detachment() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let mut events = client.subscribe();
+        let (startup, sent) = service_worker_retirement_batch(view, &mut requests, deadline).await;
+        replies
+            .send(service_worker_response(&sent[1], true))
+            .unwrap();
+        replies
+            .send(service_worker_response(&sent[2], false))
+            .unwrap();
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Test.workerErrorAck", "params":{}}),
+        )
+        .await;
+        assert_eq!(client.pending_len().await, 1);
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        assert!(
+            !startup.is_finished(),
+            "an error must not abandon a submitted sibling"
+        );
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Target.detachedFromTarget",
+                "params":{"sessionId":"worker-session","targetId":"worker-target"}}),
+        )
+        .await;
+        let error = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.contains("Network.enable: CDP response channel closed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Runtime.enable:") && error.contains("observation failed"),
+            "{error}"
+        );
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert_eq!(client.transport.tracked_responses.lock().unwrap().len(), 1);
+        // An acknowledged protocol error plus a destroyed sibling also has no
+        // debt. Empty debt alone must never classify startup as benign retirement.
+        replies
+            .send(service_worker_response(&sent[0], false))
+            .unwrap();
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Test.workerLateReplies", "params":{}}),
+        )
+        .await;
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
         assert!(!ledger.snapshot().integrity_lost);
         assert!(requests.try_recv().is_err());
         client.close().await;

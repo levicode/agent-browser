@@ -4,6 +4,7 @@
 use super::client_protocol::ProtocolError;
 use super::client_settlement_trace as diagnostic;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -26,8 +27,10 @@ pub struct OwnedTarget {
     tenure: Arc<AttachmentTenure>,
     diagnostic: Option<diagnostic::DiagnosticAttachment>,
 }
-#[derive(Debug)]
-struct AttachmentTenure;
+#[derive(Debug, Default)]
+struct AttachmentTenure {
+    observed_detach: AtomicBool,
+}
 impl OwnedTarget {
     fn diagnostic_snapshot(&self) -> Option<diagnostic::DiagnosticAttachment> {
         let mut value = self.diagnostic?;
@@ -287,6 +290,8 @@ pub struct ClientTargets {
     state: Mutex<Registry>,
     eval_owner: std::sync::OnceLock<std::sync::Weak<super::client_debt::OwnerDebtLedger>>,
     changed: Notify,
+    #[cfg(test)]
+    retirement_before_lock: Mutex<Option<std::sync::mpsc::Sender<()>>>,
 }
 pub struct CreationReservation {
     registry: Arc<ClientTargets>,
@@ -354,47 +359,155 @@ impl Drop for ProtectedTargetBarrier {
     }
 }
 impl ResumePermit {
+    /// Observation only: distinguish the retained original attachment from a
+    /// reused identity while waiting for its already-received detach to apply.
+    pub(super) fn original_worker_attachment_present(&self) -> Result<bool, ProtocolError> {
+        let state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed || state.integrity_lost || !self.worker_startup || self.completed {
+            return Err(ProtocolError::StaleScope);
+        }
+        match state.targets.get(&self.target_id) {
+            Some(target)
+                if target.session_id == self.session_id
+                    && Arc::ptr_eq(&target.tenure, &self.tenure) =>
+            {
+                Ok(true)
+            }
+            None if !state
+                .targets
+                .values()
+                .any(|target| target.session_id == self.session_id) =>
+            {
+                Ok(false)
+            }
+            _ => Err(ProtocolError::StaleScope),
+        }
+    }
+    /// Only the CDP retirement consumer calls this while holding the original
+    /// ledger. Do not call eval_invalidation or drop this permit in that scope.
+    pub(super) fn finish_retired_worker_startup(
+        &mut self,
+        registry: &Arc<ClientTargets>,
+        target: &str,
+        session: &str,
+        check_bounds: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        if !Arc::ptr_eq(&self.registry, registry)
+            || !self.worker_startup
+            || self.completed
+            || self.target_id != target
+            || self.session_id != session
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        #[cfg(test)]
+        if let Some(entered) = registry.retirement_before_lock.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let state = registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || state.integrity_lost
+            || state.protected_read
+            || state.resuming == 0
+            || !self.tenure.observed_detach.load(Ordering::Acquire)
+            || state
+                .targets
+                .values()
+                .any(|entry| entry.target_id == target || entry.session_id == session)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        // Retirement publishes neither configured nor resumed. Drop releases the
+        // original resuming reservation after the outer locks have all gone.
+        check_bounds()?;
+        self.completed = true;
+        Ok(())
+    }
+    /// Normal all-ACK completion runs under the original transport/ledger
+    /// fence. This non-consuming method cannot poison via Drop on a lost target.
+    pub(super) fn complete_acknowledged_worker_startup(
+        &mut self,
+        registry: &Arc<ClientTargets>,
+        target: &str,
+        session: &str,
+        check_bounds: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<Option<diagnostic::DiagnosticAttachment>, ProtocolError> {
+        if !Arc::ptr_eq(&self.registry, registry)
+            || !self.worker_startup
+            || self.completed
+            || self.target_id != target
+            || self.session_id != session
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        #[cfg(test)]
+        if let Some(entered) = registry.retirement_before_lock.lock().unwrap().take() {
+            let _ = entered.send(());
+        }
+        let mut state = registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.integrity_lost || state.protected_read || state.resuming == 0 {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.complete_locked(&mut state, check_bounds)
+    }
+    fn complete_locked(
+        &mut self,
+        state: &mut Registry,
+        check_bounds: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<Option<diagnostic::DiagnosticAttachment>, ProtocolError> {
+        if state.sealed {
+            return Err(ProtocolError::StaleScope);
+        }
+        let target = state
+            .targets
+            .get_mut(&self.target_id)
+            .ok_or(ProtocolError::StaleReference)?;
+        if target.session_id != self.session_id
+            || !Arc::ptr_eq(&target.tenure, &self.tenure)
+            || !target.resume_pending
+            || target.resumed
+            || (!self.worker_startup && !target.configured)
+            || (self.worker_startup
+                && (target.kind != "service_worker"
+                    || target.purpose != Some(TargetPurpose::Application)
+                    || target.configured))
+        {
+            state.lose_integrity();
+            return Err(ProtocolError::StaleScope);
+        }
+        check_bounds()?;
+        // The caller retains this permit until the entire fixed startup
+        // batch acknowledges. No earlier step advertises full readiness.
+        if self.worker_startup {
+            target.configured = true;
+        }
+        target.resumed = true;
+        if let Some(value) = &mut target.diagnostic {
+            value.stage = diagnostic::DiagnosticTargetStage::Resumed;
+        }
+        let observed = target.diagnostic_snapshot();
+        self.completed = true;
+        Ok(observed)
+    }
     pub fn complete(mut self) -> Result<(), ProtocolError> {
         let registry = self.registry.clone();
         let observed = registry.eval_invalidation(|revoke| {
             revoke();
-            let mut state = self
-                .registry
+            let mut state = registry
                 .state
                 .lock()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
-            if state.sealed {
-                return Err(ProtocolError::StaleScope);
-            }
-            let target = state
-                .targets
-                .get_mut(&self.target_id)
-                .ok_or(ProtocolError::StaleReference)?;
-            if target.session_id != self.session_id
-                || !Arc::ptr_eq(&target.tenure, &self.tenure)
-                || !target.resume_pending
-                || target.resumed
-                || (!self.worker_startup && !target.configured)
-                || (self.worker_startup
-                    && (target.kind != "service_worker"
-                        || target.purpose != Some(TargetPurpose::Application)
-                        || target.configured))
-            {
-                state.lose_integrity();
-                return Err(ProtocolError::StaleScope);
-            }
-            // The caller retains this permit until the entire fixed startup
-            // batch acknowledges. No earlier step advertises full readiness.
-            if self.worker_startup {
-                target.configured = true;
-            }
-            target.resumed = true;
-            if let Some(value) = &mut target.diagnostic {
-                value.stage = diagnostic::DiagnosticTargetStage::Resumed;
-            }
-            let observed = target.diagnostic_snapshot();
-            self.completed = true;
-            Ok(observed)
+            self.complete_locked(&mut state, || Ok(()))
         })?;
         if let Some(value) = observed {
             diagnostic::target_lifecycle(value.generation, 0, value, None);
@@ -432,7 +545,20 @@ impl ClientTargets {
             state: Mutex::new(Registry::default()),
             eval_owner: std::sync::OnceLock::new(),
             changed: Notify::new(),
+            #[cfg(test)]
+            retirement_before_lock: Mutex::new(None),
         })
+    }
+    /// Deterministic final-lock race fixture; absent from production builds.
+    #[cfg(test)]
+    pub(crate) fn with_worker_retirement_lock_for_test(
+        &self,
+        entered: std::sync::mpsc::Sender<()>,
+        held: impl FnOnce(),
+    ) {
+        *self.retirement_before_lock.lock().unwrap() = Some(entered);
+        let _state = self.state.lock().unwrap();
+        held();
     }
     pub(crate) fn bind_eval_owner(
         &self,
@@ -980,7 +1106,7 @@ impl ClientTargets {
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
             let diagnostic = state.diagnostic_attachment(&target_id);
-            let tenure = Arc::new(AttachmentTenure);
+            let tenure = Arc::new(AttachmentTenure::default());
             let observed_tenure = diagnostic::inventory_enabled().then(|| tenure.clone());
             state.targets.insert(
                 target_id.clone(),
@@ -1163,6 +1289,24 @@ impl ClientTargets {
         drop(state);
         if let Some(value) = observed {
             diagnostic::target_lifecycle(value.generation, 0, value, None);
+        }
+        Ok(())
+    }
+    /// Called only for the event's directly matched worker entry, before its
+    /// removal. Cascading/targetDestroyed cleanup never manufactures this bit.
+    pub(super) fn observe_worker_detach(
+        &self,
+        target: &str,
+        session: &str,
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(entry) = state.targets.get(target) {
+            if entry.kind == "service_worker" && entry.session_id == session {
+                entry.tenure.observed_detach.store(true, Ordering::Release);
+            }
         }
         Ok(())
     }
@@ -1960,6 +2104,76 @@ mod tests {
             )
             .unwrap();
         targets
+    }
+
+    #[tokio::test]
+    async fn service_worker_retirement_requires_exact_detach_and_absent_original_tenure() {
+        for scenario in [
+            "exact",
+            "missing",
+            "wrong-session",
+            "target-reused",
+            "session-reused",
+            "same-ids",
+            "sealed",
+        ] {
+            let targets = startup_worker();
+            let mut permit = targets
+                .service_worker_startup_permit("worker", "session")
+                .await
+                .unwrap();
+            if scenario != "missing" {
+                targets
+                    .observe_worker_detach(
+                        "worker",
+                        if scenario == "wrong-session" {
+                            "other"
+                        } else {
+                            "session"
+                        },
+                    )
+                    .unwrap();
+            }
+            targets.detach("worker").unwrap();
+            if matches!(scenario, "target-reused" | "session-reused" | "same-ids") {
+                targets
+                    .attached(
+                        "ctx",
+                        if matches!(scenario, "target-reused" | "same-ids") {
+                            "worker"
+                        } else {
+                            "new-worker"
+                        }
+                        .into(),
+                        if matches!(scenario, "session-reused" | "same-ids") {
+                            "session"
+                        } else {
+                            "new-session"
+                        }
+                        .into(),
+                        "service_worker".into(),
+                    )
+                    .unwrap();
+            }
+            if scenario == "sealed" {
+                targets.seal();
+            }
+            let result =
+                permit.finish_retired_worker_startup(&targets, "worker", "session", || Ok(()));
+            assert_eq!(result.is_ok(), scenario == "exact", "{scenario}");
+            assert_eq!(targets.state.lock().unwrap().resuming, 1);
+            assert!(!targets
+                .state
+                .lock()
+                .unwrap()
+                .targets
+                .values()
+                .any(|entry| entry.configured || entry.resumed));
+            drop(permit);
+            let state = targets.state.lock().unwrap();
+            assert_eq!(state.resuming, 0);
+            assert_eq!(state.integrity_lost, scenario != "exact", "{scenario}");
+        }
     }
 
     #[tokio::test]
@@ -3210,7 +3424,7 @@ mod atomic_revision_diagnostic_tests {
             configured: true,
             resumed: true,
             resume_pending: false,
-            tenure: Arc::new(AttachmentTenure),
+            tenure: Arc::new(AttachmentTenure::default()),
             diagnostic: None,
         }
     }

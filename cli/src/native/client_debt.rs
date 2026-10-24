@@ -645,6 +645,18 @@ pub(crate) enum CommandStatus {
     Abandoned,
     IntegrityLost,
 }
+/// Immutable provenance of the private fixed worker batch, not a lifecycle
+/// state or permission inferred from the owner's aggregate debt counters.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum WorkerStartupStatusProvenance {
+    AllAcknowledged,
+    IncludesDestroyed,
+}
+/// One synchronous proof decision; pending publication grants no authority.
+pub(super) enum WorkerStartupProof<T> {
+    Committed(T),
+    AwaitPublication,
+}
 #[derive(Clone)]
 pub(crate) struct CommandStatusHandle(Arc<AtomicU8>, bool, Arc<tokio::sync::Notify>);
 impl CommandStatusHandle {
@@ -809,6 +821,23 @@ impl LedgerState {
         self.integrity_lost = true;
         self.eof_integrity_cause = EofIntegrityCause::Contaminated;
     }
+    fn final_local_eof_resources_settled(&self) -> bool {
+        self.eof_integrity_cause == EofIntegrityCause::RemoteEofOnly
+            && self.integrity_lost
+            && !self.retired
+            && self
+                .bootstrap
+                .as_ref()
+                .is_some_and(|scope| !scope.owns_context)
+            && self.context_id.is_some()
+            && !self.context_creation_claimed
+            && self.commands.is_empty()
+            && self.objects.is_empty()
+            && self.groups.is_empty()
+            && self.realms.is_empty()
+            && self.created_targets.is_empty()
+            && self.recording_targets.is_empty()
+    }
 }
 pub(crate) struct OwnerDebtLedger {
     generation: u64,
@@ -823,6 +852,7 @@ pub(crate) struct OwnerDebtLedger {
 pub(crate) struct EvalEventPublication(Arc<OwnerDebtLedger>);
 impl EvalEventPublication {
     pub(crate) fn complete(self) {
+        let _notification = DebtChange(&self.0.changed);
         if let Ok(mut state) = self.0.state.lock() {
             if !state.integrity_lost {
                 state.eval_publication_pending = false;
@@ -876,6 +906,81 @@ impl OwnerDebtLedger {
         if let Some(window) = &mut state.eval_window {
             window.integrity_lost = true;
         }
+    }
+    /// Restricted synchronous retirement commit. The caller holds the original
+    /// transport owner; commit may touch only that owner's existing target
+    /// registry. It must not await, relock this ledger, or call the index back.
+    pub(super) fn with_worker_startup_proof<T>(
+        &self,
+        generation: u64,
+        targets: &super::client_targets::ClientTargets,
+        binding: (&str, &str),
+        statuses: &[(CommandStatusHandle, CommandStatus)],
+        provenance: WorkerStartupStatusProvenance,
+        commit: impl FnOnce(bool) -> Result<T, ProtocolError>,
+    ) -> Result<WorkerStartupProof<T>, ProtocolError> {
+        let (target, session) = binding;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !self.matches_owner(generation, &targets.identity_scope)
+            || state.retired
+            || state.integrity_lost
+            || state.context_id.as_deref() != Some(targets.context_id.as_str())
+            || statuses.is_empty()
+            || statuses.len() > 4
+            || match provenance {
+                WorkerStartupStatusProvenance::AllAcknowledged => statuses
+                    .iter()
+                    .any(|(_, expected)| *expected != CommandStatus::Acknowledged),
+                WorkerStartupStatusProvenance::IncludesDestroyed => !statuses
+                    .iter()
+                    .any(|(_, expected)| *expected == CommandStatus::Destroyed),
+            }
+            || statuses.iter().any(|(status, expected)| {
+                !matches!(
+                    expected,
+                    CommandStatus::Acknowledged | CommandStatus::Destroyed
+                ) || status.snapshot() != *expected
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let bound = match state.targets.get(session) {
+            Some(known)
+                if known == target
+                    && !state
+                        .targets
+                        .iter()
+                        .any(|(other, known)| other != session && known == target) =>
+            {
+                true
+            }
+            None if !state.targets.values().any(|known| known == target) => false,
+            _ => return Err(ProtocolError::StaleScope),
+        };
+        if bound && provenance == WorkerStartupStatusProvenance::IncludesDestroyed {
+            return Err(ProtocolError::StaleScope);
+        }
+        if state.eval_publication_pending {
+            return Ok(WorkerStartupProof::AwaitPublication);
+        }
+        invalidate_eval(&mut state);
+        commit(bound).map(WorkerStartupProof::Committed)
+    }
+    pub(super) fn worker_startup_publication_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.changed.clone()
+    }
+    pub(super) fn worker_startup_publication_pending(&self) -> Result<bool, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired || state.integrity_lost {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(state.eval_publication_pending)
     }
     /// Central target mutation follows the existing ledger -> targets ordering.
     /// The closure may only lock and mutate the exact target registry, never await.
@@ -1533,28 +1638,55 @@ impl OwnerDebtLedger {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.eof_integrity_cause != EofIntegrityCause::RemoteEofOnly
-            || !state.integrity_lost
-            || state.retired
-            || state
-                .bootstrap
-                .as_ref()
-                .is_none_or(|scope| scope.owns_context)
-            || state.context_id.is_none()
-            || state.context_creation_claimed
-            || !state.commands.is_empty()
-            || !state.objects.is_empty()
-            || !state.groups.is_empty()
-            || !state.realms.is_empty()
+        if !state.final_local_eof_resources_settled()
             || !state.targets.is_empty()
             || !state.lifecycle_sessions.is_empty()
-            || !state.created_targets.is_empty()
-            || !state.recording_targets.is_empty()
         {
             return Err(ProtocolError::ScopeUnavailable);
         }
         // Bound context identity and script authorization digests are inert
         // metadata, not live resources. Do not require descriptor_bytes == 0.
+        Ok(())
+    }
+    /// Relinquish only the exact observation bindings validated by enrollment.
+    /// The caller holds its index lock and validates targets in the fallible
+    /// commit before mutating its index. This synchronous commit cannot settle
+    /// commands, acknowledge a detach, revive admission, or change host lifetime.
+    pub(crate) fn relinquish_final_local_observers(
+        &self,
+        generation: u64,
+        identity_scope: &str,
+        context: &str,
+        observers: &[(String, String)],
+        commit_index: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        if !self.matches_owner(generation, identity_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let _notification = DebtChange(&self.changed);
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !state.final_local_eof_resources_settled()
+            || state.context_id.as_deref() != Some(context)
+            || observers.is_empty()
+            || state.targets.len() != observers.len()
+            || state.lifecycle_sessions.len() != observers.len()
+            || !state.targets.iter().all(|(session, target)| {
+                state.lifecycle_sessions.get(session) == Some(&LifecycleSessionPurpose::Observer)
+                    && observers.iter().any(|pair| {
+                        pair.0.as_str() == session.as_str() && pair.1.as_str() == target.as_str()
+                    })
+            })
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        commit_index()?;
+        for (session, _) in observers {
+            state.targets.remove(session);
+            state.lifecycle_sessions.remove(session);
+        }
         Ok(())
     }
     pub(crate) fn operation(
@@ -3024,15 +3156,18 @@ fn unpublished_admits(
     let state_session = session.is_some_and(|session| {
         state.lifecycle_sessions.get(session) == Some(&LifecycleSessionPurpose::StateBootstrap)
     });
-    if session.is_some_and(|session| {
+    let observer_session = session.is_some_and(|session| {
         state.lifecycle_sessions.get(session) == Some(&LifecycleSessionPurpose::Observer)
-    }) && !matches!(
-        method,
-        "Page.enable"
-            | "Page.getFrameTree"
-            | "Target.setAutoAttach"
-            | "Runtime.runIfWaitingForDebugger"
-    ) {
+    });
+    if observer_session
+        && !matches!(
+            method,
+            "Page.enable"
+                | "Page.getFrameTree"
+                | "Target.setAutoAttach"
+                | "Runtime.runIfWaitingForDebugger"
+        )
+    {
         return false;
     }
     let exact_context = p["browserContextId"]
@@ -3082,7 +3217,8 @@ fn unpublished_admits(
         "Target.setAutoAttach" => {
             (session.is_none() || known_session)
                 && p["autoAttach"] == true
-                && p["waitForDebuggerOnStart"] == true
+                && (p["waitForDebuggerOnStart"] == true
+                    || (observer_session && p["waitForDebuggerOnStart"] == false))
                 && p["flatten"] == true
         }
         "Browser.setDownloadBehavior" => session.is_none() && exact_context,
@@ -3589,6 +3725,89 @@ fn classify(method: &str, _params: Option<&Value>, operation: bool) -> Classific
 pub(crate) mod tests {
     use super::*;
     use serde_json::json;
+    #[test]
+    fn unpublished_non_pausing_autoattach_is_exact_observer_only() {
+        let mut state = LedgerState::default();
+        for (session, purpose) in [
+            ("observer", Some(LifecycleSessionPurpose::Observer)),
+            ("bootstrap", Some(LifecycleSessionPurpose::StateBootstrap)),
+            ("recording", Some(LifecycleSessionPurpose::Recording)),
+            ("page", None),
+            ("iframe", None),
+            ("worker", None),
+            ("service-worker", None),
+            ("observer-labelled-application", None),
+        ] {
+            state
+                .targets
+                .insert(session.into(), format!("{session}-target"));
+            if let Some(purpose) = purpose {
+                state.lifecycle_sessions.insert(session.into(), purpose);
+            }
+        }
+        // A purpose alone, or an Observer-looking name, is not a bound session.
+        state
+            .lifecycle_sessions
+            .insert("unbound-observer".into(), LifecycleSessionPurpose::Observer);
+        for session in [
+            None,
+            Some("observer"),
+            Some("page"),
+            Some("iframe"),
+            Some("worker"),
+            Some("service-worker"),
+            Some("bootstrap"),
+            Some("recording"),
+            Some("observer-labelled-application"),
+            Some("unbound-observer"),
+            Some("foreign"),
+        ] {
+            for wait in [false, true] {
+                let params =
+                    json!({"autoAttach":true,"waitForDebuggerOnStart":wait,"flatten":true});
+                let known = session.is_none_or(|id| state.targets.contains_key(id));
+                assert_eq!(
+                    unpublished_admits(
+                        &state,
+                        "Target.setAutoAttach",
+                        Some(&params),
+                        session,
+                        None
+                    ),
+                    known && (wait || session == Some("observer")),
+                    "{session:?} wait={wait}"
+                );
+            }
+        }
+        for invalid in [
+            json!({"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}),
+            json!({"autoAttach":true,"waitForDebuggerOnStart":false,"flatten":false}),
+            json!({"autoAttach":true,"flatten":true}),
+            json!({"autoAttach":true,"waitForDebuggerOnStart":"false","flatten":true}),
+        ] {
+            assert!(!unpublished_admits(
+                &state,
+                "Target.setAutoAttach",
+                Some(&invalid),
+                Some("observer"),
+                None
+            ));
+        }
+        for method in [
+            "Fetch.enable",
+            "Runtime.enable",
+            "Emulation.setLocaleOverride",
+            "Page.addScriptToEvaluateOnNewDocument",
+        ] {
+            assert!(!unpublished_admits(
+                &state,
+                method,
+                Some(&json!({})),
+                Some("observer"),
+                None
+            ));
+        }
+    }
     fn owner() -> (Arc<OwnerDebtLedger>, OperationJournalHandle) {
         let ledger = OwnerDebtLedger::new(7, "scope".into());
         let journal = ledger
@@ -4619,6 +4838,194 @@ pub(crate) mod tests {
         let ledger = OwnerDebtLedger::unpublished(&operation, "scope".into(), false).unwrap();
         ledger.bind_context("borrowed-context").unwrap();
         ledger
+    }
+    #[test]
+    fn final_local_observer_relinquishment_is_exact_and_never_restores_admission() {
+        let ledger = borrowed_final_local_owner();
+        ledger
+            .bind_observer_session("borrowed-context", "target", "observer")
+            .unwrap();
+        let observers = vec![("observer".to_owned(), "target".to_owned())];
+        let committed = std::cell::Cell::new(false);
+        assert!(ledger
+            .relinquish_final_local_observers(7, "scope", "borrowed-context", &observers, || {
+                committed.set(true);
+                Ok(())
+            })
+            .is_err());
+        assert!(!committed.get());
+        ledger.observe_remote_eof();
+        let before = ledger.snapshot();
+        for (generation, scope, context, bindings) in [
+            (8, "scope", "borrowed-context", observers.clone()),
+            (7, "replacement", "borrowed-context", observers.clone()),
+            (7, "scope", "foreign-context", observers.clone()),
+            (
+                7,
+                "scope",
+                "borrowed-context",
+                vec![("observer".into(), "foreign-target".into())],
+            ),
+        ] {
+            assert!(ledger
+                .relinquish_final_local_observers(generation, scope, context, &bindings, || {
+                    committed.set(true);
+                    Ok(())
+                })
+                .is_err());
+            assert!(!committed.get());
+            assert_eq!(ledger.snapshot(), before);
+        }
+        ledger
+            .relinquish_final_local_observers(7, "scope", "borrowed-context", &observers, || {
+                committed.set(true);
+                Ok(())
+            })
+            .unwrap();
+        assert!(committed.get());
+        ledger.check_final_local_eof(7, "scope").unwrap();
+        assert!(ledger.snapshot().integrity_lost);
+        assert!(!ledger.state.lock().unwrap().retired);
+        assert!(ledger.check_admission(AdmissionClass::Input).is_err());
+    }
+    #[test]
+    fn final_local_observer_relinquishment_retains_unknown_child_and_command_debt() {
+        for obstruction in [
+            "child",
+            "purpose",
+            "orphan",
+            "command",
+            "local-close",
+            "retired",
+            "owned",
+        ] {
+            let ledger = borrowed_final_local_owner();
+            ledger
+                .bind_observer_session("borrowed-context", "target", "observer")
+                .unwrap();
+            let submitted = if obstruction == "command" {
+                Some(
+                    ledger
+                        .reserve_command(None, "Page.enable", Some(&json!({})), Some("observer"))
+                        .unwrap()
+                        .submit()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            match obstruction {
+                "child" => ledger
+                    .bind_session("borrowed-context", "child-target", "child")
+                    .unwrap(),
+                "purpose" => {
+                    ledger
+                        .state
+                        .lock()
+                        .unwrap()
+                        .lifecycle_sessions
+                        .insert("observer".into(), LifecycleSessionPurpose::Recording);
+                }
+                "orphan" => {
+                    ledger.state.lock().unwrap().targets.remove("observer");
+                }
+                "local-close" => ledger.connection_lost(),
+                "retired" => ledger.state.lock().unwrap().retired = true,
+                "owned" => {
+                    ledger
+                        .state
+                        .lock()
+                        .unwrap()
+                        .bootstrap
+                        .as_mut()
+                        .unwrap()
+                        .owns_context = true
+                }
+                _ => {}
+            }
+            ledger.observe_remote_eof();
+            let before = ledger.snapshot();
+            let targets = ledger.state.lock().unwrap().targets.clone();
+            let purposes = ledger.state.lock().unwrap().lifecycle_sessions.clone();
+            let committed = std::cell::Cell::new(false);
+            assert!(
+                ledger
+                    .relinquish_final_local_observers(
+                        7,
+                        "scope",
+                        "borrowed-context",
+                        &[("observer".into(), "target".into())],
+                        || {
+                            committed.set(true);
+                            Ok(())
+                        }
+                    )
+                    .is_err(),
+                "{obstruction}"
+            );
+            assert!(!committed.get(), "{obstruction}");
+            assert_eq!(ledger.snapshot(), before, "{obstruction}");
+            assert!(
+                ledger.state.lock().unwrap().targets == targets,
+                "{obstruction}"
+            );
+            assert!(
+                ledger.state.lock().unwrap().lifecycle_sessions == purposes,
+                "{obstruction}"
+            );
+            assert!(ledger.check_admission(AdmissionClass::Input).is_err());
+            drop(submitted);
+        }
+    }
+    #[test]
+    fn final_local_observer_failed_commit_preserves_index_and_ledger() {
+        let ledger = borrowed_final_local_owner();
+        ledger
+            .bind_observer_session("borrowed-context", "target", "observer")
+            .unwrap();
+        let observers = vec![("observer".to_owned(), "target".to_owned())];
+        let mut index = HashMap::from([observers[0].clone()]);
+        let registry = super::super::client_targets::ClientTargets::new(
+            "borrowed-context".into(),
+            "scope".into(),
+        );
+        registry.acknowledge_enrollment().unwrap();
+        registry.check_final_local_cleanup().unwrap();
+        ledger.observe_remote_eof();
+        // A native task may poison targets after the caller's earlier check.
+        registry.seal();
+        let before = ledger.snapshot();
+        let before_index = index.clone();
+        let before_targets = ledger.state.lock().unwrap().targets.clone();
+        let before_purposes = ledger.state.lock().unwrap().lifecycle_sessions.clone();
+        let called = std::cell::Cell::new(false);
+        assert_eq!(
+            ledger.relinquish_final_local_observers(
+                7,
+                "scope",
+                "borrowed-context",
+                &observers,
+                || {
+                    called.set(true);
+                    registry.check_final_local_cleanup()?;
+                    for (session, _) in &observers {
+                        index.remove(session);
+                    }
+                    Ok(())
+                }
+            ),
+            Err(ProtocolError::CleanupFailed)
+        );
+        assert!(called.get());
+        assert_eq!(index, before_index);
+        assert_eq!(ledger.snapshot(), before);
+        assert_eq!(ledger.state.lock().unwrap().targets, before_targets);
+        assert!(ledger.state.lock().unwrap().lifecycle_sessions == before_purposes);
+        assert_eq!(
+            ledger.check_final_local_eof(7, "scope"),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+        assert!(ledger.check_admission(AdmissionClass::Input).is_err());
     }
     #[test]
     fn final_local_eof_is_read_only_exact_borrowed_owner_evidence_not_admission() {

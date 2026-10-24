@@ -219,7 +219,8 @@ struct Attribution {
     kind: String,
     application: bool,
     observation_only: bool,
-    observer_paused: bool,
+    // None preserves a missing/malformed attachment flag; it is never EOF proof.
+    observer_paused: Option<bool>,
     resumed: bool,
 }
 #[derive(Clone, Debug)]
@@ -712,6 +713,7 @@ enum CaptureTestPoint {
     BeforeVerifyReturn,
     BeforeEventApply,
     BeforeAttachedProcessing,
+    BeforeWorkerReadyCommit,
 }
 #[cfg(test)]
 struct CaptureTestGate {
@@ -1105,7 +1107,7 @@ impl ClientEnrollment {
         if !matches!(&self.ownership, ScopeOwnership::BorrowedTargets(_)) {
             return Err(ProtocolError::PolicyDenied);
         }
-        let index = self
+        let mut index = self
             .index
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
@@ -1113,13 +1115,84 @@ impl ClientEnrollment {
             return Err(error.clone());
         }
         if !index.reconciled
-            || !index.sessions.is_empty()
             || !index.realm_pending.is_empty()
             || index.realm_tickets != 0
             || index.borrowed_blank.is_some()
             || !restart_retirements_settled(&index, received)
         {
             return Err(ProtocolError::ScopeUnavailable);
+        }
+        if !index.sessions.is_empty() {
+            if !*self.client.remote_connection_closed().borrow()
+                || index.sessions.iter().any(|(session, entry)| {
+                    session != &entry.session
+                        || entry.application
+                        || !entry.observation_only
+                        || !entry.resumed
+                        || entry.observer_paused.is_none()
+                        || !matches!(entry.kind.as_str(), "page" | "iframe")
+                        || index.retired_page_sessions.contains(session)
+                        || index.retired_observer_sessions.contains(session)
+                        || index.retired_observer_targets.contains(&entry.target)
+                        || index.borrowed_retired_targets.contains(&entry.target)
+                })
+            {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            // Every child needs its own acknowledged enrollment and a complete
+            // Observer-only ancestry. A root disappearing never proves a child.
+            for entry in index.sessions.values() {
+                let mut ancestor = entry;
+                let mut rooted = false;
+                for _ in 0..index.sessions.len() {
+                    if ancestor.kind == "page"
+                        && ancestor.parent.is_none()
+                        && ancestor.root == ancestor.session
+                        && ancestor.session == entry.root
+                    {
+                        rooted = true;
+                        break;
+                    }
+                    if ancestor.kind != "iframe" || ancestor.root != entry.root {
+                        break;
+                    }
+                    let Some(parent) = ancestor
+                        .parent
+                        .as_ref()
+                        .and_then(|id| index.sessions.get(id))
+                    else {
+                        break;
+                    };
+                    ancestor = parent;
+                }
+                if !rooted {
+                    return Err(ProtocolError::ScopeUnavailable);
+                }
+            }
+            let debt = self.client.debt_ledger().ok_or(ProtocolError::StaleScope)?;
+            self.client.check_cleanup_owner(&Some(debt.clone()))?;
+            // The commit relies on seal/invalidation taking this exact ledger lock.
+            self.targets.require_eval_owner(&debt)?;
+            let observers = index
+                .sessions
+                .values()
+                .map(|entry| (entry.session.clone(), entry.target.clone()))
+                .collect::<Vec<_>>();
+            debt.relinquish_final_local_observers(
+                self.generation,
+                &self.targets.identity_scope,
+                &self.targets.context_id,
+                &observers,
+                || {
+                    // Target mutations take ledger -> targets too, so validation
+                    // cannot race a poison before this index/ledger commit.
+                    self.targets.check_final_local_cleanup()?;
+                    for (session, _) in &observers {
+                        index.sessions.remove(session);
+                    }
+                    Ok(())
+                },
+            )?;
         }
         let proof = FinalLocalEofProof {
             client: self.client.clone(),
@@ -2845,7 +2918,7 @@ impl ClientEnrollment {
             kind: kind.into(),
             application: false,
             observation_only: false,
-            observer_paused: false,
+            observer_paused: None,
             resumed: false,
         };
         self.revoke_eval_authority();
@@ -3031,14 +3104,38 @@ impl ClientEnrollment {
             // before Chromium can create the renderer that acknowledges domains.
             // This opens only network callbacks, not target readiness or capture.
             self.network.configuration_committed(&entry.session, op)?;
-            bounded(
+            match bounded(
                 op,
                 self.network
                     .initialize_service_worker_observation(&entry.session, op),
             )
-            .await?;
-            lease.permit.check()?;
-            permit.complete()?;
+            .await?
+            {
+                super::cdp::client::ServiceWorkerStartupOutcome::Ready(receipt) => {
+                    #[cfg(test)]
+                    self.pause_capture_at(CaptureTestPoint::BeforeWorkerReadyCommit, op)
+                        .await?;
+                    lease.permit.check()?;
+                    if let Some(receipt) = receipt {
+                        return self
+                            .finish_acknowledged_worker_startup(
+                                &entry,
+                                receipt,
+                                permit,
+                                op,
+                                &lease.permit,
+                            )
+                            .await;
+                    }
+                    // Unmanaged mock/CDP callers have no retirement authority.
+                    permit.complete()?;
+                }
+                super::cdp::client::ServiceWorkerStartupOutcome::Retired(retirement) => {
+                    return self
+                        .finish_retired_worker_startup(&entry, retirement, permit, op)
+                        .await;
+                }
+            }
         } else {
             self.network
                 .configure_session_observed(
@@ -3154,6 +3251,200 @@ impl ClientEnrollment {
         }
         self.changed.notify_waiters();
         Ok(())
+    }
+    /// Preserve the all-success proof until a non-consuming final decision.
+    /// Normal readiness and the enrollment resumed bit share the index fence;
+    /// a reader-first detach instead retains the proof for applied retirement.
+    async fn finish_acknowledged_worker_startup(
+        &self,
+        entry: &Attribution,
+        mut receipt: super::cdp::client::WorkerStartupRetirement,
+        mut permit: super::client_targets::ResumePermit,
+        op: &OperationLease,
+        execution: &super::client_browser::ScopePermit,
+    ) -> Result<(), ProtocolError> {
+        use super::cdp::client::WorkerStartupDecision;
+        loop {
+            let result = (|| {
+                self.check_restart_operation(op)?;
+                self.network.check_worker_startup(op)?;
+                receipt.check_bound()?;
+                execution.check()?;
+                let mut index = self
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if let Some(error) = &index.failure {
+                    return Err(error.clone());
+                }
+                if self.sealed.load(Ordering::Acquire) || op.generation != self.generation {
+                    return Err(ProtocolError::StaleScope);
+                }
+                if *op.cancellation.borrow() != CancelSignal::None {
+                    return Err(ProtocolError::Cancelled);
+                }
+                if Instant::now() >= op.deadline {
+                    return Err(ProtocolError::DeadlineExceeded);
+                }
+                let Some(current) = index.sessions.get(&entry.session) else {
+                    return Ok(WorkerStartupDecision::AwaitDetach(receipt));
+                };
+                if current.target != entry.target
+                    || current.kind != "service_worker"
+                    || current.resumed
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let decision = self.client.try_finish_acknowledged_worker_startup(
+                    receipt,
+                    &self.targets,
+                    &mut permit,
+                    op,
+                    &entry.target,
+                    &entry.session,
+                )?;
+                if matches!(&decision, WorkerStartupDecision::ReadyCommitted(_)) {
+                    // Proof locks are gone; retain only index through the
+                    // original final network check and resumed publication.
+                    self.network.configuration_committed(&entry.session, op)?;
+                    index
+                        .sessions
+                        .get_mut(&entry.session)
+                        .ok_or(ProtocolError::StaleReference)?
+                        .resumed = true;
+                    #[cfg(test)]
+                    self.trace_capture_registry(
+                        CaptureLifecycleStep::Resumed,
+                        &index.sessions[&entry.session],
+                        &index,
+                    );
+                }
+                Ok(decision)
+            })();
+            match result {
+                Ok(WorkerStartupDecision::AwaitDetach(pending)) => {
+                    return self
+                        .finish_retired_worker_startup(entry, pending, permit, op)
+                        .await;
+                }
+                Ok(WorkerStartupDecision::AwaitPublication(pending)) => {
+                    receipt = pending;
+                    // All synchronous proof/index guards have left. A wakeup
+                    // restarts normal-versus-detach selection with this receipt.
+                    if let Err(error) = self
+                        .client
+                        .wait_worker_startup_publication(&mut receipt, op)
+                        .await
+                    {
+                        drop(permit);
+                        self.changed.notify_waiters();
+                        return Err(error);
+                    }
+                }
+                Ok(WorkerStartupDecision::ReadyCommitted(observed)) => {
+                    if let Some(value) = observed {
+                        super::client_settlement_trace::target_lifecycle(
+                            value.generation,
+                            0,
+                            value,
+                            None,
+                        );
+                    }
+                    drop(permit);
+                    self.changed.notify_waiters();
+                    return Ok(());
+                }
+                Ok(WorkerStartupDecision::RetiredCommitted) => {
+                    drop(permit);
+                    self.changed.notify_waiters();
+                    return Err(ProtocolError::StaleScope);
+                }
+                Err(error) => {
+                    drop(permit);
+                    self.changed.notify_waiters();
+                    return Err(error);
+                }
+            }
+        }
+    }
+    /// This task is itself pending and retains config_gate. Wait only for the
+    /// existing event loop's applied boundary, never a global enrollment drain.
+    async fn finish_retired_worker_startup(
+        &self,
+        entry: &Attribution,
+        mut retirement: super::cdp::client::WorkerStartupRetirement,
+        mut permit: super::client_targets::ResumePermit,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let watermark = self.realm_watermark()?;
+        let result = bounded(op, async {
+            loop {
+                let mut publication_pending = false;
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                self.check_restart_operation(op)?;
+                self.network.check_worker_startup(op)?;
+                retirement.check_bound()?;
+                {
+                    let index = self.index.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if let Some(error) = &index.failure { return Err(error.clone()); }
+                    if self.sealed.load(Ordering::Acquire) || op.generation != self.generation {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    if *op.cancellation.borrow() != CancelSignal::None { return Err(ProtocolError::Cancelled); }
+                    if Instant::now() >= op.deadline { return Err(ProtocolError::DeadlineExceeded); }
+                    if self.event_watermark.lock().map_err(|_| ProtocolError::ScopeUnavailable)?
+                        .as_ref().is_none_or(|current| !watermark.same_subscription(current)) {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    // received() releases its short routes lock before taking
+                    // transport owner -> ledger -> targets. No readiness or
+                    // application authority is published by this completion.
+                    let received = watermark.received().map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if index.applied_watermark >= received {
+                        if index.sessions.contains_key(&entry.session)
+                            || index.sessions.values().any(|current| current.target == entry.target) {
+                            // A reader may unbind just after the earlier index
+                            // snapshot but before its event enters this pump.
+                            // Wait only for the original tenure; never a reused ID.
+                            if !retirement.all_acknowledged()
+                                || !permit.original_worker_attachment_present()? {
+                                return Err(ProtocolError::StaleReference);
+                            }
+                        } else {
+                            match self.client.finish_retired_worker_startup(
+                                retirement, &self.targets, &mut permit, op, &entry.target, &entry.session,
+                            )? {
+                                super::cdp::client::WorkerStartupDecision::RetiredCommitted => return Ok(()),
+                                super::cdp::client::WorkerStartupDecision::AwaitPublication(pending) => {
+                                    retirement = pending;
+                                    publication_pending = true;
+                                }
+                                _ => return Err(ProtocolError::StaleScope),
+                            }
+                        }
+                    }
+                }
+                if publication_pending {
+                    // Neither receipt provenance bypasses an in-flight event.
+                    // Retry applied watermark and final proof after the wakeup.
+                    self.client.wait_worker_startup_publication(&mut retirement, op).await?;
+                    continue;
+                }
+                let deadline = retirement.deadline();
+                tokio::select! { biased;
+                    _ = retirement.cancelled() => return Err(ProtocolError::Cancelled),
+                    _ = tokio::time::sleep_until(deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                    _ = changed => {},
+                }
+            }
+        }).await;
+        // Permit::drop relocks the ledger to release resuming. All outer index,
+        // transport-owner and ledger guards must have gone before it runs.
+        drop(permit);
+        self.changed.notify_waiters();
+        result
     }
     async fn initial_settings(
         &self,
@@ -3941,7 +4232,10 @@ impl ClientEnrollment {
             }
             // Do not release a debugger pause by closing the host page.
             for resume in [true, false] {
-                if entry.observation_only && resume && (!entry.observer_paused || entry.resumed) {
+                if entry.observation_only
+                    && resume
+                    && (entry.observer_paused != Some(true) || entry.resumed)
+                {
                     continue;
                 }
                 if Instant::now() >= session_deadline {
@@ -4242,8 +4536,7 @@ impl ClientEnrollment {
                     event
                         .params
                         .get("waitingForDebugger")
-                        .and_then(Value::as_bool)
-                        == Some(true),
+                        .and_then(Value::as_bool),
                 )
                 .await;
         }
@@ -4324,7 +4617,7 @@ impl ClientEnrollment {
         session: &str,
         kind: &str,
         parent: Option<&str>,
-        paused_by_attachment: bool,
+        paused_by_attachment: Option<bool>,
     ) -> Result<Option<Attribution>, ProtocolError> {
         let mut index = self
             .index
@@ -4385,7 +4678,7 @@ impl ClientEnrollment {
         session: &str,
         kind: &str,
         parent: Option<&str>,
-        paused_by_attachment: bool,
+        paused_by_attachment: Option<bool>,
     ) -> Result<(), ProtocolError> {
         self.check().map_err(|error| self.admission_error(error))?;
         for id in [target, session, kind] {
@@ -4409,9 +4702,13 @@ impl ClientEnrollment {
                 tree.get("frameTree").ok_or(ProtocolError::InvalidFrame)?,
                 0,
             )?;
-            self.command(&op, Some(session), "Target.setAutoAttach", autoattach(true))
+            // Observe descendant frames without creating a debugger pause: this
+            // Observer installs no Fetch policy, settings or scripts.
+            let mut params = autoattach(true);
+            params["waitForDebuggerOnStart"] = json!(false);
+            self.command(&op, Some(session), "Target.setAutoAttach", params)
                 .await?;
-            if paused_by_attachment {
+            if paused_by_attachment == Some(true) {
                 self.command(
                     &op,
                     Some(session),
@@ -4650,6 +4947,12 @@ impl ClientEnrollment {
                     .index
                     .lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if let Some(entry) = index.sessions.get(session) {
+                    if entry.kind == "service_worker" && !entry.observation_only {
+                        self.targets
+                            .observe_worker_detach(&entry.target, &entry.session)?;
+                    }
+                }
                 let mut removed = Vec::new();
                 let mut ids = vec![session.to_owned()];
                 while let Some(id) = ids.pop() {
@@ -5597,6 +5900,7 @@ mod tests {
     type Log = Arc<Mutex<Vec<Value>>>;
     type Notices = tokio::sync::mpsc::Receiver<ServerMessage>;
     include!("client_restart_readiness_tests.rs");
+    include!("client_viewport_replacement_tests.rs");
     fn coordinator(
         client: Arc<CdpClient>,
         context: &str,
@@ -5701,12 +6005,30 @@ mod tests {
         JoinHandle<()>,
         Arc<ClientSession>,
     ) {
+        let (owner, notices, log, emit, server, broker, _connection) =
+            fixture_with_client(mode, false).await;
+        (owner, notices, log, emit, server, broker)
+    }
+    async fn fixture_with_client(
+        mode: &'static str,
+        managed: bool,
+    ) -> (
+        Arc<ClientEnrollment>,
+        Notices,
+        Log,
+        tokio::sync::mpsc::Sender<Value>,
+        JoinHandle<()>,
+        Arc<ClientSession>,
+        Arc<CdpClient>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let log: Log = Arc::default();
         let recorded = log.clone();
         let (emit, mut emitted) = tokio::sync::mpsc::channel::<Value>(64);
+        let (initialization_cancel, cancellation) = watch::channel(CancelSignal::None);
         let server = tokio::spawn(async move {
+            let _initialization_cancel = initialization_cancel;
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut worker_held = Vec::<Value>::new();
@@ -5730,6 +6052,10 @@ mod tests {
                         recorded.lock().unwrap().push(request.clone());
                         let method=request["method"].as_str().unwrap();
                         if mode.starts_with("sw-startup-") && request["sessionId"]=="worker-session" {
+                            if mode=="sw-startup-retired" && method=="Runtime.runIfWaitingForDebugger" {
+                                worker_held.push(request.clone());
+                                continue;
+                            }
                             if matches!(method,"Network.enable"|"Network.setBypassServiceWorker"|"Runtime.enable") {
                                 worker_held.push(request.clone());
                                 continue;
@@ -5752,6 +6078,8 @@ mod tests {
                         // events, cancellation, or a deadline before the reply.
                         if mode=="attestation-diagnostic-held" && method=="Target.getTargetInfo" { continue; }
                         if mode=="retired-detach-held" && method=="Target.detachFromTarget" { continue; }
+                        if mode=="observer-controlled-acks" && request["sessionId"]=="observer"
+                            && matches!(method,"Page.enable"|"Target.setAutoAttach"|"Runtime.runIfWaitingForDebugger") { continue; }
                         if matches!(mode,"observer-close"|"observer-unknown-error"|"observer-detached-live") && method=="Page.enable" && request["sessionId"]=="observer" {
                             if mode!="observer-unknown-error" { socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"observer","targetId":"other-host"}}).to_string())).await.unwrap(); }
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"target closed"}}).to_string())).await.unwrap();continue;
@@ -5832,6 +6160,7 @@ mod tests {
                                 {"targetId":"unrelated","browserContextId":"owned-context","type":"page"},
                                 {"targetId":"foreign","browserContextId":"other-context","type":"page"}]}),
                             "Target.getTargets" if mode=="observer-detached-live"=>json!({"targetInfos":[{"targetId":"other-host","type":"page","browserContextId":"owned-context"}]}),
+                            "Target.getTargets" if mode=="observer-controlled-acks" && request["params"]==json!({})=>json!({"targetInfos":[{"targetId":"other-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="borrowed-capture"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"},{"targetId":"unadopted-host","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode=="borrowed-initial"=>json!({"targetInfos":[{"targetId":"initial-target","type":"page","browserContextId":"owned-context"}]}),
                             "Target.getTargets" if mode.starts_with("attestation-complete")=>complete_capture_inventory(mode, &request, inventory_reads),
@@ -5846,15 +6175,45 @@ mod tests {
                             _=>json!({}),
                         };
                         if method=="Target.getTargets" {if let Some(infos)=result.get_mut("targetInfos").and_then(Value::as_array_mut) {infos.retain(|info|!closed_targets.contains(info["targetId"].as_str().unwrap()) && !(mode=="late-popup" && info["targetId"]=="queued-popup" && !closed_targets.contains("initial-target")));}}
-                        if socket.send(Message::Text(json!({"id":request["id"],"result":result}).to_string())).await.is_err(){break;}
+                        let mut response = json!({"id":request["id"],"result":result});
+                        if (mode.starts_with("sw-startup-") || mode=="observer-controlled-acks") && request.get("sessionId").is_some() {
+                            response["sessionId"] = request["sessionId"].clone();
+                        }
+                        if socket.send(Message::Text(response.to_string())).await.is_err(){break;}
                     }
                 }
             }
         });
-        let client = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let connection = Arc::new(CdpClient::connect(&url).await.unwrap());
+        let client = if managed {
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: Instant::now() + INITIALIZE_TIMEOUT,
+                cancellation,
+            };
+            let ledger = super::super::client_debt::OwnerDebtLedger::unpublished(
+                &operation,
+                "owned-scope".into(),
+                false,
+            )
+            .unwrap();
+            ledger.bind_context("owned-context").unwrap();
+            connection.install_debt_ledger(ledger.clone()).unwrap();
+            connection.owner_view(ledger).unwrap()
+        } else {
+            connection.clone()
+        };
         let (owner, notices, broker) =
             coordinator(client, "owned-context", "owned-scope", "initial");
-        (owner, notices, log, emit, server, broker)
+        if managed {
+            owner
+                .targets
+                .bind_eval_owner(&owner.client.debt_ledger().unwrap(), 1)
+                .unwrap();
+        }
+        (owner, notices, log, emit, server, broker, connection)
     }
     // Model the pinned CDP TargetFilter rules, including the default omission
     // of native tab/browser targets. A complete inventory is not an ownership
@@ -6334,7 +6693,7 @@ mod tests {
             kind: if session == root { "page" } else { "iframe" }.into(),
             application: true,
             observation_only: false,
-            observer_paused: false,
+            observer_paused: None,
             resumed: true,
         };
         let index = complete();
@@ -7290,6 +7649,9 @@ mod tests {
     }
     impl CaptureWireFixture {
         async fn new(borrowed: bool) -> Self {
+            Self::with_viewport(borrowed, Some((700, 500))).await
+        }
+        async fn with_viewport(borrowed: bool, viewport: Option<(u32, u32)>) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let log: Log = Arc::default();
@@ -7324,7 +7686,11 @@ mod tests {
                                 "Target.closeTarget" => json!({"success":true}),
                                 _ => json!({}),
                             };
-                            if socket.send(Message::Text(json!({"id":request["id"], "result":result}).to_string())).await.is_err() { break; }
+                            let mut response = json!({"id":request["id"], "result":result});
+                            if let Some(session) = request.get("sessionId") {
+                                response["sessionId"] = session.clone();
+                            }
+                            if socket.send(Message::Text(response.to_string())).await.is_err() { break; }
                         }
                     }
                 }
@@ -7332,6 +7698,7 @@ mod tests {
             let client = Arc::new(CdpClient::connect(&url).await.unwrap());
             let (mut owner, notices, _broker) =
                 coordinator(client, "owned-context", "owned-scope", "initial");
+            Arc::get_mut(&mut owner).unwrap().config.viewport = viewport;
             if borrowed {
                 Arc::get_mut(&mut owner).unwrap().ownership =
                     ScopeOwnership::BorrowedTargets(vec!["target".into()]);
@@ -9942,7 +10309,7 @@ mod tests {
             kind: "page".into(),
             application: true,
             observation_only: false,
-            observer_paused: false,
+            observer_paused: None,
             resumed: true,
         };
         for mismatch in ["target", "root", "parent", "kind"] {
@@ -10176,7 +10543,7 @@ mod tests {
             kind: "private-browser-provided-type".into(),
             application: false,
             observation_only: true,
-            observer_paused: false,
+            observer_paused: None,
             resumed: true,
         };
         let diagnostic = capture_inventory_diagnostic(&[entry.clone()], &[], "private-context");
@@ -10461,39 +10828,226 @@ mod tests {
     }
     #[tokio::test]
     async fn observer_oopif_missing_context_requires_exact_native_metadata() {
-        let (mut owner, _notices, log, _emit, server) = fixture("observer-context").await;
-        Arc::get_mut(&mut owner).unwrap().ownership =
-            ScopeOwnership::BorrowedTargets(vec!["initial-target".into()]);
-        owner
-            .enroll_existing("initial-target", "initial", "page", &owner.operation())
-            .await
-            .unwrap();
-        owner
-            .attached(attach(
-                "owned-context",
-                "other-host",
-                "observer",
-                "page",
-                None,
-            ))
-            .await
-            .unwrap();
-        owner.attached(CdpEvent {method:"Target.attachedToTarget".into(),session_id:Some("observer".into()),params:json!({"sessionId":"child-observer","waitingForDebugger":true,"targetInfo":{"targetId":"child-target","type":"iframe"}})}).await.unwrap();
-        assert!(owner.index.lock().unwrap().sessions["child-observer"].observation_only);
-        assert!(owner.targets.owned_target("child-target").is_err());
-        owner.event(&CdpEvent {method:"Page.frameNavigated".into(),session_id:Some("child-observer".into()),params:json!({"frame":{"id":"child-frame","loaderId":"new","url":"https://iframe-origin.test/"}})}).unwrap();
-        assert_eq!(
-            owner.page.visited_origins().unwrap(),
-            vec!["https://iframe-origin.test"]
-        );
-        assert!(log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|cmd| cmd["method"] == "Target.getTargetInfo"
-                && cmd["params"]["targetId"] == "child-target"));
-        owner.close().await.unwrap();
-        server.abort();
+        for paused in [false, true] {
+            let (mut owner, _notices, log, _emit, server) = fixture("observer-context").await;
+            Arc::get_mut(&mut owner).unwrap().ownership =
+                ScopeOwnership::BorrowedTargets(vec!["initial-target".into()]);
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            let mut event = attach("owned-context", "other-host", "observer", "page", None);
+            event.params["waitingForDebugger"] = json!(paused);
+            owner.attached(event).await.unwrap();
+            owner
+                .attached(CdpEvent {
+                    method: "Target.attachedToTarget".into(),
+                    session_id: Some("observer".into()),
+                    params: json!({"sessionId":"child-observer","waitingForDebugger":paused,
+                    "targetInfo":{"targetId":"child-target","type":"iframe"}}),
+                })
+                .await
+                .unwrap();
+            assert!(owner.index.lock().unwrap().sessions["child-observer"].observation_only);
+            assert!(owner.targets.owned_target("child-target").is_err());
+            owner
+                .event(&CdpEvent {
+                    method: "Page.frameNavigated".into(),
+                    session_id: Some("child-observer".into()),
+                    params: json!({"frame":{"id":"child-frame","loaderId":"new",
+                    "url":"https://iframe-origin.test/"}}),
+                })
+                .unwrap();
+            assert_eq!(
+                owner.page.visited_origins().unwrap(),
+                vec!["https://iframe-origin.test"]
+            );
+            assert!(log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|cmd| cmd["method"] == "Target.getTargetInfo"
+                    && cmd["params"]["targetId"] == "child-target"));
+            {
+                let commands = log.lock().unwrap();
+                let mut expected = autoattach(true);
+                expected["waitForDebuggerOnStart"] = json!(false);
+                let mut methods = vec!["Page.enable", "Page.getFrameTree", "Target.setAutoAttach"];
+                if paused {
+                    methods.push("Runtime.runIfWaitingForDebugger");
+                }
+                for session in ["observer", "child-observer"] {
+                    let observed = commands
+                        .iter()
+                        .filter(|cmd| cmd["sessionId"] == session)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        observed
+                            .iter()
+                            .map(|cmd| cmd["method"].as_str().unwrap())
+                            .collect::<Vec<_>>(),
+                        methods
+                    );
+                    assert!(observed
+                        .iter()
+                        .filter(|cmd| cmd["method"] == "Target.setAutoAttach")
+                        .all(|cmd| cmd["params"] == expected));
+                    let index = owner.index.lock().unwrap();
+                    assert!(index.sessions[session].resumed);
+                    assert_eq!(index.sessions[session].observer_paused, Some(paused));
+                }
+            }
+            owner.close().await.unwrap();
+            server.abort();
+        }
+    }
+    #[tokio::test]
+    async fn context_observer_requires_successful_acks_before_ready() {
+        for (failed_method, missing_ack) in [
+            (None, false),
+            (Some("Page.enable"), false),
+            (Some("Target.setAutoAttach"), false),
+            (Some("Runtime.runIfWaitingForDebugger"), false),
+            (Some("Page.enable"), true),
+            (Some("Target.setAutoAttach"), true),
+            (Some("Runtime.runIfWaitingForDebugger"), true),
+        ] {
+            let (mut owner, _notices, log, emit, server, _broker, connection) =
+                fixture_with_client("observer-controlled-acks", true).await;
+            owner.gate.begin_transition().unwrap();
+            let authority = owner.gate.initialization(owner.targets.clone()).unwrap();
+            let mutable = Arc::get_mut(&mut owner).unwrap();
+            mutable.initialization = Some(authority.access());
+            mutable.ownership = ScopeOwnership::BorrowedTargets(vec!["initial-target".into()]);
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let task_owner = owner.clone();
+            let mut task = tokio::spawn(async move {
+                task_owner
+                    .attached(attach(
+                        "owned-context",
+                        "other-host",
+                        "observer",
+                        "page",
+                        None,
+                    ))
+                    .await
+            });
+            for method in [
+                "Page.enable",
+                "Target.setAutoAttach",
+                "Runtime.runIfWaitingForDebugger",
+            ] {
+                let request = tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let request = log
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|cmd| cmd["sessionId"] == "observer" && cmd["method"] == method)
+                            .cloned();
+                        if let Some(request) = request {
+                            break request;
+                        }
+                        assert!(!task.is_finished(), "Observer ended before {method}");
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(!owner.index.lock().unwrap().sessions["observer"].resumed);
+                assert!(owner.publish_initialized(&authority).is_err());
+                if method == "Target.setAutoAttach" {
+                    let mut expected = autoattach(true);
+                    expected["waitForDebuggerOnStart"] = json!(false);
+                    assert_eq!(request["params"], expected);
+                }
+                // A held initialization ACK cannot dispatch the later resume.
+                if method != "Runtime.runIfWaitingForDebugger" {
+                    assert!(!log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|cmd| cmd["sessionId"] == "observer"
+                            && cmd["method"] == "Runtime.runIfWaitingForDebugger"));
+                }
+                if failed_method == Some(method) && missing_ack {
+                    assert!(tokio::time::timeout(Duration::from_millis(10), &mut task)
+                        .await
+                        .is_err());
+                    assert_eq!(
+                        owner
+                            .client
+                            .debt_ledger()
+                            .unwrap()
+                            .snapshot()
+                            .outstanding_commands,
+                        1
+                    );
+                    assert!(owner.publish_initialized(&authority).is_err());
+                    task.abort();
+                    let _ = (&mut task).await;
+                    break;
+                }
+                let response = if failed_method == Some(method) {
+                    json!({"id":request["id"],"sessionId":"observer","error":{"code":-32000,"message":"synthetic Observer rejection"}})
+                } else {
+                    json!({"id":request["id"],"sessionId":"observer","result":{}})
+                };
+                emit.send(response).await.unwrap();
+                if failed_method == Some(method) {
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(2), &mut task)
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        Err(ProtocolError::BrowserFailure)
+                    );
+                    break;
+                }
+            }
+            if failed_method.is_none() {
+                tokio::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(owner.index.lock().unwrap().sessions["observer"].resumed);
+                owner.publish_initialized(&authority).unwrap();
+            } else {
+                assert!(!owner.index.lock().unwrap().sessions["observer"].resumed);
+                assert!(owner.publish_initialized(&authority).is_err());
+            }
+            if failed_method.is_some_and(|method| method != "Runtime.runIfWaitingForDebugger") {
+                assert!(!log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|cmd| cmd["sessionId"] == "observer"
+                        && cmd["method"] == "Runtime.runIfWaitingForDebugger"));
+            }
+            if failed_method == Some("Page.enable") {
+                assert!(!log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|cmd| cmd["sessionId"] == "observer"
+                        && cmd["method"] == "Target.setAutoAttach"));
+            }
+            assert!(owner.targets.owned_target("other-host").is_err());
+            // This framed fixture has no browser. Closing its transport does not
+            // waive or clear the observed missing/error ACK or Observer metadata.
+            connection.close().await;
+            // Transport closure does not stop the fixture-owned supervisor.
+            tokio::time::timeout(CLEANUP_TIMEOUT * 3, owner.close())
+                .await
+                .expect("fixture enrollment supervisor must stop within the cleanup budget")
+                .expect("fixture enrollment supervisor must join successfully");
+            server.abort();
+        }
     }
     #[tokio::test]
     async fn context_observer_never_gains_application_authority_and_rejects_late_events() {
@@ -10660,7 +11214,7 @@ mod tests {
         // Registration precedes Page.enable/getFrameTree; a real new-document
         // event interleaved with those replies must remain observed history.
         let entry = owner
-            .register_observer("other-host", "observer", "page", None, false)
+            .register_observer("other-host", "observer", "page", None, Some(false))
             .unwrap()
             .unwrap();
         owner.event(&CdpEvent {method:"Page.frameNavigated".into(),session_id:Some("observer".into()),params:json!({"frame":{"id":"other-frame","loaderId":"new","url":"https://during-init.test/"}})}).unwrap();
@@ -11787,7 +12341,7 @@ mod tests {
             kind: "page".into(),
             application: true,
             observation_only: false,
-            observer_paused: false,
+            observer_paused: None,
             resumed: true,
         };
         owner.index.lock().unwrap().frames.insert(
@@ -11964,7 +12518,7 @@ mod tests {
             kind: "page".into(),
             application: true,
             observation_only: false,
-            observer_paused: false,
+            observer_paused: None,
             resumed: false,
         };
         let lease = owner.lease(&entry).unwrap();
@@ -11986,6 +12540,345 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
         server.abort();
     }
+    async fn ready_then_exact_detach_case(cancel_before_commit: bool) {
+        let started = Instant::now();
+        let (owner, _notices, log, emit, mut server, _broker, connection) =
+            fixture_with_client("sw-startup-held", true).await;
+        let ledger = owner.client.debt_ledger().unwrap();
+        let gate = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeWorkerReadyCommit, gate.clone());
+        owner.ensure_supervisor().await.unwrap();
+        let attached = attach(
+            "owned-context",
+            "worker-target",
+            "worker-session",
+            "service_worker",
+            None,
+        );
+        emit.send(json!({"method":attached.method,"params":attached.params}))
+            .await
+            .unwrap();
+        // This point is inside the Ready arm, after the real fixed batch has
+        // joined every matching success ACK and before either permit check.
+        gate.wait_entered().await;
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(ledger.matches_owner(1, "owned-scope"));
+        assert!(!*connection.remote_connection_closed().borrow());
+        {
+            let index = owner.index.lock().unwrap();
+            assert!(index.failure.is_none());
+            assert!(index.pending_enrollment.contains("worker-session"));
+            assert!(!index.sessions["worker-session"].resumed);
+        }
+        assert!(!owner
+            .targets
+            .owned_target("worker-target")
+            .unwrap()
+            .capture_ready());
+        let watermark = owner.realm_watermark().unwrap();
+        let received_before = watermark.received().unwrap();
+        emit.send(json!({"method":"Target.detachedFromTarget","params":{
+            "sessionId":"worker-session","targetId":"worker-target"
+        }}))
+        .await
+        .unwrap();
+        let applied_detach = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let received = watermark.received().unwrap();
+                let removed = {
+                    let index = owner.index.lock().unwrap();
+                    index.failure.is_none()
+                        && index.applied_watermark >= received
+                        && !index.sessions.contains_key("worker-session")
+                };
+                if received > received_before && removed {
+                    break received;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(owner.targets.owned_target("worker-target").is_err());
+        // The existing early-reject API proves the network session is gone;
+        // with no such session it returns before any readiness mutation or I/O.
+        let probe = owner.operation();
+        owner.network.check_worker_startup(&probe).unwrap();
+        assert_eq!(
+            owner
+                .network
+                .configuration_committed("worker-session", &probe),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(!*connection.remote_connection_closed().borrow());
+        assert_eq!(*owner.stop.borrow(), CancelSignal::None);
+        assert!(started.elapsed() < INITIALIZE_TIMEOUT);
+        if cancel_before_commit {
+            owner.stop.send_replace(CancelSignal::Requested);
+        }
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_enrollment
+                .contains("worker-session")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let failure = owner.index.lock().unwrap().failure.clone();
+        let health = owner.targets.check_settlement_integrity();
+        let debt_before_close = ledger.snapshot();
+        let methods: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["sessionId"] == "worker-session")
+            .map(|request| request["method"].as_str().unwrap().to_owned())
+            .collect();
+        // Preserve primary state before any physical close, and always finish
+        // this owned synthetic peer before the desired healthy-boundary assert.
+        let cleanup = owner.close().await;
+        connection.close().await;
+        let peer = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        if peer.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        eprintln!("ready-detach cancel={cancel_before_commit} applied={applied_detach}: failure={failure:?}; health={health:?}; debt_before_close={debt_before_close:?}; methods={methods:?}; cleanup={cleanup:?}; peer={peer:?}");
+        assert_eq!(
+            methods,
+            [
+                "Fetch.enable",
+                "Target.setAutoAttach",
+                "Network.enable",
+                "Runtime.enable",
+                "Runtime.runIfWaitingForDebugger"
+            ]
+        );
+        assert_eq!(debt_before_close.outstanding_commands, 0);
+        if cancel_before_commit {
+            assert_eq!(failure, Some(ProtocolError::Cancelled));
+            assert_eq!(health, Err(ProtocolError::ScopeUnavailable));
+        } else {
+            assert_eq!(
+                failure, None,
+                "exact detach after Ready must not poison the owner"
+            );
+            assert_eq!(health, Ok(()));
+            assert!(!debt_before_close.integrity_lost);
+            assert_eq!(cleanup, Ok(()));
+        }
+        assert!(
+            matches!(peer, Ok(Ok(()))),
+            "owned peer did not finish: {peer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_worker_ready_exact_detach_before_commit_keeps_owner_healthy() {
+        ready_then_exact_detach_case(false).await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_ready_exact_detach_cancel_before_commit_remains_failure() {
+        ready_then_exact_detach_case(true).await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_error_ack_never_reaches_ready_commit_gate() {
+        let (owner, _notices, log, emit, mut server, _broker, connection) =
+            fixture_with_client("sw-startup-observer-fails", true).await;
+        let ledger = owner.client.debt_ledger().unwrap();
+        let gate = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeWorkerReadyCommit, gate.clone());
+        owner.ensure_supervisor().await.unwrap();
+        let attached = attach(
+            "owned-context",
+            "worker-target",
+            "worker-session",
+            "service_worker",
+            None,
+        );
+        emit.send(json!({"method":attached.method,"params":attached.params}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while owner.index.lock().unwrap().failure.is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let failure = owner.index.lock().unwrap().failure.clone();
+        let ready_gate_unused = gate.entered.try_acquire().is_err();
+        let debt_before_close = ledger.snapshot();
+        let resume_count = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request["sessionId"] == "worker-session"
+                    && request["method"] == "Runtime.runIfWaitingForDebugger"
+            })
+            .count();
+        let cleanup = owner.close().await;
+        connection.close().await;
+        let peer = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
+        if peer.is_err() {
+            server.abort();
+            let _ = server.await;
+        }
+        eprintln!("ready-error-ack: failure={failure:?}; ready_gate_unused={ready_gate_unused}; debt_before_close={debt_before_close:?}; cleanup={cleanup:?}; peer={peer:?}");
+        assert_eq!(failure, Some(ProtocolError::BrowserFailure));
+        assert!(ready_gate_unused);
+        assert_eq!(resume_count, 1);
+        assert_eq!(debt_before_close.outstanding_commands, 0);
+        assert!(
+            matches!(peer, Ok(Ok(()))),
+            "owned peer did not finish: {peer:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn service_worker_retirement_waits_for_applied_detach_without_publishing_ready() {
+        let (owner, _notices, log, emit, server, _broker, connection) =
+            fixture_with_client("sw-startup-retired", true).await;
+        let ledger = owner.client.debt_ledger().unwrap();
+        owner.ensure_supervisor().await.unwrap();
+        let event = attach(
+            "owned-context",
+            "worker-target",
+            "worker-session",
+            "service_worker",
+            None,
+        );
+        emit.send(json!({"method":event.method,"params":event.params}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["method"] == "Runtime.runIfWaitingForDebugger")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(owner
+            .index
+            .lock()
+            .unwrap()
+            .pending_enrollment
+            .contains("worker-session"));
+        assert!(!owner
+            .targets
+            .owned_target("worker-target")
+            .unwrap()
+            .capture_ready());
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        let gate = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+        emit.send(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"worker-session","targetId":"worker-target"}})).await.unwrap();
+        gate.wait_entered().await;
+        let watermark = owner.realm_watermark().unwrap();
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        {
+            let index = owner.index.lock().unwrap();
+            assert!(index.applied_watermark < watermark.received().unwrap());
+            assert!(index.pending_enrollment.contains("worker-session"));
+            assert!(!index.sessions["worker-session"].resumed);
+            assert!(index.failure.is_none());
+        }
+        // Reader Destroyed alone cannot complete enrollment. The same task is
+        // retained while exact detach still awaits page/network application.
+        assert!(tokio::time::timeout(Duration::from_millis(10), async {
+            while owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_enrollment
+                .contains("worker-session")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_err());
+        gate.release();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_enrollment
+                .contains("worker-session")
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let index = owner.index.lock().unwrap();
+            assert!(index.failure.is_none(), "{:?}", index.failure);
+            assert!(!index.sessions.contains_key("worker-session"));
+            assert!(index.applied_watermark >= watermark.received().unwrap());
+        }
+        assert!(owner.targets.owned_target("worker-target").is_err());
+        owner.targets.check_settlement_integrity().unwrap();
+        owner
+            .network
+            .check_worker_startup(&owner.operation())
+            .unwrap();
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        let methods: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["sessionId"] == "worker-session")
+            .map(|request| request["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            methods,
+            [
+                "Fetch.enable",
+                "Target.setAutoAttach",
+                "Network.enable",
+                "Runtime.enable",
+                "Runtime.runIfWaitingForDebugger"
+            ]
+        );
+        // No business evaluate/register result was supplied by this fixture.
+        owner.close().await.unwrap();
+        connection.close().await;
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn service_worker_enrollment_joins_observers_after_resume_in_fixed_order() {
         let (owner, _notices, log, _emit, server) = fixture("sw-startup-held").await;
@@ -12025,6 +12918,12 @@ mod tests {
                 "Runtime.runIfWaitingForDebugger"
             ]
         );
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "Target.setAutoAttach")
+            .all(|request| request["params"] == autoattach(true)));
         // Repeated identical attachment cannot initialize or resume twice.
         owner
             .attached(attach(
@@ -12373,6 +13272,10 @@ mod tests {
                 "{method}"
             );
         }
+        assert!(commands
+            .iter()
+            .filter(|entry| entry["method"] == "Target.setAutoAttach")
+            .all(|entry| entry["params"] == autoattach(true)));
         assert!(owner
             .targets
             .inventory()
