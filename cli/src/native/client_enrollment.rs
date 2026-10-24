@@ -2998,95 +2998,140 @@ impl ClientEnrollment {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             == entry.root;
-        self.network
-            .configure_session_observed(
-                ApplicationSession {
-                    session_id: entry.session.clone(),
-                    root_page_session: entry.root.clone(),
-                    active_page: active,
-                },
-                op,
-                admission,
-            )
-            .await?;
-        let page_target = matches!(entry.kind.as_str(), "page" | "iframe");
-        if page_target {
-            // Chromium fixes includeWhitespace at the first DOM.enable (and
-            // DOM.getDocument implicitly enables with the default "none").
-            // Set it once on our Application session before any DOM consumer;
-            // observer-only host sessions and workers never enter this branch.
-            self.command(
-                op,
-                Some(&entry.session),
-                "DOM.enable",
-                json!({"includeWhitespace":"all"}),
-            )
-            .await?;
-            self.initial_settings(&entry, op).await?;
-            self.command(op, Some(&entry.session), "Page.enable", json!({}))
+        if entry.kind == "service_worker" {
+            self.network
+                .prepare_service_worker_session(
+                    ApplicationSession {
+                        session_id: entry.session.clone(),
+                        root_page_session: entry.root.clone(),
+                        active_page: active,
+                    },
+                    op,
+                    admission,
+                )
                 .await?;
-            // Discover existing frames as well as future frame events.
-            let tree = self
-                .command(op, Some(&entry.session), "Page.getFrameTree", json!({}))
-                .await?;
-            if let Some(tree) = tree.get("frameTree") {
-                self.frame_tree(&entry, tree, 0)?;
-            }
-        }
-        // Runtime.enable creates the paused popup's main world before its first
-        // init registration. Chromium runs registrations immediately for paused
-        // new windows; creating the world inside that first registration can
-        // re-enter new-document injection and execute only script zero twice.
-        // Runtime events are already subscribed, and the target stays paused.
-        ServiceWorkerAdmission::observe(
-            admission,
-            WorkerAdmissionStep::RuntimeEnable,
-            self.command(op, Some(&entry.session), "Runtime.enable", json!({})),
-        )
-        .await?;
-        if page_target {
-            let revision = self
-                .page
-                .apply_to_new_session(&lease, &entry.session, op)
-                .await?;
-            if revision != self.page.config_revision()? {
-                return Err(ProtocolError::StaleScope);
-            }
-        }
-        // Autoattach is recursive. Install it while this target is paused.
-        ServiceWorkerAdmission::observe(
-            admission,
-            WorkerAdmissionStep::RecursiveAutoattach,
+            // Browser-side controls and descendant attachment are installed
+            // before startup. Renderer-domain replies may depend on the
+            // browser-side resume callback, so they form one retained batch.
             self.command(
                 op,
                 Some(&entry.session),
                 "Target.setAutoAttach",
                 autoattach(true),
-            ),
-        )
-        .await?;
-        ServiceWorkerAdmission::observe_sync(admission, WorkerAdmissionStep::Configured, || {
-            self.targets.configured(&entry.target)
-        })?;
-        let permit = ServiceWorkerAdmission::observe(
-            admission,
-            WorkerAdmissionStep::ResumePermit,
-            bounded(op, self.targets.resume_permit(&entry.target)),
-        )
-        .await?;
-        ServiceWorkerAdmission::observe(
-            admission,
-            WorkerAdmissionStep::ResumeDebugger,
-            self.command(
+            )
+            .await?;
+            let permit = bounded(
                 op,
-                Some(&entry.session),
-                "Runtime.runIfWaitingForDebugger",
-                json!({}),
-            ),
-        )
-        .await?;
-        lease.permit.check()?;
-        permit.complete()?;
+                self.targets
+                    .service_worker_startup_permit(&entry.target, &entry.session),
+            )
+            .await?;
+            // Fetch policy is installed and this exact attachment owns startup.
+            // Its main-script request must pass the normal route/auth handlers
+            // before Chromium can create the renderer that acknowledges domains.
+            // This opens only network callbacks, not target readiness or capture.
+            self.network.configuration_committed(&entry.session, op)?;
+            bounded(
+                op,
+                self.network
+                    .initialize_service_worker_observation(&entry.session, op),
+            )
+            .await?;
+            lease.permit.check()?;
+            permit.complete()?;
+        } else {
+            self.network
+                .configure_session_observed(
+                    ApplicationSession {
+                        session_id: entry.session.clone(),
+                        root_page_session: entry.root.clone(),
+                        active_page: active,
+                    },
+                    op,
+                    admission,
+                )
+                .await?;
+            let page_target = matches!(entry.kind.as_str(), "page" | "iframe");
+            if page_target {
+                // Chromium fixes includeWhitespace at the first DOM.enable (and
+                // DOM.getDocument implicitly enables with the default "none").
+                // Set it once on our Application session before any DOM consumer;
+                // observer-only host sessions and workers never enter this branch.
+                self.command(
+                    op,
+                    Some(&entry.session),
+                    "DOM.enable",
+                    json!({"includeWhitespace":"all"}),
+                )
+                .await?;
+                self.initial_settings(&entry, op).await?;
+                self.command(op, Some(&entry.session), "Page.enable", json!({}))
+                    .await?;
+                // Discover existing frames as well as future frame events.
+                let tree = self
+                    .command(op, Some(&entry.session), "Page.getFrameTree", json!({}))
+                    .await?;
+                if let Some(tree) = tree.get("frameTree") {
+                    self.frame_tree(&entry, tree, 0)?;
+                }
+            }
+            // Runtime.enable creates the paused popup's main world before its first
+            // init registration. Chromium runs registrations immediately for paused
+            // new windows; creating the world inside that first registration can
+            // re-enter new-document injection and execute only script zero twice.
+            // Runtime events are already subscribed, and the target stays paused.
+            ServiceWorkerAdmission::observe(
+                admission,
+                WorkerAdmissionStep::RuntimeEnable,
+                self.command(op, Some(&entry.session), "Runtime.enable", json!({})),
+            )
+            .await?;
+            if page_target {
+                let revision = self
+                    .page
+                    .apply_to_new_session(&lease, &entry.session, op)
+                    .await?;
+                if revision != self.page.config_revision()? {
+                    return Err(ProtocolError::StaleScope);
+                }
+            }
+            // Autoattach is recursive. Install it while this target is paused.
+            ServiceWorkerAdmission::observe(
+                admission,
+                WorkerAdmissionStep::RecursiveAutoattach,
+                self.command(
+                    op,
+                    Some(&entry.session),
+                    "Target.setAutoAttach",
+                    autoattach(true),
+                ),
+            )
+            .await?;
+            ServiceWorkerAdmission::observe_sync(
+                admission,
+                WorkerAdmissionStep::Configured,
+                || self.targets.configured(&entry.target),
+            )?;
+            let permit = ServiceWorkerAdmission::observe(
+                admission,
+                WorkerAdmissionStep::ResumePermit,
+                bounded(op, self.targets.resume_permit(&entry.target)),
+            )
+            .await?;
+            ServiceWorkerAdmission::observe(
+                admission,
+                WorkerAdmissionStep::ResumeDebugger,
+                self.command(
+                    op,
+                    Some(&entry.session),
+                    "Runtime.runIfWaitingForDebugger",
+                    json!({}),
+                ),
+            )
+            .await?;
+            lease.permit.check()?;
+            permit.complete()?;
+        }
         ServiceWorkerAdmission::observe_sync(
             admission,
             WorkerAdmissionStep::ConfigurationCommitted,
@@ -5664,6 +5709,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut worker_held = Vec::<Value>::new();
             let mut detach_count = 0;
             let mut inventory_reads = 0;
             let mut realm_loader = "synthetic-loader".to_owned();
@@ -5683,6 +5729,24 @@ mod tests {
                         let request:Value=serde_json::from_str(&text).unwrap();
                         recorded.lock().unwrap().push(request.clone());
                         let method=request["method"].as_str().unwrap();
+                        if mode.starts_with("sw-startup-") && request["sessionId"]=="worker-session" {
+                            if matches!(method,"Network.enable"|"Network.setBypassServiceWorker"|"Runtime.enable") {
+                                worker_held.push(request.clone());
+                                continue;
+                            }
+                            if mode=="sw-startup-main-script" && method=="Runtime.runIfWaitingForDebugger" {
+                                socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":"worker-session","params":{"requestId":"worker-main-script","request":{"url":"https://synthetic.test/sw.js","method":"GET","headers":{}}}}).to_string())).await.unwrap();
+                            }
+                            if (method=="Runtime.runIfWaitingForDebugger" && mode!="sw-startup-main-script") || (method=="Fetch.continueRequest" && mode=="sw-startup-main-script") {
+                                for held in worker_held.drain(..) {
+                                    let response = if mode=="sw-startup-observer-fails" && held["method"]=="Runtime.enable" {
+                                        json!({"id":held["id"],"sessionId":held["sessionId"],"error":{"code":-32000,"message":"synthetic observer failure"}})
+                                    } else { json!({"id":held["id"],"sessionId":held["sessionId"],"result":{}}) };
+                                    socket.send(Message::Text(response.to_string())).await.unwrap();
+                                }
+                            }
+                        }
+
                         if method=="Target.getTargets" { inventory_reads += 1; }
                         // Test-controlled ACK: tests can apply exact lifecycle
                         // events, cancellation, or a deadline before the reply.
@@ -11922,6 +11986,210 @@ mod tests {
         assert!(log.lock().unwrap().is_empty());
         server.abort();
     }
+    #[tokio::test]
+    async fn service_worker_enrollment_joins_observers_after_resume_in_fixed_order() {
+        let (owner, _notices, log, _emit, server) = fixture("sw-startup-held").await;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            owner.attached(attach(
+                "owned-context",
+                "worker-target",
+                "worker-session",
+                "service_worker",
+                None,
+            )),
+        )
+        .await
+        .expect("startup must not await renderer ACK before resume")
+        .unwrap();
+        assert!(owner
+            .targets
+            .owned_target("worker-target")
+            .unwrap()
+            .capture_ready());
+        assert!(owner.index.lock().unwrap().sessions["worker-session"].resumed);
+        let methods: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["sessionId"] == "worker-session")
+            .map(|request| request["method"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            methods,
+            vec![
+                "Fetch.enable",
+                "Target.setAutoAttach",
+                "Network.enable",
+                "Runtime.enable",
+                "Runtime.runIfWaitingForDebugger"
+            ]
+        );
+        // Repeated identical attachment cannot initialize or resume twice.
+        owner
+            .attached(attach(
+                "owned-context",
+                "worker-target",
+                "worker-session",
+                "service_worker",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["sessionId"] == "worker-session"
+                    && request["method"] == "Runtime.runIfWaitingForDebugger")
+                .count(),
+            1
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn service_worker_enrollment_main_script_policy_runs_before_observer_acks() {
+        let (owner, mut notices, log, _emit, server, broker) =
+            fixture_with_broker("sw-startup-main-script").await;
+        let callback_owner = owner.clone();
+        let policy = tokio::spawn(async move {
+            let notice = tokio::time::timeout(Duration::from_secs(1), notices.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let ServerMessage::Event {
+                event,
+                decision: Some(decision),
+                ..
+            } = notice
+            else {
+                panic!("expected managed request decision")
+            };
+            assert_eq!(event, "network.request");
+            assert!(!callback_owner
+                .targets
+                .owned_target("worker-target")
+                .unwrap()
+                .capture_ready());
+            broker
+                .resolve(
+                    1,
+                    &decision.token,
+                    super::super::client_protocol::Decision::Continue {
+                        overrides: Default::default(),
+                    },
+                )
+                .unwrap();
+        });
+        owner.ensure_supervisor().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            owner.attached(attach(
+                "owned-context",
+                "worker-target",
+                "worker-session",
+                "service_worker",
+                None,
+            )),
+        )
+        .await
+        .expect("main-script interception must not await renderer creation")
+        .unwrap();
+        assert!(owner
+            .targets
+            .owned_target("worker-target")
+            .unwrap()
+            .capture_ready());
+        let commands = log.lock().unwrap().clone();
+        let resume = commands
+            .iter()
+            .position(|request| {
+                request["sessionId"] == "worker-session"
+                    && request["method"] == "Runtime.runIfWaitingForDebugger"
+            })
+            .unwrap();
+        let continued = commands
+            .iter()
+            .position(|request| {
+                request["sessionId"] == "worker-session"
+                    && request["method"] == "Fetch.continueRequest"
+                    && request["params"]["requestId"] == "worker-main-script"
+            })
+            .unwrap();
+        assert!(resume < continued);
+        policy.await.unwrap();
+        owner.close().await.unwrap();
+        let proof = owner.contain_owned_resources().await.unwrap();
+        owner.release_after_containment(proof).await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn service_worker_enrollment_fetch_failure_never_resumes() {
+        let (owner, _notices, log, _emit, server) = fixture("fail-fetch").await;
+        assert!(owner
+            .attached(attach(
+                "owned-context",
+                "worker-target",
+                "worker-session",
+                "service_worker",
+                None
+            ))
+            .await
+            .is_err());
+        assert!(!log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["sessionId"] == "worker-session"
+                && matches!(
+                    request["method"].as_str(),
+                    Some("Network.enable" | "Runtime.enable" | "Runtime.runIfWaitingForDebugger")
+                )));
+        assert!(!owner
+            .targets
+            .owned_target("worker-target")
+            .is_ok_and(|target| target.capture_ready()));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn service_worker_enrollment_observer_failure_never_publishes_ready() {
+        let (owner, _notices, log, _emit, server) = fixture("sw-startup-observer-fails").await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            owner.attached(attach(
+                "owned-context",
+                "worker-target",
+                "worker-session",
+                "service_worker",
+                None
+            ))
+        )
+        .await
+        .unwrap()
+        .is_err());
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["sessionId"] == "worker-session"
+                && request["method"] == "Runtime.runIfWaitingForDebugger"));
+        assert!(!owner
+            .targets
+            .owned_target("worker-target")
+            .is_ok_and(|target| target.capture_ready()));
+        assert!(!owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .get("worker-session")
+            .is_some_and(|entry| entry.resumed));
+        server.abort();
+    }
+
     #[tokio::test]
     async fn foreign_context_only_detaches_without_domains_or_resume() {
         let (owner, _notices, log, _emit, server) = fixture("normal").await;

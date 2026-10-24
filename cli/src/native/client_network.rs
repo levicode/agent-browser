@@ -518,6 +518,59 @@ impl ClientNetwork {
         operation: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
     ) -> Result<(), ProtocolError> {
+        self.prepare_session(session, operation, admission, false)
+            .await
+    }
+
+    /// Service-worker security controls are browser-side and must acknowledge
+    /// before startup is released. Renderer-domain acknowledgements may need
+    /// that release, so enrollment completes those in its retained startup batch.
+    pub(crate) async fn prepare_service_worker_session(
+        &self,
+        session: ApplicationSession,
+        operation: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
+    ) -> Result<(), ProtocolError> {
+        self.prepare_session(session, operation, admission, true)
+            .await
+    }
+
+    pub(crate) async fn initialize_service_worker_observation(
+        &self,
+        session: &str,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check()?;
+        if operation.generation != self.scope.generation
+            || *operation.cancellation.borrow() != CancelSignal::None
+        {
+            return Err(ProtocolError::Cancelled);
+        }
+        let bypass_service_worker = self
+            .policy
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .bypass_service_worker;
+        let result = self.client.initialize_service_worker_domains(
+            session,
+            json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()}),
+            bypass_service_worker,
+            operation.deadline,
+        ).await;
+        if result.is_err() {
+            self.broker.quarantine()?;
+            return Err(ProtocolError::BrowserFailure);
+        }
+        self.check()
+    }
+
+    async fn prepare_session(
+        &self,
+        session: ApplicationSession,
+        operation: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
+        service_worker: bool,
+    ) -> Result<(), ProtocolError> {
         self.check()?;
         if operation.generation != self.scope.generation
             || *operation.cancellation.borrow() != CancelSignal::None
@@ -552,9 +605,11 @@ impl ClientNetwork {
             );
         }
         let result = tokio::time::timeout_at(operation.deadline.into(), async {
-            ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkEnable,
-                self.client.send_command("Network.enable", Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id))).await?;
-            if policy.bypass_service_worker { ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkBypass,
+            if !service_worker {
+                ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkEnable,
+                    self.client.send_command("Network.enable", Some(json!({"maxTotalBufferSize": self.blobs.producer_limit().saturating_mul(2), "maxResourceBufferSize": self.blobs.producer_limit()})), Some(&id))).await?;
+            }
+            if policy.bypass_service_worker && !service_worker { ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::NetworkBypass,
                 self.client.send_command("Network.setBypassServiceWorker",Some(json!({"bypass":true})),Some(&id))).await?; }
             ServiceWorkerAdmission::observe(admission, WorkerAdmissionStep::FetchEnable,
                 self.client.send_command("Fetch.enable", Some(json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}],"handleAuthRequests":true})), Some(&id))).await?;
@@ -567,9 +622,11 @@ impl ClientNetwork {
         self.check()
     }
 
-    /// Enrollment calls this only after exact-target settings, recursive
-    /// attachment, and resume authorization have all acknowledged completion.
-    /// Holding initial requests is failure containment, not a timing delay.
+    /// Opens this exact session's managed network callbacks. Page enrollment
+    /// waits for full configuration; service-worker enrollment opens after
+    /// Fetch policy and recursive attachment ACKs, while its retained startup
+    /// permit still blocks target readiness until all observer ACKs arrive.
+    /// Existing route/auth policy, publication, UI and tenure guards remain.
     pub(crate) fn configuration_committed(
         &self,
         session: &str,

@@ -474,6 +474,13 @@ impl Drop for PendingGuard {
     }
 }
 
+/// A submitted command keeps its waiter guard until its real response is read.
+/// Dropping the waiter never removes the reader-owned submission/debt record.
+struct CommandResponse {
+    receiver: oneshot::Receiver<CdpMessage>,
+    guard: PendingGuard,
+}
+
 impl CdpClient {
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with_headers(url, None).await
@@ -1266,6 +1273,96 @@ impl CdpClient {
             .await
     }
 
+    /// Service-worker renderer domains may not acknowledge enable until the
+    /// browser-side resume is dispatched. The caller must already hold its
+    /// resume permit and have acknowledged every mandatory security setting.
+    /// Submit this fixed sequence in order, then observe every submitted reply
+    /// under the original operation bound before publishing readiness.
+    pub(crate) async fn initialize_service_worker_domains(
+        &self,
+        session: &str,
+        network_params: Value,
+        bypass_service_worker: bool,
+        deadline: std::time::Instant,
+    ) -> Result<(), String> {
+        if session.is_empty() {
+            return Err("Service-worker initialization requires an exact session".into());
+        }
+        let expected = self.debt_ledger();
+        let mut responses = Vec::with_capacity(4);
+        let mut errors = Vec::new();
+        for (method, params) in [
+            Some(("Network.enable", network_params)),
+            bypass_service_worker.then(|| {
+                (
+                    "Network.setBypassServiceWorker",
+                    serde_json::json!({"bypass":true}),
+                )
+            }),
+            Some(("Runtime.enable", serde_json::json!({}))),
+            Some(("Runtime.runIfWaitingForDebugger", serde_json::json!({}))),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let submission = async {
+                if std::time::Instant::now() >= deadline {
+                    return Err("Service-worker initialization deadline expired".into());
+                }
+                self.check_cleanup_owner(&expected)
+                    .map_err(|_| "Native CDP owner changed".to_string())?;
+                let reservation =
+                    self.reserve_tracked_command(method, Some(&params), Some(session))?;
+                let budget = reservation
+                    .as_ref()
+                    .and_then(CommandReservation::initialization_budget);
+                let response = within_initialization(
+                    budget.clone(),
+                    self.submit_reserved_command_bound(
+                        method,
+                        Some(params),
+                        Some(session),
+                        reservation,
+                        Some((expected.clone(), deadline)),
+                    ),
+                )
+                .await?;
+                Ok((response, budget))
+            };
+            let submitted = tokio::time::timeout_at(deadline.into(), submission)
+                .await
+                .map_err(|_| "Service-worker initialization deadline expired".to_string())
+                .and_then(|result| result);
+            match submitted {
+                Ok((response, budget)) => responses.push((method, response, budget)),
+                Err(error) => {
+                    errors.push(format!("{method}: {error}"));
+                    // Never resume after an earlier local submission failure.
+                    break;
+                }
+            }
+        }
+        // Do not try_join: one failed observation must not discard a sibling
+        // that was already submitted. Cancellation/drop still retains CDP debt.
+        let results = futures_util::future::join_all(responses.into_iter().map(
+            |(method, response, budget)| async move {
+                within_initialization(
+                    budget,
+                    self.await_command_response(method, response, Some(deadline)),
+                )
+                .await
+                .map_err(|error| format!("{method}: {error}"))
+            },
+        ))
+        .await;
+        errors.extend(results.into_iter().filter_map(Result::err));
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     pub(crate) async fn send_reserved_command(
         &self,
         method: &str,
@@ -1345,6 +1442,20 @@ impl CdpClient {
         reservation: Option<CommandReservation>,
         cleanup_owner: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
     ) -> Result<Value, String> {
+        let response = self
+            .submit_reserved_command_bound(method, params, session_id, reservation, cleanup_owner)
+            .await?;
+        self.await_command_response(method, response, None).await
+    }
+
+    async fn submit_reserved_command_bound(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        reservation: Option<CommandReservation>,
+        owner_deadline: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
+    ) -> Result<CommandResponse, String> {
         let id = self.next_command_id()?;
 
         let cmd = CdpCommand {
@@ -1370,7 +1481,7 @@ impl CdpClient {
             let mut ws_tx = self.transport.ws_tx.lock().await;
             self.ensure_open()?;
             let mut pending = self.transport.pending.lock().await;
-            if let Some((expected, deadline)) = &cleanup_owner {
+            if let Some((expected, deadline)) = &owner_deadline {
                 self.check_cleanup_owner(expected)
                     .map_err(|_| "Native cleanup owner changed".to_string())?;
                 if std::time::Instant::now() >= *deadline {
@@ -1393,7 +1504,27 @@ impl CdpClient {
             }
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+        Ok(CommandResponse {
+            receiver: rx,
+            guard,
+        })
+    }
+
+    async fn await_command_response(
+        &self,
+        method: &str,
+        response: CommandResponse,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<Value, String> {
+        let CommandResponse {
+            receiver,
+            mut guard,
+        } = response;
+        let received = match deadline {
+            Some(deadline) => tokio::time::timeout_at(deadline.into(), receiver).await,
+            None => tokio::time::timeout(Duration::from_secs(30), receiver).await,
+        };
+        let response = match received {
             Ok(Ok(resp)) => {
                 guard.done = true;
                 resp
@@ -1403,8 +1534,12 @@ impl CdpClient {
                 return Err("CDP response channel closed".to_string());
             }
             Err(_) => {
-                guard.done = true;
-                self.transport.pending.lock().await.remove(&id);
+                if deadline.is_none() {
+                    guard.done = true;
+                    self.transport.pending.lock().await.remove(&guard.id);
+                }
+                // An explicit operation deadline also bounds waiter cleanup.
+                // Keep its guard armed rather than await a contended map here.
                 return Err(format!("CDP command timed out: {}", method));
             }
         };
@@ -1800,6 +1935,465 @@ mod tests {
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    async fn service_worker_test_peer() -> (
+        Arc<CdpClient>,
+        mpsc::UnboundedReceiver<Value>,
+        mpsc::UnboundedSender<Value>,
+        JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (requests, seen) = mpsc::unbounded_channel();
+        let (replies, mut responses) = mpsc::unbounded_channel::<Value>();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            loop {
+                tokio::select! {
+                    message = socket.next() => match message {
+                        Some(Ok(Message::Text(text))) => {
+                            requests.send(serde_json::from_str(&text).unwrap()).unwrap();
+                        }
+                        Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
+                        _ => {}
+                    },
+                    Some(response) = responses.recv() => {
+                        socket.send(Message::Text(response.to_string())).await.unwrap();
+                    }
+                }
+            }
+        });
+        let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+        (client, seen, replies, peer)
+    }
+
+    fn service_worker_test_owner(
+        client: &CdpClient,
+        deadline: std::time::Instant,
+    ) -> (
+        Arc<CdpClient>,
+        Arc<OwnerDebtLedger>,
+        watch::Sender<crate::native::client_session::CancelSignal>,
+    ) {
+        use crate::native::client_session::{CancelSignal, OperationLease};
+        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 1,
+            sequence: 1,
+            deadline,
+            cancellation,
+        };
+        let ledger =
+            OwnerDebtLedger::unpublished(&operation, "worker-owner".into(), false).unwrap();
+        ledger.bind_context("worker-context").unwrap();
+        ledger
+            .bind_session("worker-context", "worker-target", "worker-session")
+            .unwrap();
+        client.install_debt_ledger(ledger.clone()).unwrap();
+        (client.owner_view(ledger.clone()).unwrap(), ledger, cancel)
+    }
+
+    async fn service_worker_request(requests: &mut mpsc::UnboundedReceiver<Value>) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), requests.recv())
+            .await
+            .expect("worker command was blocked waiting for an earlier ACK")
+            .unwrap()
+    }
+
+    fn service_worker_response(request: &Value, fail: bool) -> Value {
+        let mut response = json!({"id":request["id"], "sessionId":request["sessionId"]});
+        if fail {
+            response["error"] = json!({"code":-32000,"message":"observation failed"});
+        } else {
+            response["result"] = json!({});
+        }
+        response
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_serial_enables_cannot_reach_resume_without_ack() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let sender = client.clone();
+        let serial = tokio::spawn(async move {
+            for method in [
+                "Network.enable",
+                "Runtime.enable",
+                "Runtime.runIfWaitingForDebugger",
+            ] {
+                sender
+                    .send_command(method, Some(json!({})), Some("worker-session"))
+                    .await?;
+            }
+            Ok::<_, String>(())
+        });
+        for method in [
+            "Network.enable",
+            "Runtime.enable",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            let request = service_worker_request(&mut requests).await;
+            assert_eq!(request["method"], method);
+            assert_eq!(client.pending_len().await, 1);
+            assert!(requests.try_recv().is_err());
+            assert!(!serial.is_finished());
+            replies
+                .send(service_worker_response(&request, false))
+                .unwrap();
+        }
+        serial.await.unwrap().unwrap();
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_submits_in_order_then_joins_every_real_ack() {
+        for bypass in [false, true] {
+            let methods = if bypass {
+                vec![
+                    "Network.enable",
+                    "Network.setBypassServiceWorker",
+                    "Runtime.enable",
+                    "Runtime.runIfWaitingForDebugger",
+                ]
+            } else {
+                vec![
+                    "Network.enable",
+                    "Runtime.enable",
+                    "Runtime.runIfWaitingForDebugger",
+                ]
+            };
+            for failed_method in std::iter::once(None).chain(methods.iter().copied().map(Some)) {
+                let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+                let network_params =
+                    json!({"maxTotalBufferSize":1048576,"maxResourceBufferSize":65536});
+                let expected_params = network_params.clone();
+                let startup = tokio::spawn(async move {
+                    view.initialize_service_worker_domains(
+                        "worker-session",
+                        network_params,
+                        bypass,
+                        deadline,
+                    )
+                    .await
+                });
+                let mut sent = Vec::new();
+                for method in &methods {
+                    let request = service_worker_request(&mut requests).await;
+                    assert_eq!(request["method"], *method);
+                    assert_eq!(request["sessionId"], "worker-session");
+                    assert_eq!(
+                        request["params"],
+                        match *method {
+                            "Network.enable" => expected_params.clone(),
+                            "Network.setBypassServiceWorker" => json!({"bypass":true}),
+                            _ => json!({}),
+                        }
+                    );
+                    sent.push(request);
+                }
+                for pair in sent.windows(2) {
+                    assert_ne!(pair[0]["id"], pair[1]["id"]);
+                }
+                assert_eq!(client.pending_len().await, methods.len());
+                assert_eq!(ledger.snapshot().outstanding_commands, methods.len());
+                assert!(
+                    requests.try_recv().is_err(),
+                    "duplicate worker resume/domain enable"
+                );
+                assert!(!startup.is_finished(), "submission is not readiness");
+                // Hold Runtime.enable last. Errors from any other command must
+                // not cause an early return/drop of this submitted sibling.
+                let held = methods.len() - 2;
+                for (index, request) in sent.iter().enumerate() {
+                    if index != held {
+                        replies
+                            .send(service_worker_response(
+                                request,
+                                failed_method == request["method"].as_str(),
+                            ))
+                            .unwrap();
+                    }
+                }
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    while client.pending_len().await != 1 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert!(
+                    !startup.is_finished(),
+                    "an error dropped an already submitted sibling"
+                );
+                assert_eq!(ledger.snapshot().outstanding_commands, 1);
+                replies
+                    .send(service_worker_response(
+                        &sent[held],
+                        failed_method == Some("Runtime.enable"),
+                    ))
+                    .unwrap();
+                let result = startup.await.unwrap();
+                if let Some(method) = failed_method {
+                    let error = result.unwrap_err();
+                    assert!(
+                        error.contains(method) && error.contains("observation failed"),
+                        "{error}"
+                    );
+                } else {
+                    result.unwrap();
+                }
+                assert_eq!(client.pending_len().await, 0);
+                assert_eq!(ledger.snapshot().outstanding_commands, 0);
+                assert!(requests.try_recv().is_err());
+                client.close().await;
+                peer.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_submission_failure_drains_sent_command_without_resume() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        // Network.enable gets the last usable ID. Runtime.enable fails locally
+        // before sending, so no subsequent resume may be attempted.
+        client
+            .transport
+            .next_id
+            .store(u64::MAX - 1, Ordering::SeqCst);
+        let startup = tokio::spawn(async move {
+            view.initialize_service_worker_domains("worker-session", json!({}), false, deadline)
+                .await
+        });
+        let network = service_worker_request(&mut requests).await;
+        assert_eq!(network["method"], "Network.enable");
+        assert!(!startup.is_finished());
+        assert_eq!(client.pending_len().await, 1);
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        replies
+            .send(service_worker_response(&network, false))
+            .unwrap();
+        let error = startup.await.unwrap().unwrap_err();
+        assert!(error.contains("Runtime.enable") && error.contains("identifier exhausted"));
+        assert!(requests.try_recv().is_err());
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_checks_session_owner_retirement_and_original_deadline() {
+        for change in [
+            "empty",
+            "foreign-session",
+            "owner",
+            "retired",
+            "cancelled",
+            "expired",
+            "deadline",
+        ] {
+            let (client, mut requests, _replies, peer) = service_worker_test_peer().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (view, ledger, cancel) = service_worker_test_owner(&client, deadline);
+            let session = match change {
+                "empty" => "",
+                "foreign-session" => "different-worker",
+                _ => "worker-session",
+            };
+            let command_deadline = match change {
+                "deadline" => std::time::Instant::now() + Duration::from_millis(10),
+                "expired" => std::time::Instant::now() - Duration::from_secs(1),
+                _ => deadline,
+            };
+            let writer = client.transport.ws_tx.lock().await;
+            let mut startup = Box::pin(view.initialize_service_worker_domains(
+                session,
+                json!({}),
+                false,
+                command_deadline,
+            ));
+            if matches!(change, "empty" | "foreign-session" | "expired") {
+                assert!(startup.await.is_err());
+            } else {
+                assert!(futures_util::poll!(startup.as_mut()).is_pending());
+                assert_eq!(ledger.snapshot().outstanding_commands, 1);
+                match change {
+                    "owner" => {
+                        // Model stale transport ownership while a reservation is
+                        // waiting; the writer-side exact-owner check must reject it.
+                        *client.transport.debt_owner.lock().unwrap() =
+                            Some(OwnerDebtLedger::new(1, "replacement".into()));
+                    }
+                    "retired" => ledger
+                        .retire_after_context_destroy("worker-context")
+                        .unwrap(),
+                    "cancelled" => cancel
+                        .send(crate::native::client_session::CancelSignal::Requested)
+                        .unwrap(),
+                    "deadline" => tokio::time::sleep_until(command_deadline.into()).await,
+                    _ => unreachable!(),
+                }
+                drop(writer);
+                assert!(startup.await.is_err(), "{change} admitted worker startup");
+                assert_eq!(ledger.snapshot().outstanding_commands, 0);
+                assert!(requests.try_recv().is_err());
+                client.close().await;
+                peer.await.unwrap();
+                continue;
+            }
+            drop(writer);
+            assert_eq!(ledger.snapshot().outstanding_commands, 0);
+            assert!(requests.try_recv().is_err());
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_cancel_drop_or_deadline_preserves_debt_until_late_acks() {
+        for completion in ["drop", "cancel", "deadline"] {
+            let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let (view, ledger, cancel) = service_worker_test_owner(&client, deadline);
+            // The supplied operation bound is shorter than the owner's bootstrap
+            // budget; waiting for responses must not renew either one.
+            let response_deadline = if completion == "deadline" {
+                std::time::Instant::now() + Duration::from_secs(1)
+            } else {
+                deadline
+            };
+            let startup = tokio::spawn(async move {
+                view.initialize_service_worker_domains(
+                    "worker-session",
+                    json!({}),
+                    false,
+                    response_deadline,
+                )
+                .await
+            });
+            let mut sent = Vec::new();
+            for _ in 0..3 {
+                sent.push(service_worker_request(&mut requests).await);
+            }
+            match completion {
+                "cancel" => {
+                    cancel
+                        .send(crate::native::client_session::CancelSignal::Requested)
+                        .unwrap();
+                    assert!(startup.await.unwrap().unwrap_err().contains("cancelled"));
+                }
+                "deadline" => {
+                    let result = tokio::time::timeout_at(
+                        (response_deadline + Duration::from_millis(250)).into(),
+                        startup,
+                    )
+                    .await
+                    .expect("worker response wait renewed its operation deadline");
+                    assert!(result.unwrap().unwrap_err().contains("timed out"));
+                }
+                _ => {
+                    startup.abort();
+                    assert!(startup.await.unwrap_err().is_cancelled());
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while client.pending_len().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(ledger.snapshot().outstanding_commands, 3);
+            assert_eq!(client.transport.tracked_responses.lock().unwrap().len(), 3);
+            for request in &sent {
+                replies
+                    .send(service_worker_response(request, false))
+                    .unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while ledger.snapshot().outstanding_commands != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(client
+                .transport
+                .tracked_responses
+                .lock()
+                .unwrap()
+                .is_empty());
+            assert!(!ledger.snapshot().integrity_lost);
+            assert!(requests.try_recv().is_err());
+            client.close().await;
+            peer.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_deadline_does_not_wait_for_pending_cleanup_lock() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let owner_deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, owner_deadline);
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        let startup = tokio::spawn(async move {
+            view.initialize_service_worker_domains("worker-session", json!({}), false, deadline)
+                .await
+        });
+        let mut sent = Vec::new();
+        for _ in 0..3 {
+            sent.push(service_worker_request(&mut requests).await);
+        }
+        // Hold the existing pending map across the operation deadline. The
+        // caller must finish while Drop's asynchronous cleanup remains blocked.
+        let pending = client.transport.pending.lock().await;
+        assert_eq!(pending.len(), 3);
+        let result =
+            tokio::time::timeout_at((deadline + Duration::from_millis(250)).into(), startup)
+                .await
+                .expect("expired startup awaited the pending-map cleanup lock")
+                .unwrap();
+        assert!(result.unwrap_err().contains("timed out"));
+        assert_eq!(pending.len(), 3);
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        assert_eq!(client.transport.tracked_responses.lock().unwrap().len(), 3);
+        drop(pending);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client.pending_len().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        for request in &sent {
+            replies
+                .send(service_worker_response(request, false))
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ledger.snapshot().outstanding_commands != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+        peer.await.unwrap();
+    }
 
     #[tokio::test]
     async fn navigation_stop_requires_exact_retiring_journal_and_original_writer_deadline() {

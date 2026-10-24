@@ -332,6 +332,8 @@ pub struct ResumePermit {
     registry: Arc<ClientTargets>,
     target_id: String,
     session_id: String,
+    tenure: Arc<AttachmentTenure>,
+    worker_startup: bool,
     completed: bool,
 }
 impl ProtectedTargetBarrier {
@@ -368,9 +370,23 @@ impl ResumePermit {
                 .targets
                 .get_mut(&self.target_id)
                 .ok_or(ProtocolError::StaleReference)?;
-            if target.session_id != self.session_id {
+            if target.session_id != self.session_id
+                || !Arc::ptr_eq(&target.tenure, &self.tenure)
+                || !target.resume_pending
+                || target.resumed
+                || (!self.worker_startup && !target.configured)
+                || (self.worker_startup
+                    && (target.kind != "service_worker"
+                        || target.purpose != Some(TargetPurpose::Application)
+                        || target.configured))
+            {
                 state.lose_integrity();
                 return Err(ProtocolError::StaleScope);
+            }
+            // The caller retains this permit until the entire fixed startup
+            // batch acknowledges. No earlier step advertises full readiness.
+            if self.worker_startup {
+                target.configured = true;
             }
             target.resumed = true;
             if let Some(value) = &mut target.diagnostic {
@@ -393,7 +409,9 @@ impl Drop for ResumePermit {
             revoke();
             if let Ok(mut state) = self.registry.state.lock() {
                 if let Some(target) = state.targets.get_mut(&self.target_id) {
-                    if target.session_id == self.session_id {
+                    if target.session_id == self.session_id
+                        && Arc::ptr_eq(&target.tenure, &self.tenure)
+                    {
                         target.resume_pending = false;
                     }
                 }
@@ -547,6 +565,26 @@ impl ClientTargets {
         self: &Arc<Self>,
         target_id: &str,
     ) -> Result<ResumePermit, ProtocolError> {
+        self.resume_permit_inner(target_id, None).await
+    }
+
+    /// A service worker can exist before its renderer is ready. Security
+    /// controls are acknowledged by enrollment before this private admission;
+    /// full configuration remains false until the retained startup batch ends.
+    pub(crate) async fn service_worker_startup_permit(
+        self: &Arc<Self>,
+        target_id: &str,
+        session_id: &str,
+    ) -> Result<ResumePermit, ProtocolError> {
+        self.resume_permit_inner(target_id, Some(session_id)).await
+    }
+
+    async fn resume_permit_inner(
+        self: &Arc<Self>,
+        target_id: &str,
+        worker_session: Option<&str>,
+    ) -> Result<ResumePermit, ProtocolError> {
+        let mut expected_tenure = None;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -563,24 +601,44 @@ impl ClientTargets {
                     .targets
                     .get(target_id)
                     .ok_or(ProtocolError::StaleReference)?;
-                if !target.configured || target.resumed || target.resume_pending {
+                if let Some(expected) = &expected_tenure {
+                    if !Arc::ptr_eq(expected, &target.tenure) {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                } else {
+                    expected_tenure = Some(target.tenure.clone());
+                }
+                let eligible = match worker_session {
+                    Some(session) => {
+                        target.session_id == session
+                            && target.kind == "service_worker"
+                            && target.purpose == Some(TargetPurpose::Application)
+                            && !target.configured
+                    }
+                    None => target.configured,
+                };
+                if !eligible || target.resumed || target.resume_pending {
                     return Err(ProtocolError::InvalidArguments);
                 }
                 if !state.protected_read {
                     let session_id = target.session_id.clone();
+                    let tenure = target.tenure.clone();
+                    let resuming = state
+                        .resuming
+                        .checked_add(1)
+                        .ok_or(ProtocolError::CapacityExceeded)?;
                     state
                         .targets
                         .get_mut(target_id)
                         .ok_or(ProtocolError::StaleReference)?
                         .resume_pending = true;
-                    state.resuming = state
-                        .resuming
-                        .checked_add(1)
-                        .ok_or(ProtocolError::CapacityExceeded)?;
+                    state.resuming = resuming;
                     return Ok(ResumePermit {
                         registry: self.clone(),
                         target_id: target_id.into(),
                         session_id,
+                        tenure,
+                        worker_startup: worker_session.is_some(),
                         completed: false,
                     });
                 }
@@ -1890,6 +1948,173 @@ impl Drop for CreationReservation {
 #[cfg(test)]
 mod tests {
     use super::{ClientTargets, ProtocolError};
+
+    fn startup_worker() -> std::sync::Arc<ClientTargets> {
+        let targets = ClientTargets::new("ctx".into(), "scope".into());
+        targets
+            .attached(
+                "ctx",
+                "worker".into(),
+                "session".into(),
+                "service_worker".into(),
+            )
+            .unwrap();
+        targets
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_keeps_configuration_false_until_complete() {
+        let targets = startup_worker();
+        let permit = targets
+            .service_worker_startup_permit("worker", "session")
+            .await
+            .unwrap();
+        {
+            let state = targets.state.lock().unwrap();
+            assert!(!state.inventory_complete());
+            assert_eq!(state.resuming, 1);
+            assert!(!state.targets["worker"].configured);
+            assert!(state.targets["worker"].resume_pending);
+            assert!(!state.targets["worker"].capture_ready());
+        }
+        assert!(targets.check_settlement_integrity().is_err());
+        assert!(targets
+            .service_worker_startup_permit("worker", "session")
+            .await
+            .is_err());
+        permit.complete().unwrap();
+        {
+            let state = targets.state.lock().unwrap();
+            assert!(state.inventory_complete());
+            assert_eq!(state.resuming, 0);
+            assert!(state.targets["worker"].capture_ready());
+        }
+        targets.check_settlement_integrity().unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_refuses_wrong_kind_session_and_retired_owner() {
+        for kind in ["page", "iframe", "worker", "shared_worker"] {
+            let targets = ClientTargets::new("ctx".into(), "scope".into());
+            targets
+                .attached("ctx", "worker".into(), "session".into(), kind.into())
+                .unwrap();
+            assert!(targets
+                .service_worker_startup_permit("worker", "session")
+                .await
+                .is_err());
+        }
+        let targets = startup_worker();
+        assert!(targets
+            .service_worker_startup_permit("worker", "foreign")
+            .await
+            .is_err());
+        targets.seal();
+        assert!(targets
+            .service_worker_startup_permit("worker", "session")
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_drop_cannot_publish_ready() {
+        let targets = startup_worker();
+        let permit = targets
+            .service_worker_startup_permit("worker", "session")
+            .await
+            .unwrap();
+        drop(permit);
+        let state = targets.state.lock().unwrap();
+        assert!(state.sealed && state.integrity_lost);
+        assert_eq!(state.resuming, 0);
+        assert!(!state.targets["worker"].configured);
+        assert!(!state.targets["worker"].resumed);
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_same_id_replacement_rejects_old_permit() {
+        let targets = startup_worker();
+        let old = targets
+            .service_worker_startup_permit("worker", "session")
+            .await
+            .unwrap();
+        targets.detach("worker").unwrap();
+        targets
+            .attached(
+                "ctx",
+                "worker".into(),
+                "session".into(),
+                "service_worker".into(),
+            )
+            .unwrap();
+        assert_eq!(old.complete(), Err(ProtocolError::StaleScope));
+        let state = targets.state.lock().unwrap();
+        assert!(!state.targets["worker"].configured);
+        assert!(!state.targets["worker"].resumed);
+        assert!(state.integrity_lost);
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_replacement_while_waiting_is_rejected() {
+        let targets = startup_worker();
+        targets.state.lock().unwrap().protected_read = true;
+        let future = targets.service_worker_startup_permit("worker", "session");
+        tokio::pin!(future);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut future)
+                .await
+                .is_err()
+        );
+        targets.detach("worker").unwrap();
+        targets
+            .attached(
+                "ctx",
+                "worker".into(),
+                "session".into(),
+                "service_worker".into(),
+            )
+            .unwrap();
+        targets.state.lock().unwrap().protected_read = false;
+        targets.changed.notify_waiters();
+        assert!(matches!(future.await, Err(ProtocolError::StaleScope)));
+        assert_eq!(targets.state.lock().unwrap().resuming, 0);
+        assert!(!targets.state.lock().unwrap().targets["worker"].resume_pending);
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_capacity_failure_does_not_set_pending() {
+        let targets = startup_worker();
+        targets.state.lock().unwrap().resuming = usize::MAX;
+        assert!(matches!(
+            targets
+                .service_worker_startup_permit("worker", "session")
+                .await,
+            Err(ProtocolError::CapacityExceeded)
+        ));
+        assert!(!targets.state.lock().unwrap().targets["worker"].resume_pending);
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_waits_for_protected_read_without_setting_configured() {
+        let targets = startup_worker();
+        targets.state.lock().unwrap().protected_read = true;
+        let future = targets.service_worker_startup_permit("worker", "session");
+        tokio::pin!(future);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), &mut future)
+                .await
+                .is_err()
+        );
+        {
+            let mut state = targets.state.lock().unwrap();
+            assert_eq!(state.resuming, 0);
+            assert!(!state.targets["worker"].configured);
+            state.protected_read = false;
+        }
+        targets.changed.notify_waiters();
+        let permit = future.await.unwrap();
+        permit.complete().unwrap();
+    }
 
     #[test]
     fn eval_owner_binding_requires_exact_ledger_before_enable_and_cannot_be_rebound() {
