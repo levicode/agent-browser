@@ -2398,6 +2398,312 @@ mod tests {
         peer.await.unwrap();
     }
 
+    // These characterize the reader/debt boundary of a main-script failure.
+    // The peer models an exact detach before renderer-domain ACKs;
+    // this does not establish the observed HTTP 500 event sequence. No HTTP
+    // fixture, coordinator quarantine, or ResumePermit is exercised.
+    async fn service_worker_retirement_batch(
+        view: Arc<CdpClient>,
+        requests: &mut mpsc::UnboundedReceiver<Value>,
+        deadline: std::time::Instant,
+    ) -> (JoinHandle<Result<(), String>>, Vec<Value>) {
+        let startup = tokio::spawn(async move {
+            view.initialize_service_worker_domains("worker-session", json!({}), false, deadline)
+                .await
+        });
+        let mut sent = Vec::new();
+        for method in [
+            "Network.enable",
+            "Runtime.enable",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            let request = service_worker_request(requests).await;
+            assert_eq!(request["method"], method);
+            assert_eq!(request["sessionId"], "worker-session");
+            sent.push(request);
+        }
+        assert!(!startup.is_finished());
+        assert!(requests.try_recv().is_err());
+        (startup, sent)
+    }
+
+    async fn service_worker_retirement_event(
+        replies: &mpsc::UnboundedSender<Value>,
+        events: &mut broadcast::Receiver<CdpEvent>,
+        event: Value,
+    ) {
+        replies.send(event.clone()).unwrap();
+        let observed = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("reader did not publish the lifecycle barrier")
+            .unwrap();
+        assert_eq!(Some(observed.method.as_str()), event["method"].as_str());
+        assert_eq!(observed.params, event["params"]);
+        assert_eq!(observed.session_id.as_deref(), event["sessionId"].as_str());
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_exact_detach_clears_debt_but_still_returns_channel_closed() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let mut events = client.subscribe();
+        let (startup, sent) = service_worker_retirement_batch(view, &mut requests, deadline).await;
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        // Resume succeeded, but the main script never created a renderer able
+        // to acknowledge Network.enable or Runtime.enable.
+        replies
+            .send(service_worker_response(&sent[2], false))
+            .unwrap();
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Target.detachedFromTarget", "sessionId":"worker-session",
+                "params":{"sessionId":"foreign-session","targetId":"foreign-target"}}),
+        )
+        .await;
+        assert_eq!(client.pending_len().await, 2);
+        assert_eq!(ledger.snapshot().outstanding_commands, 2);
+        assert!(
+            !startup.is_finished(),
+            "the parent envelope is not the detached child"
+        );
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Target.detachedFromTarget", "sessionId":"parent-session",
+                "params":{"sessionId":"worker-session","targetId":"worker-target"}}),
+        )
+        .await;
+        let error = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .expect("exact detach must wake startup before its deadline")
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.contains("Network.enable: CDP response channel closed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Runtime.enable: CDP response channel closed"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("Runtime.runIfWaitingForDebugger"),
+            "{error}"
+        );
+        assert_eq!(client.pending_len().await, 0);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert_eq!(client.transport.tracked_responses.lock().unwrap().len(), 2);
+        // Debt retirement is not a fabricated ACK. Reader correlation remains
+        // until late replies arrive, without reviving or replaying startup.
+        for request in &sent[..2] {
+            replies
+                .send(service_worker_response(request, false))
+                .unwrap();
+        }
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Test.workerLateReplies", "params":{}}),
+        )
+        .await;
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_connection_loss_does_not_prove_worker_retirement() {
+        let (client, mut requests, _replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let (startup, _sent) = service_worker_retirement_batch(view, &mut requests, deadline).await;
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        // Close the actual peer socket, without sending a detach or a reply.
+        peer.abort();
+        assert!(peer.await.unwrap_err().is_cancelled());
+        let error = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .expect("reader EOF must wake submitted startup waiters")
+            .unwrap()
+            .unwrap_err();
+        for method in [
+            "Network.enable",
+            "Runtime.enable",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            assert!(
+                error.contains(&format!("{method}: CDP response channel closed")),
+                "{error}"
+            );
+        }
+        assert_eq!(client.pending_len().await, 0);
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        assert!(ledger.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_replacement_detach_cannot_settle_original_owner_debt() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let mut events = client.subscribe();
+        let (startup, sent) =
+            service_worker_retirement_batch(view.clone(), &mut requests, deadline).await;
+        let replacement = OwnerDebtLedger::new(2, "replacement-owner".into());
+        replacement.bind_context("replacement-context").unwrap();
+        replacement
+            .bind_session("replacement-context", "worker-target", "worker-session")
+            .unwrap();
+        assert!(client.install_debt_ledger(replacement.clone()).is_err());
+        // Fault injection only: normal owner adoption above rejects old debt.
+        // Model a stale view after transport ownership changes, without editing
+        // any ledger or command state. Reused labels cannot confer authority.
+        *client.transport.debt_owner.lock().unwrap() = Some(replacement.clone());
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Target.detachedFromTarget",
+                "params":{"sessionId":"worker-session","targetId":"worker-target"}}),
+        )
+        .await;
+        let error = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("CDP response channel closed"), "{error}");
+        assert_eq!(client.pending_len().await, 0);
+        assert_eq!(ledger.snapshot().outstanding_commands, 3);
+        assert_eq!(replacement.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(!replacement.snapshot().integrity_lost);
+        assert_eq!(client.transport.tracked_responses.lock().unwrap().len(), 3);
+        assert!(view.check_cleanup_owner(&Some(ledger.clone())).is_err());
+        let error = view
+            .initialize_service_worker_domains("worker-session", json!({}), false, deadline)
+            .await
+            .unwrap_err();
+        assert!(error.contains("Native CDP owner changed"), "{error}");
+        assert!(requests.try_recv().is_err());
+        // Late replies are correlated to the original SubmittedCommand ledger,
+        // not the owner currently installed on the transport.
+        for request in &sent {
+            replies
+                .send(service_worker_response(request, false))
+                .unwrap();
+        }
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Test.workerLateReplies", "params":{}}),
+        )
+        .await;
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(replacement.snapshot().outstanding_commands, 0);
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(!replacement.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn service_worker_startup_error_ack_is_not_pardoned_by_sibling_detachment() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let mut events = client.subscribe();
+        let (startup, sent) = service_worker_retirement_batch(view, &mut requests, deadline).await;
+        replies
+            .send(service_worker_response(&sent[1], true))
+            .unwrap();
+        replies
+            .send(service_worker_response(&sent[2], false))
+            .unwrap();
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Test.workerErrorAck", "params":{}}),
+        )
+        .await;
+        assert_eq!(client.pending_len().await, 1);
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        assert!(
+            !startup.is_finished(),
+            "an error must not abandon a submitted sibling"
+        );
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Target.detachedFromTarget",
+                "params":{"sessionId":"worker-session","targetId":"worker-target"}}),
+        )
+        .await;
+        let error = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error.contains("Network.enable: CDP response channel closed"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Runtime.enable:") && error.contains("observation failed"),
+            "{error}"
+        );
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert_eq!(client.transport.tracked_responses.lock().unwrap().len(), 1);
+        // An acknowledged protocol error plus a destroyed sibling also has no
+        // debt. Empty debt alone must never classify startup as benign retirement.
+        replies
+            .send(service_worker_response(&sent[0], false))
+            .unwrap();
+        service_worker_retirement_event(
+            &replies,
+            &mut events,
+            json!({"method":"Test.workerLateReplies", "params":{}}),
+        )
+        .await;
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(requests.try_recv().is_err());
+        client.close().await;
+        peer.await.unwrap();
+    }
+
     #[tokio::test]
     async fn navigation_stop_requires_exact_retiring_journal_and_original_writer_deadline() {
         use crate::native::client_debt::OperationKey;
