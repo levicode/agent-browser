@@ -2099,7 +2099,10 @@ mod tests {
                     assert_ne!(pair[0]["id"], pair[1]["id"]);
                 }
                 assert_eq!(client.pending_len().await, methods.len());
-                assert_eq!(ledger.snapshot().outstanding_commands, methods.len());
+                assert_eq!(
+                    ledger.snapshot().outstanding_commands,
+                    u32::try_from(methods.len()).unwrap()
+                );
                 assert!(
                     requests.try_recv().is_err(),
                     "duplicate worker resume/domain enable"
