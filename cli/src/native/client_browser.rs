@@ -1146,11 +1146,11 @@ impl OwnedBrowser {
             operation.generation,
             session.clone(),
             super::client_enrollment::ScopeConfig {
-                viewport: if seeded {
-                    self.page_state.requested_viewport()?
-                } else {
-                    options.viewport.as_ref().map(|v| (v.width, v.height))
-                },
+                viewport: select_scope_viewport(
+                    seeded,
+                    options.viewport.as_ref().map(|v| (v.width, v.height)),
+                    || self.page_state.requested_viewport(),
+                )?,
                 user_agent: options.user_agent.clone(),
                 locale: options.locale.clone(),
                 timezone_id: options.timezone_id.clone(),
@@ -1557,6 +1557,19 @@ struct ScopeCreationOptions {
     media: InitialMedia,
     init_scripts: Vec<String>,
 }
+
+pub(super) fn select_scope_viewport(
+    seeded: bool,
+    creation: Option<(u32, u32)>,
+    requested: impl FnOnce() -> Result<Option<(u32, u32)>, ProtocolError>,
+) -> Result<Option<(u32, u32)>, ProtocolError> {
+    if seeded {
+        Ok(requested()?.or(creation))
+    } else {
+        Ok(creation)
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ScopeOpenWire {

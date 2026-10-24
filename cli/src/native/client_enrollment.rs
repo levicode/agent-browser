@@ -5597,6 +5597,7 @@ mod tests {
     type Log = Arc<Mutex<Vec<Value>>>;
     type Notices = tokio::sync::mpsc::Receiver<ServerMessage>;
     include!("client_restart_readiness_tests.rs");
+    include!("client_viewport_replacement_tests.rs");
     fn coordinator(
         client: Arc<CdpClient>,
         context: &str,
@@ -7290,6 +7291,9 @@ mod tests {
     }
     impl CaptureWireFixture {
         async fn new(borrowed: bool) -> Self {
+            Self::with_viewport(borrowed, Some((700, 500))).await
+        }
+        async fn with_viewport(borrowed: bool, viewport: Option<(u32, u32)>) -> Self {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let log: Log = Arc::default();
@@ -7332,6 +7336,7 @@ mod tests {
             let client = Arc::new(CdpClient::connect(&url).await.unwrap());
             let (mut owner, notices, _broker) =
                 coordinator(client, "owned-context", "owned-scope", "initial");
+            Arc::get_mut(&mut owner).unwrap().config.viewport = viewport;
             if borrowed {
                 Arc::get_mut(&mut owner).unwrap().ownership =
                     ScopeOwnership::BorrowedTargets(vec!["target".into()]);
