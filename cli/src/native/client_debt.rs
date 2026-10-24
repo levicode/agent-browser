@@ -3654,10 +3654,9 @@ pub(crate) mod tests {
             }
         }
         // A purpose alone, or an Observer-looking name, is not a bound session.
-        state.lifecycle_sessions.insert(
-            "unbound-observer".into(),
-            LifecycleSessionPurpose::Observer,
-        );
+        state
+            .lifecycle_sessions
+            .insert("unbound-observer".into(), LifecycleSessionPurpose::Observer);
         for session in [
             None,
             Some("observer"),
@@ -3672,10 +3671,17 @@ pub(crate) mod tests {
             Some("foreign"),
         ] {
             for wait in [false, true] {
-                let params = json!({"autoAttach":true,"waitForDebuggerOnStart":wait,"flatten":true});
+                let params =
+                    json!({"autoAttach":true,"waitForDebuggerOnStart":wait,"flatten":true});
                 let known = session.is_none_or(|id| state.targets.contains_key(id));
                 assert_eq!(
-                    unpublished_admits(&state, "Target.setAutoAttach", Some(&params), session, None),
+                    unpublished_admits(
+                        &state,
+                        "Target.setAutoAttach",
+                        Some(&params),
+                        session,
+                        None
+                    ),
                     known && (wait || session == Some("observer")),
                     "{session:?} wait={wait}"
                 );
@@ -3688,7 +3694,11 @@ pub(crate) mod tests {
             json!({"autoAttach":true,"waitForDebuggerOnStart":"false","flatten":true}),
         ] {
             assert!(!unpublished_admits(
-                &state, "Target.setAutoAttach", Some(&invalid), Some("observer"), None
+                &state,
+                "Target.setAutoAttach",
+                Some(&invalid),
+                Some("observer"),
+                None
             ));
         }
         for method in [
@@ -3698,7 +3708,11 @@ pub(crate) mod tests {
             "Page.addScriptToEvaluateOnNewDocument",
         ] {
             assert!(!unpublished_admits(
-                &state, method, Some(&json!({})), Some("observer"), None
+                &state,
+                method,
+                Some(&json!({})),
+                Some("observer"),
+                None
             ));
         }
     }

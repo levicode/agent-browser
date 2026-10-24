@@ -10604,23 +10604,35 @@ mod tests {
             let mut event = attach("owned-context", "other-host", "observer", "page", None);
             event.params["waitingForDebugger"] = json!(paused);
             owner.attached(event).await.unwrap();
-            owner.attached(CdpEvent {
-                method: "Target.attachedToTarget".into(),
-                session_id: Some("observer".into()),
-                params: json!({"sessionId":"child-observer","waitingForDebugger":paused,
+            owner
+                .attached(CdpEvent {
+                    method: "Target.attachedToTarget".into(),
+                    session_id: Some("observer".into()),
+                    params: json!({"sessionId":"child-observer","waitingForDebugger":paused,
                     "targetInfo":{"targetId":"child-target","type":"iframe"}}),
-            }).await.unwrap();
+                })
+                .await
+                .unwrap();
             assert!(owner.index.lock().unwrap().sessions["child-observer"].observation_only);
             assert!(owner.targets.owned_target("child-target").is_err());
-            owner.event(&CdpEvent {
-                method: "Page.frameNavigated".into(),
-                session_id: Some("child-observer".into()),
-                params: json!({"frame":{"id":"child-frame","loaderId":"new",
+            owner
+                .event(&CdpEvent {
+                    method: "Page.frameNavigated".into(),
+                    session_id: Some("child-observer".into()),
+                    params: json!({"frame":{"id":"child-frame","loaderId":"new",
                     "url":"https://iframe-origin.test/"}}),
-            }).unwrap();
-            assert_eq!(owner.page.visited_origins().unwrap(), vec!["https://iframe-origin.test"]);
-            assert!(log.lock().unwrap().iter().any(|cmd|
-                cmd["method"] == "Target.getTargetInfo" && cmd["params"]["targetId"] == "child-target"));
+                })
+                .unwrap();
+            assert_eq!(
+                owner.page.visited_origins().unwrap(),
+                vec!["https://iframe-origin.test"]
+            );
+            assert!(log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|cmd| cmd["method"] == "Target.getTargetInfo"
+                    && cmd["params"]["targetId"] == "child-target"));
             {
                 let commands = log.lock().unwrap();
                 let mut expected = autoattach(true);
@@ -10630,11 +10642,20 @@ mod tests {
                     methods.push("Runtime.runIfWaitingForDebugger");
                 }
                 for session in ["observer", "child-observer"] {
-                    let observed = commands.iter()
-                        .filter(|cmd| cmd["sessionId"] == session).collect::<Vec<_>>();
-                    assert_eq!(observed.iter().map(|cmd| cmd["method"].as_str().unwrap())
-                        .collect::<Vec<_>>(), methods);
-                    assert!(observed.iter().filter(|cmd| cmd["method"] == "Target.setAutoAttach")
+                    let observed = commands
+                        .iter()
+                        .filter(|cmd| cmd["sessionId"] == session)
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        observed
+                            .iter()
+                            .map(|cmd| cmd["method"].as_str().unwrap())
+                            .collect::<Vec<_>>(),
+                        methods
+                    );
+                    assert!(observed
+                        .iter()
+                        .filter(|cmd| cmd["method"] == "Target.setAutoAttach")
                         .all(|cmd| cmd["params"] == expected));
                     let index = owner.index.lock().unwrap();
                     assert!(index.sessions[session].resumed);
@@ -10663,22 +10684,45 @@ mod tests {
             let mutable = Arc::get_mut(&mut owner).unwrap();
             mutable.initialization = Some(authority.access());
             mutable.ownership = ScopeOwnership::BorrowedTargets(vec!["initial-target".into()]);
-            owner.enroll_existing("initial-target", "initial", "page", &owner.operation()).await.unwrap();
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
             owner.start(&owner.operation()).await.unwrap();
             let task_owner = owner.clone();
             let mut task = tokio::spawn(async move {
-                task_owner.attached(attach("owned-context", "other-host", "observer", "page", None)).await
+                task_owner
+                    .attached(attach(
+                        "owned-context",
+                        "other-host",
+                        "observer",
+                        "page",
+                        None,
+                    ))
+                    .await
             });
-            for method in ["Page.enable", "Target.setAutoAttach", "Runtime.runIfWaitingForDebugger"] {
+            for method in [
+                "Page.enable",
+                "Target.setAutoAttach",
+                "Runtime.runIfWaitingForDebugger",
+            ] {
                 let request = tokio::time::timeout(Duration::from_secs(2), async {
                     loop {
-                        let request = log.lock().unwrap().iter().find(|cmd|
-                            cmd["sessionId"] == "observer" && cmd["method"] == method).cloned();
-                        if let Some(request) = request { break request; }
+                        let request = log
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .find(|cmd| cmd["sessionId"] == "observer" && cmd["method"] == method)
+                            .cloned();
+                        if let Some(request) = request {
+                            break request;
+                        }
                         assert!(!task.is_finished(), "Observer ended before {method}");
                         tokio::task::yield_now().await;
                     }
-                }).await.unwrap();
+                })
+                .await
+                .unwrap();
                 assert!(!owner.index.lock().unwrap().sessions["observer"].resumed);
                 assert!(owner.publish_initialized(&authority).is_err());
                 if method == "Target.setAutoAttach" {
@@ -10688,12 +10732,26 @@ mod tests {
                 }
                 // A held initialization ACK cannot dispatch the later resume.
                 if method != "Runtime.runIfWaitingForDebugger" {
-                    assert!(!log.lock().unwrap().iter().any(|cmd|
-                        cmd["sessionId"] == "observer" && cmd["method"] == "Runtime.runIfWaitingForDebugger"));
+                    assert!(!log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|cmd| cmd["sessionId"] == "observer"
+                            && cmd["method"] == "Runtime.runIfWaitingForDebugger"));
                 }
                 if failed_method == Some(method) && missing_ack {
-                    assert!(tokio::time::timeout(Duration::from_millis(10), &mut task).await.is_err());
-                    assert_eq!(owner.client.debt_ledger().unwrap().snapshot().outstanding_commands, 1);
+                    assert!(tokio::time::timeout(Duration::from_millis(10), &mut task)
+                        .await
+                        .is_err());
+                    assert_eq!(
+                        owner
+                            .client
+                            .debt_ledger()
+                            .unwrap()
+                            .snapshot()
+                            .outstanding_commands,
+                        1
+                    );
                     assert!(owner.publish_initialized(&authority).is_err());
                     task.abort();
                     let _ = (&mut task).await;
@@ -10706,12 +10764,22 @@ mod tests {
                 };
                 emit.send(response).await.unwrap();
                 if failed_method == Some(method) {
-                    assert_eq!(tokio::time::timeout(Duration::from_secs(2), &mut task).await.unwrap().unwrap(), Err(ProtocolError::BrowserFailure));
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(2), &mut task)
+                            .await
+                            .unwrap()
+                            .unwrap(),
+                        Err(ProtocolError::BrowserFailure)
+                    );
                     break;
                 }
             }
             if failed_method.is_none() {
-                tokio::time::timeout(Duration::from_secs(2), &mut task).await.unwrap().unwrap().unwrap();
+                tokio::time::timeout(Duration::from_secs(2), &mut task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
                 assert!(owner.index.lock().unwrap().sessions["observer"].resumed);
                 owner.publish_initialized(&authority).unwrap();
             } else {
@@ -10719,18 +10787,30 @@ mod tests {
                 assert!(owner.publish_initialized(&authority).is_err());
             }
             if failed_method.is_some_and(|method| method != "Runtime.runIfWaitingForDebugger") {
-                assert!(!log.lock().unwrap().iter().any(|cmd|
-                    cmd["sessionId"] == "observer" && cmd["method"] == "Runtime.runIfWaitingForDebugger"));
+                assert!(!log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|cmd| cmd["sessionId"] == "observer"
+                        && cmd["method"] == "Runtime.runIfWaitingForDebugger"));
             }
             if failed_method == Some("Page.enable") {
-                assert!(!log.lock().unwrap().iter().any(|cmd|
-                    cmd["sessionId"] == "observer" && cmd["method"] == "Target.setAutoAttach"));
+                assert!(!log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|cmd| cmd["sessionId"] == "observer"
+                        && cmd["method"] == "Target.setAutoAttach"));
             }
             assert!(owner.targets.owned_target("other-host").is_err());
             // This framed fixture has no browser. Closing its transport does not
             // waive or clear the observed missing/error ACK or Observer metadata.
             connection.close().await;
-            let _ = owner.drain().await;
+            // Transport closure does not stop the fixture-owned supervisor.
+            tokio::time::timeout(CLEANUP_TIMEOUT * 3, owner.close())
+                .await
+                .expect("fixture enrollment supervisor must stop within the cleanup budget")
+                .expect("fixture enrollment supervisor must join successfully");
             server.abort();
         }
     }
@@ -12388,7 +12468,10 @@ mod tests {
                 "Runtime.runIfWaitingForDebugger"
             ]
         );
-        assert!(log.lock().unwrap().iter()
+        assert!(log
+            .lock()
+            .unwrap()
+            .iter()
             .filter(|request| request["method"] == "Target.setAutoAttach")
             .all(|request| request["params"] == autoattach(true)));
         // Repeated identical attachment cannot initialize or resume twice.
@@ -12739,7 +12822,8 @@ mod tests {
                 "{method}"
             );
         }
-        assert!(commands.iter()
+        assert!(commands
+            .iter()
             .filter(|entry| entry["method"] == "Target.setAutoAttach")
             .all(|entry| entry["params"] == autoattach(true)));
         assert!(owner
