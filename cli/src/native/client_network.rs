@@ -823,6 +823,43 @@ impl ClientNetwork {
         event: &CdpEvent,
         navigation: Option<AppNavigationContext<'_>>,
     ) -> Result<(), ProtocolError> {
+        use super::client_settlement_trace::network_probe as probe;
+        let fact = probe::select(&event.method, event.session_id.as_deref(), &event.params);
+        let mut outcome = probe::Outcome::Unreached;
+        let mut emitted = None;
+        let result = self.publish_app_event_inner(
+            page,
+            event,
+            navigation,
+            fact.is_some(),
+            &mut outcome,
+            &mut emitted,
+        );
+        if let Some(fact) = fact {
+            probe::emit(fact, probe::Stage::Project, Some(outcome));
+            if let Some(ok) = emitted {
+                probe::emit(
+                    fact,
+                    probe::Stage::Emit,
+                    Some(if ok {
+                        probe::Outcome::Accepted
+                    } else {
+                        probe::Outcome::Failed
+                    }),
+                );
+            }
+        }
+        result
+    }
+    fn publish_app_event_inner(
+        &self,
+        page: &BrowserExecutionLease,
+        event: &CdpEvent,
+        navigation: Option<AppNavigationContext<'_>>,
+        observe: bool,
+        outcome: &mut super::client_settlement_trace::network_probe::Outcome,
+        emitted: &mut Option<bool>,
+    ) -> Result<(), ProtocolError> {
         self.validate_app_page(page)?;
         let sessions = self
             .sessions
@@ -833,21 +870,25 @@ impl ClientNetwork {
         {
             return Err(ProtocolError::StaleReference);
         }
-        let projected = self.app_events.project(
-            event,
-            AppEventContext {
-                session_id: &page.page_session_id,
-                navigation,
-            },
-        )?;
+        let context = AppEventContext {
+            session_id: &page.page_session_id,
+            navigation,
+        };
+        let projected = if observe {
+            self.app_events.project_observed(event, context, outcome)
+        } else {
+            self.app_events.project(event, context)
+        }?;
         self.validate_app_page(page)?;
         if let Some(projected) = projected {
             let (name, payload) = projected.into_wire(&self.scope.identity_scope)?;
-            sessions
+            let result = sessions
                 .get(&page.page_session_id)
                 .ok_or(ProtocolError::StaleReference)?
                 .sink
-                .emit(name.into(), payload, None)?;
+                .emit(name.into(), payload, None);
+            *emitted = Some(result.is_ok());
+            result?;
         }
         Ok(())
     }

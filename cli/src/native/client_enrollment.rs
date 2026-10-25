@@ -2890,6 +2890,16 @@ impl ClientEnrollment {
             origin,
             (self.generation, sequence),
         );
+        if let Some(binding) = self
+            .targets
+            .network_probe_attachment(&entry.target, &entry.session)
+        {
+            super::client_settlement_trace::network_probe::binding(
+                &entry.session,
+                binding,
+                super::client_settlement_trace::network_probe::Stage::Bind,
+            );
+        }
     }
     fn register(
         &self,
@@ -5174,8 +5184,18 @@ impl ClientEnrollment {
                 removed
             };
             for entry in entries {
+                let probe_binding = self
+                    .targets
+                    .network_probe_attachment(&entry.target, &entry.session);
                 if !entry.observation_only {
                     self.targets.detach(&entry.target)?;
+                }
+                if let Some(binding) = probe_binding {
+                    super::client_settlement_trace::network_probe::binding(
+                        &entry.session,
+                        binding,
+                        super::client_settlement_trace::network_probe::Stage::Detach,
+                    );
                 }
                 self.page.forget_session(&entry.session)?;
                 if entry.application {
@@ -5239,8 +5259,32 @@ impl ClientEnrollment {
                 .cloned()
         };
         let Some(entry) = entry else {
+            if let Some(fact) = super::client_settlement_trace::network_probe::select(
+                &event.method,
+                event.session_id.as_deref(),
+                &event.params,
+            ) {
+                super::client_settlement_trace::network_probe::emit(
+                    fact,
+                    super::client_settlement_trace::network_probe::Stage::Dispatch,
+                    Some(super::client_settlement_trace::network_probe::Outcome::NoSession),
+                );
+            }
             return Ok(());
         };
+        if entry.observation_only || !entry.application {
+            if let Some(fact) = super::client_settlement_trace::network_probe::select(
+                &event.method,
+                event.session_id.as_deref(),
+                &event.params,
+            ) {
+                super::client_settlement_trace::network_probe::emit(
+                    fact,
+                    super::client_settlement_trace::network_probe::Stage::Dispatch,
+                    Some(super::client_settlement_trace::network_probe::Outcome::NotApplication),
+                );
+            }
+        }
         if entry.observation_only {
             match event.method.as_str() {
                 "Page.frameNavigated" => {

@@ -965,8 +965,15 @@ fn isolated_client_env_allowed(key: &str) -> bool {
             "AGENT_BROWSER_SOCKET_DIR"
                 | "AGENT_BROWSER_NAMESPACE"
                 | "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE"
+                | "AGENT_BROWSER_NETWORK_PROBE_SHA256"
         )
         || (cfg!(feature = "acceptance-faults") && key == "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
+}
+
+fn isolated_client_env_entry_allowed(key: &str, value: &std::ffi::OsStr) -> bool {
+    use crate::native::client_settlement_trace::network_probe as probe;
+    isolated_client_env_allowed(key)
+        && (key != probe::SELECTOR_ENV || value.to_str().is_some_and(probe::valid_selector))
 }
 
 /// New opt-in protocol mode never reuses/restarts another named daemon and
@@ -977,9 +984,9 @@ pub fn run_isolated_client_session(session: &str, namespace: Option<&str>) -> Re
     if !crate::validation::is_valid_session_name(session) {
         return Err("Invalid dedicated session name".into());
     }
-    for (key, _) in env::vars_os() {
+    for (key, value) in env::vars_os() {
         let key_text = key.to_string_lossy();
-        if !isolated_client_env_allowed(&key_text) {
+        if !isolated_client_env_entry_allowed(&key_text, &value) {
             env::remove_var(key);
         }
     }
@@ -1014,12 +1021,31 @@ pub fn run_isolated_client_session(session: &str, namespace: Option<&str>) -> Re
 
 #[cfg(test)]
 #[test]
+fn test_probe_selector_is_preserved_only_as_an_exact_64_hex_env_entry() {
+    use std::ffi::OsStr;
+    let key = crate::native::client_settlement_trace::network_probe::SELECTOR_ENV;
+    assert!(isolated_client_env_entry_allowed(
+        key,
+        OsStr::new(&"a".repeat(64))
+    ));
+    for invalid in ["", "ab", &"f".repeat(63), &"f".repeat(65), &"z".repeat(64)] {
+        assert!(!isolated_client_env_entry_allowed(key, OsStr::new(invalid)));
+    }
+    assert!(!isolated_client_env_entry_allowed(
+        &format!("{key}_EXTRA"),
+        OsStr::new(&"a".repeat(64))
+    ));
+}
+
+#[cfg(test)]
+#[test]
 fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
     for preserved in [
         "PATH",
         "AGENT_BROWSER_SOCKET_DIR",
         "AGENT_BROWSER_NAMESPACE",
         "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE",
+        "AGENT_BROWSER_NETWORK_PROBE_SHA256",
     ] {
         assert!(isolated_client_env_allowed(preserved));
     }
@@ -1035,6 +1061,8 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE_EXTRA",
         "AGENT_BROWSER_CLEANUP_DIAGNOSTIC",
         "AGENT_BROWSER_CLEANUP_OTHER",
+        "AGENT_BROWSER_NETWORK_PROBE_SHA256_EXTRA",
+        "AGENT_BROWSER_NETWORK_PROBE",
     ] {
         assert!(!isolated_client_env_allowed(removed));
     }

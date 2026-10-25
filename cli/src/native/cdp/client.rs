@@ -1049,6 +1049,17 @@ impl CdpClient {
                         params: parsed.params.clone().unwrap_or(Value::Null),
                         session_id: parsed.session_id.clone(),
                     };
+                    if let Some(fact) = super::super::client_settlement_trace::network_probe::select(
+                        &event.method,
+                        event.session_id.as_deref(),
+                        &event.params,
+                    ) {
+                        super::super::client_settlement_trace::network_probe::emit(
+                            fact,
+                            super::super::client_settlement_trace::network_probe::Stage::Receive,
+                            None,
+                        );
+                    }
                     let eval_publication = debt_reader
                         .lock()
                         .unwrap_or_else(|error| error.into_inner())

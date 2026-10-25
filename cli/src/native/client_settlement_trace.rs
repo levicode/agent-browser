@@ -30,6 +30,7 @@ pub(crate) enum SettlementPhase {
     FrameInventoryRejection,
     ReadonlyPrepareFailure,
     ServiceWorkerAdmission,
+    NetworkProbe,
     ExecuteStarted,
     ExecuteReturned,
     CancelObserved,
@@ -86,6 +87,9 @@ pub(crate) enum SettlementPhase {
 }
 
 pub(crate) use SettlementPhase as Phase;
+
+#[path = "client_network_probe.rs"]
+pub(crate) mod network_probe;
 
 const PATH_ENV: &str = "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE";
 const CLEANUP_PATH_ENV: &str = "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE";
@@ -164,6 +168,8 @@ pub(crate) enum MessageKind {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<network_probe::ProbeFact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment_ordinal: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -531,6 +537,7 @@ pub(super) fn initialize_cleanup() {
     if created {
         if let Some(capture) = capture {
             record_capture(capture, 0, Phase::CaptureStarted, Facts::default());
+            network_probe::initialize(capture);
         }
     }
 }

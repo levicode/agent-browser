@@ -12,6 +12,7 @@ use serde_json::{json, Value};
 
 use super::cdp::types::CdpEvent;
 use super::client_protocol::ProtocolError;
+use super::client_settlement_trace::network_probe::Outcome as ProbeOutcome;
 
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_URL_BYTES: usize = 64 * 1024;
@@ -247,7 +248,17 @@ impl AppEventProjector {
         event: &CdpEvent,
         context: AppEventContext<'_>,
     ) -> Result<Option<ProjectedAppEvent>, ProtocolError> {
+        self.project_observed(event, context, &mut ProbeOutcome::Unreached)
+    }
+    pub(crate) fn project_observed(
+        &self,
+        event: &CdpEvent,
+        context: AppEventContext<'_>,
+        outcome: &mut ProbeOutcome,
+    ) -> Result<Option<ProjectedAppEvent>, ProtocolError> {
+        *outcome = ProbeOutcome::Invalid;
         if event.session_id.as_deref() != Some(context.session_id) {
+            *outcome = ProbeOutcome::WrongSession;
             return Ok(None);
         }
         identifier(context.session_id)?;
@@ -257,7 +268,7 @@ impl AppEventProjector {
             "Network.requestWillBeSent"
             | "Network.responseReceived"
             | "Network.loadingFailed"
-            | "Network.loadingFinished" => self.network(event, context.session_id),
+            | "Network.loadingFinished" => self.network(event, context.session_id, outcome),
             "Page.frameNavigated" | "Page.navigatedWithinDocument" => {
                 let Some(navigation) = context.navigation else {
                     return Ok(None);
@@ -287,13 +298,17 @@ impl AppEventProjector {
                         && (navigation.initiated_by_operation || marked),
                 }))
             }
-            _ => Ok(None),
+            _ => {
+                *outcome = ProbeOutcome::Unsupported;
+                Ok(None)
+            }
         }
     }
     fn network(
         &self,
         event: &CdpEvent,
         session: &str,
+        outcome: &mut ProbeOutcome,
     ) -> Result<Option<ProjectedAppEvent>, ProtocolError> {
         let id = string(&event.params, "requestId")?;
         identifier(id)?;
@@ -333,6 +348,7 @@ impl AppEventProjector {
                     response_reported: false,
                 },
             );
+            *outcome = ProbeOutcome::Stored;
             return Ok(None);
         }
         if event.method == "Network.loadingFinished" || event.method == "Network.loadingFailed" {
@@ -364,9 +380,11 @@ impl AppEventProjector {
             )));
         }
         let Some(request) = state.requests.get_mut(&key) else {
+            *outcome = ProbeOutcome::MissingRequest;
             return Ok(None);
         };
         if request.response_reported {
+            *outcome = ProbeOutcome::Duplicate;
             return Ok(None);
         }
         let response = event
@@ -385,6 +403,7 @@ impl AppEventProjector {
                     .ok()
                     .is_some_and(|url| url.path() == "/favicon.ico"))
         {
+            *outcome = ProbeOutcome::Ignored;
             return Ok(None);
         }
         let status_text = string(response, "statusText")?;
@@ -398,6 +417,7 @@ impl AppEventProjector {
             text.push(" ");
             text.push(status_text);
         }
+        *outcome = ProbeOutcome::Projected;
         Ok(Some(log(
             AppLogSource::Network,
             if status >= 500 {
@@ -1241,5 +1261,75 @@ mod tests {
             let (_, wire) = projected.into_wire("scope").unwrap();
             assert!(wire["text"].as_str().unwrap().contains(TRUNCATED));
         }
+    }
+    #[test]
+    fn diagnostic_real_projector_and_capture_emit_keep_retirement_outcomes() {
+        use super::super::client_settlement_trace::network_probe::{self as probe, Outcome, Stage};
+        const URL: &str = "http://127.0.0.1:12345/bad-sw.js";
+        let make = |method: &str, id: &str| CdpEvent {
+            method: method.into(),
+            session_id: Some("worker".into()),
+            params: json!({
+                "requestId": id, "request": {"url": URL, "method": "GET"},
+                "response": {"url": URL, "status": 500, "statusText": "Internal Server Error"}
+            }),
+        };
+        let projector = AppEventProjector::new();
+        let request = make("Network.requestWillBeSent", "one");
+        let response = make("Network.responseReceived", "one");
+        let saved = probe::test_capture(URL, |record| {
+            let mut outcome = Outcome::Unreached;
+            let mut apply = |event: &CdpEvent, session: &str, expected: Outcome| {
+                record(
+                    &event.method,
+                    event.session_id.as_deref(),
+                    &event.params,
+                    Stage::Receive,
+                    None,
+                );
+                let result = projector
+                    .project_observed(
+                        event,
+                        AppEventContext {
+                            session_id: session,
+                            navigation: None,
+                        },
+                        &mut outcome,
+                    )
+                    .unwrap();
+                assert_eq!(outcome, expected);
+                record(
+                    &event.method,
+                    event.session_id.as_deref(),
+                    &event.params,
+                    Stage::Project,
+                    Some(outcome),
+                );
+                result
+            };
+            assert!(apply(&response, "worker", Outcome::MissingRequest).is_none());
+            assert!(apply(&request, "wrong", Outcome::WrongSession).is_none());
+            assert!(apply(&request, "worker", Outcome::Stored).is_none());
+            assert!(apply(
+                &make("Network.responseReceived", "other"),
+                "worker",
+                Outcome::MissingRequest
+            )
+            .is_none());
+            let projected = apply(&response, "worker", Outcome::Projected).unwrap();
+            let (name, payload) = projected.into_wire("scope").unwrap();
+            assert_eq!(name, "app.log");
+            assert_eq!(
+                payload["text"],
+                format!("GET {URL} 500 Internal Server Error")
+            );
+            assert!(apply(&response, "worker", Outcome::Duplicate).is_none());
+            projector.forget_session("worker").unwrap();
+            assert!(apply(&response, "worker", Outcome::MissingRequest).is_none());
+        });
+        assert_eq!(saved.len(), 14);
+        assert!(saved.iter().all(|row| row["droppedBefore"] == 0));
+        assert_eq!(saved.last().unwrap()["probe"]["outcome"], "missing-request");
+        // Diagnostic I/O and the real projector, not browser/adapter acceptance.
     }
 }

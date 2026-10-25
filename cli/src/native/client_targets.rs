@@ -1647,6 +1647,22 @@ impl ClientTargets {
             diagnostic::target_observation_lost(operation.0, operation.1);
         }
     }
+    pub(crate) fn network_probe_attachment(
+        &self,
+        target: &str,
+        session: &str,
+    ) -> Option<diagnostic::DiagnosticAttachment> {
+        if !super::client_settlement_trace::network_probe::enabled() {
+            return None;
+        }
+        self.state.try_lock().ok().and_then(|state| {
+            state
+                .targets
+                .get(target)
+                .filter(|entry| entry.session_id == session)
+                .and_then(OwnedTarget::diagnostic_snapshot)
+        })
+    }
     pub(crate) fn diagnostic_step(
         &self,
         target_id: &str,
