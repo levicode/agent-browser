@@ -1024,3 +1024,6 @@ async fn p06_framed_input_eof_cancelled_recovery_cannot_be_reissued() {
     assert!(observed.candidate_commands.is_empty());
     assert!(observed.cleanup.is_err());
 }
+
+#[path = "client_browser_locator_eof_tests.rs"]
+mod locator_eof_tests;
