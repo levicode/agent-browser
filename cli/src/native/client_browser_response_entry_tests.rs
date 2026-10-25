@@ -122,7 +122,29 @@ async fn read_entry_frame(fixture: &mut FramedFixture) -> Value {
     panic!("response entry event bound exceeded");
 }
 
-async fn response_entry_case_inner(lag_at_entry: bool) -> Value {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryCase {
+    Applied,
+    Pending,
+    Deadline,
+    Cancel,
+    FutureIngress,
+    Navigation,
+    Realm,
+    Detached,
+}
+impl EntryCase {
+    fn expected_error(self) -> Option<&'static str> {
+        match self {
+            Self::Applied | Self::Pending => None,
+            Self::Deadline => Some("deadline-exceeded"),
+            Self::Cancel => Some("cancelled"),
+            Self::FutureIngress | Self::Detached => Some("scope-unavailable"),
+            Self::Navigation | Self::Realm => Some("stale-scope"),
+        }
+    }
+}
+async fn response_entry_case_inner(case: EntryCase) -> Value {
     let (endpoint, emit, log, peer, backend) = response_peer().await;
     let broker = Arc::new(ClientSession::new());
     let browser = Arc::new(ClientBrowser::new(broker.clone()));
@@ -246,14 +268,16 @@ async fn response_entry_case_inner(lag_at_entry: bool) -> Value {
             .unwrap(),
         revision
     );
-    let release = if lag_at_entry {
+    let release = if case == EntryCase::Pending {
         let schedule = schedule.clone();
         Some(tokio::spawn(async move {
             schedule.release_at_eval_entry().await;
         }))
-    } else {
+    } else if case == EntryCase::Applied {
         schedule.release();
         enrollment.response_entry_drain_for_test(&operation).await;
+        None
+    } else {
         None
     };
     drop(page);
@@ -271,29 +295,145 @@ async fn response_entry_case_inner(lag_at_entry: bool) -> Value {
     args["identityScope"] = scope.clone().into();
     fixture.write(json!({"type":"request","id":"response-evaluate","generation":1,"operationSeq":evaluate_sequence,
         "timeoutMs":2000,"command":"page.evaluate","args":args})).await.unwrap();
+    let mut future_gate = None;
+    if !matches!(case, EntryCase::Applied | EntryCase::Pending) {
+        // On the current-thread runtime this notification is consumed only
+        // after the real pre-UI wait has frozen its watermark and yielded.
+        schedule.eval_entered().await;
+        if case == EntryCase::Cancel {
+            fixture
+                .write(
+                    json!({"type":"cancel","id":"cancel-response-evaluate","generation":1,
+                "operationSeq":evaluate_sequence}),
+                )
+                .await
+                .unwrap();
+        }
+        if matches!(
+            case,
+            EntryCase::FutureIngress
+                | EntryCase::Navigation
+                | EntryCase::Realm
+                | EntryCase::Detached
+        ) {
+            // Keep this later event unapplied until the first operation has
+            // refused. Reader-observed revocation itself must fence evaluation;
+            // scheduling of the later supervisor cannot choose the error.
+            future_gate = Some(enrollment.response_entry_schedule_for_test());
+            let event = match case {
+                EntryCase::FutureIngress => {
+                    request_event("later-request", "https://synthetic.test/later")
+                }
+                EntryCase::Navigation => {
+                    json!({"method":"Page.frameNavigated","sessionId":"session-1","params":{
+                    "type":"Navigation","frame":{"id":"frame-session-1","loaderId":"next-loader","url":"https://synthetic.test/next",
+                        "domainAndRegistry":"synthetic.test","securityOrigin":"https://synthetic.test","mimeType":"text/html",
+                        "secureContextType":"Secure","crossOriginIsolatedContextType":"NotIsolated","gatedAPIFeatures":[]}}})
+                }
+                EntryCase::Realm => {
+                    json!({"method":"Runtime.executionContextsCleared","sessionId":"session-1","params":{}})
+                }
+                EntryCase::Detached => {
+                    json!({"method":"Target.detachedFromTarget","params":{"sessionId":"session-1","targetId":"page-1"}})
+                }
+                _ => unreachable!(),
+            };
+            let before = enrollment.response_entry_state_for_test()["received"]
+                .as_u64()
+                .unwrap();
+            emit.send(event).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while enrollment.response_entry_state_for_test()["received"]
+                    .as_u64()
+                    .unwrap()
+                    < before + 1
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            schedule.release();
+            if let Some(gate) = &future_gate {
+                gate.event_received().await;
+            }
+        }
+    }
     let mut subscription = None;
     let mut evaluated = None;
-    for _ in 0..2 {
+    let mut cancel_ack = false;
+    for _ in 0..3 {
         let frame = read_entry_frame(&mut fixture).await;
-        assert_eq!(frame["type"], "result");
-        assert_eq!(frame["scopeState"], "usable");
-        if frame["id"] == "response-subscribe" {
-            assert_eq!(frame["operationSeq"], subscription_sequence);
-            assert_eq!(frame["ok"], true);
-            assert_eq!(frame["effects"], "completed");
-            assert!(subscription
-                .replace(frame["data"]["subscriptionId"].as_str().unwrap().to_owned())
-                .is_none());
+        if frame["type"] == "control-result" {
+            assert_eq!(case, EntryCase::Cancel);
+            assert_eq!(frame["id"], "cancel-response-evaluate");
+            assert_eq!(frame["accepted"], true);
+            assert_eq!(frame["scopeState"], "usable");
+            assert!(!cancel_ack);
+            cancel_ack = true;
         } else {
-            assert_eq!(frame["id"], "response-evaluate");
-            assert_eq!(frame["operationSeq"], evaluate_sequence);
-            assert!(evaluated.replace(frame).is_none());
+            assert_eq!(frame["type"], "result");
+            assert_eq!(frame["scopeState"], "usable");
+            if frame["id"] == "response-subscribe" {
+                assert_eq!(frame["operationSeq"], subscription_sequence);
+                assert_eq!(frame["ok"], true);
+                assert_eq!(frame["effects"], "completed");
+                assert!(subscription
+                    .replace(frame["data"]["subscriptionId"].as_str().unwrap().to_owned())
+                    .is_none());
+            } else {
+                assert_eq!(frame["id"], "response-evaluate");
+                assert_eq!(frame["operationSeq"], evaluate_sequence);
+                assert!(evaluated.replace(frame).is_none());
+            }
         }
+        if subscription.is_some()
+            && evaluated.is_some()
+            && (case != EntryCase::Cancel || cancel_ack)
+        {
+            break;
+        }
+    }
+    assert_eq!(cancel_ack, case == EntryCase::Cancel);
+    // A later received event stays unapplied until the original request has
+    // already returned its exact refusal. Following the moving watermark would
+    // time out here instead and cannot masquerade as this successful negative.
+    if let Some(gate) = future_gate {
+        gate.release();
+    }
+    if matches!(case, EntryCase::Deadline | EntryCase::Cancel) {
+        schedule.release();
     }
     if let Some(release) = release {
         release.await.unwrap();
     }
     let evaluated = evaluated.unwrap();
+    let drain_operation = OperationLease {
+        deadline: Instant::now() + Duration::from_secs(2),
+        ..operation
+    };
+    enrollment
+        .response_entry_drain_for_test(&drain_operation)
+        .await;
+    if case == EntryCase::Navigation {
+        assert!(enrollment.response_entry_state_for_test()["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|frame| frame[2] == "next-loader"));
+    }
+    if case == EntryCase::Detached {
+        assert!(enrollment.response_entry_state_for_test()["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|frame| frame[1] != "session-1"));
+    }
+    assert_eq!(
+        evaluated["ok"],
+        case.expected_error().is_none(),
+        "case={case:?}; evaluate={evaluated}"
+    );
     let sent = log.lock().unwrap()[before_commands..]
         .iter()
         .filter(|r| r["method"] == "Runtime.evaluate" && r["params"]["expression"] == expression())
@@ -346,16 +486,24 @@ async fn response_entry_case_inner(lag_at_entry: bool) -> Value {
             .unwrap();
     } else {
         assert_eq!(sent, 0, "refused evaluation must not reach CDP");
-        assert_eq!(evaluated["error"]["code"], "scope-unavailable");
+        assert_eq!(evaluated["error"]["code"], case.expected_error().unwrap());
         assert_eq!(evaluated["effects"], "not-dispatched");
     }
-    let unsubscribe = fixture
-        .command(
-            "network.responses.unsubscribe",
-            json!({"identityScope":scope,"subscriptionId":subscription.unwrap()}),
-            2,
+    // A retired page cannot issue a fresh resource command. Scope cleanup owns
+    // its remaining local subscription; all live-page cases still unsubscribe.
+    let unsubscribe = if case == EntryCase::Detached {
+        None
+    } else {
+        Some(
+            fixture
+                .command(
+                    "network.responses.unsubscribe",
+                    json!({"identityScope":scope,"subscriptionId":subscription.unwrap()}),
+                    2,
+                )
+                .await,
         )
-        .await;
+    };
     assert!(
         !ledger.snapshot().integrity_lost,
         "integrity lost after evaluate: {evaluated}"
@@ -372,10 +520,13 @@ async fn response_entry_case_inner(lag_at_entry: bool) -> Value {
     drop(emit);
     let peer_join = tokio::time::timeout(Duration::from_secs(2), peer).await;
     let backend_join = tokio::time::timeout(Duration::from_secs(2), backend).await;
-    assert!(
-        unsubscribe.is_ok(),
-        "unsubscribe={unsubscribe:?}; first evaluate={evaluated}"
-    );
+    assert_eq!(unsubscribe.is_none(), case == EntryCase::Detached);
+    if let Some(unsubscribe) = unsubscribe {
+        assert!(
+            unsubscribe.is_ok(),
+            "unsubscribe={unsubscribe:?}; first evaluate={evaluated}"
+        );
+    }
     assert!(
         scope_end.is_ok(),
         "scope.end={scope_end:?}; first evaluate={evaluated}"
@@ -395,33 +546,40 @@ async fn response_entry_case_inner(lag_at_entry: bool) -> Value {
     evaluated
 }
 
-async fn response_entry_case(lag_at_entry: bool) -> Value {
-    tokio::time::timeout(
-        Duration::from_secs(30),
-        response_entry_case_inner(lag_at_entry),
-    )
-    .await
-    .expect("response command-entry fixture exceeded its outer test bound")
+async fn response_entry_case(case: EntryCase) -> Value {
+    tokio::time::timeout(Duration::from_secs(30), response_entry_case_inner(case))
+        .await
+        .expect("response command-entry fixture exceeded its outer test bound")
 }
-
 #[tokio::test]
 async fn response_entry_applied_network_positive_reads_full_text_and_json() {
-    let result = response_entry_case(false).await;
-    assert_eq!(result["ok"], true, "applied network positive: {result}");
+    response_entry_case(EntryCase::Applied).await;
 }
 #[tokio::test]
-async fn response_entry_unapplied_network_characterizes_exact_framed_refusal() {
-    let result = response_entry_case(true).await;
-    assert_eq!(
-        result["ok"], false,
-        "current admission characterization: {result}"
-    );
+async fn response_entry_unapplied_network_waits_then_reads_full_text_and_json() {
+    response_entry_case(EntryCase::Pending).await;
 }
 #[tokio::test]
-async fn response_entry_unapplied_network_must_reach_public_evaluate_red() {
-    let result = response_entry_case(true).await;
-    assert_eq!(
-        result["ok"], true,
-        "RESPONSE exact public evaluate refused benign pending network application: {result}"
-    );
+async fn response_entry_pending_network_preserves_original_deadline_without_dispatch() {
+    response_entry_case(EntryCase::Deadline).await;
+}
+#[tokio::test]
+async fn response_entry_pending_network_preserves_user_cancel_without_dispatch() {
+    response_entry_case(EntryCase::Cancel).await;
+}
+#[tokio::test]
+async fn response_entry_does_not_chase_later_received_network_events() {
+    response_entry_case(EntryCase::FutureIngress).await;
+}
+#[tokio::test]
+async fn response_entry_rejects_loader_change_during_ingress_wait() {
+    response_entry_case(EntryCase::Navigation).await;
+}
+#[tokio::test]
+async fn response_entry_rejects_realm_change_during_ingress_wait() {
+    response_entry_case(EntryCase::Realm).await;
+}
+#[tokio::test]
+async fn response_entry_rejects_exact_session_detach_during_ingress_wait() {
+    response_entry_case(EntryCase::Detached).await;
 }

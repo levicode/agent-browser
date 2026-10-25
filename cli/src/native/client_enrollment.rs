@@ -1417,11 +1417,14 @@ impl ClientEnrollment {
             ledger.invalidate_eval_authority();
         }
     }
-    pub(crate) fn capture_eval_authority(
+    /// Drain only the events already received at this command's entry. This
+    /// yields before the caller owns a UI/configuration/input guard and grants
+    /// no evaluation authority: capture_eval_authority still runs at dispatch.
+    pub(crate) async fn wait_eval_ingress(
         &self,
         page: &BrowserExecutionLease,
         op: &OperationLease,
-    ) -> Result<super::client_debt::EvalAuthorityStamp, ProtocolError> {
+    ) -> Result<(), ProtocolError> {
         #[cfg(test)]
         if let Some(entered) = self
             .capture_test_gates
@@ -1431,6 +1434,89 @@ impl ClientEnrollment {
         {
             entered.entered.add_permits(1);
         }
+        self.check_restart_operation(op)?;
+        if op.is_callback
+            || !Arc::ptr_eq(&page.client, &self.client)
+            || !Arc::ptr_eq(&page.targets, &self.targets)
+            || page.identity_scope != self.targets.identity_scope
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        page.permit.check()?;
+        let ledger = self
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        self.targets.require_eval_owner(&ledger)?;
+        let watermark = self.realm_watermark()?;
+        let attachment = self.targets.owned_target(&page.target_id)?;
+        if attachment.session_id != page.page_session_id || !attachment.capture_ready() {
+            return Err(ProtocolError::StaleScope);
+        }
+        let (received, epoch, revision) = {
+            let index = self
+                .index
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if let Some(error) = &index.failure {
+                return Err(error.clone());
+            }
+            if !index.reconciled {
+                return Err(ProtocolError::StaleScope);
+            }
+            // Preserve index -> ledger ordering and observe the ledger before
+            // reading the watermark, just like the final authority capture.
+            let revision = ledger.observe_eval_revision(&page.page_session_id, &page.target_id)?;
+            let received = watermark
+                .received()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            (received, index.application_epoch, revision)
+        };
+        bounded(op, async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                self.check_restart_operation(op)?;
+                page.permit.check()?;
+                self.targets.require_eval_owner(&ledger)?;
+                if !attachment.same_attachment(&self.targets.owned_target(&page.target_id)?) {
+                    return Err(ProtocolError::StaleScope);
+                }
+                {
+                    let index = self
+                        .index
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if let Some(error) = &index.failure {
+                        return Err(error.clone());
+                    }
+                    if !index.reconciled
+                        || index.application_epoch != epoch
+                        || ledger.observe_eval_revision(&page.page_session_id, &page.target_id)?
+                            != revision
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    // Detect a lost/overflowed subscription, but never replace
+                    // the fixed received target with this later high-water mark.
+                    watermark
+                        .received()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if index.applied_watermark >= received {
+                        return Ok(());
+                    }
+                }
+                changed.await;
+            }
+        })
+        .await
+    }
+    pub(crate) fn capture_eval_authority(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<super::client_debt::EvalAuthorityStamp, ProtocolError> {
         self.check_restart_operation(op)?;
         if op.is_callback
             || !Arc::ptr_eq(&page.client, &self.client)

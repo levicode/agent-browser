@@ -128,6 +128,9 @@ impl ResponseEntrySchedule {
     pub(crate) async fn event_received(&self) {
         self.apply.wait_entered().await;
     }
+    pub(crate) async fn eval_entered(&self) {
+        self.entry.wait_entered().await;
+    }
     pub(crate) async fn release_at_eval_entry(&self) {
         self.entry.wait_entered().await;
         self.apply.release();

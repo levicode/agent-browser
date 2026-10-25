@@ -946,6 +946,20 @@ impl OwnerDebtLedger {
         check_eval_authority(&state, None, None)?;
         Ok(state.eval_revision)
     }
+    /// Read-only ingress identity, not an evaluation grant. An existing window
+    /// is left intact so callers may still wait for the normal UI admission.
+    pub(crate) fn observe_eval_revision(
+        &self,
+        session: &str,
+        target: &str,
+    ) -> Result<u64, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check_eval_authority(&state, Some((session, target)), None)?;
+        Ok(state.eval_revision)
+    }
     pub(crate) fn capture_eval_revision(
         &self,
         session: &str,
@@ -3939,6 +3953,38 @@ pub(crate) mod tests {
         ledger.arm_eval_window(&window).unwrap();
         ledger.bind_eval_root(&window, &op).unwrap();
         (ledger, journal, op, window)
+    }
+    #[tokio::test]
+    async fn eval_ingress_observation_preserves_existing_live_window() {
+        let (ledger, journal, _, window) = eval_fixture();
+        let before = ledger
+            .state
+            .lock()
+            .unwrap()
+            .eval_window
+            .as_ref()
+            .unwrap()
+            .epoch;
+        let revision = ledger.observe_eval_revision("page", "target").unwrap();
+        for _ in 0..2 {
+            assert_eq!(ledger.observe_eval_revision("page", "target"), Ok(revision));
+            let state = ledger.state.lock().unwrap();
+            let retained = state.eval_window.as_ref().unwrap();
+            assert_eq!(retained.epoch, before);
+            assert!(!retained.revoked && retained.root_reservation.is_none());
+        }
+        assert!(matches!(
+            ledger.capture_eval_revision("page", "target"),
+            Err(ProtocolError::ScopeUnavailable)
+        ));
+        assert!(ledger
+            .observe_eval_revision("replacement", "target")
+            .is_err());
+        let reservation = eval_reservation(&ledger, &journal, EvalCommandGrant::Root(window)).await;
+        assert!(
+            reservation.submit().is_ok(),
+            "read-only observation must preserve original window authority"
+        );
     }
     pub(crate) async fn eval_reservation(
         ledger: &Arc<OwnerDebtLedger>,

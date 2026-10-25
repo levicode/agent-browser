@@ -3587,6 +3587,9 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         if command != "page.navigate" && command != "page.activate" && command != "session.environment" && !command.starts_with("context.") && !page_active.load(std::sync::atomic::Ordering::SeqCst) {
                             return Err(ProtocolError::ScopeUnavailable);
                         }
+                        if command == "page.evaluate" && !lease.is_callback {
+                            enrollment.wait_eval_ingress(&page, &lease).await?;
+                        }
                         let _ui = ui
                             .enter(
                                 false,
