@@ -714,6 +714,7 @@ enum CaptureTestPoint {
     BeforeEventApply,
     BeforeAttachedProcessing,
     BeforeWorkerReadyCommit,
+    BeforeWorkerRetirementWait,
 }
 #[cfg(test)]
 struct CaptureTestGate {
@@ -3165,11 +3166,24 @@ impl ClientEnrollment {
             let outcome = match startup {
                 Ok(outcome) => outcome,
                 Err(mut failure) => {
-                    let Some(retirement) = failure.take_retirement() else {
-                        return Err(failure.error());
-                    };
+                    let (retirement, wait_for_exact_detach) =
+                        if let Some(retirement) = failure.take_retirement() {
+                            (retirement, false)
+                        } else if let Some(pending) = failure.take_pending_retirement() {
+                            (pending, true)
+                        } else {
+                            return Err(failure.error());
+                        };
+                    // Keep the original error outside the bounded retirement
+                    // wait. Cancellation/deadline cannot turn it into success.
                     let retired = self
-                        .finish_retired_worker_startup(&entry, retirement, permit, op)
+                        .finish_retired_worker_startup(
+                            &entry,
+                            retirement,
+                            permit,
+                            op,
+                            wait_for_exact_detach,
+                        )
                         .await;
                     if let Err(error) = retired {
                         self.network.quarantine_worker_startup()?;
@@ -3201,7 +3215,7 @@ impl ClientEnrollment {
                 }
                 super::cdp::client::ServiceWorkerStartupOutcome::Retired(retirement) => {
                     return self
-                        .finish_retired_worker_startup(&entry, retirement, permit, op)
+                        .finish_retired_worker_startup(&entry, retirement, permit, op, false)
                         .await
                         .map(|()| InitializationOutcome::Initialized);
                 }
@@ -3394,7 +3408,7 @@ impl ClientEnrollment {
             match result {
                 Ok(WorkerStartupDecision::AwaitDetach(pending)) => {
                     return self
-                        .finish_retired_worker_startup(entry, pending, permit, op)
+                        .finish_retired_worker_startup(entry, pending, permit, op, false)
                         .await;
                 }
                 Ok(WorkerStartupDecision::AwaitPublication(pending)) => {
@@ -3445,7 +3459,11 @@ impl ClientEnrollment {
         mut retirement: super::cdp::client::WorkerStartupRetirement,
         mut permit: super::client_targets::ResumePermit,
         op: &OperationLease,
+        wait_for_exact_detach: bool,
     ) -> Result<(), ProtocolError> {
+        if wait_for_exact_detach && !retirement.failed_terminal() {
+            return Err(ProtocolError::StaleScope);
+        }
         let watermark = self.realm_watermark()?;
         let result = bounded(op, async {
             loop {
@@ -3472,6 +3490,9 @@ impl ClientEnrollment {
                     // transport owner -> ledger -> targets. No readiness or
                     // application authority is published by this completion.
                     let received = watermark.received().map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if wait_for_exact_detach {
+                        self.client.check_pending_worker_startup(&retirement, &self.targets, op, &entry.session)?;
+                    }
                     if index.applied_watermark >= received {
                         if index.sessions.contains_key(&entry.session)
                             || index.sessions.values().any(|current| current.target == entry.target) {
@@ -3480,6 +3501,13 @@ impl ClientEnrollment {
                             // Wait only for the original tenure; never a reused ID.
                             if retirement.failed_terminal() && retirement.publication_pending()? {
                                 publication_pending = true;
+                            } else if wait_for_exact_detach {
+                                // Resume was already acknowledged. Retain
+                                // responsibility, not Ready or new business
+                                // authority, while this exact tenure is live.
+                                if !permit.original_worker_attachment_present()? {
+                                    return Err(ProtocolError::StaleReference);
+                                }
                             } else if !retirement.all_acknowledged()
                                 || !permit.original_worker_attachment_present()? {
                                 return Err(ProtocolError::StaleReference);
@@ -3503,6 +3531,10 @@ impl ClientEnrollment {
                     // Retry applied watermark and final proof after the wakeup.
                     self.client.wait_worker_startup_publication(&mut retirement, op).await?;
                     continue;
+                }
+                #[cfg(test)]
+                if wait_for_exact_detach {
+                    self.pause_capture_at(CaptureTestPoint::BeforeWorkerRetirementWait, op).await?;
                 }
                 let deadline = retirement.deadline();
                 tokio::select! { biased;
@@ -12923,9 +12955,8 @@ mod tests {
         );
     }
 
-    // Architecture diagnostic RED, not a changed failed-live contract: the
-    // original error and no-receipt decision stay fixed while real exact detach
-    // catches up within the original deadline. No new business work is admitted.
+    // The first no-receipt decision is fixed before real exact detach. Only
+    // retained responsibility can be reconsidered, never ErrorAck or Ready.
     #[tokio::test]
     async fn service_worker_failed_live_exact_detach_after_decision_keeps_owner_healthy() {
         let (owner, _notices, log, emit, mut server, _broker, connection) =
@@ -13066,13 +13097,12 @@ mod tests {
             matches!(peer, Ok(Ok(()))),
             "owned peer did not finish: {peer:?}"
         );
-        // Current-behavior characterization, separate from the desired RED.
-        // A future production fix must move/remove this old-behavior assertion
-        // and instead prove the retained error in its failed-retired outcome.
-        assert_eq!(failure, Some(ProtocolError::BrowserFailure));
         // A future design must retain that error/obligation until exact proof,
         // never turn a still-live ErrorAck into Ready or wait past its budget.
-        assert_eq!(failure, None, "desired architectural RED: exact detach applied after the fixed no-receipt decision, but the whole owner was poisoned");
+        assert_eq!(
+            failure, None,
+            "exact detach after the initial no-receipt decision must retire only the failed worker"
+        );
         assert_eq!(health, Ok(()));
         assert_eq!(network, Ok(()));
         assert!(!debt.integrity_lost);
@@ -13193,63 +13223,356 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn service_worker_error_ack_never_reaches_ready_commit_gate() {
+    // Exercise the actual retained wait after its index guard is released.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FailedWorkerWaitCase {
+        ExactDetach,
+        Deadline,
+        OperationCancel,
+        WrongSession,
+        TargetDestroyed,
+        ReplacedWatermark,
+    }
+
+    async fn failed_worker_pending_wait_case(case: FailedWorkerWaitCase) {
         let (owner, _notices, log, emit, mut server, _broker, connection) =
             fixture_with_client("sw-startup-observer-fails", true).await;
         let ledger = owner.client.debt_ledger().unwrap();
-        let gate = CaptureTestGate::new();
-        owner
-            .capture_test_gates
+        let ready = CaptureTestGate::new();
+        let waiting = CaptureTestGate::new();
+        {
+            let mut gates = owner.capture_test_gates.lock().unwrap();
+            gates.insert(CaptureTestPoint::BeforeWorkerReadyCommit, ready.clone());
+            gates.insert(
+                CaptureTestPoint::BeforeWorkerRetirementWait,
+                waiting.clone(),
+            );
+        }
+        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        let separate_operation_cancel = !cancellation.same_channel(&owner.stop.subscribe());
+        let mut startup = None;
+        let mut replacement_stream = None;
+        let mut waiting_state = None;
+        let mut event_applied = false;
+        let mut pending_after_wrong_event = false;
+        // Keep setup/waits fallible until after teardown. In particular, a
+        // missing hook or unexpected early completion must not leak this peer.
+        let observed: Result<_, String> = async {
+            owner
+                .ensure_supervisor()
+                .await
+                .map_err(|e| format!("supervisor: {e:?}"))?;
+            // The original operation gets a short budget BEFORE registration or
+            // initialization. Neither the production 30s budget nor the 2s
+            // harness bound is changed to make the no-detach case pass.
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let op = OperationLease {
+                is_callback: false,
+                generation: owner.generation,
+                sequence: 0,
+                deadline,
+                cancellation,
+            };
+            let entry = owner
+                .register(
+                    "owned-context",
+                    "worker-target",
+                    "worker-session",
+                    "service_worker",
+                    None,
+                )
+                .map_err(|e| format!("register: {e:?}"))?
+                .ok_or_else(|| "worker was not registered".to_owned())?;
+            let (decided, release_decision) = owner.client.hold_worker_startup_no_receipt();
+            let task_owner = owner.clone();
+            startup = Some(tokio::spawn(async move {
+                task_owner.initialize_observed(entry, &op, None).await
+            }));
+            let (joined_error, decision_deadline) =
+                tokio::time::timeout(Duration::from_secs(2), decided)
+                    .await
+                    .map_err(|_| "no joined ErrorACK decision".to_owned())?
+                    .map_err(|e| format!("decision channel: {e:?}"))?;
+            release_decision
+                .send(())
+                .map_err(|_| "decision waiter gone".to_owned())?;
+            // Unlike the earlier after-noReceipt test, no detach has even been
+            // sent before this point. Enrollment now owns the pending wait.
+            tokio::time::timeout(Duration::from_secs(2), waiting.entered.acquire())
+                .await
+                .map_err(|_| "retained retirement wait not entered".to_owned())?
+                .map_err(|e| format!("retirement gate: {e:?}"))?
+                .forget();
+            let original = owner
+                .targets
+                .owned_target("worker-target")
+                .map_err(|e| format!("original tenure: {e:?}"))?;
+            waiting_state = Some((
+                !ledger
+                    .worker_startup_session_unbound("worker-session")
+                    .map_err(|e| format!("original binding: {e:?}"))?,
+                !original.configured && !original.resumed,
+                !startup.as_ref().unwrap().is_finished(),
+                owner.network.check_worker_startup(&owner.operation()),
+                ledger.snapshot(),
+                Instant::now() < deadline,
+            ));
+            let watermark = owner
+                .realm_watermark()
+                .map_err(|e| format!("watermark: {e:?}"))?;
+            let before = watermark
+                .received()
+                .map_err(|e| format!("received: {e:?}"))?;
+            if case == FailedWorkerWaitCase::ReplacedWatermark {
+                // Both streams are real/live. A replacement cannot stand in for
+                // the exact subscription captured by the retained startup.
+                let events = owner
+                    .client
+                    .subscribe_bounded_methods(EVENTS, 256, 128 * 1024 * 1024)
+                    .map_err(|e| format!("replacement subscription: {e:?}"))?;
+                *owner.event_watermark.lock().unwrap() = Some(events.watermark());
+                replacement_stream = Some(events);
+                owner.changed.notify_waiters();
+            }
+            waiting.release();
+            let event = match case {
+                FailedWorkerWaitCase::ExactDetach => Some(json!({
+                    "method":"Target.detachedFromTarget",
+                    "params":{"sessionId":"worker-session","targetId":"worker-target"}
+                })),
+                FailedWorkerWaitCase::WrongSession => Some(json!({
+                    "method":"Target.detachedFromTarget",
+                    "params":{"sessionId":"other-session","targetId":"worker-target"}
+                })),
+                FailedWorkerWaitCase::TargetDestroyed => Some(json!({
+                    "method":"Target.targetDestroyed", "params":{"targetId":"worker-target"}
+                })),
+                _ => None,
+            };
+            if let Some(event) = event {
+                emit.send(event).await.map_err(|e| format!("emit: {e:?}"))?;
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let changed = owner.changed.notified();
+                        tokio::pin!(changed);
+                        changed.as_mut().enable();
+                        let received = watermark
+                            .received()
+                            .map_err(|e| format!("event watermark: {e:?}"))?;
+                        if received > before
+                            && owner.index.lock().unwrap().applied_watermark >= received
+                        {
+                            return Ok::<_, String>(());
+                        }
+                        changed.await;
+                    }
+                })
+                .await
+                .map_err(|_| "real lifecycle event was not applied".to_owned())??;
+                event_applied = true;
+                if matches!(
+                    case,
+                    FailedWorkerWaitCase::WrongSession | FailedWorkerWaitCase::TargetDestroyed
+                ) {
+                    pending_after_wrong_event = !startup.as_ref().unwrap().is_finished();
+                }
+            }
+            if case == FailedWorkerWaitCase::OperationCancel {
+                // Not owner.stop and not the fixture's bootstrap cancellation.
+                cancel.send_replace(CancelSignal::Requested);
+            }
+            let outcome = tokio::time::timeout(Duration::from_secs(2), startup.as_mut().unwrap())
+                .await
+                .map_err(|_| "initialization exceeded the unchanged harness bound".to_owned())?
+                .map_err(|e| format!("initialization task: {e:?}"))?;
+            Ok((
+                outcome,
+                joined_error,
+                decision_deadline,
+                deadline,
+                Instant::now(),
+            ))
+        }
+        .await;
+
+        // Preserve primary state before cleanup. Fresh operation authority is
+        // essential: cancellation/expiry alone must not fake quarantine.
+        let network_after = owner.network.check_worker_startup(&owner.operation());
+        let debt_after = ledger.snapshot();
+        let health_after = owner.targets.check_settlement_integrity();
+        let stop_after = *owner.stop.borrow();
+        let ready_unused = ready.entered.try_acquire().is_err();
+        let target_absent = owner.targets.owned_target("worker-target").is_err();
+        let no_ready = owner
+            .targets
+            .owned_target("worker-target")
+            .is_ok_and(|target| !target.configured && !target.resumed)
+            || target_absent;
+        let session_absent = !owner
+            .index
             .lock()
             .unwrap()
-            .insert(CaptureTestPoint::BeforeWorkerReadyCommit, gate.clone());
-        owner.ensure_supervisor().await.unwrap();
-        let attached = attach(
-            "owned-context",
-            "worker-target",
-            "worker-session",
-            "service_worker",
-            None,
-        );
-        emit.send(json!({"method":attached.method,"params":attached.params}))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while owner.index.lock().unwrap().failure.is_none() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let failure = owner.index.lock().unwrap().failure.clone();
-        let ready_gate_unused = gate.entered.try_acquire().is_err();
-        let debt_before_close = ledger.snapshot();
-        let resume_count = log
+            .sessions
+            .contains_key("worker-session");
+        let methods: Vec<String> = log
             .lock()
             .unwrap()
             .iter()
-            .filter(|request| {
-                request["sessionId"] == "worker-session"
-                    && request["method"] == "Runtime.runIfWaitingForDebugger"
-            })
-            .count();
+            .filter(|request| request["sessionId"] == "worker-session")
+            .map(|request| request["method"].as_str().unwrap().to_owned())
+            .collect();
+        waiting.release();
+        ready.release();
+        if let Some(task) = startup.take() {
+            if !task.is_finished() {
+                task.abort();
+                let _ = task.await;
+            }
+        }
         let cleanup = owner.close().await;
+        drop(replacement_stream);
         connection.close().await;
         let peer = tokio::time::timeout(Duration::from_secs(2), &mut server).await;
         if peer.is_err() {
             server.abort();
             let _ = server.await;
         }
-        eprintln!("ready-error-ack: failure={failure:?}; ready_gate_unused={ready_gate_unused}; debt_before_close={debt_before_close:?}; cleanup={cleanup:?}; peer={peer:?}");
-        assert_eq!(failure, Some(ProtocolError::BrowserFailure));
-        assert!(ready_gate_unused);
-        assert_eq!(resume_count, 1);
-        assert_eq!(debt_before_close.outstanding_commands, 0);
+        // All substantive assertions occur after the owned peer is joined.
         assert!(
             matches!(peer, Ok(Ok(()))),
-            "owned peer did not finish: {peer:?}"
+            "{case:?}: peer did not finish: {peer:?}"
         );
+        let (outcome, joined_error, decision_deadline, deadline, returned_at) =
+            observed.unwrap_or_else(|error| panic!("{case:?}: {error}; cleanup={cleanup:?}"));
+        let (was_bound, was_unready, was_pending, network_waiting, debt_waiting, within_budget) =
+            waiting_state.expect("retained wait state");
+        assert!(
+            was_bound && was_unready && was_pending && within_budget,
+            "{case:?}"
+        );
+        assert_eq!(network_waiting, Ok(()), "{case:?}: premature quarantine");
+        assert_eq!(debt_waiting.outstanding_commands, 0, "{case:?}");
+        assert!(!debt_waiting.integrity_lost, "{case:?}");
+        assert_eq!(
+            decision_deadline, deadline,
+            "{case:?}: original budget changed"
+        );
+        assert!(joined_error.contains("Runtime.enable: CDP error (Runtime.enable)"));
+        assert!(joined_error.contains("synthetic observer failure"));
+        assert!(
+            separate_operation_cancel && ready_unused && no_ready,
+            "{case:?}"
+        );
+        assert_eq!(
+            stop_after,
+            CancelSignal::None,
+            "{case:?}: owner stop was not the trigger"
+        );
+        assert_eq!(debt_after.outstanding_commands, 0, "{case:?}");
+        assert!(!debt_after.integrity_lost, "{case:?}");
+        assert_eq!(
+            methods,
+            [
+                "Fetch.enable",
+                "Target.setAutoAttach",
+                "Network.enable",
+                "Runtime.enable",
+                "Runtime.runIfWaitingForDebugger",
+            ],
+            "{case:?}: no replay, body read, evaluation, or business call is allowed"
+        );
+        match case {
+            FailedWorkerWaitCase::ExactDetach => {
+                let Ok(InitializationOutcome::FailedRetired(failure)) = outcome else {
+                    panic!("expected actual FailedRetired, got {outcome:?}");
+                };
+                assert_eq!(failure.error(), ProtocolError::BrowserFailure);
+                assert_eq!(
+                    failure.to_string(),
+                    joined_error,
+                    "the full original CDP ErrorACK must survive"
+                );
+                assert!(!failure.has_retirement() && !failure.has_pending_retirement());
+                assert!(event_applied && target_absent && session_absent);
+                assert!(returned_at < deadline);
+                assert_eq!(network_after, Ok(()));
+                assert_eq!(health_after, Ok(()));
+                assert_eq!(cleanup, Ok(()));
+            }
+            _ => {
+                let expected = match case {
+                    FailedWorkerWaitCase::OperationCancel => ProtocolError::Cancelled,
+                    FailedWorkerWaitCase::ReplacedWatermark => ProtocolError::StaleScope,
+                    _ => ProtocolError::DeadlineExceeded,
+                };
+                assert!(
+                    matches!(&outcome, Err(error) if *error == expected),
+                    "{case:?}: expected {expected:?}, got {outcome:?}"
+                );
+                assert!(
+                    network_after.is_err(),
+                    "{case:?}: fresh operation must be fail-closed"
+                );
+                if matches!(
+                    case,
+                    FailedWorkerWaitCase::Deadline
+                        | FailedWorkerWaitCase::WrongSession
+                        | FailedWorkerWaitCase::TargetDestroyed
+                ) {
+                    assert!(
+                        returned_at >= deadline,
+                        "{case:?}: must respect the original deadline"
+                    );
+                } else {
+                    assert!(
+                        returned_at < deadline,
+                        "{case:?}: must not wait for the deadline"
+                    );
+                }
+                if matches!(
+                    case,
+                    FailedWorkerWaitCase::WrongSession | FailedWorkerWaitCase::TargetDestroyed
+                ) {
+                    assert!(event_applied && pending_after_wrong_event, "{case:?}");
+                    assert!(
+                        !target_absent && !session_absent,
+                        "{case:?}: exact detach was never supplied"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn service_worker_failed_live_exact_detach_after_wait_preserves_failed_retired_error() {
+        failed_worker_pending_wait_case(FailedWorkerWaitCase::ExactDetach).await;
+    }
+
+    // No exact detach is supplied. The original 1s operation must fail closed
+    // before the unchanged 2s harness bound, never reach Ready or replay.
+    #[tokio::test]
+    async fn service_worker_error_ack_never_reaches_ready_commit_gate() {
+        failed_worker_pending_wait_case(FailedWorkerWaitCase::Deadline).await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_failed_live_pending_wait_honors_independent_operation_cancel() {
+        failed_worker_pending_wait_case(FailedWorkerWaitCase::OperationCancel).await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_failed_live_pending_wait_rejects_wrong_session_detach() {
+        failed_worker_pending_wait_case(FailedWorkerWaitCase::WrongSession).await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_failed_live_pending_wait_rejects_target_destroyed_alone() {
+        failed_worker_pending_wait_case(FailedWorkerWaitCase::TargetDestroyed).await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_failed_live_pending_wait_rejects_replaced_watermark_subscription() {
+        failed_worker_pending_wait_case(FailedWorkerWaitCase::ReplacedWatermark).await;
     }
 
     #[tokio::test]

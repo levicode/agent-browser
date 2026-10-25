@@ -83,6 +83,8 @@ pub(crate) struct ServiceWorkerStartupFailure {
     message: String,
     error: ProtocolError,
     retirement: Option<Box<WorkerStartupRetirement>>,
+    // Retained failed-live responsibility, never a retirement/Ready grant.
+    pending_retirement: Option<Box<WorkerStartupRetirement>>,
 }
 impl ServiceWorkerStartupFailure {
     pub(crate) fn error(&self) -> ProtocolError {
@@ -91,6 +93,7 @@ impl ServiceWorkerStartupFailure {
     pub(crate) fn fail_closed(mut self, error: ProtocolError) -> Self {
         self.error = error;
         self.retirement = None;
+        self.pending_retirement = None;
         self
     }
     pub(crate) fn has_retirement(&self) -> bool {
@@ -99,6 +102,12 @@ impl ServiceWorkerStartupFailure {
     pub(crate) fn take_retirement(&mut self) -> Option<WorkerStartupRetirement> {
         self.retirement.take().map(|retirement| *retirement)
     }
+    pub(crate) fn has_pending_retirement(&self) -> bool {
+        self.pending_retirement.is_some()
+    }
+    pub(crate) fn take_pending_retirement(&mut self) -> Option<WorkerStartupRetirement> {
+        self.pending_retirement.take().map(|pending| *pending)
+    }
 }
 impl From<String> for ServiceWorkerStartupFailure {
     fn from(message: String) -> Self {
@@ -106,6 +115,7 @@ impl From<String> for ServiceWorkerStartupFailure {
             message,
             error: ProtocolError::BrowserFailure,
             retirement: None,
+            pending_retirement: None,
         }
     }
 }
@@ -120,6 +130,7 @@ impl From<ProtocolError> for ServiceWorkerStartupFailure {
             message: format!("{error:?}"),
             error,
             retirement: None,
+            pending_retirement: None,
         }
     }
 }
@@ -1683,16 +1694,22 @@ impl CdpClient {
         if !same_budget {
             errors.push("Service-worker startup initialization budget changed".into());
         }
-        // The joined batch still fails. Only an already unbound original
-        // session may carry retire-only responsibility to enrollment; a live
-        // error cannot wait here for some arbitrary future detach.
+        // The joined batch still fails. Already-unbound receipt authority and
+        // still-bound responsibility are distinct. Only enrollment may retain
+        // the latter under its original permit/budget until real exact detach.
         if error_ack {
-            let retirement = if eligible
-                && expected.as_ref().is_some_and(|owner| {
-                    owner
-                        .worker_startup_session_unbound(session)
-                        .unwrap_or(false)
-                }) {
+            let can_retain = initialization.is_some()
+                && statuses.iter().all(|(status, expected)| {
+                    *expected == CommandStatus::Acknowledged && status.snapshot() == *expected
+                });
+            let unbound = if eligible {
+                expected
+                    .as_ref()
+                    .map(|owner| owner.worker_startup_session_unbound(session))
+            } else {
+                None
+            };
+            let responsibility = if matches!(unbound, Some(Ok(_))) {
                 expected.map(|owner| WorkerStartupRetirement {
                     owner,
                     session: session.into(),
@@ -1703,6 +1720,11 @@ impl CdpClient {
                 })
             } else {
                 None
+            };
+            let (retirement, pending_retirement) = match unbound {
+                Some(Ok(true)) => (responsibility, None),
+                Some(Ok(false)) if can_retain => (None, responsibility),
+                _ => (None, None),
             };
             #[cfg(test)]
             if retirement.is_none() {
@@ -1723,6 +1745,7 @@ impl CdpClient {
                 message: errors.join("; "),
                 error: ProtocolError::BrowserFailure,
                 retirement: retirement.map(Box::new),
+                pending_retirement: pending_retirement.map(Box::new),
             });
         }
         if errors.is_empty() && complete {
@@ -1868,6 +1891,28 @@ impl CdpClient {
                 WorkerStartupDecision::AwaitPublication(retirement)
             }
         })
+    }
+
+    /// Read-only fence for retained failed-live responsibility. It grants no
+    /// commit; the original complete proof still runs after applied detach.
+    pub(crate) fn check_pending_worker_startup(
+        &self,
+        pending: &WorkerStartupRetirement,
+        targets: &Arc<super::super::client_targets::ClientTargets>,
+        operation: &super::super::client_session::OperationLease,
+        session: &str,
+    ) -> Result<(), ProtocolError> {
+        pending.check_operation(operation)?;
+        if !pending.failed_terminal()
+            || pending.session != session
+            || pending.deadline != operation.deadline
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        targets.require_eval_owner(&pending.owner)?;
+        self.check_cleanup_owner(&Some(pending.owner.clone()))
+            .map_err(|_| ProtocolError::StaleScope)?;
+        self.ensure_open().map_err(|_| ProtocolError::StaleScope)
     }
 
     /// Registers the existing ledger notification before checking its condition.
@@ -4195,6 +4240,51 @@ mod tests {
             client.close().await;
             peer.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn service_worker_pending_failure_preserves_error_without_retirement_authority() {
+        let (client, mut requests, replies, peer) = service_worker_test_peer().await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let (view, ledger, _cancel) = service_worker_test_owner(&client, deadline);
+        let (startup, sent) = service_worker_retirement_batch(view, &mut requests, deadline).await;
+        for request in &sent {
+            replies
+                .send(service_worker_response(request, true))
+                .unwrap();
+        }
+        let mut failure = tokio::time::timeout(Duration::from_secs(2), startup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        let original = failure.to_string();
+        let still_bound = !ledger
+            .worker_startup_session_unbound("worker-session")
+            .unwrap();
+        let has_pending = failure.has_pending_retirement();
+        let no_receipt = !failure.has_retirement() && failure.take_retirement().is_none();
+        let original_error = failure.error();
+        let closed = failure.fail_closed(ProtocolError::Cancelled);
+        let debt = ledger.snapshot();
+        let no_replay = requests.try_recv().is_err();
+        client.close().await;
+        peer.await.unwrap();
+        for method in [
+            "Network.enable",
+            "Runtime.enable",
+            "Runtime.runIfWaitingForDebugger",
+        ] {
+            assert!(original.contains(&format!("{method}: CDP error ({method})")));
+        }
+        assert!(original.contains("observation failed"));
+        assert_eq!(original_error, ProtocolError::BrowserFailure);
+        assert!(still_bound && has_pending && no_receipt && no_replay);
+        assert_eq!(debt.outstanding_commands, 0);
+        assert!(!debt.integrity_lost);
+        assert_eq!(closed.error(), ProtocolError::Cancelled);
+        assert_eq!(closed.to_string(), original);
+        assert!(!closed.has_retirement() && !closed.has_pending_retirement());
     }
 
     #[tokio::test]

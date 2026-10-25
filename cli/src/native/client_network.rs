@@ -573,9 +573,10 @@ impl ClientNetwork {
         ).await;
         match result {
             Err(failure) => {
-                // Defer quarantine only for a still-valid failed-terminal
-                // candidate. Never clear quarantine or replace its CDP message.
-                let check = if failure.has_retirement() {
+                // Enrollment retains the original failure/permit while a
+                // qualified pending attachment awaits exact detach. Neither
+                // kind grants Ready or clears quarantine or its CDP message.
+                let check = if failure.has_retirement() || failure.has_pending_retirement() {
                     self.check_worker_startup(operation)
                 } else {
                     Err(failure.error())
