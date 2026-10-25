@@ -664,3 +664,7 @@ document.getElementById('token').textContent = localStorage.getItem('token') ?? 
 
 #[path = "client_browser_restart_transport_tests.rs"]
 mod restart_transport_tests;
+
+#[cfg(feature = "acceptance-faults")]
+#[path = "client_browser_observe_trace_timeout_tests.rs"]
+mod observe_trace_timeout_tests;
