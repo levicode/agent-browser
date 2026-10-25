@@ -571,6 +571,12 @@ impl OperationJournalHandle {
         // Neither a complete local producer nor an accounted-debt classification
         // can clear reader-owned remote obligations or earlier integrity loss.
     }
+    pub(crate) fn local_integrity_intact(&self) -> bool {
+        self.journal
+            .state
+            .lock()
+            .is_ok_and(|state| !state.integrity_lost)
+    }
     pub(crate) fn finish_local_producers(&self) {
         match self.journal.state.lock() {
             Ok(mut state) => {
@@ -1636,6 +1642,23 @@ impl OwnerDebtLedger {
         }
         state.context_id = Some(context_id.to_owned());
         Ok(())
+    }
+    /// Remote transport loss remains Unknown. This only distinguishes that
+    /// reader-owned cause from independent accounting/cleanup corruption.
+    pub(crate) fn remote_eof_only(&self) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state.integrity_lost
+                && state.eof_integrity_cause == EofIntegrityCause::RemoteEofOnly
+                && !state.retired
+                && state
+                    .bootstrap
+                    .as_ref()
+                    .is_some_and(|scope| !scope.owns_context)
+                && state.context_id.is_some()
+        })
+    }
+    pub(crate) fn identity_scope(&self) -> &str {
+        &self.identity_scope
     }
     pub(crate) fn same_owner(&self, other: &OwnerDebtLedger) -> bool {
         self.generation == other.generation && self.identity_scope == other.identity_scope

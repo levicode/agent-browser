@@ -1753,6 +1753,7 @@ mod tests {
                 .stage_until_result(&operation, &owner.identity_scope)
                 .unwrap();
             sink.acknowledge_result_for_test(&ServerMessage::Result {
+                recovery: None,
                 retention: None,
                 id: "synthetic-state-fixture".into(),
                 generation: operation.generation,

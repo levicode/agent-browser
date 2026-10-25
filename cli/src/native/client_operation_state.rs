@@ -20,6 +20,7 @@ enum ProducerState {
     Retiring,
     Retired,
     IntegrityLost,
+    DisconnectedRetired,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetiredDisposition {
@@ -29,6 +30,7 @@ enum RetiredDisposition {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RetentionIntegrityReason {
     LocalProducerFailed,
+    RemoteConnectionLost,
     RetirementDeadline,
     OwnerAccountingLost,
     RegistryUnavailable,
@@ -98,6 +100,34 @@ impl OperationRetentionStatus {
             Self::KnownRetiring { proof, .. } | Self::Retired { proof, .. } => Some(proof.clone()),
             _ => None,
         }
+    }
+}
+/// Permission to attempt one explicit exact-owner recovery, not permission to
+/// submit business work or evidence that any remote Unknown effect completed.
+#[derive(Clone)]
+pub(crate) struct DisconnectedRecoveryProof {
+    key: OperationKey,
+    ledger: std::sync::Arc<super::client_debt::OwnerDebtLedger>,
+    deadline: Instant,
+}
+impl DisconnectedRecoveryProof {
+    pub(crate) fn key(&self) -> OperationKey {
+        self.key
+    }
+    pub(crate) fn ledger(&self) -> &std::sync::Arc<super::client_debt::OwnerDebtLedger> {
+        &self.ledger
+    }
+    pub(crate) fn deadline(&self) -> Instant {
+        self.deadline
+    }
+    pub(crate) fn check(&self) -> Result<(), ProtocolError> {
+        if Instant::now() >= self.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if !self.ledger.remote_eof_only() {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        Ok(())
     }
 }
 #[derive(Default)]
@@ -240,7 +270,11 @@ impl OperationRegistry {
     /// once; subsequent lookups/new requests cannot extend it.
     pub(crate) fn retire(&self, key: OperationKey) -> Option<Instant> {
         let mut entries = self.entries.lock().ok()?;
-        if !entries.contains_key(&key) {
+        if !entries.contains_key(&key)
+            || entries
+                .get(&key)
+                .is_some_and(|entry| entry.state == ProducerState::DisconnectedRetired)
+        {
             return None;
         }
         Self::revoke_eval_windows(&entries);
@@ -259,9 +293,21 @@ impl OperationRegistry {
         Some(deadline)
     }
     pub(crate) fn finish(&self, key: OperationKey, integrity_lost: bool) -> bool {
+        self.finish_with_cause(key, integrity_lost, false)
+    }
+    pub(crate) fn finish_remote_eof(&self, key: OperationKey) -> bool {
+        self.finish_with_cause(key, true, true)
+    }
+    fn finish_with_cause(&self, key: OperationKey, integrity_lost: bool, remote_eof: bool) -> bool {
         let Ok(mut entries) = self.entries.lock() else {
             return true;
         };
+        if entries
+            .get(&key)
+            .is_some_and(|entry| entry.state == ProducerState::DisconnectedRetired)
+        {
+            return true;
+        }
         let expired = entries.get(&key).is_some_and(|entry| {
             entry.state == ProducerState::Retiring
                 && entry
@@ -288,12 +334,21 @@ impl OperationRegistry {
             .ledger()
             .eval_operation_terminal(key, true, entry.result_fixed);
         if integrity_lost || expired || entry.state == ProducerState::IntegrityLost {
-            entry
-                .journal
-                .record_cleanup_disposition(CleanupDisposition::IntegrityLost);
+            let remote_only = remote_eof
+                && !expired
+                && entry.state != ProducerState::IntegrityLost
+                && entry.journal.local_integrity_intact()
+                && entry.journal.ledger().remote_eof_only();
+            if !remote_only {
+                entry
+                    .journal
+                    .record_cleanup_disposition(CleanupDisposition::IntegrityLost);
+            }
             entry.state = ProducerState::IntegrityLost;
             entry.integrity_reason.get_or_insert(if expired {
                 RetentionIntegrityReason::RetirementDeadline
+            } else if remote_only {
+                RetentionIntegrityReason::RemoteConnectionLost
             } else {
                 RetentionIntegrityReason::LocalProducerFailed
             });
@@ -319,6 +374,96 @@ impl OperationRegistry {
         }
         self.changed.notify_waiters();
         integrity_lost
+    }
+    pub(crate) fn recovery_candidate(
+        &self,
+        key: OperationKey,
+    ) -> Option<DisconnectedRecoveryProof> {
+        let entries = self.entries.lock().ok()?;
+        let source = entries.get(&key)?;
+        let deadline = source.retirement_deadline?;
+        let ledger = source.journal.ledger();
+        let proof = DisconnectedRecoveryProof {
+            key,
+            ledger,
+            deadline,
+        };
+        proof.check().ok()?;
+        if !source.result_fixed
+            || !entries.values().all(|entry| {
+                entry.state == ProducerState::DisconnectedRetired
+                    || (std::sync::Arc::ptr_eq(&entry.journal.ledger(), proof.ledger())
+                        && entry.state == ProducerState::IntegrityLost
+                        && entry.integrity_reason
+                            == Some(RetentionIntegrityReason::RemoteConnectionLost)
+                        && entry.journal.snapshot().local_producers_finished
+                        && entry.journal.snapshot().submission_revoked
+                        && entry.journal.local_integrity_intact())
+            })
+        {
+            return None;
+        }
+        Some(proof)
+    }
+    /// Called only after exact native old-owner/runtime retirement and verified
+    /// replacement binding. Keep journals, debt and immutable Unknown receipts.
+    pub(crate) fn retire_disconnected_owner(
+        &self,
+        proof: &DisconnectedRecoveryProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check()?;
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !entries
+            .values()
+            .filter(|entry| std::sync::Arc::ptr_eq(&entry.journal.ledger(), proof.ledger()))
+            .all(|entry| {
+                entry.result_fixed
+                    && entry.state == ProducerState::IntegrityLost
+                    && entry.integrity_reason
+                        == Some(RetentionIntegrityReason::RemoteConnectionLost)
+                    && entry.journal.snapshot().local_producers_finished
+                    && entry.journal.snapshot().submission_revoked
+                    && entry.journal.local_integrity_intact()
+            })
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        if !entries.contains_key(&proof.key) {
+            return Err(ProtocolError::OperationMissing);
+        }
+        for entry in entries
+            .values_mut()
+            .filter(|entry| std::sync::Arc::ptr_eq(&entry.journal.ledger(), proof.ledger()))
+        {
+            entry.state = ProducerState::DisconnectedRetired;
+        }
+        self.changed.notify_waiters();
+        Ok(())
+    }
+    pub(crate) fn disconnected_failure_retired(&self, key: OperationKey) -> bool {
+        self.entries.lock().is_ok_and(|entries| {
+            entries
+                .get(&key)
+                .is_some_and(|entry| entry.state == ProducerState::DisconnectedRetired)
+        })
+    }
+    pub(crate) fn disconnected_failure_matches(
+        &self,
+        key: OperationKey,
+        proof: &DisconnectedRecoveryProof,
+    ) -> bool {
+        self.entries.lock().is_ok_and(|entries| {
+            entries.get(&key).is_some_and(|entry| {
+                std::sync::Arc::ptr_eq(&entry.journal.ledger(), proof.ledger())
+                    && entry.integrity_reason
+                        == Some(RetentionIntegrityReason::RemoteConnectionLost)
+                    && entry.journal.snapshot().local_producers_finished
+                    && entry.journal.local_integrity_intact()
+            })
+        })
     }
     pub(crate) fn fix_result(&self, key: OperationKey) {
         let Ok(mut entries) = self.entries.lock() else {
@@ -458,7 +603,16 @@ impl OperationRegistry {
         key: OperationKey,
         eval_root: Option<OperationKey>,
     ) -> Result<bool, ProtocolError> {
+        if entries
+            .get(&key)
+            .is_some_and(|entry| entry.state == ProducerState::DisconnectedRetired)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
         for (other, entry) in entries.iter() {
+            if entry.state == ProducerState::DisconnectedRetired {
+                continue;
+            }
             let snapshot = entry.journal.snapshot();
             if snapshot.integrity_lost || entry.state == ProducerState::IntegrityLost {
                 return Err(ProtocolError::ScopeUnavailable);
@@ -496,6 +650,9 @@ impl OperationRegistry {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         for entry in entries.values() {
+            if entry.state == ProducerState::DisconnectedRetired {
+                continue;
+            }
             if entry.state == ProducerState::IntegrityLost
                 || entry.journal.snapshot().integrity_lost
             {

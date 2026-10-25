@@ -212,6 +212,69 @@ async fn result_frame(fixture: &mut FramedFixture, sequence: u64) -> Value {
     panic!("trace result missing within finite event bound")
 }
 
+fn uncorrelated_cleanup_failure(frame: &Value) -> bool {
+    frame
+        == &json!({
+            "type":"error",
+            "error":{"code":"cleanup-failed"},
+            "scopeState":"quarantined"
+        })
+}
+
+async fn terminal_failure_frame(fixture: &mut FramedFixture) {
+    for _ in 0..32 {
+        let frame = bounded(fixture.read()).await.unwrap();
+        if frame["type"] == "error" {
+            assert!(
+                uncorrelated_cleanup_failure(&frame),
+                "unexpected terminal: {frame}"
+            );
+            return;
+        }
+        assert_eq!(frame["generation"], 1);
+        assert_eq!(frame["type"], "event");
+        assert_eq!(frame["sequence"], fixture.event_sequence + 1);
+        fixture.event_sequence += 1;
+        validate_fixture_notice(&frame).unwrap();
+    }
+    panic!("trace terminal failure missing within finite event bound")
+}
+
+#[test]
+fn trace_terminal_failure_rejects_correlated_or_reusable_shapes() {
+    let terminal = serde_json::to_value(crate::native::client_protocol::ServerMessage::Error {
+        id: None,
+        error: crate::native::client_protocol::WireError {
+            code: ProtocolError::CleanupFailed,
+        },
+        scope_state: ScopeState::Quarantined,
+    })
+    .unwrap();
+    assert!(uncorrelated_cleanup_failure(&terminal));
+    for (field, value) in [
+        ("type", json!("result")),
+        ("type", json!("closed")),
+        ("id", json!("after-trace")),
+        ("id", Value::Null),
+        ("generation", json!(1)),
+        ("generation", Value::Null),
+        ("operationSeq", json!(7)),
+        ("ok", json!(false)),
+        ("data", json!({})),
+        ("retention", json!({})),
+        ("scopeState", json!("usable")),
+        ("scopeState", json!("closed")),
+        ("error", json!({"code":"scope-unavailable"})),
+    ] {
+        let mut invalid = terminal.clone();
+        invalid[field] = value;
+        assert!(
+            !uncorrelated_cleanup_failure(&invalid),
+            "terminal fixture accepted an invalid {field}: {invalid}"
+        );
+    }
+}
+
 async fn trace_retirement_case(raw_ack: bool) {
     let (endpoint, mut requests, release, log, relay, lifecycle) = trace_peer(raw_ack).await;
     let broker = Arc::new(ClientSession::new());
@@ -305,14 +368,16 @@ async fn trace_retirement_case(raw_ack: bool) {
             }).await;
             assert!(targets.inventory().is_err());
             fixture.sequence += 1;
-            let refused_sequence = fixture.sequence;
-            fixture.write(json!({"type":"request","id":"after-trace","generation":1,
-                "operationSeq":refused_sequence,"timeoutMs":1000,"command":"page.url",
-                "args":{"identityScope":scope}})).await?;
-            let refused = result_frame(&mut fixture, refused_sequence).await;
-            assert_eq!(refused["id"], "after-trace");
-            assert_eq!(refused["ok"], false);
-            assert_eq!(refused["scopeState"], "quarantined");
+            assert!(matches!(
+                broker.admit(1, fixture.sequence, 1000),
+                Err(ProtocolError::ScopeUnavailable)
+            ));
+            // No terminal.close/1 was negotiated: the legacy transport ends
+            // with an uncorrelated cleanup error, not a new operation result.
+            // Keep result_frame's generation/sequence checks for the trace.
+            terminal_failure_frame(&mut fixture).await;
+            assert!(bounded(read_frame(&mut fixture.stream)).await.unwrap().is_none());
+            assert!(matches!(bounded(browser.page_lease(false)).await, Err(ProtocolError::ScopeUnavailable)));
         }
         assert_eq!(log.lock().unwrap().iter().filter(|r| r["method"] == "Page.captureScreenshot").count(), 1);
         Ok(())
@@ -329,6 +394,8 @@ async fn trace_retirement_case(raw_ack: bool) {
     test.unwrap();
     if raw_ack {
         assert!(cleanup, "native fixture shutdown was not proven");
+    } else {
+        assert!(!cleanup, "unacknowledged raw capture cannot prove cleanup");
     }
 }
 

@@ -197,9 +197,15 @@ pub struct DecisionLease {
     pub outcome: oneshot::Receiver<DecisionOutcome>,
 }
 
+struct RecoveryTransition {
+    source: super::client_operation_state::DisconnectedRecoveryProof,
+    operation: Option<u64>,
+    candidate: Option<Arc<super::client_debt::OwnerDebtLedger>>,
+}
 struct Inner {
     generation: u64,
     health: ScopeState,
+    recovery: Option<RecoveryTransition>,
     high_water: u64,
     operations: HashMap<u64, Operation>,
     decisions: HashMap<String, PendingDecision>,
@@ -233,6 +239,7 @@ impl ClientSession {
             inner: Mutex::new(Inner {
                 generation: 1,
                 health: ScopeState::Usable,
+                recovery: None,
                 high_water: 0,
                 operations: HashMap::new(),
                 decisions: HashMap::new(),
@@ -267,6 +274,245 @@ impl ClientSession {
         Ok((inner.generation, inner.health))
     }
 
+    pub(crate) fn offer_disconnected_recovery(
+        &self,
+        proof: super::client_operation_state::DisconnectedRecoveryProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check()?;
+        let mut inner = self.lock()?;
+        if inner.generation != proof.key().generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if inner.health != ScopeState::Quarantined
+            || inner.recovery.is_some()
+            || !inner.operations.is_empty()
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        inner.recovery = Some(RecoveryTransition {
+            source: proof,
+            operation: None,
+            candidate: None,
+        });
+        Ok(())
+    }
+    pub(crate) fn recovery_available(&self) -> bool {
+        self.lock().is_ok_and(|inner| {
+            inner.health == ScopeState::Quarantined
+                && inner.recovery.as_ref().is_some_and(|recovery| {
+                    Instant::now() < recovery.source.deadline()
+                        && recovery.operation.is_none_or(|sequence| {
+                            inner.operations.get(&sequence).is_some_and(|operation| {
+                                *operation.cancel.borrow() == CancelSignal::None
+                                    && Instant::now() < operation.deadline
+                            })
+                        })
+                })
+        })
+    }
+    pub(crate) fn admit_disconnected_reconnect(
+        &self,
+        generation: u64,
+        sequence: u64,
+        timeout_ms: u64,
+        scope: &str,
+    ) -> Result<OperationLease, ProtocolError> {
+        let mut inner = self.lock()?;
+        if inner.generation != generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if inner.health != ScopeState::Quarantined {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if sequence == 0 || sequence > MAX_SAFE_SEQUENCE {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        if sequence <= inner.high_water {
+            return Err(ProtocolError::SequenceReused);
+        }
+        inner.high_water = sequence;
+        let recovery = inner
+            .recovery
+            .as_ref()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        recovery.source.check()?;
+        if recovery.operation.is_some() || recovery.source.ledger().identity_scope() != scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
+            return Err(ProtocolError::InvalidTimeout);
+        }
+        if !inner.operations.is_empty() {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        let deadline = recovery
+            .source
+            .deadline()
+            .min(Instant::now() + Duration::from_millis(timeout_ms));
+        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        inner.operations.insert(
+            sequence,
+            Operation {
+                eval_window: None,
+                callback_token: None,
+                parent_sequence: None,
+                callback_depth: 0,
+                deadline,
+                started: false,
+                cancel,
+            },
+        );
+        inner.recovery.as_mut().unwrap().operation = Some(sequence);
+        Ok(OperationLease {
+            is_callback: false,
+            generation,
+            sequence,
+            deadline,
+            cancellation,
+        })
+    }
+    fn check_control(inner: &Inner, generation: u64, sequence: u64) -> Result<(), ProtocolError> {
+        if inner.generation != generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if inner.health == ScopeState::Usable {
+            return Ok(());
+        }
+        if inner.health == ScopeState::Quarantined
+            && inner
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.operation == Some(sequence))
+        {
+            return Ok(());
+        }
+        Err(ProtocolError::ScopeUnavailable)
+    }
+    pub(crate) fn disconnected_recovery(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<Option<super::client_operation_state::DisconnectedRecoveryProof>, ProtocolError>
+    {
+        let inner = self.lock()?;
+        if inner.health == ScopeState::Usable {
+            return Ok(None);
+        }
+        Self::check_live_operation(&inner, operation)?;
+        let recovery = inner
+            .recovery
+            .as_ref()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        recovery.source.check()?;
+        Ok(Some(recovery.source.clone()))
+    }
+    /// Native verified candidate only. The old scope remains quarantined and
+    /// ordinary admission stays closed throughout unpublished initialization.
+    pub(super) fn bind_recovery_candidate(
+        &self,
+        operation: &OperationLease,
+        verified: &super::client_reconnect::VerifiedReconnectProof,
+    ) -> Result<(), ProtocolError> {
+        let candidate = verified.ledger(operation)?;
+        let mut inner = self.lock()?;
+        Self::check_live_operation(&inner, operation)?;
+        let recovery = inner
+            .recovery
+            .as_mut()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        recovery.source.check()?;
+        if recovery.candidate.is_some()
+            || Arc::ptr_eq(recovery.source.ledger(), &candidate)
+            || recovery.source.ledger().identity_scope() == candidate.identity_scope()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        recovery.candidate = Some(candidate);
+        Ok(())
+    }
+    fn check_scope(inner: &Inner, generation: u64, scope: &str) -> Result<(), ProtocolError> {
+        if inner.health == ScopeState::Usable {
+            return Self::check(inner, generation);
+        }
+        let recovery = inner
+            .recovery
+            .as_ref()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        let sequence = recovery.operation.ok_or(ProtocolError::ScopeUnavailable)?;
+        Self::check_control(inner, generation, sequence)?;
+        let operation = inner
+            .operations
+            .get(&sequence)
+            .ok_or(ProtocolError::OperationMissing)?;
+        if *operation.cancel.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if !recovery
+            .candidate
+            .as_ref()
+            .is_some_and(|candidate| candidate.matches_owner(generation, scope))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    pub(crate) fn check_scoped_owner(
+        &self,
+        generation: u64,
+        scope: &str,
+        owner: Option<&Arc<super::client_debt::OwnerDebtLedger>>,
+    ) -> Result<(), ProtocolError> {
+        let inner = self.lock()?;
+        Self::check_scope(&inner, generation, scope)?;
+        if inner.health != ScopeState::Usable
+            && !inner
+                .recovery
+                .as_ref()
+                .and_then(|recovery| recovery.candidate.as_ref())
+                .is_some_and(|candidate| owner.is_some_and(|owner| Arc::ptr_eq(candidate, owner)))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+    pub(crate) fn staged_recovery_owner(
+        &self,
+        operation: &OperationLease,
+        scope: &str,
+    ) -> Result<Option<Arc<super::client_debt::OwnerDebtLedger>>, ProtocolError> {
+        let inner = self.lock()?;
+        if inner.health == ScopeState::Usable {
+            return Ok(None);
+        }
+        Self::check_live_operation(&inner, operation)?;
+        Self::check_scope(&inner, operation.generation, scope)?;
+        Ok(inner
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.candidate.clone()))
+    }
+    pub(crate) fn publish_recovered_scope(
+        &self,
+        operation: &OperationLease,
+        owner: &Arc<super::client_debt::OwnerDebtLedger>,
+    ) -> Result<(), ProtocolError> {
+        let mut inner = self.lock()?;
+        Self::check_live_operation(&inner, operation)?;
+        Self::check_scope(&inner, operation.generation, owner.identity_scope())?;
+        if !inner
+            .recovery
+            .as_ref()
+            .and_then(|recovery| recovery.candidate.as_ref())
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, owner))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        inner.recovery = None;
+        inner.health = ScopeState::Usable;
+        Ok(())
+    }
     pub fn admit(
         &self,
         generation: u64,
@@ -360,7 +606,7 @@ impl ClientSession {
     /// Called immediately before entering an action, not when dequeued earlier.
     pub fn start(&self, generation: u64, sequence: u64) -> Result<bool, ProtocolError> {
         let mut inner = self.lock()?;
-        Self::check(&inner, generation)?;
+        Self::check_control(&inner, generation, sequence)?;
         let op = inner
             .operations
             .get_mut(&sequence)
@@ -481,7 +727,7 @@ impl ClientSession {
     /// Control acknowledgement only. The action must still produce settlement.
     pub fn cancel(&self, generation: u64, sequence: u64) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
-        Self::check(&inner, generation)?;
+        Self::check_control(&inner, generation, sequence)?;
         if !inner.operations.contains_key(&sequence) {
             return Err(ProtocolError::OperationMissing);
         }
@@ -494,7 +740,7 @@ impl ClientSession {
     /// session remains stronger and can still replace either with SessionClosed.
     pub(crate) fn expire(&self, generation: u64, sequence: u64) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
-        Self::check(&inner, generation)?;
+        Self::check_control(&inner, generation, sequence)?;
         let operation = inner
             .operations
             .get(&sequence)
@@ -695,7 +941,10 @@ impl ClientSession {
         previous: Option<u64>,
     ) -> Result<(), ProtocolError> {
         let mut inner = self.lock()?;
-        Self::check(&inner, generation)?;
+        match identity_scope.as_deref() {
+            Some(scope) => Self::check_scope(&inner, generation, scope)?,
+            None => Self::check(&inner, generation)?,
+        }
         if version == 0 || version > MAX_SAFE_SEQUENCE || version <= inner.registry_high_water {
             return Err(ProtocolError::InvalidSequence);
         }
@@ -882,7 +1131,7 @@ impl ClientSession {
         inner: &Inner,
         operation: &OperationLease,
     ) -> Result<(), ProtocolError> {
-        Self::check(inner, operation.generation)?;
+        Self::check_control(inner, operation.generation, operation.sequence)?;
         if operation.is_callback {
             return Err(ProtocolError::InvalidArguments);
         }
@@ -1020,7 +1269,7 @@ impl ClientSession {
     ) -> Result<(), ProtocolError> {
         transfer.check_operation(operation)?;
         let mut inner = self.lock()?;
-        Self::check(&inner, transfer.generation)?;
+        Self::check_scope(&inner, transfer.generation, replacement_scope)?;
         if require_admitted {
             Self::check_live_operation(&inner, operation)?;
         }
@@ -1142,7 +1391,10 @@ impl ClientSession {
             return Err(ProtocolError::InvalidArguments);
         }
         let mut inner = self.lock()?;
-        Self::check(&inner, generation)?;
+        match resource_scope.as_deref() {
+            Some(scope) => Self::check_scope(&inner, generation, scope)?,
+            None => Self::check(&inner, generation)?,
+        }
         if timeout_ms == 0 || timeout_ms > MAX_TIMEOUT_MS {
             return Err(ProtocolError::InvalidTimeout);
         }
@@ -1549,6 +1801,7 @@ impl ClientSession {
         }
         // Seal admission before waking any asynchronous waiter.
         inner.health = health;
+        inner.recovery = None;
         for operation in inner.operations.values() {
             operation.cancel.send_replace(CancelSignal::SessionClosed);
         }

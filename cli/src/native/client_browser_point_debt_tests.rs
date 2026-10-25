@@ -502,21 +502,31 @@ async fn eof_recovery_result(framed: &mut FramedFixture, id: &str, sequence: u64
     .await
 }
 
-async fn framed_input_eof_reconnect() -> EofRecoveryObservation {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryScenario {
+    OldClient,
+    Recover,
+    WrongContext,
+    WrongScope,
+    CancelRecovery,
+    Callback,
+}
+
+async fn framed_input_eof_reconnect(scenario: RecoveryScenario) -> EofRecoveryObservation {
     use crate::native::client_browser::reconnect_tests::{peer as reconnect_peer, PeerMode};
     use crate::native::client_protocol::EXACT_OWNER_CONTINUATION;
 
     let mut original = reconnect_peer(PeerMode::HoldInput).await;
     let broker = Arc::new(ClientSession::new());
     let browser = Arc::new(ClientBrowser::new(broker.clone()));
-    // These are the existing NativeClient REQUIRED_CAPABILITIES, not a new
-    // recovery capability. terminal.close/1 makes its refusal observable after
-    // quarantine; continuation must not turn EOF into an input acknowledgement.
-    let mut framed = FramedFixture::with_capabilities(
-        broker.clone(),
-        browser.clone(),
-        vec![EXACT_OWNER_CONTINUATION.into(), "terminal.close/1".into()],
-    );
+    // Old clients preserve the recorded terminal behavior. The new descriptor
+    // is sent only after explicit schema negotiation, never as usable retention.
+    let mut capabilities = vec![EXACT_OWNER_CONTINUATION.into(), "terminal.close/1".into()];
+    if scenario != RecoveryScenario::OldClient {
+        capabilities.push(crate::native::client_protocol::DISCONNECTED_RECOVERY.into());
+    }
+    let mut framed =
+        FramedFixture::with_capabilities(broker.clone(), browser.clone(), capabilities);
     framed.ready().await.unwrap();
     let opened = framed
         .command(
@@ -566,12 +576,29 @@ async fn framed_input_eof_reconnect() -> EofRecoveryObservation {
         generation: 1,
         operation_seq: framed.sequence,
     };
-    framed
-        .write(json!({"type":"request","id":"p06-original","generation":1,
-            "operationSeq":key.operation_seq,"timeoutMs":5000,"command":"browser.pointer",
-            "args":{"identityScope":scope,"point":{"x":10,"y":10},"action":{"kind":"tap"}}}))
-        .await
-        .unwrap();
+    let callback = if scenario == RecoveryScenario::Callback {
+        Some(
+            broker
+                .decision_scoped(
+                    1,
+                    crate::native::client_session::DecisionOwner::Scope,
+                    crate::native::client_session::DecisionKind::Dialog,
+                    5000,
+                    None,
+                    Some(scope.clone()),
+                )
+                .unwrap(),
+        )
+    } else {
+        None
+    };
+    let mut original_request = json!({"type":"request","id":"p06-original","generation":1,
+        "operationSeq":key.operation_seq,"timeoutMs":5000,"command":"browser.pointer",
+        "args":{"identityScope":scope,"point":{"x":10,"y":10},"action":{"kind":"tap"}}});
+    if let Some(callback) = &callback {
+        original_request["callbackToken"] = callback.token.clone().into();
+    }
+    framed.write(original_request).await.unwrap();
     bounded(async {
         while let Some(method) = original.received.recv().await {
             if method == "Input.dispatchMouseEvent" {
@@ -617,6 +644,32 @@ async fn framed_input_eof_reconnect() -> EofRecoveryObservation {
     assert_eq!(original_result["ok"], false);
     assert_eq!(original_result["effects"], "unknown");
     assert!(original_result.get("retention").is_none());
+    assert_eq!(original_result["scopeState"], "quarantined");
+    if matches!(
+        scenario,
+        RecoveryScenario::Recover
+            | RecoveryScenario::WrongContext
+            | RecoveryScenario::WrongScope
+            | RecoveryScenario::CancelRecovery
+    ) {
+        assert_eq!(
+            original_result["recovery"],
+            json!({"version":1,"identityScope":scope})
+        );
+        // Recovery control is not old-scope business admission.
+        assert!(broker.admit(1, key.operation_seq + 1, 1000).is_err());
+        assert!(matches!(
+            broker.admit_disconnected_reconnect(2, key.operation_seq + 1, 1000, &scope),
+            Err(ProtocolError::StaleGeneration)
+        ));
+        let proof = browser.tasks.recovery_candidate(key).unwrap();
+        assert_eq!(
+            broker.offer_disconnected_recovery(proof),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+    } else {
+        assert!(original_result.get("recovery").is_none());
+    }
     // Joining the actual producer is not an acknowledgement of its remote
     // command. Retain the outcome of this join for the characterization test.
     let producer_drain = bounded(browser.tasks.drain()).await;
@@ -636,14 +689,39 @@ async fn framed_input_eof_reconnect() -> EofRecoveryObservation {
     // This is not the stronger debt-free final-local cleanup proof.
     assert!(ledger.check_final_local_eof(1, &scope).is_err());
 
+    if scenario == RecoveryScenario::CancelRecovery {
+        // Use the already-minted real-reader proof through its real broker slot,
+        // then cancel before start. No replacement client or authority is forged.
+        framed.sequence += 1;
+        let cancelled = broker
+            .admit_disconnected_reconnect(1, framed.sequence, 5000, &scope)
+            .unwrap();
+        assert!(cancelled.deadline <= browser.tasks.recovery_candidate(key).unwrap().deadline());
+        broker.cancel(1, cancelled.sequence).unwrap();
+        assert!(!broker.start(1, cancelled.sequence).unwrap());
+        assert!(matches!(
+            broker.disconnected_recovery(&cancelled),
+            Err(ProtocolError::Cancelled)
+        ));
+        assert!(!broker.recovery_available());
+        broker
+            .settle(1, cancelled.sequence, Effects::NotDispatched)
+            .unwrap();
+    }
+
     // A different transport advertising the exact retained browser/context/page
     // is eligible for verification, never a replacement page or input retry.
-    let candidate = reconnect_peer(PeerMode::ReconnectCandidate).await;
+    let candidate = reconnect_peer(if scenario == RecoveryScenario::WrongContext {
+        PeerMode::WrongContext
+    } else {
+        PeerMode::ReconnectCandidate
+    })
+    .await;
     framed.sequence += 1;
     framed
         .write(json!({"type":"request","id":"p06-reconnect","generation":1,
             "operationSeq":framed.sequence,"timeoutMs":5000,"command":"scope.reconnect",
-            "args":{"identityScope":scope,"endpoint":candidate.endpoint,
+            "args":{"identityScope":if scenario == RecoveryScenario::WrongScope { "other-scope" } else { &scope },"endpoint":candidate.endpoint,
                 "expectedBrowserIdentity":identity["browser"],
                 "expectedContextIdentity":identity["context"],
                 "expectedPageIdentity":identity["page"]}}))
@@ -653,6 +731,24 @@ async fn framed_input_eof_reconnect() -> EofRecoveryObservation {
     let reconnect = eof_recovery_result(&mut framed, "p06-reconnect", reconnect_sequence).await;
     if reconnect["ok"] == true {
         assert_ne!(reconnect["data"]["identityScope"], scope);
+        let new_scope = reconnect["data"]["identityScope"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        framed.scope = Some(new_scope.clone());
+        let observed = framed
+            .command("page.url", json!({"identityScope":new_scope}), 5)
+            .await
+            .unwrap();
+        assert_eq!(observed["url"], "about:blank");
+        assert!(matches!(
+            broker.admit(1, key.operation_seq, 1000),
+            Err(ProtocolError::SequenceReused)
+        ));
+        assert!(ledger.check_admission(AdmissionClass::Input).is_err());
+        // A duplicate old cancellation cannot revive its producer or poison
+        // the current owner after the old producer/monitor have actually joined.
+        browser.tasks.cancel_operation_producer(key);
     }
     let cleanup = tokio::time::timeout(Duration::from_secs(7), framed.finish())
         .await
@@ -716,7 +812,7 @@ async fn framed_input_eof_reconnect() -> EofRecoveryObservation {
 
 #[tokio::test]
 async fn p06_framed_input_eof_currently_quarantines_before_reconnect_verification() {
-    let observed = framed_input_eof_reconnect().await;
+    let observed = framed_input_eof_reconnect(RecoveryScenario::OldClient).await;
     assert_eq!(observed.original["scopeState"], "quarantined");
     assert_eq!(observed.producer_drain, Err(ProtocolError::CleanupFailed));
     assert_eq!(observed.reconnect["ok"], false);
@@ -729,8 +825,8 @@ async fn p06_framed_input_eof_currently_quarantines_before_reconnect_verificatio
 
 #[tokio::test]
 async fn p06_framed_input_eof_explicit_reconnect_must_recover_session_without_replay() {
-    let observed = framed_input_eof_reconnect().await;
-    // Intentional RED on the current baseline. Recovery belongs only to the
+    let observed = framed_input_eof_reconnect(RecoveryScenario::Recover).await;
+    // Preserves the original RED receipt; negotiated recovery belongs only to the
     // session: the helper has already proved the original receipt stays Unknown,
     // its one dispatched input remains owned, and neither transport replays it.
     assert_eq!(
@@ -745,4 +841,46 @@ async fn p06_framed_input_eof_explicit_reconnect_must_recover_session_without_re
         .candidate_commands
         .iter()
         .any(|r| r["method"] == "Target.getTargetInfo"));
+}
+
+#[tokio::test]
+async fn p06_framed_input_eof_recovery_rejects_wrong_context_without_replay() {
+    let observed = framed_input_eof_reconnect(RecoveryScenario::WrongContext).await;
+    assert_eq!(observed.reconnect["ok"], false);
+    assert_eq!(observed.reconnect["effects"], "not-dispatched");
+    assert_eq!(observed.reconnect["scopeState"], "quarantined");
+    assert!(observed
+        .candidate_commands
+        .iter()
+        .any(|request| request["method"] == "Target.getTargetInfo"));
+    assert!(observed.cleanup.is_err());
+}
+
+#[tokio::test]
+async fn p06_framed_callback_input_eof_never_offers_root_recovery() {
+    let observed = framed_input_eof_reconnect(RecoveryScenario::Callback).await;
+    assert!(observed.original.get("recovery").is_none());
+    assert_eq!(observed.reconnect["ok"], false);
+    assert!(observed.candidate_commands.is_empty());
+    assert!(observed.cleanup.is_err());
+}
+
+#[tokio::test]
+async fn p06_framed_input_eof_recovery_rejects_wrong_scope_before_candidate_io() {
+    let observed = framed_input_eof_reconnect(RecoveryScenario::WrongScope).await;
+    assert_eq!(observed.reconnect["ok"], false);
+    assert_eq!(observed.reconnect["error"]["code"], "stale-scope");
+    assert_eq!(observed.reconnect["effects"], "not-dispatched");
+    assert!(observed.candidate_commands.is_empty());
+    assert!(observed.cleanup.is_err());
+}
+
+#[tokio::test]
+async fn p06_framed_input_eof_cancelled_recovery_cannot_be_reissued() {
+    let observed = framed_input_eof_reconnect(RecoveryScenario::CancelRecovery).await;
+    assert_eq!(observed.reconnect["ok"], false);
+    assert_eq!(observed.reconnect["effects"], "not-dispatched");
+    assert_eq!(observed.reconnect["scopeState"], "quarantined");
+    assert!(observed.candidate_commands.is_empty());
+    assert!(observed.cleanup.is_err());
 }
