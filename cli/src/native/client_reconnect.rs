@@ -67,11 +67,23 @@ pub(super) struct VerifiedReconnectProof {
     cancellation: tokio::sync::watch::Receiver<CancelSignal>,
 }
 impl VerifiedReconnect {
+    pub(super) fn proof(&self) -> &VerifiedReconnectProof {
+        &self.proof
+    }
     pub(super) fn into_parts(self) -> (BrowserManager, String, String, VerifiedReconnectProof) {
         (self.manager, self.context_id, self.target_id, self.proof)
     }
 }
 impl VerifiedReconnectProof {
+    pub(super) fn ledger(
+        &self,
+        operation: &OperationLease,
+    ) -> Result<Arc<super::client_debt::OwnerDebtLedger>, ProtocolError> {
+        self.check(&self.client, &self.context_id, &self.target_id, operation)?;
+        let ledger = self.client.debt_ledger().ok_or(ProtocolError::StaleScope)?;
+        ledger.check_unpublished_operation(operation)?;
+        Ok(ledger)
+    }
     pub(super) fn check(
         &self,
         client: &Arc<super::cdp::client::CdpClient>,

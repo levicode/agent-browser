@@ -321,6 +321,15 @@ impl Serialize for ProtocolError {
 /// A usable owner is not per-command admission or proof that debt is empty.
 /// Negotiation is required; legacy clients retain terminal uncertainty behavior.
 pub const EXACT_OWNER_CONTINUATION: &str = "operation.continue-exact-owner/1";
+/// Independent opt-in: a quarantined result may permit one explicit reconnect.
+pub const DISCONNECTED_RECOVERY: &str = "scope.reconnect-quarantined/1";
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryDescriptor {
+    pub version: u8,
+    pub identity_scope: String,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RetentionProducerState {
@@ -367,6 +376,8 @@ pub enum ServerMessage {
         effects: Effects,
         #[serde(skip_serializing_if = "Option::is_none")]
         retention: Option<RetentionDescriptor>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        recovery: Option<RecoveryDescriptor>,
         #[serde(rename = "scopeState")]
         scope_state: ScopeState,
     },
@@ -595,6 +606,7 @@ mod tests {
                 vector["error"]["code"]
             );
             let message = ServerMessage::Result {
+                recovery: None,
                 retention: None,
                 id: "frame".into(),
                 generation: 1,

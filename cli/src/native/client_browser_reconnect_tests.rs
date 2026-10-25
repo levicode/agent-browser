@@ -34,6 +34,20 @@ pub(super) struct Peer {
     pub(super) task: tokio::task::JoinHandle<()>,
 }
 
+pub(super) fn candidate_cleanup_commands() -> [Value; 6] {
+    // Current P06 registers no scripts and holds no input/interceptions.
+    // contain_borrowed awaits this exact sequence, then the external manager
+    // closes only its socket. No host target or browser destruction is owned.
+    [
+        json!({"method":"Fetch.disable","params":{},"sessionId":"host-session"}),
+        json!({"method":"Network.disable","params":{},"sessionId":"host-session"}),
+        json!({"method":"Runtime.runIfWaitingForDebugger","params":{},"sessionId":"host-session"}),
+        json!({"method":"Target.setAutoAttach","params":{"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true},"sessionId":"host-session"}),
+        json!({"method":"Target.detachFromTarget","params":{"sessionId":"host-session"}}),
+        json!({"method":"Target.setAutoAttach","params":{"autoAttach":false,"waitForDebuggerOnStart":false,"flatten":true}}),
+    ]
+}
+
 pub(super) async fn peer(mode: PeerMode) -> Peer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -45,6 +59,9 @@ pub(super) async fn peer(mode: PeerMode) -> Peer {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
         let mut attached = false;
+        let mut network_enabled = false;
+        let mut cleanup_index = None;
+        let candidate_cleanup = candidate_cleanup_commands();
         let mut loader = "host-loader";
         let mut target = json!({"targetId":"host-page","type":"page",
             "browserContextId":"host-context","url":"about:blank","title":""});
@@ -66,9 +83,23 @@ pub(super) async fn peer(mode: PeerMode) -> Peer {
                     let _ = send.send(method.to_owned());
                     let session = request["sessionId"].as_str().unwrap_or("");
                     if mode == PeerMode::ReconnectCandidate {
-                        assert!(!matches!(method,
-                            "Page.navigate" | "Target.createTarget" | "Target.createBrowserContext"),
-                            "reconnect candidate replaced or navigated retained objects: {request}");
+                        assert!(!method.starts_with("Input.") && !matches!(method,
+                            "Page.navigate" | "Target.createTarget" | "Target.createBrowserContext"
+                            | "Target.closeTarget" | "Target.disposeBrowserContext" | "Browser.close"),
+                            "reconnect candidate mutated retained host objects: {request}");
+                    }
+                    // Cleanup begins at its real first decrement, not at a
+                    // location.href read that may also occur during verification.
+                    let cleanup_request = mode == PeerMode::ReconnectCandidate
+                        && (cleanup_index.is_some() || method == "Fetch.disable");
+                    if cleanup_request {
+                        assert!(attached && network_enabled);
+                        let index = cleanup_index.get_or_insert(0);
+                        let mut envelope = request.clone();
+                        envelope.as_object_mut().unwrap().remove("id");
+                        assert_eq!(Some(&envelope), candidate_cleanup.get(*index),
+                            "unexpected candidate cleanup step {index}: {request}");
+                        *index += 1;
                     }
                     if !matches!(mode,
                         PeerMode::Original | PeerMode::HoldInput | PeerMode::ReconnectCandidate)
@@ -90,7 +121,11 @@ pub(super) async fn peer(mode: PeerMode) -> Peer {
                         // submission in the native operation registry. No ACK.
                         continue;
                     }
-                    let mut response = if mode == PeerMode::RefuseTargetInfo
+                    let mut response = if cleanup_request {
+                        // Only the exact next cleanup envelope is ACKed here;
+                        // Network.disable is not added to the shared whitelist.
+                        json!({"id":request["id"],"result":{}})
+                    } else if mode == PeerMode::RefuseTargetInfo
                         && method == "Target.getTargetInfo"
                     {
                         json!({"id":request["id"],"error":{
@@ -139,6 +174,9 @@ pub(super) async fn peer(mode: PeerMode) -> Peer {
                     };
                     if !session.is_empty() { response["sessionId"] = session.into(); }
                     if socket.send(Message::Text(response.to_string())).await.is_err() { break; }
+                    if method == "Network.enable" && session == "host-session" {
+                        network_enabled = true;
+                    }
                     if method == "Page.navigate" {
                         for event in [
                             json!({"method":"Page.frameNavigated","sessionId":session,"params":{
@@ -153,6 +191,13 @@ pub(super) async fn peer(mode: PeerMode) -> Peer {
                     }
                 }
             }
+        }
+        if let Some(index) = cleanup_index {
+            assert_eq!(
+                index,
+                candidate_cleanup.len(),
+                "candidate cleanup was incomplete"
+            );
         }
     });
     Peer {
@@ -400,6 +445,7 @@ async fn preflight_refusal(mode: PeerMode, error: ProtocolError) {
             owner.scope.clone(),
             owner.request(&candidate.endpoint),
             owner.operation(),
+            None,
         ),
     )
     .await
@@ -432,8 +478,11 @@ async fn reconnect_supervisor_cancel_after_candidate_attach_keeps_old_runtime() 
     let operation = owner.operation();
     let browser = owner.browser.clone();
     let scope = owner.scope.clone();
-    let reconnecting =
-        tokio::spawn(async move { browser.reconnect_scope(scope, request, operation).await });
+    let reconnecting = tokio::spawn(async move {
+        browser
+            .reconnect_scope(scope, request, operation, None)
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut contexts = 0;
         while let Some(method) = candidate.received.recv().await {
@@ -481,6 +530,7 @@ async fn reconnect_supervisor_old_cleanup_failure_closes_verified_candidate() {
             owner.scope.clone(),
             owner.request(&candidate.endpoint),
             owner.operation(),
+            None,
         ),
     )
     .await

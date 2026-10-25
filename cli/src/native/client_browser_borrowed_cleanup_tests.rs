@@ -126,6 +126,7 @@ async fn managed_borrowed_case(event_first: bool, with_child: bool, fault: &'sta
         .unwrap();
     let scope = opened["identityScope"].as_str().unwrap().to_owned();
     sink.acknowledge_result_for_test(&ServerMessage::Result {
+        recovery: None,
         id: "managed-open".into(),
         generation: 1,
         operation_seq: 1,
