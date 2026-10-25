@@ -701,6 +701,7 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
         1,
         11,
         ScreenshotFailure {
+            timing: None,
             stage: ScreenshotStage::Capture,
             capture_phase: ScreenshotCapturePhase::PostCaptureValidation,
             inventory_after_failure: InventoryAfterFailure::Changed,
@@ -950,4 +951,206 @@ fn atomic_inventory_rejection_maximal_record_is_507_bytes_and_missing_counts_sta
     assert!(rows[0].get("delta").is_none());
     assert!(rows[0].get("events").is_none());
     assert_eq!(rows[0]["exact"], false);
+}
+
+#[test]
+fn screenshot_timing_maximal_shape_fits_including_newline() {
+    let record = Record {
+        schema_version: 2,
+        source: Source::Native,
+        pid: u32::MAX,
+        record: SAFE_INTEGER,
+        operation_seq: SAFE_INTEGER,
+        phase: Phase::ScreenshotFirstFailure,
+        dropped_before: SAFE_INTEGER,
+        emitted_before: SAFE_INTEGER,
+        suppressed_before: SAFE_INTEGER,
+        overflow: false,
+        facts: Facts {
+            generation: Some(SAFE_INTEGER),
+            screenshot_stage: Some(ScreenshotStage::AnimationStabilization),
+            capture_phase: Some(ScreenshotCapturePhase::NotEntered),
+            inventory_after_failure: Some(InventoryAfterFailure::Unavailable),
+            error: Some(ProtocolError::UnsupportedCapability),
+            timing: Some((
+                Some(60_000_000),
+                Some(60_000_000),
+                Some(60_000_000),
+                Some(60_000_000),
+                Some(60_000_000),
+                Some(60_000_000),
+                3,
+                false,
+            )),
+            ..Facts::default()
+        },
+    };
+    let bytes = serde_json::to_vec(&record).unwrap();
+    assert_eq!(bytes.len() + 1, 512);
+    assert!(bytes.len() < MAX_RECORD_BYTES);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    record_capture(
+        &capture,
+        SAFE_INTEGER,
+        Phase::ScreenshotFirstFailure,
+        record.facts,
+    );
+    assert_eq!(
+        records(&file).len(),
+        1,
+        "maximal facts must not silently drop"
+    );
+}
+
+#[test]
+fn screenshot_timing_overflow_contention_and_duplicate_are_unknown() {
+    use std::time::{Duration, Instant};
+    assert_eq!(
+        CaptureTiming::micros(Duration::from_micros(60_000_001)),
+        None
+    );
+    let timing = CaptureTiming::new(Instant::now() - Duration::from_secs(1));
+    let missing = timing.snapshot();
+    assert_eq!(missing.0, None);
+    assert!(missing.7);
+    let timing = CaptureTiming::new(Instant::now() + Duration::from_secs(1));
+    assert!(timing.bind(7));
+    assert!(!timing.bind(8));
+    timing.write_complete(8);
+    assert_eq!(timing.snapshot().1, None);
+    assert!(timing.snapshot().7);
+    let timing = CaptureTiming::new(Instant::now() + Duration::from_secs(1));
+    let held = timing.state.lock().unwrap();
+    timing.interrupted();
+    drop(held);
+    assert_eq!(timing.snapshot().3, None);
+    assert!(timing.snapshot().7);
+}
+
+// Real decoded CDP replies, not setter-only timing tests. The only sink write
+// uses the existing serializer and an actual pre-created local file.
+async fn screenshot_timing_reply_case(reply_kind: &str, expected: u8) {
+    use crate::native::cdp::client::CdpClient;
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::{Duration, Instant};
+    use tokio_tungstenite::tungstenite::Message;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (sent, received) = tokio::sync::oneshot::channel();
+    let kind = reply_kind.to_owned();
+    let peer = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+        let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+            panic!("missing request")
+        };
+        let request: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(request["method"], "Page.captureScreenshot");
+        let mut reply = json!({"id":request["id"],"sessionId":"page","result":{"data":"synthetic-payload-never-logged"}});
+        match kind.as_str() {
+            "wrong-id" => reply["id"] = json!(request["id"].as_u64().unwrap() + 100),
+            "wrong-session" => reply["sessionId"] = json!("foreign-page"),
+            "error" => {
+                reply.as_object_mut().unwrap().remove("result");
+                reply["error"] = json!({"code":-32000,"message":"private-error-never-logged"});
+            }
+            "success" | "missing" => {}
+            _ => panic!("invalid test mode"),
+        }
+        if kind != "missing" {
+            socket.send(Message::Text(reply.to_string())).await.unwrap();
+        }
+        sent.send(()).unwrap();
+        let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+            panic!("missing fence")
+        };
+        let fence: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(fence["method"], "Fixture.fence");
+        socket
+            .send(Message::Text(
+                json!({"id":fence["id"],"sessionId":"page","result":{}}).to_string(),
+            ))
+            .await
+            .unwrap();
+        socket.close(None).await.unwrap();
+    });
+    let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+    let timing = CaptureTiming::new(Instant::now() + Duration::from_secs(1));
+    assert!(CaptureTiming::current().is_none());
+    let task_client = client.clone();
+    let task_timing = timing.clone();
+    let request = tokio::spawn(async move {
+        task_timing
+            .scope(task_client.send_command(
+                "Page.captureScreenshot",
+                Some(json!({"format":"png"})),
+                Some("page"),
+            ))
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(2), received)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        client.send_command("Fixture.fence", Some(json!({})), Some("page")),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), request)
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), peer)
+        .await
+        .unwrap()
+        .unwrap();
+    // Preserve the legacy value-returning API: a session-mismatched local
+    // failure without a CDP error still returns its value, but is not an ACK.
+    assert_eq!(
+        result.is_ok(),
+        matches!(reply_kind, "success" | "wrong-session")
+    );
+    assert!(CaptureTiming::current().is_none());
+    let snapshot = timing.snapshot();
+    assert!(snapshot.0.is_some());
+    assert!(snapshot.1.is_some());
+    assert_eq!(snapshot.2.is_some(), expected != 0);
+    assert_eq!(snapshot.6, expected);
+    assert!(!snapshot.7);
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    screenshot_failure_into(
+        &capture,
+        1,
+        9,
+        ScreenshotFailure {
+            timing: Some(snapshot),
+            stage: ScreenshotStage::Capture,
+            capture_phase: ScreenshotCapturePhase::PostCaptureValidation,
+            inventory_after_failure: InventoryAfterFailure::Unchanged,
+            error: ProtocolError::StaleScope,
+        },
+    );
+    let rows = records(&file);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["timing"][6], expected);
+    let bytes = std::fs::read_to_string(file.path()).unwrap();
+    assert!(!bytes.contains("synthetic-payload"));
+    assert!(!bytes.contains("private-error"));
+    assert!(!bytes.contains("foreign-page"));
+}
+#[tokio::test]
+async fn screenshot_timing_exact_success_and_error_reach_existing_sink() {
+    screenshot_timing_reply_case("success", 1).await;
+    screenshot_timing_reply_case("error", 2).await;
+}
+#[tokio::test]
+async fn screenshot_timing_wrong_id_session_and_missing_reply_are_not_success() {
+    screenshot_timing_reply_case("wrong-id", 0).await;
+    screenshot_timing_reply_case("wrong-session", 3).await;
+    screenshot_timing_reply_case("missing", 0).await;
 }

@@ -355,6 +355,9 @@ pub(crate) async fn capture_under_journal(
             _ = tokio::time::sleep_until(operation.deadline.into()) => (None, Some(CaptureReason::Deadline)),
         };
         if let Some(reason) = interrupted {
+            if let Some(timing) = super::client_settlement_trace::CaptureTiming::current() {
+                timing.interrupted();
+            }
             if !super::client_observation::capture_retirement_active() {
                 return Err(reason);
             }

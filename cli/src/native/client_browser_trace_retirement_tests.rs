@@ -58,6 +58,7 @@ fn trace_framed(browser: Arc<ClientBrowser>, broker: Arc<ClientSession>) -> Fram
 // Unrecognized commands and every lifecycle event pass through unchanged.
 async fn trace_peer(
     hold_remove: bool,
+    post_ack_failure: bool,
 ) -> (
     String,
     mpsc::UnboundedReceiver<Value>,
@@ -78,6 +79,7 @@ async fn trace_peer(
         stream.set_nodelay(true).unwrap();
         let mut client = tokio_tungstenite::accept_async(stream).await.unwrap();
         let (mut backend, _) = tokio_tungstenite::connect_async(&backend).await.unwrap();
+        let mut capture_seen = false;
         loop {
             tokio::select! {
                 Some(reply) = replies.recv() => {
@@ -99,7 +101,16 @@ async fn trace_peer(
                     let remove = method == "Runtime.callFunctionOn"
                         && request["params"]["functionDeclaration"] == "function(){return this.remove()}";
                     if method == "Page.captureScreenshot" || (hold_remove && remove) {
+                        capture_seen |= method == "Page.captureScreenshot";
                         seen.send(request).unwrap();
+                        continue;
+                    }
+                    // Only the real post-ACK verification can reach this branch.
+                    // Before capture, the same source-mask guard remains successful.
+                    if post_ack_failure && capture_seen && method == "Runtime.callFunctionOn"
+                        && request["params"]["functionDeclaration"] == "function(){return this.verify()}" {
+                        capture_seen = false;
+                        client.send(Message::Text(reply(&request, json!({"result":{"value":false}})).to_string())).await.unwrap();
                         continue;
                     }
                     let Some(result) = observation_reply(&request) else {
@@ -276,7 +287,12 @@ fn trace_terminal_failure_rejects_correlated_or_reusable_shapes() {
 }
 
 async fn trace_retirement_case(raw_ack: bool) {
-    let (endpoint, mut requests, release, log, relay, lifecycle) = trace_peer(raw_ack).await;
+    trace_timing_case(raw_ack, false).await;
+}
+
+async fn trace_timing_case(raw_ack: bool, post_ack_failure: bool) {
+    let (endpoint, mut requests, release, log, relay, lifecycle) =
+        trace_peer(raw_ack && !post_ack_failure, post_ack_failure).await;
     let broker = Arc::new(ClientSession::new());
     let browser = Arc::new(ClientBrowser::new(broker.clone()));
     let mut fixture = trace_framed(browser.clone(), broker.clone());
@@ -314,6 +330,16 @@ async fn trace_retirement_case(raw_ack: bool) {
             "args":{"identityScope":scope,"secureFieldSelector":FIXTURE_SECURE_SELECTOR,"purpose":"trace"}})).await?;
         let screenshot = bounded(requests.recv()).await.unwrap();
         assert_eq!(screenshot["method"], "Page.captureScreenshot");
+        if post_ack_failure {
+            release.send(reply(&screenshot, json!({"data":png}))).unwrap();
+            let result = result_frame(&mut fixture, sequence).await;
+            assert_eq!(result["id"], "trace");
+            assert_eq!(result["ok"], false);
+            assert_eq!(result["error"]["code"], "policy-denied");
+            assert_eq!(result["scopeState"], "usable");
+            assert!(result.get("data").is_none());
+            fixture.command("scope.end", json!({"identityScope":scope}), 5).await?;
+        } else {
         assert!(matches!(bounded(retained).await.unwrap(), CaptureReason::Deadline | CaptureReason::Cancelled));
         if raw_ack {
             release.send(reply(&screenshot, json!({"data":png}))).unwrap();
@@ -379,6 +405,7 @@ async fn trace_retirement_case(raw_ack: bool) {
             assert!(bounded(read_frame(&mut fixture.stream)).await.unwrap().is_none());
             assert!(matches!(bounded(browser.page_lease(false)).await, Err(ProtocolError::ScopeUnavailable)));
         }
+        }
         assert_eq!(log.lock().unwrap().iter().filter(|r| r["method"] == "Page.captureScreenshot").count(), 1);
         Ok(())
     }.await;
@@ -407,4 +434,97 @@ async fn trace_raw_ack_then_restore_past_transport_grace_preserves_owner() {
 #[tokio::test]
 async fn trace_unacknowledged_raw_capture_cannot_regain_owner() {
     trace_retirement_case(false).await;
+}
+
+// Isolate the process-wide production sink without changing global env in a
+// parallel test process. The child still runs the existing full framed fixture.
+#[tokio::test]
+async fn trace_timing_success_ack_and_real_restoration_emit_original_sink() {
+    const CHILD: &str = "AGENT_BROWSER_CAPTURE_TIMING_TEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        crate::native::client_settlement_trace::initialize_cleanup();
+        trace_retirement_case(true).await;
+        trace_timing_case(true, true).await;
+        return;
+    }
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let name = "native::client_browser::state_lifecycle_tests::restart_transport_tests::trace_retirement_tests::trace_timing_success_ack_and_real_restoration_emit_original_sink";
+    for enabled in [false, true] {
+        let mut command = tokio::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env(CHILD, "1")
+            .env_remove("AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
+            .env_remove("AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE")
+            .kill_on_drop(true);
+        if enabled {
+            command.env("AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE", file.path());
+        }
+        let mut child = command.spawn().unwrap();
+        let status = match tokio::time::timeout(Duration::from_secs(10), child.wait()).await {
+            Ok(status) => status.unwrap(),
+            Err(_) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                panic!("diagnostic child watchdog");
+            }
+        };
+        assert!(status.success(), "diagnostic child failed: {status}");
+        let bytes = std::fs::read_to_string(file.path()).unwrap();
+        if !enabled {
+            assert!(bytes.is_empty(), "opt-out must write zero records");
+            continue;
+        }
+        let rows = bytes
+            .lines()
+            .map(|line| {
+                assert!(line.len() < 512);
+                serde_json::from_str::<Value>(line).unwrap()
+            })
+            .collect::<Vec<_>>();
+        let failures = rows
+            .iter()
+            .filter(|row| row["phase"] == "ScreenshotFirstFailure")
+            .collect::<Vec<_>>();
+        assert_eq!(
+            failures.len(),
+            2,
+            "late-ACK and post-capture failures must each emit once"
+        );
+        let late = failures
+            .iter()
+            .find(|row| row["capturePhase"] == "raw-capture")
+            .unwrap();
+        let timing = late["timing"].as_array().unwrap();
+        assert_eq!(timing.len(), 8);
+        for value in &timing[..6] {
+            assert!(value.as_u64().is_some_and(|value| value <= 60_000_000));
+        }
+        assert_eq!(timing[6], 1, "only the exact real success ACK is positive");
+        assert_eq!(timing[7], false);
+        assert!(timing[3].as_u64().unwrap() >= timing[0].as_u64().unwrap());
+        assert!(timing[4].as_u64().unwrap() >= timing[3].as_u64().unwrap());
+        assert!(timing[5].as_u64().unwrap() >= timing[4].as_u64().unwrap());
+        let post = failures
+            .iter()
+            .find(|row| row["capturePhase"] == "post-capture-validation")
+            .unwrap();
+        assert_eq!(post["error"], "policy-denied");
+        let timing = post["timing"].as_array().unwrap();
+        assert_eq!(timing.len(), 8);
+        for index in [0, 1, 2, 4, 5] {
+            assert!(timing[index]
+                .as_u64()
+                .is_some_and(|value| value <= 60_000_000));
+        }
+        assert!(
+            timing[3].is_null(),
+            "successful raw capture must not invent an interruption"
+        );
+        assert_eq!(timing[6], 1);
+        assert_eq!(timing[7], false);
+        assert!(timing[2].as_u64().unwrap() < timing[0].as_u64().unwrap());
+        assert!(timing[4].as_u64().unwrap() >= timing[2].as_u64().unwrap());
+        assert!(timing[5].as_u64().unwrap() >= timing[4].as_u64().unwrap());
+    }
 }

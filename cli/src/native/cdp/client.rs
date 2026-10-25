@@ -33,6 +33,7 @@ struct DisposalWork {
 }
 
 struct PendingResponse {
+    capture_timing: Option<Arc<super::super::client_settlement_trace::CaptureTiming>>,
     sender: oneshot::Sender<CommandReply>,
     session: Option<String>,
 }
@@ -1014,6 +1015,16 @@ impl CdpClient {
                     // Delivery itself is the authority: is_closed() alone races
                     // receiver cancellation between inspection and send.
                     let abandoned = waiter.is_none_or(|tx| {
+                        if let Some(timing) = &tx.capture_timing {
+                            let kind = if !valid_envelope || tx.session != parsed.session_id {
+                                3
+                            } else if parsed.error.is_some() {
+                                2
+                            } else {
+                                1
+                            };
+                            timing.parsed_reply(id, kind);
+                        }
                         let reply = if valid_envelope && tx.session == parsed.session_id {
                             match parsed.error {
                                 Some(error) => CommandReply::ErrorAck(error),
@@ -2060,6 +2071,10 @@ impl CdpClient {
             done: false,
         };
 
+        let capture_timing = (method == "Page.captureScreenshot")
+            .then(super::super::client_settlement_trace::CaptureTiming::current)
+            .flatten()
+            .filter(|timing| timing.bind(id));
         {
             let mut ws_tx = self.transport.ws_tx.lock().await;
             self.ensure_open()?;
@@ -2075,6 +2090,7 @@ impl CdpClient {
             pending.insert(
                 id,
                 PendingResponse {
+                    capture_timing: capture_timing.clone(),
                     sender: tx,
                     session: cmd.session_id.clone(),
                 },
@@ -2087,6 +2103,9 @@ impl CdpClient {
             }
         }
 
+        if let Some(timing) = capture_timing {
+            timing.write_complete(id);
+        }
         Ok(CommandResponse {
             receiver: rx,
             guard,
@@ -5211,6 +5230,7 @@ mod tests {
             pending.lock().await.insert(
                 id,
                 PendingResponse {
+                    capture_timing: None,
                     sender,
                     session: session.map(str::to_owned),
                 },

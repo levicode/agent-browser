@@ -95,6 +95,7 @@ impl ObserveFailureWitness {
 // contains no browser authority and holds no lock across an await. It records
 // the first failed call site before restoration, but emits only after run returns.
 struct ScreenshotFailureWitness {
+    timing: Arc<diagnostic::CaptureTiming>,
     generation: u64,
     sequence: u64,
     state: Mutex<ScreenshotFailureState>,
@@ -108,6 +109,7 @@ struct ScreenshotFailureState {
 impl ScreenshotFailureWitness {
     fn new(request: &DispatchRequest, operation: &OperationLease, enabled: bool) -> Option<Self> {
         (enabled && matches!(request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace)).then(|| Self {
+            timing: diagnostic::CaptureTiming::new(operation.deadline),
             generation: operation.generation,
             sequence: operation.sequence,
             state: Mutex::new(ScreenshotFailureState {
@@ -221,6 +223,7 @@ impl ScreenshotFailureWitness {
             },
         };
         Some(ScreenshotFailure {
+            timing: Some(self.timing.snapshot()),
             stage,
             capture_phase,
             error,
@@ -817,6 +820,12 @@ impl ObservationDispatch {
             #[cfg(test)]
             let run = FALLBACK_OBSERVED_CLEANUP_FOR_TEST.scope(observed_cleanup, run);
             let run = observation::with_capture_retirement(retirement, run);
+            let run = async {
+                match screenshot.as_ref() {
+                    Some(witness) => witness.timing.scope(run).await,
+                    None => run.await,
+                }
+            };
             let mut output = match operation_journal {
                 Some(journal) => journal.scope(run).await,
                 None => run.await,
@@ -1416,10 +1425,12 @@ impl ObservationDispatch {
             if result.is_err() { witness.failure(); }
             witness.enter(ObserveFailureStage::Restoration);
         }
+        if let Some(witness) = screenshot { witness.timing.restore_begin(); }
         let restoration = match &mut journal {
             Some(journal) => journal.restore().await,
             None => Ok(()),
         };
+        if let Some(witness) = screenshot { witness.timing.restore_end(); }
         if let Err(error) = restoration {
             if let Some(witness) = screenshot { witness.failure(&protected_error(error.reason)); }
             return Err(DispatchFailure {
