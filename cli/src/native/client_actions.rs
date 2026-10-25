@@ -3917,6 +3917,9 @@ mod tests {
     mod direct_point_clicks {
         include!("client_actions_direct_point_click_tests.rs");
     }
+    mod retirement_node_swipes {
+        include!("client_actions_retirement_node_swipe_tests.rs");
+    }
     #[test]
     fn readonly_timing_is_silent_when_disabled_tap_success_or_mutated() {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -4695,6 +4698,7 @@ mod tests {
             let mut held_direct_press: Option<Value> = None;
             let mut held_original_pointer_reply: Option<(Value, Value)> = None;
             let mut held_drag_releases: Vec<Value> = Vec::new();
+            let mut retirement_node_scrolled = false;
             while let Some(Ok(message)) = socket.next().await {
                 if mode.starts_with("preparation-readonly-") && message.is_close() {
                     break;
@@ -4709,6 +4713,17 @@ mod tests {
                     observed_since.elapsed(),
                 )
                 .await;
+                if retirement_node_swipes::is_mode(mode) {
+                    if request["method"] == "DOM.scrollIntoViewIfNeeded" {
+                        retirement_node_scrolled = true;
+                    }
+                    observed = retirement_node_swipes::observed_request(
+                        mode,
+                        &request,
+                        retirement_node_scrolled,
+                    )
+                    .await;
+                }
                 if mode == direct_point_clicks::MODE || direct_point_clicks::is_pointer_mode(mode) {
                     direct_point_clicks::record_receipt(&mut observed, observed_since.elapsed());
                 }
@@ -4966,6 +4981,18 @@ mod tests {
                     "Save"
                 };
                 let result = match method {
+                    _ if retirement_node_swipes::is_mode(mode)
+                        && observed.get("nodeSwipeScript").is_some() =>
+                    {
+                        json!({"result":{"value":observed["nodeSwipeScript"]["result"]}})
+                    }
+                    "DOM.getBoxModel" if retirement_node_swipes::is_mode(mode) => {
+                        assert_eq!(request["params"]["objectId"], "exact-node");
+                        json!({"model":{"border":[0,0,400,0,400,300,0,300]}})
+                    }
+                    "Page.getLayoutMetrics" if retirement_node_swipes::is_mode(mode) => {
+                        json!({"cssVisualViewport":{"clientWidth":1280.,"clientHeight":720.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":1280.,"clientHeight":720.}})
+                    }
                     "Page.getFrameTree" => {
                         json!({"frameTree":{"frame":{"id":"main","loaderId":"doc","url":"about:blank"}}})
                     }
@@ -5321,10 +5348,13 @@ mod tests {
                     || mode.starts_with("direct-point")
                     || mode == "strict-query-drag-cleanup-debt"
                     || mode.starts_with("preparation-readonly-")
+                    || retirement_node_swipes::is_mode(mode)
                 {
                     reply["sessionId"] = request["sessionId"].clone();
                 }
-                if direct_point_clicks::holds_pointer_reply(mode, &request) {
+                if direct_point_clicks::holds_pointer_reply(mode, &request)
+                    || retirement_node_swipes::holds_render(mode, &request)
+                {
                     assert!(held_original_pointer_reply
                         .replace((request, reply))
                         .is_none());
