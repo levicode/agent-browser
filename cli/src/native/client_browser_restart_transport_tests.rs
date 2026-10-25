@@ -763,3 +763,6 @@ async fn cancelled_pre_swap_replacement_preserves_old_terminal_cleanup_proof() {
         assert!(requests[browser_closed].get("sessionId").is_none());
     }
 }
+
+#[path = "client_browser_response_entry_tests.rs"]
+mod response_entry_tests;

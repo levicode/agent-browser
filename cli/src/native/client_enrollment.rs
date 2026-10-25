@@ -734,6 +734,7 @@ enum CaptureTestPoint {
     BeforeReturn,
     BeforeVerifyReturn,
     BeforeEventApply,
+    EvalEntry,
     BeforeAttachedProcessing,
     BeforeWorkerReadyCommit,
     BeforeWorkerRetirementWait,
@@ -1421,6 +1422,15 @@ impl ClientEnrollment {
         page: &BrowserExecutionLease,
         op: &OperationLease,
     ) -> Result<super::client_debt::EvalAuthorityStamp, ProtocolError> {
+        #[cfg(test)]
+        if let Some(entered) = self
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .remove(&CaptureTestPoint::EvalEntry)
+        {
+            entered.entered.add_permits(1);
+        }
         self.check_restart_operation(op)?;
         if op.is_callback
             || !Arc::ptr_eq(&page.client, &self.client)
