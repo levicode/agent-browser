@@ -252,3 +252,63 @@ for (const pattern of [str(''), regexp('.*'), regexp('^(?!never)')]) {
   assert.deepEqual(matched(textQuery(pattern), [nativeAncestor], [semantic()], [true]), []);
 }
 console.log('PASS: private semantic text covers hidden twins, exact/regex, scope/filter/index/live reevaluation and open/closed/security boundaries');
+
+// Original unit/locators cases 7/9: retain both hasText and has predicates,
+// distinguishing a filter-before-index from a filter-after-index. This uses
+// the production MATCH_QUERY above, not an adapter-side matcher.
+{
+  const candidates = ['wrong-child-role', 'wrong-text', 'matching', 'wrong-value'].map((id, i) => {
+    const candidate = new Element('select', id).append(text(i === 1 ? 'without match' : 'x'));
+    const child = new Element('option', `${id}-child`);
+    candidate.append(child);
+    return { candidate, child };
+  });
+  const elements = candidates.flatMap(({ candidate, child }) => [candidate, child]);
+  const metadata = candidates.flatMap((_, i) => [
+    semantic({ value: i === 3 ? 'different' : 'shared' }),
+    semantic({ role: i === 0 ? 'button' : 'textbox' }),
+  ]);
+  const textbox = { kind: 'query', query: { kind: 'role', value: str('textbox', true) } };
+  const both = source => ({ kind: 'filter', source, hasText: str('x'), has: textbox });
+  assert.deepEqual(matched(index(both(displayValue('shared')), 0), elements, metadata), [4]);
+  assert.deepEqual(matched(both(index(displayValue('shared'), 'first')), elements, metadata), []);
+  assert.deepEqual(matched(both(index(displayValue('shared'), 'last')), elements, metadata), [4]);
+  assert.deepEqual(matched(both(displayValue('shared')), elements, metadata), [4]);
+  assert.equal(metadata[4].value, 'shared');
+  console.log('PASS: original displayValue hasText+has predicates remain before/after index without reordering or dropping either predicate');
+}
+
+// Original applyPostSteps case 14 requires an access trace, not just matching
+// results: last may ask c only; first must ask a only even though c would match.
+{
+  const asked = [];
+  const elements = ['a', 'b', 'c'].map(id => {
+    const element = new Element('select', id).append(text(id === 'c' ? 'x' : 'no-match'));
+    const children = element.childNodes;
+    Object.defineProperty(element, 'childNodes', { configurable: true, get() { asked.push(`${id}:x`); return children; } });
+    return element;
+  });
+  const metadata = elements.map(() => semantic({ value: 'shared' }));
+  const last = matched(filter(index(displayValue('shared'), 'last'), str('x')), elements, metadata);
+  assert.deepEqual(last.map(i => elements[i].id), ['c']);
+  assert.deepEqual(asked, ['c:x']);
+  asked.length = 0;
+  assert.deepEqual(matched(filter(index(displayValue('shared'), 'first'), str('x')), elements, metadata), []);
+  assert.deepEqual(asked, ['a:x']);
+  console.log('PASS: original post-position filter evaluates only the previously selected match, including exact candidate access traces');
+}
+
+// The original candidate locator excludes checkbox/radio, not all inputs.
+// Assert the actual selector passed by MATCH_QUERY as well as fixture results;
+// the scripted DOM's selector shortcut alone is not evidence of that selector.
+{
+  const elements = [new Input('checkbox'), new Input('radio'), new Input('text'), new Element('textarea'), new Element('select')];
+  const selectors = [];
+  for (const element of elements) {
+    element.matches = function(selector) { selectors.push(selector); return Element.prototype.matches.call(this, selector); };
+  }
+  const metadata = elements.map(() => semantic({ value: 'shared' }));
+  assert.deepEqual(matched(displayValue('shared'), elements, metadata), [2, 3, 4]);
+  assert.deepEqual(selectors, elements.map(() => 'input:not([type="checkbox" i]):not([type="radio" i]),textarea,select'));
+  console.log('PASS: original displayValue candidate selector retains text inputs/textarea/select and exactly excludes checkbox/radio');
+}

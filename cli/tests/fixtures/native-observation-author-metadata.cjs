@@ -2,6 +2,18 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
+
+// The current metadata producer reads CSS interactivity through the standard
+// property accessor. Keep every scripted style explicit and reject new reads.
+function css(values) {
+  return { ...values, getPropertyValue(name) {
+    assert.equal(name, 'interactivity');
+    return values.interactivity ?? 'auto';
+  } };
+}
+assert.equal(css({}).getPropertyValue('interactivity'), 'auto');
+assert.equal(css({ interactivity: 'inert' }).getPropertyValue('interactivity'), 'inert');
+assert.throws(() => css({}).getPropertyValue('unexpected-property'), assert.AssertionError);
 const source = fs.readFileSync(path.join(__dirname, '../../src/native/client_observation.rs'), 'utf8');
 const script = source.match(/const METADATA: &str = r#"([\s\S]*?)"#;/)[1];
 let document;
@@ -34,7 +46,7 @@ class Text extends Node {
 }
 global.Node = Node; global.Element = Element; global.HTMLElement = Element; global.CSS = { escape: value => value };
 document = global.document = { documentElement: new Element(), activeElement: null,
-  defaultView: { getComputedStyle: () => ({ visibility: 'visible', display: 'block' }) },
+  defaultView: { getComputedStyle: () => css({ visibility: 'visible', display: 'block' }) },
   getElementById: () => null, createRange: () => ({ selectNode() {}, getBoundingClientRect() { return { width: 10, height: 10 }; } }),
 };
 const read = eval(`(${script})`);
@@ -138,14 +150,14 @@ const slot = new Element(); slot.localName = 'slot'; slot.checkVisibility = () =
 assert.equal(read.call(slot, 'data-testid', '.secure', true).states.hidden, true);
 assert.equal(read.call(slot, 'data-testid', '.secure', true).author.lineVisible, true);
 const originalStyle = document.defaultView.getComputedStyle;
-document.defaultView.getComputedStyle = () => ({ visibility: 'hidden', display: 'contents' });
+document.defaultView.getComputedStyle = () => css({ visibility: 'hidden', display: 'contents' });
 assert.equal(read.call(slot, 'data-testid', '.secure', true).author.lineVisible, false);
 document.defaultView.getComputedStyle = originalStyle;
 console.log('PASS: slot line-flow visibility stays distinct from raw node visibility');
 
 // MAIN-world property reads are a separate side-effect-restricted CDP hint.
 // Isolated metadata never invokes a page handler getter or the handler itself.
-document.defaultView.getComputedStyle = () => ({ visibility: 'visible', display: 'inline' });
+document.defaultView.getComputedStyle = () => css({ visibility: 'visible', display: 'inline' });
 const propertyEndpoint = new Element();
 Object.defineProperty(propertyEndpoint, 'onclick', { get() { throw Error('Isolated handler getter invoked'); } });
 const propertyFacts = read.call(propertyEndpoint, 'data-testid', '.secure', true);
@@ -204,7 +216,7 @@ assert.deepEqual(read.call(labelledControl, 'data-testid', '.secure', false).lab
 console.log('PASS: associated-label text drops aria-hidden markers without weakening secure exclusion');
 
 const simpleStyle = document.defaultView.getComputedStyle;
-document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+document.defaultView.getComputedStyle = () => css({ display: 'inline', visibility: 'visible', content: 'none' });
 const simpleLabel = new Element(); simpleLabel.localName = 'label';
 const unnamedControl = new Element(); unnamedControl.localName = 'input'; unnamedControl.labels = [simpleLabel];
 simpleLabel.childNodes = [new Text('Name', simpleLabel), unnamedControl];
@@ -223,9 +235,9 @@ for (const tag of ['input', 'svg', 'slot']) {
 }
 const authored = new Element(); authored.hasAttribute = name => name === 'title';
 simpleLabel.childNodes.push(authored); assert.equal(completeName(), null); simpleLabel.childNodes.pop();
-document.defaultView.getComputedStyle = (_node, pseudo) => ({ display: 'inline', visibility: 'visible', content: pseudo ? '"icon"' : 'none' });
+document.defaultView.getComputedStyle = (_node, pseudo) => css({ display: 'inline', visibility: 'visible', content: pseudo ? '"icon"' : 'none' });
 assert.equal(completeName(), null);
-document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+document.defaultView.getComputedStyle = () => css({ display: 'inline', visibility: 'visible', content: 'none' });
 simpleLabel.childNodes = [new Text('x'.repeat(513), simpleLabel)]; assert.equal(completeName(), null);
 simpleLabel.childNodes = [new Text('Name', simpleLabel)]; simpleLabel.secure = true; assert.equal(completeName(), null);
 document.defaultView.getComputedStyle = simpleStyle;
@@ -233,7 +245,7 @@ console.log('PASS: complete simple label facts require native inventory and reje
 
 // Accessible-name boundaries are not line-text inline-flow boundaries.
 simpleLabel.secure = false;
-document.defaultView.getComputedStyle = node => ({ display: node.nameDisplay || 'inline', visibility: 'visible', content: 'none' });
+document.defaultView.getComputedStyle = node => css({ display: node.nameDisplay || 'inline', visibility: 'visible', content: 'none' });
 for (const display of ['inline-block', 'inline-flex', 'inline-grid', 'contents']) {
   const child = new Element(); child.localName = 'span'; child.nameDisplay = display;
   child.childNodes = [new Text('B', child)];
@@ -252,7 +264,7 @@ referenceTarget.childNodes = [new Text(' \t', referenceTarget)];
 const referenceControl = new Element(); referenceControl.getAttribute = name => name === 'aria-labelledby' ? 'reference' : null;
 const savedLookup = document.getElementById;
 document.getElementById = id => id === 'reference' ? referenceTarget : null;
-document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+document.defaultView.getComputedStyle = () => css({ display: 'inline', visibility: 'visible', content: 'none' });
 const emptyReference = () => read.call(referenceControl, 'data-testid', '.secure', false, false, true).completeEmptyReference;
 assert.equal(emptyReference(), true);
 assert.equal(read.call(referenceControl, 'data-testid', '.secure', false).completeEmptyReference, false);
@@ -265,7 +277,7 @@ referenceTarget.childNodes = [new Text(' ', referenceTarget)];
 referenceTarget.getAttribute = name => name === 'aria-label' ? 'Named target' : null; assert.equal(emptyReference(), false);
 referenceTarget.getAttribute = () => null;
 referenceTarget.secure = true; assert.equal(emptyReference(), false); referenceTarget.secure = false;
-document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: '"generated"' });
+document.defaultView.getComputedStyle = () => css({ display: 'inline', visibility: 'visible', content: '"generated"' });
 assert.equal(emptyReference(), false);
 document.defaultView.getComputedStyle = simpleStyle;
 document.getElementById = savedLookup;
@@ -273,7 +285,7 @@ console.log('PASS: complete-empty IDREF facts require exact native-gated whitesp
 
 // A document ID with the same spelling cannot complete another tree's IDREF.
 document.getElementById = id => id === 'reference' ? referenceTarget : null;
-document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+document.defaultView.getComputedStyle = () => css({ display: 'inline', visibility: 'visible', content: 'none' });
 referenceControl.nativeRoot = { host: new Element(), getElementById: () => referenceTarget };
 assert.equal(emptyReference(), false); delete referenceControl.nativeRoot;
 referenceTarget.hasAttribute = name => name === 'role'; assert.equal(emptyReference(), false);
@@ -284,7 +296,7 @@ document.getElementById = savedLookup;
 
 // Chained authored references remain outside this intentionally simple proof.
 document.getElementById = id => id === 'reference' ? referenceTarget : null;
-document.defaultView.getComputedStyle = () => ({ display: 'inline', visibility: 'visible', content: 'none' });
+document.defaultView.getComputedStyle = () => css({ display: 'inline', visibility: 'visible', content: 'none' });
 referenceTarget.hasAttribute = name => name === 'aria-labelledby';
 referenceTarget.getAttribute = name => name === 'aria-labelledby' ? 'another-name' : null;
 assert.equal(emptyReference(), false);
@@ -293,13 +305,13 @@ document.defaultView.getComputedStyle = simpleStyle;
 document.getElementById = savedLookup;
 
 const skippingBox = new Element(); skippingBox.innerText = '';
-document.defaultView.getComputedStyle = () => ({ display: 'block', visibility: 'visible', contentVisibility: 'hidden', content: 'none' });
+document.defaultView.getComputedStyle = () => css({ display: 'block', visibility: 'visible', contentVisibility: 'hidden', content: 'none' });
 const skippingFacts = read.call(skippingBox, 'data-testid', '.secure', true);
 assert.equal(skippingFacts.author.skipsContent, true);
 assert.equal(skippingFacts.states.hidden, false);
 assert.deepEqual(skippingFacts.rect, { x: 0, y: 0, width: 10, height: 10 });
 assert.equal(read.call(skippingBox, 'data-testid', '.secure', false).text, '');
-document.defaultView.getComputedStyle = () => ({ display: 'block', visibility: 'hidden', contentVisibility: 'visible', content: 'none' });
+document.defaultView.getComputedStyle = () => css({ display: 'block', visibility: 'hidden', contentVisibility: 'visible', content: 'none' });
 assert.equal(read.call(skippingBox, 'data-testid', '.secure', true).author.skipsContent, false);
 document.defaultView.getComputedStyle = simpleStyle;
 console.log('PASS: content-skipping metadata preserves owner box and direct-read rendering contract');
@@ -329,7 +341,7 @@ console.log('PASS: exact native control properties override ARIA, with checkable
 // Complete native-button content names correct specific AX omissions without
 // growing into another accessible-name reader. Unsupported is not empty.
 const nameStyle = document.defaultView.getComputedStyle;
-document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+document.defaultView.getComputedStyle = (node, pseudo) => css({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
 function attributes(node, values) {
   node.attributes = Object.entries(values).map(([name, value]) => ({ name, value }));
   node.getAttribute = name => values[name] ?? null;
@@ -574,7 +586,7 @@ console.log('PASS: original form own-name presence and sole-cell header facts pr
 // exercise the actual shared metadata, not a replacement naming algorithm.
 const captionStyle = document.defaultView.getComputedStyle;
 const captionMatches = Element.prototype.matches;
-document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+document.defaultView.getComputedStyle = (node, pseudo) => css({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
 Element.prototype.matches = function(selector) {
   return selector.split(',').includes(this.localName) || captionMatches.call(this, selector);
 };
@@ -633,7 +645,7 @@ console.log('PASS: first direct-caption source facts preserve priority, empty fa
 // Editing-host hint provenance keeps host and first empty descendant separate.
 // Empty testing reads only bounded, proven public text nodes, never block values.
 const editorHintStyle = document.defaultView.getComputedStyle;
-document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'block', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+document.defaultView.getComputedStyle = (node, pseudo) => css({ display: node.nameDisplay || 'block', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
 function hintHost(children = [], attrs = {}) {
   const node = namingElement('div', children, attrs); node.isContentEditable = true; return node;
 }
@@ -740,7 +752,7 @@ console.log('PASS: editor hints preserve host persistence, first empty descendan
 class PlainSvgTitle extends Element { constructor() { super(); this.localName = 'title'; } }
 global.SVGTitleElement = PlainSvgTitle;
 const restrictedSvgStyle = document.defaultView.getComputedStyle;
-document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+document.defaultView.getComputedStyle = (node, pseudo) => css({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
 function svgTitleLink(svgAttrs = { width: '10', height: '10', role: 'none' }, linkAttrs = { href: '/home', 'data-testid': 'home' }) {
   const title = attributes(new PlainSvgTitle(), {}); title.childNodes = [new Text('  Home\n', title)];
   const svg = attributes(new EmptySvg(), svgAttrs); svg.childNodes = [title]; title.parentElement = svg;
@@ -812,7 +824,7 @@ console.log('PASS: restricted SVG-title link facts accept only the whitelisted c
 // Original name-content traversal preserves block/BR separators even when the
 // child's content is hidden. Caption completion must not misprove A + C as AC.
 const hiddenCaptionStyle = document.defaultView.getComputedStyle;
-document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: 'none' });
+document.defaultView.getComputedStyle = (node, pseudo) => css({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: 'none' });
 for (const [tag, source] of [['fieldset', 'legend'], ['figure', 'figcaption'], ['table', 'caption']]) {
   for (const hiddenTag of ['div', 'br', 'span']) {
     for (const hidden of ['aria', 'display', 'visibility']) {
@@ -983,7 +995,7 @@ console.log('PASS: public table-cell role facts preserve first-token source and 
 // CI18: the same bounded content proof handles the five heading receivers,
 // preserving the intentional alert-content exception rather than axe's value.
 Node.prototype.contains = function(other) { return this === other || this.childNodes?.some(child => Node.prototype.contains.call(child, other)) || false; };
-document.defaultView.getComputedStyle = (node, pseudo) => ({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+document.defaultView.getComputedStyle = (node, pseudo) => css({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
 const heading = wrapper(); heading.localName = 'h2';
 const input = attributes(new InputControl('text', false), { 'aria-labelledby': 't1label', 'aria-label': 'ARIA Label' }); input.value = 'the value';
 const reference = wrapper([new Text('This is a ', null), wrapper([new Text('label', null)])]); reference.localName = 'div';
