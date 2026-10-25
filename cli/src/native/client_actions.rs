@@ -647,6 +647,9 @@ struct ObjectReleaseOutcome {
     accepted: bool,
     // New refusal evidence requires an exact settled command, not retained debt.
     settled: bool,
+    // The reservation was refused before any command could be submitted.
+    // A sent release with a failed/missing ACK must never acquire this fact.
+    not_reserved: bool,
 }
 async fn release_object_outcome(
     client: &super::cdp::client::CdpClient,
@@ -692,7 +695,12 @@ async fn release_accounted_inner(
 ) -> ObjectReleaseOutcome {
     let reservation = match client.reserve_tracked_command(method, Some(&params), Some(session)) {
         Ok(reservation) => reservation,
-        Err(_) => return ObjectReleaseOutcome::default(),
+        Err(_) => {
+            return ObjectReleaseOutcome {
+                not_reserved: true,
+                ..Default::default()
+            }
+        }
     };
     let status = reservation.as_ref().map(|reservation| reservation.status());
     let result = tokio::time::timeout(
@@ -714,6 +722,7 @@ async fn release_accounted_inner(
             && client
                 .debt_ledger()
                 .is_some_and(|ledger| !ledger.snapshot().integrity_lost),
+        not_reserved: false,
     }
 }
 struct Resolved {
@@ -723,6 +732,41 @@ struct Resolved {
     binding: ExactBinding,
 }
 impl Resolved {
+    /// Relinquish only the local handle responsibility into an already-owned
+    /// EOF obligation. This neither releases the remote object nor settles debt.
+    fn local_handle_retained_after_eof(&self, ctx: &ActionContext<'_>) -> bool {
+        if self.realm.is_none()
+            || self.session != self.binding.session
+            || self.binding.page_session != ctx.page.page_session_id
+            || ctx.page.permit.check().is_err()
+            || !*ctx.page.client.remote_connection_closed().borrow()
+        {
+            return false;
+        }
+        let Some(journal) = OperationJournalHandle::current() else {
+            return false;
+        };
+        let ledger = journal.ledger();
+        if journal.key().generation != ctx.operation.generation
+            || journal.key().operation_seq != ctx.operation.sequence
+            || !ledger.matches_owner(ctx.operation.generation, &ctx.page.identity_scope)
+            || !ctx
+                .page
+                .client
+                .debt_ledger()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, &ledger))
+            || ctx.page.client.check_cleanup_owner(&Some(ledger)).is_err()
+        {
+            return false;
+        }
+        journal.retains_exact_object_after_remote_eof(
+            ctx.operation,
+            &ctx.page.target_id,
+            &ctx.page.page_session_id,
+            &self.session,
+            &self.object,
+        )
+    }
     async fn release_settled(&self, ctx: &ActionContext<'_>) -> Result<(), ProtocolError> {
         if self
             .realm
@@ -752,7 +796,15 @@ impl Resolved {
         {
             return Ok(());
         }
-        if release_object_accounted(&ctx.page.client, &self.session, &self.object).await {
+        let release = release_object_outcome(&ctx.page.client, &self.session, &self.object).await;
+        if release.accepted {
+            return Ok(());
+        }
+        if release.not_reserved && self.local_handle_retained_after_eof(ctx) {
+            // Ok here means local ownership remains accounted, as with an
+            // accepted-but-unsettled release above. The old remote obligation
+            // stays intact; only the retained task may finish its producer and
+            // the existing registry may later qualify explicit recovery.
             return Ok(());
         }
         // Failed release is not evidence. Only the captured native realm's
@@ -4130,7 +4182,15 @@ mod tests {
     #[tokio::test]
     async fn readonly_release_requires_exact_settled_ack_not_legacy_acceptance() {
         use tokio_tungstenite::tungstenite::Message;
-        for mode in ["settled", "held", "rejected", "wrong-session", "untracked"] {
+        for mode in [
+            "settled",
+            "held",
+            "rejected",
+            "wrong-session",
+            "untracked",
+            "eof-before-reserve",
+            "eof-after-submit",
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("ws://{}", listener.local_addr().unwrap());
             let server = tokio::spawn(async move {
@@ -4148,6 +4208,13 @@ mod tests {
                         "DOM.resolveNode" => {
                             json!({"id":request["id"],"sessionId":"page","result":{"object":{"objectId":"owned-object"}}})
                         }
+                        "Runtime.releaseObject" if mode == "eof-after-submit" => {
+                            socket.send(Message::Close(None)).await.unwrap();
+                            break;
+                        }
+                        "Runtime.releaseObject" if mode == "eof-before-reserve" => {
+                            panic!("release was submitted after reader EOF")
+                        }
                         "Runtime.releaseObject" if mode == "held" => continue,
                         "Runtime.releaseObject" if mode == "rejected" => {
                             json!({"id":request["id"],"sessionId":"page","error":{"code":-32000,"message":"synthetic release rejection"}})
@@ -4161,6 +4228,10 @@ mod tests {
                         reply["sessionId"] = json!("foreign-page");
                     }
                     socket.send(Message::Text(reply.to_string())).await.unwrap();
+                    if mode == "eof-before-reserve" && method == "DOM.resolveNode" {
+                        socket.send(Message::Close(None)).await.unwrap();
+                        break;
+                    }
                 }
             });
             let client = CdpClient::connect(&url).await.unwrap();
@@ -4195,14 +4266,31 @@ mod tests {
                 ))
                 .await
                 .unwrap();
+            if mode == "eof-before-reserve" {
+                let mut closed = client.remote_connection_closed();
+                tokio::time::timeout(Duration::from_secs(3), async {
+                    while !*closed.borrow_and_update() {
+                        closed.changed().await.unwrap();
+                    }
+                })
+                .await
+                .unwrap();
+            }
             let outcome = journal
                 .scope(release_object_outcome(&client, "page", "owned-object"))
                 .await;
-            assert!(
+            assert_eq!(
                 outcome.accepted,
+                !matches!(mode, "eof-before-reserve" | "eof-after-submit"),
                 "legacy accountable release acceptance changed for {mode}"
             );
             assert_eq!(outcome.settled, mode == "settled", "{mode}");
+            assert_eq!(outcome.not_reserved, mode == "eof-before-reserve", "{mode}");
+            if matches!(mode, "eof-before-reserve" | "eof-after-submit") {
+                assert!(*client.remote_connection_closed().borrow());
+                assert_eq!(ledger.snapshot().object_debt, 1);
+                assert!(ledger.snapshot().integrity_lost);
+            }
             if mode == "settled" {
                 assert_eq!(ledger.snapshot().object_debt, 0);
             }

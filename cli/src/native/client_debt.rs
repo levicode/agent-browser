@@ -619,6 +619,59 @@ impl OperationJournalHandle {
         self.ledger
             .reserve_command(Some(self), method, params, session)
     }
+    /// Read-only local-handle handoff, never a release ACK or debt settlement.
+    /// The real reader must already have left this exact acknowledged object
+    /// in the disconnected borrowed owner's ledger. No aggregate count suffices.
+    pub(super) fn retains_exact_object_after_remote_eof(
+        &self,
+        operation: &OperationLease,
+        page_target: &str,
+        page_session: &str,
+        session: &str,
+        object: &str,
+    ) -> bool {
+        if self.key().generation != operation.generation
+            || self.key().operation_seq != operation.sequence
+            || self.journal.target != page_target
+            || self.journal.session != page_session
+        {
+            return false;
+        }
+        // Match command submission's lock order. Local admission/integrity and
+        // remote EOF/object provenance are inspected together, without mutation.
+        self.ledger.state.lock().is_ok_and(|state| {
+            let Ok(local) = self.journal.state.lock() else {
+                return false;
+            };
+            state.remote_eof_only()
+                && !local.integrity_lost
+                && !local.submission_revoked
+                && !local.local_producers_finished
+                && local
+                    .admission
+                    .as_ref()
+                    .is_some_and(|(deadline, cancellation)| {
+                        *deadline == operation.deadline
+                            && cancellation.same_channel(&operation.cancellation)
+                            && Instant::now() < *deadline
+                            && *cancellation.borrow() == CancelSignal::None
+                    })
+                && state.objects.iter().any(|debt| {
+                    debt.serial != 0
+                        && debt.object.as_deref() == Some(object)
+                        && debt.provenance.operation == Some(self.key())
+                        && debt.provenance.session.as_deref() == Some(session)
+                        && debt
+                            .provenance
+                            .target
+                            .as_ref()
+                            .is_some_and(|target| state.targets.get(session) == Some(target))
+                        && debt.provenance.realm.is_some_and(|(context, epoch)| {
+                            state.realms.get(&(session.to_owned(), context)) == Some(&epoch)
+                        })
+                })
+        })
+    }
     pub(crate) fn has_accounted_object_creation(&self, session: &str) -> bool {
         self.ledger.state.lock().is_ok_and(|state| {
             !state.integrity_lost
@@ -821,6 +874,16 @@ struct LedgerState {
     recording_targets: HashSet<String>,
 }
 impl LedgerState {
+    fn remote_eof_only(&self) -> bool {
+        self.integrity_lost
+            && self.eof_integrity_cause == EofIntegrityCause::RemoteEofOnly
+            && !self.retired
+            && self
+                .bootstrap
+                .as_ref()
+                .is_some_and(|scope| !scope.owns_context)
+            && self.context_id.is_some()
+    }
     fn contaminate_integrity(&mut self) {
         if let Some(window) = &mut self.eval_window {
             window.revoked = true;
@@ -1646,16 +1709,7 @@ impl OwnerDebtLedger {
     /// Remote transport loss remains Unknown. This only distinguishes that
     /// reader-owned cause from independent accounting/cleanup corruption.
     pub(crate) fn remote_eof_only(&self) -> bool {
-        self.state.lock().is_ok_and(|state| {
-            state.integrity_lost
-                && state.eof_integrity_cause == EofIntegrityCause::RemoteEofOnly
-                && !state.retired
-                && state
-                    .bootstrap
-                    .as_ref()
-                    .is_some_and(|scope| !scope.owns_context)
-                && state.context_id.is_some()
-        })
+        self.state.lock().is_ok_and(|state| state.remote_eof_only())
     }
     pub(crate) fn identity_scope(&self) -> &str {
         &self.identity_scope
@@ -5541,5 +5595,227 @@ pub(crate) mod tests {
         assert!(!status.settled());
         assert_eq!(ledger.snapshot().object_debt, 1);
         assert!(!ledger.snapshot().integrity_lost);
+    }
+    fn eof_retained_object_fixture() -> (
+        Arc<OwnerDebtLedger>,
+        OperationJournalHandle,
+        OperationLease,
+        tokio::sync::watch::Sender<CancelSignal>,
+    ) {
+        let ledger = borrowed_final_local_owner();
+        ledger
+            .bind_session("borrowed-context", "target", "page")
+            .unwrap();
+        ledger.publish_initialization(|| Ok(())).unwrap();
+        let (cancel, mut operation) = admission_operation(5000);
+        operation.sequence = 1;
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 7,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&operation).unwrap();
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: json!({"context":{"id":9}}),
+        });
+        ledger
+            .reserve_command(
+                Some(&journal),
+                "DOM.resolveNode",
+                Some(
+                    &json!({"backendNodeId":7,"executionContextId":9,"objectGroup":"native-exact"}),
+                ),
+                Some("page"),
+            )
+            .unwrap()
+            .submit()
+            .unwrap()
+            .settle(&response(json!({"object":{"objectId":"eof-kept"}})));
+        // Submitted input remains owned even after its local handle is dropped.
+        drop(pending_input(&ledger, &journal));
+        (ledger, journal, operation, cancel)
+    }
+
+    #[test]
+    fn exact_eof_object_handoff_keeps_owned_debt_and_never_settles_producers() {
+        let (ledger, journal, operation, _cancel) = eof_retained_object_fixture();
+        assert!(!journal.retains_exact_object_after_remote_eof(
+            &operation, "target", "page", "page", "eof-kept"
+        ));
+        ledger.observe_remote_eof();
+        let before = ledger.snapshot();
+        let producer_before = journal.snapshot();
+        assert_eq!((before.input_debt, before.object_debt), (1, 1));
+        assert!(journal.retains_exact_object_after_remote_eof(
+            &operation, "target", "page", "page", "eof-kept"
+        ));
+        for (target, page, session, object) in [
+            ("foreign", "page", "page", "eof-kept"),
+            ("target", "foreign", "page", "eof-kept"),
+            ("target", "page", "foreign", "eof-kept"),
+            ("target", "page", "page", "foreign"),
+        ] {
+            assert!(!journal
+                .retains_exact_object_after_remote_eof(&operation, target, page, session, object));
+        }
+        assert_eq!(ledger.snapshot(), before);
+        assert_eq!(journal.snapshot(), producer_before);
+        assert!(!producer_before.local_producers_finished && !producer_before.submission_revoked);
+        assert!(ledger.check_admission(AdmissionClass::Input).is_err());
+        assert!(matches!(
+            ledger.reserve_command(
+                Some(&journal),
+                "Runtime.releaseObject",
+                Some(&json!({"objectId":"eof-kept"})),
+                Some("page")
+            ),
+            Err(ProtocolError::ScopeUnavailable)
+        ));
+        assert_eq!(ledger.snapshot(), before);
+    }
+
+    #[tokio::test]
+    async fn exact_eof_object_handoff_rejects_nonexact_or_contaminated_responsibility() {
+        for obstruction in [
+            "live",
+            "local-close-before",
+            "local-close-after",
+            "cancel",
+            "expired",
+            "revoked",
+            "finished",
+            "local-integrity",
+            "owner-retired",
+            "owned",
+            "target-mapping",
+            "realm-reused",
+            "anonymous",
+            "released",
+            "group-only",
+            "operation",
+            "generation",
+            "deadline",
+            "cancellation-channel",
+            "unbound",
+        ] {
+            let (ledger, journal, mut operation, cancel) = eof_retained_object_fixture();
+            if matches!(obstruction, "anonymous" | "released" | "group-only") {
+                ledger
+                    .reserve_command(
+                        Some(&journal),
+                        "Runtime.releaseObject",
+                        Some(&json!({"objectId":"eof-kept"})),
+                        Some("page"),
+                    )
+                    .unwrap()
+                    .submit()
+                    .unwrap()
+                    .settle(&response(json!({})));
+                if obstruction == "anonymous" {
+                    drop(
+                        ledger
+                            .reserve_command(
+                                Some(&journal),
+                                "DOM.resolveNode",
+                                Some(&json!({"executionContextId":9})),
+                                Some("page"),
+                            )
+                            .unwrap()
+                            .submit()
+                            .unwrap(),
+                    );
+                }
+                if obstruction == "group-only" {
+                    grouped(
+                        &ledger,
+                        &journal,
+                        "native-security-1",
+                        "DOM.resolveNode",
+                        json!({"executionContextId":9,"objectGroup":"native-security-1"}),
+                    )
+                    .await
+                    .submit()
+                    .unwrap()
+                    .settle(&response(json!({"object":{"objectId":"eof-kept"}})));
+                }
+            }
+            match obstruction {
+                "local-close-before" => ledger.connection_lost(),
+                "cancel" => cancel.send(CancelSignal::Requested).unwrap(),
+                "expired" => {
+                    operation.deadline = Instant::now();
+                    journal
+                        .journal
+                        .state
+                        .lock()
+                        .unwrap()
+                        .admission
+                        .as_mut()
+                        .unwrap()
+                        .0 = operation.deadline;
+                }
+                "revoked" => journal.revoke_application_submission(),
+                "finished" => journal.finish_local_producers(),
+                "local-integrity" => {
+                    journal.record_cleanup_disposition(CleanupDisposition::IntegrityLost)
+                }
+                "owner-retired" => ledger.state.lock().unwrap().retired = true,
+                "owned" => {
+                    ledger
+                        .state
+                        .lock()
+                        .unwrap()
+                        .bootstrap
+                        .as_mut()
+                        .unwrap()
+                        .owns_context = true
+                }
+                "target-mapping" => {
+                    ledger
+                        .state
+                        .lock()
+                        .unwrap()
+                        .targets
+                        .insert("page".into(), "foreign".into());
+                }
+                "realm-reused" => ledger.observe_event(&CdpEvent {
+                    method: "Runtime.executionContextCreated".into(),
+                    session_id: Some("page".into()),
+                    params: json!({"context":{"id":9}}),
+                }),
+                "operation" => operation.sequence += 1,
+                "generation" => operation.generation += 1,
+                "deadline" => operation.deadline += std::time::Duration::from_secs(1),
+                "cancellation-channel" => {
+                    let (_sender, receiver) = tokio::sync::watch::channel(CancelSignal::None);
+                    operation.cancellation = receiver;
+                }
+                "unbound" => journal.journal.state.lock().unwrap().admission = None,
+                _ => {}
+            }
+            if obstruction != "live" {
+                ledger.observe_remote_eof();
+            }
+            if obstruction == "local-close-after" {
+                ledger.connection_lost();
+            }
+            let before = ledger.snapshot();
+            let local_before = journal.snapshot();
+            assert!(
+                !journal.retains_exact_object_after_remote_eof(
+                    &operation, "target", "page", "page", "eof-kept"
+                ),
+                "{obstruction}"
+            );
+            assert_eq!(ledger.snapshot(), before, "{obstruction}");
+            assert_eq!(journal.snapshot(), local_before, "{obstruction}");
+        }
     }
 }
