@@ -17,12 +17,13 @@ const MAX_RETAINED: usize = super::client_operation_state::MAX_RETAINED_OPERATIO
 pub struct RetainedCompletion {
     pub identity_scope: String,
     pub cleanup_integrity_lost: bool,
+    operation: Option<super::client_debt::OperationKey>,
 }
 #[derive(Default)]
 struct Tasks {
     closing: bool,
     tasks: JoinSet<RetainedCompletion>,
-    failures: Vec<String>,
+    failures: Vec<RetainedCompletion>,
     unscoped_failure: bool,
 }
 #[derive(Default)]
@@ -34,9 +35,7 @@ impl Tasks {
     fn record(&mut self, result: Result<RetainedCompletion, tokio::task::JoinError>) {
         match result {
             Ok(result) if result.cleanup_integrity_lost => {
-                if !self.failures.contains(&result.identity_scope) {
-                    self.failures.push(result.identity_scope);
-                }
+                self.failures.push(result);
             }
             Err(_) => self.unscoped_failure = true,
             _ => {}
@@ -151,7 +150,8 @@ impl RetainedTasks {
     {
         let operations = self.operations.clone();
         let task_targets = targets.clone();
-        self.start_prepared(identity_scope, targets, move || {
+        let key = journal.key();
+        self.start_prepared_tracked(identity_scope, targets, Some(key), move || {
             operations.register(journal.clone())?;
             let future = match prepare() {
                 Ok(future) => future,
@@ -191,7 +191,19 @@ impl RetainedTasks {
                         true,
                     ),
                 };
+                // This timer owns no action work. Join it before publishing local
+                // completion so an old deadline cannot quarantine a fresh owner.
+                monitor.abort();
+                let monitor_failed = match monitor.await {
+                    Ok(()) => false,
+                    Err(error) => !error.is_cancelled(),
+                };
+                let dirty = dirty || monitor_failed;
                 let snapshot = journal.snapshot();
+                let remote_only = !dirty
+                    && !matches!(&outcome.result, Err(ProtocolError::CleanupFailed))
+                    && journal.local_integrity_intact()
+                    && journal.ledger().remote_eof_only();
                 let already_dirty = dirty
                     || matches!(&outcome.result, Err(ProtocolError::CleanupFailed))
                     || snapshot.integrity_lost;
@@ -225,12 +237,15 @@ impl RetainedTasks {
                 if outcome.effects == Effects::Unknown {
                     operations.retire(key);
                 }
-                let dirty = operations.finish(key, dirty) || dirty;
+                let dirty = (if remote_only {
+                    operations.finish_remote_eof(key)
+                } else {
+                    operations.finish(key, dirty)
+                }) || dirty;
                 if dirty {
                     task_targets.seal();
                     let _ = broker.quarantine();
                 }
-                monitor.abort(); // Timer only; never aborts action/cleanup work.
                 if outcome.effects == Effects::Unknown && !dirty {
                     outcome.retention = operations.status(key).proof();
                 }
@@ -266,11 +281,33 @@ impl RetainedTasks {
         F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
         P: FnOnce() -> Result<F, ProtocolError>,
     {
+        self.start_prepared_tracked(identity_scope, targets, None, prepare)
+            .await
+    }
+
+    async fn start_prepared_tracked<F, P>(
+        &self,
+        identity_scope: String,
+        targets: Arc<ClientTargets>,
+        operation: Option<super::client_debt::OperationKey>,
+        prepare: P,
+    ) -> Result<oneshot::Receiver<NativeOutcome>, ProtocolError>
+    where
+        F: Future<Output = (NativeOutcome, bool)> + Send + 'static,
+        P: FnOnce() -> Result<F, ProtocolError>,
+    {
         let mut tasks = self.inner.lock().await;
         while let Some(result) = tasks.tasks.try_join_next() {
             tasks.record(result);
         }
-        if tasks.closing || tasks.unscoped_failure || !tasks.failures.is_empty() {
+        if tasks.closing
+            || tasks.unscoped_failure
+            || tasks.failures.iter().any(|failure| {
+                !failure
+                    .operation
+                    .is_some_and(|key| self.operations.disconnected_failure_retired(key))
+            })
+        {
             return Err(ProtocolError::ScopeUnavailable);
         }
         if tasks.tasks.len() >= MAX_RETAINED {
@@ -313,17 +350,80 @@ impl RetainedTasks {
             RetainedCompletion {
                 identity_scope,
                 cleanup_integrity_lost,
+                operation,
             }
         });
         Ok(receive)
     }
 
+    pub(crate) fn recovery_candidate(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Option<super::client_operation_state::DisconnectedRecoveryProof> {
+        self.operations.recovery_candidate(key)
+    }
+    /// Join all old local producers under the caller's existing lifecycle budget.
+    /// A historical EOF failure is not erased, and unrelated local failures refuse.
+    pub(crate) async fn drain_disconnected(
+        &self,
+        proof: &super::client_operation_state::DisconnectedRecoveryProof,
+    ) -> Result<(), ProtocolError> {
+        proof.check()?;
+        let mut tasks = self.inner.lock().await;
+        while let Some(result) = tasks.tasks.join_next().await {
+            tasks.record(result);
+        }
+        if tasks.closing
+            || tasks.unscoped_failure
+            || tasks.failures.iter().any(|failure| {
+                !failure.operation.is_some_and(|key| {
+                    self.operations.disconnected_failure_retired(key)
+                        || self.operations.disconnected_failure_matches(key, proof)
+                }) || failure.identity_scope != proof.ledger().identity_scope()
+                    && !failure
+                        .operation
+                        .is_some_and(|key| self.operations.disconnected_failure_retired(key))
+            })
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        self.operations
+            .recovery_candidate(proof.key())
+            .ok_or(ProtocolError::CleanupFailed)?;
+        Ok(())
+    }
+    pub(crate) fn retire_disconnected_owner(
+        &self,
+        proof: &super::client_operation_state::DisconnectedRecoveryProof,
+    ) -> Result<(), ProtocolError> {
+        self.operations.retire_disconnected_owner(proof)
+    }
+    /// Final cleanup of the current owner. Previously verified local retirements
+    /// remain recorded; they are not live producers of this replacement scope.
+    pub(crate) async fn drain_current(&self) -> Result<(), ProtocolError> {
+        let mut tasks = self.inner.lock().await;
+        while let Some(result) = tasks.tasks.join_next().await {
+            tasks.record(result);
+        }
+        if tasks.unscoped_failure
+            || tasks.failures.iter().any(|failure| {
+                !failure
+                    .operation
+                    .is_some_and(|key| self.operations.disconnected_failure_retired(key))
+            })
+        {
+            Err(ProtocolError::CleanupFailed)
+        } else {
+            Ok(())
+        }
+    }
     pub async fn seal(&self) {
         self.inner.lock().await.closing = true;
     }
 
     /// JoinSet remains in owner storage if this wait is cancelled. All tasks
     /// are joined even when an earlier task reported cleanup failure.
+    #[cfg(test)]
     pub async fn drain(&self) -> Result<(), ProtocolError> {
         let mut tasks = self.inner.lock().await;
         while let Some(result) = tasks.tasks.join_next().await {

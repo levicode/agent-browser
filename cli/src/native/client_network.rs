@@ -579,9 +579,10 @@ impl ClientNetwork {
         ).await;
         match result {
             Err(failure) => {
-                // Defer quarantine only for a still-valid failed-terminal
-                // candidate. Never clear quarantine or replace its CDP message.
-                let check = if failure.has_retirement() {
+                // Enrollment retains the original failure/permit while a
+                // qualified pending attachment awaits exact detach. Neither
+                // kind grants Ready or clears quarantine or its CDP message.
+                let check = if failure.has_retirement() || failure.has_pending_retirement() {
                     self.check_worker_startup(operation)
                 } else {
                     Err(failure.error())
@@ -2628,13 +2629,13 @@ impl ClientNetwork {
         if self.sealed.load(Ordering::Acquire) {
             return Err(ProtocolError::StaleScope);
         }
-        let (generation, health) = self.broker.health()?;
-        if generation != self.scope.generation
-            || health != super::client_protocol::ScopeState::Usable
-        {
-            return Err(ProtocolError::StaleScope);
-        }
-        Ok(())
+        self.broker
+            .check_scoped_owner(
+                self.scope.generation,
+                &self.scope.identity_scope,
+                self.client.debt_ledger().as_ref(),
+            )
+            .map_err(|_| ProtocolError::StaleScope)
     }
 
     /// Lifecycle owner calls this before context disposal. Read aliases carry no
@@ -4125,6 +4126,7 @@ mod bridge_tests {
             .stage_until_result(&stage_op, &scope.identity_scope)
             .unwrap();
         sink.acknowledge_result_for_test(&ServerMessage::Result {
+            recovery: None,
             retention: None,
             id: "initial".into(),
             generation: 1,
@@ -5053,6 +5055,7 @@ mod bridge_tests {
         assert!(events.try_recv().is_err());
         source
             .acknowledge_result_for_test(&ServerMessage::Result {
+                recovery: None,
                 retention: None,
                 id: "restart".into(),
                 generation: 1,

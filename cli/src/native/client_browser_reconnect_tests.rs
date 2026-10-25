@@ -400,6 +400,7 @@ async fn preflight_refusal(mode: PeerMode, error: ProtocolError) {
             owner.scope.clone(),
             owner.request(&candidate.endpoint),
             owner.operation(),
+            None,
         ),
     )
     .await
@@ -432,8 +433,11 @@ async fn reconnect_supervisor_cancel_after_candidate_attach_keeps_old_runtime() 
     let operation = owner.operation();
     let browser = owner.browser.clone();
     let scope = owner.scope.clone();
-    let reconnecting =
-        tokio::spawn(async move { browser.reconnect_scope(scope, request, operation).await });
+    let reconnecting = tokio::spawn(async move {
+        browser
+            .reconnect_scope(scope, request, operation, None)
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(3), async {
         let mut contexts = 0;
         while let Some(method) = candidate.received.recv().await {
@@ -481,6 +485,7 @@ async fn reconnect_supervisor_old_cleanup_failure_closes_verified_candidate() {
             owner.scope.clone(),
             owner.request(&candidate.endpoint),
             owner.operation(),
+            None,
         ),
     )
     .await
