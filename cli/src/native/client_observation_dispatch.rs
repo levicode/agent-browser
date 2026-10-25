@@ -618,6 +618,23 @@ impl ObservationDispatch {
             publication.observed_revision,
         ))
     }
+    /// Read-only fixture witness; exact owner matching, never admission mutation.
+    #[cfg(test)]
+    pub(crate) fn capture_sequence_for_test(
+        &self,
+        page: &BrowserExecutionLease,
+        generation: u64,
+    ) -> Result<Option<u64>, ProtocolError> {
+        let authority = self
+            .captures
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        Ok(authority
+            .latest
+            .iter()
+            .find(|entry| entry.owner.matches(page, generation) && !*entry.retired.borrow())
+            .map(|entry| entry.sequence))
+    }
     /// This is called by the retained registry's synchronous prepare closure,
     /// never on raw RPC acceptance and never before capacity admission.
     pub(crate) fn prepare(

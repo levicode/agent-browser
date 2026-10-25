@@ -340,6 +340,7 @@ pub(crate) async fn capture_under_journal(
         let refs = super::element::RefMap::new();
         let iframe_sessions = HashMap::new();
         check(context, operation)?;
+        journal.raw_capture_started().map_err(protected_reason)?;
         let capture = super::screenshot::take_screenshot(
             &context.page.client,
             &context.page.page_session_id,
@@ -355,22 +356,26 @@ pub(crate) async fn capture_under_journal(
             _ = tokio::time::sleep_until(operation.deadline.into()) => (None, Some(CaptureReason::Deadline)),
         };
         if let Some(reason) = interrupted {
-            if !super::client_observation::capture_retirement_active() {
-                return Err(reason);
-            }
-            // Keep an already-started screenshot inside source-mask ownership.
+            // Source-mask custody is required even without an Observe admission.
+            // Retirement governs publication/continuation proofs, not supervision
+            // of an already-submitted protected raw capture. Never publish its
+            // late pixels or manufacture an admission while finishing cleanup.
+            let cleanup_deadline = journal.begin_cleanup();
             #[cfg(all(test, feature = "acceptance-faults"))]
-            retained_capture_test::entered(context, operation, reason);
-            let settled =
-                tokio::time::timeout(std::time::Duration::from_millis(250), &mut capture).await;
+            if super::client_observation::capture_retirement_active() {
+                retained_capture_test::entered(context, operation, reason);
+            }
+            let settled = tokio::time::timeout_at(cleanup_deadline.into(), &mut capture).await;
             if !matches!(settled, Ok(Ok(_))) {
                 return Err(CaptureReason::CleanupFailed);
             }
+            journal.raw_capture_completed().map_err(protected_reason)?;
             return Err(reason);
         }
         let raw = raw
             .ok_or(CaptureReason::BrowserFailure)?
             .map_err(|_| CaptureReason::BrowserFailure)?;
+        journal.raw_capture_completed().map_err(protected_reason)?;
         check(context, operation)?;
         if raw.base64.len() > MAX_PNG_BYTES * 4 / 3 + 4 {
             return Err(CaptureReason::BoundsExceeded);

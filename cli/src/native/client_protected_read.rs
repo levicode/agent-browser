@@ -3,9 +3,13 @@
 
 use super::client_browser::BrowserExecutionLease;
 use super::client_debt::{command_scope, CommandCategory};
+use super::client_protected_read_residual::{
+    MaskRecord, MaskStep, RateRecord, RawState, Record, Records,
+};
 use super::client_session::{CancelSignal, OperationLease};
 use super::client_targets::{ProtectedTargetBarrier, TargetPurpose};
 use serde_json::{json, Value};
+use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,8 +39,8 @@ pub struct ProtectedReadJournal<'a> {
     operation: &'a OperationLease,
     barrier: ProtectedTargetBarrier,
     sessions: Vec<String>,
-    touched: Vec<(String, f64)>,
-    source_masks: Vec<(String, Option<String>, String)>,
+    record: Arc<Record>,
+    cleanup_deadline: Option<Instant>,
     restored: bool,
     started: bool,
     stabilization_completed: bool,
@@ -76,13 +80,25 @@ impl<'a> ProtectedReadJournal<'a> {
         }
         sessions.sort();
         sessions.dedup();
+        let record = page
+            .targets
+            .protected_read_residual
+            .reserve(
+                super::client_debt::OperationKey {
+                    generation: operation.generation,
+                    operation_seq: operation.sequence,
+                },
+                &page.page_session_id,
+                page.client.clone(),
+            )
+            .map_err(|_| failure(ProtectedReadReason::CleanupFailed))?;
         let journal = Self {
             page,
             operation,
             barrier,
             sessions,
-            touched: Vec::new(),
-            source_masks: Vec::new(),
+            record,
+            cleanup_deadline: None,
             restored: false,
             started: false,
             stabilization_completed: false,
@@ -90,6 +106,37 @@ impl<'a> ProtectedReadJournal<'a> {
         };
         journal.check().map_err(failure)?;
         Ok(journal)
+    }
+    fn records(&self) -> Result<MutexGuard<'_, Records>, ProtectedReadReason> {
+        self.record
+            .data
+            .lock()
+            .map_err(|_| ProtectedReadReason::CleanupFailed)
+    }
+    pub(crate) fn begin_cleanup(&mut self) -> Instant {
+        *self
+            .cleanup_deadline
+            .get_or_insert_with(|| Instant::now() + Duration::from_secs(3))
+    }
+    pub(crate) fn raw_capture_started(&self) -> Result<(), ProtectedReadReason> {
+        let mut records = self.records()?;
+        if records.raw != RawState::NotStarted {
+            return Err(ProtectedReadReason::CleanupFailed);
+        }
+        records.raw = RawState::Pending;
+        Ok(())
+    }
+    pub(crate) fn raw_capture_completed(&self) -> Result<(), ProtectedReadReason> {
+        let mut records = self.records()?;
+        if records.raw != RawState::Pending {
+            return Err(ProtectedReadReason::CleanupFailed);
+        }
+        records.raw = RawState::SuccessfulReply;
+        Ok(())
+    }
+    fn raw_unresolved(&self) -> bool {
+        self.records()
+            .map_or(true, |records| matches!(records.raw, RawState::Pending))
     }
     pub fn check(&self) -> Result<(), ProtectedReadReason> {
         self.page
@@ -204,7 +251,11 @@ impl<'a> ProtectedReadJournal<'a> {
                 .filter(|rate| rate.is_finite())
                 .ok_or(ProtectedReadReason::BrowserFailure)?;
             // Journal before delivery: lost acknowledgements may still mutate.
-            self.touched.push((session.clone(), rate));
+            self.records()?.rates.push(RateRecord {
+                session: session.clone(),
+                original: rate,
+                acknowledged: false,
+            });
             self.command(
                 &session,
                 "Animation.setPlaybackRate",
@@ -224,16 +275,24 @@ impl<'a> ProtectedReadJournal<'a> {
         group: String,
     ) -> Result<(), ProtectedReadReason> {
         self.require_stabilized()?;
-        if !self.contains_session(&session)
-            || self.source_masks.len() >= 4096
-            || self
-                .source_masks
+        if !self.contains_session(&session) {
+            return Err(ProtectedReadReason::IncompleteInventory);
+        }
+        let mut records = self.records()?;
+        if records.masks.len() >= 4096
+            || records
+                .masks
                 .iter()
-                .any(|(s, _, g)| s == &session && g == &group)
+                .any(|mask| mask.session == session && mask.group == group)
         {
             return Err(ProtectedReadReason::IncompleteInventory);
         }
-        self.source_masks.push((session, None, group));
+        records.masks.push(MaskRecord {
+            session,
+            holder: None,
+            group,
+            step: MaskStep::InstalledOrUnknown,
+        });
         Ok(())
     }
     pub(crate) fn bind_source_holder(
@@ -242,25 +301,29 @@ impl<'a> ProtectedReadJournal<'a> {
         group: &str,
         object: String,
     ) -> Result<(), ProtectedReadReason> {
-        // Cleanup ownership accepts a known ACK even after cancellation; the
-        // next mutating command independently checks the original operation.
-        let entry = self
-            .source_masks
+        let mut records = self.records()?;
+        let mask = records
+            .masks
             .iter_mut()
-            .find(|(s, _, g)| s == session && g == group)
+            .find(|mask| mask.session == session && mask.group == group)
             .ok_or(ProtectedReadReason::IncompleteInventory)?;
-        if entry.1.is_some() {
+        if mask.holder.is_some() {
             return Err(ProtectedReadReason::IncompleteInventory);
         }
-        entry.1 = Some(object);
+        mask.holder = Some(object);
         Ok(())
     }
     pub(crate) async fn verify_source_masks(&self) -> Result<(), ProtectedReadReason> {
-        for (session, object, group) in &self.source_masks {
-            let object = object
+        let masks = self.records()?.masks.clone();
+        for mask in masks {
+            if mask.step != MaskStep::InstalledOrUnknown {
+                return Err(ProtectedReadReason::IncompleteInventory);
+            }
+            let object = mask
+                .holder
                 .as_ref()
                 .ok_or(ProtectedReadReason::IncompleteInventory)?;
-            let response=self.read_command(session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":"function(){return this.verify()}","returnByValue":true,"objectGroup":group})).await?;
+            let response = self.read_command(&mask.session, "Runtime.callFunctionOn", json!({"objectId":object,"functionDeclaration":"function(){return this.verify()}","returnByValue":true,"objectGroup":mask.group})).await?;
             if response.get("exceptionDetails").is_some() || response["result"]["value"] != true {
                 return Err(ProtectedReadReason::BrowserFailure);
             }
@@ -268,39 +331,67 @@ impl<'a> ProtectedReadJournal<'a> {
         Ok(())
     }
     pub(crate) async fn remove_source_masks(&mut self) -> Result<(), ProtectedReadReason> {
-        self.remove_source_masks_until(Instant::now() + Duration::from_secs(3))
-            .await
+        let deadline = self.begin_cleanup();
+        self.remove_source_masks_until(deadline).await
     }
     async fn remove_source_masks_until(
         &mut self,
         deadline: Instant,
     ) -> Result<(), ProtectedReadReason> {
-        // Keep every ownership record in self across await/caller cancellation.
-        // Remove only after exact node removal and group-release ACKs.
-        let attempts = self.source_masks.clone();
-        for (session, object, group) in attempts.into_iter().rev() {
-            if let Some(handle) = &object {
-                let result=tokio::time::timeout_at(deadline.into(),command_scope(CommandCategory::CleanupOther,false,self.page.client.send_command("Runtime.callFunctionOn",Some(json!({"objectId":handle,"functionDeclaration":"function(){return this.remove()}","returnByValue":true,"objectGroup":group})),Some(&session)))).await;
-                let removed = matches!(&result,Ok(Ok(value)) if value.get("exceptionDetails").is_none() && value["result"]["value"]==true);
-                if !removed {
-                    continue;
+        if self.raw_unresolved() || Instant::now() >= deadline {
+            return Err(ProtectedReadReason::CleanupFailed);
+        }
+        let attempts = self.records()?.masks.clone();
+        for mask in attempts.into_iter().rev() {
+            if mask.step == MaskStep::GroupReleased {
+                continue;
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            if mask.step == MaskStep::InstalledOrUnknown {
+                if let Some(handle) = &mask.holder {
+                    let result = tokio::time::timeout_at(deadline.into(), command_scope(CommandCategory::CleanupOther, false,
+                        self.page.client.send_command("Runtime.callFunctionOn", Some(json!({"objectId":handle,"functionDeclaration":"function(){return this.remove()}","returnByValue":true,"objectGroup":mask.group})), Some(&mask.session)))).await;
+                    if !matches!(&result, Ok(Ok(value)) if value.get("exceptionDetails").is_none() && value["result"]["value"] == true)
+                    {
+                        continue;
+                    }
                 }
+                self.records()?
+                    .masks
+                    .iter_mut()
+                    .find(|owned| owned.session == mask.session && owned.group == mask.group)
+                    .ok_or(ProtectedReadReason::CleanupFailed)?
+                    .step = MaskStep::Removed;
+            }
+            if Instant::now() >= deadline {
+                break;
             }
             let released = tokio::time::timeout_at(
                 deadline.into(),
                 self.page.client.send_command(
                     "Runtime.releaseObjectGroup",
-                    Some(json!({"objectGroup":group})),
-                    Some(&session),
+                    Some(json!({"objectGroup":mask.group})),
+                    Some(&mask.session),
                 ),
             )
             .await;
             if matches!(released, Ok(Ok(_))) {
-                self.source_masks
-                    .retain(|(s, _, g)| s != &session || g != &group);
+                self.records()?
+                    .masks
+                    .iter_mut()
+                    .find(|owned| owned.session == mask.session && owned.group == mask.group)
+                    .ok_or(ProtectedReadReason::CleanupFailed)?
+                    .step = MaskStep::GroupReleased;
             }
         }
-        if !self.source_masks.is_empty() {
+        if self
+            .records()?
+            .masks
+            .iter()
+            .any(|mask| mask.step != MaskStep::GroupReleased)
+        {
             self.barrier.quarantine();
             return Err(ProtectedReadReason::BrowserFailure);
         }
@@ -318,18 +409,35 @@ impl<'a> ProtectedReadJournal<'a> {
             "native-settlement sequence={} phase=ProtectedRestoreBegin",
             self.operation.sequence
         );
-        let deadline = Instant::now() + Duration::from_secs(3);
+        let deadline = self.begin_cleanup();
+        if self.raw_unresolved() || Instant::now() >= deadline {
+            self.record.leave_residual();
+            self.barrier.quarantine();
+            return Err(ProtectedReadFailure {
+                reason: ProtectedReadReason::CleanupFailed,
+                identity_scope: self.page.identity_scope.clone(),
+                cleanup_integrity_lost: true,
+            });
+        }
         let mut complete = self.remove_source_masks_until(deadline).await.is_ok();
         complete &= !self
             .command_cleanup_lost
             .load(std::sync::atomic::Ordering::SeqCst);
-        for (session, rate) in self.touched.iter().rev() {
+        let rates = self
+            .records()
+            .map(|records| records.rates.clone())
+            .unwrap_or_default();
+        for (index, rate) in rates.iter().enumerate().rev() {
+            if rate.acknowledged {
+                continue;
+            }
+            let session = &rate.session;
             let command_deadline = deadline.min(Instant::now() + Duration::from_millis(500));
             if Instant::now() >= deadline {
                 complete = false;
                 break;
             }
-            complete &= matches!(
+            let acknowledged = matches!(
                 tokio::time::timeout_at(
                     command_deadline.into(),
                     command_scope(
@@ -337,7 +445,7 @@ impl<'a> ProtectedReadJournal<'a> {
                         false,
                         self.page.client.send_command(
                             "Animation.setPlaybackRate",
-                            Some(json!({"playbackRate":rate})),
+                            Some(json!({"playbackRate":rate.original})),
                             Some(session)
                         )
                     )
@@ -345,13 +453,30 @@ impl<'a> ProtectedReadJournal<'a> {
                 .await,
                 Ok(Ok(_))
             );
+            complete &= acknowledged;
+            if acknowledged {
+                if let Ok(mut records) = self.records() {
+                    records.rates[index].acknowledged = true;
+                } else {
+                    complete = false;
+                }
+            }
         }
         #[cfg(feature = "acceptance-faults")]
         eprintln!(
             "native-settlement sequence={} phase=ProtectedRestoreEnd integrity={}",
             self.operation.sequence, complete
         );
+        if complete {
+            complete = self
+                .page
+                .targets
+                .protected_read_residual
+                .finish_restored(&self.record)
+                .is_ok();
+        }
         if !complete {
+            self.record.leave_residual();
             self.barrier.quarantine();
             return Err(ProtectedReadFailure {
                 reason: ProtectedReadReason::BrowserFailure,
@@ -365,7 +490,18 @@ impl<'a> ProtectedReadJournal<'a> {
 }
 impl Drop for ProtectedReadJournal<'_> {
     fn drop(&mut self) {
-        if !self.restored && (!self.touched.is_empty() || !self.source_masks.is_empty()) {
+        if !self.restored {
+            if !self.record.has_effects()
+                && self
+                    .page
+                    .targets
+                    .protected_read_residual
+                    .finish_restored(&self.record)
+                    .is_ok()
+            {
+                return;
+            }
+            self.record.leave_residual();
             self.barrier.quarantine();
         }
     }
@@ -377,6 +513,7 @@ mod tests {
     use super::super::client_browser::{ExecutionGate, OwnedBrowser};
     use base64::Engine;
     use serde_json::{json, Value};
+
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -431,6 +568,13 @@ mod tests {
                             json!({"code":-32000,"message":"synthetic source cleanup failure"});
                     }
                 }
+                if request["method"] == "Runtime.releaseObjectGroup"
+                    && request["params"]["objectGroup"] == "fail-release"
+                {
+                    response.as_object_mut().unwrap().remove("result");
+                    response["error"] =
+                        json!({"code":-32000,"message":"synthetic group release refusal"});
+                }
                 if stale_during_restore
                     && request["method"] == "Animation.setPlaybackRate"
                     && request["params"]["playbackRate"].as_f64() == Some(1.0)
@@ -476,6 +620,221 @@ mod tests {
         };
         (page, operation, sender, server, records)
     }
+    #[tokio::test]
+    async fn residual_poisoned_records_survive_journal_drop() {
+        let (page, operation, _sender, server, _requests) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
+        let record = journal.record.clone();
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = record.data.lock().unwrap();
+            panic!("synthetic journal poison");
+        }))
+        .is_err());
+        drop(journal);
+        let retained = page
+            .targets
+            .protected_read_residual
+            .snapshot_for_test()
+            .unwrap();
+        assert!(Arc::ptr_eq(&record, &retained));
+        let data = match retained.data.lock() {
+            Err(error) => error.into_inner(),
+            Ok(_) => panic!("poison must persist"),
+        };
+        assert_eq!(data.rates[0].original, 1.0);
+        assert!(!data.rates[0].acknowledged);
+        drop(data);
+        assert!(page
+            .targets
+            .protected_read_residual
+            .replacement_safe()
+            .is_err());
+        page.client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn residual_expired_cleanup_deadline_sends_no_restore_commands() {
+        let (page, operation, _sender, server, requests) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
+        journal.cleanup_deadline = Some(std::time::Instant::now() - Duration::from_millis(1));
+        let before = requests.lock().unwrap().len();
+        assert!(journal.restore().await.is_err());
+        assert_eq!(requests.lock().unwrap().len(), before);
+        drop(journal);
+        assert!(page
+            .targets
+            .protected_read_residual
+            .snapshot_for_test()
+            .is_some());
+        page.client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn residual_group_release_failure_keeps_removed_stage() {
+        let (page, operation, _sender, server, _requests) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
+        journal
+            .reserve_source_group("session".into(), "fail-release".into())
+            .unwrap();
+        journal
+            .bind_source_holder("session", "fail-release", "holder".into())
+            .unwrap();
+        assert!(journal.restore().await.is_err());
+        drop(journal);
+        let record = page
+            .targets
+            .protected_read_residual
+            .snapshot_for_test()
+            .unwrap();
+        let data = record.data.lock().unwrap();
+        assert_eq!(data.masks[0].step, super::MaskStep::Removed);
+        assert!(data.rates[0].acknowledged);
+        drop(data);
+        page.client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn residual_owner_binding_rejects_other_client_generation_and_ledger_change() {
+        let (page, operation, _sender, server, requests) = journal_fixture(false, false).await;
+        let (other, _op, _sender2, server2, _requests2) = journal_fixture(false, false).await;
+        drop(super::ProtectedReadJournal::begin(&page, &operation).unwrap());
+        let slot = &page.targets.protected_read_residual;
+        let key = super::super::client_debt::OperationKey {
+            generation: operation.generation,
+            operation_seq: operation.sequence,
+        };
+        assert!(slot.reserve(key, "session", other.client.clone()).is_err());
+        assert!(slot
+            .reserve(
+                super::super::client_debt::OperationKey {
+                    generation: 2,
+                    ..key
+                },
+                "session",
+                page.client.clone()
+            )
+            .is_err());
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(1, "scope".into());
+        page.client.install_debt_ledger(ledger).unwrap();
+        assert!(
+            slot.reserve(key, "session", page.client.clone()).is_err(),
+            "None -> Some must not silently change the bound owner"
+        );
+        assert!(requests.lock().unwrap().is_empty());
+        page.client.close().await;
+        other.client.close().await;
+        server.await.unwrap();
+        server2.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn residual_drop_keeps_exact_coordinates_and_refuses_next_read() {
+        let (page, operation, _sender, server, requests) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
+        journal
+            .reserve_source_group("session".into(), "owned-mask".into())
+            .unwrap();
+        journal
+            .bind_source_holder("session", "owned-mask", "holder".into())
+            .unwrap();
+        journal.raw_capture_started().unwrap();
+        let exact = journal.record.clone();
+        drop(journal);
+        let slot = &page.targets.protected_read_residual;
+        let retained = slot.snapshot_for_test().unwrap();
+        assert!(Arc::ptr_eq(&exact, &retained));
+        assert!(slot.replacement_safe().is_err());
+        let data = retained.data.lock().unwrap();
+        assert_eq!(data.masks[0].session, "session");
+        assert_eq!(data.masks[0].holder.as_deref(), Some("holder"));
+        assert_eq!(data.masks[0].group, "owned-mask");
+        assert_eq!(data.rates[0].original, 1.0);
+        assert!(!data.rates[0].acknowledged);
+        assert_eq!(data.raw, super::RawState::Pending);
+        drop(data);
+        let before = requests.lock().unwrap().len();
+        assert!(super::ProtectedReadJournal::begin(&page, &operation).is_err());
+        tokio::task::yield_now().await;
+        assert_eq!(
+            requests.lock().unwrap().len(),
+            before,
+            "residual must not retry or mutate"
+        );
+        assert!(Arc::ptr_eq(&exact, &slot.snapshot_for_test().unwrap()));
+        // Test harness teardown only AFTER verifying retained custody/no retries.
+        page.client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn residual_partial_failure_preserves_acknowledged_and_unresolved_steps() {
+        let (page, operation, _sender, server, _requests) = journal_fixture(false, false).await;
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
+        journal
+            .reserve_source_group("session".into(), "remaining-group".into())
+            .unwrap();
+        journal
+            .bind_source_holder("session", "remaining-group", "fail-remove".into())
+            .unwrap();
+        assert!(journal.restore().await.is_err());
+        drop(journal);
+        let retained = page
+            .targets
+            .protected_read_residual
+            .snapshot_for_test()
+            .unwrap();
+        let data = retained.data.lock().unwrap();
+        assert_eq!(data.masks[0].step, super::MaskStep::InstalledOrUnknown);
+        assert_eq!(data.masks[0].holder.as_deref(), Some("fail-remove"));
+        assert!(
+            data.rates[0].acknowledged,
+            "successful restore ACK must not be forgotten"
+        );
+        drop(data);
+        assert!(page
+            .targets
+            .protected_read_residual
+            .replacement_safe()
+            .is_err());
+        page.client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn residual_empty_drop_and_complete_restore_release_only_exact_slot() {
+        let (page, operation, _sender, server, _requests) = journal_fixture(false, false).await;
+        drop(super::ProtectedReadJournal::begin(&page, &operation).unwrap());
+        assert!(page
+            .targets
+            .protected_read_residual
+            .snapshot_for_test()
+            .is_none());
+        let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+        journal.stabilize_animations().await.unwrap();
+        journal.restore().await.unwrap();
+        drop(journal);
+        assert!(page
+            .targets
+            .protected_read_residual
+            .snapshot_for_test()
+            .is_none());
+        assert!(page
+            .targets
+            .protected_read_residual
+            .replacement_safe()
+            .is_ok());
+        page.client.close().await;
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn supersession_never_cancels_owned_source_or_animation_restore() {
         use super::super::client_observation::{with_capture_retirement, CaptureRetirement};
@@ -595,7 +954,18 @@ mod tests {
         assert!(failure.cleanup_integrity_lost);
         assert!(!journal.restored);
         assert_eq!(
-            journal.source_masks,
+            journal
+                .records()
+                .unwrap()
+                .masks
+                .iter()
+                .filter(|mask| mask.step != super::MaskStep::GroupReleased)
+                .map(|mask| (
+                    mask.session.clone(),
+                    mask.holder.clone(),
+                    mask.group.clone()
+                ))
+                .collect::<Vec<_>>(),
             vec![(
                 "session".into(),
                 Some("fail-remove".into()),

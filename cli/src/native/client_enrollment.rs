@@ -4623,6 +4623,28 @@ impl ClientEnrollment {
             }
         }
     }
+    /// Called on this exact enrollment, never on a detached cleanup boolean.
+    pub(crate) fn retire_protected_read_after_destroy(
+        &self,
+        slot: &super::client_protected_read_residual::ProtectedReadResidualSlot,
+    ) -> Result<(), ProtocolError> {
+        if !std::ptr::eq(self.targets.protected_read_residual.as_ref(), slot) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if !matches!(&self.ownership, ScopeOwnership::IsolatedContext)
+            || !self.cleanup_outcome()?.isolated_context_disposed
+        {
+            return Ok(());
+        }
+        let ledger = self
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::CleanupFailed)?;
+        if !ledger.matches_owner(self.generation, &self.targets.identity_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        slot.record_exact_context_destroyed(&self.client, &ledger, &self.targets.context_id)
+    }
     pub fn cleanup_outcome(&self) -> Result<CleanupOutcome, ProtocolError> {
         Ok(self
             .cleanup
@@ -6272,6 +6294,21 @@ mod tests {
         Arc<ClientSession>,
         Arc<CdpClient>,
     ) {
+        fixture_with_explicit_context_ownership(mode, managed, false).await
+    }
+    async fn fixture_with_explicit_context_ownership(
+        mode: &'static str,
+        managed: bool,
+        owns_context: bool,
+    ) -> (
+        Arc<ClientEnrollment>,
+        Notices,
+        Log,
+        tokio::sync::mpsc::Sender<Value>,
+        JoinHandle<()>,
+        Arc<ClientSession>,
+        Arc<CdpClient>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let log: Log = Arc::default();
@@ -6334,6 +6371,11 @@ mod tests {
                         if matches!(mode,"observer-close"|"observer-unknown-error"|"observer-detached-live") && method=="Page.enable" && request["sessionId"]=="observer" {
                             if mode!="observer-unknown-error" { socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"observer","targetId":"other-host"}}).to_string())).await.unwrap(); }
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"target closed"}}).to_string())).await.unwrap();continue;
+                        }
+                        if mode=="residual-dispose-held" && method=="Target.disposeBrowserContext" { continue; }
+                        if (mode=="residual-dispose-rejected" && method=="Target.disposeBrowserContext")
+                            || (mode=="residual-release-rejected" && method=="Target.setAutoAttach" && request["params"]["autoAttach"]==false) {
+                            socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic residual lifecycle refusal"}}).to_string())).await.unwrap(); continue;
                         }
                         if mode=="delayed-dispose" && method=="Target.disposeBrowserContext" {tokio::time::sleep(Duration::from_millis(40)).await;}
                         if mode=="popup-held-dispose" {
@@ -6447,7 +6489,7 @@ mod tests {
             let ledger = super::super::client_debt::OwnerDebtLedger::unpublished(
                 &operation,
                 "owned-scope".into(),
-                false,
+                owns_context,
             )
             .unwrap();
             ledger.bind_context("owned-context").unwrap();
@@ -6589,6 +6631,116 @@ mod tests {
         let page = owner.lease(&entry).unwrap();
         (owner, page, notices, emit, server)
     }
+    async fn residual_disposal_case(mode: &'static str) {
+        use super::super::client_protected_read_residual::{
+            MaskRecord, MaskStep, RateRecord, RawState,
+        };
+        let (mut owner, _notices, log, _emit, server, _broker, connection) =
+            fixture_with_explicit_context_ownership(mode, true, true).await;
+        owner
+            .targets
+            .protected_read_residual
+            .replacement_safe()
+            .unwrap();
+        Arc::get_mut(&mut owner).unwrap().targets =
+            ClientTargets::new_managed("owned-context".into(), "owned-scope".into());
+        let slot = &owner.targets.protected_read_residual;
+        let record = slot
+            .reserve(
+                super::super::client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "initial",
+                owner.client.clone(),
+            )
+            .unwrap();
+        {
+            // Unit-level inert custody setup, not a simulated screenshot ACK.
+            let mut data = record.data.lock().unwrap();
+            data.masks.push(MaskRecord {
+                session: "initial".into(),
+                holder: Some("mask-holder".into()),
+                group: "mask-group".into(),
+                step: MaskStep::InstalledOrUnknown,
+            });
+            data.rates.push(RateRecord {
+                session: "initial".into(),
+                original: 1.0,
+                acknowledged: false,
+            });
+            data.raw = RawState::Pending;
+        }
+        record.leave_residual();
+        assert!(slot.replacement_safe().is_err());
+        owner.retire_protected_read_after_destroy(slot).unwrap();
+        assert!(
+            slot.replacement_safe().is_err(),
+            "pre-ACK outcome cannot terminate records"
+        );
+        owner.seal();
+        owner.drain().await.unwrap();
+        let containment = owner.contain_owned_resources().await;
+        assert!(log.lock().unwrap().iter().any(|request| request["method"]
+            == "Target.disposeBrowserContext"
+            && request["params"]["browserContextId"] == "owned-context"));
+        if matches!(mode, "residual-dispose-rejected" | "residual-dispose-held") {
+            assert!(containment.is_err());
+            assert!(!owner.cleanup_outcome().unwrap().isolated_context_disposed);
+            owner.retire_protected_read_after_destroy(slot).unwrap();
+            assert!(slot.replacement_safe().is_err());
+            assert!(Arc::ptr_eq(&record, &slot.snapshot_for_test().unwrap()));
+        } else {
+            let proof = containment.expect("exact owned context should be disposed");
+            let ledger = owner.client.debt_ledger().unwrap();
+            assert!(slot
+                .record_exact_context_destroyed(&owner.client, &ledger, "wrong-context")
+                .is_err());
+            assert!(slot.replacement_safe().is_err());
+            if mode == "residual-release-rejected" {
+                assert!(owner.release_after_containment(proof).await.is_err());
+                assert!(log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["method"] == "Target.setAutoAttach"
+                        && request["params"]["autoAttach"] == false));
+            }
+            owner.retire_protected_read_after_destroy(slot).unwrap();
+            assert!(slot.replacement_safe().is_ok());
+            let data = record.data.lock().unwrap();
+            assert_eq!(
+                data.raw,
+                RawState::Pending,
+                "destruction is not a screenshot terminal ACK"
+            );
+            assert!(
+                !data.rates[0].acknowledged,
+                "Destroyed must not become restored"
+            );
+        }
+        // External fixture teardown, never evidence of native cleanup success.
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+    }
+    #[tokio::test]
+    async fn protected_residual_owned_disposal_requires_exact_ack_and_context() {
+        residual_disposal_case("normal").await;
+    }
+    #[tokio::test]
+    async fn protected_residual_rejected_disposal_keeps_custody() {
+        residual_disposal_case("residual-dispose-rejected").await;
+    }
+    #[tokio::test]
+    async fn protected_residual_missing_disposal_ack_keeps_custody() {
+        residual_disposal_case("residual-dispose-held").await;
+    }
+    #[tokio::test]
+    async fn protected_residual_destroyed_remains_distinct_from_later_release_failure() {
+        residual_disposal_case("residual-release-rejected").await;
+    }
+
     #[tokio::test]
     async fn eval_stamp_uses_native_loader_and_same_identity_refresh_does_not_revoke() {
         let (owner, page, _notices, _emit, server) = realm_test_owner().await;

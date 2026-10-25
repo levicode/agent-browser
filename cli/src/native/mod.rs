@@ -110,3 +110,6 @@ pub(crate) mod client_settlement_trace;
 
 #[allow(dead_code)]
 pub mod client_restart;
+
+#[allow(dead_code)]
+pub(crate) mod client_protected_read_residual;

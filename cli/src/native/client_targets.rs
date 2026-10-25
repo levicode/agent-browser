@@ -285,6 +285,8 @@ impl Registry {
     }
 }
 pub struct ClientTargets {
+    pub(crate) protected_read_residual:
+        Arc<super::client_protected_read_residual::ProtectedReadResidualSlot>,
     pub context_id: String,
     pub identity_scope: String,
     state: Mutex<Registry>,
@@ -539,7 +541,32 @@ impl Drop for ResumePermit {
 }
 impl ClientTargets {
     pub fn new(context_id: String, identity_scope: String) -> Arc<Self> {
+        Self::with_protected_read_mode(
+            context_id,
+            identity_scope,
+            super::client_protected_read_residual::BindingMode::LegacyRecordOnly,
+        )
+    }
+    pub(crate) fn new_managed(context_id: String, identity_scope: String) -> Arc<Self> {
+        Self::with_protected_read_mode(
+            context_id,
+            identity_scope,
+            super::client_protected_read_residual::BindingMode::Managed,
+        )
+    }
+    fn with_protected_read_mode(
+        context_id: String,
+        identity_scope: String,
+        mode: super::client_protected_read_residual::BindingMode,
+    ) -> Arc<Self> {
         Arc::new(Self {
+            protected_read_residual: Arc::new(
+                super::client_protected_read_residual::ProtectedReadResidualSlot::new(
+                    mode,
+                    context_id.clone(),
+                    identity_scope.clone(),
+                ),
+            ),
             context_id,
             identity_scope,
             state: Mutex::new(Registry::default()),

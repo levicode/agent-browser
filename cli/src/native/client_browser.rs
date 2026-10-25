@@ -786,7 +786,10 @@ impl OwnedBrowser {
             context_id: String::new(),
             identity_scope: String::new(),
             owns_context: true,
-            targets: super::client_targets::ClientTargets::new(String::new(), String::new()),
+            targets: super::client_targets::ClientTargets::new_managed(
+                String::new(),
+                String::new(),
+            ),
             page_state: Arc::new(super::client_page::ClientPageState::new(
                 String::new(),
                 String::new(),
@@ -812,6 +815,7 @@ impl OwnedBrowser {
         &mut self,
         operation: &super::client_session::OperationLease,
     ) -> Result<ReplacementLease, ProtocolError> {
+        self.targets.protected_read_residual.replacement_safe()?;
         let lease = ReplacementLease::begin(&mut self.manager, operation)?;
         self.identity_scope = lease.identity_scope.clone();
         self.context_id.clear();
@@ -832,7 +836,8 @@ impl OwnedBrowser {
             return Err(ProtocolError::InvalidFrame);
         }
         check_lifecycle_budget(operation)?;
-        self.targets = super::client_targets::ClientTargets::new(
+        self.targets.protected_read_residual.replacement_safe()?;
+        self.targets = super::client_targets::ClientTargets::new_managed(
             self.context_id.clone(),
             self.identity_scope.clone(),
         );
@@ -869,7 +874,7 @@ impl OwnedBrowser {
             .map_err(|_| ProtocolError::BrowserFailure)?;
         let identity_scope = uuid::Uuid::new_v4().to_string();
         let mut resource = Self {
-            targets: super::client_targets::ClientTargets::new(
+            targets: super::client_targets::ClientTargets::new_managed(
                 String::new(),
                 identity_scope.clone(),
             ),
@@ -896,7 +901,11 @@ impl OwnedBrowser {
                 resource.context_id = prepared.context_id;
                 resource.borrowed_targets = Some(vec![prepared.target_id]);
                 resource.persistent_probe = prepared.probe;
-                resource.targets = super::client_targets::ClientTargets::new(
+                resource
+                    .targets
+                    .protected_read_residual
+                    .replacement_safe()?;
+                resource.targets = super::client_targets::ClientTargets::new_managed(
                     resource.context_id.clone(),
                     resource.identity_scope.clone(),
                 );
@@ -967,8 +976,10 @@ impl OwnedBrowser {
             });
         }
         let identity_scope = uuid::Uuid::new_v4().to_string();
-        let targets =
-            super::client_targets::ClientTargets::new(context_id.clone(), identity_scope.clone());
+        let targets = super::client_targets::ClientTargets::new_managed(
+            context_id.clone(),
+            identity_scope.clone(),
+        );
         let initialized = async {
             let target_id = manager
                 .active_target_id()
@@ -1036,6 +1047,7 @@ impl OwnedBrowser {
     ) -> Result<ReplacementLease, ProtocolError> {
         // Caller has a complete old-context cleanup proof. Keep this object in
         // the lifecycle owner journal while the new context identity is unknown.
+        self.targets.protected_read_residual.replacement_safe()?;
         let ids = self
             .manager
             .pages_list()
@@ -1058,6 +1070,7 @@ impl OwnedBrowser {
         blobs: Arc<super::client_blobs::BlobStore>,
         request: RuntimeInitialization<'_>,
     ) -> Result<LifecycleInitialization, ProtocolError> {
+        self.targets.protected_read_residual.replacement_safe()?;
         let RuntimeInitialization {
             operation,
             retirement,
@@ -1102,7 +1115,8 @@ impl OwnedBrowser {
         }
         // The primitive blank-page constructor's provisional registry has never
         // been published. Enrollment alone now proves the complete inventory.
-        self.targets = super::client_targets::ClientTargets::new(
+        self.targets.protected_read_residual.replacement_safe()?;
+        self.targets = super::client_targets::ClientTargets::new_managed(
             self.context_id.clone(),
             self.identity_scope.clone(),
         );
@@ -1395,6 +1409,9 @@ impl OwnedBrowser {
     /// has drained operations and callback resources before entering this path.
     async fn dispose_context(&mut self) -> Result<(), ProtocolError> {
         if !self.owns_context {
+            self.targets.protected_read_residual.replacement_safe()?;
+        }
+        if !self.owns_context {
             // Ordinary borrowed scope end owns only our sessions and transport.
             // It never acquires context/page destruction authority.
             return self.close().await;
@@ -1408,7 +1425,12 @@ impl OwnedBrowser {
             .collect();
         if let Some(runtime) = &self.runtime {
             self.ui.seal();
-            runtime.contain_and_release().await?;
+            let contained = runtime.contain_and_release().await;
+            runtime
+                .enrollment
+                .retire_protected_read_after_destroy(&self.targets.protected_read_residual)?;
+            contained?;
+            self.targets.protected_read_residual.replacement_safe()?;
             self.manager.forget_disposed_targets(&ids);
             return if retained_cleanup_failed {
                 Err(ProtocolError::CleanupFailed)
@@ -1430,6 +1452,9 @@ impl OwnedBrowser {
             .map_err(|_| ProtocolError::CleanupFailed)?;
         if let Some(ledger) = debt {
             ledger.retire_after_context_destroy(&self.context_id)?;
+            self.targets
+                .protected_read_residual
+                .record_exact_context_destroyed(&self.manager.client, &ledger, &self.context_id)?;
         }
         self.manager.forget_disposed_targets(&ids);
         if retained_cleanup_failed {
@@ -1442,6 +1467,9 @@ impl OwnedBrowser {
     /// Caller seals and drains its gate first. A failed dispose is never
     /// rewritten as successful cleanup merely because the connection closes.
     pub async fn close(&mut self) -> Result<(), ProtocolError> {
+        if !self.owns_context {
+            self.targets.protected_read_residual.replacement_safe()?;
+        }
         let retained_cleanup_failed = self.cleanup_replacement_actions().await.is_err();
         if let Some(runtime) = &self.runtime {
             self.ui.seal();
@@ -1453,6 +1481,12 @@ impl OwnedBrowser {
                 } else {
                     runtime.contain_and_release().await
                 };
+            if self.owns_context {
+                runtime
+                    .enrollment
+                    .retire_protected_read_after_destroy(&self.targets.protected_read_residual)?;
+            }
+            self.targets.protected_read_residual.replacement_safe()?;
             let probe = self.persistent_probe.cleanup(&self.manager.client).await;
             let closed = self.manager.close().await;
             return if contained.is_ok()
@@ -1489,6 +1523,7 @@ impl OwnedBrowser {
             // still carries disposal plus phase-two ACK proof. Do not attempt
             // ordinary disposal through its permanently retired application gate.
             // A new/unknown acquisition cannot satisfy replacement_ready().
+            self.targets.protected_read_residual.replacement_safe()?;
             let closed = self.manager.close().await;
             return if closed.is_ok() && !retained_cleanup_failed {
                 Ok(())
@@ -1502,6 +1537,7 @@ impl OwnedBrowser {
             }
         }
         if self.context_id.is_empty() {
+            self.targets.protected_read_residual.replacement_safe()?;
             // An unknown acquisition is not clean merely because the socket
             // closes. Keep the failed lifecycle resource journaled upstream.
             self.manager
@@ -1520,11 +1556,24 @@ impl OwnedBrowser {
             )
             .await;
         let debt_retired = if disposed.is_ok() {
-            debt.map(|ledger| ledger.retire_after_context_destroy(&self.context_id))
+            debt.as_ref()
+                .map(|ledger| ledger.retire_after_context_destroy(&self.context_id))
                 .transpose()
         } else {
             Ok(None)
         };
+        if disposed.is_ok() && debt_retired.is_ok() {
+            if let Some(ledger) = &debt {
+                self.targets
+                    .protected_read_residual
+                    .record_exact_context_destroyed(
+                        &self.manager.client,
+                        ledger,
+                        &self.context_id,
+                    )?;
+            }
+        }
+        self.targets.protected_read_residual.replacement_safe()?;
         let closed = self.manager.close().await;
         if disposed.is_err() || closed.is_err() || retained_cleanup_failed || debt_retired.is_err()
         {
@@ -4232,12 +4281,15 @@ impl ClientBrowser {
                 let page_config = resource.page_state.snapshot_config(&scope)?;
                 let was_recording = actions.is_recording_armed().await?;
                 resource.ui.seal();
-                resource
+                let runtime = resource
                     .runtime
                     .as_ref()
-                    .ok_or(ProtocolError::ScopeUnavailable)?
-                    .contain_and_release_mode(true)
-                    .await?;
+                    .ok_or(ProtocolError::ScopeUnavailable)?;
+                let contained = runtime.contain_and_release_mode(true).await;
+                runtime.enrollment.retire_protected_read_after_destroy(
+                    &resource.targets.protected_read_residual,
+                )?;
+                contained?;
                 refs.lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
                     .retire_owner_references();
@@ -4633,6 +4685,11 @@ impl ClientBrowser {
                 }
                 let page_config = resource.page_state.snapshot_config(&scope)?;
                 let recording = actions.is_recording_armed().await?;
+                // Residual borrowed coordinates must survive old-session release.
+                resource
+                    .targets
+                    .protected_read_residual
+                    .replacement_safe()?;
                 resource.ui.seal();
                 let runtime = resource
                     .runtime
@@ -4679,13 +4736,22 @@ impl ClientBrowser {
                 check_lifecycle_budget(&operation)?;
                 let verified = candidate.take().ok_or(ProtocolError::ScopeUnavailable)?;
                 let (manager, context_id, target_id, proof) = verified.into_parts();
+                // Never orphan an earlier owner-local cleanup record.
+                resource
+                    .targets
+                    .protected_read_residual
+                    .replacement_safe()?;
                 // Journal the new transport before any initialization await.
                 resource.manager = manager;
                 resource.context_id = context_id;
                 resource.identity_scope = identity_scope;
                 resource.borrowed_targets = Some(vec![target_id]);
                 resource.reconnect_proof = Some(proof);
-                resource.targets = super::client_targets::ClientTargets::new(
+                resource
+                    .targets
+                    .protected_read_residual
+                    .replacement_safe()?;
+                resource.targets = super::client_targets::ClientTargets::new_managed(
                     resource.context_id.clone(),
                     resource.identity_scope.clone(),
                 );
