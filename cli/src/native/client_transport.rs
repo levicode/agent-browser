@@ -37,6 +37,12 @@ pub trait ClientExecutor: Send + Sync + 'static {
     }
     /// Short-lock cancellation hook fixes the native retirement deadline before
     /// the cleanup grace. It never drops or aborts the retained producer.
+    fn disconnected_recovery_candidate(
+        &self,
+        _key: super::client_debt::OperationKey,
+    ) -> Option<super::client_operation_state::DisconnectedRecoveryProof> {
+        None
+    }
     fn cancel_operation_producer(&self, _key: super::client_debt::OperationKey) {}
     fn fix_operation_result(&self, _key: super::client_debt::OperationKey) {}
     /// Independent publication retirement. The broker barrier is already set;
@@ -97,6 +103,7 @@ struct ScopeEmissionGate {
 struct EventBarrier {
     key: (u64, u64),
     identity_scope: String,
+    recovery_owner: Option<std::sync::Arc<super::client_debt::OwnerDebtLedger>>,
     scope_gate: std::sync::Arc<ScopeEmissionGate>,
     deadline: std::time::Instant,
     state: std::sync::Mutex<EventBarrierState>,
@@ -153,7 +160,16 @@ impl ClientEventSink {
         operation: &OperationLease,
         identity_scope: &str,
     ) -> Result<Self, ProtocolError> {
-        self.check_open()?;
+        let recovery_owner = self
+            .broker
+            .staged_recovery_owner(operation, identity_scope)?;
+        if recovery_owner.is_some() {
+            if !self.open.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+        } else {
+            self.check_open()?;
+        }
         if identity_scope.is_empty()
             || identity_scope.len() > 256
             || identity_scope.chars().any(char::is_control)
@@ -212,6 +228,7 @@ impl ClientEventSink {
         let barrier = std::sync::Arc::new(EventBarrier {
             key,
             identity_scope: identity_scope.into(),
+            recovery_owner,
             scope_gate,
             deadline: operation.deadline,
             state: std::sync::Mutex::new(EventBarrierState::Holding(Vec::new())),
@@ -321,6 +338,23 @@ impl ClientEventSink {
             return Err(ProtocolError::ScopeUnavailable);
         }
         let (generation, health) = self.broker.health()?;
+        if let Some(barrier) = &self.barrier {
+            if barrier
+                .scope_gate
+                .closed
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            if barrier.recovery_owner.is_some() {
+                self.broker.check_scoped_owner(
+                    generation,
+                    &barrier.identity_scope,
+                    barrier.recovery_owner.as_ref(),
+                )?;
+                return Ok(generation);
+            }
+        }
         if health != ScopeState::Usable {
             return Err(ProtocolError::ScopeUnavailable);
         }
@@ -341,6 +375,53 @@ impl ClientEventSink {
         self.sender
             .try_send(message)
             .map_err(|_| ProtocolError::CapacityExceeded)
+    }
+    /// Exact native reader EOF notice. False means not queued because the old
+    /// scope is already quarantined; it never means peer delivery or recovery.
+    /// Unlike ordinary publication this path cannot re-quarantine a replacement
+    /// while an old watcher is finishing. Lifecycle still joins that watcher.
+    pub(crate) fn emit_disconnected(
+        &self,
+        client: &std::sync::Arc<super::cdp::client::CdpClient>,
+        targets: &std::sync::Arc<super::client_targets::ClientTargets>,
+    ) -> Result<bool, ProtocolError> {
+        let debt = client.debt_ledger().ok_or(ProtocolError::StaleScope)?;
+        if !*client.remote_connection_closed().borrow() {
+            return Err(ProtocolError::StaleScope);
+        }
+        targets.require_eval_owner(&debt)?;
+        client.check_cleanup_owner(&Some(debt.clone()))?;
+        let result = {
+            let mut order = self
+                .sequence
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            let (generation, health) = self.broker.health()?;
+            if !debt.matches_owner(generation, &targets.identity_scope) {
+                return Err(ProtocolError::StaleScope);
+            }
+            if health == ScopeState::Quarantined {
+                return Ok(false);
+            }
+            if health != ScopeState::Usable || !self.open.load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            self.enqueue_event(
+                &mut order,
+                ServerMessage::Event {
+                    generation,
+                    sequence: 0,
+                    event: "browser.disconnected".into(),
+                    payload: serde_json::json!({"reason":"browser-connection-closed"}),
+                    decision: None,
+                },
+            )
+        };
+        if result.is_err() {
+            let _ = self.broker.quarantine();
+        }
+        result.map(|()| true)
     }
     pub fn emit(
         &self,
@@ -1015,6 +1096,12 @@ where
         && capabilities
             .iter()
             .any(|capability| capability == EXACT_OWNER_CONTINUATION);
+    let recovery_negotiated = required_capabilities
+        .iter()
+        .any(|capability| capability == DISCONNECTED_RECOVERY)
+        && capabilities
+            .iter()
+            .any(|capability| capability == DISCONNECTED_RECOVERY);
     let supported: Vec<_> = capabilities.iter().map(String::as_str).collect();
     let validation = validate_hello(&protocol, &required_capabilities, &supported)
         .and_then(|()| executor.set_event_sink(sink.clone()));
@@ -1045,7 +1132,7 @@ where
         sink_open.store(true, std::sync::atomic::Ordering::Release);
     }
     let mut operations = tokio::task::JoinSet::<(u64, NativeOutcome)>::new();
-    let mut pending = std::collections::HashMap::<u64, (String, u64)>::new();
+    let mut pending = std::collections::HashMap::<u64, (String, u64, bool)>::new();
     let mut closing_id = None;
     let mut terminal_control = false;
     // Retained across both phases: cancelling a read must not discard its prefix.
@@ -1064,17 +1151,24 @@ where
                 _ = timer.tick() => {
                     let _ = broker.expire_decisions();
                     if sink.expire_publications().is_err() { settlement_trace!(0, PublicationExpired); let _ = broker.quarantine(); break; }
-                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) {
+                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) && !broker.recovery_available() {
                         if terminal_close_negotiated && !operations.is_empty() { continue; }
+                        // Expired/consumed recovery keeps only negotiated terminal cleanup.
+                        terminal_control = terminal_close_negotiated && recovery_negotiated;
                         settlement_trace!(0, HealthFailed); break;
                     }
+                    // Keep ordinary notifications owned until the replacement
+                    // is usable. Do not drain then lose them during recovery.
+                    if broker.recovery_available() { continue; }
                     for (version,identity_scope) in broker.take_released_registry_events(16).unwrap_or_default() {
                         let mut payload=serde_json::json!({ "registryVersion": version });
                         if let Some(scope)=identity_scope { payload["identityScope"]=serde_json::json!(scope); }
                         if sink.emit("registry-released".into(), payload, None).is_err() { break; }
                     }
-                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) {
+                    if !broker.health().is_ok_and(|(_, state)| state == ScopeState::Usable) && !broker.recovery_available() {
                         if terminal_close_negotiated && !operations.is_empty() { continue; }
+                        // Expired/consumed recovery keeps only negotiated terminal cleanup.
+                        terminal_control = terminal_close_negotiated && recovery_negotiated;
                         settlement_trace!(0, HealthFailed); break;
                     }
                     continue;
@@ -1082,14 +1176,24 @@ where
                 completion = operations.join_next(), if !operations.is_empty() => {
                     let Some(Ok((sequence, outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
                     settlement_trace!(sequence, CompletionJoined);
-                    let Some((id, generation)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
+                    let Some((id, generation, callback)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
                     let state = broker.settle_with_retention(generation, sequence, outcome.effects,
                         if continuation_negotiated { outcome.retention.as_ref() } else { None }).unwrap_or(ScopeState::Quarantined);
                     executor.fix_operation_result(super::client_debt::OperationKey { generation, operation_seq: sequence });
                     let unknown = outcome.effects == Effects::Unknown;
-                    if !enqueue(&sender, result_message(id, generation, sequence, outcome, state), &broker) { settlement_trace!(sequence, ResultQueueFailed); break; }
+                    let recovery = if recovery_negotiated && !callback && unknown && state == ScopeState::Quarantined {
+                        executor.disconnected_recovery_candidate(super::client_debt::OperationKey { generation, operation_seq: sequence })
+                            .and_then(|proof| {
+                                let descriptor = RecoveryDescriptor { version: 1, identity_scope: proof.ledger().identity_scope().to_owned() };
+                                broker.offer_disconnected_recovery(proof).ok().map(|()| descriptor)
+                            })
+                    } else { None };
+                    let recoverable = recovery.is_some();
+                    let mut message = result_message(id, generation, sequence, outcome, state);
+                    if let ServerMessage::Result { recovery: field, .. } = &mut message { *field = recovery; }
+                    if !enqueue(&sender, message, &broker) { settlement_trace!(sequence, ResultQueueFailed); break; }
                     settlement_trace!(sequence, ResultQueued);
-                    if (unknown && state != ScopeState::Usable) || state == ScopeState::Quarantined {
+                    if !recoverable && ((unknown && state != ScopeState::Usable) || state == ScopeState::Quarantined) {
                         terminal_control = terminal_close_negotiated;
                         settlement_trace!(sequence, UnknownOutcome); break;
                     }
@@ -1181,14 +1285,33 @@ where
                     command,
                     args,
                 } => {
-                    match broker.admit_callback(
-                        generation,
-                        operation_seq,
-                        timeout_ms,
-                        callback_token.as_deref(),
-                    ) {
+                    let admitted = if recovery_negotiated
+                        && command == "scope.reconnect"
+                        && callback_token.is_none()
+                        && broker
+                            .health()
+                            .is_ok_and(|(_, state)| state == ScopeState::Quarantined)
+                    {
+                        broker.admit_disconnected_reconnect(
+                            generation,
+                            operation_seq,
+                            timeout_ms,
+                            args.get("identityScope")
+                                .and_then(serde_json::Value::as_str)
+                                .unwrap_or_default(),
+                        )
+                    } else {
+                        broker.admit_callback(
+                            generation,
+                            operation_seq,
+                            timeout_ms,
+                            callback_token.as_deref(),
+                        )
+                    };
+                    match admitted {
                         Ok(lease) => {
-                            pending.insert(operation_seq, (id, generation));
+                            pending
+                                .insert(operation_seq, (id, generation, callback_token.is_some()));
                             let executor = executor.clone();
                             let broker = broker.clone();
                             operations.spawn(async move {
@@ -1228,7 +1351,7 @@ where
                             ) {
                                 break;
                             }
-                            if state == ScopeState::Quarantined {
+                            if state == ScopeState::Quarantined && !broker.recovery_available() {
                                 terminal_control = terminal_close_negotiated;
                                 break;
                             }
@@ -1427,7 +1550,7 @@ where
     } else {
         settlement_trace!(0, ShutdownUnproven);
     }
-    for (sequence, (id, generation)) in pending {
+    for (sequence, (id, generation, _callback)) in pending {
         let effects = if broker.has_started(sequence) {
             Effects::Unknown
         } else {
@@ -1523,6 +1646,7 @@ fn result_message(
         generation,
         operation_seq,
         retention,
+        recovery: None,
         ok,
         data,
         error,
@@ -1677,6 +1801,7 @@ fn respond<E: ClientExecutor>(
             };
             (
                 ServerMessage::Result {
+                    recovery: None,
                     retention: None,
                     id,
                     generation,

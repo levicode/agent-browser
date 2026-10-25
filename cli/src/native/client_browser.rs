@@ -2088,16 +2088,18 @@ impl ClientBrowser {
                             if watch_slot.is_none() {
                                 {
                                     let sink = event_sink;
-                                    let mut lost =
-                                        resource.manager.client.remote_connection_closed();
+                                    let watched_client = resource.manager.client.clone();
+                                    let watched_targets = resource.targets.clone();
+                                    let mut lost = watched_client.remote_connection_closed();
                                     *watch_slot = Some(tokio::spawn(async move {
                                         loop {
                                             if *lost.borrow() {
-                                                return sink.emit(
-                                                    "browser.disconnected".into(),
-                                                    serde_json::json!({"reason":"browser-connection-closed"}),
-                                                    None,
-                                                );
+                                                return sink
+                                                    .emit_disconnected(
+                                                        &watched_client,
+                                                        &watched_targets,
+                                                    )
+                                                    .map(|_queued| ());
                                             }
                                             if lost.changed().await.is_err() {
                                                 return Ok(());
@@ -2178,7 +2180,7 @@ impl ClientBrowser {
         *slot = Some(tokio::spawn(async move {
             let _transition = transition;
             let result = async {
-                let task_cleanup = tasks.drain().await;
+                let task_cleanup = tasks.drain_current().await;
                 cleanup_trace::observe_cleanup(
                     &diagnostics,
                     CleanupPart::RetainedTaskFallback,
@@ -2277,6 +2279,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
     ) -> super::client_operation_state::OperationRetentionStatus {
         self.tasks.operation_retention_status(key)
     }
+    fn disconnected_recovery_candidate(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Option<super::client_operation_state::DisconnectedRecoveryProof> {
+        self.tasks.recovery_candidate(key)
+    }
     fn cancel_operation_producer(&self, key: super::client_debt::OperationKey) {
         self.tasks.cancel_operation_producer(key);
     }
@@ -2341,6 +2349,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         // acceptance evidence separately determines release readiness.
         let capabilities = [
             super::client_protocol::EXACT_OWNER_CONTINUATION,
+            super::client_protocol::DISCONNECTED_RECOVERY,
             "browser.scope/1",
             "browser.lifecycle/1",
             "browser.evaluate/1",
@@ -2559,7 +2568,21 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 }
             }
         };
-        if command != "scope.end" {
+        let recovery = if command == "scope.reconnect" {
+            match self.broker.disconnected_recovery(&lease) {
+                Ok(proof) => proof,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        if command != "scope.end" && recovery.is_none() {
             let admission = async {
                 self.broker.wait_application_publication(&lease).await?;
                 self.tasks.wait_application(&lease).await
@@ -2613,7 +2636,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     }
                 };
             return self
-                .reconnect_scope(captured_scope.unwrap_or_default(), request, lease)
+                .reconnect_scope(captured_scope.unwrap_or_default(), request, lease, recovery)
                 .await;
         }
         if command == "scope.restart" {
@@ -3781,7 +3804,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         let _lifecycle = self.lifecycle.lock().await;
         let drain_failed = self.gate.drained().await.is_err();
         self.tasks.seal().await;
-        let task_cleanup_failed = self.tasks.drain().await.is_err();
+        let task_cleanup_failed = self.tasks.drain_current().await.is_err();
         // Keep both journals in owner storage across cancellation or failed
         // final cleanup. A local take would drop unresolved retained resources.
         let mut owner = self.owner.lock().await;
@@ -4101,6 +4124,7 @@ impl ClientBrowser {
         let tasks = self.tasks.clone();
         let observation = self.observation.clone();
         let uncertain = self.startup_uncertain.clone();
+        let connection_watch = self.connection_watch.clone();
         let Some(sink) = self.event_sink.get().cloned() else {
             return NativeOutcome {
                 retention: None,
@@ -4179,12 +4203,24 @@ impl ClientBrowser {
                     .stop(false);
                 #[cfg(feature = "acceptance-faults")]
                 faults.retire_scope(&scope)?;
+                {
+                    let mut watch = connection_watch.lock().await;
+                    if let Some(old) = watch.as_mut() {
+                        old.abort();
+                        if let Err(error) = old.await {
+                            if !error.is_cancelled() {
+                                return Err(ProtocolError::CleanupFailed);
+                            }
+                        }
+                    }
+                    *watch = None;
+                }
                 gate.begin_transition()?;
                 // Owner mutex cannot remain held while admitted operations are
                 // finishing their captured ownership checks.
                 drop(journal);
                 gate.drained().await?;
-                tasks.drain().await?;
+                tasks.drain_current().await?;
                 let mut journal = owner.lock().await;
                 let resource = journal.as_mut().ok_or(ProtocolError::StaleScope)?;
                 if resource.identity_scope != scope {
@@ -4208,7 +4244,7 @@ impl ClientBrowser {
                     .initialize_runtime(
                         gate.clone(),
                         broker,
-                        sink,
+                        sink.clone(),
                         blobs.clone(),
                         RuntimeInitialization {
                             operation: &operation,
@@ -4360,6 +4396,22 @@ impl ClientBrowser {
                     .ok_or(ProtocolError::ScopeUnavailable)?
                     .page_active
                     .store(expose_page, std::sync::atomic::Ordering::SeqCst);
+                let watched_client = resource.manager.client.clone();
+                let watched_targets = resource.targets.clone();
+                let mut lost = watched_client.remote_connection_closed();
+                let watched_sink = sink.clone();
+                *connection_watch.lock().await = Some(tokio::spawn(async move {
+                    loop {
+                        if *lost.borrow() {
+                            return watched_sink
+                                .emit_disconnected(&watched_client, &watched_targets)
+                                .map(|_queued| ());
+                        }
+                        if lost.changed().await.is_err() {
+                            return Ok(());
+                        }
+                    }
+                }));
                 uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
                 Ok(serde_json::json!({"identityScope":resource.identity_scope}))
             }
@@ -4405,6 +4457,7 @@ impl ClientBrowser {
         scope: String,
         request: ReconnectRequest,
         operation: super::client_session::OperationLease,
+        recovery: Option<super::client_operation_state::DisconnectedRecoveryProof>,
     ) -> super::client_transport::NativeOutcome {
         use super::client_protocol::Effects;
         use super::client_transport::NativeOutcome;
@@ -4490,6 +4543,21 @@ impl ClientBrowser {
                     .ok_or(ProtocolError::ScopeUnavailable)?;
                 let terminal = runtime.enrollment.terminal_connection_proof()?;
                 terminal.check_client(&resource.manager.client)?;
+                if let Some(proof) = &recovery {
+                    proof.check()?;
+                    let debt = resource
+                        .manager
+                        .client
+                        .debt_ledger()
+                        .ok_or(ProtocolError::StaleScope)?;
+                    if !Arc::ptr_eq(&debt, proof.ledger())
+                        || !debt.matches_owner(operation.generation, &scope)
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    resource.targets.require_eval_owner(&debt)?;
+                    resource.page_state.check_no_active_local_input(&scope)?;
+                }
                 let retained = super::client_reconnect::RetainedIdentity::capture(
                     &resource.manager,
                     &resource.context_id,
@@ -4545,7 +4613,16 @@ impl ClientBrowser {
                 gate.begin_transition()?;
                 drop(journal);
                 gate.drained().await?;
-                tasks.drain().await?;
+                if let Some(proof) = &recovery {
+                    tokio::time::timeout_at(
+                        operation.deadline.into(),
+                        tasks.drain_disconnected(proof),
+                    )
+                    .await
+                    .map_err(|_| ProtocolError::DeadlineExceeded)??;
+                } else {
+                    tasks.drain_current().await?;
+                }
                 let mut journal = owner.lock().await;
                 let resource = journal.as_mut().ok_or(ProtocolError::StaleScope)?;
                 if resource.identity_scope != scope {
@@ -4566,6 +4643,27 @@ impl ClientBrowser {
                         .network
                         .take_disconnected_routes(&resource.targets, &operation)?,
                 );
+                // Stop the old root event producer before any new scoped
+                // authority exists. Abort never stands in for this actual join.
+                {
+                    let mut watch = connection_watch.lock().await;
+                    if let Some(old) = watch.as_mut() {
+                        old.abort();
+                        if let Err(error) = old.await {
+                            if !error.is_cancelled() {
+                                return Err(ProtocolError::CleanupFailed);
+                            }
+                        }
+                    }
+                    *watch = None;
+                }
+                if let Some(proof) = &recovery {
+                    let verified = candidate.as_ref().ok_or(ProtocolError::ScopeUnavailable)?;
+                    broker.bind_recovery_candidate(&operation, verified.proof())?;
+                    // This consumes positive local retirement while reader EOF
+                    // is still the sole cause, before our explicit socket close.
+                    tasks.retire_disconnected_owner(proof)?;
+                }
                 resource.runtime = None;
                 let recovery_observation_baseline =
                     observation.snapshot_with_observation(&operation).await?.2;
@@ -4592,7 +4690,7 @@ impl ClientBrowser {
                 let authority = resource
                     .initialize_runtime(
                         gate.clone(),
-                        broker,
+                        broker.clone(),
                         sink.clone(),
                         blobs.clone(),
                         RuntimeInitialization {
@@ -4694,21 +4792,29 @@ impl ClientBrowser {
                         Err(error) => return Err(error),
                     }
                 }
+                if recovery.is_some() {
+                    let debt = resource
+                        .manager
+                        .client
+                        .debt_ledger()
+                        .ok_or(ProtocolError::StaleScope)?;
+                    broker.publish_recovered_scope(&operation, &debt)?;
+                }
                 resource.reconnect_proof = None;
                 let mut watch = connection_watch.lock().await;
                 if let Some(old) = watch.as_mut() {
                     old.abort();
                     let _ = old.await;
                 }
-                let mut lost = resource.manager.client.remote_connection_closed();
+                let watched_client = resource.manager.client.clone();
+                let watched_targets = resource.targets.clone();
+                let mut lost = watched_client.remote_connection_closed();
                 *watch = Some(tokio::spawn(async move {
                     loop {
                         if *lost.borrow() {
-                            return sink.emit(
-                                "browser.disconnected".into(),
-                                serde_json::json!({"reason":"browser-connection-closed"}),
-                                None,
-                            );
+                            return sink
+                                .emit_disconnected(&watched_client, &watched_targets)
+                                .map(|_queued| ());
                         }
                         if lost.changed().await.is_err() {
                             return Ok(());

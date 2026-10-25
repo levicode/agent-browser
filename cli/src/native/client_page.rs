@@ -539,6 +539,21 @@ impl ClientPageState {
         }
         Ok(())
     }
+    /// Local held-state only, never proof that an unacknowledged remote
+    /// release completed. Recovery must not silently abandon a known drag/key.
+    pub(crate) fn check_no_active_local_input(&self, scope: &str) -> Result<(), ProtocolError> {
+        if scope != self.identity_scope {
+            return Err(ProtocolError::StaleScope);
+        }
+        let state = self.state()?;
+        if !state.input.keys.is_empty()
+            || state.input.mouse.buttons != 0
+            || state.input_cleanup.is_some()
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        Ok(())
+    }
     pub fn held_modifiers(&self) -> Result<i32, ProtocolError> {
         Ok(modifiers(&self.state()?.input))
     }
