@@ -218,6 +218,8 @@ pub(crate) struct Facts {
     pub inventory_unconfigured: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot_stage: Option<ScreenshotStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timing: Option<ScreenshotTiming>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "pass")]
     pub frame_pass: Option<FrameInventoryPass>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -968,7 +970,131 @@ pub(crate) enum InventoryAfterFailure {
     Unchanged,
     Changed,
 }
+// Temporary opt-in capture diagnosis. Fixed-size scalar state only, never authority.
+// Tuple: [budgetUs, writeCompleteUs, parsedReplyUs, interruptUs,
+//         restoreBeginUs, restoreEndUs, replyKind, incomplete].
+// Every time is monotonic microseconds after witness creation; values beyond
+// 60 seconds stay unknown, not clamped. Reply kinds: 0 absent, 1 success,
+// 2 exact error ACK, 3 invalid/session-mismatched envelope. No payload is copied.
+pub(crate) type ScreenshotTiming = (
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    Option<u64>,
+    u8,
+    bool,
+);
+const MAX_CAPTURE_TIME_US: u64 = 60_000_000;
+struct CaptureTimingState {
+    request: Option<u64>,
+    times: [Option<u64>; 5],
+    reply: u8,
+}
+pub(crate) struct CaptureTiming {
+    started: std::time::Instant,
+    budget: Option<u64>,
+    state: Mutex<CaptureTimingState>,
+    incomplete: AtomicBool,
+}
+tokio::task_local! {
+    static CAPTURE_TIMING: Arc<CaptureTiming>;
+}
+impl CaptureTiming {
+    pub(crate) fn new(deadline: std::time::Instant) -> Arc<Self> {
+        let started = std::time::Instant::now();
+        let budget = deadline
+            .checked_duration_since(started)
+            .and_then(Self::micros);
+        Arc::new(Self {
+            started,
+            budget,
+            state: Mutex::new(CaptureTimingState {
+                request: None,
+                times: [None; 5],
+                reply: 0,
+            }),
+            incomplete: AtomicBool::new(budget.is_none()),
+        })
+    }
+    fn micros(duration: std::time::Duration) -> Option<u64> {
+        u64::try_from(duration.as_micros())
+            .ok()
+            .filter(|value| *value <= MAX_CAPTURE_TIME_US)
+    }
+    pub(crate) fn current() -> Option<Arc<Self>> {
+        CAPTURE_TIMING.try_with(Arc::clone).ok()
+    }
+    pub(crate) async fn scope<F: std::future::Future>(self: &Arc<Self>, future: F) -> F::Output {
+        CAPTURE_TIMING.scope(self.clone(), future).await
+    }
+    pub(crate) fn bind(&self, id: u64) -> bool {
+        let Ok(mut state) = self.state.try_lock() else {
+            self.incomplete.store(true, Ordering::Relaxed);
+            return false;
+        };
+        if state.request.is_some() {
+            self.incomplete.store(true, Ordering::Relaxed);
+            return false;
+        }
+        state.request = Some(id);
+        true
+    }
+    fn mark(&self, index: usize, request: Option<(u64, u8)>) {
+        let at = Self::micros(self.started.elapsed());
+        let Ok(mut state) = self.state.try_lock() else {
+            self.incomplete.store(true, Ordering::Relaxed);
+            return;
+        };
+        if let Some((id, reply)) = request {
+            if state.request != Some(id) {
+                self.incomplete.store(true, Ordering::Relaxed);
+                return;
+            }
+            if index == 1 {
+                state.reply = reply;
+            }
+        }
+        if at.is_none() || state.times[index].is_some() {
+            self.incomplete.store(true, Ordering::Relaxed);
+        } else {
+            state.times[index] = at;
+        }
+    }
+    pub(crate) fn write_complete(&self, id: u64) {
+        self.mark(0, Some((id, 0)));
+    }
+    pub(crate) fn parsed_reply(&self, id: u64, kind: u8) {
+        self.mark(1, Some((id, kind)));
+    }
+    pub(crate) fn interrupted(&self) {
+        self.mark(2, None);
+    }
+    pub(crate) fn restore_begin(&self) {
+        self.mark(3, None);
+    }
+    pub(crate) fn restore_end(&self) {
+        self.mark(4, None);
+    }
+    pub(crate) fn snapshot(&self) -> ScreenshotTiming {
+        match self.state.try_lock() {
+            Ok(state) => (
+                self.budget,
+                state.times[0],
+                state.times[1],
+                state.times[2],
+                state.times[3],
+                state.times[4],
+                state.reply,
+                self.incomplete.load(Ordering::Relaxed),
+            ),
+            Err(_) => (self.budget, None, None, None, None, None, 0, true),
+        }
+    }
+}
 pub(crate) struct ScreenshotFailure {
+    pub timing: Option<ScreenshotTiming>,
     pub stage: ScreenshotStage,
     pub capture_phase: ScreenshotCapturePhase,
     pub inventory_after_failure: InventoryAfterFailure,
@@ -991,6 +1117,7 @@ fn screenshot_failure_into(
         Phase::ScreenshotFirstFailure,
         Facts {
             generation: Some(generation),
+            timing: failure.timing,
             screenshot_stage: Some(failure.stage),
             capture_phase: Some(failure.capture_phase),
             inventory_after_failure: Some(failure.inventory_after_failure),
