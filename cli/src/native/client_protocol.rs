@@ -325,6 +325,8 @@ pub const EXACT_OWNER_CONTINUATION: &str = "operation.continue-exact-owner/1";
 pub const DISCONNECTED_RECOVERY: &str = "scope.reconnect-quarantined/1";
 /// Opt-in create-only persistent page reopen with exact identity refresh events.
 pub const PERSISTENT_PAGE_REOPEN: &str = "browser.persistent-page-reopen/1";
+/// Terminal immutable recording bytes only; never browser operation admission.
+pub const TERMINAL_RECORDING_ARTIFACTS: &str = "terminal.recording-artifacts/1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryDescriptor {

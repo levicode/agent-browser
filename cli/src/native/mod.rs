@@ -53,6 +53,7 @@ pub mod client_state_dispatch;
 #[allow(dead_code)]
 pub mod client_targets;
 pub mod client_tasks;
+pub(crate) mod client_terminal_artifacts;
 pub mod client_transport;
 pub mod client_ui;
 #[allow(dead_code)]

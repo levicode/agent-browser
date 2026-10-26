@@ -674,3 +674,9 @@ mod observe_trace_timeout_tests;
 
 #[path = "client_browser_reopen_tests.rs"]
 mod persistent_page_reopen_tests;
+
+#[path = "client_browser_recording_start_receipt_tests.rs"]
+mod recording_start_receipt_tests;
+
+#[path = "client_browser_terminal_recording_tests.rs"]
+mod terminal_recording_tests;

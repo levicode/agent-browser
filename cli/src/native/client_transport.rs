@@ -28,6 +28,13 @@ pub struct NativeOutcome {
 }
 
 pub trait ClientExecutor: Send + Sync + 'static {
+    /// Move only previously frozen bytes; this hook never runs producers.
+    fn take_terminal_recording(
+        &self,
+        _key: super::client_debt::OperationKey,
+    ) -> Option<super::client_terminal_artifacts::FrozenRecordingBatch> {
+        None
+    }
     fn capabilities(&self) -> Vec<String>;
     /// Reuse the producer's exact cleanup clock; absence grants no longer wait.
     fn begin_trace_cleanup(
@@ -1133,6 +1140,13 @@ where
                 .any(|capability| capability == PERSISTENT_PAGE_REOPEN),
         std::sync::atomic::Ordering::Release,
     );
+    let terminal_recording_negotiated = terminal_close_negotiated
+        && required_capabilities
+            .iter()
+            .any(|capability| capability == super::client_protocol::TERMINAL_RECORDING_ARTIFACTS)
+        && capabilities
+            .iter()
+            .any(|capability| capability == super::client_protocol::TERMINAL_RECORDING_ARTIFACTS);
     let supported: Vec<_> = capabilities.iter().map(String::as_str).collect();
     let validation = validate_hello(&protocol, &required_capabilities, &supported)
         .and_then(|()| executor.set_event_sink(sink.clone()));
@@ -1166,6 +1180,8 @@ where
     let mut pending = std::collections::HashMap::<u64, (String, u64, bool)>::new();
     let mut closing_id = None;
     let mut terminal_control = false;
+    let mut terminal_recording = None;
+    let mut terminal_sequence = 0u64;
     // Retained across both phases: cancelling a read must not discard its prefix.
     let mut incoming_frame = Vec::new();
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(25));
@@ -1220,6 +1236,10 @@ where
                             })
                     } else { None };
                     let recoverable = recovery.is_some();
+                    if !recoverable && unknown && state == ScopeState::Quarantined {
+                        let batch = executor.take_terminal_recording(super::client_debt::OperationKey { generation, operation_seq: sequence });
+                        if terminal_recording_negotiated { terminal_recording = batch; }
+                    }
                     let mut message = result_message(id, generation, sequence, outcome, state);
                     if let ServerMessage::Result { recovery: field, .. } = &mut message { *field = recovery; }
                     if !enqueue(&sender, message, &broker) { settlement_trace!(sequence, ResultQueueFailed); break; }
@@ -1316,6 +1336,45 @@ where
                     command,
                     args,
                 } => {
+                    if operation_seq <= super::client_protocol::MAX_SAFE_SEQUENCE {
+                        terminal_sequence = terminal_sequence.max(operation_seq);
+                    }
+                    if matches!(
+                        command.as_str(),
+                        "recording.finalized.collect"
+                            | "recording.finalized.read"
+                            | "recording.finalized.release"
+                    ) {
+                        // Reserved terminal controls cannot enter ordinary
+                        // broker admission or executor dispatch while usable.
+                        let (current, state) =
+                            broker.health().unwrap_or((1, ScopeState::Quarantined));
+                        let error = if generation != current {
+                            ProtocolError::StaleGeneration
+                        } else if state != ScopeState::Usable {
+                            ProtocolError::ScopeUnavailable
+                        } else {
+                            ProtocolError::UnsupportedCommand
+                        };
+                        if !enqueue(
+                            &sender,
+                            result_message(
+                                id,
+                                generation,
+                                operation_seq,
+                                NativeOutcome {
+                                    result: Err(error),
+                                    effects: Effects::NotDispatched,
+                                    retention: None,
+                                },
+                                state,
+                            ),
+                            &broker,
+                        ) {
+                            break;
+                        }
+                        continue;
+                    }
                     let admitted = if recovery_negotiated
                         && command == "scope.reconnect"
                         && callback_token.is_none()
@@ -1486,6 +1545,41 @@ where
                 .health()
                 .map(|(generation, _)| generation)
                 .unwrap_or(1);
+            // The terminal lane retains ordinary framing/correlation bounds.
+            // Reject a duplicate without echoing its ID: a second Result could
+            // steal the outstanding writer receipt for the original request.
+            let repeated_close = matches!(&message, ClientMessage::Close { id, generation: requested }
+                if *requested == generation && closing_id.as_ref() == Some(id));
+            if !repeated_close {
+                let id = match &message {
+                    ClientMessage::Hello { id, .. }
+                    | ClientMessage::Request { id, .. }
+                    | ClientMessage::Cancel { id, .. }
+                    | ClientMessage::Decision { id, .. }
+                    | ClientMessage::Close { id, .. } => id,
+                };
+                let is_operation = matches!(&message, ClientMessage::Request { .. });
+                let admitted = outstanding.lock().is_ok_and(|mut ids| {
+                    if ids.contains_key(id)
+                        || ids.values().filter(|kind| **kind == is_operation).count() >= 64
+                    {
+                        return false;
+                    }
+                    ids.insert(id.clone(), is_operation);
+                    true
+                });
+                if !admitted {
+                    let _ = sender.results.try_send(ServerMessage::Error {
+                        id: None,
+                        error: WireError {
+                            code: ProtocolError::InvalidFrame,
+                        },
+                        scope_state: ScopeState::Quarantined,
+                    });
+                    control_trusted = false;
+                    break;
+                }
+            }
             let response = match message {
                 ClientMessage::Close {
                     id,
@@ -1495,6 +1589,7 @@ where
                     // identical Close does not extend the cutoff or send twice.
                     if closing_id.as_ref().is_none_or(|owned| owned == &id) {
                         closing_id = Some(id);
+                        terminal_recording.take();
                         continue;
                     }
                     ServerMessage::Error {
@@ -1519,6 +1614,64 @@ where
                         error: result.err().map(|code| WireError { code }),
                         scope_state: ScopeState::Quarantined,
                     }
+                }
+                ClientMessage::Request {
+                    id,
+                    generation: requested,
+                    operation_seq,
+                    timeout_ms,
+                    callback_token,
+                    command,
+                    args,
+                } if terminal_recording_negotiated
+                    && closing_id.is_none()
+                    && matches!(
+                        command.as_str(),
+                        "recording.finalized.collect"
+                            | "recording.finalized.read"
+                            | "recording.finalized.release"
+                    ) =>
+                {
+                    let result = if requested != generation {
+                        Err(ProtocolError::StaleGeneration)
+                    } else if operation_seq == 0
+                        || operation_seq > super::client_protocol::MAX_SAFE_SEQUENCE
+                    {
+                        Err(ProtocolError::InvalidSequence)
+                    } else if operation_seq <= terminal_sequence {
+                        Err(ProtocolError::SequenceReused)
+                    } else {
+                        // Independent terminal correlation only. Never advance
+                        // or reopen the ordinary broker's operation admission.
+                        terminal_sequence = operation_seq;
+                        if callback_token.is_some()
+                            || timeout_ms == 0
+                            || timeout_ms > super::client_protocol::MAX_TIMEOUT_MS
+                        {
+                            Err(ProtocolError::InvalidArguments)
+                        } else {
+                            terminal_recording
+                                .as_mut()
+                                .ok_or(ProtocolError::ScopeUnavailable)
+                                .and_then(|batch| batch.command(requested, &command, args))
+                        }
+                    };
+                    let effects = if result.is_ok() {
+                        Effects::Completed
+                    } else {
+                        Effects::NotDispatched
+                    };
+                    result_message(
+                        id,
+                        requested,
+                        operation_seq,
+                        NativeOutcome {
+                            result,
+                            effects,
+                            retention: None,
+                        },
+                        ScopeState::Quarantined,
+                    )
                 }
                 ClientMessage::Request {
                     id,
@@ -1568,6 +1721,8 @@ where
             }
         }
     }
+    // EOF, cutoff or Close releases all unclaimed immutable byte custody.
+    terminal_recording.take();
     let teardown_proven = match shutdown_outcome {
         Some(outcome) => outcome,
         None => shutdown.await,
@@ -4442,6 +4597,9 @@ mod tests {
                 ..
             }
         ));
+    }
+    mod terminal_artifact_tests {
+        include!("client_transport_terminal_artifact_tests.rs");
     }
 }
 

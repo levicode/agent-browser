@@ -2079,6 +2079,7 @@ pub struct ClientBrowser {
     retirement: Arc<Mutex<RetirementJournal>>,
     lifecycle: Arc<tokio::sync::Mutex<()>>,
     startup_uncertain: Arc<std::sync::atomic::AtomicBool>,
+    terminal_recording: Arc<Mutex<Option<super::client_terminal_artifacts::FrozenRecordingBatch>>>,
     startup_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     connection_watch: ConnectionWatch,
     tasks: Arc<super::client_tasks::RetainedTasks>,
@@ -2107,6 +2108,7 @@ impl ClientBrowser {
             retirement: Arc::new(Mutex::new(RetirementJournal::default())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             startup_uncertain: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            terminal_recording: Arc::new(Mutex::new(None)),
             startup_task: tokio::sync::Mutex::new(None),
             connection_watch: Arc::new(tokio::sync::Mutex::new(None)),
             tasks: Arc::new(super::client_tasks::RetainedTasks::default()),
@@ -2510,6 +2512,17 @@ impl ClientBrowser {
 }
 
 impl super::client_transport::ClientExecutor for ClientBrowser {
+    fn take_terminal_recording(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Option<super::client_terminal_artifacts::FrozenRecordingBatch> {
+        let mut slot = self.terminal_recording.lock().ok()?;
+        if slot.as_ref().is_some_and(|batch| batch.key() == key) {
+            slot.take()
+        } else {
+            None
+        }
+    }
     fn begin_trace_cleanup(
         &self,
         key: super::client_debt::OperationKey,
@@ -2602,6 +2615,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         let capabilities = [
             super::client_protocol::EXACT_OWNER_CONTINUATION,
             super::client_protocol::DISCONNECTED_RECOVERY,
+            super::client_protocol::TERMINAL_RECORDING_ARTIFACTS,
             "browser.scope/1",
             "browser.lifecycle/1",
             super::client_protocol::PERSISTENT_PAGE_REOPEN,
@@ -4140,6 +4154,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
     }
 
     async fn shutdown(&self) -> Result<(), ProtocolError> {
+        // Transport takes a negotiated frozen batch before shutdown begins.
+        // Any unclaimed batch has no consumer and must release its old charge.
+        let mut terminal_recording_failed = match self.terminal_recording.lock() {
+            Ok(mut batch) => {
+                batch.take();
+                false
+            }
+            Err(_) => true,
+        };
         let stop_failed = self.stop_enrollment(true).is_err();
         self.gate.seal();
         let mut startup = self.startup_task.lock().await;
@@ -4149,6 +4172,16 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         };
         *startup = None;
         drop(startup);
+        // Close/EOF may beat a retained failed transition's result. That
+        // producer can freeze after the entry clear while shutdown joins it.
+        // Once joined, no late batch may outlive a successful cleanup receipt.
+        terminal_recording_failed |= match self.terminal_recording.lock() {
+            Ok(mut batch) => {
+                batch.take();
+                false
+            }
+            Err(_) => true,
+        };
         let _lifecycle = self.lifecycle.lock().await;
         let drain_failed = self.gate.drained().await.is_err();
         self.tasks.seal().await;
@@ -4224,6 +4257,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         };
         *connection_watch = None;
         if supervisor_failed
+            || terminal_recording_failed
             || stop_failed
             || watch_failed
             || drain_failed
@@ -4670,6 +4704,7 @@ impl ClientBrowser {
         };
         let mut slot = self.startup_task.lock().await;
         let owner = self.owner.clone();
+        let terminal_recording = self.terminal_recording.clone();
         let gate = self.gate.clone();
         let broker = self.broker.clone();
         let retirement = self.retirement.clone();
@@ -4692,6 +4727,7 @@ impl ClientBrowser {
         *slot = Some(tokio::spawn(async move {
             let _transition = transition;
             let mut accepted = false;
+            let mut recording_owner = None;
             let result = async {
                 check_lifecycle_budget(&operation)?;
                 // The resource never leaves this journal, including partial new
@@ -4710,6 +4746,7 @@ impl ClientBrowser {
                     .ok_or(ProtocolError::ScopeUnavailable)?;
                 let options = runtime.creation_options.clone();
                 let actions = runtime.actions.clone();
+                recording_owner = Some(actions.clone());
                 let (policy, downloads) = {
                     let configuration = runtime
                         .configuration
@@ -4975,6 +5012,21 @@ impl ClientBrowser {
             .await;
             if accepted && result.is_err() {
                 gate.seal();
+                // The exact failed transition captured this attempt's actions
+                // before old-runtime removal. No owner is rediscovered here.
+                if let Some(actions) = recording_owner {
+                    let key = super::client_debt::OperationKey {
+                        generation: operation.generation,
+                        operation_seq: operation.sequence,
+                    };
+                    if let Some(batch) = actions.freeze_finalized_recording(&scope, key, &blobs) {
+                        if let Ok(mut slot) = terminal_recording.lock() {
+                            if slot.is_none() {
+                                *slot = Some(batch);
+                            }
+                        }
+                    }
+                }
                 if let Some(resource) = owner.lock().await.as_mut() {
                     resource.targets.seal();
                     // Preserve the primary failure; failed retirement remains
@@ -5706,6 +5758,9 @@ mod tests {
         let browser =
             ClientBrowser::new(Arc::new(super::super::client_session::ClientSession::new()));
         let capabilities = browser.capabilities();
+        assert!(capabilities
+            .iter()
+            .any(|value| value == super::super::client_protocol::TERMINAL_RECORDING_ARTIFACTS));
         let families = capabilities
             .iter()
             .filter(|capability| capability.starts_with("browser."))

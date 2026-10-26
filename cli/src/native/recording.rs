@@ -1610,7 +1610,31 @@ pub fn spawn_recording_task_with_options(
         cleanup_complete,
         None,
         None,
+        None,
     )
+}
+
+/// Closed receipt minted only by the exact capture task after a negative start
+/// ACK, positive remote cleanup and successful terminal encoder join. It is not
+/// permission to reuse a scope: ClientActions must recheck its original owner.
+#[derive(Default)]
+pub(crate) struct RecordingStartReceipt {
+    refusal: Mutex<
+        Option<(
+            Arc<CdpClient>,
+            String,
+            super::client_debt::CommandStatusHandle,
+        )>,
+    >,
+}
+impl RecordingStartReceipt {
+    pub(crate) fn matches(&self, client: &Arc<CdpClient>, session: &str) -> bool {
+        self.refusal.lock().is_ok_and(|receipt| {
+            receipt.as_ref().is_some_and(|(original, capture, status)| {
+                Arc::ptr_eq(original, client) && capture == session && status.is_error_ack()
+            })
+        })
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1635,10 +1659,22 @@ pub(crate) fn spawn_recording_task_with_session_proof(
     cleanup_complete: Option<Arc<AtomicBool>>,
     detach_complete: Option<Arc<AtomicBool>>,
     encoder_complete: Option<Arc<AtomicBool>>,
+    startup_receipt: Option<Arc<RecordingStartReceipt>>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         let fps = validate_fps(fps)?;
         let options = options.validate()?;
+        // The negotiated first-start receipt covers the fixed cursor-free,
+        // no-contact-sheet path only. Best-effort overlay removal is not a
+        // cleanup ACK and must never authorize reusable failure if that path
+        // gains additional renderer-owned work in the future.
+        let receipt_eligible = startup_receipt.is_some()
+            && !cursor
+            && iframe_sessions.is_empty()
+            && contact_sheet_path.is_none()
+            && cursor_overlays
+                .try_lock()
+                .is_ok_and(|overlays| overlays.is_empty());
         let mut cleanup = RecordingCleanupProof {
             output: cleanup_complete,
             remote_complete: false,
@@ -1710,17 +1746,36 @@ pub(crate) fn spawn_recording_task_with_session_proof(
             result => result,
         };
 
+        let mut start_status = None;
         let started = match seeded {
-            Ok(()) => client
-                .send_command(
+            Ok(()) => {
+                let params = options.screencast();
+                match client.reserve_tracked_command(
                     "Page.startScreencast",
-                    Some(options.screencast()),
+                    Some(&params),
                     Some(&capture_session),
-                )
-                .await
-                .map_err(|error| format!("Failed to start screencast: {error}")),
+                ) {
+                    Ok(reservation) => {
+                        start_status = reservation.as_ref().map(|reservation| reservation.status());
+                        client
+                            .send_reserved_command(
+                                "Page.startScreencast",
+                                Some(params),
+                                Some(&capture_session),
+                                reservation,
+                            )
+                            .await
+                            .map_err(|error| format!("Failed to start screencast: {error}"))
+                    }
+                    Err(error) => Err(format!("Failed to start screencast: {error}")),
+                }
+            }
             Err(error) => Err(error),
         };
+        let refused_start = started.is_err()
+            && start_status
+                .as_ref()
+                .is_some_and(|status| status.is_error_ack());
 
         if let Some(ready) = ready {
             let _ = ready.send(
@@ -1786,6 +1841,21 @@ pub(crate) fn spawn_recording_task_with_session_proof(
                 .and_then(|result| result),
             None => Ok(0),
         };
+        // A ready error alone is not reusable failure evidence. The exact
+        // refused start must be followed by both successful cleanup ACKs and
+        // a successful joined encoder. Unknown/missing replies never qualify.
+        if receipt_eligible
+            && refused_start
+            && cleanup.remote_complete
+            && streamed.is_ok()
+            && contact_sheet_count.is_ok()
+        {
+            if let (Some(receipt), Some(status)) = (startup_receipt, start_status) {
+                if let Ok(mut refusal) = receipt.refusal.lock() {
+                    *refusal = Some((client.clone(), capture_session.clone(), status));
+                }
+            }
+        }
         let streamed = streamed?;
         let contact_sheet_count = contact_sheet_count?;
         shared_count.store(streamed, Ordering::Relaxed);

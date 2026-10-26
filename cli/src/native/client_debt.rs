@@ -831,6 +831,11 @@ impl CommandStatusHandle {
             _ => CommandStatus::IntegrityLost,
         }
     }
+    /// A reader-validated error ACK, not transport loss or aggregate zero debt.
+    /// Private lifecycle receipts use the existing bounded outcome bit only.
+    pub(crate) fn is_error_ack(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == CommandStatus::Acknowledged as u8
+    }
     /// The reader distinguishes a validated success envelope from an error ACK.
     /// This receipt retires only the exact callback command, never owner debt.
     pub(crate) async fn wait_successful_ack(&self, deadline: Instant) -> Result<(), ProtocolError> {
@@ -6298,5 +6303,31 @@ pub(crate) mod tests {
             assert_eq!(ledger.snapshot(), before, "{obstruction}");
             assert_eq!(journal.snapshot(), local_before, "{obstruction}");
         }
+    }
+}
+
+#[cfg(test)]
+mod recording_start_status_tests {
+    use super::*;
+    #[test]
+    fn recording_refusal_requires_exact_error_ack_not_success_or_terminal_status() {
+        let status = CommandStatusHandle::new(false, Arc::new(tokio::sync::Notify::new()));
+        assert!(!status.is_error_ack());
+        for state in [
+            CommandStatus::Submitted,
+            CommandStatus::RetainedRejected,
+            CommandStatus::Destroyed,
+            CommandStatus::Abandoned,
+            CommandStatus::IntegrityLost,
+        ] {
+            status.set(state);
+            assert!(!status.is_error_ack());
+        }
+        status.acknowledged(true);
+        assert_eq!(status.snapshot(), CommandStatus::Acknowledged);
+        assert!(!status.is_error_ack());
+        status.acknowledged(false);
+        assert_eq!(status.snapshot(), CommandStatus::Acknowledged);
+        assert!(status.is_error_ack());
     }
 }

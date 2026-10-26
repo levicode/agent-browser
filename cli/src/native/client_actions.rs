@@ -46,6 +46,7 @@ struct Dispatch {
     checked_unchanged: AtomicBool,
     checked_replaced: AtomicBool,
     acknowledged_postcondition: AtomicBool,
+    recording_start_refusal: Mutex<Option<RecordingStartRefusal>>,
     settled_replacement_prefix: Mutex<Option<Arc<SettledReplacementPrefix>>>,
     preparation_enabled: AtomicBool,
     preparation_refusal: AtomicBool,
@@ -1110,6 +1111,19 @@ impl ClientActions {
             && ctx.page_state.release_input(ctx.page).await.is_err()
         {
             d.cleanup.store(true, Ordering::SeqCst);
+        }
+        // Recheck after mandatory input cleanup and immediately before result
+        // classification. A cancellation/retirement during cleanup cannot turn
+        // an earlier recording receipt into reusable public scope authority.
+        if result == Err(ProtocolError::BrowserFailure) && !d.cleanup.load(Ordering::SeqCst) {
+            if d.recording_start_refusal
+                .lock()
+                .ok()
+                .and_then(|mut proof| proof.take())
+                .is_some_and(|proof| proof.check(&ctx))
+            {
+                d.acknowledged_postcondition.store(true, Ordering::SeqCst);
+            }
         }
         #[cfg(test)]
         tests::emit_preparation_mismatch(&ctx, &d, &result);
@@ -3108,6 +3122,82 @@ struct OwnedRecording {
     cleanup_complete: Arc<AtomicBool>,
     attachment: Option<RecordingAttachment>,
 }
+struct RecordingStartAuthority {
+    enrollment: super::client_enrollment::SettledInputAuthority,
+    attachment: super::client_targets::OwnedTarget,
+    journal: OperationJournalHandle,
+}
+impl RecordingStartAuthority {
+    fn capture(ctx: &ActionContext<'_>) -> Option<Self> {
+        let ActionRealmAuthority::Enrolled(owner) = ctx.realm_authority else {
+            return None;
+        };
+        let journal = OperationJournalHandle::current()?;
+        let ledger = ctx.page.client.debt_ledger()?;
+        if !Arc::ptr_eq(&journal.ledger(), &ledger)
+            || !ledger.matches_owner(ctx.operation.generation, &ctx.page.identity_scope)
+            || journal.key()
+                != (client_debt::OperationKey {
+                    generation: ctx.operation.generation,
+                    operation_seq: ctx.operation.sequence,
+                })
+        {
+            return None;
+        }
+        Some(Self {
+            enrollment: owner
+                .capture_settled_input_authority(ctx.page, ctx.operation)
+                .ok()?,
+            attachment: ctx.page.targets.owned_target(&ctx.page.target_id).ok()?,
+            journal,
+        })
+    }
+    fn check(&self, ctx: &ActionContext<'_>) -> bool {
+        let ActionRealmAuthority::Enrolled(owner) = ctx.realm_authority else {
+            return false;
+        };
+        let Some(current) = OperationJournalHandle::current() else {
+            return false;
+        };
+        let Some(ledger) = ctx.page.client.debt_ledger() else {
+            return false;
+        };
+        let debt = ledger.snapshot();
+        ctx.check().is_ok()
+            && self.journal.same_operation(&current)
+            && self.journal.check_application_submission().is_ok()
+            && Arc::ptr_eq(&self.journal.ledger(), &ledger)
+            && ledger.matches_owner(ctx.operation.generation, &ctx.page.identity_scope)
+            && self
+                .enrollment
+                .check(owner, ctx.page, ctx.operation)
+                .is_ok()
+            && ctx
+                .page
+                .targets
+                .owned_target(&ctx.page.target_id)
+                .is_ok_and(|current| self.attachment.same_attachment(&current))
+            && debt.outstanding_commands == 0
+            && debt.input_debt == 0
+            && debt.object_debt == 0
+            && !debt.integrity_lost
+            && !self.journal.snapshot().integrity_lost
+            && ctx.blobs.check_budget_integrity().is_ok()
+    }
+}
+struct RecordingStartRefusal {
+    authority: RecordingStartAuthority,
+    receipt: Arc<recording::RecordingStartReceipt>,
+    capture_session: String,
+}
+impl RecordingStartRefusal {
+    fn check(&self, ctx: &ActionContext<'_>) -> bool {
+        self.receipt
+            .matches(&ctx.page.client, &self.capture_session)
+            && self.authority.check(ctx)
+    }
+}
+
 #[derive(Default)]
 struct RecordingLedger {
     authority: Option<AttemptArtifacts>,
@@ -3352,7 +3442,7 @@ impl ClientActions {
         if ledger.current.is_some() {
             return Err(d.failure(ProtocolError::NotActionable));
         }
-        let result = Self::begin_segment(&ctx, &d, &mut ledger).await;
+        let result = Self::begin_segment(&ctx, &d, &mut ledger, None).await;
         ledger
             .settle_start(&d, result)
             .await
@@ -3392,6 +3482,94 @@ impl ClientActions {
             result
         }));
         (arrival, release, path)
+    }
+
+    /// Failed lifecycle transitions may move only the complete, already-clean
+    /// finalized ledger into terminal byte custody. This performs no capture,
+    /// encoder, file read, browser RPC or producer wait.
+    pub(crate) fn freeze_finalized_recording(
+        &self,
+        scope: &str,
+        key: client_debt::OperationKey,
+        blobs: &BlobStore,
+    ) -> Option<super::client_terminal_artifacts::FrozenRecordingBatch> {
+        let mut ledger = self.recording.try_lock().ok()?;
+        if ledger.current.is_some()
+            || ledger.abandoned
+            || ledger.cleanup_failed
+            || ledger.filesystem_cleanup_failed
+            || ledger.lost.is_some()
+            || ledger.authority.is_none()
+            || ledger.finished.is_empty()
+            || ledger.finished.iter().any(|owned| {
+                owned.scope.generation != key.generation
+                    || owned.read_job.is_some()
+                    || owned.bytes.is_none()
+                    || owned.reservation.is_none()
+                    || owned.state.capture_task.is_some()
+                    || owned.state.cancel_tx.is_some()
+                    || owned.state.cleanup_task_failed
+                    || !owned.state.encoder_complete.load(Ordering::SeqCst)
+                    || !owned.cleanup_complete.load(Ordering::SeqCst)
+                    || !owned.attachment.as_ref().is_some_and(|attachment| {
+                        attachment.startup.is_none()
+                            && !attachment.cleanup_failed
+                            && attachment.detached.load(Ordering::SeqCst)
+                            && attachment.session.as_ref().is_some_and(|session| {
+                                attachment.acknowledged_cleanup.contains(session)
+                            })
+                    })
+            })
+        {
+            return None;
+        }
+        // Entire collection is checked before any item leaves the ledger.
+        // File cleanup failure refuses the whole batch, never a partial success.
+        ledger.armed = false;
+        ledger.abandoned = true;
+        let finished = std::mem::take(&mut ledger.finished);
+        let mut items = Vec::with_capacity(finished.len());
+        let mut metadata = Vec::with_capacity(finished.len());
+        let mut clean = true;
+        for owned in finished {
+            let OwnedRecording {
+                directory,
+                reservation,
+                bytes,
+                started_at,
+                ordinal,
+                ..
+            } = owned;
+            clean &= directory.close().is_ok();
+            items.push((reservation?, bytes?));
+            metadata.push((started_at, ordinal));
+        }
+        if !clean {
+            ledger.cleanup_failed = true;
+            ledger.filesystem_cleanup_failed = true;
+            let _ = ledger.authority.as_ref()?.retire();
+            return None;
+        }
+        let frozen = match blobs.freeze_finalized_artifacts(
+            ledger.authority.as_ref()?,
+            key.generation,
+            items,
+        ) {
+            Ok(frozen) => frozen,
+            Err(_) => {
+                ledger.cleanup_failed = true;
+                return None;
+            }
+        };
+        Some(super::client_terminal_artifacts::FrozenRecordingBatch::new(
+            key,
+            scope.to_owned(),
+            frozen
+                .into_iter()
+                .zip(metadata)
+                .map(|(blob, (started_at, ordinal))| (blob, started_at, ordinal))
+                .collect(),
+        ))
     }
 
     /// Final attempt teardown. Disarm before awaiting so queued page-open
@@ -3441,13 +3619,52 @@ impl ClientActions {
             );
         }
         ledger.options = Some(options);
-        let result = Self::begin_segment(ctx, d, &mut ledger).await;
-        ledger.settle_start(d, result).await
+        let authority = RecordingStartAuthority::capture(ctx);
+        let receipt = authority
+            .as_ref()
+            .map(|_| Arc::new(recording::RecordingStartReceipt::default()));
+        let result = Self::begin_segment(ctx, d, &mut ledger, receipt.clone()).await;
+        let capture_session = ledger
+            .current
+            .as_ref()
+            .and_then(|owned| owned.attachment.as_ref())
+            .and_then(|attachment| attachment.session.clone());
+        let result = ledger.settle_start(d, result).await;
+        // settle_start joined the capture and encoder, acknowledged detach,
+        // removed the private file and dropped this segment's quota reservation.
+        // Existing artifacts do not authorize publishing a new failure receipt.
+        if result == Err(ProtocolError::BrowserFailure)
+            && ledger.current.is_none()
+            && ledger.finished.is_empty()
+            && ledger.lost.is_none()
+            && !ledger.armed
+            && !ledger.abandoned
+            && !ledger.cleanup_failed
+            && !ledger.filesystem_cleanup_failed
+            && !d.cleanup.load(Ordering::SeqCst)
+        {
+            if let (Some(authority), Some(receipt), Some(capture_session)) =
+                (authority, receipt, capture_session)
+            {
+                let proof = RecordingStartRefusal {
+                    authority,
+                    receipt,
+                    capture_session,
+                };
+                if proof.check(ctx) {
+                    if let Ok(mut stored) = d.recording_start_refusal.lock() {
+                        *stored = Some(proof);
+                    }
+                }
+            }
+        }
+        result
     }
     async fn begin_segment(
         ctx: &ActionContext<'_>,
         d: &Dispatch,
         ledger: &mut RecordingLedger,
+        startup_receipt: Option<Arc<recording::RecordingStartReceipt>>,
     ) -> Result<(), ProtocolError> {
         ctx.check()?;
         let mut options = ledger.options.ok_or(ProtocolError::BrowserFailure)?;
@@ -3620,6 +3837,7 @@ impl ClientActions {
             Some(owned.cleanup_complete.clone()),
             Some(attachment.detached.clone()),
             Some(owned.state.encoder_complete.clone()),
+            startup_receipt,
         ));
         owned.state.cancel_tx = Some(cancel_tx);
         owned.state.shared_frame_count = Some(frames);
@@ -4061,6 +4279,9 @@ mod tests {
     }
     mod retained_action_errors {
         include!("client_actions_error_boundary_tests.rs");
+    }
+    mod recording_wire_contracts {
+        include!("client_actions_recording_wire_contract_tests.rs");
     }
     #[test]
     fn readonly_timing_is_silent_when_disabled_tap_success_or_mutated() {

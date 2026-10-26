@@ -184,6 +184,27 @@ pub struct ArtifactReservation {
     charge: Charge,
 }
 
+/// Immutable terminal-only bytes. The original charge is moved, never copied
+/// or re-reserved; ordinary BlobStore closure has no entry to release twice.
+pub(crate) struct FrozenArtifact {
+    pub(crate) info: BlobInfo,
+    bytes: Vec<u8>,
+    _charge: Charge,
+}
+impl FrozenArtifact {
+    pub(crate) fn read(&self, offset: usize, max_bytes: usize) -> Result<BlobChunk, BlobError> {
+        if max_bytes == 0 || max_bytes > MAX_CHUNK_BYTES || offset > self.bytes.len() {
+            return Err(BlobError::InvalidInput);
+        }
+        let end = offset.saturating_add(max_bytes).min(self.bytes.len());
+        Ok(BlobChunk {
+            base64: base64::engine::general_purpose::STANDARD.encode(&self.bytes[offset..end]),
+            next_offset: end,
+            eof: end == self.bytes.len(),
+        })
+    }
+}
+
 impl BlobStore {
     pub fn new(limits: BlobLimits) -> Result<Self, BlobError> {
         if limits.max_blob_bytes == 0
@@ -672,6 +693,59 @@ impl BlobStore {
         }
         budget.changed.send_replace(());
         Ok(infos)
+    }
+
+    /// Lifecycle-only transfer after every producer and file has settled.
+    /// Unlike ordinary publication, this never activates a scope or inserts a
+    /// handle into the browser blob store. Retirement and transfer are atomic.
+    pub(crate) fn freeze_finalized_artifacts(
+        &self,
+        authority: &AttemptArtifacts,
+        generation: u64,
+        items: Vec<(ArtifactReservation, Vec<u8>)>,
+    ) -> Result<Vec<FrozenArtifact>, BlobError> {
+        if authority.state.generation != generation
+            || !Arc::ptr_eq(&authority.state.budget, &self.budget)
+            || items.iter().any(|(reservation, bytes)| {
+                !Arc::ptr_eq(&reservation.authority, &authority.state)
+                    || !Arc::ptr_eq(&reservation.charge.budget, &self.budget)
+                    || reservation.charge.producer_scope.is_some()
+                    || bytes.len() != reservation.charge.size
+            })
+        {
+            return Err(BlobError::StaleScope);
+        }
+        let mut retired = authority
+            .state
+            .retired
+            .lock()
+            .map_err(|_| BlobError::Closed)?;
+        if *retired {
+            return Err(BlobError::StaleScope);
+        }
+        let inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        let budget = self.budget.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed || budget.corrupt || items.len() > self.limits.max_handles {
+            return Err(BlobError::Closed);
+        }
+        *retired = true;
+        drop(budget);
+        drop(inner);
+        Ok(items
+            .into_iter()
+            .map(|(reservation, bytes)| {
+                let info = BlobInfo {
+                    handle: Uuid::new_v4().to_string(),
+                    size: bytes.len(),
+                    sha256: format!("{:x}", Sha256::digest(&bytes)),
+                };
+                FrozenArtifact {
+                    info,
+                    bytes,
+                    _charge: reservation.charge,
+                }
+            })
+            .collect())
     }
 
     pub fn producer_limit(&self) -> usize {
