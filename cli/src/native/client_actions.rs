@@ -5461,6 +5461,7 @@ mod tests {
                     || mode.starts_with("direct-point")
                     || mode == "strict-query-drag-cleanup-debt"
                     || mode.starts_with("preparation-readonly-")
+                    || retained_action_errors::is_mode(mode)
                     || retirement_node_swipes::is_mode(mode)
                 {
                     reply["sessionId"] = request["sessionId"].clone();
@@ -10655,10 +10656,15 @@ mod tests {
                 },
             )
             .unwrap();
-        let error=ClientActions::default().execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":{"id":format!("@{id}"),"revision":"1"},"action":{"kind":"tap"}})).await.unwrap_err();
-        assert_eq!(error.error, ProtocolError::NotActionable);
-        assert_eq!(error.effects, Effects::NotDispatched);
-        assert!(f.log.lock().unwrap().is_empty());
+        // Both verbs refuse this exact readonly binding before focus or input.
+        for action in [json!({"kind":"tap"}), json!({"kind":"press","key":"Enter"})] {
+            let error = ClientActions::default().execute(f.context(), "browser.perform", &json!({
+                "identityScope":"scope","ref":{"id":format!("@{id}"),"revision":"1"},"action":action
+            })).await.unwrap_err();
+            assert_eq!(error.error, ProtocolError::NotActionable);
+            assert_eq!(error.effects, Effects::NotDispatched);
+            assert!(f.log.lock().unwrap().is_empty());
+        }
     }
     #[tokio::test]
     async fn invalid_keyboard_chord_is_not_dispatched() {

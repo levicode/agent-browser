@@ -1876,7 +1876,14 @@ impl OwnerDebtLedger {
                 .is_some_and(|bootstrap| bootstrap.published)
             || state.context_creation_claimed
             || state.eval_publication_pending
-            || state.commands.is_empty()
+            // The operation registry supplies a nonempty exact-owner proof.
+            // A reader ACK can settle the last passive command before its
+            // cancelled consumer fixes Unknown at EOF. Residual debt may thus
+            // be empty; it is not itself the authority to retire an operation.
+            || operations.is_empty()
+            || operations
+                .iter()
+                .any(|key| key.generation != self.generation || key.operation_seq == 0)
             || !state.objects.is_empty()
             || !state.groups.is_empty()
             || !state.created_targets.is_empty()
@@ -5523,6 +5530,79 @@ pub(crate) mod tests {
             );
             assert!(ledger.check_admission(AdmissionClass::FixedRead).is_err());
         }
+    }
+    #[test]
+    fn terminal_read_only_settled_ack_requires_operation_proof_and_exact_bindings() {
+        let ledger = borrowed_final_local_owner();
+        ledger
+            .bind_session("borrowed-context", "target", "page")
+            .unwrap();
+        ledger
+            .state
+            .lock()
+            .unwrap()
+            .bootstrap
+            .as_mut()
+            .unwrap()
+            .published = true;
+        let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: 7,
+            sequence: 2,
+            deadline: Instant::now() + std::time::Duration::from_secs(5),
+            cancellation,
+        };
+        let key = OperationKey {
+            generation: 7,
+            operation_seq: 2,
+        };
+        let journal = ledger
+            .operation(key, "target".into(), "page".into())
+            .unwrap();
+        journal.bind_operation(&operation).unwrap();
+        let submitted = ledger
+            .reserve_command(Some(&journal), "Browser.getVersion", None, None)
+            .unwrap()
+            .submit()
+            .unwrap();
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        let ack = serde_json::from_value(json!({"id":1,"result":{"product":"Synthetic"}})).unwrap();
+        submitted.settle(&ack);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        let bindings = [("page".into(), "target".into(), false)];
+        assert!(ledger.check_terminal_read_only(&bindings, &[key]).is_err());
+        ledger.observe_remote_eof();
+        let before = ledger.snapshot();
+        // This checks ledger obligations only. The composed browser regression
+        // additionally requires the real registry's fixed Unknown/nonmutation
+        // proof and demonstrates that zero commands cannot forgive mutation.
+        assert!(ledger.check_terminal_read_only(&bindings, &[key]).is_ok());
+        for keys in [
+            vec![],
+            vec![OperationKey {
+                generation: 8,
+                operation_seq: 2,
+            }],
+            vec![OperationKey {
+                generation: 7,
+                operation_seq: 0,
+            }],
+        ] {
+            assert!(ledger.check_terminal_read_only(&bindings, &keys).is_err());
+        }
+        assert!(ledger.check_terminal_read_only(&[], &[key]).is_err());
+        assert!(ledger
+            .check_terminal_read_only(&[("page".into(), "other".into(), false)], &[key])
+            .is_err());
+        assert_eq!(
+            ledger.snapshot(),
+            before,
+            "proof does not mutate accounting"
+        );
+        assert!(ledger.check_admission(AdmissionClass::FixedRead).is_err());
+        ledger.connection_lost();
+        assert!(ledger.check_terminal_read_only(&bindings, &[key]).is_err());
     }
     #[test]
     fn final_local_eof_is_read_only_exact_borrowed_owner_evidence_not_admission() {

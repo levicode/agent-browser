@@ -123,6 +123,20 @@ async fn exercise(mode: &'static str, sensitive: bool, succeeds: bool, raced: bo
     f.page.client.install_debt_ledger(ledger.clone()).unwrap();
     f.page.client = f.page.client.owner_view(ledger.clone()).unwrap();
     let (owner, state, _notices) = preparation_settlement_owner(&f, broker.clone()).await;
+    {
+        let enrollment_replies = f.replies.lock().unwrap();
+        assert!(enrollment_replies
+            .iter()
+            .any(|entry| entry["request"]["sessionId"] == "page"));
+        for entry in enrollment_replies.iter() {
+            assert_eq!(
+                entry["reply"]["sessionId"], entry["request"]["sessionId"],
+                "enrollment ACK must preserve the exact CDP session"
+            );
+        }
+    }
+    assert!(!ledger.snapshot().integrity_lost);
+    assert_eq!(ledger.snapshot().outstanding_commands, 0);
     // Same five-second fixture lease. The extra read gets no extra budget.
     f.op = broker.admit(1, 1, 5_000).unwrap();
     assert!(broker.start(1, 1).unwrap());

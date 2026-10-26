@@ -1305,3 +1305,204 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
         }
     }
 }
+
+/// The reader may settle the exact read ACK while its cancelled consumer has
+/// not yet polled. EOF then fixes an Unknown result with no residual command.
+/// The scheduling gate controls only that consumer; the real owner-bound CDP
+/// reader, peer ACK, cancellation broker and EOF all run normally.
+#[tokio::test]
+async fn fixed_read_ack_before_remote_eof_keeps_unknown_but_closes_settled_owner() {
+    use crate::native::client_browser::reconnect_tests::{peer, PeerMode};
+    use crate::native::client_protocol::{DISCONNECTED_RECOVERY, EXACT_OWNER_CONTINUATION};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::task::Poll;
+
+    for obstruction in ["none", "mutation-history", "contaminated", "target-poison"] {
+        let mut original = peer(PeerMode::HoldFixedRead).await;
+        let broker = Arc::new(ClientSession::new());
+        let browser = Arc::new(ClientBrowser::new(broker.clone()));
+        let mut framed = FramedFixture::with_capabilities(
+            broker.clone(),
+            browser.clone(),
+            vec![
+                EXACT_OWNER_CONTINUATION.into(),
+                "terminal.close/1".into(),
+                DISCONNECTED_RECOVERY.into(),
+            ],
+        );
+        framed.ready().await.unwrap();
+        let opened = framed
+            .command(
+                "scope.open",
+                json!({
+                    "source":"connect", "context":"persistent", "endpoint":original.endpoint
+                }),
+                5,
+            )
+            .await
+            .unwrap();
+        let scope = opened["identityScope"].as_str().unwrap().to_owned();
+        framed.scope = Some(scope.clone());
+        framed
+            .command("scope.configure", fixture_configuration(&scope, None), 5)
+            .await
+            .unwrap();
+        framed
+            .command("network.routes.replace", fixture_routes(&scope), 5)
+            .await
+            .unwrap();
+        framed.registry = 1;
+        framed
+            .command("page.activate", json!({"identityScope":scope}), 5)
+            .await
+            .unwrap();
+        while original.received.try_recv().is_ok() {}
+        let command_start = original.commands.lock().unwrap().len();
+        framed.sequence += 1;
+        let lease = broker.admit(1, framed.sequence, 5000).unwrap();
+        assert!(broker.start(1, lease.sequence).unwrap());
+        let key = OperationKey {
+            generation: lease.generation,
+            operation_seq: lease.sequence,
+        };
+        let page = browser.page_lease(false).await.unwrap();
+        let targets = page.targets.clone();
+        let client = page.client.clone();
+        let ledger = client.debt_ledger().unwrap();
+        let journal = ClientBrowser::operation_journal(&page, &lease).unwrap();
+        let kept = journal.clone();
+        if obstruction == "mutation-history" {
+            // A conservative prior mutation mark is permanent even after debt
+            // settles. It must never acquire final read-only retirement.
+            journal.mark_mutation_maybe_submitted().unwrap();
+        }
+        let blocked = Arc::new(AtomicBool::new(false));
+        let wake = Arc::new(futures_util::task::AtomicWaker::new());
+        let consumer_blocked = blocked.clone();
+        let consumer_wake = wake.clone();
+        let result = browser
+            .tasks
+            .start_operation(
+                scope.clone(),
+                targets.clone(),
+                broker.clone(),
+                journal,
+                lease.cancellation.clone(),
+                async move {
+                    let mut read = Box::pin(environment_facts(&page, &lease, None));
+                    let result = futures_util::future::poll_fn(|context| {
+                        consumer_wake.register(context.waker());
+                        if consumer_blocked.load(Ordering::SeqCst) {
+                            return Poll::Pending;
+                        }
+                        read.as_mut().poll(context)
+                    })
+                    .await;
+                    (
+                        NativeOutcome {
+                            retention: None,
+                            result,
+                            effects: Effects::NotDispatched,
+                        },
+                        false,
+                    )
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded(original.received.recv()).await.as_deref(),
+            Some("Browser.getVersion")
+        );
+        blocked.store(true, Ordering::SeqCst);
+        let request = original.commands.lock().unwrap().last().unwrap().clone();
+        assert_eq!(request["method"], "Browser.getVersion");
+        assert!(request.get("params").is_none());
+        assert!(request.get("sessionId").is_none());
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        original
+            .emit
+            .send(Message::Text(
+                json!({"id":request["id"], "result":{
+                    "product":"Synthetic Chromium/1.0", "userAgent":"Synthetic Chromium Linux"
+                }})
+                .to_string(),
+            ))
+            .await
+            .unwrap();
+        bounded(async {
+            while ledger.snapshot().outstanding_commands != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(!ledger.snapshot().integrity_lost);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert_eq!(ledger.snapshot().object_debt, 0);
+        // Both signals precede resumption of the original biased consumer.
+        broker.cancel(1, key.operation_seq).unwrap();
+        if obstruction == "contaminated" {
+            ledger.connection_lost();
+        }
+        original.emit.send(Message::Close(None)).await.unwrap();
+        bounded(original.task).await.unwrap();
+        bounded(async {
+            let mut closed = client.remote_connection_closed();
+            while !*closed.borrow() {
+                closed.changed().await.unwrap();
+            }
+        })
+        .await;
+        blocked.store(false, Ordering::SeqCst);
+        wake.wake();
+        let outcome = bounded(result).await.unwrap();
+        assert_eq!(
+            outcome.result,
+            Err(ProtocolError::Cancelled),
+            "{obstruction}"
+        );
+        assert_eq!(outcome.effects, Effects::Unknown, "{obstruction}");
+        assert!(outcome.retention.is_none());
+        assert_eq!(
+            broker
+                .settle_with_retention(1, key.operation_seq, outcome.effects, None)
+                .unwrap(),
+            ScopeState::Quarantined
+        );
+        browser.fix_operation_result(key);
+        assert_eq!(kept.snapshot().input_debt, 0);
+        assert_eq!(kept.snapshot().object_debt, 0);
+        assert_eq!(
+            kept.snapshot().mutation_dispatched,
+            obstruction == "mutation-history"
+        );
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(
+            original.commands.lock().unwrap()[command_start..].len(),
+            1,
+            "no read/input replay"
+        );
+        if obstruction == "target-poison" {
+            targets.seal();
+        }
+        let cleanup = tokio::time::timeout(Duration::from_secs(7), framed.finish())
+            .await
+            .unwrap();
+        assert_eq!(
+            cleanup.is_ok(),
+            obstruction == "none",
+            "{obstruction}: {cleanup:?}"
+        );
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert!(ledger.snapshot().integrity_lost);
+        assert!(ledger.check_admission(AdmissionClass::FixedRead).is_err());
+        assert!(browser.tasks.recovery_candidate(key).is_none());
+        assert!(matches!(
+            browser.tasks.operation_retention_status(key),
+            crate::native::client_operation_state::OperationRetentionStatus::IntegrityLost(_)
+        ));
+        if obstruction == "none" {
+            assert!(browser.shutdown().await.is_ok());
+        }
+    }
+}
