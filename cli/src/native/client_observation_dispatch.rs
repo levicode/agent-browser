@@ -91,7 +91,7 @@ impl ObserveFailureWitness {
     }
 }
 
-// Production, default-off evidence for precisely one trace Screenshot. The cell
+// Production, default-off evidence for one optional trace read. The cell
 // contains no browser authority and holds no lock across an await. It records
 // the first failed call site before restoration, but emits only after run returns.
 struct ScreenshotFailureWitness {
@@ -107,7 +107,9 @@ struct ScreenshotFailureState {
 }
 impl ScreenshotFailureWitness {
     fn new(request: &DispatchRequest, operation: &OperationLease, enabled: bool) -> Option<Self> {
-        (enabled && matches!(request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace)).then(|| Self {
+        let trace = matches!(request, DispatchRequest::TraceSemantic(_))
+            || matches!(request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace);
+        (enabled && trace).then(|| Self {
             generation: operation.generation,
             sequence: operation.sequence,
             state: Mutex::new(ScreenshotFailureState {
@@ -1350,14 +1352,19 @@ impl ObservationDispatch {
                 DispatchRequest::Correlate(_) => Err(ProtocolError::InvalidArguments),
                 DispatchRequest::TraceSemantic(request) => {
                     let options = ObservationOptions { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector, ..ObservationOptions::default() };
+                    screenshot_stage(screenshot, ScreenshotStage::TraceMetadata);
                     let observed_viewport = viewport(&capture_context.page, &operation).await?;
                     let semantic = semantic_lease(&operation, false);
+                    // Capture is semantic here; the pixel capture subphase stays NotEntered.
+                    screenshot_stage(screenshot, ScreenshotStage::Capture);
                     let mut tree = observation::observe(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic).await.map_err(map_observation)?;
+                    screenshot_stage(screenshot, ScreenshotStage::Geometry);
                     geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.hidden_frame_proof, &operation).await.map_err(map_geometry)?);
                     let proof = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, proof, &mut tree.roots, &operation).await.map_err(map_geometry)?;
                     let root = exact_root(tree.roots, &staged, &frozen)?;
                     verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
+                    screenshot_stage(screenshot, ScreenshotStage::FinalViewport);
                     if viewport(&capture_context.page, &operation).await? != observed_viewport { return Err(ProtocolError::StaleScope); }
                     Ok((json!({"identityScope":identity,"revision":revision.to_string(),"root":root,
                         "viewportRef":tree.viewport_ref,"truncated":tree.truncated,
@@ -2915,6 +2922,35 @@ mod tests {
         assert!(witness
             .take_failure(|| panic!("success must not sample inventory"))
             .is_none());
+    }
+    #[test]
+    fn semantic_trace_retains_first_inventory_failure_without_enabling_capture() {
+        let trace = DispatchRequest::TraceSemantic(ObserveRequest {
+            options: ObserveFlags::default(),
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password]".into(),
+        });
+        assert!(ScreenshotFailureWitness::new(&trace, &operation(), false).is_none());
+        let success = ScreenshotFailureWitness::new(&trace, &operation(), true).unwrap();
+        assert!(success
+            .take_failure(|| panic!("success must not sample inventory"))
+            .is_none());
+        let witness = ScreenshotFailureWitness::new(&trace, &operation(), true).unwrap();
+        witness.enter(ScreenshotStage::InitialFrames);
+        witness.failure(&ProtocolError::ScopeUnavailable);
+        witness.enter(ScreenshotStage::Restoration);
+        witness.failure(&ProtocolError::CleanupFailed);
+        let failure = witness
+            .take_failure(|| panic!("no initial revision must not sample inventory"))
+            .unwrap();
+        assert_eq!(failure.stage, ScreenshotStage::InitialFrames);
+        assert_eq!(failure.capture_phase, ScreenshotCapturePhase::NotEntered);
+        assert_eq!(failure.error, ProtocolError::ScopeUnavailable);
+        assert_eq!(
+            failure.inventory_after_failure,
+            InventoryAfterFailure::NotSampled
+        );
+        assert!(witness.take_failure(|| panic!("emit once")).is_none());
     }
     #[test]
     fn screenshot_capture_first_failure_survives_cleanup_and_is_consumed_once() {
