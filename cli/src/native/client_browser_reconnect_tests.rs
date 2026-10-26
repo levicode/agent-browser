@@ -19,6 +19,7 @@ use tokio_tungstenite::tungstenite::Message;
 pub(super) enum PeerMode {
     Original,
     HoldInput,
+    HoldFixedRead,
     ReconnectCandidate,
     WrongContext,
     RefuseTargetInfo,
@@ -102,7 +103,7 @@ pub(super) async fn peer(mode: PeerMode) -> Peer {
                         *index += 1;
                     }
                     if !matches!(mode,
-                        PeerMode::Original | PeerMode::HoldInput | PeerMode::ReconnectCandidate)
+                        PeerMode::Original | PeerMode::HoldInput | PeerMode::HoldFixedRead | PeerMode::ReconnectCandidate)
                     {
                         assert!(matches!(method,
                             "Target.getBrowserContexts" | "Target.getTargetInfo"
@@ -119,6 +120,13 @@ pub(super) async fn peer(mode: PeerMode) -> Peer {
                     if mode == PeerMode::HoldInput && method == "Input.dispatchMouseEvent" {
                         // The test closes this real socket only after observing
                         // submission in the native operation registry. No ACK.
+                        continue;
+                    }
+                    if mode == PeerMode::HoldFixedRead && network_enabled
+                        && method == "Browser.getVersion"
+                    {
+                        // Setup identity reads still receive their real ACKs.
+                        // The post-configuration fixed read waits for peer EOF.
                         continue;
                     }
                     let mut response = if cleanup_request {

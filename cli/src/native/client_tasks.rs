@@ -240,7 +240,12 @@ impl RetainedTasks {
                         outcome.effects = Effects::Unknown;
                     }
                 }
-                if outcome.effects == Effects::Unknown {
+                // Exact remote EOF will become Unknown in the retained result
+                // wrapper even for a fixed read. Establish its existing bounded
+                // retirement before finish_remote_eof seals the producer; after
+                // that transition retire correctly refuses IntegrityLost.
+                // This grants neither usable retention nor remote cleanup proof.
+                if outcome.effects == Effects::Unknown || remote_only {
                     operations.retire(key);
                 }
                 let dirty = (if remote_only {
@@ -707,5 +712,62 @@ mod tests {
             .is_err());
         assert!(!polled.load(Ordering::SeqCst));
         tasks.drain().await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod fixed_read_eof_tests {
+    use super::*;
+    use crate::native::cdp::client::CdpClient;
+    use crate::native::client_debt::{OperationKey, OwnerDebtLedger};
+    use crate::native::client_session::ClientSession;
+    use std::time::Duration;
+
+    // The loopback reader supplies EOF, never a test-written terminal flag.
+    // This narrower retained-task test controls producer completion so cleanup
+    // failure cannot accidentally be replaced by a successful fixed-read path.
+    #[tokio::test]
+    async fn fixed_read_eof_cleanup_failure_never_gains_recovery() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let (release, released) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            released.await.unwrap();
+            socket.close(None).await.unwrap();
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let broker = Arc::new(ClientSession::new());
+        let lease = broker.admit(1, 1, 5000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let key = OperationKey { generation: 1, operation_seq: 1 };
+        let ledger = OwnerDebtLedger::unpublished(&lease, "fixed-read-owner".into(), false).unwrap();
+        ledger.bind_context("borrowed-context").unwrap();
+        ledger.bind_session("borrowed-context", "page", "session").unwrap();
+        client.install_debt_ledger(ledger.clone()).unwrap();
+        let journal = ledger.operation(key, "page".into(), "session".into()).unwrap();
+        journal.bind_operation(&lease).unwrap();
+        let targets = ClientTargets::new("borrowed-context".into(), "fixed-read-owner".into());
+        targets.acknowledge_enrollment().unwrap();
+        let tasks = RetainedTasks::default();
+        let mut closed = client.remote_connection_closed();
+        let receive = tasks.start_operation(
+            "fixed-read-owner".into(), targets, broker.clone(), journal,
+            lease.cancellation.clone(), async move {
+                while !*closed.borrow_and_update() { closed.changed().await.unwrap(); }
+                (NativeOutcome { retention: None, result: Err(ProtocolError::CleanupFailed), effects: Effects::NotDispatched }, false)
+            },
+        ).await.unwrap();
+        release.send(()).unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), receive).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), peer).await.unwrap().unwrap();
+        assert_eq!(outcome.result, Err(ProtocolError::CleanupFailed));
+        assert_eq!(outcome.effects, Effects::Unknown);
+        broker.settle(1, 1, outcome.effects).unwrap();
+        tasks.fix_operation_result(key);
+        assert!(outcome.retention.is_none());
+        assert!(tasks.recovery_candidate(key).is_none());
+        assert_eq!(tasks.drain().await, Err(ProtocolError::CleanupFailed));
     }
 }

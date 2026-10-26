@@ -1027,3 +1027,87 @@ async fn p06_framed_input_eof_cancelled_recovery_cannot_be_reissued() {
 
 #[path = "client_browser_locator_eof_tests.rs"]
 mod locator_eof_tests;
+
+// Regression for a background session.environment read outliving a later
+// successful trace. This uses the existing persistent owner and real framed
+// transport. No timeout, cancellation, or fabricated EOF arms retirement.
+#[tokio::test]
+async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
+    use crate::native::client_browser::reconnect_tests::{peer, PeerMode};
+    use crate::native::client_protocol::{DISCONNECTED_RECOVERY, EXACT_OWNER_CONTINUATION};
+
+    for cause in ["remote", "local-close", "contaminated"] {
+        let mut original = peer(PeerMode::HoldFixedRead).await;
+        let broker = Arc::new(ClientSession::new());
+        let browser = Arc::new(ClientBrowser::new(broker.clone()));
+        let mut framed = FramedFixture::with_capabilities(
+            broker.clone(),
+            browser.clone(),
+            vec![EXACT_OWNER_CONTINUATION.into(), "terminal.close/1".into(), DISCONNECTED_RECOVERY.into()],
+        );
+        framed.ready().await.unwrap();
+        let opened = framed.command("scope.open", json!({
+            "source":"connect", "context":"persistent", "endpoint":original.endpoint
+        }), 5).await.unwrap();
+        let scope = opened["identityScope"].as_str().unwrap().to_owned();
+        framed.scope = Some(scope.clone());
+        framed.command("scope.configure", fixture_configuration(&scope, None), 5).await.unwrap();
+        framed.command("network.routes.replace", fixture_routes(&scope), 5).await.unwrap();
+        framed.registry = 1;
+        framed.command("page.activate", json!({"identityScope":scope}), 5).await.unwrap();
+        let client = browser.owner.lock().await.as_ref().unwrap().manager.client.clone();
+        let ledger = client.debt_ledger().unwrap();
+        // Discard only the fixture's already-ACKed setup observations.
+        while original.received.try_recv().is_ok() {}
+        let command_start = original.commands.lock().unwrap().len();
+        framed.sequence += 1;
+        let key = OperationKey { generation: 1, operation_seq: framed.sequence };
+        framed.write(json!({"type":"request", "id":"fixed-read-eof", "generation":1,
+            "operationSeq":key.operation_seq, "timeoutMs":5000, "command":"session.environment",
+            "args":{"identityScope":scope}})).await.unwrap();
+        assert_eq!(bounded(original.received.recv()).await.as_deref(), Some("Browser.getVersion"));
+        assert_eq!(browser.tasks.operation_retention_status(key).mutation_dispatched(), Some(false));
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        if cause == "local-close" {
+            client.close().await;
+        } else {
+            if cause == "contaminated" {
+                // Earlier local loss must not be laundered by the later real EOF.
+                ledger.connection_lost();
+            }
+            original.emit.send(Message::Close(None)).await.unwrap();
+        }
+        bounded(original.task).await.unwrap();
+        let mut callbacks_retired = false;
+        let receipt = eof_recovery_result(&mut framed, "fixed-read-eof", key.operation_seq, &mut callbacks_retired).await;
+        assert_eq!(receipt["ok"], false, "{cause}");
+        assert_eq!(receipt["effects"], "unknown", "{cause}");
+        assert_eq!(receipt["scopeState"], "quarantined", "{cause}");
+        assert!(receipt.get("retention").is_none(), "EOF is not clean retention");
+        assert_eq!(receipt.get("recovery").is_some(), cause == "remote", "{cause}");
+        if cause == "remote" {
+            assert_eq!(receipt["recovery"], json!({"version":1,"identityScope":scope}));
+            let proof = browser.tasks.recovery_candidate(key).unwrap();
+            let deadline = proof.deadline();
+            browser.tasks.cancel_operation_producer(key);
+            assert_eq!(browser.tasks.recovery_candidate(key).unwrap().deadline(), deadline,
+                "duplicate retirement must not renew the existing window");
+            assert!(broker.admit(1, key.operation_seq + 1, 1000).is_err());
+            assert!(broker.admit_disconnected_reconnect(1, key.operation_seq + 1, 1000, "wrong-owner").is_err());
+        } else {
+            assert!(browser.tasks.recovery_candidate(key).is_none(), "{cause}");
+        }
+        assert!(ledger.check_admission(AdmissionClass::Input).is_err());
+        assert!(ledger.snapshot().integrity_lost);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        let commands = original.commands.lock().unwrap()[command_start..].to_vec();
+        assert_eq!(commands.len(), 1, "neither fixed read nor business input is replayed");
+        assert_eq!(commands[0]["method"], "Browser.getVersion");
+        // No reconnect is attempted here. Existing failed final cleanup remains
+        // failed; this test does not turn transport EOF into a cleanup ACK.
+        let cleanup = tokio::time::timeout(Duration::from_secs(7), framed.finish())
+            .await.expect("fixed read EOF final cleanup stalled");
+        assert!(cleanup.is_err(), "unrecovered retained EOF failure is not proven teardown");
+    }
+}
