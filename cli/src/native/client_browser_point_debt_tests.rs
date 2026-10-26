@@ -1101,10 +1101,14 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
             )
             .await
             .unwrap();
-        assert_eq!(
-            bounded(original.received.recv()).await.as_deref(),
-            Some("Browser.getVersion")
-        );
+        eprintln!("FIXED_READ_EOF phase=await-browser-version cause={cause} state=entered");
+        let received = tokio::time::timeout(Duration::from_secs(5), original.received.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("FIXED_READ_EOF phase=await-browser-version cause={cause} timeout=5s")
+            });
+        eprintln!("FIXED_READ_EOF phase=await-browser-version cause={cause} state=completed");
+        assert_eq!(received.as_deref(), Some("Browser.getVersion"));
         assert_eq!(
             browser
                 .tasks
@@ -1115,7 +1119,17 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
         assert_eq!(ledger.snapshot().input_debt, 0);
         assert!(!ledger.snapshot().integrity_lost);
         if cause == "local-close" {
-            client.close().await;
+            // manager.client is an immutable owner view; close() on it is
+            // intentionally a no-op. Only the lifecycle manager owns the socket.
+            browser
+                .owner
+                .lock()
+                .await
+                .as_ref()
+                .unwrap()
+                .manager
+                .disconnect_transport()
+                .await;
         } else {
             if cause == "contaminated" {
                 // Earlier local loss must not be laundered by the later real EOF.
@@ -1123,7 +1137,12 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
             }
             original.emit.send(Message::Close(None)).await.unwrap();
         }
-        bounded(original.task).await.unwrap();
+        eprintln!("FIXED_READ_EOF phase=join-peer cause={cause} state=entered");
+        tokio::time::timeout(Duration::from_secs(5), original.task)
+            .await
+            .unwrap_or_else(|_| panic!("FIXED_READ_EOF phase=join-peer cause={cause} timeout=5s"))
+            .unwrap();
+        eprintln!("FIXED_READ_EOF phase=join-peer cause={cause} state=completed");
         let mut callbacks_retired = false;
         let receipt = eof_recovery_result(
             &mut framed,
