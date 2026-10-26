@@ -1,12 +1,17 @@
 //! Original observation-capture obligations #8 and #10, through Dispatch.start.
+//! Screenshot deadline cases separately bound the safe subset of obligation #9;
+//! they do not claim success before an unacknowledged raw capture settles.
 //! The peer implements protocol responses, not a renderer: no pixel-fidelity claim.
 use super::*;
+use base64::Engine;
 use futures_util::SinkExt;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Case {
     OptionalDeadline,
     OptionalShortDeadline,
+    OptionalScreenshotShortDeadline,
+    MissingScreenshotAck,
     CancelInventory,
     CancelUnacknowledgedObject,
     CancelShortUnacknowledgedObject,
@@ -17,6 +22,21 @@ enum Case {
 }
 
 async fn optional_mask_retirement(case: Case) {
+    let screenshot = matches!(
+        case,
+        Case::OptionalScreenshotShortDeadline | Case::MissingScreenshotAck
+    );
+    // Build a valid late PNG outside the unchanged operation budget. The
+    // withheld reply is real screenshot-shaped data, never a synthetic error.
+    let png = if screenshot {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgba8(100, 80)
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        Some(base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()))
+    } else {
+        None
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let commands = Arc::new(Mutex::new(Vec::<Value>::new()));
@@ -24,18 +44,25 @@ async fn optional_mask_retirement(case: Case) {
     let (reached_tx, reached) = oneshot::channel();
     let (release, mut resume) = oneshot::channel();
     let (late_tx, late) = oneshot::channel();
+    let mut release = Some(release);
+    let mut late = Some(late);
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
+        if screenshot {
+            stream.set_nodelay(true).unwrap();
+        }
         let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
         let mut held = None;
         let mut reached_tx = Some(reached_tx);
         let mut late_tx = Some(late_tx);
+        let mut raw_acked = false;
         loop {
             // Holding one reply must not block cleanup ACKs on the same session.
             let message = tokio::select! {
                 _ = &mut resume, if held.is_some() => {
                     let response: Value = held.take().unwrap();
                     ws.send(tokio_tungstenite::tungstenite::Message::Text(response.to_string())).await.unwrap();
+                    if screenshot { raw_acked = true; }
                     late_tx.take().unwrap().send(()).unwrap();
                     continue;
                 }
@@ -74,7 +101,20 @@ async fn optional_mask_retirement(case: Case) {
                 }
                 "Runtime.callFunctionOn" => {
                     let declaration = request["params"]["functionDeclaration"].as_str().unwrap();
-                    if group == Some("capture-1-frame") {
+                    if screenshot && group == Some("capture-source-1-frame") {
+                        assert_eq!(request["params"]["objectId"], "source-holder");
+                        if declaration == "function(){return this.remove()}" {
+                            assert!(
+                                raw_acked,
+                                "source custody cannot end before the exact raw ACK"
+                            );
+                        }
+                        assert!(matches!(
+                            declaration,
+                            "function(){return this.verify()}" | "function(){return this.remove()}" | "function(selector,...nodes){return this.install(selector,nodes)}"
+                        ));
+                        json!({"result":{"value":true}})
+                    } else if group == Some("capture-1-frame") {
                         json!({"result":{"value":{"count":0,"masks":[],"secure":[],"opaque":case == Case::PrivacyFailure,"unsafeGeometry":case == Case::GeometryFailure}}})
                     } else if declaration.contains("Array.from(result)") {
                         json!({"result":{"objectId":"security"}})
@@ -99,9 +139,27 @@ async fn optional_mask_retirement(case: Case) {
                         panic!("unexpected semantic function: {declaration}");
                     }
                 }
+                "Runtime.releaseObjectGroup"
+                    if screenshot && group == Some("capture-source-1-frame") =>
+                {
+                    assert!(
+                        raw_acked,
+                        "source group cannot be released before the exact raw ACK"
+                    );
+                    json!({})
+                }
                 "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => json!({}),
+                "Runtime.evaluate" if screenshot => {
+                    assert_eq!(group, Some("capture-source-1-frame"));
+                    assert_eq!(request["params"]["contextId"], 1);
+                    json!({"result":{"objectId":"source-holder"}})
+                }
                 "Page.captureScreenshot" => {
-                    panic!("abandoned or refused mask probe must never start a screenshot")
+                    assert!(
+                        screenshot,
+                        "abandoned or refused mask probe must never start a screenshot"
+                    );
+                    json!({"data":png.as_ref().unwrap()})
                 }
                 method => panic!("unexpected mask-retirement command: {method}"),
             };
@@ -115,7 +173,9 @@ async fn optional_mask_retirement(case: Case) {
             } else {
                 json!({"id":request["id"],"sessionId":"session","result":result})
             };
-            let hold = if matches!(
+            let hold = if screenshot {
+                method == "Page.captureScreenshot"
+            } else if matches!(
                 case,
                 Case::CancelUnacknowledgedObject | Case::CancelShortUnacknowledgedObject
             ) {
@@ -153,6 +213,8 @@ async fn optional_mask_retirement(case: Case) {
     let budget = if matches!(
         case,
         Case::OptionalShortDeadline
+            | Case::OptionalScreenshotShortDeadline
+            | Case::MissingScreenshotAck
             | Case::CancelInventory
             | Case::CancelShortUnacknowledgedObject
             | Case::CancelShortDirtyRestore
@@ -163,6 +225,10 @@ async fn optional_mask_retirement(case: Case) {
     };
     op.deadline = Instant::now() + budget;
     let deadline = op.deadline;
+    #[cfg(feature = "acceptance-faults")]
+    let mut retained = screenshot.then(|| {
+        crate::native::client_capture::retained_capture_test::register(&owner.client, op.sequence)
+    });
     let task = dispatch.clone().start(
         owner.context(),
         DispatchRequest::Observe(ObserveRequest {
@@ -176,6 +242,8 @@ async fn optional_mask_retirement(case: Case) {
         }),
         op,
     );
+    #[cfg(feature = "acceptance-faults")]
+    let mut task = task;
     let delayed = !matches!(case, Case::PrivacyFailure | Case::GeometryFailure);
     if delayed {
         tokio::time::timeout(Duration::from_secs(2), reached)
@@ -193,8 +261,37 @@ async fn optional_mask_retirement(case: Case) {
             "staging is not publication"
         );
         drop(log);
-        if !matches!(case, Case::OptionalDeadline | Case::OptionalShortDeadline) {
+        if !screenshot && !matches!(case, Case::OptionalDeadline | Case::OptionalShortDeadline) {
             cancel.send_replace(CancelSignal::Requested);
+        }
+        #[cfg(feature = "acceptance-faults")]
+        if screenshot {
+            // Causal notification from the actual raw-capture timeout branch;
+            // no sleep, deadline rewrite, manufactured failure, or early ACK.
+            let (_registration, entered) = retained.take().unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), entered)
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                crate::native::client_capture::CaptureReason::Deadline
+            );
+            assert!(matches!(
+                task.result.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(!commands
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["params"]["functionDeclaration"] == "function(){return this.remove()}"));
+            if case == Case::OptionalScreenshotShortDeadline {
+                release.take().unwrap().send(()).unwrap();
+                tokio::time::timeout(Duration::from_secs(1), late.take().unwrap())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
         }
     }
     let result = tokio::time::timeout(Duration::from_secs(5), task.result)
@@ -205,14 +302,22 @@ async fn optional_mask_retirement(case: Case) {
     let terminal = Instant::now();
     if matches!(
         case,
-        Case::OptionalDeadline | Case::OptionalShortDeadline | Case::CancelInventory
+        Case::OptionalDeadline
+            | Case::OptionalShortDeadline
+            | Case::OptionalScreenshotShortDeadline
+            | Case::CancelInventory
     ) {
         assert!(
             terminal < deadline,
-            "value-only optional subdeadline/cleanup must not consume the parent budget"
+            "clean optional subdeadline/cleanup must not consume the parent budget"
         );
     }
-    if matches!(case, Case::OptionalDeadline | Case::OptionalShortDeadline) {
+    if matches!(
+        case,
+        Case::OptionalDeadline
+            | Case::OptionalShortDeadline
+            | Case::OptionalScreenshotShortDeadline
+    ) {
         assert!(
             terminal >= deadline - (budget / 5).min(Duration::from_millis(500)),
             "optional capture must not finish before its earliest possible subdeadline"
@@ -247,8 +352,9 @@ async fn optional_mask_retirement(case: Case) {
                 Case::CancelInventory
                 | Case::CancelDirtyRestore
                 | Case::CancelShortDirtyRestore => ProtocolError::Cancelled,
-                Case::CancelUnacknowledgedObject | Case::CancelShortUnacknowledgedObject =>
-                    ProtocolError::CleanupFailed,
+                Case::CancelUnacknowledgedObject
+                | Case::CancelShortUnacknowledgedObject
+                | Case::MissingScreenshotAck => ProtocolError::CleanupFailed,
                 Case::PrivacyFailure | Case::GeometryFailure => ProtocolError::PolicyDenied,
                 _ => unreachable!(),
             }
@@ -259,6 +365,7 @@ async fn optional_mask_retirement(case: Case) {
                 case,
                 Case::CancelUnacknowledgedObject
                     | Case::CancelShortUnacknowledgedObject
+                    | Case::MissingScreenshotAck
                     | Case::CancelDirtyRestore
                     | Case::CancelShortDirtyRestore
             )
@@ -271,7 +378,10 @@ async fn optional_mask_retirement(case: Case) {
         );
     }
     assert_eq!(owner.client.pending_len().await, 0);
-    if case == Case::CancelShortUnacknowledgedObject {
+    if matches!(
+        case,
+        Case::CancelShortUnacknowledgedObject | Case::MissingScreenshotAck
+    ) {
         assert!(
             terminal >= deadline,
             "unknown resource settlement must not inherit the value-only fast exit"
@@ -280,12 +390,16 @@ async fn optional_mask_retirement(case: Case) {
     let terminal_refs = refs.lock().unwrap().ref_ids();
     let terminal_commands = commands.lock().unwrap().len();
     if delayed {
-        // Original ordering: terminal result precedes manually released reply.
-        release.send(()).unwrap();
-        tokio::time::timeout(Duration::from_secs(1), late)
-            .await
-            .unwrap()
-            .unwrap();
+        // Value-only mask replies may remain held past terminal success. Raw
+        // screenshot success instead requires its ACK and source restoration;
+        // a missing raw ACK can reach only terminal cleanup failure.
+        if let Some(release) = release.take() {
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), late.take().unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+        }
         // A same-session roundtrip fences processing of the late reply; it is
         // not an arbitrary sleep offered as evidence of no continuation.
         tokio::time::timeout(
@@ -324,6 +438,8 @@ async fn optional_mask_retirement(case: Case) {
                     | Case::CancelShortUnacknowledgedObject
                     | Case::PrivacyFailure
                     | Case::GeometryFailure
+                    | Case::OptionalScreenshotShortDeadline
+                    | Case::MissingScreenshotAck
             ))
         );
         assert_eq!(
@@ -332,16 +448,65 @@ async fn optional_mask_retirement(case: Case) {
         ["native-exact-node-7"],
         "semantic geometry's exact object is released once; semantic refs retain backend identity, not remote handles"
     );
-        assert!(!log.iter().any(|r| r["method"] == "Page.captureScreenshot"
-            || r["params"]["objectGroup"]
-                .as_str()
-                .is_some_and(|g| g.starts_with("capture-source-"))));
+        if screenshot {
+            assert_eq!(
+                log.iter()
+                    .filter(|r| r["method"] == "Page.captureScreenshot")
+                    .count(),
+                1
+            );
+            let source = log
+                .iter()
+                .filter(|r| r["params"]["objectGroup"] == "capture-source-1-frame")
+                .collect::<Vec<_>>();
+            assert_eq!(
+                source
+                    .iter()
+                    .filter(|r| r["method"] == "Runtime.evaluate")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                source
+                    .iter()
+                    .filter(|r| r["params"]["functionDeclaration"]
+                        == "function(){return this.verify()}")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                source
+                    .iter()
+                    .filter(|r| r["params"]["functionDeclaration"]
+                        == "function(selector,...nodes){return this.install(selector,nodes)}")
+                    .count(),
+                1
+            );
+            for method in [
+                "function(){return this.remove()}",
+                "Runtime.releaseObjectGroup",
+            ] {
+                assert_eq!(
+                    source
+                        .iter()
+                        .filter(|r| r["params"]["functionDeclaration"] == method
+                            || r["method"] == method)
+                        .count(),
+                    usize::from(case == Case::OptionalScreenshotShortDeadline)
+                );
+            }
+        } else {
+            assert!(!log.iter().any(|r| r["method"] == "Page.captureScreenshot"
+                || r["params"]["objectGroup"]
+                    .as_str()
+                    .is_some_and(|g| g.starts_with("capture-source-"))));
+        }
         assert_eq!(
             log.iter()
                 .filter(|r| r["method"] == "Animation.setPlaybackRate"
                     && r["params"]["playbackRate"].as_f64() == Some(1.0))
                 .count(),
-            1
+            usize::from(case != Case::MissingScreenshotAck)
         );
     }
     assert_eq!(
@@ -350,6 +515,7 @@ async fn optional_mask_retirement(case: Case) {
             case,
             Case::CancelUnacknowledgedObject
                 | Case::CancelShortUnacknowledgedObject
+                | Case::MissingScreenshotAck
                 | Case::CancelDirtyRestore
                 | Case::CancelShortDirtyRestore
         )
@@ -533,4 +699,18 @@ async fn eighty_ms_resource_mask_without_ack_remains_cleanup_failed_after_parent
 #[tokio::test]
 async fn eighty_ms_cancelled_mask_dirty_restore_retains_cleanup_uncertainty() {
     optional_mask_retirement(Case::CancelShortDirtyRestore).await;
+}
+
+// The existing exact-client notification is available in the hosted acceptance
+// harness. These test-only cases hold actual Page.captureScreenshot responses.
+#[cfg(feature = "acceptance-faults")]
+#[tokio::test]
+async fn optional_screenshot_eighty_ms_clean_late_ack_keeps_complete_tree_without_pixels() {
+    optional_mask_retirement(Case::OptionalScreenshotShortDeadline).await;
+}
+
+#[cfg(feature = "acceptance-faults")]
+#[tokio::test]
+async fn optional_screenshot_eighty_ms_missing_ack_publishes_nothing_and_preserves_custody() {
+    optional_mask_retirement(Case::MissingScreenshotAck).await;
 }

@@ -2942,6 +2942,126 @@ impl ClientEnrollment {
         }
         Ok(())
     }
+    pub(crate) fn validate_media_owner(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        active: &OwnedTarget,
+    ) -> Result<(), ProtocolError> {
+        self.check_restart_operation(op)?;
+        page.permit.check()?;
+        if !Arc::ptr_eq(&page.client, &self.client)
+            || !Arc::ptr_eq(&page.targets, &self.targets)
+            || page.identity_scope != self.targets.identity_scope
+            || *self.client.remote_connection_closed().borrow()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let root = index
+            .sessions
+            .get(&page.page_session_id)
+            .ok_or(ProtocolError::StaleReference)?;
+        if root.target != page.target_id
+            || root.kind != "page"
+            || root.root != root.session
+            || !root.application
+            || root.observation_only
+            || !root.resumed
+            || *self
+                .active_root
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                != root.session
+            || active.target_id != root.target
+            || active.session_id != root.session
+            || !active.capture_ready()
+            || !self
+                .targets
+                .owned_target(&root.target)?
+                .same_attachment(active)
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        Ok(())
+    }
+    /// Media configuration holds config_gate. Drain only the fixed reader
+    /// watermark already received at failure, never pending enrollment (which
+    /// may itself be waiting for that gate) or an indefinitely moving watermark.
+    pub(crate) async fn media_target_detached(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        active: &OwnedTarget,
+        ticket: &OwnedTarget,
+    ) -> Result<bool, ProtocolError> {
+        self.validate_media_owner(page, op, active)?;
+        if ticket.kind != "page"
+            || ticket.session_id == page.page_session_id
+            || ticket.target_id == page.target_id
+        {
+            return Ok(false);
+        }
+        let watermark = self.realm_watermark()?;
+        let received = watermark
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        bounded(op, async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                self.check()?;
+                if self
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    .applied_watermark
+                    >= received
+                {
+                    return Ok(());
+                }
+                changed.await;
+            }
+        })
+        .await?;
+        // Recheck subscription health without extending the fixed drain target.
+        watermark
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.validate_media_owner(page, op, active)?;
+        if let Some(ledger) = self.client.debt_ledger() {
+            let journal = super::client_debt::OperationJournalHandle::current()
+                .ok_or(ProtocolError::ScopeUnavailable)?;
+            let key = journal.key();
+            let state = journal.snapshot();
+            if !Arc::ptr_eq(&ledger, &journal.ledger())
+                || !ledger.matches_owner(op.generation, &page.identity_scope)
+                || key.generation != op.generation
+                || key.operation_seq != op.sequence
+                || state.integrity_lost
+                || state.submission_revoked
+                || state.input_debt != 0
+                || state.object_debt != 0
+            {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            journal.check_application_submission()?;
+        }
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if index.sessions.values().any(|current| {
+            current.target == ticket.target_id || current.session == ticket.session_id
+        }) {
+            return Ok(false);
+        }
+        self.targets.media_attachment_detached(ticket)
+    }
     pub(crate) async fn flush_app_events(
         &self,
         page: &BrowserExecutionLease,
@@ -5332,6 +5452,15 @@ impl ClientEnrollment {
                     .lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?;
                 if let Some(entry) = index.sessions.get(session) {
+                    if entry.kind == "page" && entry.application && !entry.observation_only {
+                        if let Some(target) = event.params.get("targetId") {
+                            if target.as_str() != Some(entry.target.as_str()) {
+                                return Err(ProtocolError::InvalidFrame);
+                            }
+                        }
+                        self.targets
+                            .observe_media_detach(&entry.target, &entry.session)?;
+                    }
                     if entry.kind == "service_worker" && !entry.observation_only {
                         // An omitted targetId is valid CDP; a conflicting or
                         // malformed supplied value cannot prove exact detach.
@@ -6290,6 +6419,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
     type Log = Arc<Mutex<Vec<Value>>>;
     type Notices = tokio::sync::mpsc::Receiver<ServerMessage>;
+    include!("client_media_detach_tests.rs");
     include!("client_restart_readiness_tests.rs");
     include!("client_viewport_replacement_tests.rs");
     include!("client_eval_network_watermark_tests.rs");

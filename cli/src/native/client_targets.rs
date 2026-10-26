@@ -29,6 +29,8 @@ pub struct OwnedTarget {
 }
 #[derive(Debug, Default)]
 struct AttachmentTenure {
+    owner: Arc<()>,
+    observed_media_detach: AtomicBool,
     observed_detach: AtomicBool,
 }
 impl OwnedTarget {
@@ -290,6 +292,7 @@ pub struct ClientTargets {
     pub context_id: String,
     pub identity_scope: String,
     state: Mutex<Registry>,
+    attachment_owner: Arc<()>,
     eval_owner: std::sync::OnceLock<std::sync::Weak<super::client_debt::OwnerDebtLedger>>,
     changed: Notify,
     #[cfg(test)]
@@ -570,6 +573,7 @@ impl ClientTargets {
             context_id,
             identity_scope,
             state: Mutex::new(Registry::default()),
+            attachment_owner: Arc::new(()),
             eval_owner: std::sync::OnceLock::new(),
             changed: Notify::new(),
             #[cfg(test)]
@@ -1133,7 +1137,10 @@ impl ClientTargets {
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
             let diagnostic = state.diagnostic_attachment(&target_id);
-            let tenure = Arc::new(AttachmentTenure::default());
+            let tenure = Arc::new(AttachmentTenure {
+                owner: self.attachment_owner.clone(),
+                ..Default::default()
+            });
             let observed_tenure = diagnostic::inventory_enabled().then(|| tenure.clone());
             state.targets.insert(
                 target_id.clone(),
@@ -1336,6 +1343,49 @@ impl ClientTargets {
             }
         }
         Ok(())
+    }
+    /// Only the directly matched application page may carry this receipt.
+    /// Registry removal or a cascaded descendant detach is not equivalent proof.
+    pub(super) fn observe_media_detach(
+        &self,
+        target: &str,
+        session: &str,
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(entry) = state.targets.get(target) {
+            if entry.kind == "page"
+                && entry.purpose == Some(TargetPurpose::Application)
+                && entry.session_id == session
+            {
+                entry
+                    .tenure
+                    .observed_media_detach
+                    .store(true, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+    pub(crate) fn media_attachment_detached(
+        &self,
+        ticket: &OwnedTarget,
+    ) -> Result<bool, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed || state.integrity_lost {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(Arc::ptr_eq(&self.attachment_owner, &ticket.tenure.owner)
+            && ticket.kind == "page"
+            && ticket.capture_ready()
+            && ticket.tenure.observed_media_detach.load(Ordering::Acquire)
+            && !state.targets.values().any(|current| {
+                current.target_id == ticket.target_id || current.session_id == ticket.session_id
+            }))
     }
     pub fn detach(&self, target_id: &str) -> Result<(), ProtocolError> {
         let observed = self.eval_invalidation(|revoke| {
@@ -2166,6 +2216,75 @@ impl Drop for CreationReservation {
 #[cfg(test)]
 mod tests {
     use super::{ClientTargets, ProtocolError};
+
+    #[tokio::test]
+    async fn media_detach_receipt_is_bound_to_registry_tenure_and_direct_ready_page() {
+        for mode in [
+            "exact",
+            "missing",
+            "wrong-session",
+            "replacement",
+            "foreign-owner",
+            "iframe",
+            "pending",
+            "sealed",
+        ] {
+            let targets = ClientTargets::new("ctx".into(), "scope".into());
+            let kind = if mode == "iframe" { "iframe" } else { "page" };
+            targets
+                .attached("ctx", "tab".into(), "session".into(), kind.into())
+                .unwrap();
+            if mode != "pending" {
+                targets.configured("tab").unwrap();
+                targets
+                    .resume_permit("tab")
+                    .await
+                    .unwrap()
+                    .complete()
+                    .unwrap();
+            }
+            let original = targets.owned_target("tab").unwrap();
+            if mode != "missing" {
+                targets
+                    .observe_media_detach(
+                        "tab",
+                        if mode == "wrong-session" {
+                            "other"
+                        } else {
+                            "session"
+                        },
+                    )
+                    .unwrap();
+            }
+            assert!(
+                !targets.media_attachment_detached(&original).unwrap(),
+                "a live entry is not retired: {mode}"
+            );
+            targets.detach("tab").unwrap();
+            if mode == "replacement" {
+                targets
+                    .attached("ctx", "tab".into(), "session".into(), "page".into())
+                    .unwrap();
+                assert!(!targets
+                    .owned_target("tab")
+                    .unwrap()
+                    .same_attachment(&original));
+            }
+            if mode == "sealed" {
+                targets.seal();
+                assert!(targets.media_attachment_detached(&original).is_err());
+            } else if mode == "foreign-owner" {
+                let foreign = ClientTargets::new("ctx".into(), "scope".into());
+                assert!(!foreign.media_attachment_detached(&original).unwrap());
+            } else {
+                assert_eq!(
+                    targets.media_attachment_detached(&original).unwrap(),
+                    mode == "exact",
+                    "{mode}"
+                );
+            }
+        }
+    }
 
     fn startup_worker() -> std::sync::Arc<ClientTargets> {
         let targets = ClientTargets::new("ctx".into(), "scope".into());

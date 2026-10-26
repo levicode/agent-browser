@@ -1975,6 +1975,18 @@ pub(super) fn settle_observation_dispatch(
     (outcome, cleanup_failed)
 }
 
+pub(super) fn protected_read_receipt_eligible(
+    request: &super::client_observation_dispatch::DispatchRequest,
+) -> bool {
+    use super::client_observation_dispatch::DispatchRequest;
+    matches!(
+        request,
+        DispatchRequest::Observe(_)
+            | DispatchRequest::Screenshot(_)
+            | DispatchRequest::TraceSemantic(_)
+    )
+}
+
 pub(super) fn settle_trace_screenshot(
     mut outcome: super::client_transport::NativeOutcome,
     dirty: bool,
@@ -1987,10 +1999,21 @@ pub(super) fn settle_trace_screenshot(
         outcome.retention = None;
         return (outcome, true);
     }
-    // Trace uses only native read/protection commands. A joined, clean producer
+    settle_protected_read(outcome, dirty, trace_screenshot, expected)
+}
+
+/// Joined native protection is not uncertain application input. The exact
+/// operation must prove restoration and discharge every owned remote obligation.
+pub(super) fn settle_protected_read(
+    mut outcome: super::client_transport::NativeOutcome,
+    dirty: bool,
+    eligible: bool,
+    expected: &super::client_debt::OperationJournalHandle,
+) -> (super::client_transport::NativeOutcome, bool) {
+    // Eligible dispatches use native read/protection commands. A joined producer
     // has restored its temporary changes; those are not uncertain user input.
     // The read still fails and never publishes late pixels or a continuation.
-    if trace_screenshot
+    if eligible
         && !dirty
         && outcome.result.is_err()
         && outcome.effects == super::client_protocol::Effects::NotDispatched
@@ -3166,6 +3189,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let trace_screenshot = matches!(&request, DispatchRequest::Screenshot(request)
                             if request.purpose == super::client_observation_dispatch::ScreenshotPurpose::Trace);
                         let semantic_trace = matches!(&request, DispatchRequest::TraceSemantic(_));
+                        let protected_receipt = protected_read_receipt_eligible(&request);
                         let prepared = observation.prepare(context, request, lease)?;
                         Ok(async move {
                             let task = observation.start_prepared(prepared);
@@ -3184,7 +3208,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                     });
                                 }
                             }
-                            settle_trace_screenshot(outcome, dirty, trace_screenshot || semantic_trace, &receipt_journal)
+                            let (outcome, dirty) = settle_trace_screenshot(outcome, dirty, trace_screenshot || semantic_trace, &receipt_journal);
+                            settle_protected_read(outcome, dirty, protected_receipt, &receipt_journal)
                         })
                     },
                 )
@@ -3945,7 +3970,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             dispatched = true;
                             return Ok(serde_json::json!({"activated": true}));
                         }
-                        let sessions = page
+                        let attachments = page
                             .targets
                             .inventory()?
                             .1
@@ -3955,8 +3980,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                     == Some(super::client_targets::TargetPurpose::Application)
                                     && matches!(target.kind.as_str(), "page" | "iframe")
                             })
-                            .map(|target| target.session_id)
                             .collect::<Vec<_>>();
+                        let sessions = attachments.iter().map(|target| target.session_id.clone()).collect::<Vec<_>>();
                         if command == "page.navigate" {
                             super::client_page::ClientPageState::validate_navigation(&serde_json::Value::Object(args.clone()))?;
                             activation.ensure(&page, &lease, &mut dispatched).await?;
@@ -3985,9 +4010,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         } else { None };
                         dispatched = true;
                         let arguments = serde_json::Value::Object(args);
-                        let execution = page_state.execute_with_retirement(
-                            &page, &sessions, &lease, &command, &arguments, &dispatch_tasks,
-                        );
+                        let execution = async {
+                            if command == "context.media" {
+                                (page_state.execute_media_with_owner(
+                                    &page, &lease, &arguments, &enrollment, &attachments,
+                                ).await, None)
+                            } else {
+                                page_state.execute_with_retirement(
+                                    &page, &sessions, &lease, &command, &arguments, &dispatch_tasks,
+                                ).await
+                            }
+                        };
                         let (output, interruption) = if let Some(grant) = eval_grant {
                             super::client_debt::eval_command_scope(grant, execution).await
                         } else { execution.await };

@@ -792,6 +792,87 @@ impl ClientPageState {
         }
         Ok(())
     }
+    fn update_media(&self, args: &Value) -> Result<(), ProtocolError> {
+        if ["colorScheme", "reducedMotion"]
+            .iter()
+            .any(|key| args.get(*key) == Some(&Value::Null))
+        {
+            return invalid();
+        }
+        let a: Media = decode(args)?;
+        if a.color_scheme
+            .as_ref()
+            .is_some_and(|v| !matches!(v.as_str(), "light" | "dark" | "no-preference"))
+            || a.reduced_motion
+                .as_ref()
+                .is_some_and(|v| !matches!(v.as_str(), "reduce" | "no-preference"))
+        {
+            return invalid();
+        }
+        {
+            let mut s = self.state()?;
+            let revision = s
+                .config
+                .revision
+                .checked_add(1)
+                .ok_or(ProtocolError::IdentifierExhausted)?;
+            if let Some(journal) = OperationJournalHandle::current() {
+                journal.mark_mutation_maybe_submitted()?;
+            }
+            s.config.revision = revision;
+            if a.color_scheme.is_some() {
+                s.config.color_scheme = a.color_scheme;
+            }
+            if a.reduced_motion.is_some() {
+                s.config.reduced_motion = a.reduced_motion;
+            }
+        }
+        Ok(())
+    }
+    /// Production media uses the original attachment tickets, not a later
+    /// session lookup, to prove that a failed non-active tab really departed.
+    pub(crate) async fn execute_media_with_owner(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        args: &Value,
+        enrollment: &super::client_enrollment::ClientEnrollment,
+        attachments: &[super::client_targets::OwnedTarget],
+    ) -> Result<Value, ProtocolError> {
+        self.validate(page, op)?;
+        let active = attachments
+            .iter()
+            .find(|target| {
+                target.target_id == page.target_id && target.session_id == page.page_session_id
+            })
+            .ok_or(ProtocolError::StaleReference)?;
+        enrollment.validate_media_owner(page, op, active)?;
+        self.update_media(args)?;
+        let result = async {
+            let mut unique = BTreeSet::new();
+            for target in std::iter::once(active).chain(attachments.iter()) {
+                if !unique.insert(target.session_id.as_str()) {
+                    continue;
+                }
+                match self
+                    .apply_to_new_session(page, &target.session_id, op)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(ProtocolError::BrowserFailure)
+                        if enrollment
+                            .media_target_detached(page, op, active, target)
+                            .await? => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            self.validate(page, op)?;
+            enrollment.validate_media_owner(page, op, active)?;
+            Ok(Value::Null)
+        }
+        .await;
+        result.map_err(configuration_incomplete)
+    }
     /// Production navigation keeps cleanup in the already registered producer.
     /// Other callers retain the existing result-only primitive below.
     pub(crate) async fn execute_with_retirement(
@@ -982,42 +1063,8 @@ impl ClientPageState {
                 Ok(Value::Null)
             }
             "context.media" => {
-                if ["colorScheme", "reducedMotion"]
-                    .iter()
-                    .any(|key| args.get(*key) == Some(&Value::Null))
-                {
-                    return invalid();
-                }
-                let a: Media = decode(args)?;
-                if a.color_scheme
-                    .as_ref()
-                    .is_some_and(|v| !matches!(v.as_str(), "light" | "dark" | "no-preference"))
-                    || a.reduced_motion
-                        .as_ref()
-                        .is_some_and(|v| !matches!(v.as_str(), "reduce" | "no-preference"))
-                {
-                    return invalid();
-                }
-                {
-                    let mut s = self.state()?;
-                    let revision = s
-                        .config
-                        .revision
-                        .checked_add(1)
-                        .ok_or(ProtocolError::IdentifierExhausted)?;
-                    if let Some(journal) = OperationJournalHandle::current() {
-                        journal.mark_mutation_maybe_submitted()?;
-                    }
-                    s.config.revision = revision;
-                    if a.color_scheme.is_some() {
-                        s.config.color_scheme = a.color_scheme;
-                    }
-                    if a.reduced_motion.is_some() {
-                        s.config.reduced_motion = a.reduced_motion;
-                    }
-                }
-                // The active page receives media first; retain inventory order
-                // for other sessions and the existing per-session deduplication.
+                self.update_media(args)?;
+                // The ownerless primitive keeps strict failure propagation.
                 let ordered = std::iter::once(page.page_session_id.clone())
                     .chain(sessions.iter().cloned())
                     .collect::<Vec<_>>();

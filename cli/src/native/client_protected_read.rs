@@ -552,6 +552,19 @@ mod tests {
         tokio::task::JoinHandle<()>,
         Arc<std::sync::Mutex<Vec<Value>>>,
     ) {
+        journal_fixture_with_restore_mode(fail_restore, stale_during_restore, false).await
+    }
+    async fn journal_fixture_with_restore_mode(
+        fail_restore: bool,
+        stale_during_restore: bool,
+        omit_restore_ack: bool,
+    ) -> (
+        super::super::client_browser::BrowserExecutionLease,
+        super::super::client_session::OperationLease,
+        tokio::sync::watch::Sender<super::super::client_session::CancelSignal>,
+        tokio::task::JoinHandle<()>,
+        Arc<std::sync::Mutex<Vec<Value>>>,
+    ) {
         use super::super::client_session::{CancelSignal, OperationLease};
         use super::super::client_targets::ClientTargets;
         use futures_util::{SinkExt, StreamExt};
@@ -583,6 +596,14 @@ mod tests {
                 };
                 let request: Value = serde_json::from_str(&text).unwrap();
                 recorded.lock().unwrap().push(request.clone());
+                if omit_restore_ack
+                    && request["method"] == "Animation.setPlaybackRate"
+                    && request["params"]["playbackRate"].as_f64() == Some(1.0)
+                {
+                    // A submitted cleanup command is intentionally never ACKed.
+                    // Its existing absolute cleanup deadline must fail closed.
+                    continue;
+                }
                 let mut response = json!({"id":request["id"],"sessionId":request["sessionId"],"result":if request["method"]=="Animation.getPlaybackRate" {json!({"playbackRate":1})} else {json!({})}});
                 if request["method"] == "DOM.resolveNode" {
                     response["result"] = json!({"object":{"objectId":"holder"}});
@@ -831,6 +852,259 @@ mod tests {
                 .any(|request| request["method"] == "Runtime.releaseObjectGroup"));
             client.close().await;
             server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_read_policy_failure_uses_actual_dispatch_selector_and_clean_restore() {
+        use super::super::client_browser::{
+            protected_read_receipt_eligible, settle_observation_dispatch, settle_protected_read,
+        };
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_observation_dispatch::{
+            DispatchFailure, DispatchRequest, ObserveFlags, ObserveRequest, QueryPurpose,
+            QueryRequest, ScreenshotPurpose, ScreenshotRequest,
+        };
+        // Same selector used by prepared production dispatch; no test-provided
+        // eligibility boolean. The protection/restore and retained settlement
+        // below are real, while the policy-failure payload is synthetic.
+        for kind in ["observe", "observe-pixels", "screenshot", "query"] {
+            use super::super::client_protocol::{Effects, ProtocolError, ScopeState};
+            for mode in [
+                "clean",
+                "earlier-cleanup",
+                "dirty-join",
+                "unknown",
+                "object-debt",
+                "restore-loss",
+                "missing-restore-ack",
+                "foreign-journal",
+                "foreign-key",
+            ] {
+                let request = if kind == "query" {
+                    DispatchRequest::Query(QueryRequest {
+                        options: super::super::client_observation::QueryOptions {
+                            expression:
+                                super::super::client_observation::LocatorExpression::Selector {
+                                    selector: "main".into(),
+                                },
+                            test_id_attribute: "data-testid".into(),
+                            secure_field_selector: "[data-secure]".into(),
+                        },
+                        purpose: QueryPurpose::Protected,
+                    })
+                } else if kind == "screenshot" {
+                    DispatchRequest::Screenshot(ScreenshotRequest {
+                        secure_field_selector: "[data-secure]".into(),
+                        purpose: ScreenshotPurpose::PixelsOnly,
+                    })
+                } else {
+                    DispatchRequest::Observe(ObserveRequest {
+                        options: ObserveFlags {
+                            pixels: kind == "observe-pixels",
+                            ..Default::default()
+                        },
+                        test_id_attribute: "data-testid".into(),
+                        secure_field_selector: "[data-secure]".into(),
+                    })
+                };
+                if kind == "query" {
+                    assert!(!protected_read_receipt_eligible(&request));
+                }
+                let (page, _unused_operation, _sender, server, requests) =
+                    journal_fixture_with_restore_mode(
+                        mode == "restore-loss",
+                        false,
+                        mode == "missing-restore-ack",
+                    )
+                    .await;
+                let broker = Arc::new(super::super::client_session::ClientSession::new());
+                let operation = broker.admit(1, 1, 5_000).unwrap();
+                assert!(broker.start(1, 1).unwrap());
+                let ledger = OwnerDebtLedger::new(1, "scope".into());
+                page.client.install_debt_ledger(ledger.clone()).unwrap();
+                let key = OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                };
+                let journal = ledger
+                    .operation(key, "target".into(), "session".into())
+                    .unwrap();
+                journal.bind_operation(&operation).unwrap();
+                let tasks = Arc::new(super::super::client_tasks::RetainedTasks::default());
+                let task_owner = tasks.clone();
+                let receipt_journal = journal.clone();
+                let proof_journal = if mode == "foreign-journal" {
+                    OwnerDebtLedger::new(1, "scope".into())
+                        .operation(key, "target".into(), "session".into())
+                        .unwrap()
+                } else if mode == "foreign-key" {
+                    ledger
+                        .operation(
+                            OperationKey {
+                                generation: 1,
+                                operation_seq: 2,
+                            },
+                            "target".into(),
+                            "session".into(),
+                        )
+                        .unwrap()
+                } else {
+                    journal.clone()
+                };
+                let targets = page.targets.clone();
+                let client = page.client.clone();
+                let receive = tasks
+                    .start_operation(
+                        "scope".into(),
+                        targets,
+                        broker.clone(),
+                        journal.clone(),
+                        operation.cancellation.clone(),
+                        async move {
+                            let mut protected =
+                                super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+                            protected.stabilize_animations().await.unwrap();
+                            protected
+                                .reserve_source_group("session".into(), "native-mask".into())
+                                .unwrap();
+                            let acquired = super::super::client_debt::native_object_group(
+                                "native-mask",
+                                super::super::client_debt::command_scope(
+                                    super::super::client_debt::CommandCategory::ApplicationObject,
+                                    false,
+                                    page.client.send_command(
+                                        "DOM.resolveNode",
+                                        Some(
+                                            json!({"backendNodeId":1,"objectGroup":"native-mask"}),
+                                        ),
+                                        Some("session"),
+                                    ),
+                                ),
+                            )
+                            .await
+                            .unwrap();
+                            protected
+                                .bind_source_holder(
+                                    "session",
+                                    "native-mask",
+                                    acquired["object"]["objectId"].as_str().unwrap().into(),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                receipt_journal.snapshot().object_debt,
+                                1,
+                                "actual native group must remain charged before restore"
+                            );
+                            assert!(
+                                receipt_journal.snapshot().mutation_dispatched,
+                                "real CDP stabilization must supply dispatch evidence"
+                            );
+                            let debt = if mode == "object-debt" {
+                                Some(
+                                    receipt_journal
+                                        .register_remote_obligation(
+                                            "Runtime.evaluate",
+                                            Some(&json!({"expression":"0","returnByValue":true})),
+                                            Some("session"),
+                                        )
+                                        .unwrap()
+                                        .submit()
+                                        .unwrap(),
+                                )
+                            } else {
+                                None
+                            };
+                            let deadline = if mode == "earlier-cleanup" {
+                                protected.begin_cleanup()
+                            } else {
+                                task_owner.begin_protected_cleanup(key).unwrap()
+                            };
+                            assert_eq!(protected.begin_cleanup(), deadline);
+                            assert_eq!(task_owner.begin_protected_cleanup(key), Some(deadline));
+                            let restored = protected.restore().await;
+                            drop(protected);
+                            if mode == "object-debt" {
+                                assert!(receipt_journal.snapshot().object_debt > 0);
+                            }
+                            let (mut outcome, dirty) = settle_observation_dispatch(
+                                Ok(Err(DispatchFailure {
+                                    error: ProtocolError::PolicyDenied,
+                                    identity_scope: "scope".into(),
+                                    cleanup_integrity_lost: restored.is_err(),
+                                })),
+                                Ok(if mode == "dirty-join" {
+                                    Err(DispatchFailure {
+                                        error: ProtocolError::CleanupFailed,
+                                        identity_scope: "scope".into(),
+                                        cleanup_integrity_lost: true,
+                                    })
+                                } else {
+                                    Ok(())
+                                }),
+                            );
+                            if mode == "unknown" {
+                                outcome.effects = Effects::Unknown;
+                            }
+                            let settled = settle_protected_read(
+                                outcome,
+                                dirty,
+                                protected_read_receipt_eligible(&request),
+                                &proof_journal,
+                            );
+                            // Keep an actual submitted object obligation through this proof
+                            // decision. Dropping its waiter cannot settle reader-owned debt.
+                            drop(debt);
+                            settled
+                        },
+                    )
+                    .await
+                    .unwrap();
+                let outcome = receive.await.unwrap();
+                let clean = kind != "query" && (mode == "clean" || mode == "earlier-cleanup");
+                // Ordinary reads preserve the first policy error even when
+                // restoration/join separately fails. Unknown and dirty still
+                // quarantine; trace-specific error rewriting is not borrowed.
+                assert_eq!(
+                    outcome.result,
+                    Err(ProtocolError::PolicyDenied),
+                    "{kind}/{mode}"
+                );
+                assert_eq!(
+                    outcome.effects,
+                    if clean {
+                        Effects::Completed
+                    } else {
+                        Effects::Unknown
+                    },
+                    "{kind}/{mode}"
+                );
+                if clean {
+                    assert!(outcome.retention.is_none());
+                    assert!(journal.clean_protected_read());
+                }
+                assert_eq!(
+                    broker.settle(1, 1, outcome.effects).unwrap(),
+                    if clean {
+                        ScopeState::Usable
+                    } else {
+                        ScopeState::Quarantined
+                    },
+                    "{kind}/{mode}"
+                );
+                assert_eq!(
+                    tasks.drain_current().await.is_ok(),
+                    !matches!(mode, "dirty-join" | "restore-loss" | "missing-restore-ack"),
+                    "{kind}/{mode}"
+                );
+                assert!(requests
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["method"] == "Runtime.releaseObjectGroup"));
+                client.close().await;
+                server.await.unwrap();
+            }
         }
     }
 

@@ -841,6 +841,105 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    const title=root.getAttribute('title')||'';
    return title.length<=512?title.trim():null;
  }
+ // Public role queries promise the same authored name as the observation.
+ // Chromium AX inserts separators around inline alternatives and supplies a
+ // range's default property value. This bounded proof handles only ordinary
+ // button content/IDREFs, where those differ from the promised selector rules.
+ // A native full-document inventory must exclude ALL author shadow roots first;
+ // unsupported controls, generated content, ownership, or bounds decline to AX.
+ function completePublicButtonName(root){
+   let count=0;const visited=new Set();
+   const bounded=value=>typeof value==='string'&&value.length<=512?value:null;
+   const hidden=n=>{const css=doc.defaultView.getComputedStyle(n);return (n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden';};
+   function hiddenReference(n){
+     // Positive CSS/ARIA exclusion reads the target whole. Otherwise require
+     // an ordinary visible box; skipped/flat-tree visibility is outside this
+     // narrow proof. A hidden ancestor's visibility may be overridden by n.
+     let depth=0;
+     for(let p=n;p;p=p.parentElement){
+       if(++depth>64||++count>512)return null;
+       const css=doc.defaultView.getComputedStyle(p);
+       if((p.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none')return true;
+       if(p===n&&css.visibility==='hidden')return true;
+       if(css.visibility!=='visible'||['hidden','auto'].includes(css.contentVisibility)||p.localName==='details'&&!p.open)return null;
+     }
+     const rect=n.getBoundingClientRect();
+     return rect.width>0&&rect.height>0?false:null;
+   }
+   function references(n,depth,inReference){
+     if(inReference)return {used:false};
+     const attribute=n.getAttribute('aria-labelledby')||'';
+     if(attribute.length>4096)return null;
+     if(!attribute.trim())return {used:false};
+     if(Node.prototype.getRootNode.call(n)!==doc)return null;
+     const ids=attribute.trim().split(/\s+/);if(ids.length>32)return null;
+     const names=[];let length=0;
+     for(const id of ids){
+       const target=doc.getElementById(id);if(!target)continue;
+       const allowHidden=hiddenReference(target);if(allowHidden===null)return null;
+       const value=token(target,depth+1,true,allowHidden);if(value===null)return null;
+       length+=value.length+(names.length?1:0);if(length>512)return null;names.push(value);
+     }
+     const raw=names.join(' ');return raw===''?{used:false}:{used:true,name:normalize(raw)};
+   }
+   function children(n,depth,inReference,allowHidden){
+     if(n.childNodes.length>512-count)return null;
+     let out='';
+     for(const child of n.childNodes){
+       // Comments do not contribute to a content name.
+       if(child.nodeType===8)continue;
+       const value=token(child,depth+1,inReference,allowHidden);if(value===null)return null;
+       const block=child.nodeType===1&&(child.localName==='br'||doc.defaultView.getComputedStyle(child).display!=='inline');
+       if(out.length+value.length+(block?2:0)>512)return null;
+       out+=block?' '+value+' ':value;
+     }
+     return out;
+   }
+   function token(n,depth,inReference,allowHidden){
+     if(++count>512||depth>64)return null;
+     if(n.nodeType===3)return bounded(n.nodeValue||'');
+     if(n.nodeType!==1||composedSecure(n)||n.shadowRoot||n.isContentEditable||n.hasAttribute('contenteditable')||n.hasAttribute('aria-owns'))return null;
+     if(visited.has(n))return '';visited.add(n);
+     if(!allowHidden&&hidden(n))return '';
+     for(const pseudo of ['::before','::after']){const value=doc.defaultView.getComputedStyle(n,pseudo).content;if(value!=='none'&&value!=='normal'&&value!=='')return null;}
+     const reference=references(n,depth,inReference);if(reference===null)return null;if(reference.used)return reference.name;
+     const tag=n.localName,role=n.getAttribute('role');
+     // A range uses authored ARIA/value attributes, never the browser's default
+     // .value property. A self-reference is naming, not an embedded value.
+     const selfReference=n.id&&(n.getAttribute('aria-labelledby')||'').trim().split(/\s+/).includes(n.id);
+     const range=!selfReference&&((tag==='input'&&n instanceof HTMLInputElement&&['range','number'].includes(n.type)&&!role)||(['progress','meter'].includes(tag)&&!role)||['slider','spinbutton','progressbar','scrollbar','meter'].includes(role));
+     if(range)return bounded(n.getAttribute('aria-valuetext')??n.getAttribute('aria-valuenow')??n.getAttribute('value')??'');
+     // Other embedded controls deliberately remain Chromium's responsibility.
+     if(['input','textarea','select','button'].includes(tag)&&!(tag==='input'&&n instanceof HTMLInputElement&&n.type==='image'))return null;
+     if(role&&!['img','presentation','none'].includes(role))return null;
+     const aria=n.getAttribute('aria-label');if(aria&&aria.trim())return bounded(aria.trim());
+     if(tag==='img'||tag==='input'){
+       const alt=n.getAttribute('alt');if(alt&&alt.trim())return bounded(alt.trim());
+       // Empty-image/title edge cases are outside this alternative proof.
+       return null;
+     }
+     if(tag==='svg'){
+       if(n.childNodes.length>512-count)return null;
+       const title=Array.from(n.childNodes).find(child=>child.nodeType===1&&child.localName==='title');
+       if(!title)return n.childNodes.length===0?'':null;
+       if(composedSecure(title)||title.childNodes.length>512-count)return null;
+       let out='';for(const child of title.childNodes){if(++count>512||child.nodeType!==3)return null;const value=bounded(child.nodeValue||'');if(value===null||out.length+value.length>512)return null;out+=value;}
+       const name=normalize(out);return name||null;
+     }
+     if(!['span','div','p','label','abbr','b','strong','em','i','small','br','title'].includes(tag))return null;
+     const content=children(n,depth,inReference,allowHidden);if(content===null||content!=='')return content;
+     return bounded((n.getAttribute('title')||'').trim());
+   }
+   if(composedSecure(root)||root.shadowRoot||root.isContentEditable||root.hasAttribute('contenteditable')||root.hasAttribute('aria-owns'))return null;
+   for(const pseudo of ['::before','::after']){const value=doc.defaultView.getComputedStyle(root,pseudo).content;if(value!=='none'&&value!=='normal'&&value!=='')return null;}
+   const reference=references(root,0,false);if(reference===null)return null;
+   if(reference.used)return {source:'reference',name:reference.name};
+   if(root.hasAttribute('aria-labelledby')||root.hasAttribute('aria-label')||hidden(root))return null;
+   visited.add(root);
+   const content=children(root,0,false,false);if(content===null)return null;
+   const name=normalize(content)||bounded((root.getAttribute('title')||'').trim());
+   return name===null?null:{source:'content',name};
+ }
  // One explicit content shape only: an ordinary link, whitespace, and one
  // SVG whose sole element child is a plain direct title. Do not relax the SVG
  // rejection in either general simple-label or native-button proofs.
@@ -1004,6 +1103,10 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  if(simpleNameInventory&&e instanceof HTMLButtonElement&&e.localName==='button'&&!secure&&!secureDescendants&&!protectedEditor&&
    associated.length===0&&!e.hasAttribute('aria-label')&&!e.hasAttribute('aria-labelledby')&&
    (!e.hasAttribute('role')||e.getAttribute('role')==='button'))completeButtonContentName=completeContentName(e);
+ let completePublicButtonNameFact=null;
+ if(simpleNameInventory&&e instanceof HTMLElement&&!secure&&!secureDescendants&&!protectedEditor&&associated.length===0&&
+   (e instanceof HTMLButtonElement&&(!e.hasAttribute('role')||e.getAttribute('role')==='button')||e.getAttribute('role')==='button')&&
+   completeButtonContentName===null)completePublicButtonNameFact=completePublicButtonName(e);
  let simpleAssociatedName=null;
  if(simpleNameInventory&&e&&!secure&&!protectedEditor&&associated.length>0&&associated.length<=32&&
    !(e.getAttribute('aria-label')||'').trim()&&!(e.getAttribute('aria-labelledby')||'').trim()){
@@ -1122,10 +1225,11 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const decorativeImage=tag==='img'&&e.getAttribute('alt')===''&&!e.getAttribute('title')&&!hasGlobalAria(null)&&!numericTabIndex;
  const selectListbox=tag==='select'&&(e.hasAttribute('multiple')||e.size>1);
  const inputDatalist=tag==='input'&&e instanceof HTMLInputElement&&e.list!==null&&['text','search','tel','url','email'].includes(e.type);
- // A presentation conflict can leave this receiver absent from AX. Only local
- // neighbors contribute this scalar fallback; no table/name reader is added.
+ // Public header semantics depend on immediate authored neighbors, not AX
+ // table-layout heuristics. The same bounded scalar also repairs AX omission
+ // under a presentation conflict; no table/name reader is added.
  let conflictHeaderRole=null;
- if(tag==='th'&&presentationConflict&&!singleCellHeader&&!['row','rowgroup','col','colgroup'].includes((e.getAttribute('scope')||'').toLowerCase())){
+ if(tag==='th'&&!singleCellHeader&&!['row','rowgroup','col','colgroup'].includes((e.getAttribute('scope')||'').toLowerCase())){
    const previous=e.previousElementSibling,next=e.nextElementSibling;
    let populated=false;
    if(previous?.localName!=='th'||next?.localName!=='th'){
@@ -1208,7 +1312,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  if(nativeOption)controlStates.selected=e.selected;
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
  const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
- return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
+ return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,completePublicButtonNameFact,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure||(boundedObservation&&checkable)?null:editingHost?editorValue:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
@@ -1435,6 +1539,18 @@ fn project_node_with_refs(
                 role = Some("columnheader".into())
             }
             Some("th") if data["singleCellHeader"] == true => role = None,
+            Some("th") => {
+                if let Some(value) = data
+                    .get("conflictHeaderRole")
+                    .filter(|value| !value.is_null())
+                {
+                    let header = value.as_str().ok_or(ObservationError::BackendFailure)?;
+                    if !matches!(header, "rowheader" | "columnheader") {
+                        return Err(ObservationError::BackendFailure);
+                    }
+                    role = Some(header.to_owned());
+                }
+            }
             _ => {}
         }
     }
@@ -1597,6 +1713,45 @@ fn project_node_with_refs(
                 .is_none_or(|role| role == "button")
         {
             node.name = (!name.is_empty()).then(|| name.to_owned());
+        }
+    }
+    if let Some(fact) = source_name_fact(
+        data,
+        "completePublicButtonNameFact",
+        &["content", "reference"],
+    )? {
+        let references = data["attributes"]["aria-labelledby"]
+            .as_str()
+            .is_some_and(|value| !value.trim_matches(ecmascript_whitespace).is_empty());
+        if (fact.source == "reference") != references {
+            return Err(ObservationError::BackendFailure);
+        }
+        // Same projected name for exact reads, role queries and observations.
+        // The complete inventory and renderer proof never grant identity or
+        // security authority; all final native redaction still runs below.
+        if node.role.as_deref() == Some("button")
+            && node
+                .author
+                .as_ref()
+                .is_some_and(|facts| facts.node_type == 1)
+            && (node
+                .author
+                .as_ref()
+                .is_some_and(|facts| facts.tag == "button")
+                || data["attributes"]["role"].as_str() == Some("button"))
+            && data["attributes"]["role"]
+                .as_str()
+                .is_none_or(|role| role == "button")
+            && data["__nativeReadonlyPseudo"] != true
+            && data["states"]["secure"] != true
+            && data["secureDescendants"] != true
+            && data["redactName"] != true
+            && data["labels"]
+                .as_array()
+                .is_some_and(|labels| references || labels.is_empty())
+            && (references || data["attributes"]["aria-label"].is_null())
+        {
+            node.name = (!fact.name.is_empty()).then_some(fact.name);
         }
     }
     if let Some(fact) = source_name_fact(
@@ -5664,6 +5819,176 @@ mod tests {
         }
         data["safePublicName"] = json!("Safe public name");
         assert_eq!(project(&native, &data).as_deref(), Some("Safe public name"));
+    }
+
+    #[test]
+    fn public_button_name_proof_projects_exact_and_observed_compatibility() {
+        for bounded in [false, true] {
+            for (source, name, reference) in [
+                ("content", "SearchGo", false),
+                ("content", "CloseIcon", false),
+                ("content", "Volume end", false),
+                ("reference", "Shown", true),
+                ("reference", "", true),
+            ] {
+                for explicit in [false, true] {
+                    let mut data = metadata();
+                    data["author"]["nodeType"] = json!(1);
+                    if explicit {
+                        data["author"]["tag"] = json!("div");
+                        data["attributes"]["role"] = json!("button");
+                    }
+                    if reference {
+                        data["attributes"]["aria-labelledby"] = json!("target");
+                        data["attributes"]["aria-label"] = json!("Lower priority");
+                        data["labels"] = json!(["Target label"]);
+                    }
+                    data["completePublicButtonNameFact"] = json!({"source":source,"name":name});
+                    let node = project_node(
+                        &frame(),
+                        42,
+                        &ax("button", 42, &[]),
+                        &mut observed_refs(),
+                        1,
+                        &data,
+                        bounded,
+                    )
+                    .unwrap();
+                    assert_eq!(node.name.as_deref(), (!name.is_empty()).then_some(name));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn public_button_name_proof_preserves_priority_security_and_unavailable() {
+        let mut data = metadata();
+        data["author"]["nodeType"] = json!(1);
+        let project = |data: &Value| {
+            project_node(
+                &frame(),
+                42,
+                &ax("button", 42, &[]),
+                &mut observed_refs(),
+                1,
+                data,
+                false,
+            )
+            .unwrap()
+            .name
+        };
+        assert_eq!(project(&data).as_deref(), Some("Save"));
+        data["completePublicButtonNameFact"] = json!({"source":"content","name":"SearchGo"});
+        assert_eq!(project(&data).as_deref(), Some("SearchGo"));
+        for field in ["aria-label", "role"] {
+            data["attributes"][field] = json!("Higher priority");
+            assert_eq!(project(&data).as_deref(), Some("Save"));
+            data["attributes"] = json!({});
+        }
+        data["labels"] = json!(["Associated label"]);
+        assert_eq!(project(&data).as_deref(), Some("Save"));
+        data["labels"] = json!([]);
+        for field in ["secureDescendants", "redactName", "completeEmptyReference"] {
+            data[field] = json!(true);
+            assert_eq!(project(&data), None);
+            data[field] = json!(false);
+        }
+        data["states"]["secure"] = json!(true);
+        assert_eq!(project(&data).as_deref(), Some("Save"));
+        data["states"]["secure"] = json!(false);
+        data["safePublicName"] = json!("Safe public name");
+        assert_eq!(project(&data).as_deref(), Some("Safe public name"));
+        data["safePublicName"] = Value::Null;
+        data["__nativeReadonlyPseudo"] = json!(true);
+        assert_eq!(project(&data).as_deref(), Some("Save"));
+        data["__nativeReadonlyPseudo"] = json!(false);
+        data["author"]["tag"] = json!("span");
+        assert_eq!(project(&data).as_deref(), Some("Save"));
+    }
+
+    #[test]
+    fn public_button_name_proof_rejects_invalid_source_and_oversized_facts() {
+        for fact in [
+            json!({"source":"other","name":"Wrong"}),
+            json!({"source":"reference","name":"No reference attribute"}),
+            json!({"source":"content","name":false}),
+            json!({"source":"content","name":"Extra","extra":true}),
+            json!({"source":"content","name":"x".repeat(513)}),
+            json!({"source":"content","name":"😀".repeat(257)}),
+        ] {
+            let mut data = metadata();
+            data["author"]["nodeType"] = json!(1);
+            data["completePublicButtonNameFact"] = fact;
+            assert!(matches!(
+                project_node(
+                    &frame(),
+                    42,
+                    &ax("button", 42, &[]),
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    false
+                ),
+                Err(ObservationError::BackendFailure)
+            ));
+        }
+        let mut data = metadata();
+        data["attributes"]["aria-labelledby"] = json!("Target");
+        data["completePublicButtonNameFact"] =
+            json!({"source":"content","name":"Wrong precedence"});
+        assert!(matches!(
+            project_node(
+                &frame(),
+                42,
+                &ax("button", 42, &[]),
+                &mut observed_refs(),
+                1,
+                &data,
+                false
+            ),
+            Err(ObservationError::BackendFailure)
+        ));
+    }
+
+    #[test]
+    fn ordinary_header_neighbor_proof_corrects_ax_without_changing_explicit_scope() {
+        for bounded in [false, true] {
+            let mut native = ax("rowheader", 42, &[]);
+            native.role.as_mut().unwrap().value = Some(json!("rowheader"));
+            let mut data = metadata();
+            data["author"]["tag"] = json!("th");
+            data["conflictHeaderRole"] = json!("columnheader");
+            let project = |data: &Value| {
+                project_node(
+                    &frame(),
+                    42,
+                    &native,
+                    &mut observed_refs(),
+                    1,
+                    data,
+                    bounded,
+                )
+            };
+            assert_eq!(
+                project(&data).unwrap().role.as_deref(),
+                Some("columnheader")
+            );
+            data["attributes"]["scope"] = json!("ROW");
+            assert_eq!(project(&data).unwrap().role.as_deref(), Some("rowheader"));
+            data["attributes"] = json!({"role":"button"});
+            assert_eq!(project(&data).unwrap().role.as_deref(), Some("button"));
+            data["attributes"] = json!({});
+            data["singleCellHeader"] = json!(true);
+            assert_eq!(project(&data).unwrap().role, None);
+            data["singleCellHeader"] = json!(false);
+            for invalid in [json!(true), json!("other"), json!({})] {
+                data["conflictHeaderRole"] = invalid;
+                assert!(matches!(
+                    project(&data),
+                    Err(ObservationError::BackendFailure)
+                ));
+            }
+        }
     }
 
     #[test]

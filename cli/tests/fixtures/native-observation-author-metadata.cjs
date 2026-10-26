@@ -1039,3 +1039,134 @@ assert.equal(read.call(announcer, 'data-testid', '.secure', true).author.suppres
 Element.prototype.matches = priorMatches;
 document.defaultView.getComputedStyle = nameStyle;
 console.log('PASS: bounded heading names preserve alert content and empty values; local alert/status proof, explicit/security/hidden/budget negatives and announcer suppression');
+
+// Compatibility repairs read the actual shared producer. They do not replace
+// AX globally and cannot claim that an unavailable proof was complete/empty.
+const publicNameStyle = document.defaultView.getComputedStyle;
+const publicNameLookup = document.getElementById;
+document.defaultView.getComputedStyle = (node, pseudo) => css({ display: node.nameDisplay || 'inline', visibility: node.nameVisibility || 'visible', contentVisibility: node.nameContentVisibility || 'visible', content: pseudo ? node.generated || 'none' : 'none' });
+const publicFact = (node, bounded = false, inventory = true, protectedEditor = false) => read.call(node, 'data-testid', '.secure', bounded, protectedEditor, inventory).completePublicButtonNameFact;
+function publicButton(children, attrs = {}) {
+  const node = attributes(new ButtonControl(), attrs); node.childNodes = children;
+  for (const child of children) child.parentElement = node;
+  return node;
+}
+for (const bounded of [false, true]) {
+  const image = namingElement('img', [], { alt: 'Search' });
+  const mixed = publicButton([image, new Text('Go', null)]);
+  assert.deepEqual(publicFact(mixed, bounded), { source: 'content', name: 'SearchGo' });
+  for (const display of ['block', 'inline-block', 'inline-flex', 'contents']) {
+    image.nameDisplay = display;
+    assert.equal(publicFact(mixed, bounded).name, 'Search Go');
+  }
+  delete image.nameDisplay;
+  // The promised selector algorithm retains non-inline raw boundaries even
+  // when a hidden node contributes empty text; hidden inline adds none.
+  const hiddenImage = namingElement('img', [], { alt: 'Hidden', 'aria-hidden': 'true' });
+  const around = publicButton([namingElement('img', [], { alt: 'A' }), hiddenImage, new Text('B', null)]);
+  assert.equal(publicFact(around, bounded).name, 'AB');
+  hiddenImage.nameDisplay = 'none'; assert.equal(publicFact(around, bounded).name, 'A B');
+  const emptyBlock = namingElement('span'); emptyBlock.nameDisplay = 'block';
+  const rawBoundary = publicButton([namingElement('img', [], { alt: 'A' }), emptyBlock, new Text('B', null)]);
+  assert.equal(publicFact(rawBoundary, bounded).name, 'A B');
+  const title = namingElement('title', [new Text('Close', null)]); title.nameDisplay = 'none';
+  const svg = namingElement('svg', [title], { 'aria-labelledby': 'svg-title' });
+  document.getElementById = id => id === 'svg-title' ? title : null;
+  const icon = publicButton([svg, new Text('Icon', null)]);
+  assert.equal(publicFact(icon, bounded).name, 'CloseIcon');
+  svg.nameDisplay = 'block'; assert.equal(publicFact(icon, bounded).name, 'Close Icon');
+  delete svg.nameDisplay; attributes(svg, {}); assert.equal(publicFact(icon, bounded).name, 'CloseIcon');
+
+  const range = attributes(new InputControl('range', false), {});
+  Object.defineProperty(range, 'value', { get() { throw Error('Default range property must not enter a containing name'); } });
+  const control = namingElement('div', [new Text('Volume ', null), range, new Text(' end', null)], { role: 'button' });
+  assert.equal(publicFact(control, bounded).name, 'Volume end');
+  for (const [attrs, name] of [[{ value: '4' }, 'Volume 4 end'], [{ value: '4', 'aria-valuenow': '6' }, 'Volume 6 end'], [{ value: '4', 'aria-valuenow': '6', 'aria-valuetext': 'loud' }, 'Volume loud end'], [{ value: '4', 'aria-valuetext': '' }, 'Volume end']]) {
+    attributes(range, attrs); assert.equal(publicFact(control, bounded).name, name);
+  }
+
+  const gone = namingElement('i', [new Text('gone', null)]); gone.nameDisplay = 'none';
+  const shown = namingElement('span', [new Text('Shown ', null), gone]);
+  const receiver = publicButton([new Text('Ignored', null)], { 'aria-labelledby': 'shown', 'aria-label': 'Lower priority' });
+  document.getElementById = id => id === 'shown' ? shown : null;
+  assert.deepEqual(publicFact(receiver, bounded), { source: 'reference', name: 'Shown' });
+  const ancestor = namingElement('div', [shown], { 'aria-hidden': 'TRUE' });
+  assert.equal(publicFact(receiver, bounded).name, 'Shown gone');
+  attributes(ancestor, {});
+  attributes(shown, { 'aria-label': 'Own label' }); assert.equal(publicFact(receiver, bounded).name, 'Own label');
+
+  const a = namingElement('span', [new Text('A', null)], { 'aria-labelledby': 'b' });
+  const b = namingElement('span', [new Text('B', null)], { 'aria-labelledby': 'a' });
+  document.getElementById = id => id === 'a' ? a : id === 'b' ? b : null;
+  assert.equal(publicFact(publicButton([a, b]), bounded).name, 'B');
+  const nested = namingElement('span', [new Text('Ref text', null)], { 'aria-labelledby': 'b' });
+  const outer = namingElement('span', [nested]);
+  document.getElementById = id => id === 'outer' ? outer : id === 'b' ? b : null;
+  assert.equal(publicFact(publicButton([], { 'aria-labelledby': 'outer' }), bounded).name, 'Ref text');
+  const owner = publicButton([namingElement('span', [new Text('A', null)], { 'aria-labelledby': 'owner' }), new Text('B', null)]);
+  document.getElementById = id => id === 'owner' ? owner : null;
+  assert.equal(publicFact(owner, bounded).name, 'AB');
+}
+const available = () => publicButton([namingElement('img', [], { alt: 'Search' }), new Text('Go', null)]);
+assert.equal(publicFact(available(), false, false), null);
+assert.equal(publicFact(available(), false, true, true), null);
+for (const attrs of [{ role: 'link' }, { 'aria-label': 'Higher priority' }, { 'aria-labelledby': 'missing' }, { 'aria-owns': 'other' }, { contenteditable: 'false' }]) {
+  const node = available(); attributes(node, attrs); assert.equal(publicFact(node), null);
+}
+for (const target of ['root', 'child']) {
+  for (const state of ['secure', 'shadow', 'generated']) {
+    const node = available(), subject = target === 'root' ? node : node.childNodes[0];
+    if (state === 'secure') subject.secure = true;
+    if (state === 'shadow') subject.shadowRoot = {};
+    if (state === 'generated') subject.generated = '"extra"';
+    assert.equal(publicFact(node), null);
+  }
+}
+const secret = namingElement('span'); secret.secure = true;
+Object.defineProperty(secret, 'childNodes', { get() { throw Error('Secret referenced content must not be acquired'); } });
+document.getElementById = () => secret;
+assert.equal(publicFact(publicButton([], { 'aria-labelledby': 'secret' })), null);
+for (const tag of ['textarea', 'select', 'slot', 'canvas', 'math', 'custom-element']) {
+  assert.equal(publicFact(publicButton([namingElement(tag)])), null);
+}
+assert.equal(publicFact(publicButton([namingElement('img', [], { alt: 'x'.repeat(513) })])), null);
+assert.equal(publicFact(publicButton(Array.from({ length: 513 }, () => new Text('', null)))), null);
+let nestedPublic = namingElement('img', [], { alt: 'Deep' });
+for (let i = 0; i < 65; i++) nestedPublic = namingElement('span', [nestedPublic]);
+assert.equal(publicFact(publicButton([nestedPublic])), null);
+const foreign = publicButton([], { 'aria-labelledby': 'foreign' }); foreign.nativeRoot = { host: new Element() };
+assert.equal(publicFact(foreign), null);
+// Zero-area, content skipping and closed details must not be silently treated
+// as ordinary visible IDREFs. A visible child may override ancestor visibility.
+for (const shape of ['zero-area', 'contents', 'skipped', 'auto-skipped-positive-box', 'closed-details', 'visible-override']) {
+  const target = namingElement('span', [new Text('Shown ', null), namingElement('i', [new Text('Hidden', null)])]);
+  target.childNodes[1].nameDisplay = 'none';
+  const parent = namingElement('div', [target]);
+  if (shape === 'zero-area' || shape === 'contents') target.getBoundingClientRect = () => ({ x: 0, y: 0, width: 0, height: 0 });
+  if (shape === 'contents') target.nameDisplay = 'contents';
+  if (shape === 'skipped') parent.nameContentVisibility = 'hidden';
+  if (shape === 'auto-skipped-positive-box') parent.nameContentVisibility = 'auto';
+  if (shape === 'closed-details') { parent.localName = 'details'; parent.open = false; }
+  if (shape === 'visible-override') parent.nameVisibility = 'hidden';
+  document.getElementById = () => target;
+  assert.equal(publicFact(publicButton([], { 'aria-labelledby': 'target' })), null, shape);
+}
+console.log('PASS: actual bounded public-name producer preserves inline/block alternatives, authored range priority, visible/hidden references and cycles; refuses unproven inventory, secure, shadow, generated, unsupported and oversized shapes');
+
+for (const bounded of [false, true]) {
+  const th = namingElement('th'); th.parentElement = namingElement('tr'); th.parentElement.closest = () => ({ rows: [1] });
+  th.previousElementSibling = null; th.nextElementSibling = namingElement('th');
+  let metadata = read.call(th, 'data-testid', '.secure', bounded);
+  assert.equal(metadata.presentationConflict, false);
+  assert.equal(metadata.conflictHeaderRole, 'columnheader');
+  th.nextElementSibling = namingElement('td', [new Text('42', null)]); th.nextElementSibling.children = [];
+  assert.equal(read.call(th, 'data-testid', '.secure', bounded).conflictHeaderRole, 'rowheader');
+  th.nextElementSibling = namingElement('td', [new Text(' \t', null)]); th.nextElementSibling.children = [];
+  assert.equal(read.call(th, 'data-testid', '.secure', bounded).conflictHeaderRole, 'columnheader');
+  for (const scope of ['row', 'rowgroup', 'col', 'colgroup']) {
+    attributes(th, { scope }); assert.equal(read.call(th, 'data-testid', '.secure', bounded).conflictHeaderRole, null);
+  }
+}
+document.defaultView.getComputedStyle = publicNameStyle;
+document.getElementById = publicNameLookup;
+console.log('PASS: normal th metadata uses bounded immediate neighbors without requiring a presentation conflict, while explicit scope remains authoritative');

@@ -125,6 +125,91 @@ async fn checked_transport(directory: TempDir, capture: Option<(&str, &Path)>) -
     directory
 }
 
+/// This no-browser exchange emits exactly startup and the joined shutdown
+/// checkpoint. Validate every JSONL record; never trim away an unknown suffix.
+fn validate_capture(bytes: &[u8]) -> Result<(), String> {
+    if bytes.len() > 512 || !bytes.ends_with(b"\n") {
+        return Err("Capture must be bounded complete JSONL".into());
+    }
+    let text = std::str::from_utf8(bytes).map_err(|error| error.to_string())?;
+    let records = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).map_err(|error| error.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    if records.len() != 2 {
+        return Err("Expected exactly startup and shutdown records".into());
+    }
+    let pid = records[0]["pid"]
+        .as_u64()
+        .filter(|pid| *pid > 0)
+        .ok_or("Missing native PID")?;
+    let expected = capture_records(pid);
+    if records != expected {
+        return Err("Unexpected capture payload, phase, counter or owner".into());
+    }
+    Ok(())
+}
+
+fn capture_records(pid: u64) -> Vec<Value> {
+    vec![
+        json!({"schemaVersion":2,"source":"native","pid":pid,"record":0,
+            "operationSeq":0,"phase":"CaptureStarted","droppedBefore":0,
+            "emittedBefore":0,"suppressedBefore":0,"overflow":false}),
+        json!({"schemaVersion":2,"source":"native","pid":pid,"record":1,
+            "operationSeq":0,"phase":"TerminalCleanupCheckpoint","droppedBefore":0,
+            "emittedBefore":1,"suppressedBefore":0,"overflow":false,
+            "terminalCleanupStage":"shutdown-joins","terminalCleanupOk":true}),
+    ]
+}
+
+#[test]
+fn capture_jsonl_requires_both_exact_correlated_records() {
+    fn encode(records: &[Value]) -> Vec<u8> {
+        records
+            .iter()
+            .map(|record| format!("{record}\n"))
+            .collect::<String>()
+            .into_bytes()
+    }
+    let records = capture_records(123);
+    let valid = encode(&records);
+    assert!(validate_capture(&valid).is_ok());
+    assert!(validate_capture(&encode(&records[..1])).is_err());
+    assert!(validate_capture(&encode(&records[1..])).is_err());
+    assert!(validate_capture(&valid[..valid.len() - 1]).is_err());
+    let mut malformed = valid.clone();
+    malformed.extend_from_slice(b"invalid\n");
+    assert!(validate_capture(&malformed).is_err());
+    let mut extra = records.clone();
+    extra.push(records[1].clone());
+    assert!(validate_capture(&encode(&extra)).is_err());
+    for (key, wrong) in [
+        ("pid", json!(124)),
+        ("record", json!(2)),
+        ("emittedBefore", json!(0)),
+        ("operationSeq", json!(1)),
+        ("phase", json!("CaptureStarted")),
+        ("terminalCleanupStage", json!("final-commit")),
+        ("terminalCleanupOk", json!(false)),
+        ("droppedBefore", json!(1)),
+        ("suppressedBefore", json!(1)),
+        ("overflow", json!(true)),
+        ("unexpected", json!("not admitted")),
+    ] {
+        let mut changed = records.clone();
+        changed[1][key] = wrong;
+        assert!(validate_capture(&encode(&changed)).is_err(), "{key}");
+    }
+    assert!(validate_capture(&encode(&capture_records(0))).is_err());
+    let mut reversed = records.clone();
+    reversed.reverse();
+    assert!(validate_capture(&encode(&reversed)).is_err());
+    let mut extra_startup_field = records.clone();
+    extra_startup_field[0]["unexpected"] = json!(true);
+    assert!(validate_capture(&encode(&extra_startup_field)).is_err());
+    assert!(validate_capture(&vec![b' '; 513]).is_err());
+}
+
 #[tokio::test]
 async fn cleanup_capture_survives_the_real_production_proxy() {
     let directory = tempfile::tempdir().unwrap();
@@ -138,22 +223,7 @@ async fn cleanup_capture_survives_the_real_production_proxy() {
         .read_to_end(&mut bytes)
         .unwrap();
     assert!(bytes.len() <= 512, "Unexpected startup capture size");
-    let record: Value = serde_json::from_slice(&bytes).expect("Native CaptureStarted is required");
-    assert_eq!(record.as_object().unwrap().len(), 10);
-    assert_eq!(record["schemaVersion"], 2);
-    assert_eq!(record["source"], "native");
-    assert!(record["pid"].as_u64().is_some_and(|pid| pid > 0));
-    assert_eq!(record["phase"], "CaptureStarted");
-    for key in [
-        "record",
-        "operationSeq",
-        "droppedBefore",
-        "emittedBefore",
-        "suppressedBefore",
-    ] {
-        assert_eq!(record[key], 0);
-    }
-    assert_eq!(record["overflow"], false);
+    validate_capture(&bytes).expect("Native startup and joined shutdown JSONL are required");
 }
 
 #[tokio::test]
