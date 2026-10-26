@@ -794,6 +794,21 @@ pub(super) enum WorkerStartupProof<T> {
 #[derive(Clone)]
 pub(crate) struct CommandStatusHandle(Arc<AtomicU8>, bool, Arc<tokio::sync::Notify>);
 impl CommandStatusHandle {
+    // Keep outcome provenance in the existing bounded status allocation. The
+    // public status projection retains Acknowledged for both wire ACK kinds.
+    const SUCCESS_ACK: u8 = CommandStatus::Acknowledged as u8 | 0x80;
+
+    fn acknowledged(&self, success: bool) {
+        self.0.store(
+            if success {
+                Self::SUCCESS_ACK
+            } else {
+                CommandStatus::Acknowledged as u8
+            },
+            Ordering::SeqCst,
+        );
+        self.2.notify_waiters();
+    }
     fn new(object_only: bool, changed: Arc<tokio::sync::Notify>) -> Self {
         Self(
             Arc::new(AtomicU8::new(CommandStatus::Reserved as u8)),
@@ -806,7 +821,7 @@ impl CommandStatusHandle {
         self.2.notify_waiters();
     }
     pub(crate) fn snapshot(&self) -> CommandStatus {
-        match self.0.load(Ordering::SeqCst) {
+        match self.0.load(Ordering::SeqCst) & 0x7f {
             0 => CommandStatus::Reserved,
             1 => CommandStatus::Submitted,
             2 => CommandStatus::Acknowledged,
@@ -814,6 +829,29 @@ impl CommandStatusHandle {
             4 => CommandStatus::Destroyed,
             5 => CommandStatus::Abandoned,
             _ => CommandStatus::IntegrityLost,
+        }
+    }
+    /// The reader distinguishes a validated success envelope from an error ACK.
+    /// This receipt retires only the exact callback command, never owner debt.
+    pub(crate) async fn wait_successful_ack(&self, deadline: Instant) -> Result<(), ProtocolError> {
+        loop {
+            if Instant::now() >= deadline {
+                return Err(ProtocolError::CleanupFailed);
+            }
+            let changed = self.2.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let status = self.0.load(Ordering::SeqCst);
+            if status == Self::SUCCESS_ACK {
+                return Ok(());
+            }
+            if status != CommandStatus::Submitted as u8 {
+                return Err(ProtocolError::CleanupFailed);
+            }
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep_until(deadline.into()) => return Err(ProtocolError::CleanupFailed),
+            }
         }
     }
     pub(crate) fn accountably_retained(&self) -> bool {
@@ -3706,7 +3744,7 @@ impl SubmittedCommand {
                 state.final_cleanup_acknowledged[kind as usize] = true;
             }
         }
-        command.status.set(CommandStatus::Acknowledged);
+        command.status.acknowledged(response.error.is_none());
         if let Some(group_id) = command.group_id {
             if command.release_group && command.group_release_proven {
                 state.groups.remove(&group_id);

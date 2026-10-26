@@ -1,5 +1,8 @@
 //! Native request ownership and token dispatch. ECMAScript route matching and
 //! callbacks stay in e2e; no JavaScript function or matcher is interpreted here.
+#[cfg(test)]
+#[path = "client_dialog_retirement_regression_tests.rs"]
+mod dialog_retirement_regression_tests;
 use super::cdp::client::CdpClient;
 use super::cdp::types::CdpEvent;
 use super::client_app_events::{
@@ -49,6 +52,7 @@ pub struct ClientNetwork {
     auth_attempts: Mutex<std::collections::HashSet<(String, String)>>,
     request_ids: Mutex<HashMap<(String, String), String>>,
     pending_interceptions: Mutex<HashMap<(String, String, String), ()>>,
+    dialog_commands: Mutex<HashMap<(String, String, String), DialogCommandReceipt>>,
     response_subscriptions: Mutex<std::collections::HashSet<String>>,
     responses: Mutex<HashMap<(String, String), String>>,
     resources: Mutex<HashMap<String, Arc<BodyResource>>>,
@@ -57,6 +61,13 @@ pub struct ClientNetwork {
     download_context: Mutex<Option<String>>,
     download_ready: AtomicBool,
     download_subscriptions: Mutex<std::collections::HashSet<String>>,
+}
+
+/// Private per-occurrence receipt survives the callback task's cancellation.
+/// The owner-bound reader still owns command/debt settlement.
+struct DialogCommandReceipt {
+    owner: Arc<super::client_debt::OwnerDebtLedger>,
+    status: super::client_debt::CommandStatusHandle,
 }
 
 enum NetworkCloseState {
@@ -451,6 +462,7 @@ impl ClientNetwork {
             auth_attempts: Mutex::new(std::collections::HashSet::new()),
             request_ids: Mutex::new(HashMap::new()),
             pending_interceptions: Mutex::new(HashMap::new()),
+            dialog_commands: Mutex::new(HashMap::new()),
             response_subscriptions: Mutex::new(std::collections::HashSet::new()),
             responses: Mutex::new(HashMap::new()),
             resources: Mutex::new(HashMap::new()),
@@ -1434,9 +1446,11 @@ impl ClientNetwork {
                 event.method.clone(),
                 required_string(&event.params, "requestId")?.to_owned(),
             )),
-            "Page.javascriptDialogOpening" => {
-                Some((session_id.to_owned(), event.method.clone(), String::new()))
-            }
+            "Page.javascriptDialogOpening" => Some((
+                session_id.to_owned(),
+                event.method.clone(),
+                uuid::Uuid::new_v4().to_string(),
+            )),
             _ => None,
         };
         if let Some(key) = &pending_key {
@@ -1681,7 +1695,13 @@ impl ClientNetwork {
                         .await
                 }
                 "Page.javascriptDialogOpening" => {
-                    this.dialog(&session.session_id, event.params, &sink).await
+                    this.dialog(
+                        &session.session_id,
+                        event.params,
+                        &sink,
+                        pending_key.as_ref().ok_or(ProtocolError::InvalidFrame)?,
+                    )
+                    .await
                 }
                 "Network.loadingFinished" => {
                     this.response_finished(&session, event.params, deadline, &session_tenure)
@@ -1692,6 +1712,10 @@ impl ClientNetwork {
             if result.is_ok() {
                 if let Some(key) = pending_key {
                     this.pending_interceptions
+                        .lock()
+                        .map_err(|_| ProtocolError::CleanupFailed)?
+                        .remove(&key);
+                    this.dialog_commands
                         .lock()
                         .map_err(|_| ProtocolError::CleanupFailed)?
                         .remove(&key);
@@ -1791,6 +1815,29 @@ impl ClientNetwork {
                 failed = true;
                 break;
             }
+            // Do not send a competing dismissal after this occurrence already
+            // submitted its selected decision. Only its exact success ACK can
+            // discharge that cleanup obligation; Closed/EOF/error ACK cannot.
+            if key.1 == "Page.javascriptDialogOpening" {
+                match self.retire_dialog_command(&key, deadline).await {
+                    Ok(true) => {
+                        self.pending_interceptions
+                            .lock()
+                            .map_err(|_| ProtocolError::CleanupFailed)?
+                            .remove(&key);
+                        self.dialog_commands
+                            .lock()
+                            .map_err(|_| ProtocolError::CleanupFailed)?
+                            .remove(&key);
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(_) => {
+                        failed = true;
+                        continue;
+                    }
+                }
+            }
             let command = match key.1.as_str() {
                 "Fetch.requestPaused" => ScopeCleanupCommand::FailRequest {
                     session: session.to_owned(),
@@ -1814,6 +1861,10 @@ impl ClientNetwork {
                 Ok(Ok(_))
             ) {
                 self.pending_interceptions
+                    .lock()
+                    .map_err(|_| ProtocolError::CleanupFailed)?
+                    .remove(&key);
+                self.dialog_commands
                     .lock()
                     .map_err(|_| ProtocolError::CleanupFailed)?
                     .remove(&key);
@@ -1850,6 +1901,34 @@ impl ClientNetwork {
             Ok(())
         }
     }
+    async fn retire_dialog_command(
+        &self,
+        key: &(String, String, String),
+        deadline: std::time::Instant,
+    ) -> Result<bool, ProtocolError> {
+        let receipt = self
+            .dialog_commands
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .get(key)
+            .map(|receipt| (receipt.owner.clone(), receipt.status.clone()));
+        let Some((owner, status)) = receipt else {
+            return Ok(false);
+        };
+        if !owner.matches_owner(self.scope.generation, &self.scope.identity_scope) {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        self.client.check_cleanup_owner(&Some(owner.clone()))?;
+        // A reservation abandoned before submission grants no completion, but
+        // also cannot compete with the original unselected dialog cleanup.
+        if status.snapshot() == super::client_debt::CommandStatus::Abandoned {
+            return Ok(false);
+        }
+        status.wait_successful_ack(deadline).await?;
+        self.client.check_cleanup_owner(&Some(owner))?;
+        Ok(true)
+    }
+
     fn session_tenure_live(
         &self,
         session: &str,
@@ -2299,6 +2378,7 @@ impl ClientNetwork {
         session: &str,
         params: Value,
         sink: &ClientEventSink,
+        pending_key: &(String, String, String),
     ) -> Result<(), ProtocolError> {
         let kind = required_string(&params, "type")?;
         if !matches!(kind, "alert" | "confirm" | "prompt" | "beforeunload") {
@@ -2336,8 +2416,43 @@ impl ClientNetwork {
             }) => (accept, prompt_text),
             _ => (false, None),
         };
-        super::network::handle_dialog(&self.client, session, accept, prompt.as_deref())
+        let mut arguments = json!({"accept":accept});
+        if let Some(prompt) = prompt {
+            arguments["promptText"] = json!(prompt);
+        }
+        let reservation = self
+            .client
+            .reserve_tracked_command(
+                "Page.handleJavaScriptDialog",
+                Some(&arguments),
+                Some(session),
+            )
+            .map_err(|_| ProtocolError::BrowserFailure)?;
+        if let Some(reservation) = &reservation {
+            let owner = self
+                .client
+                .debt_ledger()
+                .ok_or(ProtocolError::ScopeUnavailable)?;
+            self.dialog_commands
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                .insert(
+                    pending_key.clone(),
+                    DialogCommandReceipt {
+                        owner,
+                        status: reservation.status(),
+                    },
+                );
+        }
+        self.client
+            .send_reserved_command(
+                "Page.handleJavaScriptDialog",
+                Some(arguments),
+                Some(session),
+                reservation,
+            )
             .await
+            .map(|_| ())
             .map_err(|_| ProtocolError::BrowserFailure)
     }
 
