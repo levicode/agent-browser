@@ -1869,56 +1869,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn terminal_cleanup_checkpoints_have_closed_payloads() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        let capture = cleanup_capture(Some(file.path())).unwrap();
-        terminal_cleanup_checkpoint_into(
-            &capture,
-            TerminalCleanupStage::LedgerCommandsPresent,
-            false,
-        );
-        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::FinalCommit, true);
-        let text = std::fs::read_to_string(file.path()).unwrap();
-        let records: Vec<serde_json::Value> = text
-            .lines()
-            .map(|line| {
-                assert!(line.len() < MAX_RECORD_BYTES);
-                serde_json::from_str(line).unwrap()
-            })
-            .collect();
-        let checkpoints: Vec<_> = records
-            .iter()
-            .filter(|value| value["phase"] == "TerminalCleanupCheckpoint")
-            .collect();
-        assert_eq!(checkpoints.len(), 2);
-        assert_eq!(
-            checkpoints[0]["terminalCleanupStage"],
-            "ledger-commands-present"
-        );
-        assert_eq!(checkpoints[0]["terminalCleanupOk"], false);
-        assert_eq!(checkpoints[1]["terminalCleanupStage"], "final-commit");
-        assert_eq!(checkpoints[1]["terminalCleanupOk"], true);
-        for value in checkpoints {
-            assert_eq!(value["operationSeq"], 0);
-            assert!(value.as_object().unwrap().keys().all(|key| matches!(
-                key.as_str(),
-                "schemaVersion"
-                    | "source"
-                    | "pid"
-                    | "record"
-                    | "operationSeq"
-                    | "phase"
-                    | "droppedBefore"
-                    | "emittedBefore"
-                    | "suppressedBefore"
-                    | "overflow"
-                    | "terminalCleanupStage"
-                    | "terminalCleanupOk"
-            )));
-        }
-    }
-
-    #[test]
     fn service_worker_admission_is_closed_process_local_and_bounded() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let capture = cleanup_capture(Some(file.path())).unwrap();
@@ -2428,3 +2378,58 @@ mod tests {
 #[cfg(test)]
 #[path = "client_cleanup_diagnostic_tests.rs"]
 mod cleanup_tests;
+
+// Terminal cleanup diagnostics are also present in the production ELF.
+#[cfg(test)]
+mod terminal_cleanup_tests {
+    use super::*;
+    #[test]
+    fn terminal_cleanup_checkpoints_have_closed_payloads() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        terminal_cleanup_checkpoint_into(
+            &capture,
+            TerminalCleanupStage::LedgerCommandsPresent,
+            false,
+        );
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::FinalCommit, true);
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                assert!(line.len() < MAX_RECORD_BYTES);
+                serde_json::from_str(line).unwrap()
+            })
+            .collect();
+        let checkpoints: Vec<_> = records
+            .iter()
+            .filter(|value| value["phase"] == "TerminalCleanupCheckpoint")
+            .collect();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(
+            checkpoints[0]["terminalCleanupStage"],
+            "ledger-commands-present"
+        );
+        assert_eq!(checkpoints[0]["terminalCleanupOk"], false);
+        assert_eq!(checkpoints[1]["terminalCleanupStage"], "final-commit");
+        assert_eq!(checkpoints[1]["terminalCleanupOk"], true);
+        for value in checkpoints {
+            assert_eq!(value["operationSeq"], 0);
+            assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "schemaVersion"
+                    | "source"
+                    | "pid"
+                    | "record"
+                    | "operationSeq"
+                    | "phase"
+                    | "droppedBefore"
+                    | "emittedBefore"
+                    | "suppressedBefore"
+                    | "overflow"
+                    | "terminalCleanupStage"
+                    | "terminalCleanupOk"
+            )));
+        }
+    }
+}

@@ -1827,13 +1827,16 @@ impl OwnerDebtLedger {
             .state
             .lock()
             .map_err(|_| ProtocolError::CleanupFailed)?;
+        // root_creation_claimed is an irreversible anti-duplicate marker:
+        // binding an existing borrowed session also sets it. Pending creation
+        // is checked below through publication, created targets and each actual
+        // command acquisition; never erase the historical marker to close.
         if !state.remote_eof_only()
             || !state
                 .bootstrap
                 .as_ref()
                 .is_some_and(|bootstrap| bootstrap.published)
             || state.context_creation_claimed
-            || state.root_creation_claimed
             || state.eval_publication_pending
             || state.commands.is_empty()
             || !state.objects.is_empty()
@@ -5334,6 +5337,8 @@ pub(crate) mod tests {
             "object",
             "input",
             "initializer",
+            "acquisition",
+            "created-target",
             "recording",
             "local",
             "contaminated",
@@ -5351,6 +5356,10 @@ pub(crate) mod tests {
                 .as_mut()
                 .unwrap()
                 .published = true;
+            assert!(
+                ledger.state.lock().unwrap().root_creation_claimed,
+                "binding a borrowed root consumes the anti-duplicate marker"
+            );
             let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
             let operation = OperationLease {
                 is_callback: false,
@@ -5429,7 +5438,16 @@ pub(crate) mod tests {
                         serial: 1,
                         footprint: 256,
                     }),
-                    "initializer" => state.root_creation_claimed = true,
+                    "initializer" => state.bootstrap.as_mut().unwrap().published = false,
+                    // Guard-only corruption probes: neither a real acquisition
+                    // nor an owned target may be disguised as a passive read.
+                    "acquisition" => {
+                        state.commands.get_mut(&submitted.id).unwrap().acquisition =
+                            Some(LifecycleAcquisition::Target)
+                    }
+                    "created-target" => {
+                        state.created_targets.insert("created".into());
+                    }
                     "recording" => {
                         state.recording_targets.insert("recording".into());
                     }
@@ -5449,6 +5467,10 @@ pub(crate) mod tests {
                 ledger.check_terminal_read_only(&[("page".into(), "target".into(), false)], &keys);
             assert_eq!(result.is_ok(), obstruction == "none", "{obstruction}");
             assert_eq!(ledger.snapshot(), before, "proof must not settle debt");
+            assert!(
+                ledger.state.lock().unwrap().root_creation_claimed,
+                "terminal proof must preserve the historical root claim"
+            );
             assert_eq!(
                 ledger
                     .state

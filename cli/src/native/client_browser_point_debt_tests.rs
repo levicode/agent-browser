@@ -1184,10 +1184,18 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
                 deadline,
                 "duplicate retirement must not renew the existing window"
             );
-            assert!(broker.admit(1, key.operation_seq + 1, 1000).is_err());
-            assert!(broker
-                .admit_disconnected_reconnect(1, key.operation_seq + 1, 1000, "wrong-owner")
-                .is_err());
+            assert!(matches!(
+                broker.admit(1, key.operation_seq + 1, 1000),
+                Err(ProtocolError::ScopeUnavailable)
+            ));
+            // Rejected reconnect admission still consumes its sequence. Keep
+            // the framed fixture's high-water aligned before another request.
+            framed.sequence += 1;
+            assert_eq!(framed.sequence, key.operation_seq + 1);
+            assert!(matches!(
+                broker.admit_disconnected_reconnect(1, framed.sequence, 1000, "wrong-owner"),
+                Err(ProtocolError::StaleScope)
+            ));
         } else {
             assert!(browser.tasks.recovery_candidate(key).is_none(), "{cause}");
         }
@@ -1243,9 +1251,15 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
             assert_eq!(rejected["effects"], "not-dispatched");
             assert_eq!(rejected["scopeState"], "quarantined");
             assert!(!broker.recovery_available());
-            assert!(broker
-                .admit_disconnected_reconnect(1, framed.sequence + 1, 1000, &scope)
-                .is_err());
+            // This rejected one-shot retry also consumes a sequence, but must
+            // never create an executable operation or contact another peer.
+            framed.sequence += 1;
+            assert!(matches!(
+                broker.admit_disconnected_reconnect(1, framed.sequence, 1000, &scope),
+                // Transport shutdown may already have cleared the consumed
+                // recovery slot; either refusal must precede any new operation.
+                Err(ProtocolError::StaleScope | ProtocolError::ScopeUnavailable)
+            ));
             tokio::time::timeout(Duration::from_secs(5), candidate.task)
                 .await
                 .expect("rejected passive-read candidate did not close")
