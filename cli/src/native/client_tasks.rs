@@ -741,27 +741,57 @@ mod fixed_read_eof_tests {
         let broker = Arc::new(ClientSession::new());
         let lease = broker.admit(1, 1, 5000).unwrap();
         assert!(broker.start(1, 1).unwrap());
-        let key = OperationKey { generation: 1, operation_seq: 1 };
-        let ledger = OwnerDebtLedger::unpublished(&lease, "fixed-read-owner".into(), false).unwrap();
+        let key = OperationKey {
+            generation: 1,
+            operation_seq: 1,
+        };
+        let ledger =
+            OwnerDebtLedger::unpublished(&lease, "fixed-read-owner".into(), false).unwrap();
         ledger.bind_context("borrowed-context").unwrap();
-        ledger.bind_session("borrowed-context", "page", "session").unwrap();
+        ledger
+            .bind_session("borrowed-context", "page", "session")
+            .unwrap();
         client.install_debt_ledger(ledger.clone()).unwrap();
-        let journal = ledger.operation(key, "page".into(), "session".into()).unwrap();
+        let journal = ledger
+            .operation(key, "page".into(), "session".into())
+            .unwrap();
         journal.bind_operation(&lease).unwrap();
         let targets = ClientTargets::new("borrowed-context".into(), "fixed-read-owner".into());
         targets.acknowledge_enrollment().unwrap();
         let tasks = RetainedTasks::default();
         let mut closed = client.remote_connection_closed();
-        let receive = tasks.start_operation(
-            "fixed-read-owner".into(), targets, broker.clone(), journal,
-            lease.cancellation.clone(), async move {
-                while !*closed.borrow_and_update() { closed.changed().await.unwrap(); }
-                (NativeOutcome { retention: None, result: Err(ProtocolError::CleanupFailed), effects: Effects::NotDispatched }, false)
-            },
-        ).await.unwrap();
+        let receive = tasks
+            .start_operation(
+                "fixed-read-owner".into(),
+                targets,
+                broker.clone(),
+                journal,
+                lease.cancellation.clone(),
+                async move {
+                    while !*closed.borrow_and_update() {
+                        closed.changed().await.unwrap();
+                    }
+                    (
+                        NativeOutcome {
+                            retention: None,
+                            result: Err(ProtocolError::CleanupFailed),
+                            effects: Effects::NotDispatched,
+                        },
+                        false,
+                    )
+                },
+            )
+            .await
+            .unwrap();
         release.send(()).unwrap();
-        let outcome = tokio::time::timeout(Duration::from_secs(3), receive).await.unwrap().unwrap();
-        tokio::time::timeout(Duration::from_secs(3), peer).await.unwrap().unwrap();
+        let outcome = tokio::time::timeout(Duration::from_secs(3), receive)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(3), peer)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(outcome.result, Err(ProtocolError::CleanupFailed));
         assert_eq!(outcome.effects, Effects::Unknown);
         broker.settle(1, 1, outcome.effects).unwrap();
