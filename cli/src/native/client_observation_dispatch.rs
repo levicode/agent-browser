@@ -348,6 +348,7 @@ pub enum DispatchRequest {
     ReadFields(FieldReadRequest),
     Correlate(CorrelateRequest),
     Observe(ObserveRequest),
+    TraceSemantic(ObserveRequest),
     Query(QueryRequest),
     Screenshot(ScreenshotRequest),
 }
@@ -385,9 +386,17 @@ enum PublicationKind {
     AdditiveQuery,
     PixelsOnly,
     TraceViewport,
+    TraceSemantic,
 }
 impl Publication {
     fn stage_revision(&mut self, kind: PublicationKind) -> Result<u64, ProtocolError> {
+        if matches!(kind, PublicationKind::TraceSemantic) {
+            // Private staging only: even the revision counters remain unchanged.
+            return self
+                .revision
+                .checked_add(1)
+                .ok_or(ProtocolError::IdentifierExhausted);
+        }
         if matches!(kind, PublicationKind::PixelsOnly)
             || matches!(kind, PublicationKind::AdditiveQuery) && self.published_revision != 0
         {
@@ -406,6 +415,9 @@ impl Publication {
         destination: &mut RefMap,
         staged: RefMap,
     ) {
+        if matches!(kind, PublicationKind::TraceSemantic) {
+            return;
+        }
         if matches!(kind, PublicationKind::TraceViewport) {
             destination.commit_viewport_from(&staged);
         } else if !matches!(kind, PublicationKind::PixelsOnly) {
@@ -734,7 +746,8 @@ impl ObservationDispatch {
         } else {
             None
         };
-        let trace = if matches!(&request, DispatchRequest::Screenshot(r) if r.purpose == ScreenshotPurpose::Trace)
+        let trace = if matches!(&request, DispatchRequest::TraceSemantic(_))
+            || matches!(&request, DispatchRequest::Screenshot(r) if r.purpose == ScreenshotPurpose::Trace)
         {
             let authority = self
                 .captures
@@ -918,7 +931,10 @@ impl ObservationDispatch {
         } else if matches!(kind, PublicationKind::Snapshot) {
             return Err(ProtocolError::StaleReference);
         }
-        if matches!(kind, PublicationKind::TraceViewport) {
+        if matches!(
+            kind,
+            PublicationKind::TraceViewport | PublicationKind::TraceSemantic
+        ) {
             let trace = trace.ok_or(ProtocolError::StaleReference)?;
             let current = authority
                 .latest
@@ -1232,6 +1248,7 @@ impl ObservationDispatch {
             DispatchRequest::ReadFields(_) => return Err(failure(ProtocolError::InvalidArguments)),
             DispatchRequest::Correlate(_) => return Err(failure(ProtocolError::InvalidArguments)),
             DispatchRequest::Observe(_) => PublicationKind::Snapshot,
+            DispatchRequest::TraceSemantic(_) => PublicationKind::TraceSemantic,
             DispatchRequest::Query(_) => PublicationKind::AdditiveQuery,
             DispatchRequest::Screenshot(request) => {
                 if request.purpose == ScreenshotPurpose::Trace {
@@ -1249,6 +1266,11 @@ impl ObservationDispatch {
             .lock()
             .map_err(|_| failure(ProtocolError::ScopeUnavailable))?
             .clone();
+        if matches!(publication_kind, PublicationKind::TraceSemantic) {
+            // Clear only the clone. No trace ref, including its viewport, may
+            // alias committed action authority; the monotonic allocator is shared.
+            staged.retire_interaction_references();
+        }
         let wants_pixels = matches!(&request, DispatchRequest::Screenshot(_))
             || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
         // Charge the native producer before screenshot collection starts.
@@ -1269,7 +1291,8 @@ impl ObservationDispatch {
         #[cfg(test)]
         witness.enter(ObserveFailureStage::InitialFrames);
         screenshot_stage(screenshot, ScreenshotStage::InitialFrames);
-        let frames = if matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
+        let frames = if matches!(&request, DispatchRequest::TraceSemantic(_))
+            || matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
             self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
         } else {
             verified_frames_with_diagnostic(&context.page, &operation, Some(&observation_cleanup), screenshot).await
@@ -1318,12 +1341,28 @@ impl ObservationDispatch {
             // that exact proof before spatial validation, never infer it from
             // omitted/truncated output. Pixel and query paths remain strict.
             screenshot_stage(screenshot, ScreenshotStage::Geometry);
-            if !matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels) {
+            if !matches!(&request, DispatchRequest::TraceSemantic(_))
+                && !matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels) {
                 geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(map_geometry)?);
             }
             match request {
                 DispatchRequest::ReadFields(_) => Err(ProtocolError::InvalidArguments),
                 DispatchRequest::Correlate(_) => Err(ProtocolError::InvalidArguments),
+                DispatchRequest::TraceSemantic(request) => {
+                    let options = ObservationOptions { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector, ..ObservationOptions::default() };
+                    let observed_viewport = viewport(&capture_context.page, &operation).await?;
+                    let semantic = semantic_lease(&operation, false);
+                    let mut tree = observation::observe(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic).await.map_err(map_observation)?;
+                    geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.hidden_frame_proof, &operation).await.map_err(map_geometry)?);
+                    let proof = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
+                    observation::project_geometry(&capture_context.page.client, &frozen, &staged, proof, &mut tree.roots, &operation).await.map_err(map_geometry)?;
+                    let root = exact_root(tree.roots, &staged, &frozen)?;
+                    verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
+                    if viewport(&capture_context.page, &operation).await? != observed_viewport { return Err(ProtocolError::StaleScope); }
+                    Ok((json!({"identityScope":identity,"revision":revision.to_string(),"root":root,
+                        "viewportRef":tree.viewport_ref,"truncated":tree.truncated,
+                        "viewport":observed_viewport,"location":main_frame(&frozen)?.url}), None, None))
+                }
                 DispatchRequest::Query(query) => {
                     let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     let mut output = observation::query(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &query.options, &operation).await.map_err(map_observation)?;
@@ -1804,6 +1843,11 @@ async fn fresh_fallback<'a>(
 }
 
 fn validate_policy(policy: &ReadPolicy, request: &DispatchRequest) -> Result<(), ProtocolError> {
+    if let DispatchRequest::TraceSemantic(request) = request {
+        if request.options.pixels || request.options.pixel_fallback || request.options.comparable {
+            return Err(ProtocolError::InvalidArguments);
+        }
+    }
     if policy.test_id_attribute.is_empty()
         || policy.test_id_attribute.len() > 256
         || policy.secure_field_selector.is_empty()
@@ -1817,7 +1861,7 @@ fn validate_policy(policy: &ReadPolicy, request: &DispatchRequest) -> Result<(),
                 && policy.secure_field_selector == request.options.secure_field_selector
         }
         DispatchRequest::Correlate(_) => true,
-        DispatchRequest::Observe(request) => {
+        DispatchRequest::Observe(request) | DispatchRequest::TraceSemantic(request) => {
             policy.test_id_attribute == request.test_id_attribute
                 && policy.secure_field_selector == request.secure_field_selector
         }
@@ -4248,6 +4292,71 @@ mod tests {
             let revision = publication.stage_revision(kind).unwrap();
             publication.commit_refs(kind, revision, &mut refs, RefMap::new());
             assert_eq!(publication.observed_revision, committed);
+        }
+    }
+    #[test]
+    fn semantic_trace_discards_temporary_authority_without_advancing_publication() {
+        let mut publication = Publication {
+            revision: 7,
+            published_revision: 6,
+            observed_revision: 5,
+        };
+        let mut refs = RefMap::new();
+        let binding = frame("root", None).binding;
+        let original = refs
+            .try_bind_exact(10, "button", "kept", binding.clone())
+            .unwrap();
+        let mut staged = refs.clone();
+        staged.retire_interaction_references();
+        let temporary = staged
+            .try_bind_exact(11, "button", "trace", binding.clone())
+            .unwrap();
+        let revision = publication
+            .stage_revision(PublicationKind::TraceSemantic)
+            .unwrap();
+        publication.commit_refs(PublicationKind::TraceSemantic, revision, &mut refs, staged);
+        assert_eq!(
+            (
+                publication.revision,
+                publication.published_revision,
+                publication.observed_revision
+            ),
+            (7, 6, 5)
+        );
+        assert!(refs.get(&original).is_some());
+        assert!(refs.get(&temporary).is_none());
+        let next = refs.try_bind_exact(12, "button", "next", binding).unwrap();
+        assert_ne!(next, temporary); // A discarded trace ID is never recycled.
+    }
+    #[test]
+    fn semantic_trace_rejects_pixel_or_fallback_options() {
+        let policy = ReadPolicy {
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password]".into(),
+        };
+        for flags in [
+            ObserveFlags {
+                pixels: true,
+                ..Default::default()
+            },
+            ObserveFlags {
+                pixel_fallback: true,
+                ..Default::default()
+            },
+            ObserveFlags {
+                comparable: true,
+                ..Default::default()
+            },
+        ] {
+            let request = DispatchRequest::TraceSemantic(ObserveRequest {
+                options: flags,
+                test_id_attribute: policy.test_id_attribute.clone(),
+                secure_field_selector: policy.secure_field_selector.clone(),
+            });
+            assert_eq!(
+                validate_policy(&policy, &request),
+                Err(ProtocolError::InvalidArguments)
+            );
         }
     }
     #[test]

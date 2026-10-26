@@ -2451,6 +2451,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             "browser.evaluate/1",
             "browser.page/1",
             "browser.observe/1",
+            "browser.trace-semantic/1",
             "browser.query/1",
             "browser.query-union/1",
             "browser.fixture-read-fields/1",
@@ -2598,6 +2599,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             }
             "scope.configure"
             | "browser.observe"
+            | "browser.trace"
             | "browser.query"
             | "fixture.query"
             | "fixture.read-fields"
@@ -2890,6 +2892,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         if matches!(
             command.as_str(),
             "browser.observe"
+                | "browser.trace"
                 | "browser.query"
                 | "fixture.query"
                 | "fixture.read-fields"
@@ -2902,6 +2905,9 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let value = serde_json::Value::Object(args);
             let request = match command.as_str() {
                 "browser.observe" => serde_json::from_value(value).map(DispatchRequest::Observe),
+                "browser.trace" => {
+                    serde_json::from_value(value).map(DispatchRequest::TraceSemantic)
+                }
                 "fixture.correlate" => {
                     serde_json::from_value(value).map(DispatchRequest::Correlate)
                 }
@@ -3025,23 +3031,26 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         // admission are synchronous and precede any task reorder.
                         let trace_screenshot = matches!(&request, DispatchRequest::Screenshot(request)
                             if request.purpose == super::client_observation_dispatch::ScreenshotPurpose::Trace);
+                        let semantic_trace = matches!(&request, DispatchRequest::TraceSemantic(_));
                         let prepared = observation.prepare(context, request, lease)?;
                         Ok(async move {
                             let task = observation.start_prepared(prepared);
                             let output = task.result.await;
                             let cleanup = task.join.await;
                             let (mut outcome, mut dirty) = settle_observation_dispatch(output, cleanup);
-                            if trace_screenshot && (std::time::Instant::now() >= receipt_deadline
+                            if (trace_screenshot || semantic_trace) && (std::time::Instant::now() >= receipt_deadline
                                 || *receipt_cancellation.borrow() != super::client_session::CancelSignal::None)
                             {
                                 if let Ok(value) = &outcome.result {
-                                    dirty |= receipt_blobs.discard_trace_image(receipt_generation, value).is_err();
+                                    if trace_screenshot {
+                                        dirty |= receipt_blobs.discard_trace_image(receipt_generation, value).is_err();
+                                    }
                                     outcome.result = Err(if dirty { ProtocolError::CleanupFailed } else {
                                         (*receipt_cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)
                                     });
                                 }
                             }
-                            settle_trace_screenshot(outcome, dirty, trace_screenshot, &receipt_journal)
+                            settle_trace_screenshot(outcome, dirty, trace_screenshot || semantic_trace, &receipt_journal)
                         })
                     },
                 )
