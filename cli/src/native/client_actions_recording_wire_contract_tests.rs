@@ -426,7 +426,7 @@ async fn recording_delayed_initial_frame_precedes_ready_and_silent_stop_is_bound
 async fn recording_page_opened_remeasures_second_viewport_and_stops_each_capture_once() {
     let f = WireFixture::new(Mode::Silent).await;
     let actions = ClientActions::default();
-    let result = async {
+    let result: Result<(), String> = async {
         let args = json!({"identityScope":"recording-wire"});
         let first = f.operation(2);
         let journal = f.journal(0, &first);

@@ -161,6 +161,10 @@ fn commit(
         PublicationKind::Snapshot,
         revision,
         refs,
+        &prepared.context.blobs,
+        &prepared.context.scope,
+        // These helpers stage references only, with no encoded pixel handles.
+        &[],
     )
 }
 
@@ -843,6 +847,10 @@ fn commit_trace(
         PublicationKind::TraceViewport,
         revision,
         refs,
+        &prepared.context.blobs,
+        &prepared.context.scope,
+        // These helpers stage references only, with no encoded pixel handles.
+        &[],
     )
 }
 #[tokio::test]
@@ -1420,6 +1428,12 @@ async fn uncertainty_retirement_fences_additive_trace_and_capture_without_recycl
         .id
         .clone();
     let next_before = refs.lock().unwrap().try_allocate_ref().unwrap();
+    // A real staged handle remains owned by the original fixture store. It is
+    // not a renderer-pixel proof, and a stale commit must not publish it.
+    let staged_pixels = owner
+        .blobs
+        .insert_sealed(owner.scope.clone(), b"staged-pixels")
+        .unwrap();
     dispatch.retire_interaction().await.unwrap();
     assert!(dispatch.publication_fence().unwrap() > old_fence);
     assert!(!refs.lock().unwrap().is_viewport_ref(&old_viewport));
@@ -1437,6 +1451,11 @@ async fn uncertainty_retirement_fences_additive_trace_and_capture_without_recycl
     // Additive queries and pixels have no CaptureAdmission. They still cannot
     // bypass the one retirement fence to publish old refs or artifacts.
     for kind in [PublicationKind::AdditiveQuery, PublicationKind::PixelsOnly] {
+        let handles = if matches!(kind, PublicationKind::PixelsOnly) {
+            vec![staged_pixels.handle.clone()]
+        } else {
+            Vec::new()
+        };
         assert_eq!(
             dispatch.commit_staged(
                 &capture.context.page,
@@ -1447,11 +1466,26 @@ async fn uncertainty_retirement_fences_additive_trace_and_capture_without_recycl
                 &mut publication,
                 kind,
                 1,
-                old_refs.clone()
+                old_refs.clone(),
+                &capture.context.blobs,
+                &capture.context.scope,
+                &handles,
             ),
             Err(ProtocolError::StaleReference)
         );
     }
+    assert_eq!(
+        owner
+            .blobs
+            .read(&owner.scope, &staged_pixels.handle, 0, 13)
+            .unwrap(),
+        b"staged-pixels"
+    );
+    owner
+        .blobs
+        .release(&owner.scope, &staged_pixels.handle)
+        .unwrap();
+    owner.blobs.check_budget_integrity().unwrap();
     drop(publication);
     let next_after = refs.lock().unwrap().try_allocate_ref().unwrap();
     assert_ne!(next_before, next_after);
