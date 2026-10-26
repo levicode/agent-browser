@@ -2786,6 +2786,20 @@ async fn focus(
     node.call(ctx,d,true,"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};if(typeof this.focus!=='function')return {status:'not-actionable'};this.focus();return true;}",vec![]).await?;
     Ok(())
 }
+// This probe has no value parameter and performs no focus, selection, event or
+// input mutation. Its refusal can therefore precede the mutation reservation.
+// PREPARE_FILL still rechecks every predicate after this read; a later race is
+// not a clean refusal and must retain the mutation path's Unknown effects.
+const FILL_ADMISSIBILITY: &str = r#"function(){
+ if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};
+ if(this.matches(':disabled')||this.readOnly)return {status:'not-actionable'};
+ if(this instanceof HTMLInputElement){
+  if(['button','checkbox','file','hidden','image','radio','range','reset','submit','color'].includes(this.type))return {status:'not-actionable'};
+  return true;
+ }
+ if(this instanceof HTMLTextAreaElement||this.isContentEditable)return true;
+ return {status:'not-actionable'};
+}"#;
 const PREPARE_FILL: &str = r#"function(value){
  if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};
  if(this.matches(':disabled')||this.readOnly)return {status:'not-actionable'};
@@ -2808,6 +2822,10 @@ async fn fill(
     value: &str,
     _sensitive: bool,
 ) -> Result<(), ProtocolError> {
+    let admissible = node.call(ctx, d, false, FILL_ADMISSIBILITY, vec![]).await?;
+    if admissible != Value::Bool(true) {
+        return Err(ProtocolError::BrowserFailure);
+    }
     let result = node
         .call(ctx, d, true, PREPARE_FILL, vec![json!(value)])
         .await?;
@@ -3997,6 +4015,9 @@ mod tests {
     mod retirement_node_swipes {
         include!("client_actions_retirement_node_swipe_tests.rs");
     }
+    mod retained_action_errors {
+        include!("client_actions_error_boundary_tests.rs");
+    }
     #[test]
     fn readonly_timing_is_silent_when_disabled_tap_success_or_mutated() {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -4811,6 +4832,9 @@ mod tests {
                 if mode == direct_point_clicks::MODE || direct_point_clicks::is_pointer_mode(mode) {
                     direct_point_clicks::record_receipt(&mut observed, observed_since.elapsed());
                 }
+                if retained_action_errors::is_mode(mode) {
+                    retained_action_errors::observe(mode, &request, &mut observed).await;
+                }
                 captured.lock().unwrap().push(observed.clone());
                 let method = request["method"].as_str().unwrap();
                 if mode == direct_point_clicks::CANCEL_MODE
@@ -5065,6 +5089,11 @@ mod tests {
                     "Save"
                 };
                 let result = match method {
+                    "Runtime.callFunctionOn"
+                        if observed.get("actionErrorScriptResult").is_some() =>
+                    {
+                        json!({"result":{"value":observed["actionErrorScriptResult"]["result"]}})
+                    }
                     _ if retirement_node_swipes::is_mode(mode)
                         && observed.get("nodeSwipeScript").is_some() =>
                     {

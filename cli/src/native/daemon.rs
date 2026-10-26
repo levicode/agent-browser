@@ -954,11 +954,14 @@ mod tests {
         assert_eq!(ready["type"], "ready");
         let expected = vec![
             "operation.continue-exact-owner/1",
+            "scope.reconnect-quarantined/1",
             "browser.scope/1",
             "browser.lifecycle/1",
             "browser.evaluate/1",
             "browser.page/1",
             "browser.observe/1",
+            "browser.observe-frame-policy/1",
+            "browser.trace-semantic/1",
             "browser.query/1",
             "browser.query-union/1",
             "browser.fixture-read-fields/1",

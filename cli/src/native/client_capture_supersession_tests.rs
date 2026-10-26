@@ -77,6 +77,7 @@ impl Owner {
             blobs: self.blobs.clone(),
             scope: self.scope.clone(),
             policy: ReadPolicy {
+                frame_policy: Default::default(),
                 test_id_attribute: "data-testid".into(),
                 secure_field_selector: "input[type=password]".into(),
             },

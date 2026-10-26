@@ -550,6 +550,11 @@ struct RequestPolicy {
     headers: Option<std::collections::HashMap<String, String>>,
     basic_auth: Option<BasicCredentials>,
 }
+impl RequestPolicy {
+    fn observation_frame_policy(&self) -> super::client_observation::ObservationFramePolicy {
+        super::client_observation::ObservationFramePolicy::configured(self.site.clone())
+    }
+}
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BasicCredentials {
@@ -577,7 +582,8 @@ impl ConfigureRequest {
                 .site
                 .as_ref()
                 // EngineAppInfo.site is siteOf(hostname), not an absolute URL.
-                // Matching remains in the existing callback-side sameSite policy.
+                // Request matching remains callback-side; automatic semantic
+                // reads freeze this same site into their native-only policy.
                 .is_some_and(|site| site.len() > 16 * 1024 || site.chars().any(char::is_control))
             || self.request_policy.headers.as_ref().is_some_and(|headers| {
                 headers.iter().any(|(key, value)| {
@@ -2578,6 +2584,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             "browser.evaluate/1",
             "browser.page/1",
             "browser.observe/1",
+            "browser.observe-frame-policy/1",
             "browser.trace-semantic/1",
             "browser.query/1",
             "browser.query-union/1",
@@ -3004,7 +3011,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     network.configure_downloads(&context_id, source, &lease).await?;
                     page.permit.check()?;
                     let mut state = configuration.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
-                    state.policy = Some(super::client_observation_dispatch::ReadPolicy { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector });
+                    state.policy = Some(super::client_observation_dispatch::ReadPolicy { frame_policy: request.request_policy.observation_frame_policy(), test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector });
                     state.downloads = Some(downloads);
                     state.configuring = false;
                     Ok(serde_json::Value::Null)
@@ -5379,6 +5386,37 @@ mod tests {
     }
 
     #[test]
+    fn configured_observation_site_is_frozen_without_normalizing_or_allow_all_default() {
+        for site in [None, Some(""), Some("app.example"), Some("APP.EXAMPLE")] {
+            let mut value = serde_json::json!({
+                "testIdAttribute":"data-testid", "secureFieldSelector":"input[type=\"password\" i]",
+                "requestPolicy":{}, "downloads":{"source":"local"}
+            });
+            if let Some(site) = site {
+                value["requestPolicy"]["site"] = site.into();
+            }
+            let mut request: ConfigureRequest = serde_json::from_value(value).unwrap();
+            request.validate(false).unwrap();
+            let frozen = request.request_policy.observation_frame_policy();
+            assert_eq!(
+                frozen,
+                super::super::client_observation::ObservationFramePolicy::configured(
+                    site.map(str::to_owned)
+                )
+            );
+            request.request_policy.site = Some("replacement.example".into());
+            assert_ne!(frozen, request.request_policy.observation_frame_policy());
+            // Existing restart/reconnect seeds clone this immutable value.
+            let seed = super::super::client_observation_dispatch::ReadPolicy {
+                frame_policy: frozen.clone(),
+                test_id_attribute: request.test_id_attribute,
+                secure_field_selector: request.secure_field_selector,
+            };
+            let replacement = seed.clone();
+            assert_eq!(replacement.frame_policy, frozen);
+        }
+    }
+    #[test]
     fn hostname_configuration_rejects_control_data_without_changing_header_authority() {
         for site in ["example.com\nforeign", "example.com\0"] {
             let request: ConfigureRequest = serde_json::from_value(serde_json::json!({
@@ -5438,6 +5476,8 @@ mod tests {
             "evaluate",
             "page",
             "observe",
+            "observe-frame-policy",
+            "trace-semantic",
             "query",
             "query-union",
             "fixture-read-fields",

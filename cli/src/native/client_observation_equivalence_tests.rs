@@ -192,6 +192,33 @@ fn operation() -> (OperationLease, tokio::sync::watch::Sender<CancelSignal>) {
         tx,
     )
 }
+/// Preserve the original per-capture budget without extending the enclosing case.
+fn original_observation_capture_deadline(case_deadline: Instant, now: Instant) -> Instant {
+    std::cmp::min(case_deadline, now + Duration::from_secs(10))
+}
+
+#[test]
+fn original_observation_capture_deadline_preserves_per_capture_and_case_bounds() {
+    let now = Instant::now();
+    let case_deadline = now + Duration::from_secs(30);
+    assert_eq!(
+        original_observation_capture_deadline(case_deadline, now),
+        now + Duration::from_secs(10)
+    );
+    assert_eq!(
+        original_observation_capture_deadline(case_deadline, now + Duration::from_secs(8)),
+        now + Duration::from_secs(18)
+    );
+    assert_eq!(
+        original_observation_capture_deadline(case_deadline, now + Duration::from_secs(25)),
+        case_deadline
+    );
+    assert_eq!(
+        original_observation_capture_deadline(now, now + Duration::from_secs(1)),
+        now
+    );
+}
+
 pub(super) fn instrument(method: &str, mut args: Value, lease: &OperationLease) -> Value {
     if let Some(h) = hook(lease) {
         if matches!(h.mode, Mode::Lifetime)
@@ -436,47 +463,353 @@ async fn chromium_closed_shadow_unique_focus_and_selection_contract() {
     result.unwrap();
 }
 
+// Fixture setup uses the real document and waits for real iframe load events.
+// A data: iframe may have its own renderer: resume its actual CDP session and
+// obtain the frame ID from Page.getFrameTree, never from a target-ID assumption.
+async fn read_node_names_fixture(
+    browser: &BrowserManager,
+    expression: &str,
+    op: &OperationLease,
+) -> Result<HashMap<String, String>, String> {
+    tokio::time::timeout_at(op.deadline.into(), async {
+        let session = browser.active_session_id()?;
+        let mut events = browser.client.subscribe_methods(&["Target.attachedToTarget"]);
+        let setup = evaluate_on(&browser.client, session, expression);
+        tokio::pin!(setup);
+        let mut attached = Vec::new();
+        loop {
+            tokio::select! {
+                result = &mut setup => {
+                    if result? != json!(true) {
+                        return Err("Original read-node fixture did not finish loading".into());
+                    }
+                    break;
+                }
+                event = events.recv() => {
+                    let event = event.ok_or("Fixture event delivery ended before load")?;
+                    if event.method != "Target.attachedToTarget" || event.params["targetInfo"]["type"] != "iframe" {
+                        continue;
+                    }
+                    let child = event.params["sessionId"].as_str().ok_or("Missing fixture renderer session")?;
+                    browser.prepare_domains_pub(child).await?;
+                    browser.client.send_command_no_params("Runtime.runIfWaitingForDebugger", Some(child)).await?;
+                    attached.push(child.to_owned());
+                }
+            }
+        }
+        let mut registry = HashMap::new();
+        for session in attached {
+            let tree = command(
+                &browser.client,
+                &session,
+                "Page.getFrameTree",
+                json!({}),
+                op,
+            )
+            .await
+            .map_err(|error| format!("Fixture renderer proof failed: {error:?}"))?;
+            let frame = tree["frameTree"]["frame"]["id"]
+                .as_str()
+                .ok_or("Missing fixture renderer root")?;
+            if registry.insert(frame.to_owned(), session).is_some() {
+                return Err("Duplicate fixture renderer root".into());
+            }
+        }
+        Ok::<_, String>(registry)
+    })
+    .await
+    .map_err(|_| "Original read-node fixture exceeded its case deadline".to_owned())?
+}
+
+// The original capture helper grants 10 seconds per capture. Keep that bound
+// and the existing 30-second enclosing case; do not adapt either to the output.
+async fn read_node_names_capture(
+    browser: &BrowserManager,
+    registry: &HashMap<String, String>,
+    refs: &mut RefMap,
+    op: &OperationLease,
+    revision: u64,
+    budget: usize,
+) -> Result<(Observation, Vec<ObservationFrame>), String> {
+    let capture = OperationLease {
+        is_callback: op.is_callback,
+        generation: op.generation,
+        sequence: op.sequence,
+        deadline: std::cmp::min(op.deadline, Instant::now() + Duration::from_secs(10)),
+        cancellation: op.cancellation.clone(),
+    };
+    let inventory = enumerate_frames(
+        &browser.client,
+        browser.active_session_id()?,
+        registry,
+        &capture,
+    )
+    .await
+    .map_err(|error| format!("Original read-node frame enumeration failed: {error:?}"))?;
+    // Deliberately pass the complete native inventory. Test-side URL/depth
+    // filtering or rewriting truncated would manufacture the missing policy.
+    let observation = observe(
+        &browser.client,
+        &inventory,
+        refs,
+        "equivalence",
+        revision,
+        &ObservationOptions {
+            max_nodes: budget,
+            ..Default::default()
+        },
+        &capture,
+    )
+    .await
+    .map_err(|error| format!("Original read-node producer failed: {error:?}"))?;
+    Ok((observation, inventory))
+}
+
+fn read_node_names_receipt(identity: &str, phase: &str, budget: usize, tree: &Observation) {
+    let nodes = flatten(&tree.roots);
+    println!(
+        "RETIREMENT_READ_NODE_BUDGET {}",
+        json!({
+            "identity":identity,
+            "phase":phase,
+            "budget":budget,
+            "nodeCount":nodes.len(),
+            "truncated":tree.truncated,
+            "names":nodes.into_iter().filter_map(|node| node.name.as_deref()).collect::<Vec<_>>(),
+        })
+    );
+}
+
 #[tokio::test]
-#[ignore = "hosted Chromium: real AX controls, exact labels and native budget accounting"]
+#[ignore = "hosted Chromium: original read-node-names:2 exact 22/5 node budgets"]
 async fn chromium_twenty_controls_budget_and_frame_truncation_contract() {
     let mut browser = BrowserManager::launch(Default::default(), None)
         .await
         .unwrap();
-    let result=async {
-        let session=browser.active_session_id()?;let(op,_tx)=operation();
-        evaluate_on(&browser.client,session,"document.body.innerHTML='<main>'+Array.from({length:20},(_,i)=>'<button>Button '+i+'</button>').join('')+'</main>';true").await?;
-        let inventory=frames(&browser,&op).await;let mut refs=RefMap::new();
-        let whole=observe(&browser.client,&inventory,&mut refs,"equivalence",1,&ObservationOptions{max_nodes:100,..Default::default()},&op).await?;
-        assert!(!whole.truncated);
-        let buttons:Vec<_>=flatten(&whole.roots).into_iter().filter(|n|n.role.as_deref()==Some("button")).collect();
-        assert_eq!(buttons.len(),20);
-        let mut identities=std::collections::HashSet::new();
-        for button in &buttons {
-            assert!(identities.insert(button.reference.id.clone()));
-            let id=super::super::element::parse_ref(&button.reference.id).unwrap();
-            assert!(refs.get(&id).unwrap().exact_binding.as_ref().unwrap().actionable);
+    let result = async {
+        let (op, _tx) = operation();
+        let registry = read_node_names_fixture(&browser,
+            "document.body.innerHTML='<main>'+Array.from({length:20},(_,i)=>'<button>Button '+i+'</button>').join('')+'</main>';true", &op).await?;
+        let mut refs = RefMap::new();
+        let (whole, _) = read_node_names_capture(&browser, &registry, &mut refs, &op, 1, 100).await?;
+        let whole_refs = refs.clone();
+        let (cut, _) = read_node_names_capture(&browser, &registry, &mut refs, &op, 2, 5).await?;
+        Ok::<_, String>((whole, cut, whole_refs))
+    }
+    .await;
+    browser.close().await.unwrap();
+    let (whole, cut, refs) = result.unwrap();
+    read_node_names_receipt("read-node-names:2", "whole", 100, &whole);
+    read_node_names_receipt("read-node-names:2", "cut", 5, &cut);
+    assert!(!whole.truncated);
+    assert_eq!(flatten(&whole.roots).len(), 22, "original whole.nodeCount");
+    assert!(cut.truncated);
+    assert_eq!(flatten(&cut.roots).len(), 5, "original cut.nodeCount");
+    // Preserve the existing additional native identity/name assertions too.
+    let buttons: Vec<_> = flatten(&whole.roots)
+        .into_iter()
+        .filter(|node| node.role.as_deref() == Some("button"))
+        .collect();
+    assert_eq!(buttons.len(), 20);
+    let mut identities = std::collections::HashSet::new();
+    for button in &buttons {
+        assert!(identities.insert(button.reference.id.clone()));
+        let id = super::super::element::parse_ref(&button.reference.id).unwrap();
+        assert!(
+            refs.get(&id)
+                .unwrap()
+                .exact_binding
+                .as_ref()
+                .unwrap()
+                .actionable
+        );
+    }
+    let names: std::collections::BTreeSet<_> = buttons
+        .into_iter()
+        .map(|node| node.name.clone().unwrap())
+        .collect();
+    assert_eq!(names, (0..20).map(|i| format!("Button {i}")).collect());
+}
+
+#[tokio::test]
+#[ignore = "hosted Chromium: original read-node-names:3 child frame at exact budget three"]
+async fn chromium_original_child_frame_budget_three_contract() {
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let (op, _tx) = operation();
+        let registry = read_node_names_fixture(&browser,
+            r#"new Promise(resolve=>{document.body.innerHTML='<button>One</button>';const f=document.createElement('iframe');f.addEventListener('load',()=>resolve(true),{once:true});f.srcdoc='<button>Inside</button>';document.body.append(f);})"#, &op).await?;
+        let mut refs = RefMap::new();
+        let (whole, inventory) = read_node_names_capture(&browser, &registry, &mut refs, &op, 1, 100).await?;
+        let (cut, _) = read_node_names_capture(&browser, &registry, &mut refs, &op, 2, 3).await?;
+        Ok::<_, String>((whole, cut, inventory))
+    }
+    .await;
+    browser.close().await.unwrap();
+    let (whole, cut, inventory) = result.unwrap();
+    read_node_names_receipt("read-node-names:3", "whole", 100, &whole);
+    read_node_names_receipt("read-node-names:3", "cut", 3, &cut);
+    assert_eq!(
+        inventory.len(),
+        2,
+        "the real child must be in the input inventory"
+    );
+    assert!(!whole.truncated);
+    assert!(flatten(&whole.roots)
+        .iter()
+        .any(|node| node.name.as_deref() == Some("Inside")));
+    assert!(cut.truncated);
+    assert!(flatten(&cut.roots)
+        .iter()
+        .all(|node| node.name.as_deref() != Some("Inside")));
+    assert_eq!(flatten(&cut.roots).len(), 3);
+}
+
+#[tokio::test]
+#[ignore = "hosted Chromium: original read-node-names:4 actual off-site data iframe"]
+async fn chromium_original_offsite_data_frame_budget_three_contract() {
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let (op, _tx) = operation();
+        // No configured site and the original non-blank data: child. This is
+        // not a srcdoc frame manually removed from the producer's inputs.
+        let registry = read_node_names_fixture(&browser,
+            r#"new Promise(resolve=>{document.body.innerHTML='<button>One</button>';const f=document.createElement('iframe');f.addEventListener('load',()=>resolve(true),{once:true});f.src='data:text/html,<button>Ad</button>';document.body.append(f);})"#, &op).await?;
+        let mut refs = RefMap::new();
+        read_node_names_capture(&browser, &registry, &mut refs, &op, 1, 3).await
+    }
+    .await;
+    browser.close().await.unwrap();
+    let (cut, inventory) = result.unwrap();
+    read_node_names_receipt("read-node-names:4", "cut", 3, &cut);
+    assert_eq!(
+        inventory.len(),
+        2,
+        "off-site frame must not be erased by the fixture"
+    );
+    assert!(inventory
+        .iter()
+        .any(|frame| frame.parent_frame_id.is_some() && frame.url.starts_with("data:text/html,")));
+    assert_eq!(flatten(&cut.roots).len(), 3, "original cut.nodeCount");
+    assert!(!cut.truncated, "off-site omission is not budget truncation");
+}
+
+#[tokio::test]
+#[ignore = "hosted Chromium: original read-node-names:5 srcdoc depth four/five boundary"]
+async fn chromium_original_onsite_frame_depth_four_five_contract() {
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let (op, _tx) = operation();
+        let mut captures = Vec::new();
+        for levels in [4, 5] {
+            let expression = format!(r#"(async()=>{{
+                document.body.innerHTML='<button>Top</button>';
+                let doc=document;
+                for(let level=0;level<{levels};level+=1){{
+                    const iframe=doc.createElement('iframe');
+                    const loaded=new Promise(resolve=>iframe.addEventListener('load',resolve,{{once:true}}));
+                    iframe.srcdoc='<button>Level '+String(level+1)+'</button>';
+                    doc.body.appendChild(iframe);
+                    await loaded;
+                    doc=iframe.contentDocument;
+                }}
+                return true;
+            }})()"#);
+            let registry = read_node_names_fixture(&browser, &expression, &op).await?;
+            let mut refs = RefMap::new();
+            captures.push(read_node_names_capture(&browser, &registry, &mut refs, &op, levels, 1_000).await?);
         }
-        let names:std::collections::BTreeSet<_>=buttons.into_iter().map(|n|n.name.clone().unwrap()).collect();
-        assert_eq!(names,(0..20).map(|i|format!("Button {i}")).collect());
-        let cut=observe(&browser.client,&inventory,&mut refs,"equivalence",2,&ObservationOptions{max_nodes:5,..Default::default()},&op).await?;
-        assert!(cut.truncated);assert_eq!(flatten(&cut.roots).len(),5);
-        evaluate_on(&browser.client,session,r#"new Promise(resolve=>{document.body.innerHTML='<button>One</button>';const f=document.createElement('iframe');f.onload=()=>resolve(true);f.srcdoc='<button>Inside</button>';document.body.append(f);})"#).await?;
-        let inventory=frames(&browser,&op).await;assert_eq!(inventory.len(),2);
-        // Frame admission belongs to owner policy. Measure the native main AX
-        // count, not the retired DOM reader's incidental count of three nodes.
-        let main=observe(&browser.client,&inventory[..1],&mut refs,"equivalence",3,&ObservationOptions::default(),&op).await?;
-        let budget=flatten(&main.roots).len();assert!(!main.truncated);
-        let whole=observe(&browser.client,&inventory,&mut refs,"equivalence",4,&ObservationOptions::default(),&op).await?;
-        assert!(!whole.truncated);assert!(flatten(&whole.roots).iter().any(|n|n.role.as_deref()==Some("button")&&n.name.as_deref()==Some("Inside")));
-        let cut=observe(&browser.client,&inventory,&mut refs,"equivalence",5,&ObservationOptions{max_nodes:budget,..Default::default()},&op).await?;
-        assert!(cut.truncated);assert!(flatten(&cut.roots).iter().all(|n|n.name.as_deref()!=Some("Inside")));assert_eq!(flatten(&cut.roots).len(),budget);
-        // Explicitly excluded frames do not consume the admitted-frame budget.
-        let excluded=observe(&browser.client,&inventory[..1],&mut refs,"equivalence",6,&ObservationOptions{max_nodes:budget,..Default::default()},&op).await?;
-        assert!(!excluded.truncated);Ok::<(),String>(())
+        Ok::<_, String>(captures)
+    }
+    .await;
+    browser.close().await.unwrap();
+    let captures = result.unwrap();
+    let (within, within_inventory) = &captures[0];
+    let (beyond, beyond_inventory) = &captures[1];
+    read_node_names_receipt("read-node-names:5", "depth-four", 1_000, within);
+    read_node_names_receipt("read-node-names:5", "depth-five", 1_000, beyond);
+    assert_eq!(within_inventory.len(), 5);
+    assert_eq!(beyond_inventory.len(), 6);
+    assert_eq!(
+        within_inventory
+            .iter()
+            .map(|frame| frame.frame_path.len())
+            .max(),
+        Some(4)
+    );
+    assert_eq!(
+        beyond_inventory
+            .iter()
+            .map(|frame| frame.frame_path.len())
+            .max(),
+        Some(5)
+    );
+    assert!(!within.truncated);
+    assert!(flatten(&within.roots)
+        .iter()
+        .any(|node| node.name.as_deref() == Some("Level 4")));
+    assert!(
+        beyond.truncated,
+        "original on-site depth limit must report truncation"
+    );
+    assert!(flatten(&beyond.roots)
+        .iter()
+        .all(|node| node.name.as_deref() != Some("Level 5")));
+}
+
+#[tokio::test]
+#[ignore = "hosted Chromium: exact document-first DFS budget across sibling frames"]
+async fn chromium_observation_frame_dfs_budget_eight_contract() {
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let (op, _tx) = operation();
+        let registry = read_node_names_fixture(&browser, r#"(async()=>{
+            document.body.innerHTML='';
+            async function add(doc, html) {
+                const child=doc.createElement('iframe');
+                const loaded=new Promise(resolve=>child.addEventListener('load',resolve,{once:true}));
+                child.srcdoc=html; doc.body.appendChild(child); await loaded;
+                return child.contentDocument;
+            }
+            const a=await add(document, '<button>A</button>');
+            await add(document, '<button>B</button>');
+            await add(a, '<button>Grand</button>');
+            return true;
+        })()"#, &op).await?;
+        let mut refs = RefMap::new();
+        let (whole, inventory) = read_node_names_capture(&browser, &registry, &mut refs, &op, 1, 100).await?;
+        let (cut, _) = read_node_names_capture(&browser, &registry, &mut refs, &op, 2, 8).await?;
+        Ok::<_, String>((whole, cut, inventory))
     }.await;
     browser.close().await.unwrap();
-    result.unwrap();
+    let (whole, cut, inventory) = result.unwrap();
+    read_node_names_receipt("read-node-dfs", "whole", 100, &whole);
+    read_node_names_receipt("read-node-dfs", "cut", 8, &cut);
+    assert_eq!(inventory.len(), 4);
+    assert_eq!(flatten(&whole.roots).len(), 10);
+    assert!(!whole.truncated);
+    assert_eq!(flatten(&cut.roots).len(), 8);
+    assert!(cut.truncated);
+    let names = flatten(&cut.roots)
+        .into_iter()
+        .filter_map(|node| node.name.as_deref())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"A"));
+    assert!(
+        names.contains(&"Grand"),
+        "earlier child's descendant must precede later sibling"
+    );
+    assert!(!names.contains(&"B"));
 }
+
 #[tokio::test]
 #[ignore = "hosted Chromium: actual embedded-control labels and password-descendant names"]
 async fn chromium_embedded_control_and_password_public_labels_contract() {
@@ -485,17 +818,19 @@ async fn chromium_embedded_control_and_password_public_labels_contract() {
         .unwrap();
     let result=async {
         let session=browser.active_session_id()?;let(op,_tx)=operation();
-        evaluate_on(&browser.client,session,r#"document.body.innerHTML='<label for="qty">Qty <input value="5"> items</label><input id="qty" data-testid="label-for"><button data-testid="secure">Unlock <input type="password" value="synthetic-secret"> now</button><label for="pin">PIN <input type="password" value="synthetic-secret"> field</label><input id="pin" data-testid="secure-label">';true"#).await?;
+        evaluate_on(&browser.client,session,r#"document.body.innerHTML='<label for="qty">Qty <input value="5"> items</label><input id="qty" data-testid="label-for"><button data-testid="secure">Unlock <input type="password" value="hunter2"> now</button><label for="pin">PIN <input type="password" value="hunter2"> field</label><input id="pin" data-testid="secure-label">';true"#).await?;
         let inventory=frames(&browser,&op).await;let mut refs=RefMap::new();let qty=query_testid(&browser,&inventory,&mut refs,&op,"label-for").await;
         assert_eq!(qty.labels,vec!["Qty items"]);
         let label:QueryOptions=serde_json::from_value(json!({"expression":{"kind":"query","query":{"kind":"label","value":{"kind":"string","value":"Qty items","exact":true}}}})).unwrap();
         let found=query(&browser.client,&inventory,&mut refs,"equivalence",1,&label,&op).await?;assert_eq!(found.nodes.len(),1);assert_eq!(found.nodes[0].test_id.as_deref(),Some("label-for"));
         let button=query_testid(&browser,&inventory,&mut refs,&op,"secure").await;let pin=query_testid(&browser,&inventory,&mut refs,&op,"secure-label").await;
         assert_eq!(button.name.as_deref(),Some("Unlock now"));assert_eq!(pin.name.as_deref(),Some("PIN field"));
-        assert!(!serde_json::to_string(&[qty,button,pin]).unwrap().contains("synthetic-secret"));
+        let original_reads=serde_json::to_value(&[qty,button,pin]).unwrap();
+        assert!(!original_reads.to_string().contains("hunter2"));
         let whole=observe(&browser.client,&inventory,&mut refs,"equivalence",2,&ObservationOptions::default(),&op).await?;
-        assert!(!serde_json::to_string(&whole).unwrap().contains("synthetic-secret"));
+        assert!(!serde_json::to_string(&whole).unwrap().contains("hunter2"));
         for(id,name)in[("secure","Unlock now"),("secure-label","PIN field")]{assert_eq!(flatten(&whole.roots).into_iter().find(|n|n.test_id.as_deref()==Some(id)).and_then(|n|n.name.as_deref()),Some(name));}
+        println!("RETIREMENT_PUBLIC_LABELS {}",json!({"identity":"read-node-names:8","reads":original_reads,"observationContainsSyntheticSecret":serde_json::to_string(&whole).unwrap().contains("hunter2")}));
         evaluate_on(&browser.client,session,r#"document.body.innerHTML='<span id="public-name">Preferred name</span><button data-testid="precedence" aria-label="Secondary name" aria-labelledby="public-name">Unlock <input type="password" value="synthetic-secret"> now</button><button data-testid="blocks"><span style="display:block">Unlock</span><input type="password" value="synthetic-secret"><span style="display:block">now</span></button><button data-testid="ambiguous"><img alt="Icon"><input type="password" value="synthetic-secret"> now</button>';true"#).await?;
         let precedence=query_testid(&browser,&inventory,&mut refs,&op,"precedence").await;
         assert_eq!(precedence.name.as_deref(),Some("Preferred name"));
@@ -516,12 +851,12 @@ async fn chromium_observation_metadata_gc_and_exact_ref_actionability() {
         .await
         .unwrap();
     let result=async {
-        let session=browser.active_session_id()?;let(op,_tx)=operation();
-        evaluate_on(&browser.client,session,r#"document.body.innerHTML='<button onclick="this.textContent=\'Clicked\'">Click</button>';true"#).await?;
-        let inventory=frames(&browser,&op).await;let mut refs=RefMap::new();let(_guard,h)=install(&op,Mode::Lifetime,usize::MAX);let mut latest=None;
-        for revision in 1..=3{let observation=observe(&browser.client,&inventory,&mut refs,"equivalence",revision,&ObservationOptions::default(),&op).await?;let buttons:Vec<_>=flatten(&observation.roots).into_iter().filter(|n|n.role.as_deref()==Some("button")).collect();assert_eq!(buttons.len(),1);latest=Some(buttons[0].reference.id.clone());}
+        let session=browser.active_session_id()?;let(mut op,_tx)=operation();let original_case_deadline=op.deadline;
+        evaluate_on(&browser.client,session,r#"document.body.innerHTML='<button onclick="this.textContent = \'Clicked\'">Click me</button>';true"#).await?;
+        let inventory=frames(&browser,&op).await;let mut refs=RefMap::new();let(_guard,h)=install(&op,Mode::Lifetime,usize::MAX);let mut latest=None;let mut original_node_counts=Vec::new();
+        for revision in 1..=3{op.deadline=original_observation_capture_deadline(original_case_deadline,Instant::now());let observation=observe(&browser.client,&inventory,&mut refs,"equivalence",revision,&ObservationOptions::default(),&op).await?;let nodes=flatten(&observation.roots);original_node_counts.push(nodes.len());let buttons:Vec<_>=nodes.into_iter().filter(|n|n.role.as_deref()==Some("button")).collect();assert_eq!(buttons.len(),1);latest=Some(buttons[0].reference.id.clone());}
         assert_eq!(h.calls.load(Ordering::SeqCst),3);
-        let objects=h.handles.lock().unwrap().clone();assert!(!objects.is_empty());
+        let objects=h.handles.lock().unwrap().clone();assert!(!objects.is_empty());let released_handle_count=objects.len();
         for object in objects {let old=browser.client.send_command("Runtime.callFunctionOn",Some(json!({"objectId":object,"functionDeclaration":"function(){return true}","returnByValue":true})),Some(session)).await;assert!(old.is_err(),"Released observation remote handle remained live");}
         let world=browser.client.send_command("Page.createIsolatedWorld",Some(json!({"frameId":inventory[0].binding.frame,"worldName":"agent-browser-native-observation"})),Some(session)).await?;
         browser.client.send_command_no_params("HeapProfiler.collectGarbage",Some(session)).await?;
@@ -529,10 +864,19 @@ async fn chromium_observation_metadata_gc_and_exact_ref_actionability() {
         assert_eq!(dead["result"]["value"],json!([6,6]));
         let id=latest.unwrap();let(x,y,effective)=super::super::element::resolve_element_center(&browser.client,session,&refs,&id,&HashMap::new(),true).await?;
         for kind in ["mousePressed","mouseReleased"]{browser.client.send_command("Input.dispatchMouseEvent",Some(json!({"type":kind,"x":x,"y":y,"button":"left","clickCount":1})),Some(&effective)).await?;}
-        assert_eq!(evaluate_on(&browser.client,session,"document.querySelector('button').textContent").await?,json!("Clicked"));Ok::<(),String>(())
+        let clicked=evaluate_on(&browser.client,session,"document.querySelector('button').textContent").await?;
+        assert_eq!(clicked,json!("Clicked"));
+        println!("RETIREMENT_METADATA_GC {}",json!({"identity":"observation:1","nodeCounts":original_node_counts,"metadataCalls":h.calls.load(Ordering::SeqCst),"releasedHandleCount":released_handle_count,"weakRefs":dead["result"]["value"],"latestRef":id,"clicked":clicked}));
+        Ok::<_,String>(original_node_counts)
     }.await;
     browser.close().await.unwrap();
-    result.unwrap();
+    // Preserve the old nodeCount=2 assertion as well as GC and exact clicking.
+    // Checking after close retains cleanup even if native's tree count differs.
+    assert_eq!(
+        result.unwrap(),
+        vec![2, 2, 2],
+        "original observation:1 nodeCount must remain two in every capture"
+    );
 }
 #[tokio::test]
 #[ignore = "hosted Chromium: mutation after real metadata distinguishes stale document/frame from deadline"]

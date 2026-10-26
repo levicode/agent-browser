@@ -15,6 +15,12 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 #[path = "client_observation/author_projection.rs"]
 mod author_projection;
+#[path = "client_observation/frame_policy.rs"]
+mod frame_policy;
+pub(crate) use frame_policy::ObservationFramePolicy;
+#[path = "client_observation/semantic_frame_proof.rs"]
+mod semantic_frame_proof;
+pub(crate) use semantic_frame_proof::SemanticFrameProof;
 #[cfg(test)]
 #[path = "client_observation/composition_tests.rs"]
 pub(crate) mod composition_tests;
@@ -129,7 +135,7 @@ fn serialize_public_states<S: serde::Serializer>(
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct Observation {
     #[serde(skip)]
-    pub(crate) hidden_frame_proof: HiddenFrameProof,
+    pub(crate) semantic_frame_proof: SemanticFrameProof,
     pub identity_scope: String,
     #[serde(with = "revision_wire")]
     pub revision: u64,
@@ -170,6 +176,9 @@ pub struct ObservationFrame {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObservationOptions {
+    /// Frozen scope policy, never accepted from an observe/query wire payload.
+    #[serde(skip)]
+    pub(crate) frame_policy: ObservationFramePolicy,
     #[serde(default = "default_nodes")]
     pub max_nodes: usize,
     #[serde(default = "default_test_id")]
@@ -190,6 +199,7 @@ impl Default for ObservationOptions {
     fn default() -> Self {
         Self {
             max_nodes: default_nodes(),
+            frame_policy: ObservationFramePolicy::default(),
             test_id_attribute: default_test_id(),
             secure_field_selector: default_secure_selector(),
         }
@@ -459,6 +469,31 @@ async fn validate_frame(
     frame: &ObservationFrame,
     lease: &OperationLease,
 ) -> Result<(), ObservationError> {
+    validate_frame_impl(client, frame, lease, false).await
+}
+async fn validate_semantic_frame(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    lease: &OperationLease,
+) -> Result<(), ObservationError> {
+    validate_frame_impl(client, frame, lease, true).await
+}
+fn validate_semantic_frame_url(
+    expected: &str,
+    actual: Option<&str>,
+) -> Result<(), ObservationError> {
+    let actual = actual.ok_or(ObservationError::BackendFailure)?;
+    if actual != expected {
+        return Err(ObservationError::StaleReference);
+    }
+    Ok(())
+}
+async fn validate_frame_impl(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    lease: &OperationLease,
+    semantic_url: bool,
+) -> Result<(), ObservationError> {
     let tree = command(
         client,
         &frame.binding.session,
@@ -467,17 +502,25 @@ async fn validate_frame(
         lease,
     )
     .await?;
-    fn loader<'a>(tree: &'a Value, id: &str) -> Option<&'a str> {
+    fn native_frame<'a>(tree: &'a Value, id: &str) -> Option<&'a Value> {
         if tree["frame"]["id"].as_str() == Some(id) {
-            return tree["frame"]["loaderId"].as_str();
+            return Some(&tree["frame"]);
         }
         tree["childFrames"]
             .as_array()?
             .iter()
-            .find_map(|child| loader(child, id))
+            .find_map(|child| native_frame(child, id))
     }
-    if loader(&tree["frameTree"], &frame.binding.frame) != Some(frame.binding.loader.as_str()) {
+    let native = native_frame(&tree["frameTree"], &frame.binding.frame)
+        .ok_or(ObservationError::StaleReference)?;
+    if native["loaderId"].as_str() != Some(frame.binding.loader.as_str()) {
         return Err(ObservationError::StaleReference);
+    }
+    if semantic_url {
+        // Do not let an absent/non-string native URL acquire the legacy empty
+        // URL exception before semantic child content is read. Explicit reads
+        // retain their existing loader-only check; this adds no CDP round trip.
+        validate_semantic_frame_url(&frame.url, native["url"].as_str())?;
     }
     Ok(())
 }
@@ -2037,6 +2080,7 @@ fn proven_hidden_iframe(node: &SemanticNode) -> bool {
             .is_some_and(|facts| facts.node_type == 1 && facts.tag == "iframe")
 }
 
+#[cfg(test)]
 fn frame_has_hidden_owner(
     frame: &ObservationFrame,
     hidden_owners: &std::collections::HashSet<(String, i64)>,
@@ -2144,7 +2188,8 @@ macro_rules! semantic_capture_stage {
     }};
 }
 
-/// Capture all requested frames to staging state. A late failure never publishes
+/// Capture policy-admitted documents from the full proven inventory into staging
+/// state, in document-first DFS order. A late failure never publishes
 /// a partial tree or reference registry. Reserved IDs remain consumed.
 pub async fn observe(
     client: &CdpClient,
@@ -2163,34 +2208,21 @@ pub async fn observe(
     let mut staged = refs.clone();
     staged.begin_observation(identity_scope, lease.generation, revision);
     let mut frame_roots: HashMap<String, Vec<SemanticNode>> = HashMap::new();
-    let mut count = 0;
-    let mut truncated = false;
-    let ordered_frames = semantic_capture_stage!(
+    let mut traversal = semantic_capture_stage!(
         witness,
         FrameProof,
         SemanticCaptureFrameKind::Main,
-        observation_frame_order(frames)
+        frame_policy::FrameTraversal::new(frames, &options.frame_policy, options.max_nodes)
     )?;
-    let mut hidden_owners = std::collections::HashSet::new();
-    let mut skipped_frames = std::collections::HashSet::new();
-    for frame in ordered_frames {
+    while let Some(frame) = traversal.next()? {
         #[cfg(test)]
         let frame_kind = SemanticCaptureFrameKind::of(frame);
         semantic_capture_stage!(witness, FrameProof, frame_kind, check(lease))?;
-        if semantic_capture_stage!(
-            witness,
-            FrameProof,
-            frame_kind,
-            frame_has_hidden_owner(frame, &hidden_owners, &skipped_frames)
-        )? {
-            skipped_frames.insert(frame.binding.frame.clone());
-            continue;
-        }
         semantic_capture_stage!(
             witness,
             FrameProof,
             frame_kind,
-            validate_frame(client, frame, lease).await
+            validate_semantic_frame(client, frame, lease).await
         )?;
         let value = semantic_capture_stage!(
             witness,
@@ -2312,40 +2344,69 @@ pub async fn observe(
             witness,
             FrameProof,
             frame_kind,
-            validate_frame(client, frame, lease).await
+            validate_semantic_frame(client, frame, lease).await
         )?;
-        hidden_owners.extend(
-            nodes
-                .iter()
-                .filter(|(_, node)| proven_hidden_iframe(node))
-                .map(|(id, _)| (frame.binding.frame.clone(), *id)),
-        );
+        let hidden_owners = nodes
+            .iter()
+            .filter(|(_, node)| proven_hidden_iframe(node))
+            .map(|(id, _)| *id)
+            .collect();
         let (roots, frame_truncated) = semantic_capture_stage!(
             witness,
             Compact,
             frame_kind,
-            author_projection::compact(&graph, nodes, options.max_nodes - count)
+            author_projection::compact(&graph, nodes, options.max_nodes - traversal.count)
         )?;
-        let mut pending = roots.iter().collect::<Vec<_>>();
+        // Resolve emitted boundary order through native owner identity, not
+        // selectors/framePath. This walk excludes not-yet-captured documents.
+        let owners: HashMap<String, i64> = frames
+            .iter()
+            .filter(|child| child.parent_frame_id.as_ref() == Some(&frame.binding.frame))
+            .filter_map(|child| {
+                child.owner_backend_id.and_then(|backend| {
+                    staged
+                        .durable_ref(
+                            &child.binding.page_session,
+                            Some(&frame.binding.frame),
+                            backend,
+                        )
+                        .map(|id| (format!("@{id}"), backend))
+                })
+            })
+            .collect();
+        let mut node_count = 0;
+        let mut emitted_owners = Vec::new();
+        let mut pending = roots.iter().rev().collect::<Vec<_>>();
         while let Some(node) = pending.pop() {
-            count += 1;
-            pending.extend(node.children.iter());
+            node_count += 1;
+            if let Some(owner) = owners.get(&node.reference.id) {
+                emitted_owners.push(*owner);
+            }
+            pending.extend(node.children.iter().rev());
         }
-        truncated |= frame_truncated;
+        traversal.record(frame_policy::DocumentCapture {
+            frame: frame.binding.frame.clone(),
+            node_count,
+            truncated: frame_truncated,
+            emitted_owners,
+            hidden_owners,
+        })?;
         frame_roots.insert(frame.binding.frame.clone(), roots);
         semantic_capture_stage!(
             witness,
             FrameProof,
             frame_kind,
-            validate_frame(client, frame, lease).await
+            validate_semantic_frame(client, frame, lease).await
         )?;
     }
-    let mut pending: Vec<&ObservationFrame> = frames.iter().collect();
-    pending.sort_by_key(|f| std::cmp::Reverse(f.frame_path.len()));
-    for child in pending
-        .iter()
-        .filter(|f| f.parent_frame_id.is_some() && !skipped_frames.contains(&f.binding.frame))
-    {
+    // Native parent edges, never selector-path lengths, determine join depth.
+    let pending = observation_frame_order(frames)?
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>();
+    for child in pending.iter().filter(|f| {
+        f.parent_frame_id.is_some() && !traversal.omissions.contains_key(&f.binding.frame)
+    }) {
         let parent = child.parent_frame_id.as_ref().unwrap();
         let backend = semantic_capture_stage!(
             witness,
@@ -2356,7 +2417,9 @@ pub async fn observe(
         let owner = staged
             .durable_ref(&child.binding.page_session, Some(parent), backend)
             .map(|id| format!("@{id}"));
-        let children = frame_roots.remove(&child.binding.frame).unwrap_or_default();
+        let children = frame_roots
+            .remove(&child.binding.frame)
+            .ok_or(ObservationError::BackendFailure)?;
         fn attach(
             nodes: &mut [SemanticNode],
             id: &str,
@@ -2378,7 +2441,7 @@ pub async fn observe(
                 .get_mut(parent)
                 .is_some_and(|nodes| attach(nodes, id, &mut Some(children)))
         });
-        if !attached && !truncated {
+        if !attached {
             return semantic_capture_stage!(
                 witness,
                 FrameJoin,
@@ -2434,11 +2497,11 @@ pub async fn observe(
         pending.extend(node.children.iter());
     }
     staged.retain_snapshot_entries(refs, &published);
-    let hidden_frame_proof = semantic_capture_stage!(
+    let semantic_frame_proof = semantic_capture_stage!(
         witness,
         Finalize,
         SemanticCaptureFrameKind::Main,
-        HiddenFrameProof::new(frames, &hidden_owners, skipped_frames, options)
+        SemanticFrameProof::new(frames, &traversal, options, identity_scope, revision, lease)
     )?;
     semantic_capture_stage!(
         witness,
@@ -2448,12 +2511,12 @@ pub async fn observe(
     )?;
     *refs = staged;
     Ok(Observation {
-        hidden_frame_proof,
+        semantic_frame_proof,
         identity_scope: identity_scope.into(),
         revision,
         roots,
         viewport_ref,
-        truncated,
+        truncated: traversal.truncated,
     })
 }
 
@@ -7865,7 +7928,7 @@ mod tests {
                 let request: Value = serde_json::from_str(text).unwrap();
                 let result = match request["method"].as_str().unwrap() {
                     "Page.getFrameTree" => {
-                        json!({"frameTree":{"frame":{"id":"main","loaderId":if metadata_read&&fail_after_metadata{"replaced"}else{"doc"}}}})
+                        json!({"frameTree":{"frame":{"id":"main","url":"https://fixture.invalid","loaderId":if metadata_read&&fail_after_metadata{"replaced"}else{"doc"}}}})
                     }
                     "Accessibility.getFullAXTree" => {
                         json!({"nodes":[{"nodeId":"1","backendDOMNodeId":42,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"}}]})
@@ -9412,7 +9475,7 @@ mod tests {
     #[test]
     fn revision_wire_preserves_full_native_integer_precision() {
         let observation = Observation {
-            hidden_frame_proof: HiddenFrameProof::default(),
+            semantic_frame_proof: SemanticFrameProof::default(),
             identity_scope: "scope".into(),
             revision: u64::MAX,
             roots: vec![],
@@ -9524,7 +9587,7 @@ mod tests {
         node.children.push(node_with_public_states(false));
         let expected = serde_json::to_value(&node).unwrap();
         let observation = Observation {
-            hidden_frame_proof: HiddenFrameProof::default(),
+            semantic_frame_proof: SemanticFrameProof::default(),
             identity_scope: "scope".into(),
             revision: u64::MAX,
             roots: vec![node.clone()],

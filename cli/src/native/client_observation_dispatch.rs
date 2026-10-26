@@ -356,8 +356,22 @@ pub enum DispatchRequest {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReadPolicy {
+    /// Captured once at scope.configure, never taken from observation requests.
+    pub(crate) frame_policy: observation::ObservationFramePolicy,
     pub test_id_attribute: String,
     pub secure_field_selector: String,
+}
+impl ReadPolicy {
+    // Only automatic semantic consumers call this. Explicit query, frame,
+    // navigation, pixel and action authorization do not consult frame_policy.
+    fn observation_options(&self) -> ObservationOptions {
+        ObservationOptions {
+            frame_policy: self.frame_policy.clone(),
+            test_id_attribute: self.test_id_attribute.clone(),
+            secure_field_selector: self.secure_field_selector.clone(),
+            ..Default::default()
+        }
+    }
 }
 pub struct DispatchContext {
     #[cfg(feature = "acceptance-faults")]
@@ -1339,9 +1353,9 @@ impl ObservationDispatch {
             screenshot_stage(screenshot, ScreenshotStage::ProtectedFrames);
             let frozen = verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?;
             same_frames(&capture_context.frames, &frozen)?;
-            // A semantic tree may prove an iframe owner non-rendering. Acquire
-            // that exact proof before spatial validation, never infer it from
-            // omitted/truncated output. Pixel and query paths remain strict.
+            // Semantic capture proves which exact documents were projected,
+            // including separate hidden/policy/depth/budget omissions. Acquire
+            // its private proof before geometry; pixels and queries stay strict.
             screenshot_stage(screenshot, ScreenshotStage::Geometry);
             if !matches!(&request, DispatchRequest::TraceSemantic(_))
                 && !matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels) {
@@ -1350,8 +1364,8 @@ impl ObservationDispatch {
             match request {
                 DispatchRequest::ReadFields(_) => Err(ProtocolError::InvalidArguments),
                 DispatchRequest::Correlate(_) => Err(ProtocolError::InvalidArguments),
-                DispatchRequest::TraceSemantic(request) => {
-                    let options = ObservationOptions { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector, ..ObservationOptions::default() };
+                DispatchRequest::TraceSemantic(_) => {
+                    let options = context.policy.observation_options();
                     screenshot_stage(screenshot, ScreenshotStage::TraceMetadata);
                     let observed_viewport = viewport(&capture_context.page, &operation).await?;
                     let semantic = semantic_lease(&operation, false);
@@ -1359,7 +1373,7 @@ impl ObservationDispatch {
                     screenshot_stage(screenshot, ScreenshotStage::Capture);
                     let mut tree = observation::observe(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic).await.map_err(map_observation)?;
                     screenshot_stage(screenshot, ScreenshotStage::Geometry);
-                    geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.hidden_frame_proof, &operation).await.map_err(map_geometry)?);
+                    geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.semantic_frame_proof, &context.policy.frame_policy, &identity, revision, &operation).await.map_err(map_geometry)?);
                     let proof = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, proof, &mut tree.roots, &operation).await.map_err(map_geometry)?;
                     let root = exact_root(tree.roots, &staged, &frozen)?;
@@ -1395,7 +1409,7 @@ impl ObservationDispatch {
                     Ok((value, Some(pixels), None))
                 }
                 DispatchRequest::Observe(request) => {
-                    let options = ObservationOptions { test_id_attribute: request.test_id_attribute, secure_field_selector: request.secure_field_selector.clone(), ..ObservationOptions::default() };
+                    let options = context.policy.observation_options();
                     #[cfg(test)]
                     witness.enter(ObserveFailureStage::Viewport);
                     let observed_viewport = viewport(&capture_context.page, &operation).await?;
@@ -1427,7 +1441,7 @@ impl ObservationDispatch {
                             #[cfg(test)]
                             witness.enter(ObserveFailureStage::Geometry);
                             if geometry.is_none() {
-                                geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.hidden_frame_proof, &operation).await.map_err(map_geometry)?);
+                                geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.semantic_frame_proof, &context.policy.frame_policy, &identity, revision, &operation).await.map_err(map_geometry)?);
                             }
                             let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                             observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut tree.roots, &operation).await.map_err(map_geometry)?;
@@ -3070,6 +3084,7 @@ mod tests {
                 blobs: blobs.clone(),
                 scope: scope.clone(),
                 policy: ReadPolicy {
+                    frame_policy: Default::default(),
                     test_id_attribute: "data-testid".into(),
                     secure_field_selector: "input[type=password]".into(),
                 },
@@ -3232,6 +3247,7 @@ mod tests {
                     blobs,
                     scope,
                     policy: ReadPolicy {
+                        frame_policy: Default::default(),
                         test_id_attribute: "data-testid".into(),
                         secure_field_selector: "input[type=password]".into(),
                     },
@@ -3801,6 +3817,7 @@ mod tests {
                 blobs: blobs.clone(),
                 scope: scope.clone(),
                 policy: ReadPolicy {
+                    frame_policy: Default::default(),
                     test_id_attribute: "data-testid".into(),
                     secure_field_selector: "input[type=password]".into(),
                 },
@@ -4367,6 +4384,7 @@ mod tests {
     #[test]
     fn semantic_trace_rejects_pixel_or_fallback_options() {
         let policy = ReadPolicy {
+            frame_policy: Default::default(),
             test_id_attribute: "data-testid".into(),
             secure_field_selector: "input[type=password]".into(),
         };
@@ -4545,7 +4563,7 @@ mod tests {
             faults:Arc::new(super::super::client_test_faults::FaultController::default()),
             attachment: page.targets.owned_target(&page.target_id).unwrap(),
             page, ui:Arc::new(UiGate::default()), blobs, scope,
-            policy:ReadPolicy { test_id_attribute:"data-testid".into(), secure_field_selector:"input[type=password]".into() },
+            policy:ReadPolicy { frame_policy: Default::default(), test_id_attribute:"data-testid".into(), secure_field_selector:"input[type=password]".into() },
         }, DispatchRequest::Query(QueryRequest {
             purpose:QueryPurpose::Fixture,
             options:serde_json::from_value(json!({"expression":{"kind":"selector","selector":"#zero"},"secureFieldSelector":"input[type=password]"})).unwrap(),
@@ -4724,6 +4742,7 @@ mod tests {
                 blobs: blobs.clone(),
                 scope: scope.clone(),
                 policy: ReadPolicy {
+                    frame_policy: Default::default(),
                     test_id_attribute: "data-testid".into(),
                     secure_field_selector: "input[type=password]".into(),
                 },
@@ -4746,6 +4765,7 @@ mod tests {
             .as_array()
             .is_none_or(Vec::is_empty));
         assert!(result.get("hidden_frame_proof").is_none());
+        assert!(result.get("semanticFrameProof").is_none());
         assert!(result.get("hiddenFrameProof").is_none());
         assert!(result.get("pixels").is_none());
         assert!(result.get("treeUnavailable").is_none());
@@ -4924,6 +4944,7 @@ mod tests {
     #[test]
     fn repeated_request_policy_cannot_weaken_captured_scope_policy() {
         let policy = ReadPolicy {
+            frame_policy: Default::default(),
             test_id_attribute: "data-testid".into(),
             secure_field_selector: "input[type=password],.private".into(),
         };
@@ -4940,6 +4961,36 @@ mod tests {
             secure_field_selector: policy.secure_field_selector.clone(),
         });
         validate_policy(&policy, &exact).unwrap();
+    }
+    #[test]
+    fn semantic_options_are_frozen_scope_policy_not_per_observe_input() {
+        let mut policy = ReadPolicy {
+            frame_policy: observation::ObservationFramePolicy::configured(Some(
+                "app.example".into(),
+            )),
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password],.private".into(),
+        };
+        let captured = policy.clone();
+        let options = captured.observation_options();
+        policy.frame_policy =
+            observation::ObservationFramePolicy::configured(Some("other.example".into()));
+        assert_eq!(options.frame_policy, captured.frame_policy);
+        assert_ne!(options.frame_policy, policy.frame_policy);
+        for key in ["site", "framePolicy", "maxFrameDepth", "omittedFrames"] {
+            let mut args = json!({"options":{},"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password],.private"});
+            args[key] = json!("other.example");
+            assert!(serde_json::from_value::<ObserveRequest>(args).is_err());
+            let mut args = json!({"options":{},"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password],.private"});
+            args["options"][key] = json!("other.example");
+            assert!(serde_json::from_value::<ObserveRequest>(args).is_err());
+        }
+        let request: ObserveRequest = serde_json::from_value(json!({"options":{},"testIdAttribute":"data-testid","secureFieldSelector":"input[type=password],.private"})).unwrap();
+        validate_policy(&captured, &DispatchRequest::Observe(request)).unwrap();
+        assert_eq!(
+            captured.observation_options().frame_policy,
+            options.frame_policy
+        );
     }
     #[test]
     fn wire_observe_flags_do_not_grant_fixture_read_authority() {
