@@ -49,6 +49,7 @@ pub(crate) const BLOCK_SERVICE_WORKERS: &str = "if (globalThis.ServiceWorkerCont
 struct InputState {
     keys: BTreeMap<String, Key>,
     mouse: MouseState,
+    pointer_known: bool,
     session: Option<String>,
 }
 /// A non-cloneable receipt for the exact temporary modifier transaction.
@@ -575,6 +576,7 @@ impl ClientPageState {
         let mut state = self.state()?;
         bind_input_session(&mut state.input, &page.page_session_id)?;
         state.input.mouse = MouseState { x, y, buttons };
+        state.input.pointer_known = true;
         Ok(())
     }
     pub fn requested_viewport(&self) -> Result<Option<(u32, u32)>, ProtocolError> {
@@ -582,6 +584,20 @@ impl ClientPageState {
     }
     pub fn mouse_state(&self) -> Result<MouseState, ProtocolError> {
         Ok(self.state()?.input.mouse)
+    }
+    /// Only ACKed coordinates on this exact page may guide a node wheel.
+    /// Default0,0, another session and pending/failed moves are not evidence.
+    pub(crate) fn known_pointer_position(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<Option<(f64, f64)>, ProtocolError> {
+        self.validate(page, op)?;
+        let state = self.state()?;
+        Ok((state.input.pointer_known
+            && state.input.session.as_deref() == Some(page.page_session_id.as_str())
+            && state.input_cleanup.is_none())
+        .then_some((state.input.mouse.x, state.input.mouse.y)))
     }
     /// Target owner must keep a newly attached target paused until the returned
     /// revision equals config_revision(). Scripts install once per session and
@@ -1504,6 +1520,9 @@ impl ClientPageState {
                 return Err(ProtocolError::ScopeUnavailable);
             }
             bind_input_session(&mut state.input, &page.page_session_id)?;
+            if point.is_some() {
+                state.input.pointer_known = false;
+            }
             let mods = modifiers(&state.input);
             build_mouse_event_params(
                 &mut state.input.mouse,
@@ -1532,6 +1551,16 @@ impl ClientPageState {
             params,
         )
         .await?;
+        if let Some((x, y)) = point {
+            let mut state = self.state()?;
+            if state.input.session.as_deref() == Some(page.page_session_id.as_str())
+                && state.input.mouse.x == x
+                && state.input.mouse.y == y
+                && state.input_cleanup.is_none()
+            {
+                state.input.pointer_known = true;
+            }
+        }
         Ok(())
     }
 
@@ -1638,6 +1667,7 @@ impl ClientPageState {
         }
         let clean = InputState {
             mouse: input.mouse,
+            pointer_known: input.pointer_known,
             session: Some(session.clone()),
             ..InputState::default()
         };
@@ -1700,6 +1730,7 @@ fn bind_input_session(input: &mut InputState, session: &str) -> Result<(), Proto
     }
     if input.session.as_deref().is_some_and(|old| old != session) {
         input.mouse = MouseState::default();
+        input.pointer_known = false;
     }
     input.session = Some(session.into());
     Ok(())
@@ -2981,6 +3012,7 @@ mod tests {
                 y: 30.0,
                 buttons: 0,
             },
+            pointer_known: true,
             ..Default::default()
         };
         input
@@ -2991,7 +3023,65 @@ mod tests {
         bind_input_session(&mut input, "new").unwrap();
         assert_eq!(input.mouse.x, 0.0);
         assert_eq!(input.mouse.y, 0.0);
+        assert!(!input.pointer_known);
         assert_eq!(modifiers(&input), 0);
+    }
+
+    #[tokio::test]
+    async fn known_pointer_requires_an_ack_on_the_current_session() {
+        let (op, cancel) = operation();
+        let (mut page, _requests, _replies, server) = command_debt_peer(cancel, false).await;
+        let state = ClientPageState::new("scope".into(), "context".into());
+        assert_eq!(state.known_pointer_position(&page, &op).unwrap(), None);
+        state
+            .pointer_event(&page, &op, "mouseMoved", Some((0., 0.)), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.known_pointer_position(&page, &op).unwrap(),
+            Some((0., 0.))
+        );
+        page.page_session_id = "replacement".into();
+        assert_eq!(state.known_pointer_position(&page, &op).unwrap(), None);
+        state
+            .pointer_event(&page, &op, "mouseMoved", Some((80., 70.)), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.known_pointer_position(&page, &op).unwrap(),
+            Some((80., 70.))
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_move_never_publishes_a_known_pointer() {
+        let (op, cancel) = operation();
+        let (page, _requests, _replies, server) = command_debt_peer(cancel, false).await;
+        let state = ClientPageState::new("scope".into(), "context".into());
+        state
+            .pointer_event(&page, &op, "mouseMoved", Some((80., 70.)), None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            state.known_pointer_position(&page, &op).unwrap(),
+            Some((80., 70.))
+        );
+        server.abort();
+        assert!(server.await.unwrap_err().is_cancelled());
+        assert!(state
+            .pointer_event(
+                &page,
+                &op,
+                "mouseMoved",
+                Some((120., 90.)),
+                None,
+                None,
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(state.known_pointer_position(&page, &op).unwrap(), None);
     }
     #[test]
     fn pure_cookie_validation_never_converts_invalid_data_to_empty_success() {

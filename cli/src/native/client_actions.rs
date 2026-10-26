@@ -1819,6 +1819,80 @@ async fn action_target(
         binding: resolved.binding,
     })
 }
+/// Reuse an ACKed pointer only while it still reaches this exact hovered node.
+/// A miss leaves the existing center/scroll path in charge. This is node-wheel
+/// policy only; explicit hover/tap and viewport swipes keep their own targeting.
+async fn wheel_at_known_pointer(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    node: &Resolved,
+) -> Result<Option<(f64, f64)>, ProtocolError> {
+    let Some((x, y)) = ctx
+        .page_state
+        .known_pointer_position(ctx.page, ctx.operation)?
+    else {
+        return Ok(None);
+    };
+    let geometry = match ctx
+        .geometry
+        .refresh_after_scroll(&ctx.page.client, ctx.operation)
+        .await
+    {
+        Ok(geometry) => geometry,
+        Err(GeometryError::IncompleteInventory | GeometryError::InvalidGeometry) => {
+            return Ok(None)
+        }
+        Err(error) => return Err(geometry_failure(d, error)),
+    };
+    let local = geometry
+        .root_to_frame_point(&node.binding.frame, GeometryPoint { x, y })
+        .map_err(|error| geometry_failure(d, error))?;
+    let function = format!(
+        r#"function(x,y){{
+      if(!this.isConnected||this.ownerDocument!==document)return {{status:'stale'}};
+      if(this.ownerDocument.defaultView!==this.ownerDocument.defaultView.top||this.getClientRects().length===0)return null;
+      const rect=this.getBoundingClientRect();const style=this.ownerDocument.defaultView.getComputedStyle(this);
+      if(rect.width<=0||rect.height<=0||style.visibility==='hidden'||style.visibility==='collapse')return null;
+      if(typeof this.matches!=='function'||!this.matches(':hover'))return null;
+      const doc=this.ownerDocument;const blocker={};
+      if(typeof doc.elementFromPoint!=='function'||!doc.elementFromPoint(x,y)||blocker(doc,this,x,y)!==null)return null;
+      return {{width:rect.width,height:rect.height}};
+    }}"#,
+        element::BLOCKER_AT_JS
+    );
+    let size = node
+        .call(
+            ctx,
+            d,
+            false,
+            &function,
+            vec![json!(local.x), json!(local.y)],
+        )
+        .await?;
+    geometry
+        .revalidate(&ctx.page.client, ctx.operation)
+        .await
+        .map_err(|error| geometry_failure(d, error))?;
+    ctx.check()?;
+    if size.is_null()
+        || ctx
+            .page_state
+            .known_pointer_position(ctx.page, ctx.operation)?
+            != Some((x, y))
+    {
+        return Ok(None);
+    }
+    let width = size["width"]
+        .as_f64()
+        .filter(|n| n.is_finite() && *n > 0.)
+        .ok_or(ProtocolError::BrowserFailure)?;
+    let height = size["height"]
+        .as_f64()
+        .filter(|n| n.is_finite() && *n > 0.)
+        .ok_or(ProtocolError::BrowserFailure)?;
+    Ok(Some((width, height)))
+}
+
 async fn center(
     ctx: &ActionContext<'_>,
     d: &Dispatch,
@@ -2452,6 +2526,9 @@ impl ClientActions {
                 direction,
                 momentum,
             } => {
+                if let Some(size) = wheel_at_known_pointer(ctx, d, node).await? {
+                    return scroll(ctx, d, None, direction, momentum, size).await;
+                }
                 let (point, size) = center(ctx, d, node, false).await?;
                 scroll(ctx, d, Some(point), direction, momentum, size).await
             }
@@ -4699,6 +4776,7 @@ mod tests {
             let mut held_original_pointer_reply: Option<(Value, Value)> = None;
             let mut held_drag_releases: Vec<Value> = Vec::new();
             let mut retirement_node_scrolled = false;
+            let mut retirement_node_pointer = None;
             while let Some(Ok(message)) = socket.next().await {
                 if mode.starts_with("preparation-readonly-") && message.is_close() {
                     break;
@@ -4717,10 +4795,16 @@ mod tests {
                     if request["method"] == "DOM.scrollIntoViewIfNeeded" {
                         retirement_node_scrolled = true;
                     }
+                    if request["method"] == "Input.dispatchMouseEvent" {
+                        retirement_node_pointer = request["params"]["x"]
+                            .as_f64()
+                            .zip(request["params"]["y"].as_f64());
+                    }
                     observed = retirement_node_swipes::observed_request(
                         mode,
                         &request,
                         retirement_node_scrolled,
+                        retirement_node_pointer,
                     )
                     .await;
                 }

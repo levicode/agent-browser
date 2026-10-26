@@ -850,6 +850,34 @@ impl BlobStore {
         inner.entries.remove(handle);
         Ok(())
     }
+    /// Discard only a native trace image receipt in its original blob scope.
+    /// Scope rotation cannot transfer its charge or turn it into a new result.
+    pub(crate) fn discard_trace_image(
+        &self,
+        generation: u64,
+        value: &serde_json::Value,
+    ) -> Result<(), BlobError> {
+        let identity_scope = value
+            .get("identityScope")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(BlobError::InvalidInput)?;
+        let handle = value
+            .get("handle")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(BlobError::InvalidInput)?;
+        self.release(
+            &BlobScope {
+                generation,
+                identity_scope: identity_scope.to_owned(),
+            },
+            handle,
+        )
+    }
+    #[cfg(test)]
+    pub(crate) fn charged_for_test(&self) -> (usize, usize) {
+        let budget = self.budget.lock().unwrap();
+        (budget.bytes, budget.handles)
+    }
     pub fn revoke_scope(&self, scope: &BlobScope) -> Result<(), BlobError> {
         let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
         if inner.active_scope.as_ref() == Some(scope) {
@@ -1689,4 +1717,34 @@ mod producer_tests {
         );
         assert_eq!(store.budget.lock().unwrap().bytes, 0);
     }
+}
+#[test]
+fn late_trace_discard_releases_only_the_original_scope_charge() {
+    let store = BlobStore::new(Default::default()).unwrap();
+    let scope = BlobScope {
+        generation: 1,
+        identity_scope: "original".into(),
+    };
+    store.activate_scope(scope.clone()).unwrap();
+    let producer = store.reserve_producer(scope.clone()).unwrap();
+    let image = store.finish_producer(producer, vec![1, 2, 3]).unwrap();
+    let value = serde_json::json!({"identityScope":"original","handle":image.handle});
+    assert_eq!(store.charged_for_test(), (3, 1));
+    assert_eq!(
+        store.discard_trace_image(2, &value),
+        Err(BlobError::StaleScope)
+    );
+    let other = serde_json::json!({"identityScope":"replacement","handle":image.handle});
+    assert_eq!(
+        store.discard_trace_image(1, &other),
+        Err(BlobError::StaleScope)
+    );
+    assert_eq!(store.charged_for_test(), (3, 1));
+    store.discard_trace_image(1, &value).unwrap();
+    assert_eq!(store.charged_for_test(), (0, 0));
+    assert!(matches!(
+        store.read(&scope, &image.handle, 0, 1),
+        Err(BlobError::Missing)
+    ));
+    store.check_budget_integrity().unwrap();
 }

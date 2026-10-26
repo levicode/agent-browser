@@ -1842,6 +1842,38 @@ pub(super) fn settle_observation_dispatch(
     (outcome, cleanup_failed)
 }
 
+pub(super) fn settle_trace_screenshot(
+    mut outcome: super::client_transport::NativeOutcome,
+    dirty: bool,
+    trace_screenshot: bool,
+    expected: &super::client_debt::OperationJournalHandle,
+) -> (super::client_transport::NativeOutcome, bool) {
+    if trace_screenshot && dirty {
+        outcome.result = Err(ProtocolError::CleanupFailed);
+        outcome.effects = super::client_protocol::Effects::Unknown;
+        outcome.retention = None;
+        return (outcome, true);
+    }
+    // Trace uses only native read/protection commands. A joined, clean producer
+    // has restored its temporary changes; those are not uncertain user input.
+    // The read still fails and never publishes late pixels or a continuation.
+    if trace_screenshot
+        && !dirty
+        && outcome.result.is_err()
+        && outcome.effects == super::client_protocol::Effects::NotDispatched
+        && super::client_debt::OperationJournalHandle::current().is_some_and(|journal| {
+            let state = journal.snapshot();
+            journal.same_operation(expected)
+                && state.mutation_dispatched
+                && !state.integrity_lost
+                && journal.clean_protected_read()
+        })
+    {
+        outcome.effects = super::client_protocol::Effects::Completed;
+    }
+    (outcome, dirty)
+}
+
 /// Exact-key test observation only. It cannot grant admission or release a lock.
 #[cfg(test)]
 struct GenericAdmissionProbe {
@@ -2322,6 +2354,21 @@ impl ClientBrowser {
 }
 
 impl super::client_transport::ClientExecutor for ClientBrowser {
+    fn begin_trace_cleanup(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Option<std::time::Instant> {
+        self.tasks.begin_protected_cleanup(key)
+    }
+    fn discard_trace_result(
+        &self,
+        key: super::client_debt::OperationKey,
+        value: &serde_json::Value,
+    ) -> Result<(), ProtocolError> {
+        self.blobs
+            .discard_trace_image(key.generation, value)
+            .map_err(|_| ProtocolError::CleanupFailed)
+    }
     fn operation_retention_status(
         &self,
         key: super::client_debt::OperationKey,
@@ -2959,6 +3006,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 }
             };
             let observation = self.observation.clone();
+            let receipt_journal = journal.clone();
+            let receipt_blobs = context.blobs.clone();
+            let receipt_deadline = lease.deadline;
+            let receipt_cancellation = lease.cancellation.clone();
+            let receipt_generation = lease.generation;
             let receive = self
                 .tasks
                 .start_operation_prepared(
@@ -2971,12 +3023,25 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         // The registry has accepted capacity, but has not spawned
                         // work. Exact-owner/policy validation and Observe ticket
                         // admission are synchronous and precede any task reorder.
+                        let trace_screenshot = matches!(&request, DispatchRequest::Screenshot(request)
+                            if request.purpose == super::client_observation_dispatch::ScreenshotPurpose::Trace);
                         let prepared = observation.prepare(context, request, lease)?;
                         Ok(async move {
                             let task = observation.start_prepared(prepared);
                             let output = task.result.await;
                             let cleanup = task.join.await;
-                            settle_observation_dispatch(output, cleanup)
+                            let (mut outcome, mut dirty) = settle_observation_dispatch(output, cleanup);
+                            if trace_screenshot && (std::time::Instant::now() >= receipt_deadline
+                                || *receipt_cancellation.borrow() != super::client_session::CancelSignal::None)
+                            {
+                                if let Ok(value) = &outcome.result {
+                                    dirty |= receipt_blobs.discard_trace_image(receipt_generation, value).is_err();
+                                    outcome.result = Err(if dirty { ProtocolError::CleanupFailed } else {
+                                        (*receipt_cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)
+                                    });
+                                }
+                            }
+                            settle_trace_screenshot(outcome, dirty, trace_screenshot, &receipt_journal)
                         })
                     },
                 )
@@ -3196,7 +3261,13 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     let _ui = ui_permit;
                     let _input = input_permit;
                     let preflight = async {
-                        let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&page, &lease).await?;
+                        let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_action_frame_inventory(&page, &lease, || {
+                            page.permit.check()?;
+                            if !attachment.same_attachment(&page.targets.owned_target(&page.target_id)?) { return Err(ProtocolError::StaleScope); }
+                            if !action_broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
+                            action_tasks.check_input_dispatch(journal.key())?;
+                            observation.check_publication_fence(publication_fence)
+                        }).await?;
                         let geometry = super::client_geometry::GeometrySnapshot::capture(&page.client, &page.page_session_id, &frames, &lease).await.map_err(|error| {
                             use super::client_geometry::GeometryError;
                             match error {
@@ -4941,6 +5012,76 @@ impl ClientBrowser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn trace_native_mutation_without_restore_proof_is_not_completed() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_observation_dispatch::DispatchFailure;
+        use super::super::client_protocol::{Effects, ScopeState};
+        for trace in [false, true] {
+            for changed in [false, true] {
+                for dirty in [false, true] {
+                    let broker = super::super::client_session::ClientSession::new();
+                    let lease = broker.admit(1, 1, 5_000).unwrap();
+                    assert!(broker.start(1, 1).unwrap());
+                    let ledger = OwnerDebtLedger::new(1, "trace-scope".into());
+                    let journal = ledger
+                        .operation(
+                            OperationKey {
+                                generation: 1,
+                                operation_seq: 1,
+                            },
+                            "target".into(),
+                            "page".into(),
+                        )
+                        .unwrap();
+                    journal.bind_operation(&lease).unwrap();
+                    if changed {
+                        journal.mark_mutation_maybe_submitted().unwrap();
+                    }
+                    let (outcome, lost) = journal
+                        .scope(async {
+                            let (outcome, lost) = settle_observation_dispatch(
+                                Ok(Err(DispatchFailure {
+                                    error: ProtocolError::DeadlineExceeded,
+                                    identity_scope: "trace-scope".into(),
+                                    cleanup_integrity_lost: dirty,
+                                })),
+                                Ok(Ok(())),
+                            );
+                            settle_trace_screenshot(outcome, lost, trace, &journal)
+                        })
+                        .await;
+                    assert_eq!(
+                        outcome.result,
+                        Err(if trace && dirty {
+                            ProtocolError::CleanupFailed
+                        } else {
+                            ProtocolError::DeadlineExceeded
+                        })
+                    );
+                    assert!(outcome.retention.is_none());
+                    assert_eq!(lost, dirty);
+                    assert_eq!(
+                        outcome.effects,
+                        if dirty {
+                            Effects::Unknown
+                        } else {
+                            Effects::NotDispatched
+                        }
+                    );
+                    assert_eq!(
+                        broker.settle(1, 1, outcome.effects).unwrap(),
+                        if dirty {
+                            ScopeState::Quarantined
+                        } else {
+                            ScopeState::Usable
+                        }
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn observation_cleanup_integrity_settles_quarantined_without_losing_primary() {

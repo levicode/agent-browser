@@ -525,7 +525,11 @@ fn all_production_action_contexts_consume_the_verified_renderer_map() {
             .count(),
         4
     );
-    assert_eq!(source.matches("::verified_frame_inventory(").count(), 4);
+    assert_eq!(source.matches("::verified_frame_inventory(").count(), 3);
+    assert_eq!(
+        source.matches("::verified_action_frame_inventory(").count(),
+        1
+    );
     assert_eq!(
         source
             .matches("iframe_sessions:&sessions,observation_frames:&frames")

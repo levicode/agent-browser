@@ -420,6 +420,8 @@ struct JournalState {
     local_producers_finished: bool,
     integrity_lost: bool,
     admission: Option<(Instant, tokio::sync::watch::Receiver<CancelSignal>)>,
+    protected_cleanup_deadline: Option<Instant>,
+    protected_read_restored: bool,
 }
 struct Journal {
     key: OperationKey,
@@ -479,6 +481,78 @@ pub(crate) async fn command_scope<F: Future>(
 impl OperationJournalHandle {
     pub(crate) fn current() -> Option<Self> {
         current_operation()
+    }
+    pub(crate) fn same_operation(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ledger, &other.ledger) && Arc::ptr_eq(&self.journal, &other.journal)
+    }
+    pub(crate) fn matches_protected_read(
+        &self,
+        ledger: &Arc<OwnerDebtLedger>,
+        scope: &str,
+        target: &str,
+        session: &str,
+        operation: &OperationLease,
+    ) -> bool {
+        Arc::ptr_eq(&self.ledger, ledger)
+            && ledger.matches_owner(operation.generation, scope)
+            && self.key()
+                == (OperationKey {
+                    generation: operation.generation,
+                    operation_seq: operation.sequence,
+                })
+            && self.journal.target == target
+            && self.journal.session == session
+            && self.journal.state.lock().is_ok_and(|state| {
+                state
+                    .admission
+                    .as_ref()
+                    .is_some_and(|(deadline, cancellation)| {
+                        *deadline == operation.deadline
+                            && cancellation.same_channel(&operation.cancellation)
+                    })
+            })
+    }
+    /// One exact-operation cleanup clock. The producer and receipt waiter may
+    /// start it, but neither can renew it or extend the success deadline.
+    pub(crate) fn begin_protected_cleanup(&self) -> Instant {
+        self.journal.state.lock().map_or_else(
+            |_| Instant::now(),
+            |mut state| {
+                *state.protected_cleanup_deadline.get_or_insert_with(|| {
+                    Instant::now() + super::client_protected_read::CLEANUP_TIMEOUT
+                })
+            },
+        )
+    }
+    pub(crate) fn protected_read_restored(&self) {
+        if let Ok(mut state) = self.journal.state.lock() {
+            state.protected_read_restored = true;
+        }
+    }
+    pub(crate) fn clean_protected_read(&self) -> bool {
+        // Match command submission's ledger -> journal lock order. Empty debt
+        // alone is never restoration proof, and another owner cannot supply it.
+        self.ledger.state.lock().is_ok_and(|owner| {
+            !owner.retired
+                && !owner.integrity_lost
+                && !owner
+                    .commands
+                    .values()
+                    .any(|command| command.provenance.operation == Some(self.key()))
+                && !owner
+                    .objects
+                    .iter()
+                    .any(|object| object.provenance.operation == Some(self.key()))
+                && !owner
+                    .groups
+                    .values()
+                    .any(|group| group.provenance.operation == Some(self.key()))
+                && self
+                    .journal
+                    .state
+                    .lock()
+                    .is_ok_and(|state| state.protected_read_restored && !state.integrity_lost)
+        })
     }
     pub(crate) fn bind_operation(&self, operation: &OperationLease) -> Result<(), ProtocolError> {
         if operation.generation != self.key().generation

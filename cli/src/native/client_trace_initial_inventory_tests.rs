@@ -335,6 +335,83 @@ async fn trace_initial_inventory_single_navigation_race_reaches_protected_read()
     fixture.peer.await.unwrap();
 }
 
+#[tokio::test]
+async fn action_initial_inventory_reacquires_once_before_input_with_fresh_bindings() {
+    let fixture = Fixture::new(Race::Once).await;
+    let fence = fixture.dispatch.publication_fence().unwrap();
+    let inventory = fixture
+        .journal
+        .scope(verified_action_frame_inventory(
+            &fixture.context.page,
+            &fixture.operation,
+            || {
+                fixture.dispatch.check_initial_trace_owner(
+                    &fixture.context,
+                    &fixture.operation,
+                    fence,
+                )
+            },
+        ))
+        .await
+        .unwrap();
+    assert_eq!(inventory.frames.len(), 1);
+    assert_eq!(inventory.frames[0].binding.loader, "fresh-loader");
+    assert_eq!(fixture.samples.load(Ordering::SeqCst), 2);
+    assert_eq!(fixture.ledger.snapshot().object_debt, 0);
+    assert_eq!(fixture.ledger.snapshot().outstanding_commands, 0);
+    no_protected_read(&fixture.log.lock().unwrap());
+    fixture.context.page.client.close().await;
+    fixture.peer.await.unwrap();
+}
+
+#[tokio::test]
+async fn action_initial_inventory_bounds_reacquisition_and_preserves_refusals() {
+    for (race, expected, samples) in [
+        (Race::Continuous, ProtocolError::StaleScope, 2),
+        (Race::Cancel, ProtocolError::Cancelled, 1),
+        (Race::Sealed, ProtocolError::StaleScope, 1),
+        (Race::Reservation, ProtocolError::StaleScope, 1),
+        (Race::Replacement, ProtocolError::StaleScope, 1),
+        (Race::HeldRelease, ProtocolError::StaleScope, 1),
+        (
+            Race::HeldReleaseAfterReacquisition,
+            ProtocolError::ScopeUnavailable,
+            2,
+        ),
+    ] {
+        let fixture = Fixture::new(race).await;
+        let fence = fixture.dispatch.publication_fence().unwrap();
+        let result = fixture
+            .journal
+            .scope(verified_action_frame_inventory(
+                &fixture.context.page,
+                &fixture.operation,
+                || {
+                    fixture.dispatch.check_initial_trace_owner(
+                        &fixture.context,
+                        &fixture.operation,
+                        fence,
+                    )
+                },
+            ))
+            .await;
+        assert_eq!(result.err(), Some(expected), "{race:?}");
+        assert_eq!(fixture.samples.load(Ordering::SeqCst), samples, "{race:?}");
+        no_protected_read(&fixture.log.lock().unwrap());
+        if matches!(
+            race,
+            Race::HeldRelease | Race::HeldReleaseAfterReacquisition
+        ) {
+            let debt = fixture.ledger.snapshot();
+            assert_eq!(debt.object_debt, 1);
+            assert_eq!(debt.outstanding_commands, 1);
+            assert!(!debt.integrity_lost);
+        }
+        fixture.context.page.client.close().await;
+        fixture.peer.await.unwrap();
+    }
+}
+
 struct FailureOutcome {
     error: ProtocolError,
     cleanup_integrity_lost: bool,

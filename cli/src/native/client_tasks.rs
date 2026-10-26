@@ -43,6 +43,12 @@ impl Tasks {
     }
 }
 impl RetainedTasks {
+    pub(crate) fn begin_protected_cleanup(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Option<std::time::Instant> {
+        self.operations.begin_protected_cleanup(key)
+    }
     pub(crate) fn operation_retention_status(
         &self,
         key: super::client_debt::OperationKey,

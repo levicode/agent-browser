@@ -1938,6 +1938,71 @@ pub(crate) async fn verified_frame_inventory(
 ) -> Result<VerifiedFrameInventory, ProtocolError> {
     verified_frame_inventory_with_cleanup(page, operation, None).await
 }
+/// A revision-only race may discard one read-only prefix before input begins.
+/// Both samples retain the caller's exact owner and original operation deadline.
+pub(crate) async fn verified_action_frame_inventory(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    check_owner: impl Fn() -> Result<(), ProtocolError>,
+) -> Result<VerifiedFrameInventory, ProtocolError> {
+    check(page, operation)?;
+    check_owner()?;
+    let ledger = page.client.debt_ledger();
+    let prefix_settled = || {
+        let Some(ledger) = ledger.as_ref() else {
+            return false;
+        };
+        if !ledger.matches_owner(operation.generation, &page.identity_scope)
+            || page
+                .client
+                .check_cleanup_owner(&Some(ledger.clone()))
+                .is_err()
+            || ledger
+                .check_admission(super::client_debt::AdmissionClass::Reference)
+                .is_err()
+        {
+            return false;
+        }
+        let debt = ledger.snapshot();
+        !debt.integrity_lost
+            && debt.input_debt == 0
+            && debt.object_debt == 0
+            && debt.outstanding_commands == 0
+    };
+    let first = frame_inventory_attempt(page, operation, None, None).await;
+    match first {
+        Ok(inventory) => {
+            check(page, operation)?;
+            check_owner()?;
+            Ok(inventory)
+        }
+        Err(failure) => {
+            if !failure.revision_only() {
+                return Err(failure.record(None));
+            }
+            check(page, operation)?;
+            check_owner()?;
+            if !prefix_settled() {
+                return Err(failure.record(None));
+            }
+            tokio::task::yield_now().await;
+            check(page, operation)?;
+            check_owner()?;
+            if !prefix_settled() {
+                return Err(failure.record(None));
+            }
+            let inventory = frame_inventory_attempt(page, operation, None, None)
+                .await
+                .map_err(|failure| failure.record(None))?;
+            check(page, operation)?;
+            check_owner()?;
+            if !prefix_settled() {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            Ok(inventory)
+        }
+    }
+}
 async fn verified_frame_inventory_with_cleanup(
     page: &BrowserExecutionLease,
     operation: &OperationLease,

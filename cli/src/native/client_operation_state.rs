@@ -136,6 +136,11 @@ pub(crate) struct OperationRegistry {
     pub(crate) changed: Notify,
 }
 impl OperationRegistry {
+    pub(crate) fn begin_protected_cleanup(&self, key: OperationKey) -> Option<Instant> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(&key)?;
+        Some(entry.journal.begin_protected_cleanup())
+    }
     /// Retain entries across provisional installation and snapshots. Ledger is
     /// deliberately not held while journal.snapshot performs its own accounting.
     pub(crate) fn prepare_eval_window(

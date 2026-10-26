@@ -29,6 +29,21 @@ pub struct NativeOutcome {
 
 pub trait ClientExecutor: Send + Sync + 'static {
     fn capabilities(&self) -> Vec<String>;
+    /// Reuse the producer's exact cleanup clock; absence grants no longer wait.
+    fn begin_trace_cleanup(
+        &self,
+        _key: super::client_debt::OperationKey,
+    ) -> Option<std::time::Instant> {
+        None
+    }
+    /// Reclaim an already-produced late image under its original owner scope.
+    fn discard_trace_result(
+        &self,
+        _key: super::client_debt::OperationKey,
+        _value: &serde_json::Value,
+    ) -> Result<(), ProtocolError> {
+        Err(ProtocolError::CleanupFailed)
+    }
     fn operation_retention_status(
         &self,
         _key: super::client_debt::OperationKey,
@@ -1663,12 +1678,21 @@ async fn execute_bounded<E: ClientExecutor>(
     lease: OperationLease,
     continuation_negotiated: bool,
 ) -> NativeOutcome {
+    let trace_screenshot = command == "capture.screenshot"
+        && args.get("purpose").and_then(serde_json::Value::as_str) == Some("trace");
     let key = super::client_debt::OperationKey {
         generation: lease.generation,
         operation_seq: lease.sequence,
     };
-    let mut outcome =
-        execute_until_deadline(executor.clone(), broker.clone(), command, args, lease).await;
+    let mut outcome = execute_until_deadline(
+        executor.clone(),
+        broker.clone(),
+        command,
+        args,
+        lease,
+        continuation_negotiated,
+    )
+    .await;
     if outcome.effects != Effects::Unknown || !continuation_negotiated {
         outcome.retention = None;
         return outcome;
@@ -1682,15 +1706,24 @@ async fn execute_bounded<E: ClientExecutor>(
         outcome.retention = None;
         return outcome;
     };
+    let retirement_deadline = if trace_screenshot {
+        proof.retirement_deadline().min(
+            executor
+                .begin_trace_cleanup(key)
+                .unwrap_or_else(std::time::Instant::now),
+        )
+    } else {
+        proof.retirement_deadline()
+    };
     // This runs on the retained operation completion lane, never the control
     // reader. Events and exact native security fallback keep being serviced.
     let retirement = async {
-        if std::time::Instant::now() >= proof.retirement_deadline() {
+        if std::time::Instant::now() >= retirement_deadline {
             return Err(ProtocolError::CleanupFailed);
         }
         broker.begin_operation_retirement(key, &proof)?;
         executor.retire_operation_publication(key).await?;
-        if std::time::Instant::now() >= proof.retirement_deadline() {
+        if std::time::Instant::now() >= retirement_deadline {
             return Err(ProtocolError::CleanupFailed);
         }
         if matches!(
@@ -1702,11 +1735,36 @@ async fn execute_bounded<E: ClientExecutor>(
         broker.finish_operation_publication(key)
     };
     if !matches!(
-        tokio::time::timeout_at(proof.retirement_deadline().into(), retirement).await,
+        tokio::time::timeout_at(retirement_deadline.into(), retirement).await,
         Ok(Ok(()))
     ) {
         outcome.retention = None;
+        if trace_screenshot {
+            outcome.result = Err(ProtocolError::CleanupFailed);
+        }
         let _ = broker.quarantine();
+    }
+    outcome
+}
+
+fn trace_receipt<E: ClientExecutor>(
+    executor: &E,
+    key: super::client_debt::OperationKey,
+    cancellation: &tokio::sync::watch::Receiver<super::client_session::CancelSignal>,
+    deadline: tokio::time::Instant,
+    mut outcome: NativeOutcome,
+) -> NativeOutcome {
+    let stop = (*cancellation.borrow()).error().or_else(|| {
+        (tokio::time::Instant::now() >= deadline).then_some(ProtocolError::DeadlineExceeded)
+    });
+    if let (Some(error), Ok(value)) = (stop, &outcome.result) {
+        if executor.discard_trace_result(key, value).is_err() {
+            outcome.result = Err(ProtocolError::CleanupFailed);
+            outcome.effects = Effects::Unknown;
+        } else {
+            outcome.result = Err(error);
+        }
+        outcome.retention = None;
     }
     outcome
 }
@@ -1717,9 +1775,16 @@ async fn execute_until_deadline<E: ClientExecutor>(
     command: String,
     args: serde_json::Map<String, serde_json::Value>,
     lease: OperationLease,
+    continuation_negotiated: bool,
 ) -> NativeOutcome {
+    let trace_screenshot = command == "capture.screenshot"
+        && args.get("purpose").and_then(serde_json::Value::as_str) == Some("trace");
     let sequence = lease.sequence;
     let generation = lease.generation;
+    let key = super::client_debt::OperationKey {
+        generation,
+        operation_seq: sequence,
+    };
     let deadline = tokio::time::Instant::from_std(lease.deadline);
     let mut cancellation = lease.cancellation.clone();
     settlement_trace!(sequence, ExecuteStarted);
@@ -1727,22 +1792,38 @@ async fn execute_until_deadline<E: ClientExecutor>(
     tokio::pin!(execution);
     tokio::select! {
         biased;
-        outcome = &mut execution => { settlement_trace!(sequence, ExecuteReturned); return outcome; },
+        outcome = &mut execution => {
+            settlement_trace!(sequence, ExecuteReturned);
+            return if trace_screenshot { trace_receipt(executor.as_ref(), key, &cancellation, deadline, outcome) } else { outcome };
+        },
         _ = cancellation.changed() => { settlement_trace!(sequence, CancelObserved); },
         _ = tokio::time::sleep_until(deadline) => {
             settlement_trace!(sequence, DeadlineObserved);
             let _ = broker.expire(generation, sequence);
         },
     };
-    executor.cancel_operation_producer(super::client_debt::OperationKey {
-        generation,
-        operation_seq: sequence,
-    });
-    if let Ok(outcome) =
-        tokio::time::timeout(std::time::Duration::from_millis(250), &mut execution).await
-    {
+    // Keep the existing receipt decision point. A pending exact-owner proof
+    // must reach publication retirement while restoration still owns its locks.
+    // Raw supervision/restoration and retirement share the original absolute
+    // cleanup clock; this receipt grace cannot renew that clock.
+    let protected_cleanup_deadline = if trace_screenshot && continuation_negotiated {
+        executor
+            .begin_trace_cleanup(key)
+            .map(tokio::time::Instant::from_std)
+    } else {
+        None
+    };
+    let receipt_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+    let grace_deadline = protected_cleanup_deadline
+        .map_or(receipt_deadline, |cleanup| cleanup.min(receipt_deadline));
+    executor.cancel_operation_producer(key);
+    if let Ok(outcome) = tokio::time::timeout_at(grace_deadline, &mut execution).await {
         settlement_trace!(sequence, GraceReturned);
-        return outcome;
+        return if trace_screenshot {
+            trace_receipt(executor.as_ref(), key, &cancellation, deadline, outcome)
+        } else {
+            outcome
+        };
     }
     settlement_trace!(sequence, GraceExpired);
     let status = executor.operation_retention_status(super::client_debt::OperationKey {
@@ -1757,11 +1838,18 @@ async fn execute_until_deadline<E: ClientExecutor>(
         None if !broker.has_started(sequence) => Effects::NotDispatched,
         None => Effects::Unknown,
     };
-    let reason = (*cancellation.borrow())
-        .error()
-        .unwrap_or(ProtocolError::Cancelled);
+    let reason = if protected_cleanup_deadline
+        .is_some_and(|cleanup| tokio::time::Instant::now() >= cleanup)
+        && effects == Effects::Unknown
+    {
+        ProtocolError::CleanupFailed
+    } else {
+        (*cancellation.borrow())
+            .error()
+            .unwrap_or(ProtocolError::Cancelled)
+    };
     NativeOutcome {
-        retention: if effects == Effects::Unknown {
+        retention: if effects == Effects::Unknown && reason != ProtocolError::CleanupFailed {
             status.proof()
         } else {
             None
@@ -3434,6 +3522,227 @@ mod tests {
         assert_eq!(reply["id"], "c");
         assert_eq!(reply["accepted"], false);
         assert_eq!(reply["error"]["code"], "operation-missing");
+    }
+
+    struct TraceCleanupExecutor {
+        broker: std::sync::Arc<ClientSession>,
+        journal: super::super::client_debt::OperationJournalHandle,
+        blobs: super::super::client_blobs::BlobStore,
+        after_stop: std::time::Duration,
+        late_success: bool,
+        finished: std::sync::atomic::AtomicBool,
+    }
+    impl ClientExecutor for TraceCleanupExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        fn begin_trace_cleanup(
+            &self,
+            key: super::super::client_debt::OperationKey,
+        ) -> Option<std::time::Instant> {
+            (key == self.journal.key()).then(|| self.journal.begin_protected_cleanup())
+        }
+        fn discard_trace_result(
+            &self,
+            key: super::super::client_debt::OperationKey,
+            value: &serde_json::Value,
+        ) -> Result<(), ProtocolError> {
+            self.blobs
+                .discard_trace_image(key.generation, value)
+                .map_err(|_| ProtocolError::CleanupFailed)
+        }
+        async fn execute(
+            &self,
+            _: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            lease: OperationLease,
+        ) -> NativeOutcome {
+            assert!(self.broker.start(lease.generation, lease.sequence).unwrap());
+            let image = if self.late_success {
+                let scope = super::super::client_blobs::BlobScope {
+                    generation: lease.generation,
+                    identity_scope: "trace-scope".into(),
+                };
+                self.blobs.activate_scope(scope.clone()).unwrap();
+                let producer = self.blobs.reserve_producer(scope).unwrap();
+                let image = self.blobs.finish_producer(producer, vec![1, 2, 3]).unwrap();
+                assert_eq!(self.blobs.charged_for_test(), (3, 1));
+                Some(serde_json::json!({"identityScope":"trace-scope","handle":image.handle}))
+            } else {
+                None
+            };
+            let mut cancellation = lease.cancellation;
+            while *cancellation.borrow() == super::super::client_session::CancelSignal::None {
+                cancellation.changed().await.unwrap();
+            }
+            let error = (*cancellation.borrow()).error().unwrap();
+            tokio::time::sleep(self.after_stop).await;
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            NativeOutcome {
+                retention: None,
+                result: image.map_or_else(|| Err(error), Ok),
+                effects: Effects::Completed,
+            }
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+    fn trace_executor(
+        broker: std::sync::Arc<ClientSession>,
+        lease: &OperationLease,
+        after_stop: std::time::Duration,
+        late_success: bool,
+    ) -> std::sync::Arc<TraceCleanupExecutor> {
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(1, "trace-scope".into());
+        let journal = ledger
+            .operation(
+                super::super::client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "session".into(),
+            )
+            .unwrap();
+        journal.bind_operation(lease).unwrap();
+        std::sync::Arc::new(TraceCleanupExecutor {
+            broker,
+            journal,
+            blobs: super::super::client_blobs::BlobStore::new(Default::default()).unwrap(),
+            after_stop,
+            late_success,
+            finished: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+    async fn trace_cleanup_case(
+        trace: bool,
+        after_stop: std::time::Duration,
+        late_success: bool,
+    ) -> (NativeOutcome, bool) {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let lease = broker.admit(1, 1, 20).unwrap();
+        let executor = trace_executor(broker.clone(), &lease, after_stop, late_success);
+        let outcome = execute_bounded(
+            executor.clone(),
+            broker,
+            if trace {
+                "capture.screenshot"
+            } else {
+                "browser.perform"
+            }
+            .into(),
+            if trace {
+                serde_json::from_value(serde_json::json!({"purpose":"trace"})).unwrap()
+            } else {
+                Default::default()
+            },
+            lease,
+            true,
+        )
+        .await;
+        assert_eq!(
+            executor.blobs.charged_for_test(),
+            (0, 0),
+            "late receipt must release the actual producer charge"
+        );
+        executor.blobs.check_budget_integrity().unwrap();
+        (
+            outcome,
+            executor.finished.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+    #[tokio::test]
+    async fn trace_cleanup_waits_for_original_producer_without_continuation() {
+        // Complete cleanup before the original receipt decision point.
+        let (outcome, finished) =
+            trace_cleanup_case(true, std::time::Duration::from_millis(100), false).await;
+        assert!(finished);
+        assert_eq!(outcome.result, Err(ProtocolError::DeadlineExceeded));
+        assert_eq!(outcome.effects, Effects::Completed);
+        assert!(outcome.retention.is_none());
+    }
+    #[tokio::test]
+    async fn trace_cleanup_never_publishes_success_after_success_deadline() {
+        let (outcome, finished) =
+            trace_cleanup_case(true, std::time::Duration::from_millis(100), true).await;
+        assert!(finished);
+        assert_eq!(outcome.result, Err(ProtocolError::DeadlineExceeded));
+        assert!(outcome.retention.is_none());
+    }
+    #[tokio::test]
+    async fn trace_pending_without_proof_keeps_unknown_and_does_not_extend_input_grace() {
+        let (outcome, finished) = trace_cleanup_case(
+            true,
+            super::super::client_protected_read::CLEANUP_TIMEOUT
+                + std::time::Duration::from_millis(200),
+            false,
+        )
+        .await;
+        assert!(!finished);
+        assert_eq!(outcome.effects, Effects::Unknown);
+        assert!(outcome.result.is_err());
+        let (input, finished) =
+            trace_cleanup_case(false, std::time::Duration::from_millis(350), false).await;
+        assert!(!finished);
+        assert_eq!(input.effects, Effects::Unknown);
+    }
+    #[tokio::test]
+    async fn trace_receipt_reuses_an_earlier_cleanup_clock_without_proof() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let lease = broker.admit(1, 1, 500).unwrap();
+        let executor = trace_executor(
+            broker.clone(),
+            &lease,
+            std::time::Duration::from_millis(2_700),
+            false,
+        );
+        let limit = executor.journal.begin_protected_cleanup();
+        let outcome = execute_bounded(
+            executor.clone(),
+            broker,
+            "capture.screenshot".into(),
+            serde_json::from_value(serde_json::json!({"purpose":"trace"})).unwrap(),
+            lease,
+            true,
+        )
+        .await;
+        assert_eq!(executor.journal.begin_protected_cleanup(), limit);
+        assert_eq!(outcome.effects, Effects::Unknown);
+        assert!(
+            !executor.finished.load(std::sync::atomic::Ordering::SeqCst),
+            "a pending producer without a usable proof cannot extend receipt grace"
+        );
+    }
+    #[tokio::test]
+    async fn trace_cancellation_uses_cleanup_clock_and_discards_late_image() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let lease = broker.admit(1, 1, 5_000).unwrap();
+        let executor = trace_executor(
+            broker.clone(),
+            &lease,
+            std::time::Duration::from_millis(100),
+            true,
+        );
+        let cancel = broker.clone();
+        let control = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            cancel.cancel(1, 1).unwrap();
+        });
+        let outcome = execute_bounded(
+            executor.clone(),
+            broker,
+            "capture.screenshot".into(),
+            serde_json::from_value(serde_json::json!({"purpose":"trace"})).unwrap(),
+            lease,
+            true,
+        )
+        .await;
+        control.await.unwrap();
+        assert_eq!(outcome.result, Err(ProtocolError::Cancelled));
+        assert_eq!(executor.blobs.charged_for_test(), (0, 0));
+        assert!(outcome.retention.is_none());
     }
 
     // These tests use the production reader, admission, execute_bounded,

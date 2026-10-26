@@ -12,6 +12,8 @@ use serde_json::{json, Value};
 use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 
+pub(crate) const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtectedReadReason {
     Cancelled,
@@ -41,6 +43,7 @@ pub struct ProtectedReadJournal<'a> {
     sessions: Vec<String>,
     record: Arc<Record>,
     cleanup_deadline: Option<Instant>,
+    operation_journal: Option<super::client_debt::OperationJournalHandle>,
     restored: bool,
     started: bool,
     stabilization_completed: bool,
@@ -56,6 +59,20 @@ impl<'a> ProtectedReadJournal<'a> {
             identity_scope: page.identity_scope.clone(),
             cleanup_integrity_lost: false,
         };
+        let operation_journal = super::client_debt::OperationJournalHandle::current();
+        if let Some(journal) = &operation_journal {
+            if page.client.debt_ledger().is_none_or(|ledger| {
+                !journal.matches_protected_read(
+                    &ledger,
+                    &page.identity_scope,
+                    &page.target_id,
+                    &page.page_session_id,
+                    operation,
+                )
+            }) {
+                return Err(failure(ProtectedReadReason::StaleScope));
+            }
+        }
         let barrier = page
             .targets
             .protected_read_barrier()
@@ -99,6 +116,7 @@ impl<'a> ProtectedReadJournal<'a> {
             sessions,
             record,
             cleanup_deadline: None,
+            operation_journal,
             restored: false,
             started: false,
             stabilization_completed: false,
@@ -114,9 +132,13 @@ impl<'a> ProtectedReadJournal<'a> {
             .map_err(|_| ProtectedReadReason::CleanupFailed)
     }
     pub(crate) fn begin_cleanup(&mut self) -> Instant {
-        *self
-            .cleanup_deadline
-            .get_or_insert_with(|| Instant::now() + Duration::from_secs(3))
+        let operation_journal = self.operation_journal.as_ref();
+        *self.cleanup_deadline.get_or_insert_with(|| {
+            operation_journal.map_or_else(
+                || Instant::now() + CLEANUP_TIMEOUT,
+                |journal| journal.begin_protected_cleanup(),
+            )
+        })
     }
     pub(crate) fn raw_capture_started(&self) -> Result<(), ProtectedReadReason> {
         let mut records = self.records()?;
@@ -485,6 +507,9 @@ impl<'a> ProtectedReadJournal<'a> {
             });
         }
         self.restored = true;
+        if let Some(journal) = &self.operation_journal {
+            journal.protected_read_restored();
+        }
         Ok(())
     }
 }
@@ -551,12 +576,17 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
             while let Some(Ok(message)) = ws.next().await {
-                let Ok(text) = message.to_text() else {
-                    continue;
+                let text = match message {
+                    tokio_tungstenite::tungstenite::Message::Text(text) => text,
+                    tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                    _ => continue,
                 };
-                let request: Value = serde_json::from_str(text).unwrap();
+                let request: Value = serde_json::from_str(&text).unwrap();
                 recorded.lock().unwrap().push(request.clone());
                 let mut response = json!({"id":request["id"],"sessionId":request["sessionId"],"result":if request["method"]=="Animation.getPlaybackRate" {json!({"playbackRate":1})} else {json!({})}});
+                if request["method"] == "DOM.resolveNode" {
+                    response["result"] = json!({"object":{"objectId":"holder"}});
+                }
                 if request["method"] == "Runtime.callFunctionOn" {
                     response["result"] = json!({"result":{"value":true}});
                     if request["params"]["objectId"] == "fail-remove"
@@ -621,6 +651,269 @@ mod tests {
         (page, operation, sender, server, records)
     }
     #[tokio::test]
+    async fn trace_restore_receipt_requires_exact_owner_and_clean_ledger() {
+        use super::super::client_browser::{settle_observation_dispatch, settle_trace_screenshot};
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_observation_dispatch::DispatchFailure;
+        use super::super::client_protocol::{Effects, ProtocolError, ScopeState};
+        for mode in [
+            "clean",
+            "earlier-cleanup",
+            "dirty-join",
+            "unknown",
+            "object-debt",
+            "restore-loss",
+        ] {
+            let (page, _unused_operation, _sender, server, requests) =
+                journal_fixture(mode == "restore-loss", false).await;
+            let broker = Arc::new(super::super::client_session::ClientSession::new());
+            let operation = broker.admit(1, 1, 5_000).unwrap();
+            assert!(broker.start(1, 1).unwrap());
+            let ledger = OwnerDebtLedger::new(1, "scope".into());
+            page.client.install_debt_ledger(ledger.clone()).unwrap();
+            let key = OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            };
+            let journal = ledger
+                .operation(key, "target".into(), "session".into())
+                .unwrap();
+            journal.bind_operation(&operation).unwrap();
+            let tasks = Arc::new(super::super::client_tasks::RetainedTasks::default());
+            let task_owner = tasks.clone();
+            let receipt_journal = journal.clone();
+            let targets = page.targets.clone();
+            let client = page.client.clone();
+            let task_broker = broker.clone();
+            let receive = tasks
+                .start_operation(
+                    "scope".into(),
+                    targets,
+                    broker.clone(),
+                    journal.clone(),
+                    operation.cancellation.clone(),
+                    async move {
+                        let mut protected =
+                            super::ProtectedReadJournal::begin(&page, &operation).unwrap();
+                        protected.stabilize_animations().await.unwrap();
+                        protected
+                            .reserve_source_group("session".into(), "native-mask".into())
+                            .unwrap();
+                        let acquired = super::super::client_debt::native_object_group(
+                            "native-mask",
+                            super::super::client_debt::command_scope(
+                                super::super::client_debt::CommandCategory::ApplicationObject,
+                                false,
+                                page.client.send_command(
+                                    "DOM.resolveNode",
+                                    Some(json!({"backendNodeId":1,"objectGroup":"native-mask"})),
+                                    Some("session"),
+                                ),
+                            ),
+                        )
+                        .await
+                        .unwrap();
+                        protected
+                            .bind_source_holder(
+                                "session",
+                                "native-mask",
+                                acquired["object"]["objectId"].as_str().unwrap().into(),
+                            )
+                            .unwrap();
+                        assert_eq!(
+                            receipt_journal.snapshot().object_debt,
+                            1,
+                            "actual native group must remain charged before restore"
+                        );
+                        assert!(
+                            receipt_journal.snapshot().mutation_dispatched,
+                            "real CDP stabilization must supply dispatch evidence"
+                        );
+                        let debt = if mode == "object-debt" {
+                            Some(
+                                receipt_journal
+                                    .register_remote_obligation(
+                                        "Runtime.evaluate",
+                                        Some(&json!({"expression":"0","returnByValue":true})),
+                                        Some("session"),
+                                    )
+                                    .unwrap()
+                                    .submit()
+                                    .unwrap(),
+                            )
+                        } else {
+                            None
+                        };
+                        let deadline = if mode == "earlier-cleanup" {
+                            protected.begin_cleanup()
+                        } else {
+                            task_owner.begin_protected_cleanup(key).unwrap()
+                        };
+                        task_broker.cancel(1, 1).unwrap();
+                        assert_eq!(protected.begin_cleanup(), deadline);
+                        assert_eq!(task_owner.begin_protected_cleanup(key), Some(deadline));
+                        let restored = protected.restore().await;
+                        drop(protected);
+                        if mode == "object-debt" {
+                            assert!(receipt_journal.snapshot().object_debt > 0);
+                        }
+                        let (mut outcome, dirty) = settle_observation_dispatch(
+                            Ok(Err(DispatchFailure {
+                                error: ProtocolError::Cancelled,
+                                identity_scope: "scope".into(),
+                                cleanup_integrity_lost: restored.is_err(),
+                            })),
+                            Ok(if mode == "dirty-join" {
+                                Err(DispatchFailure {
+                                    error: ProtocolError::CleanupFailed,
+                                    identity_scope: "scope".into(),
+                                    cleanup_integrity_lost: true,
+                                })
+                            } else {
+                                Ok(())
+                            }),
+                        );
+                        if mode == "unknown" {
+                            outcome.effects = Effects::Unknown;
+                        }
+                        let settled =
+                            settle_trace_screenshot(outcome, dirty, true, &receipt_journal);
+                        // Keep an actual submitted object obligation through this proof
+                        // decision. Dropping its waiter cannot settle reader-owned debt.
+                        drop(debt);
+                        settled
+                    },
+                )
+                .await
+                .unwrap();
+            let outcome = receive.await.unwrap();
+            let clean = mode == "clean" || mode == "earlier-cleanup";
+            assert_eq!(
+                outcome.result,
+                Err(if matches!(mode, "dirty-join" | "restore-loss") {
+                    ProtocolError::CleanupFailed
+                } else {
+                    ProtocolError::Cancelled
+                }),
+                "{mode}"
+            );
+            assert_eq!(
+                outcome.effects,
+                if clean {
+                    Effects::Completed
+                } else {
+                    Effects::Unknown
+                },
+                "{mode}"
+            );
+            if clean {
+                assert!(outcome.retention.is_none());
+                assert!(journal.clean_protected_read());
+            }
+            assert_eq!(
+                broker.settle(1, 1, outcome.effects).unwrap(),
+                if clean {
+                    ScopeState::Usable
+                } else {
+                    ScopeState::Quarantined
+                },
+                "{mode}"
+            );
+            assert_eq!(
+                tasks.drain_current().await.is_ok(),
+                !matches!(mode, "dirty-join" | "restore-loss"),
+                "{mode}"
+            );
+            assert!(requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["method"] == "Runtime.releaseObjectGroup"));
+            client.close().await;
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn trace_restore_proof_rejects_other_ledger_owner_and_operation() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        let (page, operation, _sender, server, requests) = journal_fixture(false, false).await;
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        page.client.install_debt_ledger(ledger.clone()).unwrap();
+        for mismatch in [
+            "ledger",
+            "generation",
+            "scope",
+            "target",
+            "session",
+            "sequence",
+            "admission",
+        ] {
+            let owner = match mismatch {
+                "ledger" => OwnerDebtLedger::new(1, "scope".into()),
+                "generation" => OwnerDebtLedger::new(2, "scope".into()),
+                "scope" => OwnerDebtLedger::new(1, "other-scope".into()),
+                _ => ledger.clone(),
+            };
+            let key = OperationKey {
+                generation: if mismatch == "generation" { 2 } else { 1 },
+                operation_seq: if mismatch == "sequence" { 2 } else { 1 },
+            };
+            let journal = owner
+                .operation(
+                    key,
+                    if mismatch == "target" {
+                        "other-target"
+                    } else {
+                        "target"
+                    }
+                    .into(),
+                    if mismatch == "target" {
+                        "target-mismatch-session"
+                    } else if mismatch == "session" {
+                        "other-session"
+                    } else {
+                        "session"
+                    }
+                    .into(),
+                )
+                .unwrap();
+            let (_cancel, cancellation) =
+                tokio::sync::watch::channel(super::super::client_session::CancelSignal::None);
+            let bound = super::super::client_session::OperationLease {
+                is_callback: false,
+                generation: key.generation,
+                sequence: key.operation_seq,
+                deadline: operation.deadline,
+                cancellation: if mismatch == "admission" {
+                    cancellation
+                } else {
+                    operation.cancellation.clone()
+                },
+            };
+            journal.bind_operation(&bound).unwrap();
+            journal
+                .scope(async {
+                    assert!(
+                        matches!(
+                            super::ProtectedReadJournal::begin(&page, &operation),
+                            Err(super::ProtectedReadFailure {
+                                reason: super::ProtectedReadReason::StaleScope,
+                                ..
+                            })
+                        ),
+                        "{mismatch}"
+                    );
+                })
+                .await;
+            assert!(!journal.clean_protected_read(), "{mismatch}");
+        }
+        assert!(requests.lock().unwrap().is_empty());
+        page.client.close().await;
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn residual_poisoned_records_survive_journal_drop() {
         let (page, operation, _sender, server, _requests) = journal_fixture(false, false).await;
         let mut journal = super::ProtectedReadJournal::begin(&page, &operation).unwrap();
@@ -638,13 +931,14 @@ mod tests {
             .snapshot_for_test()
             .unwrap();
         assert!(Arc::ptr_eq(&record, &retained));
-        let data = match retained.data.lock() {
-            Err(error) => error.into_inner(),
-            Ok(_) => panic!("poison must persist"),
-        };
-        assert_eq!(data.rates[0].original, 1.0);
-        assert!(!data.rates[0].acknowledged);
-        drop(data);
+        {
+            let data = match retained.data.lock() {
+                Err(error) => error.into_inner(),
+                Ok(_) => panic!("poison must persist"),
+            };
+            assert_eq!(data.rates[0].original, 1.0);
+            assert!(!data.rates[0].acknowledged);
+        }
         assert!(page
             .targets
             .protected_read_residual
@@ -691,10 +985,11 @@ mod tests {
             .protected_read_residual
             .snapshot_for_test()
             .unwrap();
-        let data = record.data.lock().unwrap();
-        assert_eq!(data.masks[0].step, super::MaskStep::Removed);
-        assert!(data.rates[0].acknowledged);
-        drop(data);
+        {
+            let data = record.data.lock().unwrap();
+            assert_eq!(data.masks[0].step, super::MaskStep::Removed);
+            assert!(data.rates[0].acknowledged);
+        }
         page.client.close().await;
         server.await.unwrap();
     }
@@ -751,14 +1046,15 @@ mod tests {
         let retained = slot.snapshot_for_test().unwrap();
         assert!(Arc::ptr_eq(&exact, &retained));
         assert!(slot.replacement_safe().is_err());
-        let data = retained.data.lock().unwrap();
-        assert_eq!(data.masks[0].session, "session");
-        assert_eq!(data.masks[0].holder.as_deref(), Some("holder"));
-        assert_eq!(data.masks[0].group, "owned-mask");
-        assert_eq!(data.rates[0].original, 1.0);
-        assert!(!data.rates[0].acknowledged);
-        assert_eq!(data.raw, super::RawState::Pending);
-        drop(data);
+        {
+            let data = retained.data.lock().unwrap();
+            assert_eq!(data.masks[0].session, "session");
+            assert_eq!(data.masks[0].holder.as_deref(), Some("holder"));
+            assert_eq!(data.masks[0].group, "owned-mask");
+            assert_eq!(data.rates[0].original, 1.0);
+            assert!(!data.rates[0].acknowledged);
+            assert_eq!(data.raw, super::RawState::Pending);
+        }
         let before = requests.lock().unwrap().len();
         assert!(super::ProtectedReadJournal::begin(&page, &operation).is_err());
         tokio::task::yield_now().await;
@@ -791,14 +1087,15 @@ mod tests {
             .protected_read_residual
             .snapshot_for_test()
             .unwrap();
-        let data = retained.data.lock().unwrap();
-        assert_eq!(data.masks[0].step, super::MaskStep::InstalledOrUnknown);
-        assert_eq!(data.masks[0].holder.as_deref(), Some("fail-remove"));
-        assert!(
-            data.rates[0].acknowledged,
-            "successful restore ACK must not be forgotten"
-        );
-        drop(data);
+        {
+            let data = retained.data.lock().unwrap();
+            assert_eq!(data.masks[0].step, super::MaskStep::InstalledOrUnknown);
+            assert_eq!(data.masks[0].holder.as_deref(), Some("fail-remove"));
+            assert!(
+                data.rates[0].acknowledged,
+                "successful restore ACK must not be forgotten"
+            );
+        }
         assert!(page
             .targets
             .protected_read_residual
