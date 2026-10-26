@@ -1028,15 +1028,21 @@ async fn p06_framed_input_eof_cancelled_recovery_cannot_be_reissued() {
 #[path = "client_browser_locator_eof_tests.rs"]
 mod locator_eof_tests;
 
-// Regression for a background session.environment read outliving a later
-// successful trace. This uses the existing persistent owner and real framed
-// transport. No timeout, cancellation, or fabricated EOF arms retirement.
+// Regression for the fixed-read EOF receipt and independent final-local close.
+// This uses the existing persistent owner and real framed transport; it does
+// not claim to reproduce a later successful trace or a browser reconnect.
 #[tokio::test]
 async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
     use crate::native::client_browser::reconnect_tests::{peer, PeerMode};
     use crate::native::client_protocol::{DISCONNECTED_RECOVERY, EXACT_OWNER_CONTINUATION};
 
-    for cause in ["remote", "local-close", "contaminated"] {
+    for cause in [
+        "remote",
+        "local-close",
+        "contaminated",
+        "target-poison",
+        "expired-final",
+    ] {
         let mut original = peer(PeerMode::HoldFixedRead).await;
         let broker = Arc::new(ClientSession::new());
         let browser = Arc::new(ClientBrowser::new(broker.clone()));
@@ -1160,10 +1166,10 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
         );
         assert_eq!(
             receipt.get("recovery").is_some(),
-            cause == "remote",
+            !matches!(cause, "local-close" | "contaminated"),
             "{cause}"
         );
-        if cause == "remote" {
+        if !matches!(cause, "local-close" | "contaminated") {
             assert_eq!(
                 receipt["recovery"],
                 json!({"version":1,"identityScope":scope})
@@ -1193,14 +1199,36 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
             "neither fixed read nor business input is replayed"
         );
         assert_eq!(commands[0]["method"], "Browser.getVersion");
-        // No reconnect is attempted here. Existing failed final cleanup remains
-        // failed; this test does not turn transport EOF into a cleanup ACK.
+        // Only the independent final-local certificate changes this former
+        // conservative cleanup-Err assertion. The operation stays Unknown and
+        // its submitted command remains unacknowledged, even after final close.
+        if cause == "target-poison" {
+            browser.owner.lock().await.as_ref().unwrap().targets.seal();
+        }
+        if cause == "expired-final" {
+            browser.tasks.expire_recovery_window_for_test(key);
+            assert!(browser.tasks.recovery_candidate(key).is_none());
+        }
+        let outstanding = ledger.snapshot().outstanding_commands;
+        assert!(outstanding > 0);
         let cleanup = tokio::time::timeout(Duration::from_secs(7), framed.finish())
             .await
             .expect("fixed read EOF final cleanup stalled");
-        assert!(
-            cleanup.is_err(),
-            "unrecovered retained EOF failure is not proven teardown"
-        );
+        let terminal_success = matches!(cause, "remote" | "expired-final");
+        assert_eq!(cleanup.is_ok(), terminal_success, "{cause}: {cleanup:?}");
+        assert_eq!(ledger.snapshot().outstanding_commands, outstanding);
+        assert!(ledger.snapshot().integrity_lost);
+        assert!(ledger.check_admission(AdmissionClass::FixedRead).is_err());
+        assert!(browser.tasks.recovery_candidate(key).is_none());
+        if terminal_success {
+            assert!(
+                browser.shutdown().await.is_ok(),
+                "terminal close is idempotent"
+            );
+            assert!(matches!(
+                browser.tasks.operation_retention_status(key),
+                crate::native::client_operation_state::OperationRetentionStatus::IntegrityLost(_)
+            ));
+        }
     }
 }

@@ -832,7 +832,14 @@ impl CommandStatusHandle {
         )
     }
 }
+// Native envelope classification only; never supplied by an operation or
+// command_scope override. It does not change submission/ACK accounting.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TerminalReadKind {
+    BrowserVersion,
+}
 struct CommandRecord {
+    terminal_read: Option<TerminalReadKind>,
     owner_cleanup: bool,
     cleanup_kind: Option<OwnerCleanupCommand>,
     acquisition: Option<LifecycleAcquisition>,
@@ -1808,6 +1815,70 @@ impl OwnerDebtLedger {
     pub(crate) fn matches_owner(&self, generation: u64, identity_scope: &str) -> bool {
         self.generation == generation && self.identity_scope == identity_scope
     }
+    /// Sealed final-close evidence, not command settlement. Exact fully drained
+    /// enrollment supplies the borrowed bindings; no host detach is invented.
+    /// Every unacknowledged command remains in the ledger unchanged.
+    pub(crate) fn check_terminal_read_only(
+        &self,
+        bindings: &[(String, String, bool)],
+        operations: &[OperationKey],
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        if !state.remote_eof_only()
+            || !state
+                .bootstrap
+                .as_ref()
+                .is_some_and(|bootstrap| bootstrap.published)
+            || state.context_creation_claimed
+            || state.root_creation_claimed
+            || state.eval_publication_pending
+            || state.commands.is_empty()
+            || !state.objects.is_empty()
+            || !state.groups.is_empty()
+            || !state.created_targets.is_empty()
+            || !state.recording_targets.is_empty()
+            || bindings.is_empty()
+            || state.targets.len() != bindings.len()
+            || !bindings.iter().all(|(session, target, observer)| {
+                state.targets.get(session) == Some(target)
+                    && match state.lifecycle_sessions.get(session) {
+                        None => !observer,
+                        Some(LifecycleSessionPurpose::Observer) => *observer,
+                        _ => false,
+                    }
+            })
+            || state
+                .lifecycle_sessions
+                .keys()
+                .any(|session| !state.targets.contains_key(session))
+            || state
+                .realms
+                .keys()
+                .any(|(session, _)| !state.targets.contains_key(session))
+            || state.commands.values().any(|command| {
+                command.terminal_read != Some(TerminalReadKind::BrowserVersion)
+                    || !command.submitted
+                    || command.mutation
+                    || command.creation_slots != 0
+                    || command.owner_cleanup
+                    || command.acquisition.is_some()
+                    || !command
+                        .provenance
+                        .operation
+                        .is_some_and(|key| operations.contains(&key))
+                    || command.provenance.session.is_some()
+                    || command.release_object.is_some()
+                    || command.group_id.is_some()
+            })
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        Ok(())
+    }
+
     /// A read-only terminal check, never proof that EOF destroyed a borrowed
     /// context. Exact reader events must already have settled every obligation.
     pub(crate) fn check_final_local_eof(
@@ -2147,6 +2218,14 @@ impl OwnerDebtLedger {
         if teardown_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             return Err(ProtocolError::DeadlineExceeded);
         }
+        let terminal_read = (method == "Browser.getVersion"
+            && params.is_none()
+            && session.is_none()
+            && journal.is_some()
+            && owner_cleanup.is_none()
+            && teardown_deadline.is_none()
+            && COMMAND_OVERRIDE.try_with(|_| ()).is_err())
+        .then_some(TerminalReadKind::BrowserVersion);
         let classification = if teardown_deadline.is_some() {
             Classification {
                 category: CommandCategory::CleanupOther,
@@ -2569,6 +2648,7 @@ impl OwnerDebtLedger {
         state.commands.insert(
             id,
             CommandRecord {
+                terminal_read,
                 owner_cleanup: owner_cleanup.is_some(),
                 cleanup_kind: owner_cleanup,
                 acquisition,
@@ -5242,6 +5322,147 @@ pub(crate) mod tests {
             Err(ProtocolError::ScopeUnavailable)
         );
         assert!(ledger.check_admission(AdmissionClass::Input).is_err());
+    }
+    #[tokio::test]
+    async fn terminal_read_only_certificate_rejects_forged_envelopes_and_retains_debt() {
+        for obstruction in [
+            "none",
+            "params",
+            "session",
+            "method",
+            "override",
+            "object",
+            "input",
+            "initializer",
+            "recording",
+            "local",
+            "contaminated",
+            "wrong-operation",
+        ] {
+            let ledger = borrowed_final_local_owner();
+            ledger
+                .bind_session("borrowed-context", "target", "page")
+                .unwrap();
+            ledger
+                .state
+                .lock()
+                .unwrap()
+                .bootstrap
+                .as_mut()
+                .unwrap()
+                .published = true;
+            let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 7,
+                sequence: 2,
+                deadline: Instant::now() + std::time::Duration::from_secs(5),
+                cancellation,
+            };
+            let key = OperationKey {
+                generation: 7,
+                operation_seq: 2,
+            };
+            let journal = ledger
+                .operation(key, "target".into(), "page".into())
+                .unwrap();
+            journal.bind_operation(&operation).unwrap();
+            let params = (obstruction == "params").then(|| json!({}));
+            let session = (obstruction == "session").then_some("page");
+            let method = if obstruction == "method" {
+                "Page.getFrameTree"
+            } else {
+                "Browser.getVersion"
+            };
+            let reservation = if obstruction == "override" {
+                command_scope(CommandCategory::ApplicationRead, false, async {
+                    ledger.reserve_command(Some(&journal), method, params.as_ref(), session)
+                })
+                .await
+            } else {
+                ledger.reserve_command(Some(&journal), method, params.as_ref(), session)
+            };
+            let Ok(reservation) = reservation else {
+                assert!(matches!(
+                    obstruction,
+                    "params" | "session" | "method" | "override"
+                ));
+                continue;
+            };
+            let submitted = reservation.submit().unwrap();
+            let _input = if obstruction == "input" {
+                Some(
+                    ledger
+                        .reserve_command(
+                            Some(&journal),
+                            "Input.dispatchKeyEvent",
+                            Some(&json!({"type":"keyDown", "key":"x"})),
+                            Some("page"),
+                        )
+                        .unwrap()
+                        .submit()
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            if obstruction == "local" {
+                ledger.connection_lost();
+            } else {
+                ledger.observe_remote_eof();
+            }
+            if obstruction == "contaminated" {
+                ledger.connection_lost();
+            }
+            {
+                let mut state = ledger.state.lock().unwrap();
+                match obstruction {
+                    "object" => state.objects.push(ObjectObligation {
+                        provenance: Provenance {
+                            operation: Some(key),
+                            target: Some("target".into()),
+                            session: Some("page".into()),
+                            realm: None,
+                        },
+                        object: Some("held".into()),
+                        group: None,
+                        serial: 1,
+                        footprint: 256,
+                    }),
+                    "initializer" => state.root_creation_claimed = true,
+                    "recording" => {
+                        state.recording_targets.insert("recording".into());
+                    }
+                    _ => {}
+                }
+            }
+            let before = ledger.snapshot();
+            let keys = if obstruction == "wrong-operation" {
+                vec![OperationKey {
+                    generation: 7,
+                    operation_seq: 3,
+                }]
+            } else {
+                vec![key]
+            };
+            let result =
+                ledger.check_terminal_read_only(&[("page".into(), "target".into(), false)], &keys);
+            assert_eq!(result.is_ok(), obstruction == "none", "{obstruction}");
+            assert_eq!(ledger.snapshot(), before, "proof must not settle debt");
+            assert_eq!(
+                ledger
+                    .state
+                    .lock()
+                    .unwrap()
+                    .commands
+                    .get(&submitted.id)
+                    .unwrap()
+                    .status
+                    .snapshot(),
+                CommandStatus::Submitted
+            );
+            assert!(ledger.check_admission(AdmissionClass::FixedRead).is_err());
+        }
     }
     #[test]
     fn final_local_eof_is_read_only_exact_borrowed_owner_evidence_not_admission() {

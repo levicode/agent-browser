@@ -1593,6 +1593,53 @@ impl ClientTargets {
             self.changed.notify_waiters();
         })
     }
+    /// EOF closes admission, not accounting. All ordinary poison paths still
+    /// set integrity_lost; this never clears an earlier loss.
+    pub(crate) fn seal_remote_connection(&self, ledger: &Arc<super::client_debt::OwnerDebtLedger>) {
+        if self.require_eval_owner(ledger).is_ok() && ledger.remote_eof_only() {
+            self.seal_admission();
+        } else {
+            self.seal();
+        }
+    }
+    pub(crate) fn check_terminal_read_only(
+        &self,
+        bindings: &[(String, String, bool)],
+    ) -> Result<(), ProtocolError> {
+        self.with_terminal_read_only(bindings, || Ok(()))
+    }
+    pub(crate) fn with_terminal_read_only<T>(
+        &self,
+        bindings: &[(String, String, bool)],
+        commit: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        if !state.sealed
+            || state.integrity_lost
+            || !state.enrollment_ready
+            || state.reservations != 0
+            || state.resuming != 0
+            || state.protected_read
+            || !state.bootstrap_creations.is_empty()
+            || !state.native_bootstrap_cleanup.is_empty()
+            || !state.bootstrap_cleanup_reservations.is_empty()
+            || state.unknown_bootstrap_create
+            || !state.auxiliary.is_empty()
+            || state.targets.len() != bindings.iter().filter(|(_, _, observer)| !observer).count()
+            || state.targets.values().any(|target| {
+                !target.capture_ready()
+                    || !bindings.iter().any(|(session, id, observer)| {
+                        !observer && session == &target.session_id && id == &target.target_id
+                    })
+            })
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        commit()
+    }
     /// Final-local cleanup only: admission may already be sealed, but no
     /// accounting damage or unsettled exact resource/reservation is waived.
     pub(crate) fn check_final_local_cleanup(&self) -> Result<(), ProtocolError> {
@@ -2131,6 +2178,44 @@ mod tests {
             )
             .unwrap();
         targets
+    }
+
+    #[test]
+    fn terminal_eof_seal_never_clears_real_target_poison_or_grants_admission() {
+        use super::super::client_debt::OwnerDebtLedger;
+        use super::super::client_session::{CancelSignal, OperationLease};
+        for poison_before in [false, true] {
+            let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(5),
+                cancellation,
+            };
+            let ledger = OwnerDebtLedger::unpublished(&operation, "scope".into(), false).unwrap();
+            ledger.bind_context("context").unwrap();
+            let targets = ClientTargets::new_managed("context".into(), "scope".into());
+            targets.bind_eval_owner(&ledger).unwrap();
+            ledger.observe_remote_eof();
+            if poison_before {
+                targets.seal();
+            }
+            targets.seal_remote_connection(&ledger);
+            {
+                let state = targets.state.lock().unwrap();
+                assert!(state.sealed);
+                assert_eq!(state.integrity_lost, poison_before);
+            }
+            assert!(targets.inventory().is_err());
+            assert!(targets.acknowledge_enrollment().is_err());
+            targets.seal();
+            targets.seal_remote_connection(&ledger);
+            assert!(
+                targets.state.lock().unwrap().integrity_lost,
+                "later poison must remain sticky"
+            );
+        }
     }
 
     #[tokio::test]

@@ -854,6 +854,7 @@ pub struct ClientEnrollment {
     retirement_events: Mutex<Option<BoundedMethodEvents>>,
     terminal_proof: Mutex<Option<NativeTerminalProof>>,
     final_local_proof: Mutex<Option<FinalLocalEofProof>>,
+    terminal_received: Mutex<Option<u64>>,
     #[cfg(test)]
     capture_lifecycle: Mutex<CaptureLifecycleTrace>,
     #[cfg(test)]
@@ -898,6 +899,7 @@ impl ClientEnrollment {
             retirement_events: Mutex::new(None),
             terminal_proof: Mutex::new(None),
             final_local_proof: Mutex::new(None),
+            terminal_received: Mutex::new(None),
             #[cfg(test)]
             capture_lifecycle: Mutex::new(CaptureLifecycleTrace::default()),
             #[cfg(test)]
@@ -1142,6 +1144,116 @@ impl ClientEnrollment {
         };
         *slot = Some(proof.clone());
         Ok(proof)
+    }
+    /// Final-close evidence only, after the existing supervisor and resource
+    /// cleanup have joined. Buffered-but-unapplied events cannot certify this.
+    pub(crate) async fn check_terminal_read_only(
+        &self,
+        operations: &[super::client_debt::OperationKey],
+    ) -> Result<
+        (
+            Arc<super::client_debt::OwnerDebtLedger>,
+            Vec<(String, String, bool)>,
+        ),
+        ProtocolError,
+    > {
+        if !matches!(&self.ownership, ScopeOwnership::BorrowedTargets(_))
+            || !self.sealed.load(Ordering::Acquire)
+            || self.supervisor.lock().await.is_some()
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        self.terminal_connection_proof()?
+            .check_client(&self.client)?;
+        let received = self
+            .terminal_received
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .ok_or(ProtocolError::CleanupFailed)?;
+        let root = self
+            .active_root
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .clone();
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        if index.failure.is_some()
+            || !index.reconciled
+            || index.applied_watermark != received
+            || !index.pending_enrollment.is_empty()
+            || !index.realm_pending.is_empty()
+            || index.realm_tickets != 0
+            || index.borrowed_restart.is_some()
+            || index.borrowed_blank.is_some()
+            || !index.retiring_pages.is_empty()
+            || index.sessions.values().any(|entry| {
+                !entry.resumed
+                    || entry.application == entry.observation_only
+                    || !matches!(entry.kind.as_str(), "page" | "iframe")
+                    || index.retired_page_sessions.contains(&entry.session)
+                    || index.retired_observer_sessions.contains(&entry.session)
+                    || index.retired_observer_targets.contains(&entry.target)
+                    || index.borrowed_retired_targets.contains(&entry.target)
+            })
+            || !index.sessions.get(&root).is_some_and(|entry| {
+                entry.application && entry.root == root && entry.parent.is_none()
+            })
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        for entry in index.sessions.values() {
+            let mut ancestor = entry;
+            let mut rooted = false;
+            for _ in 0..index.sessions.len() {
+                if ancestor.kind == "page"
+                    && ancestor.parent.is_none()
+                    && ancestor.root == ancestor.session
+                    && ancestor.session == entry.root
+                {
+                    rooted = true;
+                    break;
+                }
+                if ancestor.kind != "iframe" || ancestor.root != entry.root {
+                    break;
+                }
+                let Some(parent) = ancestor
+                    .parent
+                    .as_ref()
+                    .and_then(|id| index.sessions.get(id))
+                else {
+                    break;
+                };
+                ancestor = parent;
+            }
+            if !rooted {
+                return Err(ProtocolError::CleanupFailed);
+            }
+        }
+        let ledger = self
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::CleanupFailed)?;
+        self.client.check_cleanup_owner(&Some(ledger.clone()))?;
+        if !ledger.matches_owner(self.generation, &self.targets.identity_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.targets.require_eval_owner(&ledger)?;
+        let bindings = index
+            .sessions
+            .values()
+            .map(|entry| {
+                (
+                    entry.session.clone(),
+                    entry.target.clone(),
+                    entry.observation_only,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.targets.check_terminal_read_only(&bindings)?;
+        ledger.check_terminal_read_only(&bindings, operations)?;
+        Ok((ledger, bindings))
     }
     fn capture_final_local_eof(&self, received: u64) -> Result<FinalLocalEofProof, ProtocolError> {
         if !matches!(&self.ownership, ScopeOwnership::BorrowedTargets(_)) {
@@ -3987,7 +4099,15 @@ impl ClientEnrollment {
         // waiting on retained initialization work. The network close worker is
         // itself retained; this await cannot abandon its local readers.
         let terminal_close = if let Some(proof) = &terminal {
-            self.targets.seal();
+            *self
+                .terminal_received
+                .lock()
+                .map_err(|_| ProtocolError::CleanupFailed)? = events.terminal_received().ok();
+            if let Some(ledger) = self.client.debt_ledger() {
+                self.targets.seal_remote_connection(&ledger);
+            } else {
+                self.targets.seal();
+            }
             self.sealed.store(true, Ordering::Release);
             Some(
                 match self.network.close_for_remote_disconnect(proof).await {

@@ -43,6 +43,10 @@ impl Tasks {
     }
 }
 impl RetainedTasks {
+    #[cfg(test)]
+    pub(crate) fn expire_recovery_window_for_test(&self, key: super::client_debt::OperationKey) {
+        self.operations.expire_recovery_window_for_test(key);
+    }
     pub(crate) fn begin_protected_cleanup(
         &self,
         key: super::client_debt::OperationKey,
@@ -254,7 +258,11 @@ impl RetainedTasks {
                     operations.finish(key, dirty)
                 }) || dirty;
                 if dirty {
-                    task_targets.seal();
+                    if remote_only {
+                        task_targets.seal_remote_connection(&journal.ledger());
+                    } else {
+                        task_targets.seal();
+                    }
                     let _ = broker.quarantine();
                 }
                 if outcome.effects == Effects::Unknown && !dirty {
@@ -329,6 +337,7 @@ impl RetainedTasks {
         let future = prepare()?;
         let (send, receive) = oneshot::channel();
         // Registration and permanent shutdown linearize under this mutex.
+        let operations = self.operations.clone();
         tasks.tasks.spawn(async move {
             let (mut outcome, cleanup_integrity_lost) =
                 match AssertUnwindSafe(future).catch_unwind().await {
@@ -352,7 +361,17 @@ impl RetainedTasks {
                 if outcome.result.is_ok() {
                     outcome.result = Err(ProtocolError::CleanupFailed);
                 }
-                targets.seal();
+                if !matches!(&outcome.result, Err(ProtocolError::CleanupFailed)) {
+                    if let Some(ledger) =
+                        operation.and_then(|key| operations.remote_failure_ledger(key))
+                    {
+                        targets.seal_remote_connection(&ledger);
+                    } else {
+                        targets.seal();
+                    }
+                } else {
+                    targets.seal();
+                }
             }
             // Any orphaned blob handles remain in the captured bounded BlobStore
             // scope journal until its retirement; they never transfer to another
@@ -409,6 +428,35 @@ impl RetainedTasks {
     ) -> Result<(), ProtocolError> {
         self.operations.retire_disconnected_owner(proof)
     }
+    pub(crate) async fn prepare_terminal_read_only(
+        &self,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+    ) -> Result<Vec<super::client_debt::OperationKey>, ProtocolError> {
+        let mut tasks = self.inner.lock().await;
+        while let Some(result) = tasks.tasks.join_next().await {
+            tasks.record(result);
+        }
+        if !tasks.closing
+            || tasks.unscoped_failure
+            || tasks.failures.iter().any(|failure| {
+                !failure.operation.is_some_and(|key| {
+                    self.operations.disconnected_failure_retired(key)
+                        || self.operations.terminal_failure_retired(key)
+                        || (failure.identity_scope == ledger.identity_scope()
+                            && self.operations.terminal_failure_matches(key, ledger))
+                })
+            })
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        self.operations.check_terminal_read_only(ledger)
+    }
+    pub(crate) fn commit_terminal_read_only(
+        &self,
+        proof: super::client_browser::TerminalReadOnlyRetirement,
+    ) -> Result<(), ProtocolError> {
+        self.operations.commit_terminal_read_only(proof)
+    }
     /// Final cleanup of the current owner. Previously verified local retirements
     /// remain recorded; they are not live producers of this replacement scope.
     pub(crate) async fn drain_current(&self) -> Result<(), ProtocolError> {
@@ -418,9 +466,10 @@ impl RetainedTasks {
         }
         if tasks.unscoped_failure
             || tasks.failures.iter().any(|failure| {
-                !failure
-                    .operation
-                    .is_some_and(|key| self.operations.disconnected_failure_retired(key))
+                !failure.operation.is_some_and(|key| {
+                    self.operations.disconnected_failure_retired(key)
+                        || self.operations.terminal_failure_retired(key)
+                })
             })
         {
             Err(ProtocolError::CleanupFailed)

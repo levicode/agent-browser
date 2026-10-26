@@ -412,8 +412,46 @@ impl ReplacementLease {
     }
 }
 
-/// Native lifecycle-only declarations and attempt ownership. No old session,
-/// document, input, or blob authority is copied into the replacement.
+/// Minted only after strict ledger/enrollment checks and local resource release;
+/// consumed only after physical close and watcher joins. Never remote ACK proof.
+pub(crate) struct TerminalReadOnlyRetirement {
+    ledger: Arc<super::client_debt::OwnerDebtLedger>,
+    operations: Vec<super::client_debt::OperationKey>,
+    targets: Arc<super::client_targets::ClientTargets>,
+    bindings: Vec<(String, String, bool)>,
+}
+impl TerminalReadOnlyRetirement {
+    /// Synthetic guard-test input only; never evidence that production minting,
+    /// resource release, physical close or watcher joining actually happened.
+    #[cfg(test)]
+    pub(crate) fn for_commit_guard_test(
+        ledger: Arc<super::client_debt::OwnerDebtLedger>,
+        operations: Vec<super::client_debt::OperationKey>,
+        targets: Arc<super::client_targets::ClientTargets>,
+        bindings: Vec<(String, String, bool)>,
+    ) -> Self {
+        Self {
+            ledger,
+            operations,
+            targets,
+            bindings,
+        }
+    }
+    pub(crate) fn commit_with_final_resources<T>(
+        &self,
+        commit: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        self.targets.require_eval_owner(&self.ledger)?;
+        self.targets.with_terminal_read_only(&self.bindings, commit)
+    }
+    pub(crate) fn operations(&self) -> &[super::client_debt::OperationKey] {
+        &self.operations
+    }
+    pub(crate) fn ledger(&self) -> &Arc<super::client_debt::OwnerDebtLedger> {
+        &self.ledger
+    }
+}
+
 struct ReplacementSeed {
     page_config: super::client_page::PageConfigSnapshot,
     policy: super::client_observation_dispatch::ReadPolicy,
@@ -1461,6 +1499,61 @@ impl OwnedBrowser {
             Err(ProtocolError::CleanupFailed)
         } else {
             Ok(())
+        }
+    }
+
+    /// Separate final-close path: retain command/Unknown history and grant no
+    /// reusable owner authority. Ordinary close remains unchanged.
+    async fn close_terminal_read_only(
+        &mut self,
+        operations: &[super::client_debt::OperationKey],
+    ) -> Result<TerminalReadOnlyRetirement, ProtocolError> {
+        let prepared = async {
+            if self.owns_context
+                || self.replacement_routes.is_some()
+                || self.disconnected_routes.is_some()
+                || self.reconnect_proof.is_some()
+            {
+                return Err(ProtocolError::CleanupFailed);
+            }
+            self.targets.protected_read_residual.replacement_safe()?;
+            self.page_state
+                .check_no_active_local_input(&self.identity_scope)?;
+            self.cleanup_replacement_actions().await?;
+            let runtime = self.runtime.as_ref().ok_or(ProtocolError::CleanupFailed)?;
+            self.ui.seal();
+            runtime
+                .release_terminal_connection(&self.manager.client, false)
+                .await?;
+            self.targets.protected_read_residual.replacement_safe()?;
+            self.persistent_probe.cleanup(&self.manager.client).await?;
+            // Last remote-only check before explicit physical close contaminates
+            // transport EOF. This is not an ACK, and nothing is deleted.
+            let (ledger, bindings) = runtime
+                .enrollment
+                .check_terminal_read_only(operations)
+                .await?;
+            Ok(TerminalReadOnlyRetirement {
+                ledger,
+                operations: operations.to_vec(),
+                targets: self.targets.clone(),
+                bindings,
+            })
+        }
+        .await;
+        match prepared {
+            Ok(proof) => {
+                self.manager
+                    .close()
+                    .await
+                    .map_err(|_| ProtocolError::CleanupFailed)?;
+                Ok(proof)
+            }
+            Err(_) => {
+                // Refused proof never abandons the ordinary cleanup attempts.
+                let _ = self.close().await;
+                Err(ProtocolError::CleanupFailed)
+            }
         }
     }
 
@@ -3940,11 +4033,32 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         // Keep both journals in owner storage across cancellation or failed
         // final cleanup. A local take would drop unresolved retained resources.
         let mut owner = self.owner.lock().await;
-        let cleaned = match owner.as_mut() {
-            Some(owner) => owner.close().await,
-            None => Ok(()),
+        let terminal_operations = if task_cleanup_failed {
+            match owner
+                .as_ref()
+                .and_then(|owner| owner.manager.client.debt_ledger())
+            {
+                Some(ledger) => self.tasks.prepare_terminal_read_only(&ledger).await.ok(),
+                None => None,
+            }
+        } else {
+            None
         };
-        if cleaned.is_ok() {
+        let mut terminal = None;
+        let cleaned = match (owner.as_mut(), terminal_operations.as_ref()) {
+            (Some(owner), Some(operations)) => {
+                match owner.close_terminal_read_only(operations).await {
+                    Ok(proof) => {
+                        terminal = Some(proof);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            (Some(owner), None) => owner.close().await,
+            (None, _) => Ok(()),
+        };
+        if cleaned.is_ok() && terminal.is_none() {
             *owner = None;
         }
         drop(owner);
@@ -3976,7 +4090,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             || stop_failed
             || watch_failed
             || drain_failed
-            || task_cleanup_failed
+            || (task_cleanup_failed && terminal.is_none())
             || retained_failed
             || self
                 .startup_uncertain
@@ -3984,7 +4098,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         {
             return Err(ProtocolError::CleanupFailed);
         }
-        cleaned
+        cleaned?;
+        if let Some(proof) = terminal {
+            self.tasks.commit_terminal_read_only(proof)?;
+            *self.owner.lock().await = None;
+        }
+        Ok(())
     }
 }
 

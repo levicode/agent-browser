@@ -21,6 +21,7 @@ enum ProducerState {
     Retired,
     IntegrityLost,
     DisconnectedRetired,
+    TerminalLocallyRetired,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RetiredDisposition {
@@ -276,9 +277,12 @@ impl OperationRegistry {
     pub(crate) fn retire(&self, key: OperationKey) -> Option<Instant> {
         let mut entries = self.entries.lock().ok()?;
         if !entries.contains_key(&key)
-            || entries
-                .get(&key)
-                .is_some_and(|entry| entry.state == ProducerState::DisconnectedRetired)
+            || entries.get(&key).is_some_and(|entry| {
+                matches!(
+                    entry.state,
+                    ProducerState::DisconnectedRetired | ProducerState::TerminalLocallyRetired
+                )
+            })
         {
             return None;
         }
@@ -307,10 +311,12 @@ impl OperationRegistry {
         let Ok(mut entries) = self.entries.lock() else {
             return true;
         };
-        if entries
-            .get(&key)
-            .is_some_and(|entry| entry.state == ProducerState::DisconnectedRetired)
-        {
+        if entries.get(&key).is_some_and(|entry| {
+            matches!(
+                entry.state,
+                ProducerState::DisconnectedRetired | ProducerState::TerminalLocallyRetired
+            )
+        }) {
             return true;
         }
         let expired = entries.get(&key).is_some_and(|entry| {
@@ -447,6 +453,117 @@ impl OperationRegistry {
         }
         self.changed.notify_waiters();
         Ok(())
+    }
+    #[cfg(test)]
+    pub(crate) fn expire_recovery_window_for_test(&self, key: OperationKey) {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.get_mut(&key).unwrap();
+        assert_eq!(
+            entry.integrity_reason,
+            Some(RetentionIntegrityReason::RemoteConnectionLost)
+        );
+        entry.retirement_deadline = Some(Instant::now());
+    }
+    // No recovery deadline is consulted: this is final local closure only.
+    fn terminal_keys(
+        entries: &HashMap<OperationKey, Entry>,
+        ledger: &std::sync::Arc<super::client_debt::OwnerDebtLedger>,
+    ) -> Result<Vec<OperationKey>, ProtocolError> {
+        let mut keys = Vec::new();
+        for (key, entry) in entries
+            .iter()
+            .filter(|(_, entry)| std::sync::Arc::ptr_eq(&entry.journal.ledger(), ledger))
+        {
+            let snapshot = entry.journal.snapshot();
+            if !entry.result_fixed
+                || entry.state != ProducerState::IntegrityLost
+                || entry.integrity_reason != Some(RetentionIntegrityReason::RemoteConnectionLost)
+                || !snapshot.local_producers_finished
+                || !snapshot.submission_revoked
+                || snapshot.mutation_dispatched
+                || snapshot.input_debt != 0
+                || snapshot.object_debt != 0
+                || !entry.journal.local_integrity_intact()
+            {
+                return Err(ProtocolError::CleanupFailed);
+            }
+            keys.push(*key);
+        }
+        if keys.is_empty() {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        Ok(keys)
+    }
+    pub(crate) fn check_terminal_read_only(
+        &self,
+        ledger: &std::sync::Arc<super::client_debt::OwnerDebtLedger>,
+    ) -> Result<Vec<OperationKey>, ProtocolError> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        Self::terminal_keys(&entries, ledger)
+    }
+    pub(crate) fn commit_terminal_read_only(
+        &self,
+        proof: super::client_browser::TerminalReadOnlyRetirement,
+    ) -> Result<(), ProtocolError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        let keys = Self::terminal_keys(&entries, proof.ledger())?;
+        if keys.len() != proof.operations().len()
+            || !keys.iter().all(|key| proof.operations().contains(key))
+        {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        // Shutdown sealed admission and joined retained producers, enrollment,
+        // resources and the physical reader before this check: journal writers
+        // are gone. Lock order is entries then targets; the commit closure takes
+        // no ledger/journal lock. A late target poison cannot cross this commit.
+        proof.commit_with_final_resources(|| {
+            for key in keys {
+                entries.get_mut(&key).expect("validated exact key").state =
+                    ProducerState::TerminalLocallyRetired;
+            }
+            self.changed.notify_waiters();
+            Ok(())
+        })
+    }
+    pub(crate) fn remote_failure_ledger(
+        &self,
+        key: OperationKey,
+    ) -> Option<std::sync::Arc<super::client_debt::OwnerDebtLedger>> {
+        let entries = self.entries.lock().ok()?;
+        let entry = entries.get(&key)?;
+        let ledger = entry.journal.ledger();
+        (entry.state == ProducerState::IntegrityLost
+            && entry.integrity_reason == Some(RetentionIntegrityReason::RemoteConnectionLost)
+            && entry.journal.local_integrity_intact()
+            && ledger.remote_eof_only())
+        .then_some(ledger)
+    }
+    pub(crate) fn terminal_failure_matches(
+        &self,
+        key: OperationKey,
+        ledger: &std::sync::Arc<super::client_debt::OwnerDebtLedger>,
+    ) -> bool {
+        self.entries.lock().is_ok_and(|entries| {
+            entries.get(&key).is_some_and(|entry| {
+                std::sync::Arc::ptr_eq(&entry.journal.ledger(), ledger)
+                    && entry.state == ProducerState::IntegrityLost
+                    && entry.integrity_reason
+                        == Some(RetentionIntegrityReason::RemoteConnectionLost)
+            })
+        })
+    }
+    pub(crate) fn terminal_failure_retired(&self, key: OperationKey) -> bool {
+        self.entries.lock().is_ok_and(|entries| {
+            entries
+                .get(&key)
+                .is_some_and(|entry| entry.state == ProducerState::TerminalLocallyRetired)
+        })
     }
     pub(crate) fn disconnected_failure_retired(&self, key: OperationKey) -> bool {
         self.entries.lock().is_ok_and(|entries| {
@@ -608,10 +725,12 @@ impl OperationRegistry {
         key: OperationKey,
         eval_root: Option<OperationKey>,
     ) -> Result<bool, ProtocolError> {
-        if entries
-            .get(&key)
-            .is_some_and(|entry| entry.state == ProducerState::DisconnectedRetired)
-        {
+        if entries.get(&key).is_some_and(|entry| {
+            matches!(
+                entry.state,
+                ProducerState::DisconnectedRetired | ProducerState::TerminalLocallyRetired
+            )
+        }) {
             return Err(ProtocolError::StaleScope);
         }
         for (other, entry) in entries.iter() {
@@ -658,8 +777,10 @@ impl OperationRegistry {
             if entry.state == ProducerState::DisconnectedRetired {
                 continue;
             }
-            if entry.state == ProducerState::IntegrityLost
-                || entry.journal.snapshot().integrity_lost
+            if matches!(
+                entry.state,
+                ProducerState::IntegrityLost | ProducerState::TerminalLocallyRetired
+            ) || entry.journal.snapshot().integrity_lost
             {
                 return Err(ProtocolError::ScopeUnavailable);
             }
@@ -679,6 +800,125 @@ impl OperationRegistry {
 mod tests {
     use super::super::client_debt::OwnerDebtLedger;
     use super::*;
+    /// Tests the commit guard, NOT production proof minting or a renderer close.
+    /// The independent framed test remains the only positive lifecycle witness.
+    #[tokio::test]
+    async fn terminal_commit_rechecks_journal_keys_and_target_poison() {
+        use super::super::client_browser::TerminalReadOnlyRetirement;
+        use super::super::client_session::{CancelSignal, OperationLease};
+        use super::super::client_targets::ClientTargets;
+        for change in ["none", "journal-poison", "extra-key", "target-poison"] {
+            let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: Instant::now() + Duration::from_secs(5),
+                cancellation,
+            };
+            let ledger = OwnerDebtLedger::unpublished(&operation, "scope".into(), false).unwrap();
+            ledger.bind_context("context").unwrap();
+            ledger.bind_session("context", "page", "session").unwrap();
+            ledger.publish_initialization(|| Ok(())).unwrap();
+            let targets = ClientTargets::new_managed("context".into(), "scope".into());
+            targets.bind_eval_owner(&ledger).unwrap();
+            targets
+                .attached("context", "page".into(), "session".into(), "page".into())
+                .unwrap();
+            targets.configured("page").unwrap();
+            targets
+                .resume_permit("page")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            targets.acknowledge_enrollment().unwrap();
+            let registry = OperationRegistry::default();
+            let (_, primary) = eval_operation(&ledger, 2);
+            let (_, extra) = eval_operation(&ledger, 3);
+            for journal in [&primary, &extra] {
+                registry.register(journal.clone()).unwrap();
+                registry.running(journal.key());
+                registry.retire(journal.key()).unwrap();
+            }
+            ledger.observe_remote_eof();
+            for journal in [&primary, &extra] {
+                assert!(registry.finish_remote_eof(journal.key()));
+                registry.fix_result(journal.key());
+            }
+            // Save a valid same-owner entry before preparation, then inject it
+            // afterward to isolate exact-set rejection from state rejection.
+            let extra_entry = registry
+                .entries
+                .lock()
+                .unwrap()
+                .remove(&extra.key())
+                .unwrap();
+            targets.seal_remote_connection(&ledger);
+            let bindings = vec![("session".into(), "page".into(), false)];
+            targets.check_terminal_read_only(&bindings).unwrap();
+            let keys = registry.check_terminal_read_only(&ledger).unwrap();
+            assert_eq!(keys, vec![primary.key()]);
+            let prepared = TerminalReadOnlyRetirement::for_commit_guard_test(
+                ledger.clone(),
+                keys,
+                targets.clone(),
+                bindings,
+            );
+            match change {
+                "journal-poison" => {
+                    primary.record_cleanup_disposition(CleanupDisposition::IntegrityLost)
+                }
+                "extra-key" => {
+                    registry
+                        .entries
+                        .lock()
+                        .unwrap()
+                        .insert(extra.key(), extra_entry);
+                }
+                "target-poison" => targets.seal(),
+                _ => {}
+            }
+            // The expected physical-close contamination alone must not explain
+            // a negative result: the unchanged guard control below succeeds.
+            ledger.connection_lost();
+            let before = ledger.snapshot();
+            let result = registry.commit_terminal_read_only(prepared);
+            assert_eq!(result.is_ok(), change == "none", "{change}");
+            if change != "none" {
+                assert_eq!(result, Err(ProtocolError::CleanupFailed));
+            }
+            let entries = registry.entries.lock().unwrap();
+            assert_eq!(entries.len(), if change == "extra-key" { 2 } else { 1 });
+            for entry in entries.values() {
+                assert_eq!(
+                    entry.state,
+                    if change == "none" {
+                        ProducerState::TerminalLocallyRetired
+                    } else {
+                        ProducerState::IntegrityLost
+                    }
+                );
+                assert_eq!(
+                    entry.integrity_reason,
+                    Some(RetentionIntegrityReason::RemoteConnectionLost)
+                );
+            }
+            drop(entries);
+            assert_eq!(
+                ledger.snapshot(),
+                before,
+                "commit does not settle remote debt"
+            );
+            assert_eq!(primary.local_integrity_intact(), change != "journal-poison");
+            assert!(registry.application_ready().is_err());
+            assert!(registry.recovery_candidate(primary.key()).is_none());
+            assert!(matches!(
+                registry.status(primary.key()),
+                OperationRetentionStatus::IntegrityLost(_)
+            ));
+        }
+    }
     fn journal(seq: u64) -> OperationJournalHandle {
         OwnerDebtLedger::new(1, "scope".into())
             .operation(
