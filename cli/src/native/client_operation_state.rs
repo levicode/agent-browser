@@ -821,7 +821,9 @@ mod tests {
             ledger.bind_session("context", "page", "session").unwrap();
             ledger.publish_initialization(|| Ok(())).unwrap();
             let targets = ClientTargets::new_managed("context".into(), "scope".into());
-            targets.bind_eval_owner(&ledger).unwrap();
+            targets
+                .bind_eval_owner(&ledger, operation.generation)
+                .unwrap();
             targets
                 .attached("context", "page".into(), "session".into(), "page".into())
                 .unwrap();

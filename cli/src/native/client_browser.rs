@@ -5,7 +5,9 @@ use tokio::sync::Notify;
 
 use super::cdp::client::CdpClient;
 use super::client_protocol::ProtocolError;
-use super::client_settlement_trace::{self as cleanup_trace, CleanupComponent as CleanupPart};
+use super::client_settlement_trace::{
+    self as cleanup_trace, CleanupComponent as CleanupPart, TerminalCleanupStage,
+};
 
 #[derive(Default)]
 struct GateState {
@@ -1514,25 +1516,55 @@ impl OwnedBrowser {
                 || self.disconnected_routes.is_some()
                 || self.reconnect_proof.is_some()
             {
+                cleanup_trace::terminal_cleanup_checkpoint(
+                    TerminalCleanupStage::OwnerPreconditions,
+                    false,
+                );
                 return Err(ProtocolError::CleanupFailed);
             }
+            cleanup_trace::terminal_cleanup_checkpoint(
+                TerminalCleanupStage::OwnerPreconditions,
+                true,
+            );
             self.targets.protected_read_residual.replacement_safe()?;
             self.page_state
                 .check_no_active_local_input(&self.identity_scope)?;
             self.cleanup_replacement_actions().await?;
             let runtime = self.runtime.as_ref().ok_or(ProtocolError::CleanupFailed)?;
             self.ui.seal();
-            runtime
+            let released = runtime
                 .release_terminal_connection(&self.manager.client, false)
-                .await?;
+                .await;
+            cleanup_trace::terminal_cleanup_checkpoint(
+                TerminalCleanupStage::RuntimeRelease,
+                released.is_ok(),
+            );
+            released?;
             self.targets.protected_read_residual.replacement_safe()?;
-            self.persistent_probe.cleanup(&self.manager.client).await?;
+            let probe = self.persistent_probe.cleanup(&self.manager.client).await;
+            cleanup_trace::terminal_cleanup_checkpoint(
+                TerminalCleanupStage::PersistentProbe,
+                probe.is_ok(),
+            );
+            probe?;
             // Last remote-only check before explicit physical close contaminates
             // transport EOF. This is not an ACK, and nothing is deleted.
-            let (ledger, bindings) = runtime
+            if let Some(ledger) = self.manager.client.debt_ledger() {
+                let commands_present = ledger.snapshot().outstanding_commands > 0;
+                cleanup_trace::terminal_cleanup_checkpoint(
+                    TerminalCleanupStage::LedgerCommandsPresent,
+                    commands_present,
+                );
+            }
+            let enrollment = runtime
                 .enrollment
                 .check_terminal_read_only(operations)
-                .await?;
+                .await;
+            cleanup_trace::terminal_cleanup_checkpoint(
+                TerminalCleanupStage::EnrollmentProof,
+                enrollment.is_ok(),
+            );
+            let (ledger, bindings) = enrollment?;
             Ok(TerminalReadOnlyRetirement {
                 ledger,
                 operations: operations.to_vec(),
@@ -1543,10 +1575,12 @@ impl OwnedBrowser {
         .await;
         match prepared {
             Ok(proof) => {
-                self.manager
-                    .close()
-                    .await
-                    .map_err(|_| ProtocolError::CleanupFailed)?;
+                let closed = self.manager.close().await;
+                cleanup_trace::terminal_cleanup_checkpoint(
+                    TerminalCleanupStage::PhysicalClose,
+                    closed.is_ok(),
+                );
+                closed.map_err(|_| ProtocolError::CleanupFailed)?;
                 Ok(proof)
             }
             Err(_) => {
@@ -4038,7 +4072,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 .as_ref()
                 .and_then(|owner| owner.manager.client.debt_ledger())
             {
-                Some(ledger) => self.tasks.prepare_terminal_read_only(&ledger).await.ok(),
+                Some(ledger) => {
+                    let prepared = self.tasks.prepare_terminal_read_only(&ledger).await;
+                    cleanup_trace::terminal_cleanup_checkpoint(
+                        TerminalCleanupStage::TaskProof,
+                        prepared.is_ok(),
+                    );
+                    prepared.ok()
+                }
                 None => None,
             }
         } else {
@@ -4055,7 +4096,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     Err(error) => Err(error),
                 }
             }
-            (Some(owner), None) => owner.close().await,
+            (Some(owner), None) => {
+                let closed = owner.close().await;
+                cleanup_trace::terminal_cleanup_checkpoint(
+                    TerminalCleanupStage::OrdinaryClose,
+                    closed.is_ok(),
+                );
+                closed
+            }
             (None, _) => Ok(()),
         };
         if cleaned.is_ok() && terminal.is_none() {
@@ -4096,11 +4144,18 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 .startup_uncertain
                 .load(std::sync::atomic::Ordering::SeqCst)
         {
+            cleanup_trace::terminal_cleanup_checkpoint(TerminalCleanupStage::ShutdownJoins, false);
             return Err(ProtocolError::CleanupFailed);
         }
+        cleanup_trace::terminal_cleanup_checkpoint(TerminalCleanupStage::ShutdownJoins, true);
         cleaned?;
         if let Some(proof) = terminal {
-            self.tasks.commit_terminal_read_only(proof)?;
+            let committed = self.tasks.commit_terminal_read_only(proof);
+            cleanup_trace::terminal_cleanup_checkpoint(
+                TerminalCleanupStage::FinalCommit,
+                committed.is_ok(),
+            );
+            committed?;
             *self.owner.lock().await = None;
         }
         Ok(())

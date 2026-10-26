@@ -29,6 +29,7 @@ pub(crate) enum SettlementPhase {
     ScreenshotFirstFailure,
     FrameInventoryRejection,
     ReadonlyPrepareFailure,
+    TerminalCleanupCheckpoint,
     ServiceWorkerAdmission,
     ExecuteStarted,
     ExecuteReturned,
@@ -164,6 +165,10 @@ pub(crate) enum MessageKind {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_cleanup_stage: Option<TerminalCleanupStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_cleanup_ok: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment_ordinal: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1030,6 +1035,39 @@ pub(crate) struct ReadonlyPrepareFailure {
     pub cleanup: ReadonlyCleanup,
     pub error: ProtocolError,
 }
+/// Closed metadata only. Observation cannot grant cleanup/recovery authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalCleanupStage {
+    TaskProof,
+    OwnerPreconditions,
+    RuntimeRelease,
+    PersistentProbe,
+    EnrollmentProof,
+    LedgerCommandsPresent,
+    PhysicalClose,
+    OrdinaryClose,
+    ShutdownJoins,
+    FinalCommit,
+}
+pub(crate) fn terminal_cleanup_checkpoint(stage: TerminalCleanupStage, ok: bool) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        terminal_cleanup_checkpoint_into(capture, stage, ok);
+    }
+}
+fn terminal_cleanup_checkpoint_into(capture: &Capture, stage: TerminalCleanupStage, ok: bool) {
+    record_capture(
+        capture,
+        0,
+        Phase::TerminalCleanupCheckpoint,
+        Facts {
+            terminal_cleanup_stage: Some(stage),
+            terminal_cleanup_ok: Some(ok),
+            ..Facts::default()
+        },
+    );
+}
+
 pub(crate) fn readonly_prepare_failure(
     generation: u64,
     sequence: u64,
@@ -1829,6 +1867,56 @@ impl Drop for FrameTrace {
 #[cfg(all(test, feature = "acceptance-faults"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_cleanup_checkpoints_have_closed_payloads() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        terminal_cleanup_checkpoint_into(
+            &capture,
+            TerminalCleanupStage::LedgerCommandsPresent,
+            false,
+        );
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::FinalCommit, true);
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                assert!(line.len() < MAX_RECORD_BYTES);
+                serde_json::from_str(line).unwrap()
+            })
+            .collect();
+        let checkpoints: Vec<_> = records
+            .iter()
+            .filter(|value| value["phase"] == "TerminalCleanupCheckpoint")
+            .collect();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(
+            checkpoints[0]["terminalCleanupStage"],
+            "ledger-commands-present"
+        );
+        assert_eq!(checkpoints[0]["terminalCleanupOk"], false);
+        assert_eq!(checkpoints[1]["terminalCleanupStage"], "final-commit");
+        assert_eq!(checkpoints[1]["terminalCleanupOk"], true);
+        for value in checkpoints {
+            assert_eq!(value["operationSeq"], 0);
+            assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "schemaVersion"
+                    | "source"
+                    | "pid"
+                    | "record"
+                    | "operationSeq"
+                    | "phase"
+                    | "droppedBefore"
+                    | "emittedBefore"
+                    | "suppressedBefore"
+                    | "overflow"
+                    | "terminalCleanupStage"
+                    | "terminalCleanupOk"
+            )));
+        }
+    }
 
     #[test]
     fn service_worker_admission_is_closed_process_local_and_bounded() {

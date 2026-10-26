@@ -1033,6 +1033,7 @@ mod locator_eof_tests;
 // not claim to reproduce a later successful trace or a browser reconnect.
 #[tokio::test]
 async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
+    crate::native::client_settlement_trace::initialize_cleanup();
     use crate::native::client_browser::reconnect_tests::{peer, PeerMode};
     use crate::native::client_protocol::{DISCONNECTED_RECOVERY, EXACT_OWNER_CONTINUATION};
 
@@ -1042,6 +1043,7 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
         "contaminated",
         "target-poison",
         "expired-final",
+        "rejected-context-final",
     ] {
         let mut original = peer(PeerMode::HoldFixedRead).await;
         let broker = Arc::new(ClientSession::new());
@@ -1209,12 +1211,69 @@ async fn fixed_read_remote_eof_gets_bounded_recovery_without_replaying_input() {
             browser.tasks.expire_recovery_window_for_test(key);
             assert!(browser.tasks.recovery_candidate(key).is_none());
         }
+        if cause == "rejected-context-final" {
+            // A failed, read-only candidate verification consumes recovery, but
+            // must not turn a passive old-owner EOF into unproved input cleanup.
+            // This does not change the Input EOF negative cases above.
+            let candidate = peer(PeerMode::WrongContext).await;
+            let identity = &opened["recoveryIdentity"];
+            framed.sequence += 1;
+            framed
+                .write(
+                    json!({"type":"request", "id":"fixed-read-rejected-candidate",
+                    "generation":1, "operationSeq":framed.sequence, "timeoutMs":5000,
+                    "command":"scope.reconnect", "args":{
+                        "identityScope":scope, "endpoint":candidate.endpoint,
+                        "expectedBrowserIdentity":identity["browser"],
+                        "expectedContextIdentity":identity["context"],
+                        "expectedPageIdentity":identity["page"]}}),
+                )
+                .await
+                .unwrap();
+            let sequence = framed.sequence;
+            let rejected = eof_recovery_result(
+                &mut framed,
+                "fixed-read-rejected-candidate",
+                sequence,
+                &mut callbacks_retired,
+            )
+            .await;
+            assert_eq!(rejected["ok"], false);
+            assert_eq!(rejected["error"]["code"], "stale-scope");
+            assert_eq!(rejected["effects"], "not-dispatched");
+            assert_eq!(rejected["scopeState"], "quarantined");
+            assert!(!broker.recovery_available());
+            assert!(broker
+                .admit_disconnected_reconnect(1, framed.sequence + 1, 1000, &scope)
+                .is_err());
+            tokio::time::timeout(Duration::from_secs(5), candidate.task)
+                .await
+                .expect("rejected passive-read candidate did not close")
+                .unwrap();
+            let candidate_commands = candidate.commands.lock().unwrap();
+            assert!(!candidate_commands.is_empty());
+            assert!(
+                candidate_commands.iter().all(|request| matches!(
+                    request["method"].as_str(),
+                    Some(
+                        "Browser.getVersion"
+                            | "Target.getBrowserContexts"
+                            | "Target.getTargets"
+                            | "Target.getTargetInfo"
+                    )
+                )),
+                "rejected candidate must remain read-only: {candidate_commands:?}"
+            );
+            assert_eq!(original.commands.lock().unwrap()[command_start..].len(), 1);
+            assert!(ledger.check_admission(AdmissionClass::Input).is_err());
+        }
         let outstanding = ledger.snapshot().outstanding_commands;
         assert!(outstanding > 0);
         let cleanup = tokio::time::timeout(Duration::from_secs(7), framed.finish())
             .await
             .expect("fixed read EOF final cleanup stalled");
-        let terminal_success = matches!(cause, "remote" | "expired-final");
+        let terminal_success =
+            matches!(cause, "remote" | "expired-final" | "rejected-context-final");
         assert_eq!(cleanup.is_ok(), terminal_success, "{cause}: {cleanup:?}");
         assert_eq!(ledger.snapshot().outstanding_commands, outstanding);
         assert!(ledger.snapshot().integrity_lost);

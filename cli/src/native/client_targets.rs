@@ -2196,7 +2196,9 @@ mod tests {
             let ledger = OwnerDebtLedger::unpublished(&operation, "scope".into(), false).unwrap();
             ledger.bind_context("context").unwrap();
             let targets = ClientTargets::new_managed("context".into(), "scope".into());
-            targets.bind_eval_owner(&ledger).unwrap();
+            targets
+                .bind_eval_owner(&ledger, operation.generation)
+                .unwrap();
             ledger.observe_remote_eof();
             if poison_before {
                 targets.seal();
