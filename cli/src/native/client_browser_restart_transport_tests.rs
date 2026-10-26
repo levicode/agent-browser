@@ -147,6 +147,86 @@ async fn peer_with_input_replies(
     ack_before_attach: bool,
     old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     hold_old_input: bool,
+    cleanup_ack: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    input_replies: Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
+    hold_point: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    peer_with_media_replies(
+        ack_before_attach,
+        old_input,
+        hold_old_input,
+        cleanup_ack,
+        title_seen,
+        input_replies,
+        hold_point,
+        None,
+    )
+    .await
+}
+
+async fn peer_with_media_replies(
+    ack_before_attach: bool,
+    old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    hold_old_input: bool,
+    cleanup_ack: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    input_replies: Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
+    hold_point: bool,
+    media_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    peer_with_media_and_startup_replies(
+        ack_before_attach,
+        old_input,
+        hold_old_input,
+        cleanup_ack,
+        title_seen,
+        input_replies,
+        hold_point,
+        media_seen,
+        None,
+    )
+    .await
+}
+async fn peer_with_startup_acquisition(
+    ack_before_attach: bool,
+    old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    hold_old_input: bool,
+    cleanup_ack: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    input_replies: Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
+    hold_point: bool,
+    startup_ack: Option<(
+        tokio::sync::oneshot::Sender<Value>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    peer_with_media_and_startup_replies(
+        ack_before_attach,
+        old_input,
+        hold_old_input,
+        cleanup_ack,
+        title_seen,
+        input_replies,
+        hold_point,
+        None,
+        startup_ack,
+    )
+    .await
+}
+async fn peer_with_media_and_startup_replies(
+    ack_before_attach: bool,
+    old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    hold_old_input: bool,
     mut cleanup_ack: Option<(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
@@ -154,6 +234,11 @@ async fn peer_with_input_replies(
     title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     mut input_replies: Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
     hold_point: bool,
+    media_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
+    mut startup_ack: Option<(
+        tokio::sync::oneshot::Sender<Value>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -172,6 +257,12 @@ async fn peer_with_input_replies(
                 tokio::select! {
                     incoming = socket.next() => incoming,
                     Some(reply) = replies.recv() => {
+                        // Only the media fixture emits a genuinely attached new
+                        // page through this lane; retain its native inventory.
+                        if media_seen.is_some() && reply["method"] == "Target.attachedToTarget" {
+                            let info = reply["params"]["targetInfo"].clone();
+                            pages.insert(info["targetId"].as_str().unwrap().to_owned(), info);
+                        }
                         if socket.send(Message::Text(reply.to_string())).await.is_err() { return; }
                         continue;
                     }
@@ -206,6 +297,12 @@ async fn peer_with_input_replies(
                     let id = format!("page-{created}");
                     let sid = format!("session-{created}");
                     pages.insert(id.clone(), target(&id, "page"));
+                    if created == 1 {
+                        if let Some((reached, release)) = startup_ack.take() {
+                            reached.send(request.clone()).unwrap();
+                            release.await.unwrap();
+                        }
+                    }
                     if created > 1 {
                         if ack_before_attach {
                             after.push(attach(&id, &sid, "page"));
@@ -298,6 +395,15 @@ async fn peer_with_input_replies(
                         json!({"result":{"type":"object","value":{"value":17}}})
                     }
                 }
+                "Page.navigate"
+                    if media_seen.is_some()
+                        && request["params"]["url"] == "https://synthetic.test/held-non-media" =>
+                {
+                    media_seen.as_ref().unwrap().send(request.clone()).unwrap();
+                    // Cross-command negative: neither this real mutation's ACK
+                    // nor its lifecycle events exist until the test releases it.
+                    continue;
+                }
                 "Page.navigate" => {
                     assert_eq!(session, format!("session-{created}"));
                     let frame = format!("frame-{session}");
@@ -327,6 +433,12 @@ async fn peer_with_input_replies(
                     if old_input.is_some() =>
                 {
                     json!({})
+                }
+                "Emulation.setEmulatedMedia" if media_seen.is_some() => {
+                    media_seen.as_ref().unwrap().send(request.clone()).unwrap();
+                    // The test supplies this exact ACK through the independent
+                    // reply lane; do not block the websocket command reader.
+                    continue;
                 }
                 // Explicitly bounded ACK-only protocol, never fake a value-returning command.
                 "Page.enable"
@@ -766,3 +878,210 @@ async fn cancelled_pre_swap_replacement_preserves_old_terminal_cleanup_proof() {
 
 #[path = "client_browser_response_entry_tests.rs"]
 mod response_entry_tests;
+
+#[path = "client_browser_media_merge_tests.rs"]
+mod media_merge_tests;
+
+/// Exercise the real retained startup supervisor, owner acquisition and cleanup.
+/// Strict joining means the old startup must finish before the next attempt is
+/// admitted; this test does not invent overlapping dirty owners to force a race.
+#[tokio::test]
+async fn retired_startup_joins_late_target_before_next_attempt_identity() {
+    use crate::native::client_session::{CancelSignal, OperationLease};
+    use crate::native::client_transport::{ClientEventSink, ClientExecutor};
+    let bound = Duration::from_secs(10);
+    let (reached, acquisition) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let (old_endpoint, old_log, old_peer) = peer_with_startup_acquisition(
+        true,
+        None,
+        false,
+        None,
+        None,
+        None,
+        false,
+        Some((reached, released)),
+    )
+    .await;
+    let old_broker = Arc::new(ClientSession::new());
+    let old = Arc::new(ClientBrowser::new(old_broker.clone()));
+    let (sink, _old_events) = ClientEventSink::test_channel(old_broker);
+    old.set_event_sink(sink).unwrap();
+    let (_old_cancel, old_cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+    let opening = {
+        let old = old.clone();
+        tokio::spawn(async move {
+            old.open(
+                OpenRequest::Connect {
+                    endpoint: old_endpoint,
+                    persistent: false,
+                    options: Default::default(),
+                },
+                OperationLease {
+                    is_callback: false,
+                    generation: 1,
+                    sequence: 1,
+                    deadline: std::time::Instant::now() + bound,
+                    cancellation: old_cancellation,
+                },
+            )
+            .await
+        })
+    };
+    let request = tokio::time::timeout(bound, acquisition)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(request["method"], "Target.createTarget");
+    assert_eq!(request["params"]["browserContextId"], "synthetic-context");
+    assert!(old.owner.lock().await.is_none());
+    let closing = {
+        let old = old.clone();
+        tokio::spawn(async move { old.shutdown().await })
+    };
+    tokio::time::timeout(bound, async {
+        while !old.gate.state.lock().unwrap().closed {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        !closing.is_finished(),
+        "shutdown skipped the retained acquisition join"
+    );
+    assert!(
+        !opening.is_finished(),
+        "startup completed without its actual target ACK"
+    );
+    assert!(old.gate.enter(true).is_err());
+    assert!(old.owner.lock().await.is_none());
+    release.send(()).unwrap();
+    assert!(
+        tokio::time::timeout(bound, opening)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err(),
+        "a retired startup published its late target"
+    );
+    tokio::time::timeout(bound, closing)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(bound, old_peer)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(old.owner.lock().await.is_none());
+    assert!(!old.startup_uncertain.load(Ordering::SeqCst));
+    assert!(old.startup_task.lock().await.is_none());
+    let old_requests = old_log.lock().unwrap().clone();
+    assert_eq!(
+        old_requests
+            .iter()
+            .filter(|r| r["method"] == "Target.createBrowserContext")
+            .count(),
+        1
+    );
+    assert_eq!(
+        old_requests
+            .iter()
+            .filter(|r| r["method"] == "Target.createTarget")
+            .count(),
+        1
+    );
+    assert!(old_requests
+        .iter()
+        .any(|r| r["method"] == "Target.disposeBrowserContext"
+            && r["params"]["browserContextId"] == "synthetic-context"));
+    assert!(old_requests
+        .iter()
+        .any(|r| r["method"] == "Target.setAutoAttach" && r["params"]["autoAttach"] == false));
+
+    // Only after actual old-owner cleanup/join, start a new real ClientBrowser.
+    // The peer intentionally reuses textual context/page IDs: native authority
+    // must come from the new owner, not those strings or a fabricated response.
+    let (next_endpoint, next_log, next_peer) = peer(true).await;
+    let next_broker = Arc::new(ClientSession::new());
+    let next = Arc::new(ClientBrowser::new(next_broker.clone()));
+    let (sink, _next_events) = ClientEventSink::test_channel(next_broker);
+    next.set_event_sink(sink).unwrap();
+    let (_next_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+    let operation = |sequence| OperationLease {
+        is_callback: false,
+        generation: 1,
+        sequence,
+        deadline: std::time::Instant::now() + bound,
+        cancellation: cancellation.clone(),
+    };
+    let opened = tokio::time::timeout(
+        bound,
+        next.open(
+            OpenRequest::Connect {
+                endpoint: next_endpoint.clone(),
+                persistent: false,
+                options: Default::default(),
+            },
+            operation(1),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let identity = opened["identityScope"].as_str().unwrap().to_owned();
+    assert!(!identity.is_empty());
+    let recovery = opened["recoveryIdentity"].clone();
+    {
+        let owner = next.owner.lock().await;
+        let owner = owner.as_ref().unwrap();
+        assert_eq!(owner.identity_scope, identity);
+        assert_eq!(owner.recovery_identity(), recovery);
+        assert_eq!(owner.context_id, "synthetic-context");
+        assert_eq!(owner.manager.active_target_id().unwrap(), "page-1");
+        assert_eq!(owner.manager.active_session_id().unwrap(), "session-1");
+    }
+    // A late use of the retired startup owner cannot begin another acquisition
+    // or publish into either registry, even with the next attempt's endpoint.
+    assert!(tokio::time::timeout(
+        bound,
+        old.open(
+            OpenRequest::Connect {
+                endpoint: next_endpoint,
+                persistent: false,
+                options: Default::default(),
+            },
+            operation(2)
+        )
+    )
+    .await
+    .unwrap()
+    .is_err());
+    assert!(old.owner.lock().await.is_none());
+    {
+        let owner = next.owner.lock().await;
+        let owner = owner.as_ref().unwrap();
+        assert_eq!(owner.identity_scope, identity);
+        assert_eq!(owner.recovery_identity(), recovery);
+        assert_eq!(owner.manager.active_target_id().unwrap(), "page-1");
+        assert_eq!(owner.manager.active_session_id().unwrap(), "session-1");
+    }
+    assert_eq!(
+        next_log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "Target.createTarget")
+            .count(),
+        1
+    );
+    tokio::time::timeout(bound, next.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(bound, next_peer)
+        .await
+        .unwrap()
+        .unwrap();
+}

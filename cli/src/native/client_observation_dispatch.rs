@@ -510,6 +510,7 @@ struct CaptureAdmission {
 #[derive(Default)]
 struct CaptureAuthority {
     retirement_fence: u64,
+    page_blob_tenure: Arc<()>,
     latest: Vec<Arc<CaptureAdmission>>,
 }
 // Optional traces observe the existing admission, but never own or replace it.
@@ -600,6 +601,26 @@ impl ObservationDispatch {
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             .retire_interaction_references();
         publication.observed_revision = 0;
+        Ok(())
+    }
+
+    /// The caller retains exclusive UI/input/lifecycle authority. Old capture
+    /// producers have drained; revoke both reference publication and exact old
+    /// pixel handles without touching saved videos or context/network bodies.
+    pub(crate) async fn retire_page_publication(
+        &self,
+        blobs: &BlobStore,
+        scope: &BlobScope,
+    ) -> Result<(), ProtocolError> {
+        self.retire_interaction().await?;
+        let mut authority = self
+            .captures
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        blobs
+            .revoke_page_captures(scope, &authority.page_blob_tenure)
+            .map_err(blob_error)?;
+        authority.page_blob_tenure = Arc::new(());
         Ok(())
     }
 
@@ -925,6 +946,9 @@ impl ObservationDispatch {
         kind: PublicationKind,
         revision: u64,
         staged: RefMap,
+        blobs: &BlobStore,
+        blob_scope: &BlobScope,
+        handles: &[String],
     ) -> Result<(), ProtocolError> {
         let authority = self
             .captures
@@ -970,6 +994,9 @@ impl ObservationDispatch {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         check(page, operation)?;
+        blobs
+            .bind_page_captures(blob_scope, handles, &authority.page_blob_tenure)
+            .map_err(blob_error)?;
         publication.commit_refs(kind, revision, &mut refs, staged);
         Ok(())
     }
@@ -1619,7 +1646,7 @@ impl ObservationDispatch {
                 journal.check().map_err(protected_error)?;
             }
             self.commit_staged(&capture_context.page, &operation, capture.as_ref(), trace.as_ref(), retirement_fence,
-                &mut publication, publication_kind, revision, staged)?;
+                &mut publication, publication_kind, revision, staged, &context.blobs, &context.scope, &handles)?;
             Ok::<(), ProtocolError>(())
         })();
         if let Err(error) = publish {
@@ -3391,6 +3418,29 @@ mod tests {
     }
     #[cfg(feature = "acceptance-faults")]
     #[tokio::test]
+    async fn fallback_capture_error_ack_restores_exact_owner_and_preserves_prior_refs() {
+        semantic_timeout_fallback_admission_with_refs(
+            false,
+            true,
+            FallbackTestMode::CaptureRefused,
+            false,
+            true,
+        )
+        .await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn fallback_withheld_raw_ack_retains_masks_and_rejects_late_revival() {
+        semantic_timeout_fallback_admission(
+            false,
+            true,
+            FallbackTestMode::CaptureCancelWithheldAck,
+            false,
+        )
+        .await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
     async fn fallback_dirty_restore_dominates_coverage_policy_and_cancellation() {
         for mode in [
             FallbackTestMode::CoverageUnproven,
@@ -3518,7 +3568,7 @@ mod tests {
                     | FallbackTestMode::CaptureRefused
             );
         let (capture_reached, capture_receipt) = oneshot::channel();
-        let (restore_reached, restore_receipt) = oneshot::channel();
+        let (restore_reached, mut restore_receipt) = oneshot::channel();
         let (restore_release, restore_release_receipt) = oneshot::channel();
         let (capture_release, capture_release_receipt) = oneshot::channel();
         let (capture_sent, capture_sent_receipt) = oneshot::channel();
@@ -3728,7 +3778,7 @@ mod tests {
         // The boundary under test is Dispatch.start, not enrollment startup.
         targets.acknowledge_enrollment().unwrap();
         let gate = Arc::new(ExecutionGate::default());
-        let page = BrowserExecutionLease {
+        let mut page = BrowserExecutionLease {
             client: client.clone(),
             page_session_id: "session".into(),
             target_id: "target".into(),
@@ -3746,6 +3796,40 @@ mod tests {
             deadline: Instant::now() + Duration::from_millis(2000),
             cancellation,
         };
+        // Error-ACK custody is reader-owned command evidence, not a String
+        // returned by the screenshot wrapper. This branch supplies the same
+        // exact owner/operation accounting as production dispatch.
+        let capture_journal = if mode == FallbackTestMode::CaptureRefused {
+            use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+            let ledger = OwnerDebtLedger::new(operation.generation, page.identity_scope.clone());
+            ledger.bind_context(&page.targets.context_id).unwrap();
+            ledger
+                .bind_session(
+                    &page.targets.context_id,
+                    &page.target_id,
+                    &page.page_session_id,
+                )
+                .unwrap();
+            client.install_debt_ledger(ledger.clone()).unwrap();
+            page.client = client.owner_view(ledger.clone()).unwrap();
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: operation.generation,
+                        operation_seq: operation.sequence,
+                    },
+                    page.target_id.clone(),
+                    page.page_session_id.clone(),
+                )
+                .unwrap();
+            journal.bind_operation(&operation).unwrap();
+            Some(journal)
+        } else {
+            None
+        };
+        // All subsequent fixture control/validation uses the same owner-bound
+        // view; installing a ledger never upgrades a legacy raw client handle.
+        let client = page.client.clone();
         let refs = Arc::new(Mutex::new(RefMap::new()));
         let dispatch = ObservationDispatch::new(refs.clone());
         dispatch
@@ -3808,35 +3892,41 @@ mod tests {
             Some((guard, receipt)) => (Some(guard), Some(receipt)),
             None => (None, None),
         };
-        let mut task = dispatch.clone().start(
-            DispatchContext {
-                faults: faults.clone(),
-                attachment: page.targets.owned_target(&page.target_id).unwrap(),
-                page,
-                ui: Arc::new(UiGate::default()),
-                blobs: blobs.clone(),
-                scope: scope.clone(),
-                policy: ReadPolicy {
-                    frame_policy: Default::default(),
+        let start_dispatch = || {
+            dispatch.clone().start(
+                DispatchContext {
+                    faults: faults.clone(),
+                    attachment: page.targets.owned_target(&page.target_id).unwrap(),
+                    page,
+                    ui: Arc::new(UiGate::default()),
+                    blobs: blobs.clone(),
+                    scope: scope.clone(),
+                    policy: ReadPolicy {
+                        frame_policy: Default::default(),
+                        test_id_attribute: "data-testid".into(),
+                        secure_field_selector: "input[type=password]".into(),
+                    },
+                },
+                DispatchRequest::Observe(ObserveRequest {
+                    options: ObserveFlags {
+                        pixels,
+                        pixel_fallback: fallback,
+                        comparable: false,
+                    },
                     test_id_attribute: "data-testid".into(),
-                    secure_field_selector: "input[type=password]".into(),
-                },
-            },
-            DispatchRequest::Observe(ObserveRequest {
-                options: ObserveFlags {
-                    pixels,
-                    pixel_fallback: fallback,
-                    comparable: false,
-                },
-                test_id_attribute: "data-testid".into(),
-                secure_field_selector: if mode == FallbackTestMode::PolicyGate {
-                    "input".into()
-                } else {
-                    "input[type=password]".into()
-                },
-            }),
-            operation,
-        );
+                    secure_field_selector: if mode == FallbackTestMode::PolicyGate {
+                        "input".into()
+                    } else {
+                        "input[type=password]".into()
+                    },
+                }),
+                operation,
+            )
+        };
+        let mut task = match capture_journal.as_ref() {
+            Some(journal) => journal.scope(async { start_dispatch() }).await,
+            None => start_dispatch(),
+        };
         if mode == FallbackTestMode::SemanticCancel {
             tokio::time::timeout(Duration::from_secs(5), async {
                 while faults.status("scope", &token).unwrap().state != State::Reached {
@@ -3882,8 +3972,11 @@ mod tests {
                     .unwrap();
             }
         }
-        if hold_restore {
-            tokio::time::timeout(Duration::from_secs(5), restore_receipt)
+        // A still-unacknowledged raw screenshot keeps source-mask custody.
+        // No animation restore can safely begin after its drain budget expires.
+        // The settled/error-ACK branches must still hit the original restore gate.
+        if hold_restore && !capture_unsettled {
+            tokio::time::timeout(Duration::from_secs(5), &mut restore_receipt)
                 .await
                 .unwrap()
                 .unwrap();
@@ -3915,6 +4008,14 @@ mod tests {
         let output = task.result.await;
         let cleanup = task.join.await;
         assert!(matches!(&cleanup, Ok(Ok(()))));
+        if let Some(journal) = &capture_journal {
+            assert_eq!(journal.ledger().snapshot().outstanding_commands, 0);
+            assert_eq!(journal.snapshot().object_debt, 0);
+            assert!(
+                journal.clean_protected_read(),
+                "error ACK still requires real protection restoration"
+            );
+        }
         if let Ok(Err(error)) = &output {
             assert_eq!(error.identity_scope, "scope");
             assert_eq!(error.cleanup_integrity_lost, integrity_lost_expected);
@@ -3949,6 +4050,19 @@ mod tests {
         if capture_unsettled {
             assert_eq!(output, Err(ProtocolError::CleanupFailed));
             assert!(targets.inventory().is_err());
+            assert!(targets.protected_read_residual.replacement_safe().is_err());
+            assert!(
+                matches!(
+                    restore_receipt.try_recv(),
+                    Err(oneshot::error::TryRecvError::Empty)
+                ),
+                "withheld raw ACK must not authorize animation restoration"
+            );
+            assert_eq!(
+                *source_commands.lock().unwrap(),
+                ["holder", "verify"],
+                "withheld raw ACK must retain installed source-mask custody"
+            );
             let count_before_late = commands.lock().unwrap().len();
             // Keep the old withheld-ACK schedule as a distinct negative case:
             // only a terminal CleanupFailed/Unknown result permits this ACK.
@@ -3964,6 +4078,14 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(commands.lock().unwrap().len(), count_before_late + 1);
+            assert!(
+                targets.protected_read_residual.replacement_safe().is_err(),
+                "late ACK must not retroactively retire abandoned raw custody"
+            );
+            assert!(matches!(
+                restore_receipt.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
         }
         assert_eq!(blobs.read(&scope, &retained.handle, 0, 1).unwrap(), b"r");
         if mode == FallbackTestMode::Occupied {
@@ -4032,11 +4154,19 @@ mod tests {
             let semantic_failure = semantic_policy || mode == FallbackTestMode::SemanticCancel;
             assert_eq!(
                 animation_commands.load(Ordering::SeqCst),
-                if semantic_failure && !pixels { 0 } else { 4 }
+                if semantic_failure && !pixels {
+                    0
+                } else if capture_unsettled {
+                    3
+                } else {
+                    4
+                }
             );
             assert!(lifecycle.lock().unwrap().is_empty());
             let expected_source = if pre_capture {
                 vec![]
+            } else if capture_unsettled {
+                vec!["holder", "verify"]
             } else if matches!(
                 mode,
                 FallbackTestMode::CaptureRefused
@@ -4220,6 +4350,53 @@ mod tests {
         server.abort();
         let _ = server.await;
     }
+    #[tokio::test]
+    async fn page_retirement_fences_publication_and_revokes_old_pixel_handles() {
+        let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+        let blobs = BlobStore::new(Default::default()).unwrap();
+        let scope = BlobScope {
+            generation: 1,
+            identity_scope: "page-scope".into(),
+        };
+        blobs.activate_scope(scope.clone()).unwrap();
+        let old = blobs.insert_sealed(scope.clone(), b"old pixels").unwrap();
+        let video = blobs
+            .insert_sealed(scope.clone(), b"saved segment")
+            .unwrap();
+        let before = dispatch.publication_fence().unwrap();
+        let tenure = dispatch.captures.lock().unwrap().page_blob_tenure.clone();
+        blobs
+            .bind_page_captures(&scope, &[old.handle.clone()], &tenure)
+            .unwrap();
+        dispatch
+            .retire_page_publication(&blobs, &scope)
+            .await
+            .unwrap();
+        assert_eq!(
+            dispatch.check_publication_fence(before),
+            Err(ProtocolError::StaleReference)
+        );
+        assert_eq!(
+            blobs.read(&scope, &old.handle, 0, 32),
+            Err(BlobError::Missing)
+        );
+        assert_eq!(
+            blobs.read(&scope, &video.handle, 0, 32).unwrap(),
+            b"saved segment"
+        );
+        let fresh = blobs.insert_sealed(scope.clone(), b"fresh pixels").unwrap();
+        let current = dispatch.captures.lock().unwrap().page_blob_tenure.clone();
+        assert!(!Arc::ptr_eq(&tenure, &current));
+        blobs
+            .bind_page_captures(&scope, &[fresh.handle.clone()], &current)
+            .unwrap();
+        blobs.revoke_page_captures(&scope, &tenure).unwrap();
+        assert_eq!(
+            blobs.read(&scope, &fresh.handle, 0, 32).unwrap(),
+            b"fresh pixels"
+        );
+    }
+
     #[tokio::test]
     async fn action_snapshot_uses_committed_revision_not_failed_staging_counter() {
         let refs = Arc::new(Mutex::new(RefMap::new()));

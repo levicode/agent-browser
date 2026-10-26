@@ -336,17 +336,11 @@ pub(crate) async fn capture_under_journal(
     .map_err(|reason| CapturePhase::SourceProtection.failure(reason))?;
     let bytes = async {
         // Reuse canonical native screenshot capture, without annotations or IO.
-        let options = super::screenshot::ScreenshotOptions::default();
-        let refs = super::element::RefMap::new();
-        let iframe_sessions = HashMap::new();
         check(context, operation)?;
         journal.raw_capture_started().map_err(protected_reason)?;
-        let capture = super::screenshot::take_screenshot(
-            &context.page.client,
-            &context.page.page_session_id,
-            &refs,
-            &options,
-            &iframe_sessions,
+        let receipt = super::screenshot::ProtectedScreenshotReceipt::default();
+        let capture = super::screenshot::take_protected_screenshot(
+            &context.page.client, &context.page.page_session_id, &receipt,
         );
         tokio::pin!(capture);
         let mut cancellation = operation.cancellation.clone();
@@ -366,15 +360,24 @@ pub(crate) async fn capture_under_journal(
                 retained_capture_test::entered(context, operation, reason);
             }
             let settled = tokio::time::timeout_at(cleanup_deadline.into(), &mut capture).await;
-            if !matches!(settled, Ok(Ok(_))) {
+            if !matches!(&settled, Ok(Ok(_))) && !(matches!(&settled, Ok(Err(_))) && receipt.acknowledged()) {
                 return Err(CaptureReason::CleanupFailed);
             }
             journal.raw_capture_completed().map_err(protected_reason)?;
             return Err(reason);
         }
-        let raw = raw
-            .ok_or(CaptureReason::BrowserFailure)?
-            .map_err(|_| CaptureReason::BrowserFailure)?;
+        let raw = match raw.ok_or(CaptureReason::BrowserFailure)? {
+            Ok(raw) => raw,
+            Err(_) => {
+                // A correlated error ACK has no pixels but ends raw custody.
+                // EOF, malformed/wrong-session replies and abandoned waiters
+                // cannot supply this reader-owned reservation receipt.
+                if receipt.acknowledged() {
+                    journal.raw_capture_completed().map_err(protected_reason)?;
+                }
+                return Err(CaptureReason::BrowserFailure);
+            }
+        };
         journal.raw_capture_completed().map_err(protected_reason)?;
         check(context, operation)?;
         if raw.base64.len() > MAX_PNG_BYTES * 4 / 3 + 4 {
@@ -1223,7 +1226,7 @@ mod tests {
             .await
             .unwrap();
         let gate = Arc::new(ExecutionGate::default());
-        let page = owner.lease(gate.enter(false).unwrap()).unwrap();
+        let mut page = owner.lease(gate.enter(false).unwrap()).unwrap();
         let client = page.client.clone();
         let session = page.page_session_id.clone();
         let target = page.target_id.clone();
@@ -1272,14 +1275,16 @@ mod tests {
             if before["visibility"]!="hidden"||peer_before["visibility"]!="visible"||peer_before["focus"]!=true{return Err("Fixture did not establish exact background and foreground pages".into());}
             let frames=super::super::client_observation::enumerate_frames(&client,&session,&HashMap::new(),&operation).await.map_err(|e|format!("Frame inventory: {e:?}"))?;
             page.targets.acknowledge_enrollment().map_err(|e|format!("Primitive fixture inventory: {e:?}"))?;
+            let operation_journal = owned_capture_journal(&mut owner, &mut page, &operation);
+            let client = page.client.clone();
             let context=CaptureContext{page,frames,inventory_complete:true};
-            let mut journal=ProtectedReadJournal::begin(&context.page,&operation).map_err(|e|format!("Journal: {e:?}"))?;
+            let mut journal=operation_journal.scope(async { ProtectedReadJournal::begin(&context.page,&operation) }).await.map_err(|e|format!("Journal: {e:?}"))?;
             let masked:Result<(),String>=async {
-                journal.stabilize_animations().await.map_err(|e|format!("Stabilization: {e:?}"))?;
-                install_source_masks(&context,&CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},&operation,&mut journal).await.map_err(|e|format!("Install: {e:?}"))?;
+                operation_journal.scope(journal.stabilize_animations()).await.map_err(|e|format!("Stabilization: {e:?}"))?;
+                operation_journal.scope(install_source_masks(&context,&CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},&operation,&mut journal)).await.map_err(|e|format!("Install: {e:?}"))?;
                 let changed=client.send_command("Runtime.evaluate",Some(json!({"expression":r#"(()=>{const f=window.__sourceMaskFixture;f.input.style.left='100px';const n=document.createElement('input');n.type='password';n.value='new-synthetic-only';n.style.cssText='position:absolute;left:10px;top:10px;width:80px;height:25px;background:red';f.root.append(n);f.newInput=n;return getComputedStyle(f.input).opacity==='0'&&getComputedStyle(n).opacity==='0'})()"#,"returnByValue":true})),Some(&session)).await?;
                 if changed["result"]["value"]!=true{return Err("Moved or new matching closed-root field was not masked at source".into());}
-                journal.verify_source_masks().await.map_err(|e|format!("Source proof: {e:?}"))?;
+                operation_journal.scope(journal.verify_source_masks()).await.map_err(|e|format!("Source proof: {e:?}"))?;
                 // Raw source screenshot must already suppress the red controls;
                 // the production raster pass adds the required black regions.
                 let shot=client.send_command("Page.captureScreenshot",Some(json!({"format":"png","fromSurface":true})),Some(&session)).await?;
@@ -1289,7 +1294,7 @@ mod tests {
                 for x in [20,110]{if image.get_pixel(x,20).0!=[255,255,255,255]{return Err("Source mask did not suppress control pixels".into());}}
                 Ok(())
             }.await;
-            let restore=journal.restore().await;
+            let restore=operation_journal.scope(journal.restore()).await;
             drop(journal);
             restore.map_err(|e|format!("Source cleanup: {e:?}"))?;masked?;
             let after=client.send_command("Runtime.evaluate",Some(read.clone()),Some(&session)).await?["result"]["value"].clone();
@@ -1322,6 +1327,57 @@ mod tests {
     async fn chromium_shared_geometry_masks_transformed_frame_passwords() {
         static_mask_fixture(true).await;
     }
+    /// Primitive Chromium fixtures launch a real managed owner without the
+    /// ClientBrowser dispatcher. Install its exact accounting before capture;
+    /// never downgrade managed targets or manufacture restoration evidence.
+    pub(super) fn owned_capture_journal(
+        owner: &mut super::super::client_browser::OwnedBrowser,
+        page: &mut super::super::client_browser::BrowserExecutionLease,
+        operation: &OperationLease,
+    ) -> super::super::client_debt::OperationJournalHandle {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        assert!(page.client.debt_ledger().is_none());
+        assert!(
+            matches!(
+                ProtectedReadJournal::begin(page, operation),
+                Err(failure) if failure.reason == ProtectedReadReason::CleanupFailed
+                    && !failure.cleanup_integrity_lost
+            ),
+            "a managed owner without accounting must still refuse capture"
+        );
+        let ledger = OwnerDebtLedger::new(operation.generation, page.identity_scope.clone());
+        ledger.bind_context(&page.targets.context_id).unwrap();
+        ledger
+            .bind_session(
+                &page.targets.context_id,
+                &page.target_id,
+                &page.page_session_id,
+            )
+            .unwrap();
+        assert!(std::sync::Arc::ptr_eq(&owner.manager.client, &page.client));
+        page.client.install_debt_ledger(ledger.clone()).unwrap();
+        let view = page.client.owner_view(ledger.clone()).unwrap();
+        owner.manager.client = view.clone();
+        page.client = view;
+        assert!(std::sync::Arc::ptr_eq(&owner.manager.client, &page.client));
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: operation.generation,
+                    operation_seq: operation.sequence,
+                },
+                page.target_id.clone(),
+                page.page_session_id.clone(),
+            )
+            .unwrap();
+        journal.bind_operation(operation).unwrap();
+        assert!(ledger.matches_owner(operation.generation, &page.identity_scope));
+        assert_eq!(
+            ledger.bound_context().as_deref(),
+            Some(page.targets.context_id.as_str())
+        );
+        journal
+    }
     async fn static_mask_fixture(framed: bool) {
         use super::super::client_browser::{ExecutionGate, OwnedBrowser};
         use std::sync::Arc;
@@ -1331,7 +1387,7 @@ mod tests {
                 .await
                 .unwrap();
             let gate = Arc::new(ExecutionGate::default());
-            let page = owner.lease(gate.enter(false).unwrap()).unwrap();
+            let mut page = owner.lease(gate.enter(false).unwrap()).unwrap();
             let client = page.client.clone();
             let session = page.page_session_id.clone();
             let (sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
@@ -1359,7 +1415,9 @@ mod tests {
                 // Production callers cannot use this acknowledgement as a substitute
                 // for the native owner's recursive enrollment barrier.
                 page.targets.acknowledge_enrollment().map_err(|_|"Static inventory acknowledgement failed")?;
-                let captured=start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await.map_err(|_|"Capture task failed")?.map_err(|_|"Static protected capture failed")?;
+                let journal = owned_capture_journal(&mut owner, &mut page, &operation);
+                let client = page.client.clone();
+                let captured=journal.scope(async { start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await }).await.map_err(|_|"Capture task failed")?.map_err(|error|format!("Static protected capture failed: {error:?}"))?;
                 let rate=client.send_command("Animation.getPlaybackRate",Some(json!({})),Some(&session)).await?;
                 if rate["playbackRate"].as_f64()!=Some(0.75){return Err("Animation playback was not restored".into());}
                 let controls=client.send_command("Runtime.evaluate",Some(json!({"expression":"window.__maskFixture.input.value==='synthetic-mask-only' && window.__maskFixture.input.getAttribute('style')===window.__maskFixture.style","returnByValue":true})),Some(&session)).await?;

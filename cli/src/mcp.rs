@@ -4182,6 +4182,10 @@ fn tool_text(parsed: Option<&Value>, stdout: &str, stderr: &str) -> String {
             });
             // Most hosts put text content in the model context; preserving
             // metadata only in structuredContent is not sufficient.
+            if let Some(warning) = primary.get("warning").and_then(Value::as_str) {
+                text.push_str("\n\nwarning: ");
+                text.push_str(warning);
+            }
             for context in contexts {
                 text.push_str("\n\n");
                 text.push_str(&context);
@@ -4313,6 +4317,18 @@ mod tests {
             tool["name"].as_str(),
             Some("session_connect" | "browser_session_connect")
         )));
+    }
+
+    #[test]
+    fn tool_text_keeps_response_warnings() {
+        let value = json!({ "success": true, "data": { "url": "about:blank" },
+                            "warning": "page_wedged: the active tab was replaced" });
+        let text = tool_text(Some(&value), "", "");
+        assert!(text.contains("about:blank"), "{text}");
+        assert!(
+            text.contains("page_wedged: the active tab was replaced"),
+            "{text}"
+        );
     }
 
     #[test]

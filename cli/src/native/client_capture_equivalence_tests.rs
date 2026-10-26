@@ -34,25 +34,31 @@ pub(super) async fn after_raw_capture(
         .and_then(|m| m.lock().unwrap().get(&operation.sequence).cloned());
     let Some(hook) = hook else { return Ok(()) };
     hook.reached.store(true, Ordering::SeqCst);
-    match hook.mode {
+    // This hook is an external host actor, not an application script executed
+    // under the capture journal. Tokio tasks do not inherit that task-local.
+    let mode = hook.mode;
+    let client = context.page.client.clone();
+    let session = context.page.page_session_id.clone();
+    let deadline = operation.deadline;
+    tokio::spawn(async move {
+    match mode {
         Mode::Navigate => {
-            let client = &context.page.client;
-            let session = &context.page.page_session_id;
+
             tokio::time::timeout(Duration::from_secs(3), async {
                 let before = client
-                    .send_command_no_params("Page.getFrameTree", Some(session))
+                    .send_command_no_params("Page.getFrameTree", Some(&session))
                     .await?;
                 let old = before["frameTree"]["frame"]["loaderId"].clone();
                 client
                     .send_command(
                         "Page.navigate",
                         Some(json!({"url":"data:text/html,<button>Replacement</button>"})),
-                        Some(session),
+                        Some(&session),
                     )
                     .await?;
                 loop {
                     let after = client
-                        .send_command_no_params("Page.getFrameTree", Some(session))
+                        .send_command_no_params("Page.getFrameTree", Some(&session))
                         .await?;
                     if after["frameTree"]["frame"]["loaderId"] != old {
                         return Ok::<(), String>(());
@@ -65,13 +71,14 @@ pub(super) async fn after_raw_capture(
             .map_err(|_| CaptureReason::BrowserFailure)?;
         }
         Mode::Detach => {
-            context.page.client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelector('iframe').remove();true","returnByValue":true})),Some(&context.page.page_session_id)).await.map_err(|_|CaptureReason::BrowserFailure)?;
+            client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelector('iframe').remove();true","returnByValue":true})),Some(&session)).await.map_err(|_|CaptureReason::BrowserFailure)?;
         }
         Mode::Deadline => {
-            tokio::time::sleep_until((operation.deadline + Duration::from_millis(10)).into()).await
+            tokio::time::sleep_until((deadline + Duration::from_millis(10)).into()).await
         }
     }
     Ok(())
+    }).await.map_err(|_| CaptureReason::BrowserFailure)?
 }
 #[tokio::test]
 #[ignore = "hosted Chromium: protected screenshot retirement/no output versus deadline"]
@@ -81,7 +88,7 @@ async fn chromium_capture_retirement_races_publish_no_pixels_and_keep_typed_reas
             .await
             .unwrap();
         let gate = Arc::new(ExecutionGate::default());
-        let page = owner.lease(gate.enter(false).unwrap()).unwrap();
+        let mut page = owner.lease(gate.enter(false).unwrap()).unwrap();
         let sequence = SEQUENCE.fetch_add(1, Ordering::SeqCst);
         let hook = Arc::new(Hook {
             mode,
@@ -111,7 +118,8 @@ async fn chromium_capture_retirement_races_publish_no_pixels_and_keep_typed_reas
             let frames=super::super::client_observation::enumerate_frames(&page.client,&page.page_session_id,&HashMap::new(),&operation).await.map_err(|_|"Frame enumeration failed")?;assert_eq!(frames.len(),2);
             page.targets.acknowledge_enrollment().map_err(|_|"Fixture enrollment failed")?;
             let identity=page.identity_scope.clone();
-            let outcome=start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await.map_err(|_|"Retained capture task failed")?;
+            let journal = super::tests::owned_capture_journal(&mut owner, &mut page, &operation);
+            let outcome=journal.scope(async { start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"input[type=\"password\" i]".into()},operation).await }).await.map_err(|_|"Retained capture task failed")?;
             let failure=match outcome{Err(error)=>error,Ok(_)=>panic!("Retired capture returned pixels")};
             assert!(hook.reached.load(Ordering::SeqCst),"Race must occur after actual screenshot, not preflight");
             assert_eq!(failure.reason,if matches!(mode,Mode::Deadline){CaptureReason::Deadline}else{CaptureReason::StaleScope});assert_eq!(failure.identity_scope,identity);Ok::<(),String>(())

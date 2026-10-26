@@ -3358,6 +3358,42 @@ impl ClientActions {
             .await
             .map_err(|error| d.failure(error))
     }
+    /// Test scheduling only: retain the REAL recorder/encoder result, then hold
+    /// its join publication. No capture, artifact, scope or cleanup proof is seeded.
+    #[cfg(test)]
+    pub(super) async fn hold_recording_completion_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+        PathBuf,
+    ) {
+        let mut ledger = self.recording.lock().await;
+        let current = ledger
+            .current
+            .as_mut()
+            .expect("real recording must be started");
+        let task = current
+            .state
+            .capture_task
+            .take()
+            .expect("real capture task missing");
+        let path = current.directory.path.clone();
+        let (arrived, arrival) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        current.state.capture_task = Some(tokio::spawn(async move {
+            let result = task
+                .await
+                .map_err(|error| format!("real recorder join: {error}"))?;
+            let _ = arrived.send(());
+            released
+                .await
+                .map_err(|_| "test completion gate dropped".to_owned())?;
+            result
+        }));
+        (arrival, release, path)
+    }
+
     /// Final attempt teardown. Disarm before awaiting so queued page-open
     /// hooks cannot create another segment; retire publication authority first.
     pub async fn abandon_recording(&self) -> Result<(), ProtocolError> {
@@ -3963,6 +3999,14 @@ impl FixtureOperations {
         self.broker.validate_reconnect_operation(&lease)?;
         let outcome = executor.execute(command.into(), args, lease).await;
         self.broker.settle(1, self.sequence, outcome.effects)?;
+        // Match the transport completion lane, not only the writer ACK below.
+        // A finished evaluation retains its owned eval window until this exact
+        // immutable result is fixed; otherwise the next input/evaluation is
+        // correctly rejected even though the fixture already settled its broker.
+        executor.fix_operation_result(client_debt::OperationKey {
+            generation: 1,
+            operation_seq: self.sequence,
+        });
         Ok(outcome)
     }
     /// Also reproduce the real writer's post-settlement result ACK. This opens
@@ -10790,7 +10834,10 @@ mod tests {
                     || broker.health().map_err(|error| format!("health: {error:?}"))?
                         != (generation, ScopeState::Usable)
                 {
-                    return Err(format!("{key}: prefix did not settle as cancelled and reusable"));
+                    return Err(format!(
+                        "{key}: prefix did not settle as cancelled and reusable: reached={}, result={:?}, effects={:?}, health={:?}",
+                        reached.load(Ordering::SeqCst), outcome.result.as_ref().map(|_| ()), outcome.effects, broker.health()
+                    ));
                 }
                 // Both reads are fresh, admitted, post-settlement operations on
                 // the same live ClientBrowser/scope. No reset, reattach, replay,

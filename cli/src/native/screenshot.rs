@@ -94,6 +94,39 @@ impl Serialize for ScreenshotAnnotation {
     }
 }
 
+/// Exact reservation status is written only by the CDP reader. It proves
+/// remote settlement, not successful pixels or reusable scope authority.
+#[derive(Default)]
+pub(crate) struct ProtectedScreenshotReceipt(
+    std::sync::Mutex<Option<super::client_debt::CommandStatusHandle>>,
+);
+impl ProtectedScreenshotReceipt {
+    pub(crate) fn acknowledged(&self) -> bool {
+        self.0.lock().is_ok_and(|status| {
+            status.as_ref().is_some_and(|status| {
+                status.snapshot() == super::client_debt::CommandStatus::Acknowledged
+            })
+        })
+    }
+}
+
+/// Protected capture uses exactly the ordinary default screenshot envelope.
+pub(crate) async fn take_protected_screenshot(
+    client: &CdpClient,
+    session_id: &str,
+    receipt: &ProtectedScreenshotReceipt,
+) -> Result<ScreenshotResult, String> {
+    take_screenshot_inner(
+        client,
+        session_id,
+        &RefMap::new(),
+        &ScreenshotOptions::default(),
+        &HashMap::new(),
+        Some(receipt),
+    )
+    .await
+}
+
 /// Captures screenshot bytes and optional annotations without writing a file.
 pub async fn take_screenshot(
     client: &CdpClient,
@@ -101,6 +134,17 @@ pub async fn take_screenshot(
     ref_map: &RefMap,
     options: &ScreenshotOptions,
     iframe_sessions: &HashMap<String, String>,
+) -> Result<ScreenshotResult, String> {
+    take_screenshot_inner(client, session_id, ref_map, options, iframe_sessions, None).await
+}
+
+async fn take_screenshot_inner(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    options: &ScreenshotOptions,
+    iframe_sessions: &HashMap<String, String>,
+    receipt: Option<&ProtectedScreenshotReceipt>,
 ) -> Result<ScreenshotResult, String> {
     let target_rect = if options.annotate {
         match options.selector.as_deref() {
@@ -128,8 +172,15 @@ pub async fn take_screenshot(
         false
     };
 
-    let base64 =
-        capture_screenshot_base64(client, session_id, ref_map, options, iframe_sessions).await;
+    let base64 = capture_screenshot_base64(
+        client,
+        session_id,
+        ref_map,
+        options,
+        iframe_sessions,
+        receipt,
+    )
+    .await;
 
     if overlay_injected {
         let _ = remove_annotation_overlay(client, session_id).await;
@@ -159,6 +210,7 @@ async fn capture_screenshot_base64(
     ref_map: &RefMap,
     options: &ScreenshotOptions,
     iframe_sessions: &HashMap<String, String>,
+    receipt: Option<&ProtectedScreenshotReceipt>,
 ) -> Result<String, String> {
     let mut params = CaptureScreenshotParams {
         format: Some(options.format.clone()),
@@ -169,7 +221,7 @@ async fn capture_screenshot_base64(
         },
         clip: None,
         from_surface: Some(true),
-        capture_beyond_viewport: if options.full_page { Some(true) } else { None },
+        capture_beyond_viewport: capture_beyond_viewport(options),
     };
 
     if options.full_page {
@@ -177,13 +229,7 @@ async fn capture_screenshot_base64(
             .send_command_no_params("Page.getLayoutMetrics", Some(session_id))
             .await?;
 
-        let content_size = metrics
-            .get("contentSize")
-            .or_else(|| metrics.get("cssContentSize"));
-        if let Some(size) = content_size {
-            let width = size.get("width").and_then(|v| v.as_f64()).unwrap_or(1280.0);
-            let height = size.get("height").and_then(|v| v.as_f64()).unwrap_or(720.0);
-
+        if let Some((width, height)) = full_page_clip_size(&metrics) {
             params.clip = Some(Viewport {
                 x: 0.0,
                 y: 0.0,
@@ -194,7 +240,8 @@ async fn capture_screenshot_base64(
         }
     } else if let Some(ref selector) = options.selector {
         if let Some(rect) =
-            get_rect_for_selector(client, session_id, ref_map, selector, iframe_sessions).await?
+            get_document_rect_for_selector(client, session_id, ref_map, selector, iframe_sessions)
+                .await?
         {
             params.clip = Some(Viewport {
                 x: rect.x,
@@ -206,11 +253,64 @@ async fn capture_screenshot_base64(
         }
     }
 
-    let result: CaptureScreenshotResult = client
-        .send_command_typed("Page.captureScreenshot", &params, Some(session_id))
-        .await?;
+    let result: CaptureScreenshotResult = if let Some(receipt) = receipt {
+        // This closed path captures pixels only: no annotations, DOM writes or
+        // file IO. Its correlated error ACK settles read debt, never input debt.
+        super::client_debt::command_scope(
+            super::client_debt::CommandCategory::ApplicationRead,
+            false,
+            async {
+                let params = serde_json::to_value(&params).map_err(|error| error.to_string())?;
+                let reservation = client.reserve_tracked_command(
+                    "Page.captureScreenshot",
+                    Some(&params),
+                    Some(session_id),
+                )?;
+                {
+                    let mut status = receipt
+                        .0
+                        .lock()
+                        .map_err(|_| "Screenshot receipt unavailable".to_string())?;
+                    if status.is_some() {
+                        return Err("Screenshot receipt already bound".into());
+                    }
+                    *status = reservation.as_ref().map(|reservation| reservation.status());
+                }
+                let value = client
+                    .send_reserved_command(
+                        "Page.captureScreenshot",
+                        Some(params),
+                        Some(session_id),
+                        reservation,
+                    )
+                    .await?;
+                serde_json::from_value(value).map_err(|error| error.to_string())
+            },
+        )
+        .await?
+    } else {
+        client
+            .send_command_typed("Page.captureScreenshot", &params, Some(session_id))
+            .await?
+    };
 
     Ok(result.data)
+}
+
+fn capture_beyond_viewport(options: &ScreenshotOptions) -> Option<bool> {
+    (options.full_page || options.selector.is_some()).then_some(true)
+}
+
+/// Size of the full-page clip in CSS pixels, which is the unit
+/// `Page.captureScreenshot` expects. The deprecated `contentSize` is in
+/// physical pixels, so it is only a fallback.
+fn full_page_clip_size(metrics: &Value) -> Option<(f64, f64)> {
+    let size = metrics
+        .get("cssContentSize")
+        .or_else(|| metrics.get("contentSize"))?;
+    let width = size.get("width").and_then(|v| v.as_f64()).unwrap_or(1280.0);
+    let height = size.get("height").and_then(|v| v.as_f64()).unwrap_or(720.0);
+    Some((width, height))
 }
 
 async fn collect_annotations(
@@ -322,6 +422,75 @@ async fn get_rect_for_selector(
     )
     .await?;
     get_rect_for_object(client, &effective_session_id, &object_id).await
+}
+
+async fn get_document_rect_for_selector(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<Option<Rect>, String> {
+    let (object_id, effective_session_id) = super::element::resolve_element_object_id(
+        client,
+        session_id,
+        ref_map,
+        selector,
+        iframe_sessions,
+    )
+    .await?;
+    let Some(rect) = get_rect_for_object(client, &effective_session_id, &object_id).await? else {
+        return Ok(None);
+    };
+    let offset = get_document_offset_for_object(client, &effective_session_id, &object_id).await?;
+    Ok(Some(offset_rect(rect, offset)))
+}
+
+/// Offset that turns the element's viewport rect into top document
+/// coordinates: the position of every same-process frame it sits in, plus the
+/// top window's scroll.
+async fn get_document_offset_for_object(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+) -> Result<(f64, f64), String> {
+    let result: EvaluateResult = client
+        .send_command_typed(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: r#"function() {
+                    let x = 0;
+                    let y = 0;
+                    let win = this.ownerDocument.defaultView;
+                    while (win && win.frameElement) {
+                        const frame = win.frameElement;
+                        const rect = frame.getBoundingClientRect();
+                        x += rect.x + frame.clientLeft;
+                        y += rect.y + frame.clientTop;
+                        win = win.parent;
+                    }
+                    return { x: x + (win ? win.scrollX : 0), y: y + (win ? win.scrollY : 0) };
+                }"#
+                .to_string(),
+                object_id: Some(object_id.to_string()),
+                arguments: None,
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
+
+    let value = result.result.value.unwrap_or(Value::Null);
+    let x = value.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    let y = value.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
+    Ok((x, y))
+}
+
+fn offset_rect(mut rect: Rect, (scroll_x, scroll_y): (f64, f64)) -> Rect {
+    rect.x += scroll_x;
+    rect.y += scroll_y;
+    rect
 }
 
 async fn get_rect_for_object(
@@ -587,7 +756,152 @@ fn get_screenshot_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn protected_screenshot_receipt_requires_exact_reader_ack() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::*;
+        use futures_util::{SinkExt, StreamExt};
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio_tungstenite::tungstenite::Message;
+        for mode in [
+            "success",
+            "error-ack",
+            "wrong-id",
+            "wrong-session",
+            "malformed",
+            "eof",
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let Message::Text(text) = ws.next().await.unwrap().unwrap() else {
+                    panic!("screenshot request required")
+                };
+                let request: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(request["method"], "Page.captureScreenshot");
+                assert_eq!(request["sessionId"], "session");
+                assert_eq!(
+                    request["params"],
+                    json!({"format":"png","fromSurface":true})
+                );
+                if mode == "eof" {
+                    ws.close(None).await.unwrap();
+                    return;
+                }
+                let mut response = json!({"id":request["id"],"sessionId":"session"});
+                if mode == "success" {
+                    response["result"] = json!({"data":"synthetic-encoded-pixels"});
+                } else {
+                    response["error"] = json!({"code":-32000,"message":"synthetic refusal"});
+                }
+                if mode == "wrong-id" {
+                    response["id"] = json!(request["id"].as_u64().unwrap() + 1);
+                }
+                if mode == "wrong-session" {
+                    response["sessionId"] = json!("other-session");
+                }
+                if mode == "malformed" {
+                    response["error"] = json!("not an error object");
+                }
+                ws.send(Message::Text(response.to_string())).await.unwrap();
+                if matches!(mode, "wrong-id" | "wrong-session" | "malformed") {
+                    let _ = ws.close(None).await;
+                } else {
+                    while let Some(Ok(message)) = ws.next().await {
+                        if matches!(message, Message::Close(_)) {
+                            break;
+                        }
+                    }
+                }
+            });
+            let raw = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
+            let ledger = OwnerDebtLedger::new(1, "scope".into());
+            ledger.bind_context("context").unwrap();
+            ledger.bind_session("context", "target", "session").unwrap();
+            raw.install_debt_ledger(ledger.clone()).unwrap();
+            let client = raw.owner_view(ledger.clone()).unwrap();
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "session".into(),
+                )
+                .unwrap();
+            let (_cancel, cancellation) =
+                tokio::sync::watch::channel(super::super::client_session::CancelSignal::None);
+            let operation = super::super::client_session::OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now() + Duration::from_secs(2),
+                cancellation,
+            };
+            journal.bind_operation(&operation).unwrap();
+            let receipt = ProtectedScreenshotReceipt::default();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                journal.scope(take_protected_screenshot(&client, "session", &receipt)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.is_ok(), mode == "success", "{mode}");
+            assert_eq!(
+                receipt.acknowledged(),
+                matches!(mode, "success" | "error-ack"),
+                "{mode}"
+            );
+            if mode == "error-ack" {
+                assert_eq!(ledger.snapshot().outstanding_commands, 0);
+                assert!(!ledger.snapshot().integrity_lost);
+            }
+            client.close().await;
+            tokio::time::timeout(Duration::from_secs(2), peer)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn selector_screenshots_capture_beyond_the_initial_viewport() {
+        let options = ScreenshotOptions {
+            selector: Some("#below-fold".to_string()),
+            ..ScreenshotOptions::default()
+        };
+
+        assert_eq!(capture_beyond_viewport(&options), Some(true));
+    }
+
+    #[test]
+    fn viewport_screenshots_keep_the_default_capture_extent() {
+        assert_eq!(capture_beyond_viewport(&ScreenshotOptions::default()), None);
+    }
+
+    #[test]
+    fn selector_clip_uses_document_coordinates_after_scroll() {
+        let rect = Rect {
+            x: 10.0,
+            y: 197.0,
+            width: 200.0,
+            height: 200.0,
+        };
+
+        let document_rect = offset_rect(rect, (0.0, 503.0));
+
+        assert_eq!(document_rect.x, 10.0);
+        assert_eq!(document_rect.y, 700.0);
+        assert_eq!(document_rect.width, 200.0);
+        assert_eq!(document_rect.height, 200.0);
+    }
 
     #[test]
     fn filters_annotations_to_target_overlap() {
@@ -675,5 +989,26 @@ mod tests {
         let projected = project_annotations(&annotations, None, Some((10.0, 1000.0)));
         assert_eq!(projected[0].box_.x, 15);
         assert_eq!(projected[0].box_.y, 1012);
+    }
+
+    #[test]
+    fn full_page_clip_uses_css_pixels_on_high_dpi_displays() {
+        // Page.getLayoutMetrics for a 1280x2500 CSS px page at device scale factor 2.
+        let metrics = serde_json::json!({
+            "contentSize": { "x": 0, "y": 0, "width": 2560, "height": 5000 },
+            "cssContentSize": { "x": 0, "y": 0, "width": 1280, "height": 2500 },
+        });
+
+        assert_eq!(full_page_clip_size(&metrics), Some((1280.0, 2500.0)));
+    }
+
+    #[test]
+    fn full_page_clip_falls_back_to_content_size() {
+        let metrics = serde_json::json!({
+            "contentSize": { "x": 0, "y": 0, "width": 1280, "height": 2500 },
+        });
+
+        assert_eq!(full_page_clip_size(&metrics), Some((1280.0, 2500.0)));
+        assert_eq!(full_page_clip_size(&serde_json::json!({})), None);
     }
 }

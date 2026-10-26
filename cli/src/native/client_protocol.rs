@@ -323,6 +323,8 @@ impl Serialize for ProtocolError {
 pub const EXACT_OWNER_CONTINUATION: &str = "operation.continue-exact-owner/1";
 /// Independent opt-in: a quarantined result may permit one explicit reconnect.
 pub const DISCONNECTED_RECOVERY: &str = "scope.reconnect-quarantined/1";
+/// Opt-in create-only persistent page reopen with exact identity refresh events.
+pub const PERSISTENT_PAGE_REOPEN: &str = "browser.persistent-page-reopen/1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryDescriptor {

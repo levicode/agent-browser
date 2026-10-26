@@ -1151,6 +1151,40 @@ for (const shape of ['zero-area', 'contents', 'skipped', 'auto-skipped-positive-
   document.getElementById = () => target;
   assert.equal(publicFact(publicButton([], { 'aria-labelledby': 'target' })), null, shape);
 }
+// SVGTitleElement is non-rendered native metadata even when its computed
+// style is inline/visible. The prior fixture's forced display:none hid this
+// distinction from the real Chromium producer path.
+const zeroBox = () => ({ x: 0, y: 0, width: 0, height: 0 });
+function nonRenderedSvgTitle(title = attributes(new PlainSvgTitle(), {}), svg = attributes(new EmptySvg(), {})) {
+  title.childNodes = [new Text('Close', title)]; title.getBoundingClientRect = zeroBox;
+  svg.childNodes = [title]; title.parentElement = svg;
+  attributes(svg, { 'aria-labelledby': 'non-rendered-title' });
+  document.getElementById = id => id === 'non-rendered-title' ? title : null;
+  return { title, svg, button: publicButton([svg, new Text('Icon', null)]) };
+}
+for (const bounded of [false, true]) {
+  const shape = nonRenderedSvgTitle();
+  assert.deepEqual(publicFact(shape.button, bounded), { source: 'content', name: 'CloseIcon' });
+  shape.svg.nameDisplay = 'block'; assert.equal(publicFact(shape.button, bounded).name, 'Close Icon');
+  delete shape.svg.nameDisplay;
+  for (const visibility of ['hidden', 'auto']) {
+    shape.svg.nameContentVisibility = visibility;
+    assert.equal(publicFact(shape.button, bounded), null);
+  }
+  delete shape.svg.nameContentVisibility;
+  shape.title.secure = true;
+  Object.defineProperty(shape.title, 'childNodes', { get() { throw Error('Secure SVG title content acquired'); } });
+  assert.equal(publicFact(shape.button, bounded), null);
+}
+// Same localName/zero box is not enough: retain ordinary HTML title, span and
+// wrong-parent refusals. Only native SVG element interfaces establish shape.
+for (const target of [namingElement('title'), namingElement('span')]) {
+  const shape = nonRenderedSvgTitle(target);
+  assert.equal(publicFact(shape.button), null);
+}
+const wrongParent = nonRenderedSvgTitle(attributes(new PlainSvgTitle(), {}), namingElement('div'));
+assert.equal(publicFact(wrongParent.button), null);
+console.log('PASS: non-rendered native SVG title IDREFs preserve inline/block naming without admitting arbitrary zero-box targets, skipped content or secure text');
 console.log('PASS: actual bounded public-name producer preserves inline/block alternatives, authored range priority, visible/hidden references and cycles; refuses unproven inventory, secure, shadow, generated, unsupported and oversized shapes');
 
 for (const bounded of [false, true]) {

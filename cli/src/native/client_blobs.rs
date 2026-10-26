@@ -119,6 +119,7 @@ struct Entry {
     hasher: Sha256,
     sealed: bool,
     reserved_by: Option<String>,
+    page_capture: Option<Arc<()>>,
     charge: Arc<Charge>,
 }
 struct Inner {
@@ -286,6 +287,7 @@ impl BlobStore {
                 hasher: Sha256::new(),
                 sealed: false,
                 reserved_by: None,
+                page_capture: None,
                 charge: Arc::new(Charge {
                     size,
                     budget: self.budget.clone(),
@@ -663,6 +665,7 @@ impl BlobStore {
                     hasher: Sha256::new(),
                     sealed: true,
                     reserved_by: None,
+                    page_capture: None,
                     charge: Arc::new(reservation.charge),
                 },
             );
@@ -717,6 +720,7 @@ impl BlobStore {
                 hasher: Sha256::new(),
                 sealed: true,
                 reserved_by: None,
+                page_capture: None,
                 charge: Arc::new(producer.charge),
             },
         );
@@ -837,6 +841,55 @@ impl BlobStore {
         inner
             .entries
             .retain(|_, entry| entry.reserved_by.as_deref() != Some(token));
+        Ok(())
+    }
+
+    /// Native capture publication binds pixels to one unforgeable page tenure.
+    /// Uploads, network bodies and saved recording segments are not enrolled.
+    pub(crate) fn bind_page_captures(
+        &self,
+        scope: &BlobScope,
+        handles: &[String],
+        tenure: &Arc<()>,
+    ) -> Result<(), BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        for handle in handles {
+            let entry = inner.entries.get(handle).ok_or(BlobError::Missing)?;
+            Self::check_scope(entry, scope)?;
+            if !entry.sealed || entry.reserved_by.is_some() || entry.page_capture.is_some() {
+                return Err(BlobError::Reserved);
+            }
+        }
+        for handle in handles {
+            inner
+                .entries
+                .get_mut(handle)
+                .ok_or(BlobError::Missing)?
+                .page_capture = Some(tenure.clone());
+        }
+        Ok(())
+    }
+    /// Called after exclusive page work drains, before replacement publication.
+    /// Exact scope+Arc identity cannot revoke a newer page or attempt artifacts.
+    pub(crate) fn revoke_page_captures(
+        &self,
+        scope: &BlobScope,
+        tenure: &Arc<()>,
+    ) -> Result<(), BlobError> {
+        let mut inner = self.inner.lock().map_err(|_| BlobError::Closed)?;
+        if inner.closed {
+            return Err(BlobError::Closed);
+        }
+        inner.entries.retain(|_, entry| {
+            &entry.scope != scope
+                || !entry
+                    .page_capture
+                    .as_ref()
+                    .is_some_and(|captured| Arc::ptr_eq(captured, tenure))
+        });
         Ok(())
     }
 
@@ -1393,6 +1446,47 @@ mod tests {
         store.activate_scope(scope()).unwrap();
         store
     }
+    #[test]
+    fn page_capture_retirement_revokes_only_exact_pixels_not_saved_artifacts() {
+        let store = BlobStore::new(Default::default()).unwrap();
+        let scope = scope();
+        store.activate_scope(scope.clone()).unwrap();
+        let old = store.insert_sealed(scope.clone(), b"old pixels").unwrap();
+        let video = store.insert_sealed(scope.clone(), b"saved video").unwrap();
+        let fresh = store.insert_sealed(scope.clone(), b"fresh pixels").unwrap();
+        let old_tenure = Arc::new(());
+        let new_tenure = Arc::new(());
+        store
+            .bind_page_captures(&scope, &[old.handle.clone()], &old_tenure)
+            .unwrap();
+        store
+            .bind_page_captures(&scope, &[fresh.handle.clone()], &new_tenure)
+            .unwrap();
+        store.revoke_page_captures(&scope, &Arc::new(())).unwrap();
+        assert_eq!(
+            store.read(&scope, &old.handle, 0, 32).unwrap(),
+            b"old pixels"
+        );
+        store.revoke_page_captures(&scope, &old_tenure).unwrap();
+        assert_eq!(
+            store.read(&scope, &old.handle, 0, 32),
+            Err(BlobError::Missing)
+        );
+        assert!(matches!(
+            store.borrow_sealed(&scope, &old.handle),
+            Err(BlobError::Missing)
+        ));
+        assert_eq!(
+            store.read(&scope, &video.handle, 0, 32).unwrap(),
+            b"saved video"
+        );
+        assert_eq!(
+            store.read(&scope, &fresh.handle, 0, 32).unwrap(),
+            b"fresh pixels"
+        );
+        store.check_budget_integrity().unwrap();
+    }
+
     #[test]
     fn retired_scope_cannot_repopulate_after_late_completion() {
         let store = store();

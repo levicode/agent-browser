@@ -671,3 +671,6 @@ mod trace_cleanup_tests;
 #[cfg(feature = "acceptance-faults")]
 #[path = "client_browser_observe_trace_timeout_tests.rs"]
 mod observe_trace_timeout_tests;
+
+#[path = "client_browser_reopen_tests.rs"]
+mod persistent_page_reopen_tests;

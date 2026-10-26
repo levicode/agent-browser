@@ -94,6 +94,53 @@ impl RetainedTasks {
         }
     }
 
+    pub(crate) fn media_dispatch_ready(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Result<bool, ProtocolError> {
+        self.operations.media_dispatch_ready(key)
+    }
+
+    pub(crate) fn mark_media_dispatch(
+        &self,
+        journal: &super::client_debt::OperationJournalHandle,
+    ) -> Result<(), ProtocolError> {
+        self.operations.mark_media_dispatch(journal)
+    }
+
+    /// Called only after the media configuration mutex. The predecessor has
+    /// released that mutex before retained result classification, so waiting on
+    /// this existing notification cannot block its completion on the same gate.
+    pub(crate) async fn wait_media_dispatch(
+        &self,
+        operation: &super::client_session::OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let key = super::client_debt::OperationKey {
+            generation: operation.generation,
+            operation_seq: operation.sequence,
+        };
+        let mut cancellation = operation.cancellation.clone();
+        loop {
+            let changed = self.operations.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if *cancellation.borrow() != super::client_session::CancelSignal::None {
+                return Err(ProtocolError::Cancelled);
+            }
+            if std::time::Instant::now() >= operation.deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+            if self.operations.media_dispatch_ready(key)? {
+                return Ok(());
+            }
+            tokio::select! { biased;
+                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                _ = &mut changed => {},
+            }
+        }
+    }
+
     /// Owner services do not enter this gate. New application work waits only
     /// for positively retained local producers, under its own original budget.
     pub(crate) async fn wait_application(
@@ -505,6 +552,83 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn media_wait_uses_retained_notifications_and_original_cancellation_deadline() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_session::{CancelSignal, OperationLease};
+        for mode in ["completed", "cancelled", "expired", "retiring"] {
+            let tasks = RetainedTasks::default();
+            let ledger = OwnerDebtLedger::new(1, "scope".into());
+            let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let mut operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 2,
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+                cancellation,
+            };
+            let first = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "session".into(),
+                )
+                .unwrap();
+            let second = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 2,
+                    },
+                    "target".into(),
+                    "session".into(),
+                )
+                .unwrap();
+            for handle in [&first, &second] {
+                tasks.operations.register(handle.clone()).unwrap();
+                tasks.operations.running(handle.key());
+            }
+            tasks.operations.mark_media_dispatch(&first).unwrap();
+            first.mark_mutation_maybe_submitted().unwrap();
+            if mode == "expired" {
+                operation.deadline = std::time::Instant::now();
+                assert_eq!(
+                    tasks.wait_media_dispatch(&operation).await,
+                    Err(ProtocolError::DeadlineExceeded)
+                );
+                continue;
+            }
+            let pending = tasks.wait_media_dispatch(&operation);
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            let expected = match mode {
+                "completed" => {
+                    assert!(!tasks.operations.finish(first.key(), false));
+                    Ok(())
+                }
+                "cancelled" => {
+                    cancel.send_replace(CancelSignal::Requested);
+                    Err(ProtocolError::Cancelled)
+                }
+                "retiring" => {
+                    tasks.operations.retire(first.key()).unwrap();
+                    Err(ProtocolError::ScopeUnavailable)
+                }
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), pending)
+                    .await
+                    .unwrap(),
+                expected
+            );
+            assert!(!second.snapshot().mutation_dispatched);
+        }
+    }
 
     fn complete() -> NativeOutcome {
         NativeOutcome {

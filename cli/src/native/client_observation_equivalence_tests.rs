@@ -1294,3 +1294,107 @@ async fn metadata_acquisition_error_drains_started_sibling_before_group_release(
     assert_eq!(result.unwrap_err(), ObservationError::BackendFailure);
     server.await.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "hosted Chromium: original read-node-names:12 SVG IDREF box and nine exact observation/query names"]
+async fn chromium_svg_title_idref_public_names_contract() {
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    // Byte-for-byte author fixture from read-node-names:12. Do not hide <title>
+    // with test CSS: the native interface/style/box distinction is the regression target.
+    let html = r#"
+      <button data-testid="svg-reference"><svg aria-labelledby="t1" width="10" height="10"><title id="t1">Close</title></svg>Icon</button>
+      <button data-testid="block-svg-reference"><svg aria-labelledby="t2" style="display:block" width="10" height="10"><title id="t2">Close</title></svg>Icon</button>
+      <button data-testid="svg-title"><svg width="10" height="10"><title>Svg title</title></svg></button>
+      <button data-testid="two-references"><span aria-labelledby="p1 p2"></span></button>
+      <span id="p1">One</span><span id="p2">Two</span>
+      <button data-testid="hidden-target"><span aria-labelledby="p3"></span></button>
+      <span id="p3" hidden>Hidden target</span>
+      <button data-testid="cycle"><span id="c1" aria-labelledby="c2">A</span><span id="c2" aria-labelledby="c1">B</span></button>
+      <button id="ancestor" data-testid="ancestor-reference"><span aria-labelledby="ancestor">A</span>B</button>
+      <button id="me" aria-labelledby="me" data-testid="self-reference">Self</button>
+      <button aria-labelledby="r1" data-testid="nested-reference">x</button>
+      <span id="r1"><span aria-labelledby="r2">Ref text</span></span><span id="r2">Nested</span>
+    "#;
+    let result = async {
+        let session = browser.active_session_id()?;
+        let (op, _tx) = operation();
+        let setup = format!("document.body.innerHTML={};true", serde_json::to_string(html).unwrap());
+        read_node_names_fixture(&browser, &setup, &op).await?;
+        let inventory = enumerate_frames(&browser.client, session, &HashMap::new(), &op)
+            .await.map_err(|error| format!("Naming frame inventory failed: {error:?}"))?;
+        let frame = inventory.iter().find(|frame| frame.parent_frame_id.is_none())
+            .ok_or("Missing naming fixture main frame")?;
+        let policy = security_inventory(&browser.client, frame, &ObservationOptions::default(), &op)
+            .await.map_err(|error| format!("Naming security inventory failed: {error:?}"))?;
+        if !policy.simple_name_inventory {
+            return Err("Owned fixture must have the actual no-author-shadow inventory proof".into());
+        }
+        let diagnostics = evaluate_on(&browser.client, session, r#"['svg-reference','block-svg-reference'].map(id=>{
+            const button=document.querySelector('[data-testid="'+id+'"]'),svg=button.querySelector('svg'),title=svg.querySelector('title');
+            const css=getComputedStyle(title),rect=title.getBoundingClientRect();
+            return {id,svgDisplay:getComputedStyle(svg).display,titleDisplay:css.display,titleVisibility:css.visibility,
+                titleContentVisibility:css.contentVisibility,titleWidth:rect.width,titleHeight:rect.height,
+                titleIsNativeSvgTitle:title instanceof SVGTitleElement,parentIsNativeSvg:title.parentElement instanceof SVGSVGElement};
+        })"#).await?;
+        println!("RETIREMENT_SVG_TITLE_FACTS {}", json!({"identity":"read-node-names:12","simpleNameInventory":policy.simple_name_inventory,"targets":diagnostics}));
+        let targets = diagnostics.as_array().ok_or("Missing SVG title diagnostics")?;
+        if targets.len()!=2 || targets.iter().any(|target|
+            target["titleIsNativeSvgTitle"]!=true || target["parentIsNativeSvg"]!=true ||
+            target["titleWidth"].as_f64()!=Some(0.0) || target["titleHeight"].as_f64()!=Some(0.0)) {
+            return Err(format!("SVG title fixture did not exercise actual non-rendered native title: {diagnostics}"));
+        }
+        let mut refs = RefMap::new();
+        // Original public capture budget is 100 nodes and at most 10 seconds,
+        // still bounded by the existing 30-second enclosing producer case.
+        let (observed, inventory) = read_node_names_capture(
+            &browser, &HashMap::new(), &mut refs, &op, 1, 100,
+        ).await?;
+        if observed.truncated { return Err("Original naming fixture must be complete".into()); }
+        let cases = [
+            ("svg-reference", "CloseIcon"),
+            ("block-svg-reference", "Close Icon"),
+            ("svg-title", "Svg title"),
+            ("two-references", "One Two"),
+            ("hidden-target", "Hidden target"),
+            ("cycle", "B"),
+            ("ancestor-reference", "AB"),
+            ("self-reference", "Self"),
+            ("nested-reference", "Ref text"),
+        ];
+        let nodes=flatten(&observed.roots);
+        println!("RETIREMENT_SVG_TITLE_OBSERVATION {}", json!({"identity":"read-node-names:12","nodes":nodes.iter().filter(|node| node.test_id.is_some()).map(|node| json!({"testId":node.test_id,"role":node.role,"name":node.name})).collect::<Vec<_>>()}));
+        // Return mismatch errors through cleanup, rather than panic before the
+        // owned browser close. Each exact role query uses the real producer.
+        for (id, name) in cases {
+            let matches: Vec<_> = nodes.iter().filter(|node| node.test_id.as_deref()==Some(id)).collect();
+            if matches.len()!=1 || matches[0].role.as_deref()!=Some("button") || matches[0].name.as_deref()!=Some(name) {
+                return Err(format!("Original {id} observation expected button {name:?}, got {matches:?}"));
+            }
+            let options: QueryOptions = serde_json::from_value(json!({"expression":{"kind":"query","query":{
+                "kind":"role","value":{"kind":"string","value":"button","exact":true},
+                "name":{"kind":"string","value":name,"exact":true}}}})).unwrap();
+            let query_op = OperationLease {
+                is_callback: op.is_callback,
+                generation: op.generation,
+                sequence: op.sequence,
+                deadline: original_observation_capture_deadline(op.deadline, Instant::now()),
+                cancellation: op.cancellation.clone(),
+            };
+            let found = query(&browser.client, &inventory, &mut refs, "equivalence", 1, &options, &query_op)
+                .await.map_err(|error| format!("Original {id} exact role query failed: {error:?}"))?;
+            if found.nodes.len()!=1 || found.nodes[0].test_id.as_deref()!=Some(id) || found.nodes[0].name.as_deref()!=Some(name) {
+                return Err(format!("Original {id} exact role/name query did not match its observed identity: {:?}", found.nodes));
+            }
+        }
+        println!("RETIREMENT_SVG_TITLE_CONTRACT {}", json!({"identity":"read-node-names:12","observedNames":cases,"exactRoleQueries":cases.len(),"truncated":false}));
+        Ok::<(), String>(())
+    }.await;
+    let cleanup = browser.close().await;
+    assert!(
+        cleanup.is_ok(),
+        "Owned SVG naming browser cleanup failed: {cleanup:?}"
+    );
+    result.unwrap();
+}

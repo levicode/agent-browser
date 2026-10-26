@@ -43,6 +43,9 @@ struct Entry {
     result_fixed: bool,
     disposition: Option<RetiredDisposition>,
     integrity_reason: Option<RetentionIntegrityReason>,
+    // Set only by the actual media dispatcher after acquiring config_gate and
+    // passing input admission, before its first possible mutation.
+    serialized_media: bool,
 }
 /// Only this exact retained producer registry can mint this native proof.
 /// The descriptor is a snapshot, never dispatch authority or completion proof.
@@ -239,6 +242,7 @@ impl OperationRegistry {
                 result_fixed: false,
                 disposition: None,
                 integrity_reason: None,
+                serialized_media: false,
             },
         );
         Ok(())
@@ -720,6 +724,81 @@ impl OperationRegistry {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         Self::entries_input_ready(&entries, key, None)
     }
+    pub(crate) fn mark_media_dispatch(
+        &self,
+        journal: &OperationJournalHandle,
+    ) -> Result<(), ProtocolError> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let entry = entries
+            .get_mut(&journal.key())
+            .ok_or(ProtocolError::OperationMissing)?;
+        let state = entry.journal.snapshot();
+        if !entry.journal.same_operation(journal)
+            || entry.state != ProducerState::Running
+            || entry.serialized_media
+            || state.integrity_lost
+            || state.mutation_dispatched
+            || state.submission_revoked
+            || state.local_producers_finished
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        entry.serialized_media = true;
+        Ok(())
+    }
+    /// Only the serialized media path may wait out a live producer's final
+    /// classification. A known retirement is not a completion notification and
+    /// must retain the ordinary fail-closed admission result.
+    pub(crate) fn media_dispatch_ready(&self, key: OperationKey) -> Result<bool, ProtocolError> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let current = entries.get(&key).ok_or(ProtocolError::OperationMissing)?;
+        let own = current.journal.snapshot();
+        if current.state != ProducerState::Running
+            || own.integrity_lost
+            || own.mutation_dispatched
+            || own.submission_revoked
+            || own.local_producers_finished
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if Self::entries_input_ready(&entries, key, None)? {
+            return Ok(true);
+        }
+        for (other, entry) in entries.iter() {
+            if *other == key || entry.state == ProducerState::DisconnectedRetired {
+                continue;
+            }
+            let snapshot = entry.journal.snapshot();
+            if snapshot.integrity_lost
+                || entry.state == ProducerState::IntegrityLost
+                || entry.state == ProducerState::Retiring
+                || entry.state == ProducerState::Retired
+                    && entry.retirement_deadline.is_some()
+                    && !entry.result_fixed
+                || matches!(
+                    entry.state,
+                    ProducerState::Running | ProducerState::RegisteredNotDispatched
+                ) && snapshot.mutation_dispatched
+                    && (entry.state != ProducerState::Running
+                        || !entry.serialized_media
+                        || !std::sync::Arc::ptr_eq(
+                            &entry.journal.ledger(),
+                            &current.journal.ledger(),
+                        )
+                        || snapshot.submission_revoked
+                        || snapshot.local_producers_finished)
+            {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+        }
+        Ok(false)
+    }
     fn entries_input_ready(
         entries: &HashMap<OperationKey, Entry>,
         key: OperationKey,
@@ -1190,6 +1269,152 @@ mod tests {
         registry.finish(key, false);
         registry.register(journal(67)).unwrap();
     }
+    fn media_journals() -> (OperationJournalHandle, OperationJournalHandle) {
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        let make = |operation_seq| {
+            ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq,
+                    },
+                    "page".into(),
+                    "session".into(),
+                )
+                .unwrap()
+        };
+        (make(1), make(2))
+    }
+    #[test]
+    fn media_wait_classifies_live_completion_gap_without_weakening_input_guard() {
+        let registry = OperationRegistry::default();
+        let (first, second) = media_journals();
+        for handle in [&first, &second] {
+            registry.register(handle.clone()).unwrap();
+            registry.running(handle.key());
+        }
+        registry.mark_media_dispatch(&first).unwrap();
+        first.mark_mutation_maybe_submitted().unwrap();
+        assert!(!registry.input_dispatch_ready(second.key()).unwrap());
+        assert!(!registry.media_dispatch_ready(second.key()).unwrap());
+        assert!(!registry.finish(first.key(), false));
+        assert!(registry.media_dispatch_ready(second.key()).unwrap());
+        assert!(registry.input_dispatch_ready(second.key()).unwrap());
+    }
+    #[test]
+    fn media_wait_never_waits_for_an_unmarked_or_foreign_mutation() {
+        for foreign in [false, true] {
+            let registry = OperationRegistry::default();
+            let (first, mut second) = media_journals();
+            if foreign {
+                second = journal(2);
+            }
+            for handle in [&first, &second] {
+                registry.register(handle.clone()).unwrap();
+                registry.running(handle.key());
+            }
+            if foreign {
+                registry.mark_media_dispatch(&first).unwrap();
+            }
+            first.mark_mutation_maybe_submitted().unwrap();
+            assert_eq!(
+                registry.media_dispatch_ready(second.key()),
+                Err(ProtocolError::ScopeUnavailable)
+            );
+        }
+    }
+    #[test]
+    fn media_wait_never_hides_dirty_journal_behind_live_media_in_hashmap_order() {
+        for dirty_own in [false, true] {
+            let registry = OperationRegistry::default();
+            let ledger = OwnerDebtLedger::new(1, "scope".into());
+            for operation_seq in 1..=3 {
+                let handle = ledger
+                    .operation(
+                        OperationKey {
+                            generation: 1,
+                            operation_seq,
+                        },
+                        "page".into(),
+                        "session".into(),
+                    )
+                    .unwrap();
+                registry.register(handle.clone()).unwrap();
+                registry.running(handle.key());
+            }
+            // Observe this map's actual order, then mutate only journal state:
+            // a live media entry deterministically precedes the dirty entry.
+            let ordered: Vec<_> = registry
+                .entries
+                .lock()
+                .unwrap()
+                .values()
+                .map(|entry| entry.journal.clone())
+                .collect();
+            let first = &ordered[0];
+            let current = &ordered[2];
+            let dirty = if dirty_own { current } else { &ordered[1] };
+            registry.mark_media_dispatch(first).unwrap();
+            first.mark_mutation_maybe_submitted().unwrap();
+            dirty.record_cleanup_disposition(CleanupDisposition::IntegrityLost);
+            assert_eq!(registry.input_dispatch_ready(current.key()), Ok(false));
+            assert_eq!(
+                registry.media_dispatch_ready(current.key()),
+                Err(ProtocolError::ScopeUnavailable)
+            );
+        }
+    }
+    #[test]
+    fn media_dispatch_kind_requires_exact_registered_nonmutating_journal() {
+        let registry = OperationRegistry::default();
+        let handle = journal(1);
+        registry.register(handle.clone()).unwrap();
+        assert!(registry.mark_media_dispatch(&handle).is_err());
+        registry.running(handle.key());
+        assert!(registry.mark_media_dispatch(&journal(1)).is_err());
+        registry.mark_media_dispatch(&handle).unwrap();
+        assert!(registry.mark_media_dispatch(&handle).is_err());
+    }
+    #[test]
+    fn media_wait_refuses_known_retirement_integrity_and_own_mutation() {
+        for mode in [
+            "retiring",
+            "unpublished-unknown",
+            "integrity",
+            "own-mutation",
+        ] {
+            let registry = OperationRegistry::default();
+            let (first, second) = media_journals();
+            for handle in [&first, &second] {
+                registry.register(handle.clone()).unwrap();
+                registry.running(handle.key());
+            }
+            registry.mark_media_dispatch(&first).unwrap();
+            first.mark_mutation_maybe_submitted().unwrap();
+            match mode {
+                "retiring" => {
+                    registry.retire(first.key()).unwrap();
+                }
+                "unpublished-unknown" => {
+                    registry.retire(first.key()).unwrap();
+                    assert!(!registry.finish(first.key(), false));
+                }
+                "integrity" => {
+                    assert!(registry.finish(first.key(), true));
+                }
+                "own-mutation" => {
+                    second.mark_mutation_maybe_submitted().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                registry.media_dispatch_ready(second.key()),
+                Err(ProtocolError::ScopeUnavailable),
+                "{mode}"
+            );
+        }
+    }
+
     #[test]
     fn mutation_completion_gap_and_publication_pending_both_block_new_input() {
         let registry = OperationRegistry::default();

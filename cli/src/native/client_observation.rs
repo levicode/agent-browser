@@ -864,6 +864,10 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
        if(css.visibility!=='visible'||['hidden','auto'].includes(css.contentVisibility)||p.localName==='details'&&!p.open)return null;
      }
      const rect=n.getBoundingClientRect();
+     // SVG title is native non-rendered alternative metadata: Chromium can
+     // report inline/visible style while it has no layout box. Only that exact
+     // element under an SVG root is a proven hidden IDREF, not any zero box.
+     if(n instanceof SVGTitleElement&&n.parentElement instanceof SVGSVGElement&&rect.width===0&&rect.height===0)return true;
      return rect.width>0&&rect.height>0?false:null;
    }
    function references(n,depth,inReference){

@@ -2604,6 +2604,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             super::client_protocol::DISCONNECTED_RECOVERY,
             "browser.scope/1",
             "browser.lifecycle/1",
+            super::client_protocol::PERSISTENT_PAGE_REOPEN,
             "browser.evaluate/1",
             "browser.page/1",
             "browser.observe/1",
@@ -2899,6 +2900,32 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 .restart_pages(captured_scope.unwrap_or_default(), lease)
                 .await;
         }
+        // Reopen only at the existing explicit page activation boundary. Reads
+        // and locators cannot turn an untouched/closed host page into a new tab.
+        let reopened = if matches!(
+            command.as_str(),
+            "page.activate" | "page.navigate" | "recording.start"
+        ) {
+            let outcome = self
+                .ensure_persistent_page(captured_scope.as_deref().unwrap_or_default(), &lease)
+                .await;
+            match outcome.result {
+                Ok(value) => {
+                    value.get("reopened").and_then(serde_json::Value::as_bool) == Some(true)
+                }
+                Err(_) => return outcome,
+            }
+        } else {
+            false
+        };
+        let finish = |mut outcome: NativeOutcome| {
+            // A proven, completed page creation is a completed prefix, not a
+            // clean no-effect refusal of the whole public operation.
+            if reopened && outcome.effects == Effects::NotDispatched {
+                outcome.effects = Effects::Completed;
+            }
+            outcome
+        };
         #[cfg(feature = "acceptance-faults")]
         if matches!(
             command.as_str(),
@@ -2939,22 +2966,22 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             } else {
                 Effects::NotDispatched
             };
-            return NativeOutcome {
+            return finish(NativeOutcome {
                 retention: None,
                 result,
                 effects,
-            };
+            });
         }
         if command == "scope.configure" {
             let request: ConfigureRequest =
                 match serde_json::from_value(serde_json::Value::Object(args)) {
                     Ok(request) => request,
                     Err(_) => {
-                        return NativeOutcome {
+                        return finish(NativeOutcome {
                             retention: None,
                             result: Err(ProtocolError::InvalidArguments),
                             effects: Effects::NotDispatched,
-                        }
+                        })
                     }
                 };
             let captured = async {
@@ -2984,21 +3011,21 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let (page, configuration, network, config_gate, context_id) = match captured {
                 Ok(value) => value,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let journal = match Self::operation_journal(&page, &lease) {
                 Ok(journal) => journal,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let receive = self.tasks.start_operation(page.identity_scope.clone(), page.targets.clone(), self.broker.clone(), journal.clone(), lease.cancellation.clone(), async move {
@@ -3044,7 +3071,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 let effects = if failed { Effects::Unknown } else if result.is_err() { Effects::NotDispatched } else { Effects::Completed };
                 (NativeOutcome { retention: None, result, effects }, failed)
             }).await;
-            return await_retained(receive).await;
+            return finish(await_retained(receive).await);
         }
         if matches!(
             command.as_str(),
@@ -3101,11 +3128,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let request = match request {
                 Ok(request) => request,
                 Err(_) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(ProtocolError::InvalidArguments),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let captured = async {
@@ -3151,21 +3178,21 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let context = match captured {
                 Ok(context) => context,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let journal = match Self::operation_journal(&context.page, &lease) {
                 Ok(journal) => journal,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let observation = self.observation.clone();
@@ -3214,7 +3241,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     },
                 )
                 .await;
-            return await_retained(receive).await;
+            return finish(await_retained(receive).await);
         }
         if matches!(
             command.as_str(),
@@ -3274,11 +3301,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             ) = match captured {
                 Ok(value) => value,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             // Direct coordinates carry exact page authority, not DOM/viewport
@@ -3289,11 +3316,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 match super::client_actions::ClientActions::is_direct_point(&args) {
                     Ok(direct) => direct,
                     Err(error) => {
-                        return NativeOutcome {
+                        return finish(NativeOutcome {
                             retention: None,
                             result: Err(error),
                             effects: Effects::NotDispatched,
-                        }
+                        })
                     }
                 }
             } else {
@@ -3303,31 +3330,31 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let publication_fence = match observation.publication_fence() {
                 Ok(fence) => fence,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let attachment = match page.targets.owned_target(&page.target_id) {
                 Ok(attachment) => attachment,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let journal = match Self::operation_journal(&page, &lease) {
                 Ok(journal) => journal,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let action_broker = self.broker.clone();
@@ -3474,7 +3501,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     }
                 }
             }).await;
-            return await_retained(receive).await;
+            return finish(await_retained(receive).await);
         }
         if command == "state.capture" {
             let captured = async {
@@ -3512,21 +3539,21 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let (page, page_state, ui, enrollment, blobs, scope, context_kind) = match captured {
                 Ok(value) => value,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let journal = match Self::operation_journal(&page, &lease) {
                 Ok(journal) => journal,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let receive = self
@@ -3654,7 +3681,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     },
                 )
                 .await;
-            return await_retained(receive).await;
+            return finish(await_retained(receive).await);
         }
         if resource_command {
             // The resource helper owns exact effect classification. In particular,
@@ -3685,22 +3712,22 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let (page, network, blobs, scope) = match captured {
                 Ok(captured) => captured,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let broker = self.broker.clone();
             let journal = match Self::operation_journal(&page, &lease) {
                 Ok(journal) => journal,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let receive = self
@@ -3760,7 +3787,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     },
                 )
                 .await;
-            return await_retained(receive).await;
+            return finish(await_retained(receive).await);
         }
 
         let result = if let Some(request) = prepared {
@@ -3788,18 +3815,18 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let page = match self.page_lease(lease.is_callback).await {
                 Ok(page) if captured_scope.as_deref() == Some(page.identity_scope.as_str()) => page,
                 Ok(_) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(ProtocolError::StaleScope),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let captured = {
@@ -3835,11 +3862,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 activation,
             )) = captured
             else {
-                return NativeOutcome {
+                return finish(NativeOutcome {
                     retention: None,
                     result: Err(ProtocolError::StaleScope),
                     effects: Effects::NotDispatched,
-                };
+                });
             };
             let broker = self.broker.clone();
             let dispatch_tasks = self.tasks.clone();
@@ -3848,21 +3875,21 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let attachment = match page.targets.owned_target(&page.target_id) {
                 Ok(attachment) => attachment,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let journal = match Self::operation_journal(&page, &lease) {
                 Ok(journal) => journal,
                 Err(error) => {
-                    return NativeOutcome {
+                    return finish(NativeOutcome {
                         retention: None,
                         result: Err(error),
                         effects: Effects::NotDispatched,
-                    }
+                    })
                 }
             };
             let receive = self.tasks.start_operation(page.identity_scope.clone(), page.targets.clone(), self.broker.clone(), journal.clone(), lease.cancellation.clone(), async move {
@@ -3898,11 +3925,21 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         if let Some(permit) = &eval_child {
                             dispatch_tasks.check_eval_dispatch(permit)?;
                             debt.check_eval_input(permit)?;
+                        } else if command == "context.media" {
+                            // Only an exact same-owner, registered media producer
+                            // may justify queuing. Other command mutations retain
+                            // the original fast refusal before taking config_gate.
+                            if dispatch_tasks.media_dispatch_ready(journal.key())? {
+                                debt.check_admission(super::client_debt::AdmissionClass::Input)?;
+                            }
                         } else {
                             if !fixed_read { dispatch_tasks.check_input_dispatch(journal.key())?; }
                             debt.check_admission(if fixed_read { super::client_debt::AdmissionClass::FixedRead }
                                 else { super::client_debt::AdmissionClass::Input })?;
                         }
+                        // Media merges serialize under config_gate. A positively
+                        // retained predecessor may still own input until its ACK;
+                        // the unchanged admission checks run after this gate.
                         // Enrollment and context changes share only this narrow
                         // configuration boundary; navigation and callback reads
                         // must never hold it while waiting on application work.
@@ -3941,6 +3978,13 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                 guard = tokio::time::timeout_at(lease.deadline.into(), guard) => guard.map_err(|_| ProtocolError::DeadlineExceeded)?,
                             })
                         } else { None };
+                        // The prior media producer releases config_gate before
+                        // its retained supervisor finishes result classification.
+                        // Wait only for that positively retained completion, not
+                        // an Unknown retirement, and never renew this lease.
+                        if command == "context.media" {
+                            dispatch_tasks.wait_media_dispatch(&lease).await?;
+                        }
                         // Admission before a mutex wait is not dispatch authority.
                         // Cleanup can retain debt or retire publication while this
                         // command waits for the configuration/input guard.
@@ -3956,6 +4000,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             if !fixed_read { dispatch_tasks.check_input_dispatch(journal.key())?; }
                             debt.check_admission(if fixed_read { super::client_debt::AdmissionClass::FixedRead }
                                 else { super::client_debt::AdmissionClass::Input })?;
+                        }
+                        if command == "context.media" {
+                            // Closed native kind proof for this exact registered
+                            // journal; only this real serialized path can mint it.
+                            dispatch_tasks.mark_media_dispatch(&journal)?;
                         }
                         if command == "session.environment" {
                             return environment_facts(&page, &lease, configured_user_agent.as_deref()).await;
@@ -4059,18 +4108,18 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 };
                 (NativeOutcome { retention: None, result, effects }, cleanup_failed)
             }).await;
-            return await_retained(receive).await;
+            return finish(await_retained(receive).await);
         };
 
         if *lease.cancellation.borrow() != super::client_session::CancelSignal::None
             || std::time::Instant::now() >= lease.deadline
         {
             let _ = self.broker.quarantine();
-            return NativeOutcome {
+            return finish(NativeOutcome {
                 retention: None,
                 result: Err(ProtocolError::Cancelled),
                 effects: Effects::Unknown,
-            };
+            });
         }
         let effects = if matches!(
             result,
@@ -4083,11 +4132,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         } else {
             Effects::Completed
         };
-        NativeOutcome {
+        finish(NativeOutcome {
             retention: None,
             result,
             effects,
-        }
+        })
     }
 
     async fn shutdown(&self) -> Result<(), ProtocolError> {
@@ -4263,6 +4312,165 @@ async fn await_retained(
 }
 
 impl ClientBrowser {
+    /// Reopen only a proven-closed persistent application root. This runs before
+    /// dispatch of the caller's command, never as a retry after a command error.
+    async fn ensure_persistent_page(
+        &self,
+        scope: &str,
+        operation: &super::client_session::OperationLease,
+    ) -> super::client_transport::NativeOutcome {
+        use super::client_protocol::Effects;
+        use super::client_transport::NativeOutcome;
+        let captured = async {
+            let (candidate, enrollment) = {
+                let owner = self.owner.lock().await;
+                let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+                if owner.identity_scope != scope { return Err(ProtocolError::StaleScope); }
+                if owner.owns_context || owner.borrowed_targets.is_none() { return Ok(None); }
+                let runtime = owner.runtime.as_ref().ok_or(ProtocolError::ScopeUnavailable)?;
+                (owner.lease(self.gate.enter(operation.is_callback)?)?, runtime.enrollment.clone())
+            };
+            if !enrollment.persistent_reopen_candidate(&candidate, operation).await? { return Ok(None); }
+            if operation.is_callback { return Err(ProtocolError::StaleReference); }
+            if !self.event_sink.get().is_some_and(|sink| sink.persistent_page_reopen_negotiated()) {
+                return Err(ProtocolError::UnsupportedCapability);
+            }
+            drop(candidate);
+            let mut cancellation = operation.cancellation.clone();
+            check_lifecycle_budget(operation)?;
+            let transition = tokio::select! {
+                biased;
+                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                result = tokio::time::timeout_at(operation.deadline.into(), self.lifecycle.clone().lock_owned()) => result.map_err(|_| ProtocolError::DeadlineExceeded)?,
+            };
+            let owner = self.owner.lock().await;
+            let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+            if owner.identity_scope != scope || owner.owns_context || owner.borrowed_targets.is_none() { return Err(ProtocolError::StaleScope); }
+            let runtime = owner.runtime.as_ref().ok_or(ProtocolError::ScopeUnavailable)?;
+            let page = owner.lease(self.gate.enter(false)?)?;
+            Ok(Some((transition, page, owner.ui.clone(), owner.page_state.clone(), runtime.enrollment.clone(), runtime.actions.clone(), runtime.input_gate.clone(), runtime.blobs.clone(), runtime.page_active.clone())))
+        }.await;
+        let (transition, page, ui, page_state, enrollment, actions, input_gate, blobs, active) =
+            match captured {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Ok(serde_json::json!({"reopened":false})),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            };
+        let scope = scope.to_owned();
+        let operation = super::client_session::OperationLease {
+            is_callback: operation.is_callback,
+            generation: operation.generation,
+            sequence: operation.sequence,
+            deadline: operation.deadline,
+            cancellation: operation.cancellation.clone(),
+        };
+        let owner = self.owner.clone();
+        let gate = self.gate.clone();
+        let refs = self.refs.clone();
+        let observation = self.observation.clone();
+        let tasks = self.tasks.clone();
+        let targets = page.targets.clone();
+        let event_sink = match self.event_sink.get().cloned() {
+            Some(sink) => sink,
+            None => {
+                return NativeOutcome {
+                    retention: None,
+                    result: Err(ProtocolError::ScopeUnavailable),
+                    effects: Effects::NotDispatched,
+                }
+            }
+        };
+        let receive = self.tasks.start(scope.clone(), targets.clone(), async move {
+            let _transition = transition;
+            let mut effects = false;
+            let result = async {
+                let exclusive = ui.enter(true, false, operation.deadline, operation.cancellation.clone()).await?;
+                let mut cancellation = operation.cancellation.clone();
+                check_lifecycle_budget(&operation)?;
+                let _input = tokio::select! {
+                    biased;
+                    _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
+                    result = tokio::time::timeout_at(operation.deadline.into(), input_gate.lock()) => result.map_err(|_| ProtocolError::DeadlineExceeded)?,
+                };
+                page.permit.check()?;
+                // The preceding waiter may have shared an already-completed
+                // reopen. Do not create a second page for concurrent callers.
+                if !enrollment.persistent_page_detached(&page, &operation).await? {
+                    return Ok(serde_json::json!({"reopened":false}));
+                }
+                let key = super::client_debt::OperationKey { generation: operation.generation, operation_seq: operation.sequence };
+                tasks.check_input_dispatch(key)?;
+                page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?.check_admission(super::client_debt::AdmissionClass::Input)?;
+                let staged = event_sink.stage_until_result(&operation, &scope)?;
+                let context = super::client_restart::RestartContext::new_persistent_reopen(&page, &enrollment, &ui, &exclusive, &operation).await?.with_staged_sink(staged);
+                // Exact detach has already cleared this session's held input;
+                // never send release keys to a detached/replacement session.
+                actions.recording_page_closing(&scope, &blobs).await?;
+                observation.retire_page_publication(&blobs, &super::client_blobs::BlobScope { generation: operation.generation, identity_scope: scope.clone() }).await?;
+                let observation_after = observation.snapshot_for_action(&operation).await?.0;
+                refs.lock().map_err(|_| ProtocolError::ScopeUnavailable)?.retire_owner_references();
+                let replacement = super::client_restart::reopen_closed_page(&context).await.map_err(|failure| {
+                    effects |= failure.effects_started;
+                    failure.error
+                })?;
+                effects = true;
+                replacement.validate(&context)?;
+                actions.cleanup_scope_uploads().await?;
+                let (next, previous_identity, recovery_identity) = {
+                    let mut owner = owner.lock().await;
+                    let owner = owner.as_mut().ok_or(ProtocolError::StaleScope)?;
+                    if owner.identity_scope != scope || !Arc::ptr_eq(&owner.targets, &targets)
+                        || owner.manager.active_target_id().ok() != Some(page.target_id.as_str())
+                        || owner.manager.active_session_id().ok() != Some(page.page_session_id.as_str()) { return Err(ProtocolError::StaleScope); }
+                    replacement.validate(&context)?;
+                    let previous_identity = owner.recovery_identity();
+                    owner.manager.forget_disposed_targets(&std::iter::once(page.target_id.clone()).collect());
+                    owner.manager.register_discovered_page(&replacement.target_id, &replacement.session_id, "about:blank".into(), String::new(), "page".into());
+                    if !owner.manager.restore_target_binding(&replacement.target_id, "about:blank") || owner.manager.active_session_id().ok() != Some(replacement.session_id.as_str()) { return Err(ProtocolError::StaleScope); }
+                    owner.borrowed_targets = Some(vec![replacement.target_id.clone()]);
+                    owner.runtime.as_mut().ok_or(ProtocolError::ScopeUnavailable)?.observation_after = Some(observation_after);
+                    (owner.lease(gate.enter(false)?)?, previous_identity, owner.recovery_identity())
+                };
+                replacement.publish_ready(&context, || next.permit.check()).await?;
+                if actions.is_recording_armed().await? {
+                    let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
+                    let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
+                    let (revision, references) = observation.snapshot_for_action(&operation).await?;
+                    actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page: &next, operation: &operation, page_state: &page_state, refs: &references, revision, iframe_sessions: &sessions, observation_frames: &frames, blobs: &blobs, geometry: &geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| failure.error)?;
+                }
+                replacement.publish_ready(&context, || {
+                    next.permit.check()?;
+                    // Queue the exact-owner refresh before the operation result,
+                    // not behind its result-staged application events.
+                    event_sink.emit("scope.page-reopened".into(), serde_json::json!({
+                        "version": 1, "identityScope": scope,
+                        "previousPageIdentity": previous_identity["page"],
+                        "recoveryIdentity": recovery_identity,
+                    }), None)?;
+                    active.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(serde_json::json!({"reopened":true}))
+                }).await
+            }.await;
+            let dirty = effects && result.is_err() || matches!(result, Err(ProtocolError::CleanupFailed));
+            if dirty { targets.seal(); }
+            let effect = if result.is_ok() { Effects::Completed } else if effects { Effects::Unknown } else { Effects::NotDispatched };
+            (NativeOutcome { retention: None, result, effects: effect }, dirty)
+        }).await;
+        await_retained(receive).await
+    }
+
     async fn restart_pages(
         &self,
         scope: String,
@@ -5506,6 +5714,7 @@ mod tests {
         let expected = [
             "scope",
             "lifecycle",
+            "persistent-page-reopen",
             "evaluate",
             "page",
             "observe",
@@ -6207,3 +6416,7 @@ mod borrowed_cleanup_tests;
 #[cfg(test)]
 #[path = "client_browser_reconnect_tests.rs"]
 mod reconnect_tests;
+
+#[cfg(test)]
+#[path = "client_browser_recording_attempt_tests.rs"]
+mod recording_attempt_tests;

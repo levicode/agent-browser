@@ -262,6 +262,7 @@ struct Index {
     borrowed_restart: Option<u64>,
     borrowed_restart_sequence: u64,
     borrowed_retired_targets: HashSet<String>,
+    detached_application_roots: HashMap<String, String>,
     borrowed_blank: Option<Arc<BorrowedBlankState>>,
     sessions: HashMap<String, Attribution>,
     frames: HashMap<String, FrameOwner>,
@@ -446,6 +447,7 @@ pub(crate) struct BorrowedRestartPermit {
     nonce: u64,
     operation: OperationLease,
     creation_started: AtomicBool,
+    may_retire_pages: bool,
 }
 #[derive(Clone)]
 enum BorrowedBlankStatus {
@@ -510,6 +512,9 @@ impl BorrowedRestartPermit {
         op: &OperationLease,
     ) -> Result<Option<String>, ProtocolError> {
         self.check(op)?;
+        if !self.may_retire_pages {
+            return Err(ProtocolError::PolicyDenied);
+        }
         let target = self.owner.exact_borrowed_page(info)?;
         let mut index = self
             .owner
@@ -2230,6 +2235,135 @@ impl ClientEnrollment {
             return Err(ProtocolError::InvalidArguments);
         }
         self.validate_restart_page(page, ui_gate, op)?;
+        self.issue_borrowed_page_creation(op, true)
+    }
+
+    /// A disappeared session alone is not a closed page. This exact native
+    /// detach fact is only a candidate; the reopen coordinator must also prove
+    /// that the target is absent from a fresh browser inventory before creation.
+    pub(crate) async fn persistent_page_detached(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<bool, ProtocolError> {
+        self.check_restart_operation(op)?;
+        page.permit.check()?;
+        if !matches!(self.ownership, ScopeOwnership::BorrowedTargets(_))
+            || !Arc::ptr_eq(&page.client, &self.client)
+            || !Arc::ptr_eq(&page.targets, &self.targets)
+            || page.identity_scope != self.targets.identity_scope
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let watermark = self.realm_watermark()?;
+        self.drain_capture_watermark(&watermark, op).await?;
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if *self
+            .active_root
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            != page.page_session_id
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        if let Some(entry) = index.sessions.get(&page.page_session_id) {
+            if entry.target == page.target_id
+                && entry.kind == "page"
+                && entry.root == entry.session
+                && entry.application
+                && entry.resumed
+            {
+                return Ok(false);
+            }
+            return Err(ProtocolError::StaleReference);
+        }
+        if index.detached_application_roots.get(&page.target_id) != Some(&page.page_session_id)
+            || index
+                .sessions
+                .values()
+                .any(|entry| entry.target == page.target_id)
+            || !matches!(
+                self.targets.owned_target(&page.target_id),
+                Err(ProtocolError::StaleReference)
+            )
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        Ok(true)
+    }
+
+    /// One read-only browser snapshot orders a close observed on another CDP
+    /// connection before admission. If the target is absent but its exact
+    /// detach event is still in flight, wait for that event, never retry the
+    /// caller command or infer a replacement right from absence alone.
+    pub(crate) async fn persistent_reopen_candidate(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<bool, ProtocolError> {
+        if self.persistent_page_detached(page, op).await? {
+            return Ok(true);
+        }
+        if let Some(ledger) = self.client.debt_ledger() {
+            ledger.check_admission(super::client_debt::AdmissionClass::FixedRead)?;
+        }
+        let inventory = bounded(op, async {
+            self.client
+                .send_command("Target.getTargets", Some(serde_json::json!({})), None)
+                .await
+                .map_err(|_| ProtocolError::BrowserFailure)
+        })
+        .await?;
+        let infos = inventory
+            .get("targetInfos")
+            .and_then(Value::as_array)
+            .ok_or(ProtocolError::InvalidFrame)?;
+        if infos.len() > 8192 {
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        for info in infos {
+            if field(info, "targetId")? == page.target_id {
+                return Ok(false);
+            }
+        }
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.persistent_page_detached(page, op).await? {
+                return Ok(true);
+            }
+            bounded(op, async {
+                changed.await;
+                Ok(())
+            })
+            .await?;
+        }
+    }
+
+    pub(crate) async fn borrowed_reopen_permit(
+        self: &Arc<Self>,
+        page: &BrowserExecutionLease,
+        ui_gate: &Arc<super::client_ui::UiGate>,
+        op: &OperationLease,
+    ) -> Result<BorrowedRestartPermit, ProtocolError> {
+        if op.is_callback || op.sequence == 0 || !self.network.uses_ui_gate(ui_gate) {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        if !self.persistent_page_detached(page, op).await? {
+            return Err(ProtocolError::StaleReference);
+        }
+        self.issue_borrowed_page_creation(op, false)
+    }
+
+    fn issue_borrowed_page_creation(
+        self: &Arc<Self>,
+        op: &OperationLease,
+        may_retire_pages: bool,
+    ) -> Result<BorrowedRestartPermit, ProtocolError> {
         let mut index = self
             .index
             .lock()
@@ -2248,6 +2382,7 @@ impl ClientEnrollment {
             nonce,
             operation: copy_operation(op),
             creation_started: AtomicBool::new(false),
+            may_retire_pages,
         })
     }
     fn exact_borrowed_page<'a>(&self, info: &'a Value) -> Result<&'a str, ProtocolError> {
@@ -3242,6 +3377,16 @@ impl ClientEnrollment {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if index.borrowed_retired_targets.contains(target) {
             return Ok(None);
+        }
+        // Reused text is not a resurrected application-root tenure. Keep the
+        // exact detach candidate unambiguous until its owner opens a new page.
+        if matches!(self.ownership, ScopeOwnership::BorrowedTargets(_))
+            && index
+                .detached_application_roots
+                .iter()
+                .any(|(old_target, old_session)| old_target == target || old_session == session)
+        {
+            return Err(ProtocolError::StaleScope);
         }
         if let Some(existing) = index.sessions.get(session) {
             return if existing.target == target {
@@ -5452,6 +5597,15 @@ impl ClientEnrollment {
                     .lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?;
                 if let Some(entry) = index.sessions.get(session) {
+                    // A supplied identity must agree for page detach too. A
+                    // conflicting event cannot mint a closed-page candidate.
+                    if event
+                        .params
+                        .get("targetId")
+                        .is_some_and(|target| target.as_str() != Some(entry.target.as_str()))
+                    {
+                        return Err(ProtocolError::InvalidFrame);
+                    }
                     if entry.kind == "page" && entry.application && !entry.observation_only {
                         if let Some(target) = event.params.get("targetId") {
                             if target.as_str() != Some(entry.target.as_str()) {
@@ -5512,6 +5666,18 @@ impl ClientEnrollment {
                     return Err(ProtocolError::CapacityExceeded);
                 }
                 index.retired_page_sessions.extend(retired);
+                for entry in removed.iter().filter(|entry| {
+                    entry.application && entry.kind == "page" && entry.root == entry.session
+                }) {
+                    if index.detached_application_roots.len() >= MAX_SESSIONS
+                        && !index.detached_application_roots.contains_key(&entry.target)
+                    {
+                        return Err(ProtocolError::CapacityExceeded);
+                    }
+                    index
+                        .detached_application_roots
+                        .insert(entry.target.clone(), entry.session.clone());
+                }
                 for entry in removed.iter().filter(|entry| entry.observation_only) {
                     if index.retired_observer_sessions.len() >= MAX_FRAMES {
                         return Err(ProtocolError::CapacityExceeded);

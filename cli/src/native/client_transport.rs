@@ -150,8 +150,13 @@ pub struct ClientEventSink {
     sequence: std::sync::Arc<std::sync::Mutex<EventOrder>>,
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
     barrier: Option<std::sync::Arc<EventBarrier>>,
+    persistent_page_reopen: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl ClientEventSink {
+    pub(crate) fn persistent_page_reopen_negotiated(&self) -> bool {
+        self.persistent_page_reopen
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
     #[cfg(test)]
     pub(crate) fn test_channel(
         broker: std::sync::Arc<ClientSession>,
@@ -164,6 +169,7 @@ impl ClientEventSink {
                 sequence: Default::default(),
                 open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 barrier: None,
+                persistent_page_reopen: Default::default(),
             },
             receiver,
         )
@@ -979,6 +985,7 @@ where
         sequence: event_order.clone(),
         open: sink_open.clone(),
         barrier: None,
+        persistent_page_reopen: Default::default(),
     };
     let (drain, mut drain_requested) = tokio::sync::oneshot::channel::<()>();
     let (failed, mut failure) = tokio::sync::oneshot::channel::<()>();
@@ -1117,6 +1124,15 @@ where
         && capabilities
             .iter()
             .any(|capability| capability == DISCONNECTED_RECOVERY);
+    sink.persistent_page_reopen.store(
+        required_capabilities
+            .iter()
+            .any(|capability| capability == PERSISTENT_PAGE_REOPEN)
+            && capabilities
+                .iter()
+                .any(|capability| capability == PERSISTENT_PAGE_REOPEN),
+        std::sync::atomic::Ordering::Release,
+    );
     let supported: Vec<_> = capabilities.iter().map(String::as_str).collect();
     let validation = validate_hello(&protocol, &required_capabilities, &supported)
         .and_then(|()| executor.set_event_sink(sink.clone()));
@@ -3286,6 +3302,7 @@ mod tests {
             sequence: Default::default(),
             open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             barrier: None,
+            persistent_page_reopen: Default::default(),
         };
         let threads: Vec<_> = (0..16)
             .map(|_| {
