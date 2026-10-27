@@ -297,6 +297,8 @@ async fn trace_initial_inventory_single_navigation_race_reaches_protected_read()
         .dispatch
         .prepare_inner(fixture.context, request, fixture.operation, Some(&witness))
         .unwrap();
+    let mut result_send = None;
+    let receipt = ObservationResultReceipt::default();
     let result = fixture
         .journal
         .scope(fixture.dispatch.run(
@@ -307,6 +309,8 @@ async fn trace_initial_inventory_single_navigation_race_reaches_protected_read()
             prepared.trace,
             prepared.retirement_fence,
             Some(&witness),
+            &mut result_send,
+            &receipt,
         ))
         .await;
     let failure = result.err().unwrap();
@@ -436,6 +440,8 @@ impl Fixture {
             .dispatch
             .prepare_inner(self.context, request, self.operation, witness.as_ref())
             .unwrap();
+        let mut result_send = None;
+        let receipt = ObservationResultReceipt::default();
         let failure = self
             .journal
             .scope(self.dispatch.run(
@@ -446,6 +452,8 @@ impl Fixture {
                 prepared.trace,
                 prepared.retirement_fence,
                 witness.as_ref(),
+                &mut result_send,
+                &receipt,
             ))
             .await
             .err()

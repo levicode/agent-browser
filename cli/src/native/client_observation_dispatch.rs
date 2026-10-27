@@ -3472,6 +3472,8 @@ mod tests {
             let prepared = dispatch
                 .prepare_inner(context(), diagnostic_trace(), op, Some(&witness))
                 .unwrap();
+            let mut result_send = None;
+            let receipt = ObservationResultReceipt::default();
             let result = dispatch
                 .run(
                     prepared.context,
@@ -3481,6 +3483,8 @@ mod tests {
                     prepared.trace,
                     prepared.retirement_fence,
                     Some(&witness),
+                    &mut result_send,
+                    &receipt,
                 )
                 .await;
             let error = result.err().unwrap();
