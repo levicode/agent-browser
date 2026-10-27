@@ -46,10 +46,10 @@ const PAGE = `<!doctype html><html><head><style>
 <details id="details"><summary id="summary">s</summary><span id="folded" class="box">folded</span></details>
 <input id="inp" class="box" value="x">
 <ul id="rows">
-  <li id="row-1" style="display:none">one</li>
-  <li id="row-2">two</li>
-  <li id="row-3" style="visibility:hidden">three</li>
-  <li id="row-4">four</li>
+  <li id="row-1" style="display:none"><span class="box">one</span></li>
+  <li id="row-2"><span class="box">two</span></li>
+  <li id="row-3" style="visibility:hidden"><span class="box">three</span></li>
+  <li id="row-4"><span class="box">four</span></li>
 </ul>
 <div id="open-host" class="box"></div>
 <div id="closed-host" class="box"></div>
@@ -107,8 +107,11 @@ const CASES = [
   { selector: '* >> visible=true >> css=#contents-shadow-child', parts: [{ engine: 'css', body: '*' }, { engine: 'visible', body: 'true' }, { engine: 'css', body: '#contents-shadow-child' }] },
   { selector: '#shown >> visible=true >> visible=false', parts: [{ engine: 'css', body: '#shown' }, { engine: 'visible', body: 'true' }, { engine: 'visible', body: 'false' }] },
   { selector: '#shown >> visible=true >> visible=true', parts: [{ engine: 'css', body: '#shown' }, { engine: 'visible', body: 'true' }, { engine: 'visible', body: 'true' }] },
-  { selector: '*css=.box >> visible=true', parts: [{ engine: 'css', body: '.box' }, { engine: 'visible', body: 'true' }] },
-  { selector: '*css=.box >> visible=false', parts: [{ engine: 'css', body: '.box' }, { engine: 'visible', body: 'false' }] },
+  // Final capture only: native validation refuses a capture before the last
+  // part, so these are the forms it accepts. Playwright's capture rewrite and
+  // the native root filter agree on the result for both.
+  { selector: '.box >> *visible=true', parts: [{ engine: 'css', body: '.box' }, { engine: 'visible', body: 'true' }] },
+  { selector: '.box >> *visible=false', parts: [{ engine: 'css', body: '.box' }, { engine: 'visible', body: 'false' }] },
   { selector: '#rows >> li >> *visible=false', parts: [{ engine: 'css', body: '#rows' }, { engine: 'css', body: 'li' }, { engine: 'visible', body: 'false' }] },
 ];
 const IDS = [
@@ -152,12 +155,48 @@ const IDS = [
       return indices.map(i => els[i].id || els[i].tagName);
     }, { inventory: INVENTORY, indices: result.indices });
   }
+  async function probeHas(source, inner) {
+    const result = await page.evaluate(({ script, inventory, source, inner }) => {
+      const els = eval(`(${inventory})`)();
+      const fn = eval(`(${script})`);
+      const data = els.map(() => ({ states: { secure: false, hidden: false } }));
+      return fn(
+        {
+          kind: 'filter',
+          source: { kind: 'selector', nativeParts: source },
+          has: { kind: 'selector', nativeParts: inner },
+        },
+        data, els.map(() => []), els.map(() => null), '.secure', els.map(() => false), ...els,
+      );
+    }, { script, inventory: INVENTORY, source, inner });
+    if (result.error) return { error: result.error };
+    return await page.evaluate(({ inventory, indices }) => {
+      const els = eval(`(${inventory})`)();
+      return indices.map(i => els[i].id || els[i].tagName);
+    }, { inventory: INVENTORY, indices: result.indices });
+  }
   for (const { selector, parts } of CASES) {
     const expected = await oracle(selector);
     const actual = await probe(parts);
     const equal = JSON.stringify(sorted(expected)) === JSON.stringify(sorted(actual));
     checks++;
     if (!equal) { mismatches++; report.push({ selector, expected, actual }); }
+  }
+  // Element root in a chain: Playwright's `has` engine evaluates the inner
+  // selector with the candidate element as its root, so the first `visible`
+  // step filters that element itself before the next step searches below it.
+  for (const body of ['true', 'false']) {
+    const expected = await page
+      .locator('#rows >> li')
+      .filter({ has: page.locator(`visible=${body} >> css=span`) })
+      .evaluateAll(els => els.map(e => e.id));
+    const actual = await probeHas(
+      [{ engine: 'css', body: '#rows' }, { engine: 'css', body: 'li' }],
+      [{ engine: 'visible', body }, { engine: 'css', body: 'span' }],
+    );
+    const equal = JSON.stringify(sorted(expected)) === JSON.stringify(sorted(actual));
+    checks++;
+    if (!equal) { mismatches++; report.push({ selector: `filter(has: visible=${body} >> span)`, expected, actual }); }
   }
   // Per-element oracle: each element id filtered in both directions.
   for (const id of IDS) {
