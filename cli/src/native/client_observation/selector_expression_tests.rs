@@ -129,3 +129,51 @@ fn attribute_engines_compile_inside_the_existing_chain() {
         assert!(validate_expression(&expression, 0).is_err(), "{selector}");
     }
 }
+
+#[test]
+fn visible_engine_compiles_inside_the_existing_chain() {
+    let source = r#"main >> visible=true >> visible=false >> nth=0"#;
+    let expression = LocatorExpression::Selector {
+        selector: source.into(),
+    };
+    assert_eq!(validate_expression(&expression, 0), Ok(false));
+    let compiled = compile_selector_expression(&expression).unwrap();
+    assert_eq!(compiled["selector"], source);
+    assert_eq!(
+        compiled["nativeParts"],
+        json!([
+            {"engine": "css", "body": "main"},
+            {"engine": "visible", "body": "true"},
+            {"engine": "visible", "body": "false"},
+            {"engine": "nth", "body": "0"},
+        ])
+    );
+    // An empty body is a real Playwright visible body ("not visible"), so it
+    // stays legal and reaches the renderer unchanged.
+    for selector in [
+        "visible=true",
+        "visible=false",
+        "visible=",
+        "visible=TRUE",
+        "*visible=true",
+        "div >> visible=false >> span",
+    ] {
+        let expression = LocatorExpression::Selector {
+            selector: selector.into(),
+        };
+        assert_eq!(validate_expression(&expression, 0), Ok(false), "{selector}");
+        let compiled = compile_selector_expression(&expression).unwrap();
+        assert!(compiled["nativeParts"].is_array(), "{selector}");
+    }
+    // Capture placement and final-only rules are unchanged.
+    for selector in ["*visible=true >> css=div", "div >> *visible=true >> nth=0"] {
+        let expression = LocatorExpression::Selector {
+            selector: selector.into(),
+        };
+        assert_eq!(
+            validate_expression(&expression, 0),
+            Err(ObservationError::InvalidLocator),
+            "{selector}"
+        );
+    }
+}

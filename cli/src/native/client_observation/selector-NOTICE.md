@@ -33,4 +33,31 @@ Playwright builds `[<attribute>=${JSON.stringify(body)}]` and evaluates it with 
 
 The Playwright public locator layer additionally rejects a `:light` match as a deprecated selector. That refusal lives above the engine and is not reproduced here, so this adapter returns the engine result.
 
+## Visible engine
+
+`visible` follows `_createVisibleEngine` in the same pinned bundle. SHA-256 of that method through the line before `_createInternalChainEngine`:
+
+`31fd112748a2f2c0cf1ff20c2a8fec40efa8c967c3430e3d0ad6d9c2ef5eb02a`
+
+It is a `queryAll` engine with no `matches`/`query` form: for each current chain root it returns that root when `isElementVisible(root)` equals `body === "true"`, and nothing otherwise. Three consequences are reproduced exactly:
+
+- The body is compared to the exact string `true`. `visible=false`, `visible=`, `visible=TRUE`, `visible= true` and `visible="true"` all ask for invisible roots; only `visible=true` asks for visible ones. Native validation therefore accepts an empty body for this engine.
+- A document/root node that is not an Element never survives, in either direction. `visible=true` and `visible=false` are both empty as the first chain part.
+- The step filters the roots already selected by the previous part. It is not a descendant search, does not re-enter open shadow roots, and cannot enter a closed root.
+
+The pinned helpers this depends on, each hashed through the line before the next symbol:
+
+- `computeBox` through the line before `isElementVisible`: `4bf7c24ead72290045e62662cee6c68783d293a315ac257653cdd8f31fc86a0d`
+- `isElementVisible` through the line before `var kTextNodeRange`: `125d32f1ee4e56e756167ba9643f6a2cf154a3044399245266934ec5172ba70c`
+- `isVisibleTextNode` through the line before `function elementSafeTagName`: `4d1130355e08deeada248df05fd5f73d90d405f39b06bf4ae307f8a37c7012aa`
+- `isElementStyleVisibilityVisible` through the line before `function isListBoxSelect`: `c23401047f83bc9a9f95092af0710d091fae187b5de26689d2be1cfe39a2b10b`
+
+`selector_query.js` inlines the subset those helpers read. `getElementComputedStyle` becomes the document's `getComputedStyle`; the cache and the WebKit `<option>` workaround are omitted because this adapter does not negotiate WebKit. The result:
+
+- `display: contents` has no box for `checkVisibility`. The element is visible when a light-tree element child is visible or a direct text node range has positive width and height. Its own `visibility` is not consulted, and its shadow root is not inspected.
+- Every other element needs `checkVisibility()` (called with no arguments, so content-visibility and flat-tree state participate) and a computed `visibility` of `visible`, then a client rect with positive width and height. `opacity` is ignored.
+- Zero-area boxes are invisible. `content-visibility: hidden` boxes that still have a positive rect are visible in Chromium, matching the pinned implementation rather than a semantic "hidden" reading.
+
+This is Playwright rendering visibility, not the E2E reader's semantic `hidden` state and not the native `renderVisible` observation helper. It reads no input value, attribute, accessible name or closed-root inventory, and every root check charges the existing `matcherStep` budget.
+
 This change affects the negotiated E2E session adapter. It does not change the legacy CLI or MCP selector parser, so their command help is unchanged.

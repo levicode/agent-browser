@@ -63,6 +63,11 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             // The body stays authored source: no unquoting or unescaping.
             "id" | "id:light" | "data-testid" | "data-testid:light" | "data-test-id"
             | "data-test-id:light" | "data-test" | "data-test:light" => {}
+            // Playwright's visible engine takes no arguments but accepts any
+            // authored body: `_createVisibleEngine` compares it to the exact
+            // string "true", so `visible=`, `visible=false` and `visible=TRUE`
+            // are all "not visible". The empty body is therefore legal.
+            "visible" => {}
             // These Playwright engines are not CSS. Never pass their source
             // to Element.matches or silently reinterpret their semantics.
             "text"
@@ -70,7 +75,6 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             | "role"
             | "_react"
             | "_vue"
-            | "visible"
             | "internal:has"
             | "internal:has-not"
             | "internal:has-text"
@@ -155,10 +159,12 @@ fn append<'a>(
         engine = name;
     }
     // Playwright's attribute engines accept an empty body, which matches an
-    // empty attribute value. Every other engine rejects one.
+    // empty attribute value. The visible engine compares its body to "true",
+    // so an empty body is meaningful there too. Every other engine rejects one.
     let attribute_engine = engine.strip_suffix(":light").unwrap_or(engine);
     if body.trim_matches(js_whitespace).is_empty()
         && engine != "nth"
+        && engine != "visible"
         && !matches!(
             attribute_engine,
             "id" | "data-testid" | "data-test-id" | "data-test"
@@ -354,6 +360,48 @@ mod tests {
         for selector in ["css=", "css:light=", "xpath=", "text="] {
             assert_eq!(parse(selector), Err(ParseError::Invalid), "{selector}");
         }
+    }
+
+    #[test]
+    fn visible_engine_preserves_playwright_body_equality() {
+        // Playwright's visible engine compares the authored body to the exact
+        // string "true", so every other body (including empty) means false.
+        // The shared part trim still runs before the split, as for any engine.
+        for (selector, body) in [
+            ("visible=true", "true"),
+            ("visible=false", "false"),
+            ("visible=", ""),
+            ("visible=TRUE", "TRUE"),
+            ("visible= true", " true"),
+            ("visible=true ", "true"),
+            ("visible=\u{00a0}", ""),
+            ("visible= 日本", " 日本"),
+            ("visible=\"true\"", "\"true\""),
+        ] {
+            let parts = parse(selector).unwrap();
+            assert_eq!(parts.len(), 1, "{selector}");
+            assert_eq!(parts[0].engine, "visible", "{selector}");
+            assert_eq!(parts[0].body, body, "{selector}");
+        }
+        assert_eq!(parse("div >> visible=true").unwrap()[1].body, "true");
+        assert_eq!(parse("visible=true >> visible=false").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn visible_engine_keeps_final_capture_and_chain_boundaries() {
+        assert!(parse("*visible=true").is_ok());
+        assert!(parse("div >> *visible=false").is_ok());
+        assert_eq!(parse("*visible=true >> css=div"), Err(ParseError::Invalid));
+        assert_eq!(
+            parse("div >> *visible=true >> nth=0"),
+            Err(ParseError::Invalid)
+        );
+        // A bare word with no `=` is still CSS, exactly as Playwright parses it.
+        assert_eq!(parse("div >> visible").unwrap()[1].engine, "css");
+        assert_eq!(
+            parse("div >> visible=true >> >> span"),
+            Err(ParseError::Invalid)
+        );
     }
 
     #[test]
