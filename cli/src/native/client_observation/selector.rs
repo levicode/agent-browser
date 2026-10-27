@@ -319,6 +319,24 @@ mod tests {
     }
 
     #[test]
+    fn attribute_bodies_are_trimmed_exactly_like_every_other_engine() {
+        // parseSelectorString trims the whole part before splitting on the
+        // first `=`, so trailing whitespace disappears while whitespace right
+        // after `=` stays in the body. A part that is only whitespace becomes
+        // the same empty body as `attr=`, and U+0085 is not JavaScript
+        // whitespace, matching String.prototype.trim.
+        for (selector, body) in [
+            ("data-testid=\u{00a0}", ""),
+            ("data-testid= \u{3000} ", ""),
+            ("data-testid=\u{0085}", "\u{0085}"),
+            ("data-testid=  row  ", "  row"),
+            ("data-testid= row", " row"),
+        ] {
+            assert_eq!(parse(selector).unwrap()[0].body, body, "{selector}");
+        }
+    }
+
+    #[test]
     fn attribute_engines_accept_empty_bodies_but_other_engines_do_not() {
         for engine in [
             "id",
