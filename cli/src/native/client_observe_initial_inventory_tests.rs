@@ -331,7 +331,10 @@ async fn dispatch_stops_before_semantics(race: Race) {
     assert!(!receipt.is_sealed_observation());
     {
         let refs = fixture.dispatch.refs.lock().unwrap();
-        assert_eq!(refs.ref_ids(), vec![old_id.clone()]);
+        assert_eq!(
+            refs.ref_ids(),
+            std::collections::HashSet::from([old_id.clone()])
+        );
         assert_eq!(refs.get(&old_id).unwrap().backend_node_id, Some(77));
         assert!(refs.get(&old_id).unwrap().is_current_observed(7));
     }
