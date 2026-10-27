@@ -691,20 +691,31 @@ impl BrowserManager {
     }
 
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
-        Self::launch_with_transport_limit(options, engine, None).await
+        Self::launch_with_transport_limit(options, engine, None, true).await
     }
 
     pub(super) async fn launch_owned(
         options: LaunchOptions,
         engine: Option<&str>,
     ) -> Result<Self, String> {
-        Self::launch_with_transport_limit(options, engine, Some(128 * 1024 * 1024)).await
+        Self::launch_with_transport_limit(options, engine, Some(128 * 1024 * 1024), true).await
+    }
+
+    /// Native still owns the one Chrome process; PW creates the attempt context.
+    /// Do not attach/configure a startup tab or allocate a throwaway context.
+    pub(super) async fn launch_owned_for_interop(
+        mut options: LaunchOptions,
+    ) -> Result<Self, String> {
+        options.args.push("--no-startup-window".into());
+        Self::launch_with_transport_limit(options, Some("chrome"), Some(128 * 1024 * 1024), false)
+            .await
     }
 
     async fn launch_with_transport_limit(
         options: LaunchOptions,
         engine: Option<&str>,
         message_limit: Option<usize>,
+        attach_startup_page: bool,
     ) -> Result<Self, String> {
         let engine = engine.unwrap_or("chrome");
 
@@ -803,6 +814,9 @@ impl BrowserManager {
                 wedge_suspect: None,
                 headless,
             };
+            if !attach_startup_page {
+                return Ok(manager);
+            }
             if let Err(error) = manager.discover_and_attach_targets().await {
                 let _ = manager
                     .close_with_timeout(Some(FAILED_INITIALIZATION_CLOSE_TIMEOUT))

@@ -880,6 +880,7 @@ pub struct ClientEnrollment {
     stop: watch::Sender<CancelSignal>,
     started: AtomicBool,
     sealed: AtomicBool,
+    peer_context_retirement: AtomicBool,
     supervisor: tokio::sync::Mutex<Option<JoinHandle<Result<(), ProtocolError>>>>,
     containment: tokio::sync::Mutex<ContainmentState>,
     retirement_events: Mutex<Option<BoundedMethodEvents>>,
@@ -925,6 +926,7 @@ impl ClientEnrollment {
             stop,
             started: AtomicBool::new(false),
             sealed: AtomicBool::new(false),
+            peer_context_retirement: AtomicBool::new(false),
             supervisor: tokio::sync::Mutex::new(None),
             containment: tokio::sync::Mutex::new(ContainmentState::default()),
             retirement_events: Mutex::new(None),
@@ -4825,6 +4827,76 @@ impl ClientEnrollment {
             generation: self.generation,
         })
     }
+    /// Only the lifecycle owner may hand destruction to the genuine PW context.
+    /// Enrollment and callbacks must already be sealed and actually joined.
+    pub(crate) async fn prepare_peer_context_retirement(&self) -> Result<(), ProtocolError> {
+        if !matches!(self.ownership, ScopeOwnership::IsolatedContext)
+            || !self.sealed.load(Ordering::Acquire)
+            || self.supervisor.lock().await.is_some()
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        self.peer_context_retirement.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// A successful, exact browser inventory is the proof. Missing-context
+    /// protocol errors, a caller boolean, and target absence are not substitutes.
+    async fn peer_context_absent(&self) -> Result<bool, ProtocolError> {
+        let reply = self
+            .client
+            .send_scope_cleanup(
+                super::client_debt::ScopeCleanupCommand::ContextInventory,
+                Instant::now() + CLEANUP_TIMEOUT,
+            )
+            .await
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        let ids = reply
+            .get("browserContextIds")
+            .and_then(Value::as_array)
+            .ok_or(ProtocolError::CleanupFailed)?;
+        let mut unique = HashSet::new();
+        for id in ids {
+            let id = id
+                .as_str()
+                .filter(|id| !id.is_empty() && id.len() <= 4096)
+                .ok_or(ProtocolError::CleanupFailed)?;
+            if !unique.insert(id) {
+                return Err(ProtocolError::CleanupFailed);
+            }
+        }
+        Ok(!unique.contains(self.targets.context_id.as_str()))
+    }
+
+    pub(crate) async fn confirm_peer_context_retirement(&self) -> Result<(), ProtocolError> {
+        if !self.peer_context_retirement.load(Ordering::Acquire)
+            || !self.sealed.load(Ordering::Acquire)
+            || self.supervisor.lock().await.is_some()
+            || !matches!(self.ownership, ScopeOwnership::IsolatedContext)
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let debt = self.client.debt_ledger();
+        if debt.as_ref().is_none_or(|ledger| {
+            !ledger.matches_owner(self.generation, &self.targets.identity_scope)
+        }) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if !self.peer_context_absent().await? {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        self.client.check_cleanup_owner(&debt)?;
+        debt.ok_or(ProtocolError::StaleScope)?
+            .retire_after_context_destroy(&self.targets.context_id)?;
+        let mut cleanup = self
+            .cleanup
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        cleanup.isolated_context_disposed = true;
+        cleanup.owned_resources_contained = true;
+        Ok(())
+    }
+
     pub async fn release_after_containment(
         &self,
         proof: ContainmentProof,
@@ -5037,11 +5109,18 @@ impl ClientEnrollment {
                 }) {
                     return Err(ProtocolError::StaleScope);
                 }
-                self.cleanup_command(
-                    "Target.disposeBrowserContext",
-                    json!({"browserContextId":self.targets.context_id}),
-                )
-                .await?;
+                // Terminal close can arrive after the peer disposed the exact
+                // context or before it did. Read first only for this sealed
+                // handoff; ordinary native-only disposal is unchanged.
+                let already_absent = self.peer_context_retirement.load(Ordering::Acquire)
+                    && self.peer_context_absent().await?;
+                if !already_absent {
+                    self.cleanup_command(
+                        "Target.disposeBrowserContext",
+                        json!({"browserContextId":self.targets.context_id}),
+                    )
+                    .await?;
+                }
                 if let Some(debt) = debt {
                     debt.retire_after_context_destroy(&self.targets.context_id)?;
                 }
@@ -7094,6 +7173,7 @@ mod tests {
     use tokio_tungstenite::tungstenite::Message;
     type Log = Arc<Mutex<Vec<Value>>>;
     type Notices = tokio::sync::mpsc::Receiver<ServerMessage>;
+    include!("client_interop_retirement_tests.rs");
     include!("client_media_detach_tests.rs");
     include!("client_restart_readiness_tests.rs");
     include!("client_viewport_replacement_tests.rs");
@@ -7313,7 +7393,7 @@ mod tests {
                         }
                         if mode=="residual-dispose-held" && method=="Target.disposeBrowserContext" { continue; }
                         if (mode=="residual-dispose-rejected" && method=="Target.disposeBrowserContext")
-                            || (mode=="residual-release-rejected" && method=="Target.setAutoAttach" && request["params"]["autoAttach"]==false) {
+                            || ((mode=="residual-release-rejected" || mode=="peer-release-failed") && method=="Target.setAutoAttach" && request["params"]["autoAttach"]==false) {
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic residual lifecycle refusal"}}).to_string())).await.unwrap(); continue;
                         }
                         if mode=="delayed-dispose" && method=="Target.disposeBrowserContext" {tokio::time::sleep(Duration::from_millis(40)).await;}
@@ -7400,6 +7480,10 @@ mod tests {
                             "Target.getTargets" if mode=="attestation-missing-context" && inventory_reads>1=>json!({"targetInfos":[{"targetId":"target","type":"page"}]}),
                             "Target.getTargets" if mode=="attestation-foreign-context" && inventory_reads>1=>json!({"targetInfos":[{"targetId":"target","type":"page","browserContextId":"foreign-context"}]}),
                             "Target.getTargets" if mode=="attestation" || mode.starts_with("attestation-")=>json!({"targetInfos":[{"targetId":"target","type":"page","browserContextId":"owned-context"}]}),
+                            "Target.getBrowserContexts" if mode == "peer-absent" || mode == "peer-release-failed" => json!({"browserContextIds":["foreign-context"]}),
+                            "Target.getBrowserContexts" if mode == "peer-present" => json!({"browserContextIds":["owned-context","foreign-context"]}),
+                            "Target.getBrowserContexts" if mode == "peer-malformed" => json!({"browserContextIds":["foreign-context",null]}),
+                            "Target.getBrowserContexts" if mode == "peer-duplicate" => json!({"browserContextIds":["foreign-context","foreign-context"]}),
                             "Target.getTargets"=>json!({"targetInfos":[]}),
                             "Target.closeTarget"=>json!({"success":true}),
                             "Browser.getVersion"=>json!({"userAgent":"Synthetic Chromium"}),

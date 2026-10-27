@@ -795,3 +795,5 @@ async fn poisoned_terminal_recording_custody_never_proves_closed() {
         "final owner drop lost original charge accounting"
     );
 }
+
+include!("client_interop_phase_one_failure_tests.rs");

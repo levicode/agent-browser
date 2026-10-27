@@ -529,6 +529,22 @@ impl ClientSession {
         timeout_ms: u64,
         callback_token: Option<&str>,
     ) -> Result<OperationLease, ProtocolError> {
+        self.admit_callback_capped(generation, sequence, timeout_ms, callback_token, Ok(None))
+    }
+
+    /// A retained native lifecycle may shorten a later RPC to its original
+    /// absolute deadline. The broker still allocates the real new sequence and
+    /// cancellation channel and records the same deadline in both owner/lease.
+    /// The cap never authorizes a command, renews a timeout or copies old RPC
+    /// authority. Caller must validate its retained identity again at dispatch.
+    pub(crate) fn admit_callback_capped(
+        &self,
+        generation: u64,
+        sequence: u64,
+        timeout_ms: u64,
+        callback_token: Option<&str>,
+        deadline_cap: Result<Option<Instant>, ProtocolError>,
+    ) -> Result<OperationLease, ProtocolError> {
         let mut inner = self.lock()?;
         Self::check(&inner, generation)?;
         if sequence == 0 || sequence > MAX_SAFE_SEQUENCE {
@@ -547,6 +563,14 @@ impl ClientSession {
             return Err(ProtocolError::CapacityExceeded);
         }
         let mut deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        if let Some(cap) = deadline_cap? {
+            deadline = deadline.min(cap);
+            // Sequence was consumed above, even when the retained lifetime has
+            // already expired. A retry cannot revive this request identity.
+            if Instant::now() >= deadline {
+                return Err(ProtocolError::DeadlineExceeded);
+            }
+        }
         let mut parent_sequence = None;
         let mut callback_depth = 0;
         if let Some(token) = callback_token {
@@ -3254,3 +3278,7 @@ mod exact_retention_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "client_preparation_deadline_tests.rs"]
+mod preparation_deadline_tests;

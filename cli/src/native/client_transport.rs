@@ -38,6 +38,19 @@ pub trait ClientExecutor: Send + Sync + 'static {
         None
     }
     fn capabilities(&self) -> Vec<String>;
+    /// Optional shortening-only deadline for a later RPC belonging to an exact
+    /// retained native lifecycle. This synchronous hook may take only short
+    /// metadata locks. Mismatch rejects admission; absence never grants ownership.
+    /// Ordinary commands return Ok(None). Execute must revalidate
+    /// identity/state. No browser work, waiting, or RPC lease fabrication here.
+    fn admission_deadline_cap(
+        &self,
+        _generation: u64,
+        _command: &str,
+        _args: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<std::time::Instant>, ProtocolError> {
+        Ok(None)
+    }
     /// Reuse the producer's exact cleanup clock; absence grants no longer wait.
     fn begin_trace_cleanup(
         &self,
@@ -1487,11 +1500,12 @@ where
                                 .unwrap_or_default(),
                         )
                     } else {
-                        broker.admit_callback(
+                        broker.admit_callback_capped(
                             generation,
                             operation_seq,
                             timeout_ms,
                             callback_token.as_deref(),
+                            executor.admission_deadline_cap(generation, &command, &args),
                         )
                     };
                     match admitted {
@@ -4702,3 +4716,7 @@ mod tests {
 #[cfg(test)]
 #[path = "client_operation_retention_tests.rs"]
 mod operation_retention_tests;
+
+#[cfg(test)]
+#[path = "client_preparation_admission_tests.rs"]
+mod preparation_admission_tests;

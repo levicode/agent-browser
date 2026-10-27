@@ -3826,6 +3826,31 @@ impl ClientActions {
             .await
             .map_err(|error| d.failure(error))
     }
+    /// Test observation only: read the already-created encoder's real joined
+    /// success receipts. No test writer or failure injection is exposed.
+    #[cfg(test)]
+    pub(super) async fn recording_encoder_status_for_test(
+        &self,
+    ) -> (impl Fn() -> (bool, bool) + Send + Sync + 'static, PathBuf) {
+        let ledger = self.recording.lock().await;
+        let current = ledger
+            .current
+            .as_ref()
+            .expect("real recorder must be started");
+        let complete = current.state.encoder_complete.clone();
+        let succeeded = current.state.encoder_succeeded.clone();
+        let path = current.directory.path.clone();
+        (
+            move || {
+                (
+                    complete.load(Ordering::SeqCst),
+                    succeeded.load(Ordering::SeqCst),
+                )
+            },
+            path,
+        )
+    }
+
     /// Test scheduling only: retain the REAL recorder/encoder result, then hold
     /// its join publication. No capture, artifact, scope or cleanup proof is seeded.
     #[cfg(test)]

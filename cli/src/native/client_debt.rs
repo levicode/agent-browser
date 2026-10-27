@@ -205,6 +205,9 @@ pub(crate) enum AdmissionClass {
 pub(crate) enum OwnerCleanupCommand {
     DisableAutoAttach,
     CloseBrowser,
+    /// One fixed metadata read after exact old-context retirement and phase two.
+    /// It grants no new context, target, or application authority.
+    InteropContextInventory,
 }
 impl OwnerCleanupCommand {
     pub(crate) fn envelope(self) -> (&'static str, Option<Value>) {
@@ -216,11 +219,16 @@ impl OwnerCleanupCommand {
                 })),
             ),
             Self::CloseBrowser => ("Browser.close", None),
+            Self::InteropContextInventory => {
+                ("Target.getBrowserContexts", Some(serde_json::json!({})))
+            }
         }
     }
     fn category(self) -> CommandCategory {
         match self {
-            Self::DisableAutoAttach => CommandCategory::CleanupOther,
+            Self::DisableAutoAttach | Self::InteropContextInventory => {
+                CommandCategory::CleanupOther
+            }
             Self::CloseBrowser => CommandCategory::Destroy,
         }
     }
@@ -260,6 +268,7 @@ pub(crate) enum ScopeCleanupCommand {
         session: String,
     },
     Inventory,
+    ContextInventory,
 }
 impl ScopeCleanupCommand {
     pub(crate) fn diagnostic_component(&self) -> super::client_settlement_trace::CleanupComponent {
@@ -273,7 +282,7 @@ impl ScopeCleanupCommand {
             Self::RemoveScript { .. } => C::Script,
             Self::Detach { .. } => C::Detach,
             Self::DisableAutoAttach { .. } | Self::ResumeDebugger { .. } => C::Release,
-            Self::Inventory => C::Containment,
+            Self::Inventory | Self::ContextInventory => C::Containment,
         }
     }
 
@@ -331,6 +340,7 @@ impl ScopeCleanupCommand {
             Self::DisableFetch { session } => ("Fetch.disable", json!({}), Some(session)),
             Self::DisableNetwork { session } => ("Network.disable", json!({}), Some(session)),
             Self::Inventory => ("Target.getTargets", json!({}), None),
+            Self::ContextInventory => ("Target.getBrowserContexts", json!({}), None),
         };
         if let Some(session) = &result.2 {
             checked_cleanup_id(session)?;
@@ -987,8 +997,8 @@ struct LedgerState {
     eof_integrity_cause: EofIntegrityCause,
     retired: bool,
     context_id: Option<String>,
-    final_cleanup_claimed: [bool; 2],
-    final_cleanup_acknowledged: [bool; 2],
+    final_cleanup_claimed: [bool; 3],
+    final_cleanup_acknowledged: [bool; 3],
     bootstrap: Option<ScopeBootstrap>,
     created_targets: HashSet<String>,
     lifecycle_sessions: HashMap<String, LifecycleSessionPurpose>,
@@ -1648,6 +1658,40 @@ impl OwnerDebtLedger {
         state.initialization_scripts.insert(digest);
         Ok(())
     }
+    /// The constructor has independently verified a newly PW-created blank
+    /// Page in its newly adopted context. This records that real owned target,
+    /// not a synthetic Target.createTarget ACK. Session ownership still requires
+    /// the actual attach ACK, under this genuinely admitted adoption operation.
+    pub(crate) fn bind_adopted_blank_target(
+        &self,
+        context: &str,
+        target: &str,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.check_unpublished_operation(operation)?;
+        checked_cleanup_id(target)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired
+            || state.integrity_lost
+            || state.context_id.as_deref() != Some(context)
+            || state.root_creation_claimed
+            || !state.created_targets.is_empty()
+            || !state.targets.is_empty()
+            || state
+                .bootstrap
+                .as_ref()
+                .is_none_or(|bootstrap| !bootstrap.owns_context)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        check_metadata_add(&state, 64 + target.len())?;
+        state.created_targets.insert(target.to_owned());
+        state.root_creation_claimed = true;
+        Ok(())
+    }
     pub(crate) fn bind_state_bootstrap(
         &self,
         target: &str,
@@ -2141,7 +2185,8 @@ impl OwnerDebtLedger {
         })
     }
     /// Native lifecycle owner calls this only after exact context destruction
-    /// acknowledgement. It is never a timeout/recovery or waiter-drop shortcut.
+    /// ACK, or the sealed peer-handoff's successful browser-context inventory
+    /// proving this exact ID absent. Never a protocol-error/timeout shortcut.
     pub(crate) fn retire_after_context_destroy(
         &self,
         context_id: &str,
@@ -2498,6 +2543,21 @@ impl OwnerDebtLedger {
             .is_some_and(|bootstrap| !bootstrap.owns_context)
         {
             return Err(ProtocolError::PolicyDenied);
+        }
+        if owner_cleanup == Some(OwnerCleanupCommand::InteropContextInventory)
+            && (!state.retired
+                || state.integrity_lost
+                || !state.final_cleanup_acknowledged
+                    [OwnerCleanupCommand::DisableAutoAttach as usize]
+                || !state.commands.is_empty()
+                || !state.objects.is_empty()
+                || !state.groups.is_empty()
+                || state
+                    .bootstrap
+                    .as_ref()
+                    .is_none_or(|bootstrap| !bootstrap.owns_context))
+        {
+            return Err(ProtocolError::ScopeUnavailable);
         }
         if (state.retired && owner_cleanup.is_none())
             || owner_cleanup.is_some_and(|command| state.final_cleanup_claimed[command as usize])
@@ -3606,6 +3666,7 @@ fn unpublished_admits(
             .as_str()
             .is_some_and(|id| state.targets.contains_key(id)),
         "Target.getTargets" | "Browser.getVersion" => session.is_none(),
+        "Target.getBrowserContexts" => session.is_none() && p == &serde_json::json!({}),
         "Target.getTargetInfo" => {
             (known_session && p == &serde_json::json!({}))
                 || p["targetId"]

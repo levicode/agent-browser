@@ -9,6 +9,13 @@ use super::client_settlement_trace::{
     self as cleanup_trace, CleanupComponent as CleanupPart, TerminalCleanupStage,
 };
 
+#[path = "client_interop_adoption.rs"]
+mod interop_adoption;
+#[path = "client_interop_preparation.rs"]
+mod interop_preparation;
+#[path = "client_interop_wire.rs"]
+mod interop_wire;
+
 #[derive(Default)]
 struct GateState {
     epoch: u64,
@@ -345,6 +352,7 @@ struct RuntimeInitialization<'a> {
     retirement: &'a Arc<Mutex<RetirementJournal>>,
     options: &'a ScopeCreationOptions,
     replacement: Option<ReplacementSeed>,
+    reserved_page: bool,
 }
 
 /// One explicit new-scope request, not old application or final-close authority.
@@ -463,6 +471,8 @@ struct ReplacementSeed {
 }
 
 struct OwnedRuntime {
+    // 0 live, 1 retained phase-one in progress/failed, 2 ready for exact peer finish.
+    peer_retirement: std::sync::atomic::AtomicU8,
     // Original attempts allow focused input; reconnect requires fresh evidence.
     observation_after: Option<u64>,
     enrollment: Arc<super::client_enrollment::ClientEnrollment>,
@@ -479,7 +489,7 @@ struct OwnedRuntime {
     download_cleanup: tokio::sync::Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
 }
 struct PageActivation {
-    borrowed: bool,
+    fresh_document: bool,
     active: Arc<std::sync::atomic::AtomicBool>,
     serial: tokio::sync::Mutex<()>,
     page_state: Arc<super::client_page::ClientPageState>,
@@ -498,7 +508,7 @@ impl PageActivation {
         #[cfg(test)]
         page.client
             .activation_diagnostic("ensure-enter", None, "entered", None, None);
-        if !self.borrowed || self.active.load(std::sync::atomic::Ordering::SeqCst) {
+        if !self.fresh_document || self.active.load(std::sync::atomic::Ordering::SeqCst) {
             #[cfg(test)]
             page.client
                 .activation_diagnostic("ensure-bypass", None, "bypass", None, None);
@@ -800,6 +810,20 @@ impl OwnedRuntime {
             Ok(())
         }
     }
+    async fn begin_peer_retirement(&self) -> Result<(), ProtocolError> {
+        self.peer_retirement
+            .store(1, std::sync::atomic::Ordering::Release);
+        self.enrollment.seal();
+        self.enrollment.drain().await?;
+        self.actions
+            .cleanup_with_diagnostics(&self.network.client.cleanup_observer())
+            .await?;
+        self.enrollment.prepare_peer_context_retirement().await?;
+        self.peer_retirement
+            .store(2, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     async fn contain_and_release(&self) -> Result<(), ProtocolError> {
         self.contain_and_release_mode(false).await
     }
@@ -812,7 +836,13 @@ impl OwnedRuntime {
         let drained = self.enrollment.drain().await;
         cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::EnrollmentFallback, &drained);
         let drain_failed = drained.is_err();
-        let action_cleanup_failed = if preserve_recording {
+        let action_cleanup_failed = if self
+            .peer_retirement
+            .load(std::sync::atomic::Ordering::Acquire)
+            == 2
+        {
+            false // The retained peer-retirement phase one already joined it.
+        } else if preserve_recording {
             let recording = self
                 .actions
                 .recording_page_closing(&self.scope.identity_scope, &self.blobs)
@@ -1159,6 +1189,7 @@ impl OwnedBrowser {
             retirement,
             options,
             mut replacement,
+            reserved_page,
         } = request;
         if self.runtime.is_some() || (!self.owns_context && self.borrowed_targets.is_none()) {
             return Err(ProtocolError::PolicyDenied);
@@ -1263,7 +1294,7 @@ impl OwnedBrowser {
         );
         let page_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let activation = Arc::new(PageActivation {
-            borrowed: !self.owns_context,
+            fresh_document: !self.owns_context || reserved_page,
             active: page_active.clone(),
             serial: tokio::sync::Mutex::new(()),
             page_state: self.page_state.clone(),
@@ -1271,6 +1302,7 @@ impl OwnedBrowser {
             enrollment: enrollment.clone(),
         });
         self.runtime = Some(OwnedRuntime {
+            peer_retirement: std::sync::atomic::AtomicU8::new(0),
             observation_after: None,
             enrollment: enrollment.clone(),
             network,
@@ -1508,6 +1540,20 @@ impl OwnedBrowser {
             .collect();
         if let Some(runtime) = &self.runtime {
             self.ui.seal();
+            if runtime
+                .peer_retirement
+                .load(std::sync::atomic::Ordering::Acquire)
+                != 0
+            {
+                if runtime
+                    .peer_retirement
+                    .load(std::sync::atomic::Ordering::Acquire)
+                    != 2
+                {
+                    return Err(ProtocolError::CleanupFailed);
+                }
+                runtime.enrollment.confirm_peer_context_retirement().await?;
+            }
             let contained = runtime.contain_and_release().await;
             runtime
                 .enrollment
@@ -2103,6 +2149,176 @@ async fn observe_generic_admission_wait<F: std::future::Future>(
     .await
 }
 
+/// Shared retained startup publication. Ordinary open and interop adoption use
+/// the same runtime enrollment, owner journal, event barrier and failure cleanup.
+struct ScopeStartup {
+    gate: Arc<ExecutionGate>,
+    owner: Arc<tokio::sync::Mutex<Option<OwnedBrowser>>>,
+    connection_watch: ConnectionWatch,
+    event_sink: super::client_transport::ClientEventSink,
+    broker: Arc<super::client_session::ClientSession>,
+    retirement: Arc<Mutex<RetirementJournal>>,
+    blobs: Arc<super::client_blobs::BlobStore>,
+    uncertain: Arc<std::sync::atomic::AtomicBool>,
+}
+impl ScopeStartup {
+    async fn publish(
+        self,
+        mut resource: OwnedBrowser,
+        operation: &super::client_session::OperationLease,
+        options: &ScopeCreationOptions,
+        preparation: Option<&interop_preparation::InteropPreparation>,
+    ) -> Result<serde_json::Value, ProtocolError> {
+        let Self {
+            gate,
+            owner,
+            connection_watch,
+            event_sink,
+            broker,
+            retirement,
+            blobs,
+            uncertain,
+        } = self;
+        let identity = resource.identity_scope.clone();
+        let recovery = resource.recovery_identity();
+        let authority = match resource
+            .initialize_runtime(
+                gate.clone(),
+                broker,
+                event_sink.clone(),
+                blobs,
+                RuntimeInitialization {
+                    operation,
+                    retirement: &retirement,
+                    options,
+                    replacement: None,
+                    reserved_page: preparation.is_some(),
+                },
+            )
+            .await
+        {
+            Ok(authority) => authority,
+            Err(error) => {
+                let result = match resource.close().await {
+                    Ok(()) => {
+                        uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
+                        Err(error)
+                    }
+                    Err(_) => {
+                        *owner.lock().await = Some(resource);
+                        Err(ProtocolError::CleanupFailed)
+                    }
+                };
+                return result;
+            }
+        };
+        let mut current = owner.lock().await;
+        let published = loop {
+            if *operation.cancellation.borrow() != super::client_session::CancelSignal::None {
+                break Err(ProtocolError::Cancelled);
+            }
+            if std::time::Instant::now() >= operation.deadline {
+                break Err(ProtocolError::DeadlineExceeded);
+            }
+            let publication = {
+                let mut handoff = match preparation
+                    .map(|preparation| preparation.claim_publication(operation))
+                    .transpose()
+                {
+                    Ok(handoff) => handoff,
+                    Err(error) => break Err(error),
+                };
+                let publication = resource
+                    .runtime
+                    .as_ref()
+                    .ok_or(ProtocolError::ScopeUnavailable)
+                    .and_then(|runtime| runtime.enrollment.publish_initialized(&authority));
+                if publication.is_ok() {
+                    if let Some(handoff) = handoff.as_mut() {
+                        handoff.published();
+                    }
+                }
+                publication
+            };
+            match publication {
+                Ok(epoch) => break Ok(epoch),
+                Err(error) => {
+                    if error != ProtocolError::ScopeUnavailable {
+                        break Err(error);
+                    }
+                    if std::time::Instant::now() >= operation.deadline
+                        || *operation.cancellation.borrow()
+                            != super::client_session::CancelSignal::None
+                    {
+                        break Err(error);
+                    }
+                    if gate.state.lock().map_or(true, |state| state.closed) {
+                        break Err(error);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+            }
+        };
+        match published {
+            Ok(_) => {
+                if let Err(error) = resource
+                    .persistent_probe
+                    .commit(resource.manager.active_target_id().unwrap_or_default())
+                {
+                    *current = Some(resource);
+                    return Err(error);
+                }
+                let mut watch_slot = connection_watch.lock().await;
+                // A completed borrowed scope may reopen on a different
+                // connection. Join the old event-only watcher before
+                // installing the exact current connection's watcher.
+                if let Some(previous) = watch_slot.as_mut() {
+                    previous.abort();
+                    let _ = previous.await;
+                }
+                *watch_slot = None;
+                if watch_slot.is_none() {
+                    {
+                        let sink = event_sink;
+                        let watched_client = resource.manager.client.clone();
+                        let watched_targets = resource.targets.clone();
+                        let mut lost = watched_client.remote_connection_closed();
+                        *watch_slot = Some(tokio::spawn(async move {
+                            loop {
+                                if *lost.borrow() {
+                                    return sink
+                                        .emit_disconnected(&watched_client, &watched_targets)
+                                        .map(|_queued| ());
+                                }
+                                if lost.changed().await.is_err() {
+                                    return Ok(());
+                                }
+                            }
+                        }));
+                    }
+                }
+                drop(watch_slot);
+                *current = Some(resource);
+                uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
+                Ok(serde_json::json!({"identityScope": identity, "recoveryIdentity": recovery}))
+            }
+            Err(error) => {
+                drop(current);
+                match resource.close().await {
+                    Ok(()) => {
+                        uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
+                        Err(error)
+                    }
+                    Err(_) => {
+                        *owner.lock().await = Some(resource);
+                        Err(ProtocolError::CleanupFailed)
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub struct ClientBrowser {
     #[cfg(test)]
     generic_admission_probe: Arc<Mutex<Option<GenericAdmissionProbe>>>,
@@ -2111,6 +2327,7 @@ pub struct ClientBrowser {
     gate: Arc<ExecutionGate>,
     owner: Arc<tokio::sync::Mutex<Option<OwnedBrowser>>>,
     retained_browser: Arc<tokio::sync::Mutex<Option<super::browser::BrowserManager>>>,
+    interop_preparation: Arc<interop_preparation::InteropPreparation>,
     refs: Arc<Mutex<super::element::RefMap>>,
     blobs: Arc<super::client_blobs::BlobStore>,
     retirement: Arc<Mutex<RetirementJournal>>,
@@ -2129,13 +2346,17 @@ impl ClientBrowser {
         let refs = Arc::new(Mutex::new(super::element::RefMap::new()));
         let observation =
             super::client_observation_dispatch::ObservationDispatch::new(refs.clone());
+        let owner = Arc::new(tokio::sync::Mutex::new(None));
+        let interop_preparation =
+            interop_preparation::InteropPreparation::new(owner.clone(), broker.clone());
         Self {
             #[cfg(test)]
             generic_admission_probe: Arc::new(Mutex::new(None)),
             broker,
             event_sink: std::sync::OnceLock::new(),
             gate: Arc::new(ExecutionGate::default()),
-            owner: Arc::new(tokio::sync::Mutex::new(None)),
+            owner,
+            interop_preparation,
             retained_browser: Arc::new(tokio::sync::Mutex::new(None)),
             refs,
             blobs: Arc::new(
@@ -2274,137 +2495,19 @@ impl ClientBrowser {
                     }
                     Err(error)
                 }
-                Ok(mut resource) => {
-                    let identity = resource.identity_scope.clone();
-                    let recovery = resource.recovery_identity();
-                    let authority = match resource
-                        .initialize_runtime(
-                            gate.clone(),
-                            broker,
-                            event_sink.clone(),
-                            blobs,
-                            RuntimeInitialization {
-                                operation: &operation,
-                                retirement: &retirement,
-                                options: &options,
-                                replacement: None,
-                            },
-                        )
-                        .await
-                    {
-                        Ok(authority) => authority,
-                        Err(error) => {
-                            let result = match resource.close().await {
-                                Ok(()) => {
-                                    uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    Err(error)
-                                }
-                                Err(_) => {
-                                    *owner.lock().await = Some(resource);
-                                    Err(ProtocolError::CleanupFailed)
-                                }
-                            };
-                            let _ = send.send(result);
-                            return;
-                        }
-                    };
-                    let mut current = owner.lock().await;
-                    let published = loop {
-                        if *operation.cancellation.borrow()
-                            != super::client_session::CancelSignal::None
-                        {
-                            break Err(ProtocolError::Cancelled);
-                        }
-                        if std::time::Instant::now() >= operation.deadline {
-                            break Err(ProtocolError::DeadlineExceeded);
-                        }
-                        match resource
-                            .runtime
-                            .as_ref()
-                            .ok_or(ProtocolError::ScopeUnavailable)
-                            .and_then(|runtime| runtime.enrollment.publish_initialized(&authority))
-                        {
-                            Ok(epoch) => break Ok(epoch),
-                            Err(error) => {
-                                if error != ProtocolError::ScopeUnavailable {
-                                    break Err(error);
-                                }
-                                if std::time::Instant::now() >= operation.deadline
-                                    || *operation.cancellation.borrow()
-                                        != super::client_session::CancelSignal::None
-                                {
-                                    break Err(error);
-                                }
-                                if gate.state.lock().map_or(true, |state| state.closed) {
-                                    break Err(error);
-                                }
-                                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                            }
-                        }
-                    };
-                    match published {
-                        Ok(_) => {
-                            if let Err(error) = resource
-                                .persistent_probe
-                                .commit(resource.manager.active_target_id().unwrap_or_default())
-                            {
-                                *current = Some(resource);
-                                let _ = send.send(Err(error));
-                                return;
-                            }
-                            let mut watch_slot = connection_watch.lock().await;
-                            // A completed borrowed scope may reopen on a different
-                            // connection. Join the old event-only watcher before
-                            // installing the exact current connection's watcher.
-                            if let Some(previous) = watch_slot.as_mut() {
-                                previous.abort();
-                                let _ = previous.await;
-                            }
-                            *watch_slot = None;
-                            if watch_slot.is_none() {
-                                {
-                                    let sink = event_sink;
-                                    let watched_client = resource.manager.client.clone();
-                                    let watched_targets = resource.targets.clone();
-                                    let mut lost = watched_client.remote_connection_closed();
-                                    *watch_slot = Some(tokio::spawn(async move {
-                                        loop {
-                                            if *lost.borrow() {
-                                                return sink
-                                                    .emit_disconnected(
-                                                        &watched_client,
-                                                        &watched_targets,
-                                                    )
-                                                    .map(|_queued| ());
-                                            }
-                                            if lost.changed().await.is_err() {
-                                                return Ok(());
-                                            }
-                                        }
-                                    }));
-                                }
-                            }
-                            drop(watch_slot);
-                            *current = Some(resource);
-                            uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
-                            Ok(
-                                serde_json::json!({"identityScope": identity, "recoveryIdentity": recovery}),
-                            )
-                        }
-                        Err(error) => {
-                            drop(current);
-                            match resource.close().await {
-                                Ok(()) => {
-                                    uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
-                                    Err(error)
-                                }
-                                Err(_) => {
-                                    *owner.lock().await = Some(resource);
-                                    Err(ProtocolError::CleanupFailed)
-                                }
-                            }
-                        }
+                Ok(resource) => {
+                    ScopeStartup {
+                        gate,
+                        owner,
+                        connection_watch,
+                        event_sink,
+                        broker,
+                        retirement,
+                        blobs,
+                        uncertain,
                     }
+                    .publish(resource, &operation, &options, None)
+                    .await
                 }
             };
             let _ = send.send(result);
@@ -2421,21 +2524,30 @@ impl ClientBrowser {
         operation_seq: u64,
     ) -> Result<serde_json::Value, ProtocolError> {
         let transition = self.lifecycle.clone().lock_owned().await;
-        let diagnostics = {
+        let (diagnostics, peer_ready) = {
             let owner = self.owner.lock().await;
             if owner.as_ref().map(|scope| scope.identity_scope.as_str())
                 != Some(identity_scope.as_str())
             {
                 return Err(ProtocolError::StaleScope);
             }
-            owner
-                .as_ref()
-                .and_then(|owner| owner.manager.client.cleanup_diagnostics())
+            let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
+            (
+                owner.manager.client.cleanup_diagnostics(),
+                owner.runtime.as_ref().is_some_and(|runtime| {
+                    runtime
+                        .peer_retirement
+                        .load(std::sync::atomic::Ordering::Acquire)
+                        == 2
+                }),
+            )
         };
         self.stop_enrollment(false)?;
         #[cfg(feature = "acceptance-faults")]
         self.faults.retire_scope(&identity_scope)?;
-        self.gate.begin_transition()?;
+        if !peer_ready {
+            self.gate.begin_transition()?;
+        }
         self.gate.drained().await?;
         let mut slot = self.startup_task.lock().await;
         self.startup_uncertain
@@ -2565,12 +2677,20 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         let owner = self.owner.try_lock().ok()?;
         let owner = owner.as_ref()?;
         if owner.identity_scope != scope
-            || !owner.manager.client.debt_ledger()?.matches_owner(key.generation, scope)
+            || !owner
+                .manager
+                .client
+                .debt_ledger()?
+                .matches_owner(key.generation, scope)
             || self.broker.health().ok()?.1 != super::client_protocol::ScopeState::Quarantined
         {
             return None;
         }
-        owner.runtime.as_ref()?.actions.freeze_finalized_recording(scope, key, &self.blobs)
+        owner
+            .runtime
+            .as_ref()?
+            .actions
+            .freeze_finalized_recording(scope, key, &self.blobs)
     }
     fn begin_trace_cleanup(
         &self,
@@ -2658,6 +2778,16 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         Ok(())
     }
 
+    fn admission_deadline_cap(
+        &self,
+        generation: u64,
+        command: &str,
+        args: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<std::time::Instant>, ProtocolError> {
+        self.interop_preparation
+            .admission_deadline_cap(generation, command, args)
+    }
+
     fn capabilities(&self) -> Vec<String> {
         // Capabilities describe implemented, wired candidate contracts. External
         // acceptance evidence separately determines release readiness.
@@ -2709,6 +2839,16 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
     ) -> super::client_transport::NativeOutcome {
         use super::client_protocol::Effects;
         use super::client_transport::NativeOutcome;
+        if matches!(
+            command.as_str(),
+            "scope.interop.prepare"
+                | "scope.interop.adopt"
+                | "scope.interop.abort"
+                | "scope.interop.identify"
+                | "scope.interop.retire"
+        ) {
+            return self.execute_interop(command, args, lease).await;
+        }
         // Scope authority is captured by the caller before asynchronous work.
         // Never replace it with the current scope after a reset or reconnect.
         let captured_scope = if command == "scope.open" {
@@ -2743,6 +2883,25 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 };
             }
             if command != "scope.end" {
+                if self
+                    .owner
+                    .lock()
+                    .await
+                    .as_ref()
+                    .and_then(|owner| owner.runtime.as_ref())
+                    .is_some_and(|runtime| {
+                        runtime
+                            .peer_retirement
+                            .load(std::sync::atomic::Ordering::Acquire)
+                            != 0
+                    })
+                {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(ProtocolError::ScopeUnavailable),
+                        effects: Effects::NotDispatched,
+                    };
+                }
                 args.remove("identityScope");
             }
             Some(scope)
@@ -4251,6 +4410,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         };
         let stop_failed = self.stop_enrollment(true).is_err();
         self.gate.seal();
+        // Signal retained preparation before joining any lifecycle lock holder.
+        let interop_failed = self.interop_preparation.shutdown().await.is_err();
         let mut startup = self.startup_task.lock().await;
         let supervisor_failed = match startup.as_mut() {
             Some(task) => task.await.is_err(),
@@ -4343,6 +4504,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         };
         *connection_watch = None;
         if supervisor_failed
+            || interop_failed
             || terminal_recording_failed
             || stop_failed
             || watch_failed
@@ -4938,6 +5100,7 @@ impl ClientBrowser {
                                 actions: actions.clone(),
                                 owner: Some(replacement_owner),
                             }),
+                            reserved_page: false,
                         },
                     )
                     .await?;
@@ -5414,6 +5577,7 @@ impl ClientBrowser {
                                 actions: actions.clone(),
                                 owner: None,
                             }),
+                            reserved_page: false,
                         },
                     )
                     .await?;
