@@ -47,7 +47,12 @@ const CASES = [
   ['css=li >> nth=NaN >> *css=div', 'nth-capture'],
   ['css=li >> nth= >> *css=div', 'nth-capture'],
   ['css=li >> nth=Infinity >> *css=div', 'nth-capture'],
+  ['css=li >> nth=0x2 >> *css=div', 'nth-capture'],
+  ['css=li >> nth=1.5 >> *css=div', 'nth-capture'],
+  ['css=li >> nth=9007199254740992 >> *css=div', 'nth-capture'],
   ['css=li >> nth=0 >> nth=1 >> *css=div', 'nth-capture'],
+  ['css=li >> nth=0 >> *css=div >> nth=1', 'nth-capture'],
+  ['css=li >> nth=0 >> *id=row', 'nth-capture'],
   // The captured part may itself be nth; xpath does not change the rule.
   ['li >> *nth=0', 'nth-capture'],
   ['*nth=0', 'nth-capture'],
