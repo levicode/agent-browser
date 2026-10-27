@@ -113,9 +113,16 @@ const CASES = [
   { selector: '.box >> *visible=true', parts: [{ engine: 'css', body: '.box' }, { engine: 'visible', body: 'true' }] },
   { selector: '.box >> *visible=false', parts: [{ engine: 'css', body: '.box' }, { engine: 'visible', body: 'false' }] },
   { selector: '#rows >> li >> *visible=false', parts: [{ engine: 'css', body: '#rows' }, { engine: 'css', body: 'li' }, { engine: 'visible', body: 'false' }] },
+  // The body boundary in a real document: body/html are Elements, unlike the
+  // document root itself.
+  { selector: 'body >> visible=true', parts: [{ engine: 'css', body: 'body' }, { engine: 'visible', body: 'true' }] },
+  { selector: 'body >> visible=false', parts: [{ engine: 'css', body: 'body' }, { engine: 'visible', body: 'false' }] },
+  { selector: 'body >> visible=', parts: [{ engine: 'css', body: 'body' }, { engine: 'visible', body: '' }] },
+  { selector: 'html >> visible=true', parts: [{ engine: 'css', body: 'html' }, { engine: 'visible', body: 'true' }] },
+  { selector: 'html >> visible=false', parts: [{ engine: 'css', body: 'html' }, { engine: 'visible', body: 'false' }] },
 ];
 const IDS = [
-  'body', 'shown', 'display-none', 'visibility-hidden', 'visibility-collapse', 'zero-area',
+  'shown', 'display-none', 'visibility-hidden', 'visibility-collapse', 'zero-area',
   'opacity-zero', 'content-skipped', 'contents-empty', 'contents-child', 'contents-visible-child',
   'contents-zero-child', 'contents-zero-grandchild', 'contents-text', 'contents-zero-text',
   'contents-hidden-text', 'contents-override', 'contents-override-child', 'inert-node',

@@ -205,6 +205,13 @@ expect('contents painted text', one('contents-text', 'true'), ['contents-text'])
 expect('contents zero text', one('contents-zero-text', 'false'), ['contents-zero-text']);
 expect('contents child overrides visibility', one('contents-override', 'true'), ['contents-override']);
 
+// The body boundary: `body`/`html` are ordinary Elements, so the pinned
+// engine filters them like any other root. A document root is not.
+expect('body is a visible Element', ids([engine('css', 'body'), engine('visible', 'true')]), ['body']);
+expect('body is not an invisible Element', ids([engine('css', 'body'), engine('visible', 'false')]), []);
+expect('empty body drops body element', ids([engine('css', 'body'), engine('visible', '')]), []);
+expect('nth after the body filter keeps the same body', ids([engine('css', 'body'), engine('visible', 'true'), engine('nth', '0')]), ['body']);
+
 // `visible` filters the current roots; it never widens the chain.
 expect('visible then css keeps visible descendants', ids([engine('css', '#contents-child'), engine('visible', 'true'), engine('css', 'span')]), ['contents-visible-child']);
 expect('invisible root excludes descendants', ids([engine('css', '#contents-hidden-child'), engine('visible', 'true'), engine('css', 'span')]), []);
