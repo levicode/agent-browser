@@ -38,9 +38,8 @@ function elementVisible(element, depth = 0) {
   if (style.display === 'contents') {
     // No box exists for the element itself; Playwright asks its light-tree
     // children and direct text nodes instead, never its shadow root.
-    for (let child = element.firstChild, count = 0; child; child = child.nextSibling) {
+    for (let child = element.firstChild; child; child = child.nextSibling) {
       matcherStep();
-      if (++count > 100000) throw matcherLimit;
       if (child.nodeType === 1 && elementVisible(child, depth + 1)) return true;
       if (child.nodeType === 3 && visibleTextNode(child)) return true;
     }
