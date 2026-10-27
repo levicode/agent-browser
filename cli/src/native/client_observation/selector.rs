@@ -96,6 +96,23 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             _ => return Err(ParseError::Invalid),
         }
     }
+    // Playwright 1.64.1 refuses every top-level `nth` when the selector also
+    // captures (`Can't query n-th element in a request with the capture.`).
+    // It does so in InjectedScript.querySelectorAll, after engine-name
+    // resolution and before the capture rewrite, so position, sign, repetition
+    // and the captured part itself do not matter. Only a parsed `nth` engine
+    // counts: a CSS body, an attribute body or a quoted text body that happens
+    // to contain the characters `nth` stays literal data.
+    //
+    // This runs after the engine allowlist on purpose. Engines this adapter
+    // does not implement must keep returning unsupported-capability rather than
+    // being relabelled as an invalid locator, because that distinction drives
+    // capability reporting. Pinned Playwright would execute those engines and
+    // then hit the nth refusal, so a spec-native selector with an unsupported
+    // engine still fails here, only with the adapter's own classification.
+    if capture.is_some() && parts.iter().any(|part| part.engine == "nth") {
+        return Err(ParseError::Invalid);
+    }
     Ok(parts)
 }
 
@@ -424,6 +441,107 @@ mod tests {
         );
         assert_eq!(parse("role=button"), Err(ParseError::Unsupported));
         assert_eq!(parse("data-k=row"), Err(ParseError::Invalid));
+    }
+
+    #[test]
+    fn capture_refuses_every_nth_position_and_neighbour_engine() {
+        // Pinned 1.64.1 InjectedScript.querySelectorAll rejects any top-level
+        // `nth` once the selector captures, before the capture rewrite runs.
+        // Position does not matter: before, after, negative, repeated, and the
+        // captured part itself are all refused.
+        for selector in [
+            "css=li >> nth=0 >> *visible=true",
+            "css=li >> nth=0 >> *visible=false",
+            "css=li >> nth=0 >> *css=div",
+            "css=li >> nth=0 >> *css:light=div",
+            "css=li >> nth=0 >> *xpath=//li",
+            "css=li >> nth=0 >> *data-testid=row",
+            "css=li >> nth=0 >> *data-testid:light=row",
+            "css=li >> nth=-1 >> *visible=true",
+            "css=li >> nth=-2 >> *data-testid=row",
+            "css=li >> *css=div >> nth=0",
+            "css=li >> *visible=true >> nth=0",
+            "css=li >> nth=0 >> nth=1 >> *css=div",
+            "css=li >> nth=NaN >> *css=div",
+            "css=li >> nth= >> *css=div",
+            "css=li >> nth=Infinity >> *css=div",
+            "li >> *nth=0",
+            "*nth=0",
+            "nth=0 >> *css=li",
+            "xpath=//li >> nth=0 >> *css=div",
+        ] {
+            assert_eq!(parse(selector), Err(ParseError::Invalid), "{selector}");
+        }
+    }
+
+    #[test]
+    fn nth_without_capture_and_capture_without_nth_are_unchanged() {
+        for selector in [
+            "li >> nth=0",
+            "li >> nth=-1",
+            "li >> nth=0 >> nth=1",
+            "css=ul >> nth=2 >> div",
+            "section >> nth=NaN",
+            "css=ul >> xpath=//li >> nth=-1",
+        ] {
+            assert!(parse(selector).is_ok(), "{selector}");
+        }
+        for selector in [
+            "*css=li",
+            "ul >> *css=li",
+            "*visible=true",
+            "div >> *visible=false",
+            "*data-testid=row",
+            "css=div >> *data-test-id:light=cell",
+            "*xpath=//li",
+            "css=ul >> *visible=true",
+        ] {
+            assert!(parse(selector).is_ok(), "{selector}");
+        }
+        // The existing final-only rule and the single-capture rule still
+        // reject their own inputs.
+        assert_eq!(parse("*css=li >> css=div"), Err(ParseError::Invalid));
+        assert_eq!(parse("*css=a >> *css=b"), Err(ParseError::Invalid));
+        assert_eq!(
+            parse("css=div >> *css=span >> css=b"),
+            Err(ParseError::Invalid)
+        );
+    }
+
+    #[test]
+    fn nth_text_never_participates_in_the_capture_rule() {
+        // Only a parsed `nth` engine counts. Characters inside a CSS body, an
+        // attribute body or a quoted text body stay literal data. A bare `nth`
+        // has no `=`, so Playwright parses it as CSS with body "nth", not as
+        // the nth engine; a naive substring check would wrongly reject it.
+        assert!(parse("div:nth-child(1) >> *css=span").is_ok());
+        assert!(parse("div[data-x=\"nth=0\"] >> *css=span").is_ok());
+        assert!(parse("data-testid=nth=0 >> *css=span").is_ok());
+        assert!(parse("*css=nth").is_ok());
+        assert!(parse("css=ul >> nth-child >> *css=li").is_ok());
+        assert!(parse("nth >> *css=div").is_ok());
+        assert_eq!(parse("nth >> *css=div").unwrap()[0].engine, "css");
+        assert_eq!(parse("css=li >> nth >> *css=div").unwrap()[1].engine, "css");
+        // A quoted text part is still unsupported, not an nth capture refusal.
+        assert_eq!(
+            parse("css=li >> \"nth=0\" >> *css=div"),
+            Err(ParseError::Unsupported)
+        );
+        assert_eq!(parse("text=nth >> *css=div"), Err(ParseError::Unsupported));
+        // Unsupported and unknown engines keep their existing classification
+        // instead of being relabelled by the new capture rule.
+        assert_eq!(
+            parse("css=li >> nth=0 >> role=button >> *css=div"),
+            Err(ParseError::Unsupported)
+        );
+        assert_eq!(
+            parse("css=li >> nth=0 >> text=Hello >> *css=div"),
+            Err(ParseError::Unsupported)
+        );
+        assert_eq!(
+            parse("css=li >> nth=0 >> bogus=1 >> *css=div"),
+            Err(ParseError::Invalid)
+        );
     }
 
     #[test]
