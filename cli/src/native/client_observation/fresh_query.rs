@@ -30,9 +30,9 @@ fn eligible(expression: &LocatorExpression, fields: &[ReadField]) -> bool {
 
 /// The native root inventory is authority for closed author roots and UA
 /// exclusion. Churning element IDs are deliberately absent from the lease.
-type RootInventory = (Vec<i64>, Vec<bool>, Vec<usize>);
+pub(super) type RootInventory = (Vec<i64>, Vec<bool>, Vec<usize>);
 
-fn roots(root: &Value) -> Result<Option<RootInventory>, ObservationError> {
+pub(super) fn roots(root: &Value) -> Result<Option<RootInventory>, ObservationError> {
     let internal = browser_internal_ids(root)?;
     let ids: Vec<i64> = security_root_ids(root)?
         .into_iter()

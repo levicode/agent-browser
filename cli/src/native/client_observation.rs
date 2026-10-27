@@ -19,6 +19,8 @@ mod author_projection;
 mod frame_policy;
 #[path = "client_observation/fresh_query.rs"]
 mod fresh_query;
+#[path = "client_observation/role_candidates.rs"]
+mod role_candidates;
 pub(crate) use frame_policy::ObservationFramePolicy;
 #[path = "client_observation/semantic_frame_proof.rs"]
 mod semantic_frame_proof;
@@ -1423,23 +1425,13 @@ fn project_node(
 ) -> Result<SemanticNode, ObservationError> {
     project_node_with_refs(frame, backend, ax, Some(refs), revision, data, bounded)
 }
-#[allow(clippy::too_many_arguments)]
-fn project_node_with_refs(
-    frame: &ObservationFrame,
-    backend: i64,
+/// One public-role projection for full metadata and conservative query planning.
+/// Candidate planning varies unknown renderer facts; it never substitutes CSS roles.
+fn project_public_role(
     ax: &AXNode,
-    refs: Option<&mut RefMap>,
-    revision: u64,
     data: &Value,
-    bounded: bool,
-) -> Result<SemanticNode, ObservationError> {
-    match data["__nativeStatus"].as_str() {
-        Some("stale-reference") => return Err(ObservationError::StaleReference),
-        Some("invalid-arguments") => return Err(ObservationError::InvalidArguments),
-        Some("resource-limit") => return Err(ObservationError::ResourceLimit),
-        Some(_) => return Err(ObservationError::BackendFailure),
-        None => {}
-    }
+    author: &Option<author_projection::Facts>,
+) -> Result<Option<String>, ObservationError> {
     let mut role = ax_string(&ax.role).map(|role| match role.as_str() {
         "img" => "image".into(),
         "Iframe" => "iframe".into(),
@@ -1448,13 +1440,6 @@ fn project_node_with_refs(
         "StaticText" | "ListMarker" => "text".into(),
         _ => role,
     });
-    let author = data
-        .get("author")
-        .map(|value| {
-            serde_json::from_value::<author_projection::Facts>(value.clone())
-                .map_err(|_| ObservationError::BackendFailure)
-        })
-        .transpose()?;
     // Presentation is ineffective on focusable/global-ARIA receivers. Reuse
     // the same effective absence for all implicit tag and editor projections.
     let authored = authored_role(&data["attributes"]);
@@ -1661,6 +1646,34 @@ fn project_node_with_refs(
             .to_owned(),
         );
     }
+    Ok(role)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_node_with_refs(
+    frame: &ObservationFrame,
+    backend: i64,
+    ax: &AXNode,
+    refs: Option<&mut RefMap>,
+    revision: u64,
+    data: &Value,
+    bounded: bool,
+) -> Result<SemanticNode, ObservationError> {
+    match data["__nativeStatus"].as_str() {
+        Some("stale-reference") => return Err(ObservationError::StaleReference),
+        Some("invalid-arguments") => return Err(ObservationError::InvalidArguments),
+        Some("resource-limit") => return Err(ObservationError::ResourceLimit),
+        Some(_) => return Err(ObservationError::BackendFailure),
+        None => {}
+    }
+    let author = data
+        .get("author")
+        .map(|value| {
+            serde_json::from_value::<author_projection::Facts>(value.clone())
+                .map_err(|_| ObservationError::BackendFailure)
+        })
+        .transpose()?;
+    let role = project_public_role(ax, data, &author)?;
     let mut binding = frame.binding.clone();
     binding.actionable = !matches!(role.as_deref(), Some("document" | "text" | "InlineTextBox"))
         && !author
@@ -3571,7 +3584,7 @@ async fn evaluate_query(
     )
     .await?;
     let tree: GetFullAXTreeResult =
-        serde_json::from_value(ax_value).map_err(|_| ObservationError::BackendFailure)?;
+        serde_json::from_value(ax_value.clone()).map_err(|_| ObservationError::BackendFailure)?;
     let ax_by_backend: HashMap<i64, &AXNode> = tree
         .nodes
         .iter()
@@ -3580,14 +3593,31 @@ async fn evaluate_query(
     // DOM.getDocument includes shadow roots. Query candidates are real elements,
     // including AX-omitted nodes; shared projection applies authored public roles.
     let dom = frame_dom(client, frame, lease).await?;
-    let ids = author_query_ids(&dom["root"])?;
+    let candidate_plan = role_candidates::plan(&dom["root"], &ax_value, expression, options)?;
+    let ids = match &candidate_plan {
+        Some(plan) => plan.ids.clone(),
+        None => author_query_ids(&dom["root"])?,
+    };
     let mut nodes = Vec::new();
     let metadata_options = ObservationOptions {
         test_id_attribute: options.test_id_attribute.clone(),
         secure_field_selector: options.secure_field_selector.clone(),
         ..Default::default()
     };
-    let security = security_inventory(client, frame, &metadata_options, lease).await?;
+    let security = match &candidate_plan {
+        Some(plan) => {
+            security_inventory_for_roots(
+                client,
+                frame,
+                &metadata_options,
+                lease,
+                &dom,
+                plan.roots.0.clone(),
+            )
+            .await?
+        }
+        None => security_inventory(client, frame, &metadata_options, lease).await?,
+    };
     let group = client
         .readonly_group_instance(&format!("native-query-{}", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
@@ -3608,7 +3638,7 @@ async fn evaluate_query(
             }
         })).buffered(16).collect().await;
         let objects=collect_hint_results(objects)?;
-        if objects.is_empty() { return Ok(QueryEvaluation { projection_count: 0, matches: Vec::new() }); }
+        let (indices,redacted) = if objects.is_empty() { (Vec::<usize>::new(),Vec::<usize>::new()) } else {
         let mut arguments=vec![json!({"value":compile_selector_expression(expression)?}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
         arguments.extend(objects.iter().map(|id|json!({"objectId":id})));
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
@@ -3617,6 +3647,27 @@ async fn evaluate_query(
         match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("invalid-locator")=>return Err(ObservationError::InvalidLocator),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
         let indices:Vec<usize>=serde_json::from_value(value["indices"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         let redacted:Vec<usize>=serde_json::from_value(value["redacted"].clone()).map_err(|_|ObservationError::BackendFailure)?;
+        (indices,redacted)
+        };
+        if let Some(expected) = &candidate_plan {
+            // Reacquire the complete native inventories, not just issued handles:
+            // additions and formerly excluded receivers changing role must reject.
+            let current_ax = command(client,session,"Accessibility.getFullAXTree",json!({"frameId":frame.binding.frame}),lease).await?;
+            let current_dom = frame_dom(client,frame,lease).await?;
+            let current = role_candidates::plan(&current_dom["root"],&current_ax,expression,options)?;
+            if current.as_ref() != Some(expected) { return Err(ObservationError::StaleReference); }
+            let current_security = security_inventory_for_roots(client,frame,&metadata_options,lease,&current_dom,expected.roots.0.clone()).await?;
+            if !role_candidates::same_security(&security,&current_security,&ids) { return Err(ObservationError::StaleReference); }
+            // Public names can use live properties/computed styles not represented
+            // by DOM attributes. Reuse the original projection rather than invent
+            // accname rules, and require the same complete matching inputs.
+            let mut confirmed = Vec::new();
+            for chunk in ax_nodes.chunks(64) {
+                confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security).await?);
+            }
+            for (backend,node) in ids.iter().zip(&mut confirmed) { apply_security(node,*backend,&current_security); }
+            if role_candidates::matching_facts(&nodes) != role_candidates::matching_facts(&confirmed) { return Err(ObservationError::StaleReference); }
+        }
         for index in redacted { let node=nodes.get_mut(index).ok_or(ObservationError::BackendFailure)?;scrub_ancestor_content(node); }
         let projection_count = indices.len();
         let matches = indices.into_iter().enumerate().map(|(projection_index, i)| {
@@ -5186,9 +5237,22 @@ async fn security_inventory(
     options: &ObservationOptions,
     lease: &OperationLease,
 ) -> Result<SecurityInventory, ObservationError> {
-    use futures_util::{stream, StreamExt};
     let dom = frame_dom(client, frame, lease).await?;
     let ids = security_root_ids(&dom["root"])?;
+    security_inventory_for_roots(client, frame, options, lease, &dom, ids).await
+}
+
+// The normal caller supplies every native root. A role candidate proof may
+// supply author roots only after the existing default-policy UA-secret proof.
+async fn security_inventory_for_roots(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    options: &ObservationOptions,
+    lease: &OperationLease,
+    dom: &Value,
+    ids: Vec<i64>,
+) -> Result<SecurityInventory, ObservationError> {
+    use futures_util::{stream, StreamExt};
     let browser_internal = browser_internal_ids(&dom["root"])?;
     let simple_name_inventory = simple_name_inventory(&dom["root"], &ids, &browser_internal);
     let local_name_inventory = local_name_inventory(&dom["root"])?;
