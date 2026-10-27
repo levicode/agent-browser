@@ -1899,6 +1899,89 @@ async fn action_target(
         binding: resolved.binding,
     })
 }
+/// Follow only the native association of this already-resolved exact label.
+/// The derived handle stays in the captured realm/session; it is never a new
+/// query, an opaque reference, or a retry after input dispatch.
+async fn retarget_upload_label(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    mut node: Resolved,
+) -> Result<Resolved, ProtocolError> {
+    let reply = ctx
+        .command(
+            d,
+            false,
+            &node.session,
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": node.object,
+                "functionDeclaration": UPLOAD_LABEL_CONTROL,
+                "returnByValue": false,
+            }),
+        )
+        .await;
+    // Retain a returned handle while interpreting the reply. Even a malformed
+    // or exceptional reply must relinquish every new handle on the error path.
+    let candidate = reply
+        .as_ref()
+        .ok()
+        .and_then(|value| value["result"]["objectId"].as_str())
+        .filter(|object| *object != node.object)
+        .map(str::to_owned);
+    let result = async {
+        let value = reply.as_ref().map_err(Clone::clone)?;
+        release_call_handles(
+            ctx,
+            d,
+            &node.session,
+            value,
+            Some(candidate.as_deref().unwrap_or(&node.object)),
+        )
+        .await?;
+        ctx.check()?;
+        if value.get("exceptionDetails").is_some() {
+            return Err(ProtocolError::BrowserFailure);
+        }
+        if value["result"]["value"] == "unchanged" && candidate.is_none() {
+            return Ok(false);
+        }
+        if value["result"]["value"] == "stale" && candidate.is_none() {
+            return Err(ProtocolError::StaleReference);
+        }
+        if candidate.is_some() && value["result"]["subtype"] == "node" {
+            return Ok(true);
+        }
+        Err(ProtocolError::BrowserFailure)
+    }
+    .await;
+    match result {
+        Ok(false) => Ok(node),
+        Ok(true) => {
+            let released = node.release(ctx).await;
+            node.object = candidate.expect("validated node handle");
+            let release_failed = released.is_err();
+            if let Err(error) = released.and_then(|()| ctx.check()) {
+                let candidate_release = node.release(ctx).await;
+                if release_failed || candidate_release.is_err() {
+                    d.cleanup.store(true, Ordering::SeqCst);
+                }
+                return Err(error);
+            }
+            Ok(node)
+        }
+        Err(error) => {
+            if let Some(object) = candidate {
+                if !release_object_accounted(&ctx.page.client, &node.session, &object).await {
+                    d.cleanup.store(true, Ordering::SeqCst);
+                }
+            }
+            if node.release(ctx).await.is_err() {
+                d.cleanup.store(true, Ordering::SeqCst);
+            }
+            Err(error)
+        }
+    }
+}
 /// Reuse an ACKed pointer only while it still reaches this exact hovered node.
 /// A miss leaves the existing center/scroll path in charge. This is node-wheel
 /// policy only; explicit hover/tap and viewport swipes keep their own targeting.
@@ -2498,6 +2581,11 @@ impl ClientActions {
             }
             Ok(node) => node,
         };
+        let node = if matches!(&request.action, LocatorAction::SetInputFiles { .. }) {
+            retarget_upload_label(ctx, d, node).await?
+        } else {
+            node
+        };
         action_stage("exact.resolve.ack");
         d.preparation_enabled
             .store(preparation.is_some(), Ordering::SeqCst);
@@ -2888,10 +2976,17 @@ async fn focus(
     node.call(ctx,d,true,"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};if(typeof this.focus!=='function')return {status:'not-actionable'};this.focus();return true;}",vec![]).await?;
     Ok(())
 }
-// This probe has no value parameter and performs no focus, selection, event or
-// input mutation. Its refusal can therefore precede the mutation reservation.
-// PREPARE_FILL still rechecks every predicate after this read; a later race is
-// not a clean refusal and must retain the mutation path's Unknown effects.
+// Match the former setInputFiles label association without broad locator
+// retargeting. A non-label or invalid association keeps the existing refusal.
+// No page data, paths, control IDs, or object handles cross the protocol.
+const UPLOAD_LABEL_CONTROL: &str = r#"function(){
+ if(!this.isConnected||this.ownerDocument!==document)return 'stale';
+ if(!(this instanceof HTMLLabelElement))return 'unchanged';
+ const control=this.control;
+ if(!(control instanceof HTMLInputElement)||control.type!=='file')return 'unchanged';
+ if(!control.isConnected||control.ownerDocument!==document)return 'stale';
+ return control;
+}"#;
 // Identical upload admission predicates; closed diagnostic tags describe only
 // the acknowledged read, never final cleanup, effects, retry, or authority.
 const UPLOAD_ADMISSIBILITY: &str = r#"function(directory,count){
@@ -2905,6 +3000,10 @@ const UPLOAD_ADMISSIBILITY: &str = r#"function(directory,count){
  if(!directory&&!this.multiple&&count>1)return {status:'not-actionable',diagnostic:'multiple-mismatch'};
  return true;
 }"#;
+// This probe has no value parameter and performs no focus, selection, event or
+// input mutation. Its refusal can therefore precede the mutation reservation.
+// PREPARE_FILL still rechecks every predicate after this read; a later race is
+// not a clean refusal and must retain the mutation path's Unknown effects.
 const FILL_ADMISSIBILITY: &str = r#"function(){
  if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};
  if(this.matches(':disabled')||this.readOnly)return {status:'not-actionable'};
@@ -4430,6 +4529,9 @@ mod tests {
     mod recording_wire_contracts {
         include!("client_actions_recording_wire_contract_tests.rs");
     }
+    mod upload_label_controls {
+        include!("client_actions_upload_label_tests.rs");
+    }
     #[test]
     fn readonly_timing_is_silent_when_disabled_tap_success_or_mutated() {
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -5495,6 +5597,12 @@ mod tests {
                 {
                     break;
                 }
+                if mode == "upload-label-retired"
+                    && method == "Runtime.releaseObject"
+                    && request["params"]["objectId"] == "exact-node"
+                {
+                    server_gate.seal();
+                }
                 // These are author-controlled query facts, never dispatch receipts.
                 let query_name = if mode == "strict-query-misleading-ambiguous" {
                     "click action done"
@@ -5507,6 +5615,43 @@ mod tests {
                     "Save"
                 };
                 let result = match method {
+                    "Runtime.callFunctionOn"
+                        if mode.starts_with("upload-") && source == UPLOAD_LABEL_CONTROL =>
+                    {
+                        assert_eq!(request["params"]["objectId"], "exact-node");
+                        assert_eq!(request["params"]["returnByValue"], false);
+                        match mode {
+                            "upload-direct" | "upload-label-missing" => {
+                                json!({"result":{"value":"unchanged"}})
+                            }
+                            "upload-label-stale" => json!({"result":{"value":"stale"}}),
+                            "upload-label-exception" => {
+                                json!({"result":{"objectId":"upload-control","subtype":"node"},"exceptionDetails":{"exception":{"objectId":"upload-exception"}}})
+                            }
+                            _ => json!({"result":{"objectId":"upload-control","subtype":"node"}}),
+                        }
+                    }
+                    "Runtime.callFunctionOn"
+                        if mode.starts_with("upload-") && source == UPLOAD_ADMISSIBILITY =>
+                    {
+                        assert_eq!(
+                            request["params"]["objectId"],
+                            if matches!(mode, "upload-direct" | "upload-label-missing") {
+                                "exact-node"
+                            } else {
+                                "upload-control"
+                            }
+                        );
+                        match mode {
+                            "upload-label-disabled" => {
+                                json!({"result":{"value":{"status":"not-actionable","diagnostic":"disabled"}}})
+                            }
+                            "upload-label-missing" => {
+                                json!({"result":{"value":{"status":"not-actionable","diagnostic":"label"}}})
+                            }
+                            _ => json!({"result":{"value":true}}),
+                        }
+                    }
                     "Runtime.callFunctionOn"
                         if observed.get("actionErrorScriptResult").is_some() =>
                     {
@@ -5840,12 +5985,17 @@ mod tests {
                 {
                     // Let fixture geometry initialize; refuse the actual start.
                     json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic recording startup failure"}})
-                } else if (mode == "strict-query-drag-release-failed"
-                    && drag_pressed
-                    && method == "Runtime.releaseObject"
-                    && request["params"]["objectId"]
-                        .as_str()
-                        .is_some_and(|object| object.starts_with("drag-node-43-")))
+                } else if ((mode == "upload-label-release-failed"
+                    && request["params"]["objectId"] == "exact-node"
+                    || mode == "upload-control-release-failed"
+                        && request["params"]["objectId"] == "upload-control")
+                    && method == "Runtime.releaseObject")
+                    || (mode == "strict-query-drag-release-failed"
+                        && drag_pressed
+                        && method == "Runtime.releaseObject"
+                        && request["params"]["objectId"]
+                            .as_str()
+                            .is_some_and(|object| object.starts_with("drag-node-43-")))
                     || (mode.starts_with("strict-query-cleanup")
                         && query_reads > 1
                         && method == "Runtime.releaseObjectGroup"

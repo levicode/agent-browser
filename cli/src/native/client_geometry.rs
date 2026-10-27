@@ -1579,6 +1579,25 @@ async fn read_exact_box_impl(
     )
     .await
 }
+// A positive native negative identity proof refuses this exact node. In the
+// readonly path the outer group still owns every acquired object on refusal;
+// only its failed disposal may turn this clean stale result into cleanup loss.
+// Strict action geometry and all backend/cleanup failures keep their old fence.
+fn box_resolution_failure(
+    error: element::ExactResolutionError,
+    interrupted: Option<GeometryError>,
+    readonly_group: bool,
+) -> GeometryError {
+    if readonly_group && error == element::ExactResolutionError::StaleReference {
+        return interrupted.unwrap_or(GeometryError::StaleIdentity);
+    }
+    GeometryError::CleanupFailed {
+        primary: Some(Box::new(
+            interrupted.unwrap_or(GeometryError::StaleIdentity),
+        )),
+    }
+}
+
 async fn read_exact_box_inner(
     client: &CdpClient,
     binding: &element::ExactBinding,
@@ -1627,11 +1646,7 @@ async fn read_exact_box_inner(
         element::ExactResolutionError::Superseded => {
             check(operation).err().unwrap_or(GeometryError::Superseded)
         }
-        _ => GeometryError::CleanupFailed {
-            primary: Some(Box::new(
-                interrupted.clone().unwrap_or(GeometryError::StaleIdentity),
-            )),
-        },
+        error => box_resolution_failure(error, interrupted.clone(), readonly_group.is_some()),
     })?;
     if let Some(primary) = interrupted {
         return if readonly_group.is_some()
@@ -1726,6 +1741,54 @@ async fn read_exact_box_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn readonly_box_negative_identity_is_not_cleanup_loss() {
+        use element::ExactResolutionError as Exact;
+        assert_eq!(
+            box_resolution_failure(Exact::StaleReference, None, true),
+            GeometryError::StaleIdentity
+        );
+        for stopped in [GeometryError::Cancelled, GeometryError::DeadlineExceeded] {
+            assert_eq!(
+                box_resolution_failure(Exact::StaleReference, Some(stopped.clone()), true),
+                stopped
+            );
+        }
+    }
+    #[test]
+    fn readonly_box_backend_and_cleanup_failures_stay_dirty() {
+        use element::ExactResolutionError as Exact;
+        for error in [
+            Exact::BackendFailure,
+            Exact::CleanupFailed {
+                primary: Some(Box::new(Exact::StaleReference)),
+            },
+        ] {
+            assert_eq!(
+                box_resolution_failure(error, None, true),
+                GeometryError::CleanupFailed {
+                    primary: Some(Box::new(GeometryError::StaleIdentity))
+                }
+            );
+        }
+    }
+    #[test]
+    fn strict_box_negative_identity_keeps_its_existing_fence() {
+        use element::ExactResolutionError as Exact;
+        for stopped in [
+            None,
+            Some(GeometryError::Cancelled),
+            Some(GeometryError::DeadlineExceeded),
+        ] {
+            assert_eq!(
+                box_resolution_failure(Exact::StaleReference, stopped.clone(), false),
+                GeometryError::CleanupFailed {
+                    primary: Some(Box::new(stopped.unwrap_or(GeometryError::StaleIdentity)))
+                }
+            );
+        }
+    }
+
     fn rect(x: f64, y: f64, width: f64, height: f64) -> [Point; 4] {
         Bounds {
             x,

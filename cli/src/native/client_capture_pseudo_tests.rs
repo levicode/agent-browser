@@ -88,6 +88,140 @@ fn capture_pseudo_chain_and_node_budget_are_bounded() {
     );
 }
 
+// Test-only closed diagnostics. No CDP message, JS exception, page value,
+// identifier, URL or pixel data can be carried by these output types.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PseudoStage {
+    Launch,
+    Lease,
+    Viewport,
+    Setup,
+    Snapshot,
+    Provenance,
+    AnimationEnable,
+    AnimationSetRate,
+    FrameEnumeration,
+    Enrollment,
+    JournalBinding,
+    Capture,
+    PixelChecks,
+    SourceRestoration,
+    AnimationRestoration,
+    OwnerCleanup,
+}
+#[derive(Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PseudoCdpFailure {
+    OwnerViewRequired,
+    OwnerChanged,
+    AdmissionRefused,
+    AdmissionRevoked,
+    ChannelClosed,
+    TransportClosed,
+    ResponseDeadline,
+    ErrorAck,
+    SendFailed,
+    Other,
+}
+fn pseudo_cdp_failure(error: &str) -> PseudoCdpFailure {
+    match error {
+        "Native CDP requires an owner-bound view" => PseudoCdpFailure::OwnerViewRequired,
+        "Native CDP owner changed"
+        | "Native CDP reservation owner changed"
+        | "Native cleanup owner changed" => PseudoCdpFailure::OwnerChanged,
+        "Native CDP command admission refused" => PseudoCdpFailure::AdmissionRefused,
+        "Native CDP command admission revoked" => PseudoCdpFailure::AdmissionRevoked,
+        "CDP response channel closed" => PseudoCdpFailure::ChannelClosed,
+        "CDP connection closed" => PseudoCdpFailure::TransportClosed,
+        value if value.starts_with("CDP command timed out:") => PseudoCdpFailure::ResponseDeadline,
+        value if value.starts_with("CDP error (") => PseudoCdpFailure::ErrorAck,
+        value if value.starts_with("Failed to send CDP command:") => PseudoCdpFailure::SendFailed,
+        _ => PseudoCdpFailure::Other,
+    }
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PseudoCheckFailure {
+    Setup,
+    SnapshotStrings,
+    NoOrigin,
+    PseudoTypes,
+    MissingRequestedKind,
+    FrameInventory,
+    SecurePaintAccepted,
+    PasswordMaskMissing,
+    PngInvalid,
+    PasswordPixel,
+    PublicPaintPixel,
+    SourceRestoration,
+    AnimationRestoration,
+}
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum PseudoFailure {
+    Cdp(PseudoCdpFailure),
+    Check(PseudoCheckFailure),
+    Protocol(super::super::client_protocol::ProtocolError),
+    Provenance(CaptureReason),
+    Enumeration,
+    ScriptException,
+    Join {
+        cancelled: bool,
+        panicked: bool,
+    },
+    Capture {
+        reason: CaptureReason,
+        cleanup_integrity_lost: bool,
+    },
+}
+impl From<String> for PseudoFailure {
+    fn from(error: String) -> Self {
+        Self::Cdp(pseudo_cdp_failure(&error))
+    }
+}
+fn pseudo_diagnostic(
+    kind: &str,
+    closed: bool,
+    secure: bool,
+    stage: PseudoStage,
+    outcome: &str,
+    failure: Option<&PseudoFailure>,
+) {
+    // The only string inputs are local closed call-site literals; reject rather
+    // than project an unexpected string if a future test changes the schema.
+    assert!(matches!(kind, "before" | "after"));
+    assert!(matches!(outcome, "entered" | "passed" | "failed"));
+    eprintln!(
+        "PSEUDO_CAPTURE_DIAGNOSTIC {}",
+        json!({"kind":kind,"closed":closed,"secure":secure,"stage":stage,"outcome":outcome,"failure":failure})
+    );
+}
+#[test]
+fn pseudo_diagnostics_never_retain_untrusted_cdp_text() {
+    let secret = "synthetic-private-value https://invalid.example/private";
+    for (error, expected) in [
+        (secret.to_owned(), PseudoCdpFailure::Other),
+        (
+            format!("CDP error (Runtime.evaluate): {secret}"),
+            PseudoCdpFailure::ErrorAck,
+        ),
+        (
+            format!("Failed to send CDP command: {secret}"),
+            PseudoCdpFailure::SendFailed,
+        ),
+        (
+            "Native CDP requires an owner-bound view".into(),
+            PseudoCdpFailure::OwnerViewRequired,
+        ),
+    ] {
+        assert_eq!(pseudo_cdp_failure(&error), expected);
+        let serialized = serde_json::to_string(&PseudoFailure::from(error)).unwrap();
+        assert!(!serialized.contains(secret));
+        assert!(serialized.len() < 96);
+    }
+}
+
 #[tokio::test]
 #[ignore = "requires real Chromium: pseudo receivers, generated-secret refusal and restoration"]
 async fn chromium_pseudo_capture_preserves_public_pixels_and_refuses_secure_generated_paint() {
@@ -102,11 +236,40 @@ async fn chromium_pseudo_capture_preserves_public_pixels_and_refuses_secure_gene
         ("before", true, true),
         ("after", true, true),
     ] {
+        let stage = std::cell::Cell::new(PseudoStage::Launch);
+        let mark = |next| {
+            stage.set(next);
+            pseudo_diagnostic(kind, closed, secure, next, "entered", None);
+        };
+        mark(PseudoStage::Launch);
         let mut owner = OwnedBrowser::launch(Default::default(), None)
             .await
-            .unwrap();
+            .unwrap_or_else(|error| {
+                pseudo_diagnostic(
+                    kind,
+                    closed,
+                    secure,
+                    stage.get(),
+                    "failed",
+                    Some(&PseudoFailure::Protocol(error)),
+                );
+                panic!("Pseudo fixture launch failed");
+            });
+        mark(PseudoStage::Lease);
         let gate = Arc::new(ExecutionGate::default());
-        let mut page = owner.lease(gate.enter(false).unwrap()).unwrap();
+        let mut page = owner
+            .lease(gate.enter(false).unwrap())
+            .unwrap_or_else(|error| {
+                pseudo_diagnostic(
+                    kind,
+                    closed,
+                    secure,
+                    stage.get(),
+                    "failed",
+                    Some(&PseudoFailure::Protocol(error)),
+                );
+                panic!("Pseudo fixture lease failed");
+            });
         let client = page.client.clone();
         let session = page.page_session_id.clone();
         let (_sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
@@ -117,7 +280,8 @@ async fn chromium_pseudo_capture_preserves_public_pixels_and_refuses_secure_gene
             deadline: Instant::now() + Duration::from_secs(30),
             cancellation,
         };
-        let result: Result<(), String> = async {
+        let result: Result<(), PseudoFailure> = async {
+            mark(PseudoStage::Viewport);
             client.send_command("Emulation.setDeviceMetricsOverride",Some(json!({"width":400,"height":300,"deviceScaleFactor":1,"mobile":false})),Some(&session)).await?;
             let setup = format!(r#"(()=>{{
               document.body.style.cssText='margin:0;background:rgb(25,75,125)';
@@ -135,56 +299,91 @@ async fn chromium_pseudo_capture_preserves_public_pixels_and_refuses_secure_gene
               window.__pseudoFixture={{root,input,generated,style,inline:input.getAttribute('style')}};
               return true;
             }})()"#);
+            mark(PseudoStage::Setup);
             let ready=client.send_command("Runtime.evaluate",Some(json!({"expression":setup,"returnByValue":true})),Some(&session)).await?;
-            if ready["result"]["value"]!=true{return Err("Pseudo fixture setup failed".into());}
+            if ready.get("exceptionDetails").is_some(){return Err(PseudoFailure::ScriptException);}
+            if ready["result"]["value"]!=true{return Err(PseudoFailure::Check(PseudoCheckFailure::Setup));}
             // Prove this is a real generated-node fixture, not a browser that
             // ignored the CSS. Native snapshot must contain this exact kind.
+            mark(PseudoStage::Snapshot);
             let snapshot=client.send_command("DOMSnapshot.captureSnapshot",Some(json!({"computedStyles":[]})),Some(&session)).await?;
-            let strings=snapshot["strings"].as_array().ok_or("Missing snapshot strings")?;
+            mark(PseudoStage::Provenance);
+            let strings=snapshot["strings"].as_array().ok_or(PseudoFailure::Check(PseudoCheckFailure::SnapshotStrings))?;
             let document=&snapshot["documents"][0];
-            let proof=capture_pseudo_nodes(document,strings).map_err(|_|"Pseudo fixture provenance failed")?;
-            if proof.origins.is_empty(){return Err("Pseudo fixture has no native origin".into());}
-            let values=document["nodes"]["pseudoType"]["value"].as_array().ok_or("Missing pseudo types")?;
+            let proof=capture_pseudo_nodes(document,strings).map_err(PseudoFailure::Provenance)?;
+            if proof.origins.is_empty(){return Err(PseudoFailure::Check(PseudoCheckFailure::NoOrigin));}
+            let values=document["nodes"]["pseudoType"]["value"].as_array().ok_or(PseudoFailure::Check(PseudoCheckFailure::PseudoTypes))?;
             if !values.iter().any(|v|v.as_u64().and_then(|i|strings.get(i as usize)).and_then(Value::as_str)==Some(kind)) {
-                return Err("Browser did not generate the requested pseudo kind".into());
+                return Err(PseudoFailure::Check(PseudoCheckFailure::MissingRequestedKind));
             }
+            mark(PseudoStage::AnimationEnable);
             client.send_command("Animation.enable",Some(json!({})),Some(&session)).await?;
+            mark(PseudoStage::AnimationSetRate);
             client.send_command("Animation.setPlaybackRate",Some(json!({"playbackRate":0.75})),Some(&session)).await?;
-            let frames=super::super::client_observation::enumerate_frames(&client,&session,&HashMap::new(),&operation).await.map_err(|_|"Pseudo frame enumeration failed")?;
-            if frames.len()!=1{return Err("Unexpected pseudo frame inventory".into());}
+            mark(PseudoStage::FrameEnumeration);
+            let frames=super::super::client_observation::enumerate_frames(&client,&session,&HashMap::new(),&operation).await.map_err(|_|PseudoFailure::Enumeration)?;
+            if frames.len()!=1{return Err(PseudoFailure::Check(PseudoCheckFailure::FrameInventory));}
             // This isolated synthetic fixture is a known one-renderer owner.
-            page.targets.acknowledge_enrollment().map_err(|_|"Pseudo enrollment failed")?;
+            mark(PseudoStage::Enrollment);
+            page.targets.acknowledge_enrollment().map_err(PseudoFailure::Protocol)?;
+            mark(PseudoStage::JournalBinding);
             let journal=super::tests::owned_capture_journal(&mut owner,&mut page,&operation);
+            // Installation replaces the ambient transport handle with its exact
+            // owner-bound view. Post-capture checks must use that view too.
+            let client=page.client.clone();
+            mark(PseudoStage::Capture);
             let captured=journal.scope(async {
                 start_capture(CaptureContext{page,frames,inventory_complete:true},CaptureRequest{secure_field_selector:"[data-protected]".into()},operation).await
-            }).await.map_err(|_|"Pseudo capture task failed")?;
+            }).await.map_err(|error|PseudoFailure::Join{cancelled:error.is_cancelled(),panicked:error.is_panic()})?;
             if secure {
                 match captured {
                     Err(error) if error.reason==CaptureReason::UnsafeGeometry && !error.cleanup_integrity_lost => {},
-                    _ => return Err("Generated protected paint did not fail closed".into()),
+                    Err(error) => return Err(PseudoFailure::Capture{reason:error.reason,cleanup_integrity_lost:error.cleanup_integrity_lost}),
+                    Ok(_) => return Err(PseudoFailure::Check(PseudoCheckFailure::SecurePaintAccepted)),
                 }
             } else {
-                let captured=captured.map_err(|error|format!("Public pseudo protected capture failed: {:?}",error.reason))?;
-                if captured.masked_region_count<1{return Err("Password mask missing with public pseudos".into());}
-                let pixels=image::load_from_memory(&captured.png).map_err(|_|"Pseudo PNG invalid")?.to_rgba8();
+                let captured=captured.map_err(|error|PseudoFailure::Capture{reason:error.reason,cleanup_integrity_lost:error.cleanup_integrity_lost})?;
+                mark(PseudoStage::PixelChecks);
+                if captured.masked_region_count<1{return Err(PseudoFailure::Check(PseudoCheckFailure::PasswordMaskMissing));}
+                let pixels=image::load_from_memory(&captured.png).map_err(|_|PseudoFailure::Check(PseudoCheckFailure::PngInvalid))?.to_rgba8();
                 if pixels.dimensions()!=(400,300)||pixels.get_pixel(25,25).0!=[0,0,0,255] {
-                    return Err("Public pseudo fixture password was not masked".into());
+                    return Err(PseudoFailure::Check(PseudoCheckFailure::PasswordPixel));
                 }
                 if pixels.get_pixel(240,30).0!=[0,255,0,255]||pixels.get_pixel(300,200).0!=[25,75,125,255] {
-                    return Err("Capture removed public generated paint or background".into());
+                    return Err(PseudoFailure::Check(PseudoCheckFailure::PublicPaintPixel));
                 }
             }
+            mark(PseudoStage::SourceRestoration);
             let restored=client.send_command("Runtime.evaluate",Some(json!({"expression":"(()=>{const f=window.__pseudoFixture;return f.input.value==='synthetic-password'&&f.input.getAttribute('style')===f.inline&&f.generated.getAttribute('value')==='synthetic-generated-secret'&&f.root.querySelectorAll('style').length===1&&f.style.isConnected&&getComputedStyle(f.input).opacity==='1'})()","returnByValue":true})),Some(&session)).await?;
-            if restored["result"]["value"]!=true{return Err("Pseudo capture changed source state or left masks".into());}
+            if restored.get("exceptionDetails").is_some(){return Err(PseudoFailure::ScriptException);}
+            if restored["result"]["value"]!=true{return Err(PseudoFailure::Check(PseudoCheckFailure::SourceRestoration));}
+            mark(PseudoStage::AnimationRestoration);
             let rate=client.send_command("Animation.getPlaybackRate",Some(json!({})),Some(&session)).await?;
-            if rate["playbackRate"].as_f64()!=Some(0.75){return Err("Pseudo capture did not restore animation playback".into());}
+            if rate["playbackRate"].as_f64()!=Some(0.75){return Err(PseudoFailure::Check(PseudoCheckFailure::AnimationRestoration));}
             Ok(())
         }.await;
-        let cleanup = owner.close().await;
+        pseudo_diagnostic(
+            kind,
+            closed,
+            secure,
+            stage.get(),
+            if result.is_ok() { "passed" } else { "failed" },
+            result.as_ref().err(),
+        );
+        mark(PseudoStage::OwnerCleanup);
+        let cleanup = owner.close().await.map_err(PseudoFailure::Protocol);
+        pseudo_diagnostic(
+            kind,
+            closed,
+            secure,
+            stage.get(),
+            if cleanup.is_ok() { "passed" } else { "failed" },
+            cleanup.as_ref().err(),
+        );
         assert!(cleanup.is_ok(), "Pseudo fixture owner cleanup failed");
         assert!(
             result.is_ok(),
-            "Pseudo fixture {kind}/{closed}/{secure}: {result:?}"
+            "Pseudo fixture contract failed; see closed diagnostic"
         );
     }
 }

@@ -16,6 +16,7 @@ struct Peer {
     replies: mpsc::UnboundedSender<Value>,
     log: Arc<Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
+    connected: Arc<std::sync::atomic::AtomicBool>,
 }
 impl Peer {
     async fn new(child: bool, bad_proof: bool) -> Self {
@@ -25,6 +26,8 @@ impl Peer {
         let (replies, mut reply_rx) = mpsc::unbounded_channel::<Value>();
         let log = Arc::new(Mutex::new(Vec::new()));
         let recorded = log.clone();
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let peer_connected = connected.clone();
         let task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -60,7 +63,7 @@ impl Peer {
                                 } else if request["params"]["functionDeclaration"] == crate::native::client_observation::FRAME_OWNER_GEOMETRY {
                                     json!({"result":{"value":{"x":0,"y":0,"selector":"#child"}}})
                                 } else {
-                                    json!({"result":{"value":true}})
+                                    json!({"result":{"value":peer_connected.load(std::sync::atomic::Ordering::SeqCst)}})
                                 }
                             }
                             "Runtime.releaseObject" | "Runtime.releaseObjectGroup" => {
@@ -107,6 +110,7 @@ impl Peer {
             replies,
             log,
             task,
+            connected,
         }
     }
     fn binding(&self) -> element::ExactBinding {
@@ -554,5 +558,64 @@ async fn semantic_snapshot_rejects_strict_polygon_before_any_new_cdp_work() {
         "semantic snapshot must not acquire a strict action/pixel object"
     );
     assert_eq!(peer.ledger.snapshot().object_debt, 0);
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn semantic_box_detached_proof_refuses_cleanly_and_next_read_can_succeed() {
+    let mut peer = Peer::new(false, false).await;
+    peer.connected
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let binding = peer.binding();
+    let result = peer
+        .journal
+        .scope(read_exact_box_impl(
+            &peer.client,
+            &binding,
+            1,
+            &peer.operation,
+            false,
+            true,
+        ))
+        .await;
+    // Native false is a settled negative identity proof, not evidence that
+    // group disposal failed. Never publish geometry for the refused object.
+    assert_eq!(result, Err(GeometryError::StaleIdentity));
+    let refused_release = peer.next_release().await;
+    assert_eq!(refused_release["method"], "Runtime.releaseObjectGroup");
+    assert_eq!(peer.ledger.snapshot().object_debt, 1);
+    assert!(!peer.ledger.snapshot().integrity_lost);
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|r| r["method"] == "DOM.getBoxModel" || r["method"] == "Runtime.releaseObject"));
+    peer.ack(&refused_release);
+    peer.wait_debt(0).await;
+
+    peer.connected
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let current = peer
+        .journal
+        .scope(read_exact_box_impl(
+            &peer.client,
+            &binding,
+            1,
+            &peer.operation,
+            false,
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(current.0["model"]["border"][2], 10);
+    let current_release = peer.next_release().await;
+    assert_ne!(
+        refused_release["params"]["objectGroup"],
+        current_release["params"]["objectGroup"]
+    );
+    peer.ack(&current_release);
+    peer.wait_debt(0).await;
+    assert!(!peer.ledger.snapshot().integrity_lost);
     peer.close().await;
 }
