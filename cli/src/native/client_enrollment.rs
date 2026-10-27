@@ -7492,7 +7492,9 @@ mod tests {
                         };
                         if method=="Target.getTargets" {if let Some(infos)=result.get_mut("targetInfos").and_then(Value::as_array_mut) {infos.retain(|info|!closed_targets.contains(info["targetId"].as_str().unwrap()) && !(mode=="late-popup" && info["targetId"]=="queued-popup" && !closed_targets.contains("initial-target")));}}
                         let mut response = json!({"id":request["id"],"result":result});
-                        if (mode.starts_with("sw-startup-") || mode=="observer-controlled-acks" || mode.starts_with("iframe-") || mode=="eval-network-watermark") && request.get("sessionId").is_some() {
+                        // Owner-retirement tests use managed flattened sessions. Their
+                        // successful replies must preserve exact session correlation.
+                        if (mode.starts_with("owner-retirement") || mode.starts_with("sw-startup-") || mode=="observer-controlled-acks" || mode.starts_with("iframe-") || mode=="eval-network-watermark") && request.get("sessionId").is_some() {
                             response["sessionId"] = request["sessionId"].clone();
                         }
                         if socket.send(Message::Text(response.to_string())).await.is_err(){break;}
@@ -18800,7 +18802,7 @@ mod tests {
     }
     async fn pending_popup_owner_retirement_case(mode: &str) {
         let (owner, _notices, log, emit, server, _broker, connection) =
-            fixture_with_client("normal", true).await;
+            fixture_with_client("owner-retirement", true).await;
         owner
             .enroll_existing("initial-target", "initial", "page", &owner.operation())
             .await
