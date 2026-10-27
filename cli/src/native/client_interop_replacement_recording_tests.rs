@@ -7,11 +7,17 @@ async fn setup_interop_recording(
     endpoint: &str,
     context_present: &AtomicBool,
 ) -> Result<String, String> {
-    fixture.ready().await?;
+    fixture
+        .ready()
+        .await
+        .map_err(|error| format!("ready: {error}"))?;
     let preparation = uuid::Uuid::new_v4().to_string();
     let mut args = fixture_scope_open("connect", Some(endpoint));
     args["preparationId"] = json!(preparation);
-    fixture.command("scope.interop.prepare", args, 5).await?;
+    fixture
+        .command("scope.interop.prepare", args, 5)
+        .await
+        .map_err(|error| format!("interop prepare: {error}"))?;
     // No native creation ACK is fabricated: the independent inventory before
     // this transition was empty. Adoption must verify this new blank target.
     context_present.store(true, Ordering::SeqCst);
@@ -21,7 +27,7 @@ async fn setup_interop_recording(
             json!({"preparationId":preparation,"contextId":"synthetic-context","targetId":"page-1"}),
             5,
         )
-        .await?;
+        .await.map_err(|error| format!("interop adopt: {error}"))?;
     let scope = opened["identityScope"]
         .as_str()
         .ok_or("missing interop scope")?
@@ -29,14 +35,17 @@ async fn setup_interop_recording(
     fixture.scope = Some(scope.clone());
     fixture
         .command("scope.configure", fixture_configuration(&scope, None), 5)
-        .await?;
+        .await
+        .map_err(|error| format!("scope configure: {error}"))?;
     fixture
         .command("network.routes.replace", fixture_routes(&scope), 5)
-        .await?;
+        .await
+        .map_err(|error| format!("routes replace: {error}"))?;
     fixture.registry = 1;
     fixture
         .command("page.activate", json!({"identityScope":scope}), 5)
-        .await?;
+        .await
+        .map_err(|error| format!("page activate: {error}"))?;
     Ok(scope)
 }
 
@@ -60,6 +69,8 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
     let mut retained_actions = None;
     let mut recording_directory = None;
     let mut phase_one_enrollment = None;
+    let mut stage = "interop setup";
+    let mut marker_three_observed = false;
     let proof: Result<Vec<u8>, String> = async {
         let scope = setup_interop_recording(&mut fixture, &peer.endpoint, &context_present).await?;
         let (actions, original_enrollment) = {
@@ -72,12 +83,14 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
             (runtime.actions.clone(), runtime.enrollment.clone())
         };
         retained_actions = Some(actions.clone());
+        stage = "recording start";
         fixture.command("recording.start", json!({"identityScope":scope}), 5).await?;
         if !actions.is_recording_armed().await.map_err(|_| "recording arm read")?
             || browser.blobs.charged_for_test().1 != 1
         {
             return Err("actual armed recording and quota were not established".into());
         }
+        stage = "recording armed";
         let (encoder_status, directory) = actions.recording_encoder_status_for_test().await;
         recording_directory = Some(directory.clone());
         let (sender, snapshot) = tokio::sync::oneshot::channel();
@@ -86,6 +99,7 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
         fixture.sequence += 1;
         let failed = fixture.sequence;
         let reset_id = "marker-three-reset";
+        stage = "scope reset awaiting private retire";
         fixture.write(json!({"type":"request","id":reset_id,"generation":1,
             "operationSeq":failed,"timeoutMs":10000,"command":"scope.reset",
             "args":{"identityScope":scope}})).await?;
@@ -123,6 +137,8 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
                         {
                             return Err("actual recording-preserving phase3 owner was not reached".into());
                         }
+                        marker_three_observed = true;
+                        stage = "marker3 encoder and preserved custody";
                         phase_one_enrollment = Some(observed.enrollment);
                         if encoder_status() != (true, true)
                             || !actions.is_recording_armed().await.map_err(|_| "preserved recording arm")?
@@ -132,6 +148,7 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
                         }
                         // Model the exact external context.close before selecting
                         // retired. Native must independently observe absence.
+                        stage = "peer old context absent awaiting private create";
                         context_present.store(false, Ordering::SeqCst);
                         ("marker-three-retired", json!({"kind":"interop-retired"}))
                     } else {
@@ -142,6 +159,7 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
                         if !cleanup.isolated_context_disposed || !cleanup.autoattach_disabled {
                             return Err("create preceded real independent absence and phase-two ACK".into());
                         }
+                        stage = "private create refused awaiting receipts";
                         ("marker-three-create-refused", json!({"kind":"interop-failed"}))
                     };
                     phase += 1;
@@ -169,6 +187,7 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
             if phase == 2 && controls.is_empty() && outcome.is_some() { break; }
         }
         if phase != 2 || !controls.is_empty() { return Err("private receipts did not settle".into()); }
+        stage = "original Unknown result contract";
         let outcome = outcome.ok_or("replacement result missing")?;
         if outcome["ok"] != false || outcome["effects"] != "unknown"
             || outcome["scopeState"] != "quarantined" || outcome["error"]["code"] != "browser-failure"
@@ -179,6 +198,7 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
 
         // Use the existing legal terminal-artifact lane while automatic shutdown
         // proceeds concurrently. Nothing holds the runtime owner or stops cleanup.
+        stage = "terminal finalized collect";
         let identity = json!({"identityScope":scope,"failedOperationSeq":failed});
         let manifest = completed(command(&mut fixture, &mut notices, "recording.finalized.collect", identity.clone()).await?)?;
         if manifest["identityScope"] != scope || manifest["failedOperationSeq"] != failed
@@ -191,6 +211,7 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
         let mut base = identity;
         base["token"] = manifest["token"].clone();
         base["handle"] = segment["handle"].clone();
+        stage = "terminal finalized read";
         let mut bytes = Vec::new();
         let mut eof = false;
         for _ in 0..64 {
@@ -206,13 +227,16 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
         if !eof || bytes.is_empty() || segment["size"] != bytes.len()
             || segment["sha256"] != format!("{:x}", Sha256::digest(&bytes))
         { return Err("actual terminal recording bytes failed size/hash validation".into()); }
+        stage = "terminal finalized release";
         if completed(command(&mut fixture, &mut notices, "recording.finalized.release", base).await?)? != json!({"released":true}) {
             return Err("terminal byte release receipt missing".into());
         }
+        stage = "terminal ordinary authority denial";
         let denied = command(&mut fixture, &mut notices, "page.title", json!({"identityScope":scope})).await?;
         if denied["ok"] != false || denied["effects"] != "not-dispatched" || denied["error"]["code"] != "scope-unavailable" {
             return Err("terminal collection reopened ordinary operation authority".into());
         }
+        stage = "terminal Close";
         fixture.write(json!({"type":"close","id":"marker-three-close","generation":1})).await?;
         let mut closed = false;
         for _ in 0..16 {
@@ -224,6 +248,7 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
             fixture.event_sequence += 1;
         }
         if !closed { return Err("actual terminal Closed receipt missing".into()); }
+        stage = "terminal Closed received";
         Ok(bytes)
     }.await;
 
@@ -233,7 +258,18 @@ async fn interop_marker_three_create_refusal_joins_recording_and_terminal_close(
     let manager_returned = browser.retained_browser.lock().await.is_some();
     peer.task.abort();
     let _ = peer.task.await;
-    cleanup.expect("real marker3 terminal cleanup must be proven");
+    // Always join production cleanup first, then preserve BOTH independent
+    // failures. No resource bytes, IDs, URLs or CDP argument data are printed.
+    if proof.is_err() || cleanup.is_err() {
+        let methods = log
+            .iter()
+            .filter_map(|request| request["method"].as_str())
+            .collect::<Vec<_>>();
+        panic!(
+            "marker3 proof/cleanup failed: stage={stage}; markerThreeObserved={marker_three_observed}; proofError={:?}; cleanupError={:?}; ownerRetired={owner_retired}; managerReturned={manager_returned}; cdpMethods={methods:?}",
+            proof.as_ref().err(), cleanup.as_ref().err(),
+        );
+    }
     let bytes = proof.unwrap();
     assert!(owner_retired);
     assert!(

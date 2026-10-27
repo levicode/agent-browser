@@ -5090,7 +5090,14 @@ impl ClientBrowser {
                 // Registry capture is acceptance; retain it before stop can
                 // independently drain/revoke the old native network owner.
                 accepted = true;
-                uncertain.store(true, std::sync::atomic::Ordering::SeqCst);
+                // Only the native allocator can leave an unidentified native
+                // context behind. Interop creation remains peer-owned until its
+                // exact context/target are verified and adopted into our ledger.
+                // Do not invent allocation uncertainty for a peer handoff, and
+                // never clear uncertainty retained by any earlier native work.
+                if !interop {
+                    uncertain.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
                 let state = prepared
                     .map(|prepared| prepared.accept(&operation))
                     .transpose()
