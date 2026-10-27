@@ -1,5 +1,5 @@
-//! Exact navigation fencing through real framed dispatch and native leases.
-//! Only the CDP peer is scripted; no target/owner/publication state is seeded.
+// Exact navigation fencing through real framed dispatch and native leases.
+// Only the CDP peer is scripted; no target/owner/publication state is seeded.
 
 struct PageFenceFixture {
     wire: FramedFixture,
