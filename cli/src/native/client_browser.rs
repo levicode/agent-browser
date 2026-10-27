@@ -2552,13 +2552,25 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
     fn take_terminal_recording(
         &self,
         key: super::client_debt::OperationKey,
+        scope: Option<&str>,
     ) -> Option<super::client_terminal_artifacts::FrozenRecordingBatch> {
         let mut slot = self.terminal_recording.lock().ok()?;
         if slot.as_ref().is_some_and(|batch| batch.key() == key) {
-            slot.take()
-        } else {
-            None
+            return slot.take();
         }
+        drop(slot);
+        // Transport passes the failed request's original scope, never a current
+        // scope guessed after recovery. Fail closed under owner contention.
+        let scope = scope?;
+        let owner = self.owner.try_lock().ok()?;
+        let owner = owner.as_ref()?;
+        if owner.identity_scope != scope
+            || !owner.manager.client.debt_ledger()?.matches_owner(key.generation, scope)
+            || self.broker.health().ok()?.1 != super::client_protocol::ScopeState::Quarantined
+        {
+            return None;
+        }
+        owner.runtime.as_ref()?.actions.freeze_finalized_recording(scope, key, &self.blobs)
     }
     fn begin_trace_cleanup(
         &self,
@@ -3579,6 +3591,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             Some(ActionReason::ControlReplacedAfterClick) => ProtocolError::CheckedControlReplaced,
                             Some(ActionReason::FillUnsupportedTarget) => ProtocolError::FillUnsupportedTarget,
                             Some(ActionReason::NoEditableFocus) => ProtocolError::NoEditableFocus,
+                            Some(ActionReason::TapTargetReplacedBeforePress) => ProtocolError::TapTargetReplacedBeforePress,
                             _ => failure.error,
                         };
                         (NativeOutcome { retention: None, result: Err(error), effects: if activation_dispatched && failure.effects == Effects::NotDispatched { Effects::Completed } else { failure.effects } }, failure.cleanup_failed)

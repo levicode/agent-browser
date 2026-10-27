@@ -528,6 +528,8 @@ pub struct RecordingState {
     pub capture_task: Option<tokio::task::JoinHandle<Result<(), String>>>,
     /// Negotiated encoder proof: true only after explicit child wait (or no child).
     pub(crate) encoder_complete: Arc<AtomicBool>,
+    // Successful encoder output is independent of the remote stop/cleanup ACK.
+    pub(crate) encoder_succeeded: Arc<AtomicBool>,
     pub(crate) cleanup_task_failed: bool,
     pub shared_frame_count: Option<Arc<AtomicU64>>,
     pub shared_captured_count: Option<Arc<AtomicU64>>,
@@ -558,6 +560,7 @@ impl RecordingState {
             contact_sheet_frame_count: 0,
             capture_task: None,
             encoder_complete: Arc::new(AtomicBool::new(true)),
+            encoder_succeeded: Arc::new(AtomicBool::new(false)),
             cleanup_task_failed: false,
             shared_frame_count: None,
             shared_captured_count: None,
@@ -1611,6 +1614,7 @@ pub fn spawn_recording_task_with_options(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -1659,6 +1663,7 @@ pub(crate) fn spawn_recording_task_with_session_proof(
     cleanup_complete: Option<Arc<AtomicBool>>,
     detach_complete: Option<Arc<AtomicBool>>,
     encoder_complete: Option<Arc<AtomicBool>>,
+    encoder_succeeded: Option<Arc<AtomicBool>>,
     startup_receipt: Option<Arc<RecordingStartReceipt>>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
@@ -1719,6 +1724,7 @@ pub(crate) fn spawn_recording_task_with_session_proof(
             options,
             acknowledge_first_frame.then_some(first_frame_tx),
             Some(cleanup.encoder_complete.clone()),
+            encoder_succeeded,
         ));
 
         // Chrome does not reliably emit an initial PNG screencast frame for a
@@ -2141,6 +2147,7 @@ async fn encode_stream(
         CaptureOptions::default(),
         None,
         None,
+        None,
     )
     .await
 }
@@ -2154,6 +2161,7 @@ async fn encode_stream_with_options(
     options: CaptureOptions,
     mut first_frame: Option<oneshot::Sender<()>>,
     encoder_complete: Option<Arc<AtomicBool>>,
+    encoder_succeeded: Option<Arc<AtomicBool>>,
 ) -> Result<u64, String> {
     let mut command = build_ffmpeg_command_with_options(&output_path, fps, cursor, options);
     let mut ffmpeg = match spawn_ffmpeg_command(&mut command) {
@@ -2247,6 +2255,11 @@ async fn encode_stream_with_options(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg failed: {}", ffmpeg_error_tail(&stderr)));
+    }
+    if produced.is_ok() {
+        if let Some(succeeded) = encoder_succeeded {
+            succeeded.store(true, Ordering::SeqCst);
+        }
     }
     produced
 }
@@ -3551,4 +3564,32 @@ mod tests {
             .map(String::as_str);
         assert_eq!(threads, Some("1"));
     }
+    #[tokio::test]
+    #[ignore = "hosted ffmpeg; actual failed encoder exit cannot certify terminal video"]
+    async fn encoder_failure_joins_without_minting_successful_output_proof() {
+        for invalid_frame in [false, true] {
+            let path = std::env::temp_dir().join(format!("native-negative-video-{}.webm", uuid::Uuid::new_v4()));
+            let (sender, frames) = mpsc::channel(2);
+            if invalid_frame {
+                sender.send(CapturedVideoFrame {
+                    sequence: 0, image_data: Arc::new(b"not an image".to_vec()),
+                    elapsed: Duration::ZERO, captured_at: tokio::time::Instant::now(),
+                    timestamp: cursor_timestamp(), device_width: 64.0, device_height: 64.0,
+                }).await.unwrap();
+            }
+            drop(sender);
+            let joined = Arc::new(AtomicBool::new(false));
+            let succeeded = Arc::new(AtomicBool::new(false));
+            let output = encode_stream_with_options(
+                path.to_string_lossy().into_owned(), 30, false,
+                Arc::new(Mutex::new(RecordingCursorHistory::default())), frames,
+                CaptureOptions::default(), None, Some(joined.clone()), Some(succeeded.clone()),
+            ).await;
+            assert!(output.is_err());
+            assert!(joined.load(Ordering::SeqCst));
+            assert!(!succeeded.load(Ordering::SeqCst));
+            if path.exists() { std::fs::remove_file(path).unwrap(); }
+        }
+    }
+
 }

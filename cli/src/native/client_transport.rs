@@ -28,10 +28,12 @@ pub struct NativeOutcome {
 }
 
 pub trait ClientExecutor: Send + Sync + 'static {
-    /// Move only previously frozen bytes; this hook never runs producers.
+    /// Move only independently finalized bytes for this failed request owner.
+    /// The hook never stops, starts, waits for, or reads a producer.
     fn take_terminal_recording(
         &self,
         _key: super::client_debt::OperationKey,
+        _scope: Option<&str>,
     ) -> Option<super::client_terminal_artifacts::FrozenRecordingBatch> {
         None
     }
@@ -1271,7 +1273,7 @@ where
         sink_open.store(true, std::sync::atomic::Ordering::Release);
     }
     let mut operations = tokio::task::JoinSet::<(u64, NativeOutcome)>::new();
-    let mut pending = std::collections::HashMap::<u64, (String, u64, bool)>::new();
+    let mut pending = std::collections::HashMap::<u64, (String, u64, bool, Option<String>)>::new();
     let mut closing_id = None;
     let mut terminal_control = false;
     let mut terminal_recording = None;
@@ -1317,7 +1319,7 @@ where
                 completion = operations.join_next(), if !operations.is_empty() => {
                     let Some(Ok((sequence, outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
                     settlement_trace!(sequence, CompletionJoined);
-                    let Some((id, generation, callback)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
+                    let Some((id, generation, callback, scope)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
                     let state = broker.settle_with_retention(generation, sequence, outcome.effects,
                         if continuation_negotiated { outcome.retention.as_ref() } else { None }).unwrap_or(ScopeState::Quarantined);
                     executor.fix_operation_result(super::client_debt::OperationKey { generation, operation_seq: sequence });
@@ -1330,8 +1332,8 @@ where
                             })
                     } else { None };
                     let recoverable = recovery.is_some();
-                    if !recoverable && unknown && state == ScopeState::Quarantined {
-                        let batch = executor.take_terminal_recording(super::client_debt::OperationKey { generation, operation_seq: sequence });
+                    if !recoverable && !callback && outcome.result.is_err() && state == ScopeState::Quarantined {
+                        let batch = executor.take_terminal_recording(super::client_debt::OperationKey { generation, operation_seq: sequence }, scope.as_deref());
                         if terminal_recording_negotiated { terminal_recording = batch; }
                     }
                     let mut message = result_message(id, generation, sequence, outcome, state);
@@ -1495,7 +1497,7 @@ where
                     match admitted {
                         Ok(lease) => {
                             pending
-                                .insert(operation_seq, (id, generation, callback_token.is_some()));
+                                .insert(operation_seq, (id, generation, callback_token.is_some(), args.get("identityScope").and_then(serde_json::Value::as_str).map(str::to_owned)));
                             let executor = executor.clone();
                             let broker = broker.clone();
                             operations.spawn(async move {
@@ -1830,7 +1832,7 @@ where
     } else {
         settlement_trace!(0, ShutdownUnproven);
     }
-    for (sequence, (id, generation, _callback)) in pending {
+    for (sequence, (id, generation, _callback, _scope)) in pending {
         let effects = if broker.has_started(sequence) {
             Effects::Unknown
         } else {

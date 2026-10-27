@@ -27,6 +27,7 @@ async fn peer(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
+    failure: Option<&'static str>,
 ) -> Peer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -153,6 +154,14 @@ async fn peer(
                 }
                 "Page.navigate" => {
                     assert_eq!(session, "session-1");
+                    if loader == "activated-loader" && failure.is_some() {
+                        if failure == Some("disconnect") {
+                            let _ = socket.close(None).await;
+                            return;
+                        }
+                        error = true;
+                        json!({})
+                    } else {
                     loader = "activated-loader";
                     isolated_world = None;
                     after.push(json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":{
@@ -162,6 +171,7 @@ async fn peer(
                         "frameId":"frame-session-1","loaderId":loader,"name":"load"}}),
                     );
                     json!({"frameId":"frame-session-1","loaderId":loader})
+                    }
                 }
                 "Page.getLayoutMetrics" => {
                     json!({"cssLayoutViewport":{"pageX":0,"pageY":0,"clientWidth":320,"clientHeight":200},
@@ -371,7 +381,17 @@ async fn decode_video(bytes: &[u8]) -> Result<(), String> {
 }
 
 async fn run(negotiated: bool, clean_stop: bool) {
-    let peer = peer(clean_stop, None).await;
+    run_with_failure(negotiated, clean_stop, "scope.reset").await;
+}
+
+async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &str) {
+    let native_command = if failed_command == "connection" { "page.navigate" } else { failed_command };
+    let failure = match failed_command {
+        "page.navigate" => Some("navigation"),
+        "connection" => Some("disconnect"),
+        _ => None,
+    };
+    let peer = peer(clean_stop, None, failure).await;
     let broker = Arc::new(ClientSession::new());
     let browser = Arc::new(ClientBrowser::new(broker.clone()));
     let mut capabilities = vec!["terminal.close/1".into()];
@@ -421,7 +441,15 @@ async fn run(negotiated: bool, clean_stop: bool) {
         {
             return Err("active recording was frozen or quota moved".into());
         }
-        let reset = command(&mut fixture, "scope.reset", json!({"identityScope":scope})).await?;
+        let mut failure_args = json!({"identityScope":scope});
+        if native_command == "page.navigate" {
+            // Finish the actual managed recorder through its production
+            // lifecycle hook, not a fabricated clean ledger or byte seed.
+            actions.recording_page_closing(&scope, &browser.blobs).await.map_err(|e| format!("real segment finalization: {e:?}"))?;
+            failure_args["url"] = json!("about:blank");
+            failure_args["waitUntil"] = json!("load");
+        }
+        let reset = command(&mut fixture, native_command, failure_args).await?;
         let failed = fixture.sequence;
         if reset["ok"] != false
             || reset["error"]["code"]
@@ -454,7 +482,7 @@ async fn run(negotiated: bool, clean_stop: bool) {
             identity.clone(),
         )
         .await?;
-        if !negotiated || !clean_stop {
+        if !negotiated {
             if collected["ok"] != false || collected["effects"] != "not-dispatched" {
                 return Err("unnegotiated terminal artifact accepted".into());
             }
@@ -559,7 +587,7 @@ async fn run(negotiated: bool, clean_stop: bool) {
             ("Page.startScreencast", 1),
             ("Page.stopScreencast", 1),
             ("Page.captureScreenshot", 1),
-            ("Target.createBrowserContext", 2),
+            ("Target.createBrowserContext", if clean_stop && failed_command == "scope.reset" { 2 } else { 1 }),
         ] {
             if log
                 .iter()
@@ -604,9 +632,27 @@ async fn failed_replacement_without_capability_never_exports_frozen_recording() 
 }
 
 #[tokio::test]
-#[ignore = "hosted ffmpeg; actual stop error ACK forbids finalized recording export"]
-async fn failed_replacement_with_unclean_recording_never_exports_finished_bytes() {
+#[ignore = "hosted ffmpeg/ffprobe; actual stop error retains independently finalized bytes without clearing cleanup failure"]
+async fn failed_replacement_with_stop_error_exports_verified_bytes_without_reopening() {
     run(true, false).await;
+}
+
+#[tokio::test]
+#[ignore = "hosted ffmpeg/ffprobe; direct recording.stop fails after actual encoder completion and transfers only immutable bytes"]
+async fn failed_stop_exports_verified_bytes_without_repeating_stop_or_new_session() {
+    run_with_failure(true, false, "recording.stop").await;
+}
+
+#[tokio::test]
+#[ignore = "hosted ffmpeg/ffprobe; real finalized segment survives actual failed Page.navigate receipt and framed terminal transfer"]
+async fn failed_navigation_exports_real_previous_segment_without_reopening_scope() {
+    run_with_failure(true, true, "page.navigate").await;
+}
+
+#[tokio::test]
+#[ignore = "hosted ffmpeg/ffprobe; real CDP socket EOF during navigation retains a previously finalized real segment under the failed receipt"]
+async fn failed_cdp_connection_exports_real_previous_segment_without_reconnect() {
+    run_with_failure(true, true, "connection").await;
 }
 
 #[tokio::test]
@@ -614,7 +660,7 @@ async fn failed_replacement_with_unclean_recording_never_exports_finished_bytes(
 async fn close_before_failed_replacement_result_releases_late_unclaimed_frozen_quota() {
     let (reached, wait_reached) = tokio::sync::oneshot::channel();
     let (release, wait_release) = tokio::sync::oneshot::channel();
-    let peer = peer(true, Some((reached, wait_release))).await;
+    let peer = peer(true, Some((reached, wait_release)), None).await;
     let broker = Arc::new(ClientSession::new());
     let browser = Arc::new(ClientBrowser::new(broker.clone()));
     let mut fixture = FramedFixture::with_capabilities(

@@ -182,7 +182,8 @@
     "checked-state-unchanged",
     "checked-control-replaced",
     "fill-unsupported-target",
-    "no-editable-focus"
+    "no-editable-focus",
+    "tap-target-replaced-before-press"
   ],
   "validDecision": [
     {

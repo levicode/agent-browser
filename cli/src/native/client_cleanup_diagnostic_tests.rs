@@ -701,6 +701,8 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
         1,
         11,
         ScreenshotFailure {
+            read_error: None,
+            read_cleanup_lost: None,
             stage: ScreenshotStage::Capture,
             capture_phase: ScreenshotCapturePhase::PostCaptureValidation,
             inventory_after_failure: InventoryAfterFailure::Changed,
@@ -950,4 +952,86 @@ fn atomic_inventory_rejection_maximal_record_is_507_bytes_and_missing_counts_sta
     assert!(rows[0].get("delta").is_none());
     assert!(rows[0].get("events").is_none());
     assert_eq!(rows[0]["exact"], false);
+}
+
+#[test]
+fn semantic_read_failure_uses_existing_sink_with_closed_typed_detail_only() {
+    let file = tempfile::NamedTempFile::new().unwrap();
+    let capture = cleanup_capture(Some(file.path())).unwrap();
+    screenshot_failure_into(
+        &capture,
+        1,
+        12,
+        ScreenshotFailure {
+            stage: ScreenshotStage::SemanticNodeGeometry,
+            capture_phase: ScreenshotCapturePhase::NotEntered,
+            inventory_after_failure: InventoryAfterFailure::NotSampled,
+            error: ProtocolError::StaleScope,
+            read_error: Some(ReadError::Geometry(GeometryReadError::StaleIdentity)),
+            read_cleanup_lost: Some(false),
+        },
+    );
+    let rows = records(&file);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["phase"], "ScreenshotFirstFailure");
+    assert_eq!(rows[0]["screenshotStage"], "semantic-node-geometry");
+    assert_eq!(
+        rows[0]["readError"],
+        serde_json::json!({"geometry":"stale-identity"})
+    );
+    assert_eq!(rows[0]["readDirty"], false);
+    assert_eq!(
+        keys(&rows[0]),
+        [
+            "capturePhase",
+            "droppedBefore",
+            "emittedBefore",
+            "error",
+            "generation",
+            "inventoryAfterFailure",
+            "operationSeq",
+            "overflow",
+            "phase",
+            "pid",
+            "readDirty",
+            "readError",
+            "record",
+            "schemaVersion",
+            "screenshotStage",
+            "source",
+            "suppressedBefore"
+        ]
+    );
+}
+
+#[test]
+fn semantic_read_failure_maximal_closed_record_keeps_existing_byte_bound() {
+    for read_error in [
+        ReadError::Observation(ObservationReadError::UnsupportedCapability),
+        ReadError::Geometry(GeometryReadError::IncompleteInventory),
+    ] {
+        let record = Record {
+            schema_version: 2,
+            source: Source::Native,
+            pid: u32::MAX,
+            record: SAFE_INTEGER,
+            operation_seq: SAFE_INTEGER,
+            phase: Phase::ScreenshotFirstFailure,
+            dropped_before: SAFE_INTEGER,
+            emitted_before: SAFE_INTEGER,
+            suppressed_before: SAFE_INTEGER,
+            overflow: false,
+            facts: Facts {
+                generation: Some(SAFE_INTEGER),
+                screenshot_stage: Some(ScreenshotStage::SemanticFrameGeometry),
+                capture_phase: Some(ScreenshotCapturePhase::NotEntered),
+                inventory_after_failure: Some(InventoryAfterFailure::Unavailable),
+                error: Some(ProtocolError::UnsupportedCapability),
+                read_error: Some(read_error),
+                read_cleanup_lost: Some(false),
+                ..Facts::default()
+            },
+        };
+        assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
+    }
 }

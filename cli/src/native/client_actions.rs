@@ -32,6 +32,7 @@ pub enum ActionReason {
     ControlReplacedAfterClick,
     FillUnsupportedTarget,
     NoEditableFocus,
+    TapTargetReplacedBeforePress,
 }
 #[derive(Debug)]
 pub struct ActionFailure {
@@ -50,6 +51,9 @@ struct Dispatch {
     fill_unsupported_target: AtomicBool,
     no_editable_focus: AtomicBool,
     acknowledged_postcondition: AtomicBool,
+    tap_detached_before_press: AtomicBool,
+    tap_before_press_certified: AtomicBool,
+    tap_before_press_refusal: Mutex<Option<TapBeforePressRefusal>>,
     recording_start_refusal: Mutex<Option<RecordingStartRefusal>>,
     settled_replacement_prefix: Mutex<Option<Arc<SettledReplacementPrefix>>>,
     preparation_enabled: AtomicBool,
@@ -155,6 +159,14 @@ impl Dispatch {
         self.mark_mutation(false);
     }
     fn mark_mutation(&self, preparation: bool) {
+        self.tap_detached_before_press
+            .store(false, Ordering::SeqCst);
+        self.tap_before_press_certified
+            .store(false, Ordering::SeqCst);
+        match self.tap_before_press_refusal.lock() {
+            Ok(mut proof) => *proof = None,
+            Err(_) => self.cleanup.store(true, Ordering::SeqCst),
+        }
         self.readonly_preparation_refusal
             .store(false, Ordering::SeqCst);
         self.readonly_preparation_disqualified
@@ -174,10 +186,15 @@ impl Dispatch {
         // A reason refines a semantic refusal, never an authority, transport,
         // or cleanup error from a later attempt in the same action.
         let semantic_refusal = error == ProtocolError::NotActionable;
+        let tap_refusal = error == ProtocolError::StaleReference
+            && self.tap_before_press_certified.load(Ordering::SeqCst)
+            && !self.cleanup.load(Ordering::SeqCst);
         ActionFailure {
             error,
             cleanup_failed: self.cleanup.load(Ordering::SeqCst),
-            reason: if !semantic_refusal {
+            reason: if tap_refusal {
+                Some(ActionReason::TapTargetReplacedBeforePress)
+            } else if !semantic_refusal {
                 None
             } else if self.intercepted.load(Ordering::SeqCst) {
                 Some(ActionReason::InterceptedPointer)
@@ -196,7 +213,7 @@ impl Dispatch {
             } else {
                 None
             },
-            effects: if self.acknowledged_postcondition.load(Ordering::SeqCst)
+            effects: if (tap_refusal || self.acknowledged_postcondition.load(Ordering::SeqCst))
                 && !self.cleanup.load(Ordering::SeqCst)
             {
                 Effects::Completed
@@ -280,6 +297,49 @@ impl SettledReplacementPrefix {
             (None, ActionRealmAuthority::UntrackedFixture) => Ok(()),
             _ => Err(ProtocolError::StaleScope),
         }
+    }
+}
+/// A one-shot receipt for an exact receiver detached by the acknowledged
+/// hover. No press was submitted. The known scroll/hover effects are not rolled
+/// back; only the caller's existing descriptor relocation may choose a new ref.
+struct TapBeforePressRefusal {
+    authority: SettledReplacementPrefix,
+    realm: super::client_enrollment::ExactRealmTicket,
+    reference: NodeReference,
+}
+impl TapBeforePressRefusal {
+    fn check(&self, ctx: &ActionContext<'_>) -> Result<(), ProtocolError> {
+        ctx.check()?;
+        self.authority.check(ctx)?;
+        reference(ctx, &self.reference)?;
+        if self.realm.destroyed()? {
+            return Err(ProtocolError::StaleReference);
+        }
+        let journal = OperationJournalHandle::current().ok_or(ProtocolError::ScopeUnavailable)?;
+        let ledger = ctx
+            .page
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        if !journal.matches_protected_read(
+            &ledger,
+            &ctx.page.identity_scope,
+            &ctx.page.target_id,
+            &ctx.page.page_session_id,
+            ctx.operation,
+        ) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let settled = journal.snapshot();
+        if settled.integrity_lost || settled.input_debt != 0 || settled.object_debt != 0 {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        if settled.submission_revoked {
+            return Err(ProtocolError::StaleScope);
+        }
+        ctx.page_state
+            .check_no_active_local_input(&ctx.page.identity_scope)?;
+        ctx.check()
     }
 }
 async fn settle_replacement_cancellation(ctx: &ActionContext<'_>, d: &Dispatch) -> bool {
@@ -1183,6 +1243,31 @@ impl ClientActions {
                 result = Err(error);
             }
         }
+        // Only after exact handle release and mandatory input cleanup can a
+        // detached-before-press receipt authorize descriptor relocation. A late
+        // cancellation, retired realm, or outstanding debt keeps the old error
+        // boundary; it must never become a clean stale-target retry.
+        let tap_refusal = d
+            .tap_before_press_refusal
+            .lock()
+            .ok()
+            .and_then(|mut proof| proof.take());
+        if result == Err(ProtocolError::StaleReference)
+            && d.tap_detached_before_press.load(Ordering::SeqCst)
+            && !d.cleanup.load(Ordering::SeqCst)
+        {
+            if let Some(proof) = tap_refusal {
+                match proof.check(&ctx) {
+                    Ok(()) => d.tap_before_press_certified.store(true, Ordering::SeqCst),
+                    Err(error) => {
+                        if error == ProtocolError::CleanupFailed {
+                            d.cleanup.store(true, Ordering::SeqCst);
+                        }
+                        result = Err(error);
+                    }
+                }
+            }
+        }
         #[cfg(test)]
         tests::emit_preparation_mismatch(&ctx, &d, &result);
         let result = finish_dispatch(&d, result).map_err(|mut failure| {
@@ -1762,6 +1847,16 @@ async fn click(
     hold: Duration,
 ) -> Result<(), ProtocolError> {
     pointer_event(ctx, d, "mouseMoved", Some(point), None, None, None).await?;
+    click_buttons(ctx, d, point, button, count, hold).await
+}
+async fn click_buttons(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    point: Point,
+    button: &str,
+    count: i32,
+    hold: Duration,
+) -> Result<(), ProtocolError> {
     for click_count in 1..=count {
         pointer_event(
             ctx,
@@ -2355,6 +2450,17 @@ async fn center_once(
         x: rounded.x,
         y: rounded.y,
     };
+    let size = hit_test_action_point(ctx, d, node, &geometry, root, enabled).await?;
+    Ok((rounded, size))
+}
+async fn hit_test_action_point(
+    ctx: &ActionContext<'_>,
+    d: &Dispatch,
+    node: &Resolved,
+    geometry: &GeometrySnapshot,
+    root: GeometryPoint,
+    enabled: bool,
+) -> Result<(f64, f64), ProtocolError> {
     let local = geometry
         .root_to_frame_point(&node.binding.frame, root)
         .map_err(|e| geometry_failure(d, e))?;
@@ -2434,21 +2540,15 @@ async fn center_once(
         .map_err(|e| geometry_failure(d, e))?;
     ctx.check()?;
     Ok((
-        Point {
-            x: root.x,
-            y: root.y,
-        }
-        .validate()?,
-        (
-            size["width"]
-                .as_f64()
-                .ok_or(ProtocolError::BrowserFailure)?,
-            size["height"]
-                .as_f64()
-                .ok_or(ProtocolError::BrowserFailure)?,
-        ),
+        size["width"]
+            .as_f64()
+            .ok_or(ProtocolError::BrowserFailure)?,
+        size["height"]
+            .as_f64()
+            .ok_or(ProtocolError::BrowserFailure)?,
     ))
 }
+
 impl ClientActions {
     async fn pointer(
         &self,
@@ -2535,7 +2635,7 @@ impl ClientActions {
         }
         // Capture before the first scroll; never mint replacement authority at
         // the end of a deadline or after a retry. Only ordinary Tap participates.
-        let preparation =
+        let mut preparation =
             if matches!(&request.action, LocatorAction::Tap { .. }) && !ctx.operation.is_callback {
                 // Optional settlement evidence is not another action admission gate.
                 // Callback leases cannot obtain this receipt. Any other inability to
@@ -2581,7 +2681,7 @@ impl ClientActions {
             }
             Ok(node) => node,
         };
-        let node = if matches!(&request.action, LocatorAction::SetInputFiles { .. }) {
+        let mut node = if matches!(&request.action, LocatorAction::SetInputFiles { .. }) {
             retarget_upload_label(ctx, d, node).await?
         } else {
             node
@@ -2611,7 +2711,9 @@ impl ClientActions {
             && d.readonly_preparation_refusal.load(Ordering::SeqCst)
             && !d.readonly_preparation_disqualified.load(Ordering::SeqCst)
             && !d.sent.load(Ordering::SeqCst);
-        let released = if readonly_refusal {
+        let tap_refusal = result == Err(ProtocolError::StaleReference)
+            && d.tap_detached_before_press.load(Ordering::SeqCst);
+        let released = if readonly_refusal || tap_refusal {
             node.release_settled(ctx).await
         } else {
             node.release(ctx).await
@@ -2629,6 +2731,17 @@ impl ClientActions {
                 return Err(ProtocolError::CleanupFailed);
             }
             return result.and(Err(ProtocolError::CleanupFailed));
+        }
+        if tap_refusal {
+            if let (Some(authority), Some(realm)) = (preparation.take(), node.realm.take()) {
+                *d.tap_before_press_refusal
+                    .lock()
+                    .map_err(|_| ProtocolError::CleanupFailed)? = Some(TapBeforePressRefusal {
+                    authority,
+                    realm,
+                    reference: request.reference.clone(),
+                });
+            }
         }
         if readonly_refusal {
             // Every failing final fence is the actual result; a boolean guard
@@ -2831,7 +2944,43 @@ impl ClientActions {
         } else {
             None
         };
-        let result = click(ctx, d, point, button, count, Duration::ZERO).await;
+        let result = async {
+            pointer_event(ctx, d, "mouseMoved", Some(point), None, None, None).await?;
+            let receiver = node
+                .call(ctx, d, false, TAP_RECEIVER_AFTER_HOVER, vec![])
+                .await;
+            if receiver == Err(ProtocolError::StaleReference)
+                && button == "left"
+                && count == 1
+                && receipt.is_none()
+            {
+                d.tap_detached_before_press.store(true, Ordering::SeqCst);
+            }
+            if receiver? != Value::Bool(true) {
+                return Err(ProtocolError::BrowserFailure);
+            }
+            // Hover handlers can move or cover a still-connected receiver too.
+            // Recheck the same root point and native owner chain, not a new node.
+            let geometry = ctx
+                .geometry
+                .refresh_after_scroll(&ctx.page.client, ctx.operation)
+                .await
+                .map_err(|error| geometry_failure(d, error))?;
+            hit_test_action_point(
+                ctx,
+                d,
+                node,
+                &geometry,
+                GeometryPoint {
+                    x: point.x,
+                    y: point.y,
+                },
+                true,
+            )
+            .await?;
+            click_buttons(ctx, d, point, button, count, Duration::ZERO).await
+        }
+        .await;
         if let Some(receipt) = receipt {
             let restored = ctx
                 .page_state
@@ -2976,6 +3125,12 @@ async fn focus(
     node.call(ctx,d,true,"function(){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};if(typeof this.focus!=='function')return {status:'not-actionable'};this.focus();return true;}",vec![]).await?;
     Ok(())
 }
+// Exact read after the acknowledged hover, before any button press. This is
+// not a locator and cannot retarget a replacement or synthesize a click.
+const TAP_RECEIVER_AFTER_HOVER: &str = r#"function(){
+ if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};
+ return true;
+}"#;
 // Match the former setInputFiles label association without broad locator
 // retargeting. A non-label or invalid association keeps the existing refusal.
 // No page data, paths, control IDs, or object handles cross the protocol.
@@ -3459,6 +3614,18 @@ impl RecordingLedger {
         } else {
             Ok(owned.bytes.take().ok_or(ProtocolError::BrowserFailure)?)
         };
+        // A WebM header alone is not playable-output evidence. The encoder's
+        // successful explicit join is independent of a failed remote stop ACK.
+        let result = result.and_then(|bytes| {
+            if owned.state.encoder_complete.load(Ordering::SeqCst)
+                && owned.state.encoder_succeeded.load(Ordering::SeqCst)
+                && !owned.state.cleanup_task_failed
+            {
+                Ok(bytes)
+            } else {
+                Err(ProtocolError::BrowserFailure)
+            }
+        });
         match result {
             Ok(bytes) => {
                 blobs
@@ -3695,9 +3862,10 @@ impl ClientActions {
         (arrival, release, path)
     }
 
-    /// Failed lifecycle transitions may move only the complete, already-clean
-    /// finalized ledger into terminal byte custody. This performs no capture,
-    /// encoder, file read, browser RPC or producer wait.
+    /// Terminal collection moves only immutable bytes whose real encoder joined
+    /// successfully and whose owned file was read independently of stop status.
+    /// A failed current segment or remote cleanup never invalidates earlier safe
+    /// bytes, and exporting bytes never clears that outstanding cleanup owner.
     pub(crate) fn freeze_finalized_recording(
         &self,
         scope: &str,
@@ -3705,62 +3873,35 @@ impl ClientActions {
         blobs: &BlobStore,
     ) -> Option<super::client_terminal_artifacts::FrozenRecordingBatch> {
         let mut ledger = self.recording.try_lock().ok()?;
-        if ledger.current.is_some()
-            || ledger.abandoned
-            || ledger.cleanup_failed
-            || ledger.filesystem_cleanup_failed
-            || ledger.lost.is_some()
-            || ledger.authority.is_none()
-            || ledger.finished.is_empty()
-            || ledger.finished.iter().any(|owned| {
-                owned.scope.generation != key.generation
-                    || owned.read_job.is_some()
-                    || owned.bytes.is_none()
-                    || owned.reservation.is_none()
-                    || owned.state.capture_task.is_some()
-                    || owned.state.cancel_tx.is_some()
-                    || owned.state.cleanup_task_failed
-                    || !owned.state.encoder_complete.load(Ordering::SeqCst)
-                    || !owned.cleanup_complete.load(Ordering::SeqCst)
-                    || !owned.attachment.as_ref().is_some_and(|attachment| {
-                        attachment.startup.is_none()
-                            && !attachment.cleanup_failed
-                            && attachment.detached.load(Ordering::SeqCst)
-                            && attachment.session.as_ref().is_some_and(|session| {
-                                attachment.acknowledged_cleanup.contains(session)
-                            })
-                    })
-            })
-        {
+        if ledger.abandoned || ledger.authority.is_none() {
             return None;
         }
-        // Entire collection is checked before any item leaves the ledger.
-        // File cleanup failure refuses the whole batch, never a partial success.
+        let safe = |owned: &OwnedRecording| {
+            owned.scope.generation == key.generation
+                && owned.read_job.is_none()
+                && owned.bytes.is_some()
+                && owned.reservation.is_some()
+                && owned.state.capture_task.is_none()
+                && owned.state.cancel_tx.is_none()
+                && !owned.state.cleanup_task_failed
+                && owned.state.encoder_complete.load(Ordering::SeqCst)
+                && owned.state.encoder_succeeded.load(Ordering::SeqCst)
+        };
+        if !ledger.finished.iter().any(safe) {
+            return None;
+        }
         ledger.armed = false;
         ledger.abandoned = true;
-        let finished = std::mem::take(&mut ledger.finished);
-        let mut items = Vec::with_capacity(finished.len());
-        let mut metadata = Vec::with_capacity(finished.len());
-        let mut clean = true;
-        for owned in finished {
-            let OwnedRecording {
-                directory,
-                reservation,
-                bytes,
-                started_at,
-                ordinal,
-                ..
-            } = owned;
-            clean &= directory.close().is_ok();
-            items.push((reservation?, bytes?));
-            metadata.push((started_at, ordinal));
+        let mut items = Vec::new();
+        let mut metadata = Vec::new();
+        for owned in &mut ledger.finished {
+            if safe(owned) {
+                items.push((owned.reservation.take()?, owned.bytes.take()?));
+                metadata.push((owned.started_at.clone(), owned.ordinal));
+            }
         }
-        if !clean {
-            ledger.cleanup_failed = true;
-            ledger.filesystem_cleanup_failed = true;
-            let _ = ledger.authority.as_ref()?.retire();
-            return None;
-        }
+        // Private files and attachments stay in the original cleanup journal.
+        // Their deletion/remote settlement cannot be inferred from byte custody.
         let frozen = match blobs.freeze_finalized_artifacts(
             ledger.authority.as_ref()?,
             key.generation,
@@ -4052,6 +4193,7 @@ impl ClientActions {
             Some(owned.cleanup_complete.clone()),
             Some(attachment.detached.clone()),
             Some(owned.state.encoder_complete.clone()),
+            Some(owned.state.encoder_succeeded.clone()),
             startup_receipt,
         ));
         owned.state.cancel_tx = Some(cancel_tx);
@@ -4090,12 +4232,9 @@ impl ClientActions {
         if ledger.cleanup_failed {
             return Err(ProtocolError::CleanupFailed);
         }
-        if let Some(ordinal) = ledger.lost.take() {
-            // Finalization and cleanup are acknowledged, but the recording is
-            // incomplete. Report this once without publishing retained blobs;
-            // the public adapter raises the artifact error and may retry stop.
-            return Ok(json!({"identityScope":ctx.page.identity_scope,"missingSegment":ordinal}));
-        }
+        // Return the safe handles in the same stop receipt as the missing part.
+        // Delivery must never repeat producer finalization to recover this batch.
+        let missing = ledger.lost.take();
         if ledger
             .finished
             .iter()
@@ -4139,7 +4278,11 @@ impl ClientActions {
             return Err(check.err().unwrap_or(ProtocolError::CleanupFailed));
         }
 
-        Ok(json!({"identityScope":ctx.page.identity_scope,"segments":segments}))
+        let mut result = json!({"identityScope":ctx.page.identity_scope,"segments":segments});
+        if let Some(ordinal) = missing {
+            result["missingSegment"] = json!(ordinal);
+        }
+        Ok(result)
     }
 }
 
@@ -4531,6 +4674,9 @@ mod tests {
     }
     mod upload_label_controls {
         include!("client_actions_upload_label_tests.rs");
+    }
+    mod tap_before_press {
+        include!("client_actions_tap_before_press_tests.rs");
     }
     #[test]
     fn readonly_timing_is_silent_when_disabled_tap_success_or_mutated() {
@@ -5603,6 +5749,17 @@ mod tests {
                 {
                     server_gate.seal();
                 }
+                if mode == "preparation-tap-before-press-cancel"
+                    && source == TAP_RECEIVER_AFTER_HOVER
+                {
+                    action_broker.as_ref().unwrap().cancel(1, 1).unwrap();
+                }
+                if mode == "preparation-tap-before-press-retired"
+                    && method == "Runtime.releaseObject"
+                    && request["params"]["objectId"] == "exact-node"
+                {
+                    server_gate.seal();
+                }
                 // These are author-controlled query facts, never dispatch receipts.
                 let query_name = if mode == "strict-query-misleading-ambiguous" {
                     "click action done"
@@ -5615,6 +5772,22 @@ mod tests {
                     "Save"
                 };
                 let result = match method {
+                    "Runtime.callFunctionOn"
+                        if mode.starts_with("preparation-tap-before-press-")
+                            && source == TAP_RECEIVER_AFTER_HOVER =>
+                    {
+                        assert_eq!(request["params"]["objectId"], "exact-node");
+                        match mode {
+                            "preparation-tap-before-press-connected"
+                            | "preparation-tap-before-press-press-error" => {
+                                json!({"result":{"value":true}})
+                            }
+                            "preparation-tap-before-press-probe-error" => {
+                                json!({"result":{},"exceptionDetails":{"exception":{"objectId":"probe-exception"}}})
+                            }
+                            _ => json!({"result":{"value":{"status":"stale"}}}),
+                        }
+                    }
                     "Runtime.callFunctionOn"
                         if mode.starts_with("upload-") && source == UPLOAD_LABEL_CONTROL =>
                     {
@@ -5985,11 +6158,20 @@ mod tests {
                 {
                     // Let fixture geometry initialize; refuse the actual start.
                     json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic recording startup failure"}})
-                } else if ((mode == "upload-label-release-failed"
-                    && request["params"]["objectId"] == "exact-node"
-                    || mode == "upload-control-release-failed"
-                        && request["params"]["objectId"] == "upload-control")
-                    && method == "Runtime.releaseObject")
+                } else if (mode == "preparation-tap-before-press-move-error"
+                    && method == "Input.dispatchMouseEvent"
+                    && request["params"]["type"] == "mouseMoved")
+                    || (mode == "preparation-tap-before-press-press-error"
+                        && method == "Input.dispatchMouseEvent"
+                        && request["params"]["type"] == "mousePressed")
+                    || (mode == "preparation-tap-before-press-release-error"
+                        && method == "Runtime.releaseObject"
+                        && request["params"]["objectId"] == "exact-node")
+                    || ((mode == "upload-label-release-failed"
+                        && request["params"]["objectId"] == "exact-node"
+                        || mode == "upload-control-release-failed"
+                            && request["params"]["objectId"] == "upload-control")
+                        && method == "Runtime.releaseObject")
                     || (mode == "strict-query-drag-release-failed"
                         && drag_pressed
                         && method == "Runtime.releaseObject"
@@ -6029,6 +6211,7 @@ mod tests {
                     || mode.starts_with("direct-point")
                     || mode == "strict-query-drag-cleanup-debt"
                     || mode.starts_with("preparation-readonly-")
+                    || mode.starts_with("preparation-tap-before-press-")
                     || retained_action_errors::is_mode(mode)
                     || retirement_node_swipes::is_mode(mode)
                 {
@@ -8580,6 +8763,9 @@ mod tests {
         state.output_path = path.to_string_lossy().into_owned();
         state.active = true;
         state.frame_count = 1;
+        // Byte-ledger fixture only, not a real producer/failure proof. Hosted
+        // wire tests obtain this witness exclusively from the actual FFmpeg wait.
+        state.encoder_succeeded.store(true, Ordering::SeqCst);
         state.capture_task = Some(tokio::spawn(async move {
             if stop_error {
                 Err("Synthetic stop failure".into())
@@ -8720,26 +8906,35 @@ mod tests {
             .unwrap();
         seed_recording(&actions, &f, 2, None, true).await;
         let missing = collect_recording(&actions, &f).await.unwrap();
-        assert_eq!(missing, json!({"identityScope":"scope","missingSegment":2}));
+        assert_eq!(missing["missingSegment"], 2);
+        assert_eq!(missing["identityScope"], "scope");
+        assert_eq!(missing["segments"].as_array().unwrap().len(), 1);
+        assert_eq!(missing.as_object().unwrap().len(), 3);
         {
             let ledger = actions.recording.lock().await;
             assert!(!ledger.armed);
             assert!(ledger.current.is_none());
             assert!(!ledger.cleanup_failed);
-            assert_eq!(ledger.finished.len(), 1);
-            assert!(ledger.finished[0].reservation.is_some());
-            assert_eq!(ledger.finished[0].bytes.as_deref(), Some(bytes.as_slice()));
+            assert!(ledger.finished.is_empty());
         }
-        let result = collect_recording(&actions, &f).await.unwrap();
-        assert_eq!(result["segments"].as_array().unwrap().len(), 1);
         assert_eq!(
-            result["segments"][0]["startedAt"],
+            missing["segments"][0]["startedAt"],
             "2026-10-21T00:00:01.000Z"
         );
         assert_eq!(
             collect_recording(&actions, &f).await.unwrap()["segments"],
             json!([])
         );
+    }
+    #[tokio::test]
+    async fn recording_failed_encoder_never_publishes_a_header_only_file() {
+        let f = fixture("normal").await;
+        let actions = ClientActions::default();
+        seed_recording(&actions, &f, 1, Some(&[0x1a, 0x45, 0xdf, 0xa3]), false).await;
+        actions.recording.lock().await.current.as_ref().unwrap().state.encoder_succeeded.store(false, Ordering::SeqCst);
+        let result = collect_recording(&actions, &f).await.unwrap();
+        assert_eq!(result, json!({"identityScope":"scope","segments":[],"missingSegment":1}));
+        assert!(actions.recording.lock().await.finished.is_empty());
     }
     #[tokio::test]
     async fn recording_abandon_joins_and_prevents_late_page_segments() {
@@ -10125,6 +10320,9 @@ mod tests {
                         ProtocolError::FillUnsupportedTarget
                     }
                     Some(ActionReason::NoEditableFocus) => ProtocolError::NoEditableFocus,
+                    Some(ActionReason::TapTargetReplacedBeforePress) => {
+                        ProtocolError::TapTargetReplacedBeforePress
+                    }
                     None => failure.error.clone(),
                 };
                 let outcome = NativeOutcome {
@@ -10460,6 +10658,9 @@ mod tests {
                         ProtocolError::FillUnsupportedTarget
                     }
                     Some(ActionReason::NoEditableFocus) => ProtocolError::NoEditableFocus,
+                    Some(ActionReason::TapTargetReplacedBeforePress) => {
+                        ProtocolError::TapTargetReplacedBeforePress
+                    }
                     None => failure.error.clone(),
                 };
                 let outcome = NativeOutcome {
@@ -11200,6 +11401,9 @@ mod tests {
                                     }
                                     Some(ActionReason::NoEditableFocus) => {
                                         ProtocolError::NoEditableFocus
+                                    }
+                                    Some(ActionReason::TapTargetReplacedBeforePress) => {
+                                        ProtocolError::TapTargetReplacedBeforePress
                                     }
                                     None => failure.error,
                                 }),

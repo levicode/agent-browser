@@ -627,3 +627,101 @@ async fn recording_real_screencast_start_error_disarms_and_joins_without_late_se
     assert_eq!(cleanup, Ok(()));
     result.unwrap();
 }
+
+#[tokio::test]
+#[ignore = "hosted ffmpeg/ffprobe; real second segment loses its owned path and the first decodable segment is delivered in the same stop receipt"]
+async fn recording_missing_second_file_returns_first_real_segment_without_another_stop() {
+    let f = WireFixture::new(Mode::Silent).await;
+    let actions = ClientActions::default();
+    let result: Result<(), String> = async {
+        let args = json!({"identityScope":"recording-wire"});
+        let first = f.operation(2);
+        f.journal(0, &first).scope(actions.execute(f.context(0, &first), "recording.start", &args)).await.map_err(action_error)?;
+        let closing = f.operation(3);
+        f.journal(0, &closing).scope(actions.recording_page_closing("recording-wire", &f.blobs)).await.map_err(|e| format!("first close {e:?}"))?;
+        let second = f.operation(4);
+        f.journal(1, &second).scope(actions.recording_page_opened(f.context(1, &second))).await.map_err(action_error)?;
+        // Both producers are real. Remove only the second private path while
+        // its encoder retains the FD: the subsequent independent read fails.
+        let missing_path = actions.recording.lock().await.current.as_ref().ok_or("missing current recorder")?.state.output_path.clone();
+        std::fs::remove_file(&missing_path).map_err(|_| "inject second-file read failure")?;
+        let stop = f.operation(5);
+        let output = f.journal(1, &stop).scope(actions.execute(f.context(1, &stop), "recording.stop", &args)).await.map_err(action_error)?;
+        let segments = output["segments"].as_array().ok_or("missing safe segments")?;
+        if output["missingSegment"] != 2 || output.as_object().map(|o| o.len()) != Some(3) || segments.len() != 1 {
+            return Err(format!("missing-file receipt lost safe output: {output}"));
+        }
+        for session in ["capture1", "capture2"] {
+            if f.count("Page.startScreencast", session) != 1 || f.count("Page.stopScreencast", session) != 1 || f.count("Target.detachFromTarget", session) != 1 {
+                return Err("partial file read repeated capture or stop".into());
+            }
+        }
+        let requests = f.requests.lock().unwrap().len();
+        decoded_segment(&f, &segments[0], (320, 200)).await?;
+        if f.requests.lock().unwrap().len() != requests {
+            return Err("safe byte read issued a browser command".into());
+        }
+        Ok(())
+    }.await;
+    let cleanup = actions.cleanup().await;
+    f.close().await;
+    assert_eq!(cleanup, Ok(()));
+    result.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "hosted ffmpeg/ffprobe; only a completed real segment transfers while the active second recorder remains in its cleanup owner"]
+async fn recording_freeze_preserves_finished_segment_without_stopping_active_second() {
+    let f = WireFixture::new(Mode::Silent).await;
+    let actions = ClientActions::default();
+    let result: Result<(), String> = async {
+        let args = json!({"identityScope":"recording-wire"});
+        let first = f.operation(2);
+        f.journal(0, &first).scope(actions.execute(f.context(0, &first), "recording.start", &args)).await.map_err(action_error)?;
+        let closing = f.operation(3);
+        f.journal(0, &closing).scope(actions.recording_page_closing("recording-wire", &f.blobs)).await.map_err(|e| format!("first close {e:?}"))?;
+        let second = f.operation(4);
+        f.journal(1, &second).scope(actions.recording_page_opened(f.context(1, &second))).await.map_err(action_error)?;
+        let before = f.requests.lock().unwrap().len();
+        let key = client_debt::OperationKey { generation: 1, operation_seq: 5 };
+        let mut batch = actions.freeze_finalized_recording("recording-wire", key, &f.blobs).ok_or("safe previous segment not frozen")?;
+        if f.requests.lock().unwrap().len() != before || f.count("Page.stopScreencast", "capture2") != 0 {
+            return Err("read-only freeze stopped or mutated the active recorder".into());
+        }
+        {
+            let ledger = actions.recording.lock().await;
+            if ledger.current.is_none() || !ledger.abandoned || ledger.armed || ledger.finished.len() != 1 || ledger.finished[0].reservation.is_some() || ledger.finished[0].bytes.is_some() {
+                return Err("freeze lost retained producer/cleanup ownership".into());
+            }
+        }
+        let identity = json!({"identityScope":"recording-wire","failedOperationSeq":5});
+        let manifest = batch.command(1, "recording.finalized.collect", identity.as_object().unwrap().clone()).map_err(|e|format!("collect {e:?}"))?;
+        if manifest["segments"].as_array().map(Vec::len) != Some(1) || manifest["segments"][0]["ordinal"] != 1 {
+            return Err("active or missing segment entered the frozen manifest".into());
+        }
+        let mut read = identity;
+        read["token"] = manifest["token"].clone(); read["handle"] = manifest["segments"][0]["handle"].clone();
+        read["offset"] = json!(0); read["maxBytes"] = json!(262144);
+        let mut bytes = Vec::new();
+        loop {
+            read["offset"] = json!(bytes.len());
+            let chunk = batch.command(1, "recording.finalized.read", read.as_object().unwrap().clone()).map_err(|e|format!("read {e:?}"))?;
+            bytes.extend(base64::engine::general_purpose::STANDARD.decode(chunk["base64"].as_str().ok_or("missing chunk")?).map_err(|_|"base64")?);
+            if chunk["eof"] == true { break; }
+        }
+        let directory = OwnedDirectory::create().map_err(|_|"probe directory")?;
+        let video = directory.path.join("safe.webm");
+        std::fs::write(&video, &bytes).map_err(|_|"probe file")?;
+        let decoded = tokio::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&video).args(["-frames:v", "1", "-f", "null", "-"]).output().await.map_err(|_|"ffmpeg required")?;
+        directory.close().map_err(|_|"probe cleanup")?;
+        if !decoded.status.success() { return Err("frozen real segment did not decode".into()); }
+        if f.requests.lock().unwrap().len() != before { return Err("frozen transfer issued browser commands".into()); }
+        drop(batch);
+        Ok(())
+    }.await;
+    let cleanup = actions.cleanup().await;
+    if result.is_ok() { assert_eq!(f.count("Page.stopScreencast", "capture2"), 1); }
+    f.close().await;
+    assert_eq!(cleanup, Ok(()));
+    result.unwrap();
+}

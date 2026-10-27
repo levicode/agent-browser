@@ -228,6 +228,10 @@ pub(crate) struct Facts {
     pub inventory_unconfigured: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot_stage: Option<ScreenshotStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<ReadError>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readDirty")]
+    pub read_cleanup_lost: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "pass")]
     pub frame_pass: Option<FrameInventoryPass>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1043,10 +1047,17 @@ pub(crate) enum ScreenshotStage {
     ProtectedFrames,
     Geometry,
     TraceMetadata,
+    SemanticViewport,
+    SemanticMetadata,
+    SemanticFrameGeometry,
+    SemanticNodeGeometry,
+    SemanticDocumentRoot,
+    SemanticFinalViewport,
     Capture,
     Restoration,
     FinalGeometry,
     FinalBarrier,
+    FinalScope,
     FinalFrames,
     FinalViewport,
     BlobPublication,
@@ -1071,8 +1082,47 @@ pub(crate) enum InventoryAfterFailure {
     Unchanged,
     Changed,
 }
+// Closed typed read classifications retain no frame selector, node identity or
+// renderer message. Cleanup wrappers are represented separately, not erased.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadError {
+    Observation(ObservationReadError),
+    Geometry(GeometryReadError),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ObservationReadError {
+    InvalidArguments,
+    InvalidLocator,
+    FrameNotFound,
+    FrameAmbiguous,
+    UnsupportedCapability,
+    StaleReference,
+    Superseded,
+    Cancelled,
+    DeadlineExceeded,
+    BackendFailure,
+    PolicyDenied,
+    ResourceLimit,
+    CleanupFailed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GeometryReadError {
+    InvalidGeometry,
+    IncompleteInventory,
+    StaleIdentity,
+    Cancelled,
+    Superseded,
+    DeadlineExceeded,
+    BackendFailure,
+    CleanupFailed,
+}
 pub(crate) struct ScreenshotFailure {
     pub stage: ScreenshotStage,
+    pub read_error: Option<ReadError>,
+    pub read_cleanup_lost: Option<bool>,
     pub capture_phase: ScreenshotCapturePhase,
     pub inventory_after_failure: InventoryAfterFailure,
     pub error: ProtocolError,
@@ -1095,6 +1145,8 @@ fn screenshot_failure_into(
         Facts {
             generation: Some(generation),
             screenshot_stage: Some(failure.stage),
+            read_error: failure.read_error,
+            read_cleanup_lost: failure.read_cleanup_lost,
             capture_phase: Some(failure.capture_phase),
             inventory_after_failure: Some(failure.inventory_after_failure),
             error: Some(failure.error),

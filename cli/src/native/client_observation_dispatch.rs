@@ -91,7 +91,7 @@ impl ObserveFailureWitness {
     }
 }
 
-// Production, default-off evidence for one trace or optional-pixel read. The cell
+// Production, default-off evidence for one trace or observation read. The cell
 // contains no browser authority and holds no lock across an await. It records
 // the first failed call site before restoration, but emits only after run returns.
 struct ScreenshotFailureWitness {
@@ -104,12 +104,13 @@ struct ScreenshotFailureState {
     first: Option<(ScreenshotStage, ScreenshotCapturePhase, ProtocolError)>,
     revision: Option<u64>,
     inventory_rejection: Option<diagnostic::FrameInventoryRejection>,
+    read_failure: Option<(diagnostic::ReadError, bool)>,
 }
 impl ScreenshotFailureWitness {
     fn new(request: &DispatchRequest, operation: &OperationLease, enabled: bool) -> Option<Self> {
         let trace = matches!(request, DispatchRequest::TraceSemantic(_))
             || matches!(request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace)
-            || matches!(request, DispatchRequest::Observe(request) if request.options.pixels);
+            || matches!(request, DispatchRequest::Observe(_));
         (enabled && trace).then(|| Self {
             generation: operation.generation,
             sequence: operation.sequence,
@@ -118,6 +119,7 @@ impl ScreenshotFailureWitness {
                 first: None,
                 revision: None,
                 inventory_rejection: None,
+                read_failure: None,
             }),
         })
     }
@@ -136,6 +138,18 @@ impl ScreenshotFailureWitness {
                     ScreenshotCapturePhase::NotEntered,
                     error.clone(),
                 ));
+            }
+        }
+    }
+    fn read_failure(&self, detail: (diagnostic::ReadError, bool), error: &ProtocolError) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() {
+                state.first = Some((
+                    state.stage,
+                    ScreenshotCapturePhase::NotEntered,
+                    error.clone(),
+                ));
+                state.read_failure = Some(detail);
             }
         }
     }
@@ -210,10 +224,16 @@ impl ScreenshotFailureWitness {
         }
     }
     fn take_failure(&self, after: impl FnOnce() -> Option<u64>) -> Option<ScreenshotFailure> {
-        let (stage, capture_phase, error, before) = {
+        let (stage, capture_phase, error, before, read_failure) = {
             let mut state = self.state.lock().ok()?;
             let (stage, phase, error) = state.first.take()?;
-            (stage, phase, error, state.revision)
+            (
+                stage,
+                phase,
+                error,
+                state.revision,
+                state.read_failure.take(),
+            )
         };
         let inventory_after_failure = match before {
             None => InventoryAfterFailure::NotSampled,
@@ -225,6 +245,8 @@ impl ScreenshotFailureWitness {
         };
         Some(ScreenshotFailure {
             stage,
+            read_error: read_failure.map(|detail| detail.0),
+            read_cleanup_lost: read_failure.map(|detail| detail.1),
             capture_phase,
             error,
             inventory_after_failure,
@@ -1496,8 +1518,22 @@ impl ObservationDispatch {
             matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels && !request.options.pixel_fallback),
         );
         let observation_cleanup = AtomicBool::new(false);
-        let map_observation = |error| observation_error_with_cleanup(error, &observation_cleanup);
-        let map_geometry = |error| geometry_error_with_cleanup(error, &observation_cleanup);
+        let map_observation = |error| {
+            let detail = screenshot.map(|_| observation_read_failure(&error));
+            let error = observation_error_with_cleanup(error, &observation_cleanup);
+            if let (Some(witness), Some(detail)) = (screenshot, detail) {
+                witness.read_failure(detail, &error);
+            }
+            error
+        };
+        let map_geometry = |error| {
+            let detail = screenshot.map(|_| geometry_read_failure(&error));
+            let error = geometry_error_with_cleanup(error, &observation_cleanup);
+            if let (Some(witness), Some(detail)) = (screenshot, detail) {
+                witness.read_failure(detail, &error);
+            }
+            error
+        };
         let failure = |error: ProtocolError| {
             if let Some(witness) = screenshot {
                 witness.failure(&error);
@@ -1785,19 +1821,21 @@ impl ObservationDispatch {
                 DispatchRequest::Correlate(_) => Err(ProtocolError::InvalidArguments),
                 DispatchRequest::TraceSemantic(_) => {
                     let options = context.policy.observation_options();
-                    screenshot_stage(screenshot, ScreenshotStage::TraceMetadata);
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticViewport);
                     let observed_viewport = viewport(&capture_context.page, &operation).await?;
                     let semantic = semantic_lease(&operation, false);
                     // Capture is semantic here; the pixel capture subphase stays NotEntered.
-                    screenshot_stage(screenshot, ScreenshotStage::Capture);
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticMetadata);
                     let mut tree = observation::observe(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic).await.map_err(map_observation)?;
-                    screenshot_stage(screenshot, ScreenshotStage::Geometry);
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticFrameGeometry);
                     geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.semantic_frame_proof, &context.policy.frame_policy, &identity, revision, &operation).await.map_err(map_geometry)?);
                     let proof = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticNodeGeometry);
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, proof, &mut tree.roots, &operation).await.map_err(map_geometry)?;
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
                     let root = exact_root(tree.roots, &staged, &frozen)?;
                     verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
-                    screenshot_stage(screenshot, ScreenshotStage::FinalViewport);
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticFinalViewport);
                     if viewport(&capture_context.page, &operation).await? != observed_viewport { return Err(ProtocolError::StaleScope); }
                     Ok((json!({"identityScope":identity,"revision":revision.to_string(),"root":root,
                         "viewportRef":tree.viewport_ref,"truncated":tree.truncated,
@@ -1831,10 +1869,12 @@ impl ObservationDispatch {
                     let options = context.policy.observation_options();
                     #[cfg(test)]
                     witness.enter(ObserveFailureStage::Viewport);
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticViewport);
                     let observed_viewport = viewport(&capture_context.page, &operation).await?;
                     let semantic = semantic_lease(&operation, request.options.pixel_fallback);
                     #[cfg(test)]
                     witness.enter(ObserveFailureStage::SemanticRead);
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticMetadata);
                     let tree = async {
                         #[cfg(test)]
                         {
@@ -1860,12 +1900,15 @@ impl ObservationDispatch {
                             #[cfg(test)]
                             witness.enter(ObserveFailureStage::Geometry);
                             if geometry.is_none() {
+                                screenshot_stage(screenshot, ScreenshotStage::SemanticFrameGeometry);
                                 geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.semantic_frame_proof, &context.policy.frame_policy, &identity, revision, &operation).await.map_err(map_geometry)?);
                             }
                             let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
+                            screenshot_stage(screenshot, ScreenshotStage::SemanticNodeGeometry);
                             observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut tree.roots, &operation).await.map_err(map_geometry)?;
                             #[cfg(test)]
                             witness.enter(ObserveFailureStage::DocumentRoot);
+                            screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
                             let root = exact_root(tree.roots, &staged, &frozen)?;
                             verify_document_root(&capture_context.page, &root, &staged, &operation).await?;
                             (json!({"identityScope":identity,"revision":revision.to_string(),"root":root,"viewportRef":tree.viewport_ref,"truncated":tree.truncated}), false)
@@ -1880,6 +1923,7 @@ impl ObservationDispatch {
                     };
                     #[cfg(test)]
                     witness.enter(ObserveFailureStage::Viewport);
+                    screenshot_stage(screenshot, ScreenshotStage::SemanticFinalViewport);
                     if viewport(&capture_context.page, &operation).await? != observed_viewport { return Err(ProtocolError::StaleScope); }
                     value["viewport"] = observed_viewport;
                     let main = main_frame(&frozen)?;
@@ -1895,12 +1939,16 @@ impl ObservationDispatch {
                             drop(semantic_journal);
                         }
                         let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
+                        screenshot_stage(screenshot, ScreenshotStage::FinalGeometry);
                         geometry.revalidate(&capture_context.page.client, &operation).await.map_err(map_geometry)?;
+                        screenshot_stage(screenshot, ScreenshotStage::FinalFrames);
                         let current = verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
                         same_frames(&capture_context.frames, &current)?;
+                        screenshot_stage(screenshot, ScreenshotStage::FinalViewport);
                         if viewport(&capture_context.page, &operation).await? != value["viewport"] {
                             return Err(ProtocolError::StaleScope);
                         }
+                        screenshot_stage(screenshot, ScreenshotStage::FinalScope);
                         bounded_result(&value)?;
                         check(&capture_context.page, &operation)?;
                         // The tree is immutable, but its staged refs remain
@@ -2005,6 +2053,7 @@ impl ObservationDispatch {
         if let Some(journal) = &journal {
             journal.check().map_err(|e| failure(protected_error(e)))?;
         }
+        screenshot_stage(screenshot, ScreenshotStage::FinalScope);
         check(&capture_context.page, &operation).map_err(failure)?;
         screenshot_stage(screenshot, ScreenshotStage::FinalFrames);
         let final_frames = if is_observe {
@@ -3052,6 +3101,58 @@ fn protected_error(error: ProtectedReadReason) -> ProtocolError {
         ProtectedReadReason::BrowserFailure => ProtocolError::BrowserFailure,
     }
 }
+fn observation_read_failure(error: &ObservationError) -> (diagnostic::ReadError, bool) {
+    use diagnostic::ObservationReadError as Kind;
+    let kind = match error {
+        ObservationError::InvalidArguments => Kind::InvalidArguments,
+        ObservationError::InvalidLocator => Kind::InvalidLocator,
+        ObservationError::FrameNotFound(_) => Kind::FrameNotFound,
+        ObservationError::FrameAmbiguous(_) => Kind::FrameAmbiguous,
+        ObservationError::UnsupportedCapability => Kind::UnsupportedCapability,
+        ObservationError::StaleReference => Kind::StaleReference,
+        ObservationError::Superseded => Kind::Superseded,
+        ObservationError::Cancelled => Kind::Cancelled,
+        ObservationError::DeadlineExceeded => Kind::DeadlineExceeded,
+        ObservationError::BackendFailure => Kind::BackendFailure,
+        ObservationError::PolicyDenied => Kind::PolicyDenied,
+        ObservationError::ResourceLimit => Kind::ResourceLimit,
+        ObservationError::CleanupFailed { primary } => {
+            return (
+                primary
+                    .as_ref()
+                    .map(|error| observation_read_failure(error).0)
+                    .unwrap_or(diagnostic::ReadError::Observation(Kind::CleanupFailed)),
+                true,
+            );
+        }
+    };
+    (diagnostic::ReadError::Observation(kind), false)
+}
+fn geometry_read_failure(
+    error: &super::client_geometry::GeometryError,
+) -> (diagnostic::ReadError, bool) {
+    use super::client_geometry::GeometryError as Error;
+    use diagnostic::GeometryReadError as Kind;
+    let kind = match error {
+        Error::InvalidGeometry => Kind::InvalidGeometry,
+        Error::IncompleteInventory => Kind::IncompleteInventory,
+        Error::StaleIdentity => Kind::StaleIdentity,
+        Error::Cancelled => Kind::Cancelled,
+        Error::Superseded => Kind::Superseded,
+        Error::DeadlineExceeded => Kind::DeadlineExceeded,
+        Error::BackendFailure => Kind::BackendFailure,
+        Error::CleanupFailed { primary } => {
+            return (
+                primary
+                    .as_ref()
+                    .map(|error| geometry_read_failure(error).0)
+                    .unwrap_or(diagnostic::ReadError::Geometry(Kind::CleanupFailed)),
+                true,
+            );
+        }
+    };
+    (diagnostic::ReadError::Geometry(kind), false)
+}
 fn geometry_error_with_cleanup(
     error: super::client_geometry::GeometryError,
     cleanup: &AtomicBool,
@@ -3408,7 +3509,8 @@ mod tests {
             test_id_attribute: "data-testid".into(),
             secure_field_selector: "input[type=password]".into(),
         });
-        assert!(ScreenshotFailureWitness::new(&observe, &op, true).is_none());
+        assert!(ScreenshotFailureWitness::new(&observe, &op, false).is_none());
+        assert!(ScreenshotFailureWitness::new(&observe, &op, true).is_some());
         let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &op, true).unwrap();
         assert!(witness
             .take_failure(|| panic!("success must not sample inventory"))
@@ -3440,6 +3542,121 @@ mod tests {
         assert!(witness
             .take_failure(|| panic!("only one refusal"))
             .is_none());
+    }
+
+    #[test]
+    fn semantic_read_failure_keeps_typed_primary_and_cleanup_wrapper() {
+        use super::super::client_geometry::GeometryError as Geometry;
+        use super::diagnostic::{
+            GeometryReadError as G, ObservationReadError as O, ReadError as R,
+        };
+        for (error, kind) in [
+            (ObservationError::StaleReference, O::StaleReference),
+            (ObservationError::Superseded, O::Superseded),
+            (ObservationError::Cancelled, O::Cancelled),
+            (ObservationError::DeadlineExceeded, O::DeadlineExceeded),
+            (ObservationError::BackendFailure, O::BackendFailure),
+            (
+                ObservationError::FrameNotFound(
+                    super::super::client_protocol::FrameSelectionIndex::new(0).unwrap(),
+                ),
+                O::FrameNotFound,
+            ),
+            (
+                ObservationError::FrameAmbiguous(
+                    super::super::client_protocol::FrameAmbiguity::new(0, 2).unwrap(),
+                ),
+                O::FrameAmbiguous,
+            ),
+        ] {
+            assert_eq!(
+                observation_read_failure(&error),
+                (R::Observation(kind), false)
+            );
+            assert_eq!(
+                observation_read_failure(&ObservationError::CleanupFailed {
+                    primary: Some(Box::new(error))
+                }),
+                (R::Observation(kind), true)
+            );
+        }
+        for (error, kind) in [
+            (Geometry::StaleIdentity, G::StaleIdentity),
+            (Geometry::InvalidGeometry, G::InvalidGeometry),
+            (Geometry::IncompleteInventory, G::IncompleteInventory),
+            (Geometry::Superseded, G::Superseded),
+            (Geometry::Cancelled, G::Cancelled),
+            (Geometry::DeadlineExceeded, G::DeadlineExceeded),
+            (Geometry::BackendFailure, G::BackendFailure),
+        ] {
+            assert_eq!(geometry_read_failure(&error), (R::Geometry(kind), false));
+            assert_eq!(
+                geometry_read_failure(&Geometry::CleanupFailed {
+                    primary: Some(Box::new(Geometry::CleanupFailed {
+                        primary: Some(Box::new(error))
+                    }))
+                }),
+                (R::Geometry(kind), true)
+            );
+        }
+        assert_eq!(
+            geometry_read_failure(&Geometry::CleanupFailed { primary: None }),
+            (R::Geometry(G::CleanupFailed), true)
+        );
+        assert_eq!(
+            observation_read_failure(&ObservationError::CleanupFailed { primary: None }),
+            (R::Observation(O::CleanupFailed), true)
+        );
+    }
+
+    #[test]
+    fn semantic_read_witness_keeps_first_stage_and_does_not_invent_typed_scope_failure() {
+        let request = DispatchRequest::Observe(ObserveRequest {
+            options: ObserveFlags::default(),
+            test_id_attribute: "private-test-id".into(),
+            secure_field_selector: "private-selector".into(),
+        });
+        for stage in [
+            ScreenshotStage::SemanticMetadata,
+            ScreenshotStage::SemanticFrameGeometry,
+            ScreenshotStage::SemanticNodeGeometry,
+            ScreenshotStage::SemanticDocumentRoot,
+            ScreenshotStage::SemanticFinalViewport,
+            ScreenshotStage::FinalScope,
+        ] {
+            let witness = ScreenshotFailureWitness::new(&request, &operation(), true).unwrap();
+            witness.enter(stage);
+            let detail =
+                geometry_read_failure(&super::super::client_geometry::GeometryError::StaleIdentity);
+            witness.read_failure(detail, &ProtocolError::StaleScope);
+            witness.enter(ScreenshotStage::Restoration);
+            witness.read_failure(
+                (
+                    diagnostic::ReadError::Geometry(diagnostic::GeometryReadError::CleanupFailed),
+                    true,
+                ),
+                &ProtocolError::CleanupFailed,
+            );
+            let failure = witness
+                .take_failure(|| panic!("no new inventory read"))
+                .unwrap();
+            assert_eq!(failure.stage, stage);
+            assert_eq!(failure.error, ProtocolError::StaleScope);
+            assert_eq!(failure.read_error, Some(detail.0));
+            assert_eq!(failure.read_cleanup_lost, Some(false));
+            assert!(witness.take_failure(|| panic!("emit once")).is_none());
+        }
+        let witness = ScreenshotFailureWitness::new(&request, &operation(), true).unwrap();
+        witness.enter(ScreenshotStage::FinalScope);
+        witness.failure(&ProtocolError::StaleScope);
+        witness.read_failure(
+            geometry_read_failure(&super::super::client_geometry::GeometryError::StaleIdentity),
+            &ProtocolError::StaleScope,
+        );
+        let failure = witness.take_failure(|| None).unwrap();
+        assert_eq!(failure.stage, ScreenshotStage::FinalScope);
+        assert_eq!(failure.read_error, None);
+        assert_eq!(failure.read_cleanup_lost, None);
     }
 
     #[test]

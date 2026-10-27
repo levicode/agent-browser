@@ -341,6 +341,7 @@ impl FramedFixture {
                                 | "checked-control-replaced"
                                 | "fill-unsupported-target"
                                 | "no-editable-focus"
+                                | "tap-target-replaced-before-press"
                                 | "frame-not-found"
                                 | "frame-ambiguous"),
                             ) => value,

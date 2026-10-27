@@ -275,6 +275,7 @@ pub enum ProtocolError {
     CheckedControlReplaced,
     FillUnsupportedTarget,
     NoEditableFocus,
+    TapTargetReplacedBeforePress,
     FrameNotFound(FrameSelectionIndex),
     FrameAmbiguous(FrameAmbiguity),
 }
@@ -318,6 +319,7 @@ impl Serialize for ProtocolError {
             Self::CheckedControlReplaced => "checked-control-replaced",
             Self::FillUnsupportedTarget => "fill-unsupported-target",
             Self::NoEditableFocus => "no-editable-focus",
+            Self::TapTargetReplacedBeforePress => "tap-target-replaced-before-press",
             Self::FrameNotFound(_) => "frame-not-found",
             Self::FrameAmbiguous(_) => "frame-ambiguous",
         })
@@ -562,6 +564,10 @@ mod tests {
                 "fill-unsupported-target",
             ),
             (ProtocolError::NoEditableFocus, "no-editable-focus"),
+            (
+                ProtocolError::TapTargetReplacedBeforePress,
+                "tap-target-replaced-before-press",
+            ),
             (ProtocolError::LocatorNotFound, "locator-not-found"),
             (
                 ProtocolError::ContentLengthMismatch,
