@@ -1094,14 +1094,16 @@ impl ClientNetwork {
         params: &Value,
         sink: &ClientEventSink,
     ) -> Result<(), ProtocolError> {
-        if self
+        let native_bytes = match self
             .download_source
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?
-            .is_none()
+            .as_ref()
         {
-            return Err(ProtocolError::UnsupportedCapability);
-        }
+            Some(DownloadSource::Local(_)) => true,
+            Some(DownloadSource::Provider(_)) => false,
+            None => return Err(ProtocolError::UnsupportedCapability),
+        };
         let guid = required_string(params, "guid")?;
         if !safe_basename(guid) {
             return Err(ProtocolError::InvalidArguments);
@@ -1118,10 +1120,17 @@ impl ClientNetwork {
         if downloads.len() >= 128 || downloads.contains_key(guid) {
             return Err(ProtocolError::CapacityExceeded);
         }
-        let reservation = self
-            .blobs
-            .reserve_producer(self.scope.clone())
-            .map_err(producer_error)?;
+        // Provider bytes never enter BlobStore: the caller reads them remotely.
+        // Entry and observed download-size limits still apply to both sources.
+        let reservation = if native_bytes {
+            Some(
+                self.blobs
+                    .reserve_producer(self.scope.clone())
+                    .map_err(producer_error)?,
+            )
+        } else {
+            None
+        };
         let (handle, resource) = self.new_resource()?;
         downloads.insert(
             guid.into(),
@@ -1131,7 +1140,7 @@ impl ClientNetwork {
                 completed: false,
                 terminal_started: false,
                 published,
-                reservation: Some(reservation),
+                reservation,
             },
         );
         if !published {
@@ -5798,6 +5807,114 @@ mod bridge_tests {
         network.close().await.unwrap();
         server.abort();
     }
+    #[tokio::test]
+    async fn three_provider_downloads_do_not_reserve_unowned_native_bytes() {
+        let (network, mut events, _, server) = fixture().await;
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Provider("/synthetic-provider".into()));
+        *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
+        network.subscribe_downloads().unwrap();
+        let mut handles = Vec::new();
+        // Keep all three live before any completion/release. Provider metadata
+        // owns entries, not native file buffers or producer byte reservations.
+        for index in 0..3 {
+            let guid = format!("provider-{index}");
+            network.event(&CdpEvent { method: "Browser.downloadWillBegin".into(), session_id: Some("owned".into()), params: json!({"guid":guid,"frameId":"owned-frame","suggestedFilename":"small.bin"}) }).unwrap();
+            let (_, event, _) = next_event(&mut events).await;
+            handles.push(event["handle"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(network.downloads.lock().unwrap().len(), 3);
+        assert_eq!(network.resources.lock().unwrap().len(), 3);
+        let first = network.blobs.reserve_producer(network.scope.clone()).unwrap();
+        let second = network.blobs.reserve_producer(network.scope.clone()).unwrap();
+        let operation = network.broker.admit(1, 1, 2000).unwrap();
+        for (index, handle) in handles.iter().enumerate() {
+            let guid = format!("provider-{index}");
+            network.event(&CdpEvent { method: "Browser.downloadProgress".into(), session_id: None, params: json!({"guid":guid,"state":"completed","receivedBytes":32}) }).unwrap();
+            let metadata = network.download_metadata(handle, &operation).await.unwrap();
+            assert_eq!(metadata["source"], "provider");
+            assert_eq!(metadata["basename"], guid);
+            network.release_body(handle).unwrap();
+        }
+        assert!(network.resources.lock().unwrap().is_empty());
+        assert!(network.downloads.lock().unwrap().is_empty());
+        drop((first, second));
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_download_metadata_still_obeys_the_resource_entry_limit() {
+        let (network, mut events, _, server) = fixture().await;
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Provider("/synthetic-provider".into()));
+        *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
+        network.subscribe_downloads().unwrap();
+        let mut handles = Vec::new();
+        for index in 0..128 {
+            network.event(&CdpEvent { method: "Browser.downloadWillBegin".into(), session_id: Some("owned".into()), params: json!({"guid":format!("provider-{index}"),"frameId":"owned-frame","suggestedFilename":"small.bin"}) }).unwrap();
+            let (_, event, _) = next_event(&mut events).await;
+            handles.push(event["handle"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(network.event(&CdpEvent { method: "Browser.downloadWillBegin".into(), session_id: Some("owned".into()), params: json!({"guid":"provider-over-limit","frameId":"owned-frame","suggestedFilename":"small.bin"}) }), Err(ProtocolError::CapacityExceeded));
+        assert_eq!(network.downloads.lock().unwrap().len(), 128);
+        assert_eq!(network.resources.lock().unwrap().len(), 128);
+        assert!(events.try_recv().is_err());
+        for handle in handles { network.release_body(&handle).unwrap(); }
+        assert!(network.resources.lock().unwrap().is_empty());
+        assert!(network.downloads.lock().unwrap().is_empty());
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn provider_download_oversize_still_cancels_and_refuses_metadata() {
+        let (network, mut events, mut commands, server) = fixture().await;
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Provider("/synthetic-provider".into()));
+        *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
+        network.subscribe_downloads().unwrap();
+        network.event(&CdpEvent { method: "Browser.downloadWillBegin".into(), session_id: Some("owned".into()), params: json!({"guid":"provider-oversize","frameId":"owned-frame","suggestedFilename":"large.bin"}) }).unwrap();
+        let (_, event, _) = next_event(&mut events).await;
+        let handle = event["handle"].as_str().unwrap();
+        network.event(&CdpEvent { method: "Browser.downloadProgress".into(), session_id: None, params: json!({"guid":"provider-oversize","state":"inProgress","receivedBytes":network.blobs.producer_limit() + 1}) }).unwrap();
+        let operation = network.broker.admit(1, 1, 2000).unwrap();
+        assert_eq!(network.download_metadata(handle, &operation).await.unwrap_err(), ProtocolError::CapacityExceeded);
+        let cancel = commands.try_recv().unwrap();
+        assert_eq!(cancel["method"], "Browser.cancelDownload");
+        assert_eq!(cancel["params"], json!({"guid":"provider-oversize","browserContextId":"owned-context"}));
+        assert!(commands.try_recv().is_err());
+        network.release_body(handle).unwrap();
+        assert!(network.check().is_ok());
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn local_downloads_keep_the_existing_native_byte_reservation_bound() {
+        let (network, mut events, _, server) = fixture().await;
+        let directory = tempfile::tempdir().unwrap();
+        *network.download_source.lock().unwrap() = Some(DownloadSource::Local(std::fs::canonicalize(directory.path()).unwrap()));
+        *network.download_context.lock().unwrap() = Some("owned-context".into());
+        network.download_ready.store(true, Ordering::Release);
+        network.subscribe_downloads().unwrap();
+        let mut handles = Vec::new();
+        for index in 0..2 {
+            network.event(&CdpEvent { method: "Browser.downloadWillBegin".into(), session_id: Some("owned".into()), params: json!({"guid":format!("local-{index}"),"frameId":"owned-frame","suggestedFilename":"small.bin"}) }).unwrap();
+            let (_, event, _) = next_event(&mut events).await;
+            handles.push(event["handle"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(network.event(&CdpEvent { method: "Browser.downloadWillBegin".into(), session_id: Some("owned".into()), params: json!({"guid":"local-over-limit","frameId":"owned-frame","suggestedFilename":"small.bin"}) }), Err(ProtocolError::CapacityExceeded));
+        assert_eq!(network.downloads.lock().unwrap().len(), 2);
+        assert_eq!(network.resources.lock().unwrap().len(), 2);
+        for handle in handles { network.release_body(&handle).unwrap(); }
+        let first = network.blobs.reserve_producer(network.scope.clone()).unwrap();
+        let second = network.blobs.reserve_producer(network.scope.clone()).unwrap();
+        drop((first, second));
+        network.close().await.unwrap();
+        server.abort();
+    }
+
     #[tokio::test]
     async fn owned_download_completes_without_browser_action_mutex() {
         let (network, mut events, _, server) = fixture().await;
