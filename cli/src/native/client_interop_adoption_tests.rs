@@ -389,7 +389,18 @@ async fn retained_manager(
     Arc<super::super::super::client_debt::OwnerDebtLedger>,
     Peer,
 ) {
-    let (mut manager, peer) = peer(Mode::Valid).await;
+    retained_manager_with_mode(phase_two, Mode::Valid).await
+}
+
+async fn retained_manager_with_mode(
+    phase_two: bool,
+    mode: Mode,
+) -> (
+    super::super::super::browser::BrowserManager,
+    Arc<super::super::super::client_debt::OwnerDebtLedger>,
+    Peer,
+) {
+    let (mut manager, peer) = peer(mode).await;
     let (_cancel, op) = operation();
     let old = super::super::super::client_debt::OwnerDebtLedger::unpublished(
         &op,
@@ -421,6 +432,10 @@ async fn retained_manager(
             .unwrap();
     }
     (manager, old, peer)
+}
+
+mod replacement_tests {
+    include!("client_interop_replacement_adoption_tests.rs");
 }
 
 #[tokio::test]

@@ -4777,6 +4777,9 @@ mod tests {
     mod terminal_artifact_tests {
         include!("client_transport_terminal_artifact_tests.rs");
     }
+    mod interop_replacement_emission_tests {
+        include!("client_interop_replacement_emission_tests.rs");
+    }
 }
 
 #[cfg(test)]

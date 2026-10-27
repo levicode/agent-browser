@@ -26,11 +26,23 @@ fn reply(request: &Value, error: bool) -> Value {
 }
 async fn peer(
     clean_stop: bool,
+    held_create: Option<(
+        tokio::sync::oneshot::Sender<()>,
+        tokio::sync::oneshot::Receiver<()>,
+    )>,
+    failure: Option<&'static str>,
+) -> Peer {
+    peer_with_interop(clean_stop, held_create, failure, None).await
+}
+
+async fn peer_with_interop(
+    clean_stop: bool,
     mut held_create: Option<(
         tokio::sync::oneshot::Sender<()>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
     failure: Option<&'static str>,
+    interop_context: Option<Arc<AtomicBool>>,
 ) -> Peer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
@@ -67,12 +79,25 @@ async fn peer(
             log.lock().unwrap().push(request.clone());
             let method = request["method"].as_str().unwrap();
             let session = request["sessionId"].as_str().unwrap_or("");
+            if let Some(present) = &interop_context {
+                // Script the external peer's context creation/close only. The
+                // production constructor must still inventory, verify and attach.
+                page = present.load(Ordering::SeqCst).then(|| {
+                    json!({"targetId":"page-1","type":"page","browserContextId":"synthetic-context","url":"about:blank","title":""})
+                });
+            }
             let mut after = Vec::new();
             let mut error = false;
             let result = match method {
                 "Browser.getVersion" => {
                     json!({"protocolVersion":"1.3","product":"Synthetic Chromium/1.0",
                     "revision":"synthetic-revision","userAgent":"Synthetic Chromium Linux","jsVersion":"synthetic-js"})
+                }
+                "Target.getBrowserContexts" => {
+                    let present = interop_context.as_ref().expect("unexpected context inventory");
+                    json!({"browserContextIds":if present.load(Ordering::SeqCst) {
+                        vec!["synthetic-context"]
+                    } else { Vec::<&str>::new() }})
                 }
                 "Target.createBrowserContext" => {
                     contexts += 1;
@@ -111,6 +136,10 @@ async fn peer(
                     json!({"success":true})
                 }
                 "Target.disposeBrowserContext" => {
+                    if let Some(present) = &interop_context {
+                        assert_eq!(request["params"]["browserContextId"], "synthetic-context");
+                        present.store(false, Ordering::SeqCst);
+                    }
                     page = None;
                     json!({})
                 }
@@ -176,6 +205,10 @@ async fn peer(
                     isolated_world = None;
                     after.push(json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":{
                         "id":"frame-session-1","loaderId":loader,"url":"about:blank","securityOrigin":"null"}}}));
+                    if interop_context.is_some() {
+                        after.push(json!({"method":"Page.lifecycleEvent","sessionId":session,"params":{
+                            "frameId":"frame-session-1","loaderId":loader,"name":"DOMContentLoaded"}}));
+                    }
                     after.push(
                         json!({"method":"Page.lifecycleEvent","sessionId":session,"params":{
                         "frameId":"frame-session-1","loaderId":loader,"name":"load"}}),
@@ -966,3 +999,4 @@ fn terminal_recording_notice_rejects_foreign_extra_duplicate_and_out_of_order_ev
 }
 
 include!("client_interop_phase_one_failure_tests.rs");
+include!("client_interop_replacement_recording_tests.rs");

@@ -2352,7 +2352,21 @@ struct InteropRetirementFailureSnapshot {
     startup_uncertain: bool,
 }
 
+// Observation only, sent synchronously after the actual recording-preserving
+// phase one. It never keeps the owner installed or delays terminal cleanup.
+#[cfg(test)]
+struct InteropReplacementPhaseOneSnapshot {
+    identity_scope: String,
+    context_id: String,
+    operation_seq: u64,
+    phase: u8,
+    enrollment: Arc<super::client_enrollment::ClientEnrollment>,
+}
+
 pub struct ClientBrowser {
+    #[cfg(test)]
+    interop_replacement_phase_one_snapshot:
+        Arc<Mutex<Option<tokio::sync::oneshot::Sender<InteropReplacementPhaseOneSnapshot>>>>,
     #[cfg(test)]
     interop_retirement_failure_snapshot:
         Arc<Mutex<Option<tokio::sync::oneshot::Sender<Option<InteropRetirementFailureSnapshot>>>>>,
@@ -2386,6 +2400,8 @@ impl ClientBrowser {
         let interop_preparation =
             interop_preparation::InteropPreparation::new(owner.clone(), broker.clone());
         Self {
+            #[cfg(test)]
+            interop_replacement_phase_one_snapshot: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             interop_retirement_failure_snapshot: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -5002,6 +5018,8 @@ impl ClientBrowser {
         let observation = self.observation.clone();
         let uncertain = self.startup_uncertain.clone();
         let connection_watch = self.connection_watch.clone();
+        #[cfg(test)]
+        let phase_one_snapshot = self.interop_replacement_phase_one_snapshot.clone();
         let Some(sink) = self.event_sink.get().cloned() else {
             return NativeOutcome {
                 retention: None,
@@ -5115,6 +5133,22 @@ impl ClientBrowser {
                     .ok_or(ProtocolError::ScopeUnavailable)?;
                 if interop {
                     runtime.begin_peer_replacement().await?;
+                    #[cfg(test)]
+                    if let Some(sender) = phase_one_snapshot
+                        .lock()
+                        .ok()
+                        .and_then(|mut slot| slot.take())
+                    {
+                        let _ = sender.send(InteropReplacementPhaseOneSnapshot {
+                            identity_scope: resource.identity_scope.clone(),
+                            context_id: resource.context_id.clone(),
+                            operation_seq: operation.sequence,
+                            phase: runtime
+                                .peer_retirement
+                                .load(std::sync::atomic::Ordering::Acquire),
+                            enrollment: runtime.enrollment.clone(),
+                        });
+                    }
                     let decision = interop_replacement::rendezvous(
                         &broker,
                         &sink,
@@ -6109,6 +6143,7 @@ mod tests {
             .cloned()
             .collect::<std::collections::HashSet<_>>();
         let expected = [
+            "interop-context-replacement",
             "scope",
             "lifecycle",
             "persistent-page-reopen",

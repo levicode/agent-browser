@@ -3367,6 +3367,8 @@ mod preparation_deadline_tests;
 mod interop_replacement_decision_tests {
     use super::*;
 
+    include!("client_interop_replacement_authority_tests.rs");
+
     fn started(broker: &ClientSession) -> OperationLease {
         let operation = broker.admit(1, 1, 1000).unwrap();
         assert!(broker.start(1, 1).unwrap());

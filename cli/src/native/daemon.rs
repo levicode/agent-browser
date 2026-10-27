@@ -961,6 +961,7 @@ mod tests {
             "operation.continue-exact-owner/1",
             "scope.reconnect-quarantined/1",
             "terminal.recording-artifacts/1",
+            "browser.interop-context-replacement/1",
             "browser.scope/1",
             "browser.lifecycle/1",
             "browser.persistent-page-reopen/1",
