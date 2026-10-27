@@ -1310,6 +1310,10 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  // ignores stale ARIA on native controls. These remain untrusted semantic facts.
  const checkable=!!e&&tag==='input'&&e instanceof HTMLInputElement&&(e.type==='checkbox'||e.type==='radio');
  const nativeOption=!!e&&tag==='option'&&e instanceof HTMLOptionElement;
+ // A string .value alone is not a control: output/button/custom properties
+ // remain text. Keep native empty values and the control-before-editor order.
+ const nativeValueControl=!!e&&(tag==='input'&&e instanceof HTMLInputElement||
+   tag==='textarea'&&e instanceof HTMLTextAreaElement||tag==='select'&&e instanceof HTMLSelectElement||nativeOption);
  const controlStates={};
  if(checkable)controlStates.checked=e.checked;
  else if(e&&e.hasAttribute('aria-checked'))controlStates.checked=e.getAttribute('aria-checked')==='true';
@@ -1317,7 +1321,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
  const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
  return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,completePublicButtonNameFact,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
- value:secure||(boundedObservation&&checkable)?null:editingHost?editorValue:e&&typeof e.value==='string'?e.value:null,selection, inputPurpose:purpose,
+ value:secure||(boundedObservation&&checkable)?null:nativeValueControl?e.value:editingHost?editorValue:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
 }"#;

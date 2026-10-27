@@ -36,7 +36,10 @@ class Element extends Node {
 }
 class InputControl extends Element { constructor(type, checked) { super(); this.localName='input'; this.type=type; this.checked=checked; this.value='on'; } }
 class OptionControl extends Element { constructor(selected) { super(); this.localName='option'; this.selected=selected; this.value='Poland'; } }
+class TextAreaControl extends Element { constructor() { super(); this.localName='textarea'; this.value=''; } }
+class SelectControl extends Element { constructor() { super(); this.localName='select'; this.value=''; } }
 global.HTMLInputElement=InputControl; global.HTMLOptionElement=OptionControl;
+global.HTMLTextAreaElement=TextAreaControl; global.HTMLSelectElement=SelectControl;
 class ButtonControl extends Element { constructor() { super(); this.localName='button'; } }
 class EmptySvg extends Element { constructor() { super(); this.localName='svg'; } }
 global.HTMLButtonElement=ButtonControl; global.SVGSVGElement=EmptySvg;
@@ -50,6 +53,80 @@ document = global.document = { documentElement: new Element(), activeElement: nu
   getElementById: () => null, createRange: () => ({ selectNode() {}, getBoundingClientRect() { return { width: 10, height: 10 }; } }),
 };
 const read = eval(`(${script})`);
+
+// E2E's frozen original reader (e557432, read-semantics.ts:1360-1390)
+// assigns values to native controls and editing hosts, never arbitrary .value
+// properties. These are metadata assertions, not real browser/tree acceptance.
+for (const bounded of [false, true]) {
+  for (const value of ['', '  typed value\nnext  ']) {
+    for (const control of [new InputControl('text', false), new TextAreaControl(), new SelectControl(), new OptionControl(true)]) {
+      control.value = value;
+      assert.equal(read.call(control, 'data-testid', '.secure', bounded).value, value, `${control.localName} retains ${JSON.stringify(value)}`);
+    }
+  }
+  for (const type of ['search', 'email', 'number', 'range', 'color', 'date', 'submit', 'reset', 'button']) {
+    const control = new InputControl(type, false); control.value = 'native-value';
+    assert.equal(read.call(control, 'data-testid', '.secure', bounded).value, control.value, `input ${type}`);
+  }
+  for (const type of ['checkbox', 'radio']) {
+    for (const value of ['', 'on', 'internal-submit-token']) {
+      const control = new InputControl(type, true); control.value = value;
+      const facts = read.call(control, 'data-testid', '.secure', bounded);
+      assert.equal(facts.value, bounded ? null : value);
+      assert.equal(facts.controlStates.checked, true);
+    }
+  }
+  for (const tag of ['output', 'button', 'li', 'meter', 'progress', 'param', 'div', 'x-widget']) {
+    const noncontrol = new Element(); noncontrol.localName = tag; noncontrol.value = 'shown-result'; noncontrol.innerText = 'shown-result';
+    assert.equal(read.call(noncontrol, 'data-testid', '.secure', bounded).value, null, `${tag} is text, not an input value`);
+    if (!bounded) assert.equal(read.call(noncontrol, 'data-testid', '.secure', bounded).text, 'shown-result');
+    assert.equal(read.call(new Text('shown-result', noncontrol), 'data-testid', '.secure', true).author.text, 'shown-result');
+    Object.defineProperty(noncontrol, 'value', { get() { throw Error('Noncontrol value getter read'); } });
+    assert.equal(read.call(noncontrol, 'data-testid', '.secure', bounded).value, null);
+  }
+  // An authored tag/property is not proof of the native HTML control type.
+  for (const tag of ['input', 'textarea', 'select', 'option']) {
+    const noncontrol = new Element(); noncontrol.localName = tag;
+    Object.defineProperty(noncontrol, 'value', { get() { throw Error('Non-HTML control value read'); } });
+    assert.equal(read.call(noncontrol, 'data-testid', '.secure', bounded).value, null);
+  }
+  // Native option data wins over contenteditable, as in the original reader.
+  const editableOption = new OptionControl(true); editableOption.isContentEditable = true;
+  editableOption.innerText = 'Visible choice'; editableOption.textContent = 'Visible choice';
+  assert.equal(read.call(editableOption, 'data-testid', '.secure', bounded).value, 'Poland');
+  for (const control of [new InputControl('password', false), new InputControl('checkbox', true), new TextAreaControl(), new SelectControl(), new OptionControl(true)]) {
+    control.secure = true;
+    control.attributes = [{ name: 'value', value: 'never-transmit-value-secret' }];
+    for (const field of ['value', 'innerText', 'textContent']) Object.defineProperty(control, field, { get() { throw Error(`Secure ${field} read`); } });
+    const facts = read.call(control, 'data-testid', '.secure', bounded);
+    assert.equal(facts.value, null); assert.equal(facts.text, null); assert.equal(facts.selection, null);
+    assert.equal(facts.attributes.value, undefined);
+    assert.equal(facts.states.secure, true);
+    assert.equal(JSON.stringify(facts).includes('never-transmit-value-secret'), false);
+  }
+}
+console.log('PASS: original control-only values preserve empty/nonempty/native/checkable/option data and never acquire noncontrol or secure values');
+
+// Exercise the built-in password selector without a custom secure marker,
+// plus composed ancestry, before any potentially secret getter is evaluated.
+const originalControlMatches = Element.prototype.matches;
+Element.prototype.matches = function(selector) {
+  return this instanceof InputControl && this.type === 'password' && selector.includes('input[type="password" i]') || originalControlMatches.call(this, selector);
+};
+for (const bounded of [false, true]) {
+  for (const boundary of ['password', 'parent', 'shadow']) {
+    const control = new InputControl(boundary === 'password' ? 'password' : 'text', false);
+    const secureHost = new Element(); secureHost.secure = true;
+    if (boundary === 'parent') control.parentElement = secureHost;
+    if (boundary === 'shadow') control.getRootNode = () => ({ host: secureHost });
+    Object.defineProperty(control, 'value', { get() { throw Error(`${boundary} secret value acquired`); } });
+    const facts = read.call(control, 'data-testid', '.secure', bounded);
+    assert.equal(facts.states.secure, true); assert.equal(facts.value, null);
+  }
+}
+Element.prototype.matches = originalControlMatches;
+console.log('PASS: built-in password and composed secure ancestry prevent value acquisition in both projections');
+
 const host = new Element();
 const ordinary = read.call(new Text('Hello   shadow', host), 'data-testid', '.secure', true);
 assert.equal(ordinary.author.visible, true);
