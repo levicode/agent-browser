@@ -89,8 +89,12 @@ fn metadata_hold(lease: &OperationLease) -> Option<Arc<MetadataHold>> {
             .cloned()
     })
 }
+fn metadata_group_matches(group: &str, sequence: u64) -> bool {
+    group == format!("native-metadata-{sequence}")
+        || group.starts_with(&format!("native-metadata-{sequence}-"))
+}
 pub(super) fn after_group_release(lease: &OperationLease, group: &str) {
-    if group == format!("native-metadata-{}", lease.sequence) {
+    if metadata_group_matches(group, lease.sequence) {
         if let Some(hold) = metadata_hold(lease) {
             hold.releases.fetch_add(1, Ordering::SeqCst);
         }
@@ -106,13 +110,13 @@ async fn metadata_checkpoint(
     let Some(hold) = metadata_hold(lease) else {
         return Ok(());
     };
-    let metadata_group = format!("native-metadata-{}", lease.sequence);
-    if method == "DOM.resolveNode" && group == Some(metadata_group.as_str()) {
+    let exact_metadata = group.is_some_and(|group| metadata_group_matches(group, lease.sequence));
+    if method == "DOM.resolveNode" && exact_metadata {
         if let Some(object) = value["object"]["objectId"].as_str() {
             hold.handles.lock().unwrap().push(object.to_owned());
         }
     }
-    if site != "metadata-batch" || group != Some(metadata_group.as_str()) {
+    if site != "metadata-batch" || !exact_metadata {
         return Ok(());
     }
     if value.get("exceptionDetails").is_some() || !value["result"]["value"].is_array() {

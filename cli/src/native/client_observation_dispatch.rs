@@ -385,7 +385,17 @@ pub struct DispatchContext {
     pub scope: BlobScope,
     pub policy: ReadPolicy,
 }
+/// Private evidence that only this dispatcher may issue after committing an
+/// independently complete Observe tree. It grants no cleanup or UI authority.
+#[derive(Clone, Default)]
+pub(crate) struct ObservationResultReceipt(Arc<AtomicBool>);
+impl ObservationResultReceipt {
+    pub(crate) fn is_sealed_observation(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 pub struct DispatchTask {
+    pub(crate) receipt: ObservationResultReceipt,
     /// Must be retained and joined by lifecycle shutdown, never aborted merely
     /// because the RPC receiver or its deadline has gone away.
     pub join: tokio::task::JoinHandle<Result<(), DispatchFailure>>,
@@ -841,7 +851,11 @@ impl ObservationDispatch {
                     }));
                     Ok(())
                 });
-                DispatchTask { join, result }
+                DispatchTask {
+                    join,
+                    result,
+                    receipt: ObservationResultReceipt::default(),
+                }
             }
         }
     }
@@ -856,10 +870,13 @@ impl ObservationDispatch {
             screenshot,
         } = prepared;
         let (send, result) = oneshot::channel();
+        let receipt = ObservationResultReceipt::default();
+        let task_receipt = receipt.clone();
         // Explicit inheritance only for this operation-local capture task.
         // Durable owner services intentionally do not inherit task-local state.
         let operation_journal = super::client_debt::OperationJournalHandle::current();
         let join = tokio::spawn(async move {
+            let mut send = Some(send);
             let scope = context.scope.clone();
             let blobs = context.blobs.clone();
             let targets = context.page.targets.clone();
@@ -880,6 +897,8 @@ impl ObservationDispatch {
                 trace,
                 retirement_fence,
                 screenshot.as_ref(),
+                &mut send,
+                &task_receipt,
             );
             #[cfg(test)]
             let run = FALLBACK_OBSERVED_CLEANUP_FOR_TEST.scope(observed_cleanup, run);
@@ -904,7 +923,9 @@ impl ObservationDispatch {
             }
             match output {
                 Ok(output) => {
-                    if send.send(Ok(output.value)).is_err()
+                    if send
+                        .take()
+                        .is_some_and(|send| send.send(Ok(output.value)).is_err())
                         && !release_handles(&blobs, &scope, &output.handles)
                     {
                         targets.seal();
@@ -919,16 +940,28 @@ impl ObservationDispatch {
                     if error.cleanup_integrity_lost {
                         targets.seal();
                     }
-                    if let Err(Err(error)) = send.send(Err(error)) {
-                        if error.cleanup_integrity_lost {
-                            return Err(error);
+                    match send.take() {
+                        Some(send) => {
+                            if let Err(Err(error)) = send.send(Err(error)) {
+                                if error.cleanup_integrity_lost {
+                                    return Err(error);
+                                }
+                            }
                         }
+                        // The immutable result is already fixed. Report later
+                        // custody failure through the retained join, exactly once.
+                        None if error.cleanup_integrity_lost => return Err(error),
+                        None => {}
                     }
                 }
             }
             Ok(())
         });
-        DispatchTask { join, result }
+        DispatchTask {
+            join,
+            result,
+            receipt,
+        }
     }
     /// Admission and final comparison/commit are one linearization domain.
     /// The publication/UI guards are already held by the caller; this short
@@ -1092,6 +1125,281 @@ impl ObservationDispatch {
             }
         }
     }
+    /// Enrich an independently sealed tree without giving its result deadline to
+    /// raw-pixel settlement. This future stays inside the original retained run,
+    /// with its UI/publication guards, journal and exact capture ticket alive.
+    #[allow(clippy::too_many_arguments)]
+    async fn optional_observe_pixels(
+        &self,
+        context: &CaptureContext,
+        operation: &OperationLease,
+        capture: Option<&Arc<CaptureAdmission>>,
+        retirement_fence: u64,
+        blobs: &BlobStore,
+        scope: &BlobScope,
+        publication: &mut Publication,
+        revision: u64,
+        staged: &RefMap,
+        secure_field_selector: String,
+        semantic: Value,
+        result_send: &mut Option<oneshot::Sender<Result<Value, DispatchFailure>>>,
+        receipt: &ObservationResultReceipt,
+    ) -> Result<Output, DispatchFailure> {
+        let identity = &context.page.identity_scope;
+        let cleanup_lost = AtomicBool::new(false);
+        let failure = |error: ProtocolError| DispatchFailure {
+            cleanup_integrity_lost: error == ProtocolError::CleanupFailed
+                || cleanup_lost.load(Ordering::SeqCst),
+            error,
+            identity_scope: identity.clone(),
+        };
+        let pixel_operation = optional_observe_lease(operation);
+        let published = AtomicBool::new(false);
+        let optional = async {
+            check(&context.page, &pixel_operation).map_err(failure)?;
+            let producer = blobs
+                .reserve_bounded_producer(
+                    scope.clone(),
+                    client_capture::MAX_PNG_BYTES.min(blobs.producer_limit()),
+                )
+                .map_err(|error| failure(blob_error(error)))?;
+            let mut journal =
+                ProtectedReadJournal::begin(&context.page, operation).map_err(|error| {
+                    DispatchFailure {
+                        error: protected_error(error.reason),
+                        identity_scope: error.identity_scope,
+                        cleanup_integrity_lost: error.cleanup_integrity_lost,
+                    }
+                })?;
+            let captured = async {
+                journal
+                    .stabilize_animations()
+                    .await
+                    .map_err(protected_error)?;
+                let frames = verified_frames_with_cleanup(
+                    &context.page,
+                    &pixel_operation,
+                    Some(&cleanup_lost),
+                )
+                .await?;
+                same_frames(&context.frames, &frames)?;
+                let geometry = GeometrySnapshot::capture(
+                    &context.page.client,
+                    &context.page.page_session_id,
+                    &frames,
+                    &pixel_operation,
+                )
+                .await
+                .map_err(|error| geometry_error_with_cleanup(error, &cleanup_lost))?;
+                let pixels = client_capture::capture_under_journal(
+                    context,
+                    &CaptureRequest {
+                        secure_field_selector,
+                    },
+                    &pixel_operation,
+                    &mut journal,
+                    &geometry,
+                )
+                .await
+                .map_err(|error| capture_error(error.reason))?;
+                Ok::<_, ProtocolError>((pixels, geometry))
+            }
+            .await;
+            // Even after publishing semantics, this exact owner must finish
+            // source-mask/animation/raw custody. No detached cleanup task.
+            if let Err(error) = journal.restore().await {
+                return Err(DispatchFailure {
+                    error: captured
+                        .as_ref()
+                        .err()
+                        .cloned()
+                        .unwrap_or_else(|| protected_error(error.reason)),
+                    identity_scope: identity.clone(),
+                    cleanup_integrity_lost: error.cleanup_integrity_lost
+                        || cleanup_lost.load(Ordering::SeqCst),
+                });
+            }
+            if published.load(Ordering::Acquire) {
+                // A late ACK can discharge custody, never publish pixels or
+                // restart final-proof reads after the optional acceptance cut.
+                return Ok(Output {
+                    value: semantic.clone(),
+                    handles: vec![],
+                });
+            }
+            let (pixels, geometry) = captured.map_err(failure)?;
+            geometry
+                .revalidate(&context.page.client, &pixel_operation)
+                .await
+                .map_err(|error| failure(geometry_error_with_cleanup(error, &cleanup_lost)))?;
+            journal
+                .check()
+                .map_err(|error| failure(protected_error(error)))?;
+            let current =
+                verified_frames_with_cleanup(&context.page, &pixel_operation, Some(&cleanup_lost))
+                    .await
+                    .map_err(failure)?;
+            same_frames(&context.frames, &current).map_err(failure)?;
+            if viewport(&context.page, &pixel_operation)
+                .await
+                .map_err(failure)?
+                != semantic["viewport"]
+            {
+                return Err(failure(ProtocolError::StaleScope));
+            }
+            check(&context.page, &pixel_operation).map_err(failure)?;
+            let image = blobs
+                .finish_producer(producer, pixels.png)
+                .map_err(|error| failure(blob_error(error)))?;
+            let handles = vec![image.handle.clone()];
+            let mut value = semantic.clone();
+            value["maskedRegionCount"] = json!(pixels.masked_region_count);
+            value["pixels"] = json!({"identityScope":identity,"handle":image.handle,"size":image.size,
+                "sha256":image.sha256,"mediaType":"image/png","width":pixels.width,"height":pixels.height,
+                "scale":pixels.scale,"maskedRegionCount":pixels.masked_region_count});
+            let publish = bounded_result(&value);
+            if let Err(error) = publish {
+                if !release_handles(blobs, scope, &handles) {
+                    cleanup_lost.store(true, Ordering::SeqCst);
+                }
+                return Err(failure(error));
+            }
+            Ok(Output { value, handles })
+        };
+        tokio::pin!(optional);
+        // This is immutable-result authority only. Check the original permit,
+        // cancellation, generation ticket and supersession, not new UI admission.
+        let mut publish_semantic =
+            |result_send: &mut Option<oneshot::Sender<Result<Value, DispatchFailure>>>| {
+                check(&context.page, operation)?;
+                let authority = self
+                    .captures
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                let capture = capture.ok_or(ProtocolError::StaleReference)?;
+                if authority.retirement_fence != retirement_fence
+                    || capture.sequence != operation.sequence
+                    || capture.owner.scope != *scope
+                    || capture.owner.page_session_id != context.page.page_session_id
+                    || capture.owner.target_id != context.page.target_id
+                    || !capture
+                        .owner
+                        .client
+                        .ptr_eq(&Arc::downgrade(&context.page.client))
+                    || !capture
+                        .owner
+                        .targets
+                        .ptr_eq(&Arc::downgrade(&context.page.targets))
+                    || !context
+                        .page
+                        .targets
+                        .retains_exact_attachment(&capture.owner.attachment)
+                    || !authority
+                        .latest
+                        .iter()
+                        .any(|current| Arc::ptr_eq(current, capture))
+                {
+                    return Err(ProtocolError::StaleReference);
+                }
+                let mut refs = self
+                    .refs
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                check(&context.page, operation)?;
+                if let Some(send) = result_send.take() {
+                    publication.commit_refs(
+                        PublicationKind::Snapshot,
+                        revision,
+                        &mut refs,
+                        staged.clone(),
+                    );
+                    receipt.0.store(true, Ordering::Release);
+                    published.store(true, Ordering::Release);
+                    // The exact operation keeps cleanup custody even if the RPC
+                    // receiver has gone away. There are no blob handles in this value.
+                    let _ = send.send(Ok(semantic.clone()));
+                }
+                Ok::<(), ProtocolError>(())
+            };
+        let completed = tokio::select! {
+            biased;
+            result = &mut optional => result,
+            _ = tokio::time::sleep_until(pixel_operation.deadline.into()) => {
+                // Do not cancel/drop the optional future: a raw ACK or a mask
+                // restore may still be outstanding. Only its output is cut off.
+                let publication = publish_semantic(result_send);
+                let result = optional.await;
+                if let Err(error) = publication {
+                    let mut rejected = failure(error);
+                    match &result {
+                        Err(cleanup) => rejected.cleanup_integrity_lost |= cleanup.cleanup_integrity_lost,
+                        Ok(output) => rejected.cleanup_integrity_lost |= !release_handles(blobs, scope, &output.handles),
+                    }
+                    return Err(rejected);
+                }
+                result
+            }
+        };
+        match completed {
+            Ok(output) if !published.load(Ordering::Acquire) => {
+                let publish = self.commit_staged(
+                    &context.page,
+                    &pixel_operation,
+                    capture,
+                    None,
+                    retirement_fence,
+                    publication,
+                    PublicationKind::Snapshot,
+                    revision,
+                    staged.clone(),
+                    blobs,
+                    scope,
+                    &output.handles,
+                );
+                if let Err(error) = publish {
+                    if !release_handles(blobs, scope, &output.handles) {
+                        cleanup_lost.store(true, Ordering::SeqCst);
+                    }
+                    return Err(failure(error));
+                }
+                Ok(output)
+            }
+            Ok(output) => Ok(output),
+            Err(error) if published.load(Ordering::Acquire) => {
+                if error.cleanup_integrity_lost {
+                    Err(error)
+                } else {
+                    Ok(Output {
+                        value: semantic.clone(),
+                        handles: vec![],
+                    })
+                }
+            }
+            Err(error)
+                if matches!(
+                    error.error,
+                    ProtocolError::BrowserFailure
+                        | ProtocolError::DeadlineExceeded
+                        | ProtocolError::PolicyDenied
+                        | ProtocolError::CapacityExceeded
+                        | ProtocolError::CleanupFailed
+                ) =>
+            {
+                // Pixel-only refusal cannot revoke a separately completed tree.
+                // Cancellation, identity loss and supersession are not optional.
+                publish_semantic(result_send).map_err(failure)?;
+                if error.cleanup_integrity_lost {
+                    Err(error)
+                } else {
+                    Ok(Output {
+                        value: semantic.clone(),
+                        handles: vec![],
+                    })
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
     #[allow(clippy::too_many_arguments)] // The optional diagnostic borrows only for this run.
     async fn run(
         &self,
@@ -1102,6 +1410,8 @@ impl ObservationDispatch {
         trace: Option<TraceFence>,
         retirement_fence: u64,
         screenshot: Option<&ScreenshotFailureWitness>,
+        result_send: &mut Option<oneshot::Sender<Result<Value, DispatchFailure>>>,
+        receipt: &ObservationResultReceipt,
     ) -> Result<Output, DispatchFailure> {
         let identity = context.page.identity_scope.clone();
         #[cfg(test)]
@@ -1144,8 +1454,7 @@ impl ObservationDispatch {
         // Semantic-only reads need exclusive admission and exact target/frame
         // fences, not a browser lifecycle mutation. Chromium's frozen state
         // also hides the page; setting active does not undo that visibility.
-        let stabilize_pixels = matches!(&request, DispatchRequest::Screenshot(_))
-            || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
+        let stabilize_pixels = matches!(&request, DispatchRequest::Screenshot(_));
         // Pending browser input can need a late route/dialog callback to settle.
         // Wait before UI/publication locks so that owner service stays runnable.
         screenshot_stage(screenshot, ScreenshotStage::DebtAdmission);
@@ -1314,8 +1623,7 @@ impl ObservationDispatch {
             // alias committed action authority; the monotonic allocator is shared.
             staged.retire_interaction_references();
         }
-        let wants_pixels = matches!(&request, DispatchRequest::Screenshot(_))
-            || matches!(&request, DispatchRequest::Observe(r) if r.options.pixels);
+        let wants_pixels = matches!(&request, DispatchRequest::Screenshot(_));
         // Charge the native producer before screenshot collection starts.
         screenshot_stage(screenshot, ScreenshotStage::ProducerReservation);
         let mut producer = if wants_pixels {
@@ -1372,6 +1680,7 @@ impl ObservationDispatch {
             None
         };
         let mut geometry = None;
+        let mut completed_optional = None;
         let result = async {
             screenshot_stage(screenshot, ScreenshotStage::AnimationStabilization);
             if stabilize_pixels { journal.as_mut().ok_or(ProtocolError::PolicyDenied)?.stabilize_animations().await.map_err(protected_error)?; }
@@ -1385,7 +1694,7 @@ impl ObservationDispatch {
             // its private proof before geometry; pixels and queries stay strict.
             screenshot_stage(screenshot, ScreenshotStage::Geometry);
             if !matches!(&request, DispatchRequest::TraceSemantic(_))
-                && !matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels) {
+                && !matches!(&request, DispatchRequest::Observe(_)) {
                 geometry = Some(GeometrySnapshot::capture(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &operation).await.map_err(map_geometry)?);
             }
             match request {
@@ -1492,26 +1801,39 @@ impl ObservationDispatch {
                     value["viewport"] = observed_viewport;
                     let main = main_frame(&frozen)?;
                     value["location"] = Value::String(main.url.clone());
-                    let pixels = if request.options.pixels || fallback {
-                        let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
-                        let pixel_operation = pixel_lease(&operation);
-                        let result = client_capture::capture_under_journal(&capture_context, &CaptureRequest { secure_field_selector: request.secure_field_selector }, &pixel_operation, journal.as_mut().ok_or(ProtocolError::PolicyDenied)?, geometry).await.map_err(|error| error.reason);
-                        match result {
-                            Ok(pixels) => {
-                                if viewport(&capture_context.page, &operation).await? != value["viewport"] { return Err(ProtocolError::StaleScope); }
-                                Some(pixels)
-                            },
-                            // Only an ordinary backend capture failure can omit
-                            // optional enrichment. Masking/scope/cleanup proof is
-                            // never downgraded to fixture reads or raw pixels.
-                            Err(CaptureReason::BrowserFailure | CaptureReason::Deadline) if !fallback => { check(&capture_context.page, &operation)?; None },
-                            Err(reason) => return Err(capture_error(reason)),
+                    if request.options.pixels && !fallback {
+                        // Finish the same proof as tree-only Observe before any
+                        // optional-only animation, strict geometry or raw capture.
+                        if let Some(semantic_journal) = journal.take() {
+                            semantic_journal.check().map_err(protected_error)?;
+                            // Observe has not stabilized or installed masks yet.
+                            // The existing no-effects Drop closes this read-only
+                            // barrier without starting the raw cleanup clock.
+                            drop(semantic_journal);
                         }
-                    } else { None };
-                    Ok((value, pixels, None))
+                        let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
+                        geometry.revalidate(&capture_context.page.client, &operation).await.map_err(map_geometry)?;
+                        let current = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
+                        same_frames(&capture_context.frames, &current)?;
+                        if viewport(&capture_context.page, &operation).await? != value["viewport"] {
+                            return Err(ProtocolError::StaleScope);
+                        }
+                        bounded_result(&value)?;
+                        check(&capture_context.page, &operation)?;
+                        // The tree is immutable, but its staged refs remain
+                        // private until the on-time result actually publishes.
+                        completed_optional = Some(self.optional_observe_pixels(
+                            &capture_context, &operation, capture.as_ref(), retirement_fence,
+                            &context.blobs, &context.scope, &mut publication, revision, &staged,
+                            request.secure_field_selector, value, result_send, receipt,
+                        ).await);
+                        return Ok((Value::Null, None, None));
+                    }
+                    Ok((value, None, None))
                 }
             }
         }.await;
+        if let Some(output) = completed_optional { return output; }
         if let (Some(witness), Err(error)) = (screenshot, &result) { witness.failure(error); }
         screenshot_stage(screenshot, ScreenshotStage::Restoration);
         #[cfg(test)]
@@ -2531,6 +2853,18 @@ async fn viewport(
         .filter(|n| n.is_finite() && *n > 0.0)
         .ok_or(ProtocolError::BrowserFailure)?;
     Ok(json!({"width":width,"height":height}))
+}
+fn optional_observe_lease(operation: &OperationLease) -> OperationLease {
+    let remaining = operation.deadline.saturating_duration_since(Instant::now());
+    // Cleanup is independently retained. Reserve only local result publication,
+    // not the old 20%/500ms restoration allowance used by strict fallback.
+    OperationLease {
+        is_callback: operation.is_callback,
+        generation: operation.generation,
+        sequence: operation.sequence,
+        deadline: operation.deadline - remaining.min(Duration::from_millis(1)),
+        cancellation: operation.cancellation.clone(),
+    }
 }
 fn pixel_lease(operation: &OperationLease) -> OperationLease {
     let remaining = operation.deadline.saturating_duration_since(Instant::now());

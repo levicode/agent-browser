@@ -12,6 +12,14 @@ enum Case {
     Immediate,
     NativeDeadline,
     ClientCancel,
+    OptionalRawHeld,
+    OptionalRawNeverAck,
+    MetadataReleaseHeld,
+    OptionalMaskHeld,
+    OptionalWrongSessionHeld,
+    OptionalMalformedHeld,
+    SemanticCorruption,
+    OptionalRestoreFailure,
 }
 
 struct Peer {
@@ -22,6 +30,7 @@ struct Peer {
     restoration_acked: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
     protected_png: String,
+    release: mpsc::UnboundedSender<()>,
 }
 
 fn png(color: [u8; 4]) -> String {
@@ -47,6 +56,8 @@ async fn peer(case: Case) -> Peer {
     let protected = protected_png.clone();
     // Synthetic marker only; no real private pixels exist in this test.
     let unprotected = png([255, 0, 255, 255]);
+    let (release_tx, mut release_rx) = mpsc::unbounded_channel::<()>();
+    let peer_release = release_tx.clone();
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         stream.set_nodelay(true).unwrap();
@@ -58,16 +69,21 @@ async fn peer(case: Case) -> Peer {
         let (mut removed, mut released, mut rate_restored) = (false, false, false);
         let mut captures = 0;
         let mut held: Option<Value> = None;
-        let (release_tx, mut release_rx) = mpsc::unbounded_channel::<()>();
+        let mut readonly_held_once = false;
         let mut release_job = None;
         loop {
             tokio::select! {
                 signal = release_rx.recv(), if held.is_some() => {
                     signal.expect("release owner remains alive");
                     let request = held.take().unwrap();
-                    terminal.store(true, Ordering::Release);
+                    let raw = request["method"] == "Page.captureScreenshot";
+                    if raw { terminal.store(true, Ordering::Release); }
                     let data = if source_holder { &protected } else { &unprotected };
-                    if socket.send(Message::Text(json!({"id":request["id"],"sessionId":request["sessionId"],"result":{"data":data}}).to_string())).await.is_err() { break; }
+                    let result = if raw {
+                        if case == Case::OptionalMalformedHeld { json!({"data":42}) } else { json!({"data":data}) }
+                    } else { observation_reply(&request).expect("known held readonly command") };
+                    let session = if raw && case == Case::OptionalWrongSessionHeld { json!("wrong-session") } else { request["sessionId"].clone() };
+                    if socket.send(Message::Text(json!({"id":request["id"],"sessionId":session,"result":result}).to_string())).await.is_err() { break; }
                 }
                 message = socket.next() => {
                     let Some(Ok(Message::Text(text))) = message else { break; };
@@ -75,7 +91,8 @@ async fn peer(case: Case) -> Peer {
                     recorded.lock().unwrap().push(request.clone());
                     let method = request["method"].as_str().unwrap();
                     let session = request["sessionId"].as_str().unwrap_or("");
-                    let rejected = false;
+                    let rejected = case == Case::OptionalRestoreFailure && method == "Animation.setPlaybackRate"
+                        && request["params"]["playbackRate"].as_f64() == Some(1.0);
                     let result = match method {
                         "Browser.getVersion" => json!({"protocolVersion":"1.3","product":"Synthetic Chromium/1.0","revision":"synthetic","userAgent":"Synthetic Chromium Linux","jsVersion":"synthetic"}),
                         "Target.getBrowserContexts" => json!({"browserContextIds":[],"defaultBrowserContextId":"host-context"}),
@@ -88,7 +105,10 @@ async fn peer(case: Case) -> Peer {
                         "Page.createIsolatedWorld" => { assert_eq!(request["params"]["frameId"], frame); json!({"executionContextId":1}) },
                         "Page.getLayoutMetrics" => json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}}),
                         "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":1}}),
-                        "DOMSnapshot.captureSnapshot" => json!({"strings":[frame],"documents":[{"frameId":0,"nodes":{"nodeType":[9],"backendNodeId":[1]}}]}),
+                        "DOMSnapshot.captureSnapshot" => {
+                            if case == Case::OptionalMaskHeld { assert!(held.replace(request.clone()).is_none()); continue; }
+                            json!({"strings":[frame],"documents":[{"frameId":0,"nodes":{"nodeType":[9],"backendNodeId":[1]}}]})
+                        },
                         "Animation.getPlaybackRate" => json!({"playbackRate":1}),
                         "Animation.setPlaybackRate" => {
                             if request["params"]["playbackRate"].as_f64().is_some_and(|rate| rate.is_finite() && rate == 1.0) {
@@ -115,11 +135,18 @@ async fn peer(case: Case) -> Peer {
                                     other => panic!("unmodeled source-holder call: {other}"),
                                 }
                             }
-                            observation_reply(&request).expect("known Observe/source-mask protocol")
+                            if case == Case::SemanticCorruption && declaration.contains("const read=") {
+                                json!({"result":{"value":[]}})
+                            } else { observation_reply(&request).expect("known Observe/source-mask protocol") }
                         }
                         "Runtime.releaseObjectGroup" => {
                             let group=request["params"]["objectGroup"].as_str().unwrap();
                             if group.starts_with("capture-source-") { assert!(!source_holder); }
+                            if case == Case::MetadataReleaseHeld && group.starts_with("native-metadata-") && !readonly_held_once {
+                                readonly_held_once = true;
+                                assert!(held.replace(request.clone()).is_none());
+                                continue;
+                            }
                             json!({})
                         }
                         "Page.captureScreenshot" => {
@@ -127,16 +154,16 @@ async fn peer(case: Case) -> Peer {
                             assert_eq!(captures, 1, "no retry/warmup permitted");
                             assert!(source_holder);
                             assert_eq!(request["params"], json!({"format":"png","fromSurface":true}));
-                            if case != Case::Immediate {
+                            if !matches!(case, Case::Immediate | Case::OptionalRestoreFailure) {
                                 assert!(held.is_none());
                                 held=Some(request.clone());
                                 let release=release_tx.clone();
-                                release_job=Some(tokio::spawn(async move {
+                                if matches!(case, Case::NativeDeadline | Case::ClientCancel) { release_job=Some(tokio::spawn(async move {
                                     // Scheduling a late peer reply is NOT a larger operation budget.
                                     // Start after capture receipt, so this is beyond original 1s + 250ms.
                                     tokio::time::sleep(Duration::from_millis(1600)).await;
                                     release.send(()).unwrap();
-                                }));
+                                })); }
                                 continue;
                             }
                             json!({"data":protected})
@@ -181,6 +208,7 @@ async fn peer(case: Case) -> Peer {
         restoration_acked,
         task,
         protected_png,
+        release: peer_release,
     }
 }
 
@@ -196,7 +224,15 @@ fn observation_reply(request: &Value) -> Option<Value> {
         "Accessibility.getFullAXTree" => {
             json!({"nodes":[{"nodeId":"document","backendDOMNodeId":1,"role":{"type":"role","value":"RootWebArea"}}]})
         }
-        "DOM.resolveNode" => json!({"object":{"objectId":"node-1","subtype":"node"}}),
+        "DOM.resolveNode" => {
+            let group = request["params"]["objectGroup"].as_str().unwrap_or("");
+            let object = if group.starts_with("native-") {
+                format!("{group}-node-1")
+            } else {
+                "node-1".into()
+            };
+            json!({"object":{"objectId":object,"subtype":"node"}})
+        }
         "DOMSnapshot.captureSnapshot" => {
             json!({"strings":["frame-host-session"],"documents":[{"frameId":0,"nodes":{"nodeType":[9],"backendNodeId":[1]}}]})
         }
@@ -213,10 +249,10 @@ fn observation_reply(request: &Value) -> Option<Value> {
         "Runtime.callFunctionOn" => {
             let declaration = request["params"]["functionDeclaration"].as_str().unwrap();
             if declaration.contains("Array.from(result)") {
-                json!({"result":{"objectId":"security"}})
+                json!({"result":{"objectId":format!("{}-security", request["params"]["objectGroup"].as_str().unwrap())}})
             } else if declaration.contains("const read=") {
                 let values = request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|argument| {
-                    assert_eq!(argument["objectId"], "node-1");
+                    assert!(argument["objectId"].as_str().unwrap().ends_with("node-1"));
                     json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
                 }).collect::<Vec<_>>();
                 json!({"result":{"value":values}})
@@ -645,4 +681,555 @@ fn observe_peer_ax_schema_and_omitted_flags_match_real_protocol() {
     ] {
         assert_eq!(value.as_f64().filter(|rate| rate.is_finite()), expected);
     }
+}
+
+// I10/#17: exercise the actual framed transport, ClientBrowser result bridge,
+// retained operation registry and CDP reader. A held ACK is never a fake clean
+// restoration. The peer is protocol proof, not a renderer/pixel-fidelity test.
+async fn optional_fixture(case: Case) -> (Peer, Arc<ClientBrowser>, FramedFixture, String) {
+    let peer = peer(case).await;
+    let broker = Arc::new(ClientSession::new());
+    let browser = Arc::new(ClientBrowser::new(broker.clone()));
+    let mut fixture =
+        FramedFixture::with_capabilities(broker, browser.clone(), required_capabilities());
+    fixture.ready().await.unwrap();
+    let opened = fixture
+        .command(
+            "scope.open",
+            json!({"source":"connect","context":"persistent","endpoint":peer.endpoint}),
+            10,
+        )
+        .await
+        .unwrap();
+    let scope = opened["identityScope"].as_str().unwrap().to_owned();
+    fixture.scope = Some(scope.clone());
+    fixture
+        .command("scope.configure", fixture_configuration(&scope, None), 10)
+        .await
+        .unwrap();
+    fixture
+        .command("network.routes.replace", fixture_routes(&scope), 10)
+        .await
+        .unwrap();
+    fixture.registry = 1;
+    fixture
+        .command("page.activate", json!({"identityScope":scope}), 10)
+        .await
+        .unwrap();
+    (peer, browser, fixture, scope)
+}
+
+async fn optional_request(
+    fixture: &mut FramedFixture,
+    scope: &str,
+    id: &str,
+    pixels: bool,
+    timeout: u64,
+) -> Instant {
+    fixture.sequence += 1;
+    let started = Instant::now();
+    fixture
+        .write(
+            json!({"type":"request","id":id,"generation":1,"operationSeq":fixture.sequence,
+        "timeoutMs":timeout,"command":"browser.observe","args":{"identityScope":scope,
+        "testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,
+        "options":{"pixels":pixels}}}),
+        )
+        .await
+        .unwrap();
+    started
+}
+
+async fn optional_result(fixture: &mut FramedFixture, id: &str) -> Value {
+    trace_and_control(fixture, id, None).await.0
+}
+
+async fn peer_reached(peer: &Peer, method: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !peer
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == method)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("real held command not submitted");
+}
+
+async fn optional_finish(peer: Peer, fixture: FramedFixture) -> Result<(), String> {
+    let cleanup = tokio::time::timeout(Duration::from_secs(10), fixture.finish())
+        .await
+        .expect("retained native shutdown stalled");
+    tokio::time::timeout(Duration::from_secs(2), peer.task)
+        .await
+        .expect("peer not joined")
+        .unwrap();
+    cleanup
+}
+
+#[tokio::test]
+async fn i10_t01_metadata_release_ack_is_not_the_eighty_ms_tree_deadline() {
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::MetadataReleaseHeld).await;
+    let client = browser.page_lease(false).await.unwrap().client;
+    let ledger = client.debt_ledger().unwrap();
+    let started = optional_request(&mut fixture, &scope, "readonly-debt-tree", false, 80).await;
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "readonly-debt-tree"),
+    )
+    .await
+    .expect("metadata ACK consumed the original deadline");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["effects"], "completed");
+    assert_eq!(result["data"]["root"]["role"], "document");
+    assert!(result["data"].get("pixels").is_none());
+    assert!(
+        ledger.snapshot().object_debt > 0,
+        "held disposal was not accounted"
+    );
+    assert!(ledger.snapshot().outstanding_commands > 0);
+    assert!(!ledger.snapshot().integrity_lost);
+    let old = browser.refs.lock().unwrap().ref_ids();
+    assert!(!old.is_empty());
+    // A second operation has different metadata group identity. Its release
+    // cannot borrow or discharge the old held release receipt.
+    let next = fixture.command("browser.observe", json!({"identityScope":scope,
+        "testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{}}), 1).await.unwrap();
+    assert_ne!(next["revision"], result["data"]["revision"]);
+    assert!(ledger.snapshot().object_debt > 0);
+    let groups = peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request["method"] == "Runtime.releaseObjectGroup")
+        .filter_map(|request| request["params"]["objectGroup"].as_str())
+        .filter(|group| group.starts_with("native-metadata-"))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    assert_eq!(groups.len(), 2);
+    assert_ne!(groups[0], groups[1]);
+    peer.release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ledger.snapshot().object_debt != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("matching late release ACK did not discharge exact debt");
+    assert_eq!(browser.refs.lock().unwrap().ref_ids().len(), old.len());
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["method"] == "Page.captureScreenshot"));
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn i10_t02_mask_probe_no_ack_returns_tree_without_late_screenshot() {
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::OptionalMaskHeld).await;
+    let client = browser.page_lease(false).await.unwrap().client;
+    let started = optional_request(&mut fixture, &scope, "mask-debt-tree", true, 80).await;
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "mask-debt-tree"),
+    )
+    .await
+    .expect("mask probe consumed immutable tree deadline");
+    assert_eq!(result["ok"], true);
+    assert!(result["data"].get("pixels").is_none());
+    assert!(!browser.refs.lock().unwrap().ref_ids().is_empty());
+    peer_reached(&peer, "DOMSnapshot.captureSnapshot").await;
+    peer.release.send(()).unwrap();
+    // A same-transport roundtrip fences processing of the real late value ACK.
+    client
+        .send_command_no_params("Browser.getVersion", None)
+        .await
+        .unwrap();
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["method"] == "Page.captureScreenshot"));
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn i10_t03_t04_raw_no_ack_publishes_tree_retains_join_blocks_input_then_recovers() {
+    use crate::native::client_debt::OperationKey;
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::OptionalRawHeld).await;
+    let client = browser.page_lease(false).await.unwrap().client;
+    let ledger = client.debt_ledger().unwrap();
+    let started = optional_request(&mut fixture, &scope, "raw-debt-tree", true, 80).await;
+    let sequence = fixture.sequence;
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "raw-debt-tree"),
+    )
+    .await
+    .expect("raw ACK/join consumed immutable tree deadline");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["effects"], "completed");
+    assert!(
+        result.get("retention").is_none(),
+        "successful semantics are not an Unknown continuation"
+    );
+    assert!(result["data"].get("pixels").is_none());
+    peer_reached(&peer, "Page.captureScreenshot").await;
+    let (journal, fixed) = browser
+        .tasks
+        .operation_journal_result_for_test(OperationKey {
+            generation: 1,
+            operation_seq: sequence,
+        })
+        .expect("old producer must remain registered");
+    assert!(
+        fixed,
+        "wire publication fixes the immutable result, not local cleanup"
+    );
+    assert!(!journal.snapshot().local_producers_finished);
+    assert!(ledger.snapshot().outstanding_commands > 0);
+    assert!(!peer.early_restore.load(Ordering::Acquire));
+    assert!(!peer.terminal_sent.load(Ordering::Acquire));
+    fixture.sequence += 1;
+    fixture.write(json!({"type":"request","id":"unsafe-input","generation":1,"operationSeq":fixture.sequence,
+        "timeoutMs":30,"command":"browser.pointer","args":{"identityScope":scope,"point":{"x":1,"y":1},"action":{"kind":"tap"}}})).await.unwrap();
+    let refused = optional_result(&mut fixture, "unsafe-input").await;
+    assert_eq!(refused["ok"], false);
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["method"] == "Input.dispatchMouseEvent"));
+    assert!(!peer.early_restore.load(Ordering::Acquire));
+    let retained_refs = browser.refs.lock().unwrap().ref_ids();
+    assert!(!retained_refs.is_empty());
+    peer.release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !journal.snapshot().local_producers_finished {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late raw ACK did not join its exact producer");
+    assert!(peer.restoration_acked.load(Ordering::Acquire));
+    assert!(!ledger.snapshot().integrity_lost);
+    assert_eq!(browser.refs.lock().unwrap().ref_ids(), retained_refs);
+    fixture
+        .command(
+            "browser.pointer",
+            json!({"identityScope":scope,"point":{"x":1,"y":1},"action":{"kind":"tap"}}),
+            1,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        peer.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "Input.dispatchMouseEvent")
+            .count(),
+        3
+    );
+    assert_eq!(
+        peer.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "Page.captureScreenshot")
+            .count(),
+        1
+    );
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn i10_t03_permanent_raw_no_ack_keeps_tree_but_never_claims_clean_custody() {
+    use crate::native::client_debt::OperationKey;
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::OptionalRawNeverAck).await;
+    let started = optional_request(&mut fixture, &scope, "permanent-raw-tree", true, 80).await;
+    let sequence = fixture.sequence;
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "permanent-raw-tree"),
+    )
+    .await
+    .expect("permanent raw debt delayed immutable tree");
+    assert_eq!(result["ok"], true);
+    assert!(result["data"].get("pixels").is_none());
+    let (journal, fixed) = browser
+        .tasks
+        .operation_journal_result_for_test(OperationKey {
+            generation: 1,
+            operation_seq: sequence,
+        })
+        .unwrap();
+    assert!(fixed && !journal.snapshot().local_producers_finished);
+    tokio::time::timeout(Duration::from_secs(4), async {
+        while !journal.snapshot().local_producers_finished {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("bounded raw custody did not reach an honest terminal disposition");
+    assert!(journal.snapshot().integrity_lost);
+    assert!(!peer.early_restore.load(Ordering::Acquire));
+    assert!(!peer.terminal_sent.load(Ordering::Acquire));
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["params"]["functionDeclaration"]
+            == "function(){return this.remove()}"));
+    // Shutdown is joined even when its honest result is failed cleanup.
+    let _ = optional_finish(peer, fixture).await;
+}
+
+#[tokio::test]
+async fn i10_t05_wrong_session_or_malformed_late_raw_ack_never_becomes_pixels() {
+    use crate::native::client_debt::OperationKey;
+    for case in [Case::OptionalWrongSessionHeld, Case::OptionalMalformedHeld] {
+        let (peer, browser, mut fixture, scope) = optional_fixture(case).await;
+        let started = optional_request(&mut fixture, &scope, "invalid-late-raw", true, 80).await;
+        let sequence = fixture.sequence;
+        let result = tokio::time::timeout_at(
+            (started + Duration::from_millis(80)).into(),
+            optional_result(&mut fixture, "invalid-late-raw"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["ok"], true);
+        assert!(result["data"].get("pixels").is_none());
+        let (journal, _) = browser
+            .tasks
+            .operation_journal_result_for_test(OperationKey {
+                generation: 1,
+                operation_seq: sequence,
+            })
+            .unwrap();
+        peer.release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while !journal.snapshot().local_producers_finished {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!peer.early_restore.load(Ordering::Acquire));
+        if case == Case::OptionalWrongSessionHeld {
+            assert!(journal.snapshot().integrity_lost);
+        }
+        assert_eq!(
+            peer.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Page.captureScreenshot")
+                .count(),
+            1
+        );
+        let _ = optional_finish(peer, fixture).await;
+    }
+}
+
+#[tokio::test]
+async fn i10_t05_shared_semantic_corruption_never_enters_optional_success() {
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::SemanticCorruption).await;
+    optional_request(&mut fixture, &scope, "broken-semantic", true, 80).await;
+    let result = optional_result(&mut fixture, "broken-semantic").await;
+    assert_eq!(result["ok"], false);
+    assert!(result.get("data").is_none());
+    assert!(browser.refs.lock().unwrap().ref_ids().is_empty());
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["method"] == "Page.captureScreenshot"));
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn i10_t06_client_cancel_before_optional_cutoff_keeps_old_published_refs() {
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::OptionalRawHeld).await;
+    fixture
+        .command(
+            "browser.observe",
+            json!({"identityScope":scope,"testIdAttribute":"data-testid",
+        "secureFieldSelector":FIXTURE_SECURE_SELECTOR,"options":{}}),
+            1,
+        )
+        .await
+        .unwrap();
+    let before = browser.refs.lock().unwrap().ref_ids();
+    optional_request(&mut fixture, &scope, "cancel-before-cutoff", true, 1000).await;
+    peer_reached(&peer, "Page.captureScreenshot").await;
+    fixture.write(json!({"type":"cancel","id":"cancel-optional","generation":1,"operationSeq":fixture.sequence})).await.unwrap();
+    peer.release.send(()).unwrap();
+    let (result, cancel) = trace_and_control(
+        &mut fixture,
+        "cancel-before-cutoff",
+        Some("cancel-optional"),
+    )
+    .await;
+    assert_eq!(cancel.unwrap()["accepted"], true);
+    assert_eq!(result["ok"], false);
+    assert!(result.get("data").is_none());
+    assert_eq!(browser.refs.lock().unwrap().ref_ids(), before);
+    assert_eq!(
+        peer.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "Page.captureScreenshot")
+            .count(),
+        1
+    );
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn i10_t05_failed_optional_restore_emits_completed_quarantined_tree() {
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::OptionalRestoreFailure).await;
+    let started =
+        optional_request(&mut fixture, &scope, "failed-restore-safe-tree", true, 80).await;
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "failed-restore-safe-tree"),
+    )
+    .await
+    .expect("failed optional cleanup erased the on-time immutable tree");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["effects"], "completed");
+    assert_eq!(result["scopeState"], "quarantined");
+    assert_eq!(result["data"]["root"]["role"], "document");
+    assert!(result["data"].get("pixels").is_none());
+    assert!(result.get("retention").is_none());
+    assert!(!browser.refs.lock().unwrap().ref_ids().is_empty());
+    assert!(
+        browser.broker.admit(1, fixture.sequence + 1, 80).is_err(),
+        "immutable publication must not restore new operation admission"
+    );
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["method"] == "Input.dispatchMouseEvent"));
+    let _ = optional_finish(peer, fixture).await;
+}
+
+#[tokio::test]
+async fn i10_t06_new_observe_after_tree_publication_cannot_receive_late_old_pixels_or_refs() {
+    let (peer, browser, mut fixture, scope) = optional_fixture(Case::OptionalRawHeld).await;
+    let started = optional_request(&mut fixture, &scope, "old-sealed-tree", true, 80).await;
+    let first = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "old-sealed-tree"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first["ok"], true);
+    assert!(first["data"].get("pixels").is_none());
+    peer_reached(&peer, "Page.captureScreenshot").await;
+    optional_request(&mut fixture, &scope, "newer-tree", false, 1000).await;
+    peer.release.send(()).unwrap();
+    let newer = optional_result(&mut fixture, "newer-tree").await;
+    assert_eq!(newer["ok"], true);
+    assert!(newer["data"].get("pixels").is_none());
+    assert_ne!(newer["data"]["revision"], first["data"]["revision"]);
+    let newer_viewport = newer["data"]["viewportRef"]["id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches('@');
+    assert!(browser.refs.lock().unwrap().get(newer_viewport).is_some());
+    assert!(peer.restoration_acked.load(Ordering::Acquire));
+    assert_eq!(
+        peer.log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "Page.captureScreenshot")
+            .count(),
+        1
+    );
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn i10_t08_healthy_optional_image_remains_available_with_complete_tree() {
+    let (peer, _browser, mut fixture, scope) = optional_fixture(Case::Immediate).await;
+    let started = optional_request(&mut fixture, &scope, "healthy-optional-image", true, 80).await;
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "healthy-optional-image"),
+    )
+    .await
+    .expect("healthy optional image exceeded unchanged budget");
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["effects"], "completed");
+    assert_eq!(result["data"]["root"]["role"], "document");
+    assert_eq!(result["data"]["pixels"]["width"], 10);
+    assert_eq!(result["data"]["pixels"]["height"], 10);
+    assert!(result["data"]["pixels"]["sha256"]
+        .as_str()
+        .is_some_and(|digest| digest.len() == 64));
+    assert!(peer.restoration_acked.load(Ordering::Acquire));
+    fixture
+        .command(
+            "blob.release",
+            json!({"identityScope":scope,"handle":result["data"]["pixels"]["handle"]}),
+            1,
+        )
+        .await
+        .unwrap();
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn i10_t08_healthy_optional_pixels_after_old_cleanup_cutoff_still_publish() {
+    let (peer, _browser, mut fixture, scope) = optional_fixture(Case::OptionalRawHeld).await;
+    let started = optional_request(&mut fixture, &scope, "late-healthy-optional", true, 1000).await;
+    peer_reached(&peer, "Page.captureScreenshot").await;
+    let result = {
+        let pending = optional_result(&mut fixture, "late-healthy-optional");
+        tokio::pin!(pending);
+        // The old 20% reserve would omit an otherwise valid image near800ms.
+        // Keep the real raw ACK held beyond it, within this caller's unchanged1s.
+        tokio::select! {
+            result = &mut pending => panic!("healthy optional availability was cut off early: {result}"),
+            _ = tokio::time::sleep_until((started + Duration::from_millis(850)).into()) => {}
+        }
+        assert!(!peer.early_restore.load(Ordering::Acquire));
+        tokio::time::sleep_until((started + Duration::from_millis(900)).into()).await;
+        peer.release.send(()).unwrap();
+        tokio::time::timeout_at((started + Duration::from_millis(1000)).into(), pending)
+            .await
+            .expect("valid late image missed unchanged deadline")
+    };
+    assert_eq!(result["ok"], true);
+    assert_eq!(result["data"]["root"]["role"], "document");
+    assert_eq!(result["data"]["pixels"]["width"], 10);
+    assert_eq!(result["data"]["pixels"]["height"], 10);
+    assert!(peer.restoration_acked.load(Ordering::Acquire));
+    assert!(!peer.early_restore.load(Ordering::Acquire));
+    fixture
+        .command(
+            "blob.release",
+            json!({"identityScope":scope,"handle":result["data"]["pixels"]["handle"]}),
+            1,
+        )
+        .await
+        .unwrap();
+    optional_finish(peer, fixture).await.unwrap();
 }

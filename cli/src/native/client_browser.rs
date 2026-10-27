@@ -3252,6 +3252,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let receipt_deadline = lease.deadline;
             let receipt_cancellation = lease.cancellation.clone();
             let receipt_generation = lease.generation;
+            let (semantic_send, semantic_receive) = tokio::sync::oneshot::channel();
             let receive = self
                 .tasks
                 .start_operation_prepared(
@@ -3272,6 +3273,18 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         Ok(async move {
                             let task = observation.start_prepared(prepared);
                             let output = task.result.await;
+                            if task.receipt.is_sealed_observation() {
+                                if let Ok(Ok(value)) = &output {
+                                    // Only the dispatcher can issue this receipt,
+                                    // after the tree-only commit. Keep this same
+                                    // registered producer alive through its join.
+                                    let _ = semantic_send.send(NativeOutcome {
+                                        retention: None,
+                                        result: Ok(value.clone()),
+                                        effects: Effects::Completed,
+                                    });
+                                }
+                            }
                             let cleanup = task.join.await;
                             let (mut outcome, mut dirty) = settle_observation_dispatch(output, cleanup);
                             if (trace_screenshot || semantic_trace) && (std::time::Instant::now() >= receipt_deadline
@@ -3292,7 +3305,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     },
                 )
                 .await;
-            return finish(await_retained(receive).await);
+            let retained = await_retained(receive);
+            tokio::pin!(retained);
+            let outcome = tokio::select! {
+                biased;
+                result = semantic_receive => match result {
+                    Ok(outcome) => outcome,
+                    Err(_) => retained.await,
+                },
+                outcome = &mut retained => outcome,
+            };
+            return finish(outcome);
         }
         if matches!(
             command.as_str(),

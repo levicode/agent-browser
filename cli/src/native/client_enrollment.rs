@@ -743,6 +743,8 @@ enum CaptureTestPoint {
     BeforeAttachedProcessing,
     BeforeWorkerReadyCommit,
     BeforeWorkerRetirementWait,
+    BeforeIframeRetirementWait,
+    BeforeIframeConfigurationCommit,
 }
 #[cfg(test)]
 struct CaptureTestGate {
@@ -819,15 +821,24 @@ impl SettledInputAuthority {
 #[derive(Debug)]
 enum InitializationOutcome {
     Initialized,
+    DetachedChild,
     FailedRetired(super::cdp::client::ServiceWorkerStartupFailure),
 }
 impl InitializationOutcome {
     fn result(self) -> Result<(), ProtocolError> {
         match self {
-            Self::Initialized => Ok(()),
+            Self::Initialized | Self::DetachedChild => Ok(()),
             Self::FailedRetired(failure) => Err(failure.error()),
         }
     }
+}
+
+/// Original attachment tickets, not an inferred absence or replacement tab.
+struct IframeInitialization {
+    child: OwnedTarget,
+    root: OwnedTarget,
+    watermark: Option<BoundedEventWatermark>,
+    ledger: Option<Arc<super::client_debt::OwnerDebtLedger>>,
 }
 
 #[derive(Default)]
@@ -3312,15 +3323,17 @@ impl ClientEnrollment {
         self.ensure_supervisor().await?;
         #[cfg(test)]
         self.trace_capture_admission(CaptureLifecycleStep::EnrollingExisting, target, session);
-        let entry = self
-            .register(&self.targets.context_id, target, session, kind, None)?
+        let (entry, initialization) = self
+            .register_with_initialization(&self.targets.context_id, target, session, kind, None)?
             .ok_or(ProtocolError::InvalidArguments)?;
         self.diagnostic_registration(
             &entry,
             super::client_settlement_trace::DiagnosticTargetOrigin::InitialDiscovery,
             op.sequence,
         );
-        let result = self.initialize_observed(entry, op, None).await;
+        let result = self
+            .initialize_observed(entry, op, None, initialization)
+            .await;
         if let Err(error) = &result {
             self.poison(error.clone());
         }
@@ -3354,6 +3367,7 @@ impl ClientEnrollment {
             (self.generation, sequence),
         );
     }
+    #[cfg(test)]
     fn register(
         &self,
         context: &str,
@@ -3362,6 +3376,17 @@ impl ClientEnrollment {
         kind: &str,
         parent: Option<&str>,
     ) -> Result<Option<Attribution>, ProtocolError> {
+        self.register_with_initialization(context, target, session, kind, parent)
+            .map(|registered| registered.map(|(entry, _)| entry))
+    }
+    fn register_with_initialization(
+        &self,
+        context: &str,
+        target: &str,
+        session: &str,
+        kind: &str,
+        parent: Option<&str>,
+    ) -> Result<Option<(Attribution, Option<IframeInitialization>)>, ProtocolError> {
         if context != self.targets.context_id {
             return Ok(None);
         }
@@ -3455,8 +3480,47 @@ impl ClientEnrollment {
                 },
             );
         }
+        let initialization = self.capture_iframe_initialization(&index, &entry)?;
         self.changed.notify_waiters();
-        Ok(Some(entry))
+        Ok(Some((entry, initialization)))
+    }
+    fn capture_iframe_initialization(
+        &self,
+        index: &Index,
+        entry: &Attribution,
+    ) -> Result<Option<IframeInitialization>, ProtocolError> {
+        if entry.kind != "iframe" || entry.observation_only {
+            return Ok(None);
+        }
+        let root = index
+            .sessions
+            .get(&entry.root)
+            .ok_or(ProtocolError::StaleReference)?;
+        if entry.parent.is_none()
+            || root.kind != "page"
+            || root.session == entry.session
+            || root.observation_only
+        {
+            return Err(ProtocolError::StaleReference);
+        }
+        let (child, root) = self.targets.initializing_iframe_tickets(
+            &entry.target,
+            &entry.session,
+            &root.target,
+            &root.session,
+        )?;
+        Ok(Some(IframeInitialization {
+            child,
+            root,
+            // Direct test-only initialization need not run a supervisor, but it
+            // also receives no permission to retire an unobserved detach.
+            watermark: self
+                .event_watermark
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                .clone(),
+            ledger: self.client.debt_ledger(),
+        }))
     }
     #[cfg(test)]
     async fn initialize(
@@ -3464,7 +3528,7 @@ impl ClientEnrollment {
         entry: Attribution,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
-        self.initialize_observed(entry, op, None)
+        self.initialize_observed(entry, op, None, None)
             .await
             .and_then(InitializationOutcome::result)
     }
@@ -3473,6 +3537,7 @@ impl ClientEnrollment {
         entry: Attribution,
         op: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
+        initialization: Option<IframeInitialization>,
     ) -> Result<InitializationOutcome, ProtocolError> {
         // Retain only the existing bounded diagnostic fields before an event
         // can remove this attachment. Diagnostics grant no retirement authority.
@@ -3484,11 +3549,57 @@ impl ClientEnrollment {
                     .and_then(|target| target.diagnostic_snapshot())
             })
             .flatten();
-        let result = self.initialize_inner(entry.clone(), op, admission).await;
+        let child = if initialization.is_some() {
+            initialization
+        } else if entry.kind == "iframe" && !entry.observation_only {
+            let index = self
+                .index
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            self.capture_iframe_initialization(&index, &entry)?
+        } else {
+            None
+        };
+        // A reader-side detach wakes the command before this supervisor applies
+        // the event. Keep the resume reservation until that exact retirement is
+        // checked; dropping it at the command's `?` would poison the whole scope.
+        let mut pending_resume = None;
+        if let Some(original) = &child {
+            match self.targets.initializing_iframe_tickets(
+                &entry.target,
+                &entry.session,
+                &original.root.target_id,
+                &original.root.session_id,
+            ) {
+                Ok((current, root))
+                    if current.same_initialization_attachment(&original.child)
+                        && root.same_initialization_attachment(&original.root) => {}
+                Ok(_) => return Err(ProtocolError::StaleScope),
+                Err(ProtocolError::StaleReference) => {
+                    if self
+                        .retire_detached_iframe_initialization(
+                            &entry,
+                            original,
+                            &mut pending_resume,
+                            op,
+                        )
+                        .await?
+                    {
+                        return Ok(InitializationOutcome::DetachedChild);
+                    }
+                    return Err(ProtocolError::StaleReference);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let result = self
+            .initialize_inner(entry.clone(), op, admission, &mut pending_resume)
+            .await;
         let error = match result {
             Ok(InitializationOutcome::Initialized) => {
                 return Ok(InitializationOutcome::Initialized)
             }
+            Ok(InitializationOutcome::DetachedChild) => unreachable!(),
             Ok(InitializationOutcome::FailedRetired(failure)) => {
                 if let Some(mut value) = diagnostic {
                     value.generation = op.generation;
@@ -3510,18 +3621,36 @@ impl ClientEnrollment {
             }
             Err(error) => error,
         };
+        if !matches!(
+            error,
+            ProtocolError::BrowserFailure | ProtocolError::StaleReference
+        ) && !(error == ProtocolError::StaleScope && child.is_some())
+        {
+            self.targets.diagnostic_step(
+                &entry.target,
+                (op.generation, op.sequence),
+                super::client_settlement_trace::DiagnosticTargetStage::ConfigureFailed,
+                Some(error.clone()),
+            );
+            return Err(error);
+        }
+        if let Some(child) = &child {
+            if self
+                .retire_detached_iframe_initialization(&entry, child, &mut pending_resume, op)
+                .await?
+            {
+                return Ok(InitializationOutcome::DetachedChild);
+            }
+        }
+        if error == ProtocolError::StaleScope {
+            return Err(error);
+        }
         self.targets.diagnostic_step(
             &entry.target,
             (op.generation, op.sequence),
             super::client_settlement_trace::DiagnosticTargetStage::ConfigureFailed,
             Some(error.clone()),
         );
-        if !matches!(
-            error,
-            ProtocolError::BrowserFailure | ProtocolError::StaleReference
-        ) {
-            return Err(error);
-        }
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
@@ -3560,11 +3689,104 @@ impl ClientEnrollment {
             }
         }
     }
+    async fn retire_detached_iframe_initialization(
+        &self,
+        entry: &Attribution,
+        original: &IframeInitialization,
+        permit: &mut Option<super::client_targets::ResumePermit>,
+        op: &OperationLease,
+    ) -> Result<bool, ProtocolError> {
+        let watermark = original
+            .watermark
+            .as_ref()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        let ledger = original
+            .ledger
+            .as_ref()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        let publication = ledger.initialization_retirement_notifier();
+        // Reader publication precedes waiter closure. Apply that failure-time
+        // boundary once, not an ever-growing stream of unrelated later events.
+        // Later root detach/replacement is still rejected by the final reader
+        // ledger and original-root tenure fence, even before its event applies.
+        let received = watermark
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        bounded(op, async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let published = publication.notified();
+                tokio::pin!(published);
+                published.as_mut().enable();
+                self.check_restart_operation(op)?;
+                self.network.check_worker_startup(op)?;
+                {
+                    let index = self
+                        .index
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if let Some(error) = &index.failure {
+                        return Err(error.clone());
+                    }
+                    if self
+                        .event_watermark
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?
+                        .as_ref()
+                        .is_none_or(|current| !watermark.same_subscription(current))
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    if index.applied_watermark >= received {
+                        // Do not wait for a future detach to excuse a live
+                        // target's configuration error. Only queued lifecycle
+                        // application may explain this interrupted operation.
+                        if index.sessions.contains_key(&entry.session) {
+                            return Ok(false);
+                        }
+                        if index
+                            .sessions
+                            .values()
+                            .any(|current| current.target == entry.target)
+                            || !index.sessions.get(&entry.root).is_some_and(|root| {
+                                root.target == original.root.target_id
+                                    && root.kind == "page"
+                                    && root.application
+                                    && !root.observation_only
+                            })
+                        {
+                            return Err(ProtocolError::StaleScope);
+                        }
+                        if self.client.finish_detached_iframe_initialization(
+                            ledger,
+                            &self.targets,
+                            &original.child,
+                            &original.root,
+                            permit.as_mut(),
+                            op,
+                        )? {
+                            return Ok(true);
+                        }
+                    }
+                }
+                // No pending-enrollment drain: this task is itself one of those
+                // jobs. Only the original event pump/ledger may make progress.
+                #[cfg(test)]
+                self.pause_capture_at(CaptureTestPoint::BeforeIframeRetirementWait, op)
+                    .await?;
+                tokio::select! { _ = changed => {}, _ = &mut published => {} }
+            }
+        })
+        .await
+    }
     async fn initialize_inner(
         &self,
         mut entry: Attribution,
         op: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
+        pending_resume: &mut Option<super::client_targets::ResumePermit>,
     ) -> Result<InitializationOutcome, ProtocolError> {
         self.targets.diagnostic_step(
             &entry.target,
@@ -3794,6 +4016,7 @@ impl ClientEnrollment {
                 bounded(op, self.targets.resume_permit(&entry.target)),
             )
             .await?;
+            *pending_resume = Some(permit);
             ServiceWorkerAdmission::observe(
                 admission,
                 WorkerAdmissionStep::ResumeDebugger,
@@ -3806,7 +4029,15 @@ impl ClientEnrollment {
             )
             .await?;
             lease.permit.check()?;
-            permit.complete()?;
+            pending_resume
+                .as_mut()
+                .ok_or(ProtocolError::StaleScope)?
+                .complete_retained()?;
+        }
+        #[cfg(test)]
+        if entry.kind == "iframe" {
+            self.pause_capture_at(CaptureTestPoint::BeforeIframeConfigurationCommit, op)
+                .await?;
         }
         ServiceWorkerAdmission::observe_sync(
             admission,
@@ -4311,7 +4542,7 @@ impl ClientEnrollment {
                     break Ok(());
                 },
                 completed = tasks.join_next(), if !tasks.is_empty() => {
-                    match completed { Some(Ok(Ok(InitializationOutcome::Initialized))) => {}, Some(Ok(Ok(InitializationOutcome::FailedRetired(_failure)))) => {}, Some(Ok(Err(error))) => break Err(error), Some(Err(_)) => break Err(ProtocolError::BrowserFailure), None=>{} }
+                    match completed { Some(Ok(Ok(InitializationOutcome::Initialized | InitializationOutcome::DetachedChild))) => {}, Some(Ok(Ok(InitializationOutcome::FailedRetired(_failure)))) => {}, Some(Ok(Err(error))) => break Err(error), Some(Err(_)) => break Err(ProtocolError::BrowserFailure), None=>{} }
                 },
                 event = events.recv() => {
                     let event = match event {
@@ -4410,7 +4641,7 @@ impl ClientEnrollment {
             if !matches!(
                 completed,
                 Ok(Ok(
-                    InitializationOutcome::Initialized | InitializationOutcome::FailedRetired(_)
+                    InitializationOutcome::Initialized | InitializationOutcome::DetachedChild | InitializationOutcome::FailedRetired(_)
                 )) | Ok(Err(ProtocolError::Cancelled))
             ) && result.is_ok()
             {
@@ -5232,15 +5463,15 @@ impl ClientEnrollment {
         match ServiceWorkerAdmission::observe_sync(
             admission.as_ref(),
             WorkerAdmissionStep::Register,
-            || self.register(context, target, &session, kind, event.session_id.as_deref()),
+            || self.register_with_initialization(context, target, &session, kind, event.session_id.as_deref()),
         )? {
-            Some(entry) => {
+            Some((entry, initialization)) => {
                 self.diagnostic_registration(
                     &entry,
                     super::client_settlement_trace::DiagnosticTargetOrigin::AutoAttach,
                     0,
                 );
-                self.initialize_observed(entry, &self.operation(), admission.as_ref())
+                self.initialize_observed(entry, &self.operation(), admission.as_ref(), initialization)
                     .await
             }
             None => {
@@ -5605,6 +5836,12 @@ impl ClientEnrollment {
                         .is_some_and(|target| target.as_str() != Some(entry.target.as_str()))
                     {
                         return Err(ProtocolError::InvalidFrame);
+                    }
+                    if entry.kind == "iframe" && !entry.observation_only {
+                        if event.session_id.as_deref().is_some_and(|parent| entry.parent.as_deref() != Some(parent)) {
+                            return Err(ProtocolError::InvalidFrame);
+                        }
+                        self.targets.observe_iframe_detach(&entry.target, &entry.session)?;
                     }
                     if entry.kind == "page" && entry.application && !entry.observation_only {
                         if let Some(target) = event.params.get("targetId") {
@@ -6784,6 +7021,8 @@ mod tests {
                         if mode=="retired-detach-held" && method=="Target.detachFromTarget" { continue; }
                         if mode=="observer-controlled-acks" && request["sessionId"]=="observer"
                             && matches!(method,"Page.enable"|"Target.setAutoAttach"|"Runtime.runIfWaitingForDebugger") { continue; }
+                        if mode=="iframe-controlled-acks" && request["sessionId"]=="child"
+                            && matches!(method,"Page.enable"|"Runtime.runIfWaitingForDebugger") { continue; }
                         if matches!(mode,"observer-close"|"observer-unknown-error"|"observer-detached-live") && method=="Page.enable" && request["sessionId"]=="observer" {
                             if mode!="observer-unknown-error" { socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"observer","targetId":"other-host"}}).to_string())).await.unwrap(); }
                             socket.send(Message::Text(json!({"id":request["id"],"error":{"code":-32000,"message":"target closed"}}).to_string())).await.unwrap();continue;
@@ -6885,7 +7124,7 @@ mod tests {
                         };
                         if method=="Target.getTargets" {if let Some(infos)=result.get_mut("targetInfos").and_then(Value::as_array_mut) {infos.retain(|info|!closed_targets.contains(info["targetId"].as_str().unwrap()) && !(mode=="late-popup" && info["targetId"]=="queued-popup" && !closed_targets.contains("initial-target")));}}
                         let mut response = json!({"id":request["id"],"result":result});
-                        if (mode.starts_with("sw-startup-") || mode=="observer-controlled-acks" || mode=="eval-network-watermark") && request.get("sessionId").is_some() {
+                        if (mode.starts_with("sw-startup-") || mode=="observer-controlled-acks" || mode.starts_with("iframe-") || mode=="eval-network-watermark") && request.get("sessionId").is_some() {
                             response["sessionId"] = request["sessionId"].clone();
                         }
                         if socket.send(Message::Text(response.to_string())).await.is_err(){break;}
@@ -13974,7 +14213,7 @@ mod tests {
             let (decided, release_decision) = owner.client.hold_worker_startup_no_receipt();
             let task_owner = owner.clone();
             startup = Some(tokio::spawn(async move {
-                task_owner.initialize_observed(entry, &op, None).await
+                task_owner.initialize_observed(entry, &op, None, None).await
             }));
             let (joined_error, decision_deadline) =
                 tokio::time::timeout(Duration::from_secs(2), decided)
@@ -14891,6 +15130,475 @@ mod tests {
         assert!(!owner.index.lock().unwrap().sessions["bootstrap-session"].application);
         server.abort();
     }
+    #[tokio::test]
+    async fn iframe_detach_before_initialization_uses_atomic_registration_tickets() {
+        for obstruction in [
+            "none",
+            "child-reused",
+            "root-reused",
+            "ledger-lost",
+            "root-reader-detach",
+            "wrong-generation",
+            "cancelled",
+            "expired",
+            "watermark-replaced",
+        ] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                fixture_with_client("iframe-controlled-acks", true).await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let host = owner.targets.owned_target("initial-target").unwrap();
+            let (entry, initialization) = owner
+                .register_with_initialization(
+                    "owned-context",
+                    "iframe-target",
+                    "child",
+                    "iframe",
+                    Some("initial"),
+                )
+                .unwrap()
+                .unwrap();
+            let watermark = owner.realm_watermark().unwrap();
+            let before = watermark.received().unwrap();
+            emit.send(
+                json!({"method":"Target.detachedFromTarget","sessionId":"initial",
+                "params":{"sessionId":"child","targetId":"iframe-target"}}),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while watermark.received().unwrap() == before {
+                    tokio::task::yield_now().await;
+                }
+                owner
+                    .drain_capture_watermark(&watermark, &owner.operation())
+                    .await
+                    .unwrap();
+            })
+            .await
+            .unwrap();
+            let (cancel, cancellation) = watch::channel(CancelSignal::None);
+            let mut op = OperationLease {
+                cancellation,
+                ..owner.operation()
+            };
+            let mut replacement_events = None;
+            let mut root_publication = None;
+            match obstruction {
+                "child-reused" => {
+                    owner
+                        .targets
+                        .attached(
+                            "owned-context",
+                            "iframe-target".into(),
+                            "child".into(),
+                            "iframe".into(),
+                        )
+                        .unwrap();
+                }
+                "root-reused" => {
+                    owner.targets.detach("initial-target").unwrap();
+                    owner
+                        .targets
+                        .attached(
+                            "owned-context",
+                            "initial-target".into(),
+                            "initial".into(),
+                            "page".into(),
+                        )
+                        .unwrap();
+                }
+                "ledger-lost" => connection.debt_ledger().unwrap().connection_lost(),
+                "root-reader-detach" => {
+                    // Reader ownership has already ended, but the root event is
+                    // not even published to the captured watermark yet. A fixed
+                    // child boundary must still fail the independent root fence.
+                    root_publication = connection
+                        .debt_ledger()
+                        .unwrap()
+                        .observe_event_for_publication(&CdpEvent {
+                            method: "Target.detachedFromTarget".into(),
+                            session_id: None,
+                            params: json!({"sessionId":"initial","targetId":"initial-target"}),
+                        });
+                    assert!(root_publication.is_some());
+                }
+                "cancelled" => {
+                    cancel.send_replace(CancelSignal::Requested);
+                }
+                "expired" => op.deadline = Instant::now(),
+                "wrong-generation" => op.generation += 1,
+                "watermark-replaced" => {
+                    let events = owner
+                        .client
+                        .subscribe_bounded_methods(EVENTS, 256, 128 * 1024 * 1024)
+                        .unwrap();
+                    *owner.event_watermark.lock().unwrap() = Some(events.watermark());
+                    replacement_events = Some(events);
+                }
+                _ => {}
+            }
+            let result = owner
+                .initialize_observed(entry, &op, None, initialization)
+                .await;
+            if obstruction == "none" {
+                assert!(matches!(result, Ok(InitializationOutcome::DetachedChild)));
+                assert!(owner
+                    .targets
+                    .owned_target("initial-target")
+                    .unwrap()
+                    .same_attachment(&host));
+                assert!(!connection.debt_ledger().unwrap().snapshot().integrity_lost);
+            } else {
+                assert!(result.is_err(), "{obstruction} granted retirement");
+            }
+            assert!(
+                !log.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["sessionId"] == "child"),
+                "pre-initialization retirement must send no child commands"
+            );
+            drop(replacement_events);
+            if let Some(publication) = root_publication {
+                publication.complete();
+            }
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn iframe_detach_during_initialization_preserves_original_host() {
+        for during_resume in [false, true] {
+            let (mut owner, _notices, log, emit, server, _broker, connection) =
+                fixture_with_client("iframe-controlled-acks", true).await;
+            Arc::get_mut(&mut owner).unwrap().ownership =
+                ScopeOwnership::BorrowedTargets(vec!["initial-target".into()]);
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let host = owner.targets.owned_target("initial-target").unwrap();
+            emit.send(json!({"method":"Target.attachedToTarget","sessionId":"initial",
+                "params":{"sessionId":"child","waitingForDebugger":true,"targetInfo":{
+                    "targetId":"iframe-target","type":"iframe","browserContextId":"owned-context"}}}))
+                .await.unwrap();
+            let mut held = wait_iframe_initialization_command(&log, "Page.enable").await;
+            if during_resume {
+                emit.send(json!({"id":held["id"],"sessionId":"child","result":{}}))
+                    .await
+                    .unwrap();
+                held = wait_iframe_initialization_command(&log, "Runtime.runIfWaitingForDebugger")
+                    .await;
+            }
+            let apply = CaptureTestGate::new();
+            let retirement = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeEventApply, apply.clone());
+            owner.capture_test_gates.lock().unwrap().insert(
+                CaptureTestPoint::BeforeIframeRetirementWait,
+                retirement.clone(),
+            );
+            let mut detached = json!({"method":"Target.detachedFromTarget","sessionId":"initial",
+                "params":{"sessionId":"child"}});
+            if during_resume {
+                detached["params"]["targetId"] = json!("iframe-target");
+            }
+            emit.send(detached).await.unwrap();
+            apply.wait_entered().await;
+            retirement.wait_entered().await;
+            // The reader has closed the waiter but the direct detach is not yet
+            // applied. The original reservation must remain retained, not Ready
+            // and not dropped into global inventory loss.
+            assert!(owner.index.lock().unwrap().failure.is_none());
+            assert_eq!(*owner.stop.borrow(), CancelSignal::None);
+            assert!(!owner.targets.owned_target("iframe-target").unwrap().resumed);
+            assert!(owner
+                .targets
+                .owned_target("initial-target")
+                .unwrap()
+                .same_attachment(&host));
+            // A newer unrelated stream must not extend the child's captured
+            // failure boundary. Hold its first event unapplied indefinitely:
+            // a moving-watermark implementation cannot finish this pending job.
+            let later = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeEventApply, later.clone());
+            for ordinal in 0..32 {
+                emit.send(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":{
+                    "targetId":format!("unrelated-{ordinal}"),"type":"page","browserContextId":"foreign-context"}}}))
+                    .await.unwrap();
+            }
+            apply.release();
+            retirement.release();
+            later.wait_entered().await;
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while owner
+                    .index
+                    .lock()
+                    .unwrap()
+                    .pending_enrollment
+                    .contains("child")
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(owner.index.lock().unwrap().failure.is_none());
+            assert!(
+                owner.index.lock().unwrap().applied_watermark
+                    < owner.realm_watermark().unwrap().received().unwrap()
+            );
+            later.release();
+            owner
+                .drain_capture_watermark(&owner.realm_watermark().unwrap(), &owner.operation())
+                .await
+                .unwrap();
+            assert!(owner.targets.owned_target("iframe-target").is_err());
+            assert!(owner
+                .targets
+                .owned_target("initial-target")
+                .unwrap()
+                .same_attachment(&host));
+            assert_eq!(*owner.active_root.lock().unwrap(), "initial");
+            assert!(owner.index.lock().unwrap().failure.is_none());
+            let debt = connection.debt_ledger().unwrap().snapshot();
+            assert!(!debt.integrity_lost);
+            assert_eq!(debt.outstanding_commands, 0);
+            assert!(
+                !log.lock()
+                    .unwrap()
+                    .iter()
+                    .any(|request| request["sessionId"] == "child"
+                        && request["method"] == "Runtime.runIfWaitingForDebugger")
+                    || during_resume
+            );
+            // A late ACK settles its original provenance only. It may not revive
+            // the removed child or transfer its readiness to a new attachment.
+            emit.send(json!({"id":held["id"],"sessionId":"child","result":{}}))
+                .await
+                .unwrap();
+            owner
+                .drain_capture_watermark(&owner.realm_watermark().unwrap(), &owner.operation())
+                .await
+                .unwrap();
+            assert!(owner.targets.owned_target("iframe-target").is_err());
+            owner
+                .attached(attach(
+                    "owned-context",
+                    "replacement-frame",
+                    "replacement",
+                    "iframe",
+                    Some("initial"),
+                ))
+                .await
+                .unwrap();
+            owner
+                .drain_capture_watermark(&owner.realm_watermark().unwrap(), &owner.operation())
+                .await
+                .unwrap();
+            assert!(owner
+                .targets
+                .owned_target("replacement-frame")
+                .unwrap()
+                .capture_ready());
+            assert!(owner
+                .targets
+                .owned_target("initial-target")
+                .unwrap()
+                .same_attachment(&host));
+            owner.close().await.unwrap();
+            connection.close().await;
+            server.abort();
+        }
+    }
+
+    async fn wait_iframe_initialization_command(log: &Log, method: &str) -> Value {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(request) = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .find(|request| request["sessionId"] == "child" && request["method"] == method)
+                    .cloned()
+                {
+                    return request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn iframe_detach_after_resume_ack_before_configuration_commit_is_retired() {
+        for obstruction in [
+            "none",
+            "network-revoked",
+            "broker-quarantined",
+            "ledger-lost",
+        ] {
+            let (owner, _notices, log, emit, server, broker, connection) =
+                fixture_with_client("iframe-controlled-acks", true).await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let host = owner.targets.owned_target("initial-target").unwrap();
+            let commit = CaptureTestGate::new();
+            owner.capture_test_gates.lock().unwrap().insert(
+                CaptureTestPoint::BeforeIframeConfigurationCommit,
+                commit.clone(),
+            );
+            emit.send(
+                json!({"method":"Target.attachedToTarget","sessionId":"initial",
+                "params":{"sessionId":"child","waitingForDebugger":true,"targetInfo":{
+                    "targetId":"iframe-target","type":"iframe","browserContextId":"owned-context"}}}),
+            )
+            .await
+            .unwrap();
+            for method in ["Page.enable", "Runtime.runIfWaitingForDebugger"] {
+                let held = wait_iframe_initialization_command(&log, method).await;
+                emit.send(json!({"id":held["id"],"sessionId":"child","result":{}}))
+                    .await
+                    .unwrap();
+            }
+            commit.wait_entered().await;
+            assert!(owner.targets.owned_target("iframe-target").unwrap().resumed);
+            let watermark = owner.realm_watermark().unwrap();
+            let before = watermark.received().unwrap();
+            emit.send(
+                json!({"method":"Target.detachedFromTarget","sessionId":"initial",
+                "params":{"sessionId":"child","targetId":"iframe-target"}}),
+            )
+            .await
+            .unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let received = watermark.received().unwrap();
+                    if received > before
+                        && owner.index.lock().unwrap().applied_watermark >= received
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            match obstruction {
+                "network-revoked" => owner.network.revoke().unwrap(),
+                "broker-quarantined" => broker.quarantine().unwrap(),
+                "ledger-lost" => connection.debt_ledger().unwrap().connection_lost(),
+                _ => {}
+            }
+            commit.release();
+            let settled = owner
+                .drain_capture_watermark(&watermark, &owner.operation())
+                .await;
+            if obstruction == "none" {
+                settled.unwrap();
+                assert!(owner.index.lock().unwrap().failure.is_none());
+                assert!(owner.targets.owned_target("iframe-target").is_err());
+                assert!(owner
+                    .targets
+                    .owned_target("initial-target")
+                    .unwrap()
+                    .same_attachment(&host));
+                assert!(!connection.debt_ledger().unwrap().snapshot().integrity_lost);
+                owner.close().await.unwrap();
+            } else {
+                assert!(
+                    settled.is_err(),
+                    "{obstruction} was excused by child detach"
+                );
+                let _ = owner.close().await;
+            }
+            assert_eq!(
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["sessionId"] == "child"
+                        && request["method"] == "Runtime.runIfWaitingForDebugger")
+                    .count(),
+                1
+            );
+            connection.close().await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn iframe_initialization_error_without_exact_child_retirement_still_fails() {
+        for event in [
+            None,
+            Some(
+                json!({"method":"Target.detachedFromTarget","sessionId":"initial",
+                "params":{"sessionId":"other-child","targetId":"iframe-target"}}),
+            ),
+            Some(
+                json!({"method":"Target.detachedFromTarget","sessionId":"initial",
+                "params":{"sessionId":"child","targetId":"wrong-target"}}),
+            ),
+            Some(
+                json!({"method":"Target.detachedFromTarget","sessionId":"wrong-parent",
+                "params":{"sessionId":"child","targetId":"iframe-target"}}),
+            ),
+            Some(json!({"method":"Target.detachedFromTarget",
+                "params":{"sessionId":"initial","targetId":"initial-target"}})),
+            Some(json!({"method":"Target.targetDestroyed","params":{"targetId":"iframe-target"}})),
+        ] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                fixture_with_client("iframe-controlled-acks", true).await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            emit.send(json!({"method":"Target.attachedToTarget","sessionId":"initial",
+                "params":{"sessionId":"child","waitingForDebugger":true,"targetInfo":{
+                    "targetId":"iframe-target","type":"iframe","browserContextId":"owned-context"}}}))
+                .await.unwrap();
+            let held = wait_iframe_initialization_command(&log, "Page.enable").await;
+            if let Some(event) = event {
+                emit.send(event).await.unwrap();
+            }
+            emit.send(json!({"id":held["id"],"sessionId":"child",
+                "error":{"code":-32000,"message":"synthetic initialization failure"}}))
+                .await
+                .unwrap();
+            assert!(owner
+                .drain_capture_watermark(&owner.realm_watermark().unwrap(), &owner.operation())
+                .await
+                .is_err());
+            assert!(!log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["sessionId"] == "child"
+                    && request["method"] == "Runtime.runIfWaitingForDebugger"));
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+        }
+    }
+
     #[tokio::test]
     async fn child_frame_and_popup_have_exact_separate_roots_and_detach_inventory() {
         let (owner, _notices, _log, _emit, server) = fixture("normal").await;

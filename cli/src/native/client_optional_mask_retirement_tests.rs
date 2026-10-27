@@ -1,6 +1,6 @@
 //! Original observation-capture obligations #8 and #10, through Dispatch.start.
 //! Screenshot deadline cases separately bound the safe subset of obligation #9;
-//! they do not claim success before an unacknowledged raw capture settles.
+//! semantic publication is independent of the retained raw-capture join.
 //! The peer implements protocol responses, not a renderer: no pixel-fidelity claim.
 use super::*;
 use base64::Engine;
@@ -19,6 +19,8 @@ enum Case {
     CancelShortDirtyRestore,
     PrivacyFailure,
     GeometryFailure,
+    SupersededBeforeCutoff,
+    DetachedBeforeCutoff,
 }
 
 async fn optional_mask_retirement(case: Case) {
@@ -186,6 +188,8 @@ async fn optional_mask_retirement(case: Case) {
                     Case::OptionalDeadline
                         | Case::OptionalShortDeadline
                         | Case::CancelInventory
+                        | Case::SupersededBeforeCutoff
+                        | Case::DetachedBeforeCutoff
                         | Case::CancelDirtyRestore
                         | Case::CancelShortDirtyRestore
                 ) && method == "DOMSnapshot.captureSnapshot"
@@ -216,6 +220,8 @@ async fn optional_mask_retirement(case: Case) {
             | Case::OptionalScreenshotShortDeadline
             | Case::MissingScreenshotAck
             | Case::CancelInventory
+            | Case::SupersededBeforeCutoff
+            | Case::DetachedBeforeCutoff
             | Case::CancelShortUnacknowledgedObject
             | Case::CancelShortDirtyRestore
     ) {
@@ -229,7 +235,8 @@ async fn optional_mask_retirement(case: Case) {
     let mut retained = screenshot.then(|| {
         crate::native::client_capture::retained_capture_test::register(&owner.client, op.sequence)
     });
-    let task = dispatch.clone().start(
+    #[allow(unused_mut)] // The acceptance raw-ACK cases inspect the pending receiver.
+    let mut task = dispatch.clone().start(
         owner.context(),
         DispatchRequest::Observe(ObserveRequest {
             options: ObserveFlags {
@@ -242,8 +249,10 @@ async fn optional_mask_retirement(case: Case) {
         }),
         op,
     );
-    #[cfg(feature = "acceptance-faults")]
-    let mut task = task;
+    #[allow(unused_mut)] // Set only by the acceptance raw-ACK cases.
+    let mut early_result = None;
+    #[allow(unused_mut)]
+    let mut published_at = None;
     let delayed = !matches!(case, Case::PrivacyFailure | Case::GeometryFailure);
     if delayed {
         tokio::time::timeout(Duration::from_secs(2), reached)
@@ -261,7 +270,15 @@ async fn optional_mask_retirement(case: Case) {
             "staging is not publication"
         );
         drop(log);
-        if !screenshot && !matches!(case, Case::OptionalDeadline | Case::OptionalShortDeadline) {
+        if case == Case::SupersededBeforeCutoff {
+            let (newer, _cancel_newer) = operation(2);
+            let admitted = dispatch.prepare(owner.context(), observe(), newer).unwrap();
+            drop(admitted); // Admission alone retires the old publication ticket.
+        } else if case == Case::DetachedBeforeCutoff {
+            owner.targets.detach(&owner.target).unwrap();
+        } else if !screenshot
+            && !matches!(case, Case::OptionalDeadline | Case::OptionalShortDeadline)
+        {
             cancel.send_replace(CancelSignal::Requested);
         }
         #[cfg(feature = "acceptance-faults")]
@@ -276,10 +293,18 @@ async fn optional_mask_retirement(case: Case) {
                     .unwrap(),
                 crate::native::client_capture::CaptureReason::Deadline
             );
-            assert!(matches!(
-                task.result.try_recv(),
-                Err(oneshot::error::TryRecvError::Empty)
-            ));
+            let result = tokio::time::timeout_at(deadline.into(), &mut task.result)
+                .await
+                .expect("sealed tree must beat the original 80ms deadline")
+                .expect("result sender retained");
+            published_at = Some(Instant::now());
+            assert!(task.receipt.is_sealed_observation());
+            assert!(
+                !task.join.is_finished(),
+                "raw custody must remain joined after the semantic result"
+            );
+            assert!(result.as_ref().unwrap().get("pixels").is_none());
+            early_result = Some(result);
             assert!(!commands
                 .lock()
                 .unwrap()
@@ -294,11 +319,20 @@ async fn optional_mask_retirement(case: Case) {
             }
         }
     }
-    let result = tokio::time::timeout(Duration::from_secs(5), task.result)
-        .await
-        .unwrap()
-        .unwrap();
-    task.join.await.unwrap().unwrap();
+    let result = match early_result {
+        Some(result) => result,
+        None => tokio::time::timeout(Duration::from_secs(5), task.result)
+            .await
+            .unwrap()
+            .unwrap(),
+    };
+    let result_time = published_at.unwrap_or_else(Instant::now);
+    let joined = task.join.await.unwrap();
+    if case == Case::MissingScreenshotAck {
+        assert!(joined.unwrap_err().cleanup_integrity_lost);
+    } else {
+        joined.unwrap();
+    }
     let terminal = Instant::now();
     if matches!(
         case,
@@ -308,8 +342,8 @@ async fn optional_mask_retirement(case: Case) {
             | Case::CancelInventory
     ) {
         assert!(
-            terminal < deadline,
-            "clean optional subdeadline/cleanup must not consume the parent budget"
+            result_time < deadline,
+            "immutable result must not consume the parent budget waiting for cleanup"
         );
     }
     if matches!(
@@ -317,10 +351,19 @@ async fn optional_mask_retirement(case: Case) {
         Case::OptionalDeadline
             | Case::OptionalShortDeadline
             | Case::OptionalScreenshotShortDeadline
+            | Case::MissingScreenshotAck
+            | Case::PrivacyFailure
+            | Case::GeometryFailure
     ) {
+        if !matches!(case, Case::PrivacyFailure | Case::GeometryFailure) {
+            assert!(
+                result_time >= deadline - (budget / 5).min(Duration::from_millis(500)),
+                "optional capture must not finish before its earliest possible subdeadline"
+            );
+        }
         assert!(
-            terminal >= deadline - (budget / 5).min(Duration::from_millis(500)),
-            "optional capture must not finish before its earliest possible subdeadline"
+            result_time < deadline,
+            "cleanup grace is not the result budget"
         );
         let value = result.unwrap();
         assert!(value.get("treeUnavailable").is_none());
@@ -342,10 +385,18 @@ async fn optional_mask_retirement(case: Case) {
             assert!(entry.is_current_observed(1));
             assert_eq!(entry.exact_binding.as_ref().unwrap(), &owner.binding());
         }
-        let (action, _cancel) = operation(2);
-        assert_eq!(dispatch.snapshot_for_action(&action).await.unwrap().0, 1);
+        if case != Case::MissingScreenshotAck {
+            let (action, _cancel) = operation(2);
+            assert_eq!(dispatch.snapshot_for_action(&action).await.unwrap().0, 1);
+        }
     } else {
         let failure = result.unwrap_err();
+        if case == Case::DetachedBeforeCutoff {
+            assert!(matches!(
+                failure.error,
+                ProtocolError::StaleScope | ProtocolError::StaleReference
+            ));
+        }
         assert_eq!(
             failure.error,
             match case {
@@ -356,6 +407,8 @@ async fn optional_mask_retirement(case: Case) {
                 | Case::CancelShortUnacknowledgedObject
                 | Case::MissingScreenshotAck => ProtocolError::CleanupFailed,
                 Case::PrivacyFailure | Case::GeometryFailure => ProtocolError::PolicyDenied,
+                Case::SupersededBeforeCutoff => ProtocolError::StaleReference,
+                Case::DetachedBeforeCutoff => failure.error.clone(),
                 _ => unreachable!(),
             }
         );
@@ -391,8 +444,8 @@ async fn optional_mask_retirement(case: Case) {
     let terminal_commands = commands.lock().unwrap().len();
     if delayed {
         // Value-only mask replies may remain held past terminal success. Raw
-        // screenshot success instead requires its ACK and source restoration;
-        // a missing raw ACK can reach only terminal cleanup failure.
+        // raw-pixel cleanup still requires its exact ACK and restoration;
+        // missing ACK reaches cleanup failure after immutable semantic success.
         if let Some(release) = release.take() {
             release.send(()).unwrap();
             tokio::time::timeout(Duration::from_secs(1), late.take().unwrap())
@@ -549,11 +602,11 @@ async fn cancelled_mask_dirty_restore_never_publishes_or_claims_clean_cleanup() 
     optional_mask_retirement(Case::CancelDirtyRestore).await;
 }
 #[tokio::test]
-async fn optional_mask_privacy_failure_is_hard_with_complete_semantic_tree() {
+async fn optional_mask_privacy_refusal_omits_pixels_but_preserves_independent_tree() {
     optional_mask_retirement(Case::PrivacyFailure).await;
 }
 #[tokio::test]
-async fn optional_mask_geometry_failure_is_hard_with_complete_semantic_tree() {
+async fn optional_mask_geometry_refusal_omits_pixels_but_preserves_independent_tree() {
     optional_mask_retirement(Case::GeometryFailure).await;
 }
 
@@ -711,6 +764,15 @@ async fn optional_screenshot_eighty_ms_clean_late_ack_keeps_complete_tree_withou
 
 #[cfg(feature = "acceptance-faults")]
 #[tokio::test]
-async fn optional_screenshot_eighty_ms_missing_ack_publishes_nothing_and_preserves_custody() {
+async fn optional_screenshot_eighty_ms_missing_ack_publishes_only_tree_and_preserves_custody() {
     optional_mask_retirement(Case::MissingScreenshotAck).await;
+}
+
+#[tokio::test]
+async fn i10_t06_newer_admission_before_optional_cutoff_never_commits_old_staging() {
+    optional_mask_retirement(Case::SupersededBeforeCutoff).await;
+}
+#[tokio::test]
+async fn i10_t06_detached_page_before_optional_cutoff_never_publishes_sealed_tree() {
+    optional_mask_retirement(Case::DetachedBeforeCutoff).await;
 }

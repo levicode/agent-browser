@@ -32,8 +32,15 @@ struct AttachmentTenure {
     owner: Arc<()>,
     observed_media_detach: AtomicBool,
     observed_detach: AtomicBool,
+    observed_iframe_detach: AtomicBool,
 }
 impl OwnedTarget {
+    pub(super) fn same_initialization_attachment(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.tenure, &other.tenure)
+            && self.target_id == other.target_id
+            && self.session_id == other.session_id
+            && self.kind == other.kind
+    }
     pub(super) fn diagnostic_snapshot(&self) -> Option<diagnostic::DiagnosticAttachment> {
         let mut value = self.diagnostic?;
         value.kind = diagnostic::DiagnosticTargetKind::from_native(&self.kind);
@@ -504,7 +511,7 @@ impl ResumePermit {
         self.completed = true;
         Ok(observed)
     }
-    pub fn complete(mut self) -> Result<(), ProtocolError> {
+    pub(super) fn complete_retained(&mut self) -> Result<(), ProtocolError> {
         let registry = self.registry.clone();
         let observed = registry.eval_invalidation(|revoke| {
             revoke();
@@ -518,6 +525,9 @@ impl ResumePermit {
             diagnostic::target_lifecycle(value.generation, 0, value, None);
         }
         Ok(())
+    }
+    pub fn complete(mut self) -> Result<(), ProtocolError> {
+        self.complete_retained()
     }
 }
 impl Drop for ResumePermit {
@@ -1213,6 +1223,18 @@ impl ClientTargets {
             changed.await;
         }
     }
+    /// Identity comparison for an already-sealed immutable observation only.
+    /// A cleanup quarantine blocks new browser authority, not this comparison.
+    /// Removal or replacement still invalidates the exact attachment.
+    pub(crate) fn retains_exact_attachment(&self, captured: &OwnedTarget) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            state
+                .targets
+                .get(&captured.target_id)
+                .is_some_and(|current| captured.same_attachment(current))
+        })
+    }
+
     /// Return only the exact attachment after creation purpose is claimed.
     pub fn owned_target(&self, target_id: &str) -> Result<OwnedTarget, ProtocolError> {
         let state = self
@@ -1341,6 +1363,115 @@ impl ClientTargets {
             if entry.kind == "service_worker" && entry.session_id == session {
                 entry.tenure.observed_detach.store(true, Ordering::Release);
             }
+        }
+        Ok(())
+    }
+    /// Capture registration identity even while a creation reservation has not
+    /// classified purpose. This grants neither Application nor Ready authority.
+    pub(super) fn initializing_iframe_tickets(
+        &self,
+        target: &str,
+        session: &str,
+        root_target: &str,
+        root_session: &str,
+    ) -> Result<(OwnedTarget, OwnedTarget), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed || state.integrity_lost {
+            return Err(ProtocolError::StaleScope);
+        }
+        let entry = state
+            .targets
+            .get(target)
+            .ok_or(ProtocolError::StaleReference)?;
+        if entry.kind != "iframe"
+            || entry.session_id != session
+            || entry.resumed
+            || entry.resume_pending
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let root = state
+            .targets
+            .get(root_target)
+            .ok_or(ProtocolError::StaleReference)?;
+        if root.kind != "page" || root.session_id != root_session {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok((entry.clone(), root.clone()))
+    }
+    /// Only the directly matched iframe event may retire initialization. Generic
+    /// removal, ancestor detach and targetDestroyed do not grant this receipt.
+    pub(super) fn observe_iframe_detach(
+        &self,
+        target: &str,
+        session: &str,
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(entry) = state.targets.get(target) {
+            if entry.kind == "iframe" && entry.session_id == session {
+                entry
+                    .tenure
+                    .observed_iframe_detach
+                    .store(true, Ordering::Release);
+            }
+        }
+        Ok(())
+    }
+    /// Caller holds the enrollment, transport-owner and ledger fences. This
+    /// retires only a gone child, never publishes Ready or authorizes a new tab.
+    pub(super) fn finish_detached_iframe_initialization(
+        self: &Arc<Self>,
+        child: &OwnedTarget,
+        root: &OwnedTarget,
+        permit: Option<&mut ResumePermit>,
+        check_bounds: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || state.integrity_lost
+            || state.protected_read
+            || child.kind != "iframe"
+            || root.kind != "page"
+            || !Arc::ptr_eq(&self.attachment_owner, &child.tenure.owner)
+            || !Arc::ptr_eq(&self.attachment_owner, &root.tenure.owner)
+            || !child.tenure.observed_iframe_detach.load(Ordering::Acquire)
+            || state.targets.values().any(|current| {
+                current.target_id == child.target_id || current.session_id == child.session_id
+            })
+            || !state.targets.get(&root.target_id).is_some_and(|current| {
+                current.session_id == root.session_id
+                    && current.kind == "page"
+                    && current.purpose == Some(TargetPurpose::Application)
+                    && Arc::ptr_eq(&current.tenure, &root.tenure)
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if let Some(permit) = permit {
+            if permit.worker_startup
+                || !Arc::ptr_eq(&permit.registry, self)
+                || permit.target_id != child.target_id
+                || permit.session_id != child.session_id
+                || !Arc::ptr_eq(&permit.tenure, &child.tenure)
+                || state.resuming == 0
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            check_bounds()?;
+            // Drop releases the original reservation after the outer locks go.
+            // Detached initialization is not a successful resume ACK.
+            permit.completed = true;
+        } else {
+            check_bounds()?;
         }
         Ok(())
     }
@@ -2216,6 +2347,48 @@ impl Drop for CreationReservation {
 #[cfg(test)]
 mod tests {
     use super::{ClientTargets, ProtocolError};
+
+    #[tokio::test]
+    async fn sealed_observation_comparison_ignores_only_health_not_attachment_tenure() {
+        for mode in ["sealed", "removed", "replacement"] {
+            let targets = ClientTargets::new("ctx".into(), "scope".into());
+            targets
+                .attached("ctx", "tab".into(), "session".into(), "page".into())
+                .unwrap();
+            targets.configured("tab").unwrap();
+            targets
+                .resume_permit("tab")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            let captured = targets.owned_target("tab").unwrap();
+            if mode == "sealed" {
+                targets.seal();
+            } else {
+                targets.detach("tab").unwrap();
+                if mode == "replacement" {
+                    targets
+                        .attached("ctx", "tab".into(), "session".into(), "page".into())
+                        .unwrap();
+                    targets.configured("tab").unwrap();
+                    targets
+                        .resume_permit("tab")
+                        .await
+                        .unwrap()
+                        .complete()
+                        .unwrap();
+                }
+            }
+            assert_eq!(
+                targets.retains_exact_attachment(&captured),
+                mode == "sealed"
+            );
+            if mode == "sealed" {
+                assert!(targets.owned_target("tab").is_err());
+            }
+        }
+    }
 
     #[tokio::test]
     async fn media_detach_receipt_is_bound_to_registry_tenure_and_direct_ready_page() {

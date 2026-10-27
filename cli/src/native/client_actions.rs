@@ -642,6 +642,27 @@ pub(crate) async fn release_group_accounted(
     )
     .await
 }
+/// Readonly metadata has no restoration effect. Its exact bounded disposal
+/// owner may finish later without delaying immutable semantic publication.
+pub(crate) async fn release_readonly_group_accounted(
+    client: &super::cdp::client::CdpClient,
+    session: &str,
+    group: &str,
+) -> bool {
+    if client.debt_ledger().is_none() {
+        // Legacy/unmanaged clients have no owner to receive retained debt.
+        return release_group_accounted(client, session, group).await;
+    }
+    client_debt::command_scope(CommandCategory::CleanupObject, false, async {
+        client
+            .handoff_readonly_group_release(session, group)
+            .is_ok()
+            && client
+                .debt_ledger()
+                .is_some_and(|ledger| !ledger.snapshot().integrity_lost)
+    })
+    .await
+}
 #[derive(Clone, Copy, Default)]
 struct ObjectReleaseOutcome {
     // Preserve the existing ownership-transfer contract for every old caller.

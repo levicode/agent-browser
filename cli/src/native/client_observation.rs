@@ -363,7 +363,10 @@ pub(crate) async fn retained_read_command(
 fn native_owned_group(group: &str, sequence: u64) -> bool {
     ["native-query", "native-metadata", "native-security"]
         .iter()
-        .any(|prefix| group == format!("{prefix}-{sequence}"))
+        .any(|prefix| {
+            group == format!("{prefix}-{sequence}")
+                || group.starts_with(&format!("{prefix}-{sequence}-"))
+        })
         || ["native-hidden-proof", "native-onclick"]
             .iter()
             .any(|prefix| group.starts_with(&format!("{prefix}-{sequence}-")))
@@ -538,7 +541,7 @@ async fn settle_object_group<T>(
     result: Result<T, ObservationError>,
     lease: &OperationLease,
 ) -> Result<T, ObservationError> {
-    if super::client_actions::release_group_accounted(client, session, group).await {
+    if super::client_actions::release_readonly_group_accounted(client, session, group).await {
         #[cfg(test)]
         equivalence_tests::after_group_release(lease, group);
         result.map_err(|error| settled_stop(error, lease))
@@ -2200,7 +2203,9 @@ impl HiddenFrameProof {
         for (index, (parent, child)) in self.owners.iter().enumerate() {
             check(lease)?;
             let session = &parent.binding.session;
-            let group = format!("native-hidden-proof-{}-{index}", lease.sequence);
+            let group = client
+                .readonly_group_instance(&format!("native-hidden-proof-{}-{index}", lease.sequence))
+                .map_err(|_| ObservationError::ResourceLimit)?;
             let result = async {
                 validate_frame(client, parent, lease).await?;
                 validate_frame(client, child, lease).await?;
@@ -3562,7 +3567,9 @@ async fn evaluate_query(
         ..Default::default()
     };
     let security = security_inventory(client, frame, &metadata_options, lease).await?;
-    let group = format!("native-query-{}", lease.sequence);
+    let group = client
+        .readonly_group_instance(&format!("native-query-{}", lease.sequence))
+        .map_err(|_| ObservationError::ResourceLimit)?;
     let result=async {
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
         for chunk in ax_nodes.chunks(64) {
@@ -3843,7 +3850,9 @@ async fn main_onclick_hint(
     // No group has been acquired yet: expired admissions need no cleanup.
     check(lease)?;
     let session = &frame.binding.session;
-    let group = format!("native-onclick-{}-{backend}", lease.sequence);
+    let group = client
+        .readonly_group_instance(&format!("native-onclick-{}-{backend}", lease.sequence))
+        .map_err(|_| ObservationError::ResourceLimit)?;
     let result = async {
         validate_frame(client, frame, lease).await?;
         if !hint_boolean(
@@ -3953,7 +3962,9 @@ async fn read_batch_with_refs(
         return Ok(Vec::new());
     }
     let session = &frame.binding.session;
-    let group = format!("native-metadata-{}", lease.sequence);
+    let group = client
+        .readonly_group_instance(&format!("native-metadata-{}", lease.sequence))
+        .map_err(|_| ObservationError::ResourceLimit)?;
     #[cfg(test)]
     let mut diagnostic_stage = "World";
     macro_rules! metadata_stage {
@@ -5080,7 +5091,9 @@ async fn security_inventory(
         .map(|id| !browser_internal.contains(id))
         .collect();
     let session = &frame.binding.session;
-    let group = format!("native-security-{}", lease.sequence);
+    let group = client
+        .readonly_group_instance(&format!("native-security-{}", lease.sequence))
+        .map_err(|_| ObservationError::ResourceLimit)?;
     let result=async{
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?;

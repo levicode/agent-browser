@@ -1180,6 +1180,48 @@ impl OwnerDebtLedger {
         invalidate_eval(&mut state);
         commit(bound).map(WorkerStartupProof::Committed)
     }
+    /// A child detach releases only that attachment's initialization, while its
+    /// original page root and shared owner remain live. Absence alone is not
+    /// proof: the commit also checks the registry's direct-detach tenure bit.
+    pub(super) fn with_detached_iframe_initialization(
+        &self,
+        generation: u64,
+        targets: &super::client_targets::ClientTargets,
+        child: &super::client_targets::OwnedTarget,
+        root: &super::client_targets::OwnedTarget,
+        commit: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<bool, ProtocolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !self.matches_owner(generation, &targets.identity_scope)
+            || state.retired
+            || state.integrity_lost
+            || state.context_id.as_deref() != Some(targets.context_id.as_str())
+            || state.targets.contains_key(&child.session_id)
+            || state
+                .targets
+                .values()
+                .any(|target| target == &child.target_id)
+            || state.targets.get(&root.session_id) != Some(&root.target_id)
+            || state.commands.values().any(|command| {
+                command.provenance.session.as_deref() == Some(child.session_id.as_str())
+                    || command.provenance.target.as_deref() == Some(child.target_id.as_str())
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if state.eval_publication_pending {
+            return Ok(false);
+        }
+        invalidate_eval(&mut state);
+        commit()?;
+        Ok(true)
+    }
+    pub(super) fn initialization_retirement_notifier(&self) -> Arc<tokio::sync::Notify> {
+        self.changed.clone()
+    }
     /// Candidate classification only. Absence cannot complete retirement:
     /// enrollment still requires its exact applied detach and original tenure.
     pub(super) fn worker_startup_session_unbound(

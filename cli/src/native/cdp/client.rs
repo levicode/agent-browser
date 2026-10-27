@@ -652,6 +652,8 @@ struct CdpTransport {
     reader_handle: Mutex<Option<JoinHandle<()>>>,
     keepalive_handle: Mutex<Option<JoinHandle<()>>>,
     disposal_handle: Mutex<Option<JoinHandle<()>>>,
+    disposal_tx: mpsc::Sender<DisposalWork>,
+    disposal_budget: Arc<EventBudget>,
     private_sessions: PrivateSessions,
     method_taps: MethodTaps,
     bounded_method_taps: BoundedMethodTaps,
@@ -860,6 +862,8 @@ impl CdpClient {
             }
         });
 
+        let owner_disposal_tx = disposal_tx.clone();
+        let owner_disposal_budget = disposal_budget.clone();
         let reader_handle = tokio::spawn(async move {
             while let Some(msg) = ws_rx.next().await {
                 // Accept both Text and Binary frames — remote CDP proxies
@@ -1168,6 +1172,8 @@ impl CdpClient {
                 reader_handle: Mutex::new(Some(reader_handle)),
                 keepalive_handle: Mutex::new(Some(keepalive_handle)),
                 disposal_handle: Mutex::new(Some(disposal_handle)),
+                disposal_tx: owner_disposal_tx,
+                disposal_budget: owner_disposal_budget,
                 private_sessions,
                 method_taps,
                 bounded_method_taps,
@@ -1857,6 +1863,56 @@ impl CdpClient {
         )
     }
 
+    /// Enrollment has applied the original child's direct detach. Serialize the
+    /// final retirement against owner replacement and shared transport failure.
+    pub(crate) fn finish_detached_iframe_initialization(
+        &self,
+        expected: &Arc<OwnerDebtLedger>,
+        targets: &Arc<super::super::client_targets::ClientTargets>,
+        child: &super::super::client_targets::OwnedTarget,
+        root: &super::super::client_targets::OwnedTarget,
+        permit: Option<&mut super::super::client_targets::ResumePermit>,
+        operation: &super::super::client_session::OperationLease,
+    ) -> Result<bool, ProtocolError> {
+        let current = self
+            .transport
+            .debt_owner
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if self.transport.closed.load(Ordering::SeqCst)
+            || current
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(expected, current))
+            || self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !Arc::ptr_eq(owner, expected))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let commit = || {
+            targets.finish_detached_iframe_initialization(child, root, permit, || {
+                if *operation.cancellation.borrow()
+                    != super::super::client_session::CancelSignal::None
+                {
+                    return Err(ProtocolError::Cancelled);
+                }
+                if std::time::Instant::now() >= operation.deadline {
+                    return Err(ProtocolError::DeadlineExceeded);
+                }
+                Ok(())
+            })
+        };
+        targets.require_eval_owner(expected)?;
+        expected.with_detached_iframe_initialization(
+            operation.generation,
+            targets,
+            child,
+            root,
+            commit,
+        )
+    }
+
     /// Retains the same all-ACK receipt across publication and applied detach.
     /// The caller emits the existing lifecycle observation after index unlock.
     pub(crate) fn try_finish_acknowledged_worker_startup(
@@ -2352,6 +2408,52 @@ impl CdpClient {
         self.send_command(method, None, session_id).await
     }
 
+    /// Managed readonly groups may outlive their reader. Never reuse a name
+    /// while an earlier release is still queued or awaiting its exact ACK.
+    pub(crate) fn readonly_group_instance(&self, name: &str) -> Result<String, String> {
+        if self.debt_ledger().is_none() {
+            return Ok(name.to_owned());
+        }
+        self.next_command_id().map(|id| format!("{name}-{id}"))
+    }
+
+    /// Transfer only an exact readonly object-group release to the existing
+    /// bounded transport disposal owner. Success means custody, not an ACK.
+    /// Source masks and other restoration must keep their strict receipt path.
+    pub(crate) fn handoff_readonly_group_release(
+        &self,
+        session: &str,
+        group: &str,
+    ) -> Result<(), String> {
+        self.ensure_open()?;
+        let params = serde_json::json!({"objectGroup": group});
+        let reservation = self
+            .reserve_tracked_command("Runtime.releaseObjectGroup", Some(&params), Some(session))?
+            .ok_or_else(|| "Readonly disposal requires an accounted owner".to_string())?;
+        let bytes = serde_json::to_vec(&params)
+            .map_err(|_| "Invalid readonly disposal".to_string())?
+            .len()
+            .saturating_add(session.len())
+            .saturating_add(128);
+        let charge = self
+            .transport
+            .disposal_budget
+            .reserve(bytes)
+            .ok_or_else(|| "Readonly disposal capacity exceeded".to_string())?;
+        self.transport
+            .disposal_tx
+            .try_send(DisposalWork {
+                command: ReservedDisposal {
+                    reservation,
+                    method: "Runtime.releaseObjectGroup",
+                    params,
+                    session: Some(session.to_owned()),
+                },
+                _bytes: charge,
+            })
+            .map_err(|_| "Readonly disposal owner unavailable".to_string())
+    }
+
     /// Send a CDP command without waiting for its response.
     ///
     /// This is useful for best-effort commands where Chrome may not emit a
@@ -2765,6 +2867,111 @@ mod tests {
         });
         let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
         (client, seen, replies, peer)
+    }
+
+    #[tokio::test]
+    async fn i10_t01_readonly_disposal_handoff_retains_exact_groups_until_matching_ack() {
+        use crate::native::client_debt::{
+            command_scope, native_object_group, CommandCategory, OperationKey,
+        };
+        for wrong_session in [false, true] {
+            let (transport, mut requests, replies, peer) = service_worker_test_peer().await;
+            let ledger = OwnerDebtLedger::new(1, "readonly-owner".into());
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            transport.install_debt_ledger(ledger.clone()).unwrap();
+            let client = transport.owner_view(ledger.clone()).unwrap();
+            let mut releases = Vec::new();
+            let mut groups = Vec::new();
+            for index in 0..2 {
+                let group = client.readonly_group_instance("native-metadata-1").unwrap();
+                groups.push(group.clone());
+                let sender = client.clone();
+                let read_journal = journal.clone();
+                let read_group = group.clone();
+                let read = tokio::spawn(async move {
+                    read_journal
+                        .scope(native_object_group(
+                            &read_group,
+                            command_scope(
+                                CommandCategory::ApplicationObject,
+                                false,
+                                sender.send_command(
+                                    "DOM.resolveNode",
+                                    Some(json!({"backendNodeId":7,
+                                "objectGroup":read_group})),
+                                    Some("page"),
+                                ),
+                            ),
+                        ))
+                        .await
+                });
+                let request = service_worker_request(&mut requests).await;
+                assert_eq!(request["method"], "DOM.resolveNode");
+                replies
+                    .send(json!({"id":request["id"],"sessionId":"page",
+                    "result":{"object":{"objectId":format!("readonly-{index}"),"subtype":"node"}}}))
+                    .unwrap();
+                read.await.unwrap().unwrap();
+                tokio::time::timeout(
+                    Duration::from_millis(80),
+                    journal.scope(async { client.handoff_readonly_group_release("page", &group) }),
+                )
+                .await
+                .expect("readonly release awaited an ACK")
+                .unwrap();
+                let release = service_worker_request(&mut requests).await;
+                assert_eq!(release["method"], "Runtime.releaseObjectGroup");
+                assert_eq!(release["params"]["objectGroup"], group);
+                releases.push(release);
+            }
+            assert_ne!(
+                groups[0], groups[1],
+                "pending release names cannot be reused"
+            );
+            assert_eq!(ledger.snapshot().object_debt, 2);
+            assert_eq!(ledger.snapshot().outstanding_commands, 2);
+            // Acknowledging the second release never discharges the first group.
+            replies
+                .send(service_worker_response(&releases[1], false))
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while ledger.snapshot().outstanding_commands != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(ledger.snapshot().object_debt, 1);
+            let mut first = service_worker_response(&releases[0], false);
+            if wrong_session {
+                first["sessionId"] = json!("replacement-session");
+            }
+            replies.send(first).unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while ledger.snapshot().outstanding_commands != 0
+                    && !ledger.snapshot().integrity_lost
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert_eq!(ledger.snapshot().integrity_lost, wrong_session);
+            if !wrong_session {
+                assert_eq!(ledger.snapshot().object_debt, 0);
+            }
+            transport.close().await;
+            peer.await.unwrap();
+        }
     }
 
     fn service_worker_test_owner(
