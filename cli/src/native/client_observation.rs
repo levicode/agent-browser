@@ -825,6 +825,9 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    function token(n,depth){
      if(++count>512||depth>64)return null;
      if(n.nodeType===3){const value=n.nodeValue||'';return value.length<=512?value:null;}
+     // Original content naming skips comments, including React SSR separators.
+     // Count them above, but never read their contents or treat them as text.
+     if(n.nodeType===8)return '';
      if(n.nodeType!==1||composedSecure(n)||n.shadowRoot||n.isContentEditable)return null;
      const css=doc.defaultView.getComputedStyle(n);
      if((n.getAttribute('aria-hidden')||'').toLowerCase()==='true'||css.display==='none'||css.visibility==='hidden')return '';
@@ -9234,7 +9237,7 @@ mod tests {
             mgr.client.send_command("Runtime.evaluate", Some(json!({"expression":r#"
                 document.body.innerHTML = '<ul>' +
                   '<li id="file" data-testid="file"><span>report.pdf</span></li>' +
-                  '<li id="promo" data-testid="promo"><div><p>Wireless Headphones</p><p><s>$80.00</s> <strong>$40.00</strong> <span>50% OFF</span></p></div><p>Order confirmed</p></li>' +
+                  '<li id="promo" data-testid="promo"><div><p>Wireless Headphones</p><p><s>$<!-- -->80.00</s> <strong>$<!-- -->40.00</strong> <span>50<!-- -->% OFF</span></p></div><p>Order confirmed</p></li>' +
                   '<li id="unique" data-testid="unique"><span><strong>Cabin fresh</strong> 7 Pine Way, Bend</span><button>Delete</button></li>' +
                   '<li id="named" data-testid="named" aria-label="Explicit">Other content</li>' +
                   '<li id="protected" data-testid="protected"><span class="secure">synthetic-content-secret</span></li>' +

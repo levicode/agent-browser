@@ -967,6 +967,7 @@ mod tests {
             "browser.persistent-page-reopen/1",
             "browser.evaluate/1",
             "browser.page/1",
+            "browser.page-identity-fence/1",
             "browser.observe/1",
             "browser.observe-frame-policy/1",
             "browser.trace-semantic/1",

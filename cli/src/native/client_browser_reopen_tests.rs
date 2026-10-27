@@ -10,6 +10,12 @@ fn attachment(id: &str, session: &str) -> Value {
     json!({"method":"Target.attachedToTarget","params":{"sessionId":session,"targetInfo":info(id,"persistent-context"),"waitingForDebugger":true}})
 }
 async fn peer() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    peer_with_navigation(false, false).await
+}
+async fn peer_with_navigation(
+    fenced_navigation: bool,
+    close_during_navigation: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -33,12 +39,15 @@ async fn peer() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>)
             ),
         ]);
         let mut watching = false;
+        let mut navigations = 0;
         while let Some(Ok(Message::Text(text))) = socket.next().await {
             let request: Value = serde_json::from_str(&text).unwrap();
             recorded.lock().unwrap().push(request.clone());
             let method = request["method"].as_str().unwrap();
             let session = request["sessionId"].as_str().unwrap_or_default();
+            let mut before = Vec::new();
             let mut after = Vec::new();
+            let mut navigation_closed = false;
             let result = match method {
                 "Target.getBrowserContexts" => {
                     json!({"browserContextIds":["foreign-context"],"defaultBrowserContextId":"persistent-context"})
@@ -101,12 +110,34 @@ async fn peer() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>)
                 }
                 "Page.addScriptToEvaluateOnNewDocument" => json!({"identifier":"test-script"}),
                 "Page.navigate" => {
-                    assert_eq!(session, "initial-session");
+                    navigations += 1;
+                    let target = match session {
+                        "initial-session" => "application",
+                        "replacement-session" if fenced_navigation => "replacement",
+                        _ => panic!("unexpected navigation session"),
+                    };
+                    assert!(
+                        pages.contains_key(target),
+                        "navigation reached a closed target"
+                    );
                     assert_eq!(request["params"]["url"], "about:blank");
                     let frame = format!("frame-{session}");
-                    after.push(json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":{"id":frame,"loaderId":"fresh-loader","url":"about:blank","securityOrigin":"null"}}}));
-                    after.push(json!({"method":"Page.lifecycleEvent","sessionId":session,"params":{"frameId":frame,"loaderId":"fresh-loader","name":"DOMContentLoaded"}}));
-                    json!({"frameId":frame,"loaderId":"fresh-loader"})
+                    let loader = if fenced_navigation {
+                        format!("fresh-loader-{navigations}")
+                    } else {
+                        "fresh-loader".into()
+                    };
+                    if close_during_navigation && navigations > 1 {
+                        // A real peer event after native has sent Page.navigate,
+                        // not a test-written native target/lease state.
+                        pages.remove(target);
+                        before.push(json!({"method":"Target.detachedFromTarget","params":{"sessionId":session,"targetId":target}}));
+                        navigation_closed = true;
+                    } else {
+                        after.push(json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":{"id":frame,"loaderId":loader,"url":"about:blank","securityOrigin":"null"}}}));
+                        after.push(json!({"method":"Page.lifecycleEvent","sessionId":session,"params":{"frameId":frame,"loaderId":loader,"name":"DOMContentLoaded"}}));
+                    }
+                    json!({"frameId":frame,"loaderId":loader})
                 }
                 "Runtime.evaluate" => {
                     let target = if session == "initial-session" {
@@ -148,9 +179,18 @@ async fn peer() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>)
                 | "Page.removeScriptToEvaluateOnNewDocument" => json!({}),
                 other => panic!("unmodeled reopen CDP method {other}: {request}"),
             };
-            let mut reply = json!({"id":request["id"],"result":result});
+            let mut reply = if navigation_closed {
+                json!({"id":request["id"],"error":{"code":-32000,"message":"scripted target closed during navigation"}})
+            } else {
+                json!({"id":request["id"],"result":result})
+            };
             if let Some(session) = request.get("sessionId") {
                 reply["sessionId"] = session.clone();
+            }
+            for event in before {
+                if socket.send(Message::Text(event.to_string())).await.is_err() {
+                    return;
+                }
             }
             if socket.send(Message::Text(reply.to_string())).await.is_err() {
                 return;
@@ -349,3 +389,5 @@ async fn chromium_persistent_page_close_reopens_without_adopting_another_host_ta
     cleaned.unwrap();
     host_cleaned.unwrap();
 }
+
+include!("client_browser_page_fence_tests.rs");

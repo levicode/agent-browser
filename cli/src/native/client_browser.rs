@@ -327,6 +327,46 @@ pub struct BrowserExecutionLease {
     pub targets: Arc<super::client_targets::ClientTargets>,
 }
 
+/// A caller may narrow navigation to the Page already acknowledged by activation.
+/// This is an identity constraint, never an execution or allocation authority.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ExpectedNavigationPage {
+    context_id: String,
+    target_id: String,
+}
+impl ExpectedNavigationPage {
+    fn take(
+        args: &mut serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<Self>, ProtocolError> {
+        let Some(value) = args.remove("expectedPage") else {
+            return Ok(None);
+        };
+        let value: Self =
+            serde_json::from_value(value).map_err(|_| ProtocolError::InvalidArguments)?;
+        if [&value.context_id, &value.target_id]
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 256 || id.chars().any(char::is_control))
+        {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        // Reject all remaining malformed navigation fields before any activation.
+        super::client_page::ClientPageState::validate_navigation(&serde_json::Value::Object(
+            args.clone(),
+        ))?;
+        Ok(Some(value))
+    }
+
+    fn matches(&self, owner: &OwnedBrowser, page: &BrowserExecutionLease) -> bool {
+        owner.identity_scope == page.identity_scope
+            && Arc::ptr_eq(&owner.targets, &page.targets)
+            && owner.context_id == self.context_id
+            && page.target_id == self.target_id
+            && owner.manager.active_target_id().ok() == Some(page.target_id.as_str())
+            && owner.manager.active_session_id().ok() == Some(page.page_session_id.as_str())
+    }
+}
+
 /// Resource owner retained separately from active execution leases. For remote
 /// connections only this context is disposable; the leased browser is not ours.
 pub struct OwnedBrowser {
@@ -2855,6 +2895,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             super::client_protocol::PERSISTENT_PAGE_REOPEN,
             "browser.evaluate/1",
             "browser.page/1",
+            super::client_protocol::PAGE_IDENTITY_FENCE,
             "browser.observe/1",
             "browser.observe-frame-policy/1",
             "browser.trace-semantic/1",
@@ -2960,6 +3001,20 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 args.remove("identityScope");
             }
             Some(scope)
+        };
+        let expected_page = if command == "page.navigate" {
+            match ExpectedNavigationPage::take(&mut args) {
+                Ok(value) => value,
+                Err(error) => {
+                    return NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    }
+                }
+            }
+        } else {
+            None
         };
         let resource_command = matches!(
             command.as_str(),
@@ -3179,10 +3234,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         }
         // Reopen only at the existing explicit page activation boundary. Reads
         // and locators cannot turn an untouched/closed host page into a new tab.
-        let reopened = if matches!(
-            command.as_str(),
-            "page.activate" | "page.navigate" | "recording.start"
-        ) {
+        let reopened = if expected_page.is_none()
+            && matches!(
+                command.as_str(),
+                "page.activate" | "page.navigate" | "recording.start"
+            ) {
             let outcome = self
                 .ensure_persistent_page(captured_scope.as_deref().unwrap_or_default(), &lease)
                 .await;
@@ -4144,7 +4200,12 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 let owner = self.owner.lock().await;
                 owner
                     .as_ref()
-                    .filter(|owner| owner.identity_scope == page.identity_scope)
+                    .filter(|owner| {
+                        owner.identity_scope == page.identity_scope
+                            && expected_page
+                                .as_ref()
+                                .is_none_or(|expected| expected.matches(owner, &page))
+                    })
                     .and_then(|owner| {
                         owner.runtime.as_ref().map(|runtime| {
                             (
@@ -6156,6 +6217,7 @@ mod tests {
             "persistent-page-reopen",
             "evaluate",
             "page",
+            "page-identity-fence",
             "observe",
             "observe-frame-policy",
             "trace-semantic",

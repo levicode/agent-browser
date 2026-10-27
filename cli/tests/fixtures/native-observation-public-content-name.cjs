@@ -33,6 +33,15 @@ class Element extends Node {
   checkVisibility() { return true; }
 }
 class Text extends Node { constructor(value) { super(); this.nodeType = 3; this.nodeValue = this.textContent = value; } }
+// React SSR inserts comment separators between adjacent JSX text expressions.
+// Original childrenNameOf skips non-Text/non-Element children, without reading
+// their content. Keep a throwing getter to prove comments cannot leak data.
+class Comment extends Node {
+  constructor() { super(); this.nodeType = 8; }
+  get nodeValue() { throw new Error('Comment contents must not be read'); }
+  get textContent() { throw new Error('Comment contents must not be read'); }
+}
+
 Object.assign(global, { Node, Element, HTMLElement: Element, HTMLInputElement: class extends Element { constructor() { super('input'); } }, HTMLButtonElement: class extends Element {}, HTMLSelectElement: class extends Element {}, HTMLTextAreaElement: class extends Element {}, HTMLOptionElement: class extends Element {}, SVGSVGElement: class extends Element {}, CSS: { escape: value => value } });
 const style = (element, pseudo) => ({ display: ['span', 's', 'strong'].includes(element.localName) ? 'inline' : 'block', visibility: element.hidden ? 'hidden' : 'visible', content: pseudo && element.generated ? '"generated"' : 'none', contentVisibility: 'visible', getPropertyValue: () => 'auto' });
 document = global.document = { documentElement: new Element(), activeElement: null, defaultView: { getComputedStyle: style }, getElementById: () => null };
@@ -44,6 +53,28 @@ const cases = [
   [el('li', el('span', el('strong', 'Cabin fresh'), ' 7 Pine Way, Bend'), el('button', 'Delete')), 'Cabin fresh 7 Pine Way, Bend Delete'],
 ];
 for (const [node, name] of cases) assert.deepEqual(fact(node), { source: 'listitem', name });
+// Same pricing structure produced by renderToString of the unchanged e557
+// PromoStorefront with its pinned React 19.3.1; three SSR text separators.
+const ssrPromo = el('li',
+  el('div', el('p', 'Wireless Headphones'),
+    el('p', el('s', '$', new Comment(), '80.00'), ' ',
+      el('strong', '$', new Comment(), '40.00'), ' ',
+      el('span', '50', new Comment(), '% OFF'))),
+  el('p', 'Order confirmed'));
+assert.deepEqual(fact(ssrPromo), { source: 'listitem', name: cases[1][1] });
+for (const role of ['listitem', 'status', 'alert']) {
+  const node = new Element('div', [new Text('Public'), new Comment(), new Text(' content')], { role });
+  assert.deepEqual(fact(node), { source: role, name: 'Public content' });
+}
+assert.deepEqual(fact(el('li', new Comment())), { source: 'listitem', name: '' });
+assert.deepEqual(fact(el('li', ...Array.from({ length: 511 }, () => new Comment()))), { source: 'listitem', name: '' });
+assert.equal(fact(el('li', ...Array.from({ length: 512 }, () => new Comment()))), null);
+for (const kind of [7, 10]) {
+  const unsupported = new Node(); unsupported.nodeType = kind;
+  assert.equal(fact(el('li', unsupported)), null);
+}
+console.log('PASS: SSR comments are empty naming contributions, never content reads or a proof-budget bypass');
+
 for (const role of ['listitem', 'status', 'alert']) {
   const node = new Element('div', [el('span', 'Message'), el('button', 'Dismiss')], { role });
   assert.deepEqual(fact(node), { source: role, name: 'Message Dismiss' });
