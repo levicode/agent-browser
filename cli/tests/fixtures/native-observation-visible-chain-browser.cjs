@@ -205,6 +205,30 @@ const IDS = [
     checks++;
     if (!equal) { mismatches++; report.push({ selector: `filter(has: visible=${body} >> span)`, expected, actual }); }
   }
+  // Terminal Element root: the inner chain ends on `visible`, so the candidate
+  // element is the only possible match. Both directions plus both negatives.
+  // CSS `:scope` is the pre-existing form of the same root match.
+  for (const [source, inner] of [
+    ['#shown', 'visible=true'],
+    ['#display-none', 'visible=false'],
+    ['#shown', 'visible=false'],
+    ['#display-none', 'visible=true'],
+    ['#shown', ':scope'],
+  ]) {
+    const expected = await page
+      .locator(source)
+      .filter({ has: page.locator(inner) })
+      .evaluateAll(els => els.map(e => e.id || e.tagName));
+    const actual = await probeHas(
+      [{ engine: 'css', body: source }],
+      inner === ':scope'
+        ? [{ engine: 'css', body: ':scope' }]
+        : [{ engine: 'visible', body: inner.slice('visible='.length) }],
+    );
+    const equal = JSON.stringify(sorted(expected)) === JSON.stringify(sorted(actual));
+    checks++;
+    if (!equal) { mismatches++; report.push({ selector: `terminal filter(has: ${inner}) on ${source}`, expected, actual }); }
+  }
   // Per-element oracle: each element id filtered in both directions.
   for (const id of IDS) {
     for (const body of ['true', 'false', '', 'TRUE', ' true']) {

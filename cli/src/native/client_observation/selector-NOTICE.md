@@ -60,4 +60,12 @@ The pinned helpers this depends on, each hashed through the line before the next
 
 This is Playwright rendering visibility, not the E2E reader's semantic `hidden` state and not the native `renderVisible` observation helper. It reads no input value, attribute, accessible name or closed-root inventory, and every root check charges the existing `matcherStep` budget. The `display: contents` walk reuses that same budget and adds the existing 256-level depth bound, so a pathological nesting chain is refused as a resource limit where Playwright would recurse without one. A final-only capture (`*visible=true` as the last part) stays a no-op, which is also what Playwright's capture rewrite produces when the capture is at the last part.
 
+### Root matching in a chain
+
+`visible` can return the very element a chain started from, as CSS `:scope` already can. Playwright's `has` engine evaluates its inner selector with the candidate element as scope and accepts that element as a match, so `locator('#row').filter({ has: locator('visible=true') })` keeps `#row` when it is visible. The native chain therefore admits the root it was given; every other result still has to be one of the issued elements, so this cannot widen the candidate inventory, read a closed root, or fabricate a node outside the acquisition.
+
+### Known shared-parser difference (out of scope)
+
+Pinned Playwright refuses *any* `nth` combined with a capture (`Can't query n-th element in a request with the capture`). The native parser only enforces final-only capture, so a chain such as `css=li >> nth=0 >> *visible=true` is still accepted here where Playwright errors. That gap predates this change and applies to the CSS engines too; it is tracked on GitHub issue levicode/e2e#12 and was deliberately not widened or fixed in this slice.
+
 This change affects the negotiated E2E session adapter. It does not change the legacy CLI or MCP selector parser, so their command help is unchanged.

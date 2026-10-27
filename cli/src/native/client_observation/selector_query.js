@@ -57,6 +57,16 @@ function visibleRoot(root, body) {
 }
 function selectChain(parts, scope, root) {
   const allowed = new Set(scope);
+  // A chain can legitimately produce the very root it was given: the visible
+  // engine returns the root itself when it matches, and CSS `:scope` already
+  // does the same. Playwright's `has` engine evaluates the inner selector with
+  // the candidate element as scope and accepts that match, but the candidate
+  // is not in its own descendant scope, so admit the root explicitly. `allowed`
+  // holds inventory indices, so add the root's index rather than the element.
+  // The root is always a document or one of the issued elements, so this can
+  // never widen the candidate inventory or reach a node outside it.
+  const rootIndex = root.nodeType === 1 ? selectorIndex.get(root) : undefined;
+  if (rootIndex !== undefined) allowed.add(rootIndex);
   let roots = [root];
   for (const part of parts) {
     matcherStep();

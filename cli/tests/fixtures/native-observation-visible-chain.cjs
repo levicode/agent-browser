@@ -244,6 +244,28 @@ function hasVisible(source, body, rest = []) {
 expect('element root stays for visible step', hasVisible([engine('css', '#contents-child')], 'true', [engine('css', 'span')]), ['contents-child']);
 expect('element root dropped for visible step', hasVisible([engine('css', '#contents-hidden-child')], 'true', [engine('css', 'span')]), []);
 
+// A terminal Element root: the `has` chain ends on `visible` itself, so the
+// only possible match is the candidate element. Playwright keeps the candidate
+// when the body agrees with its rendering visibility and drops it otherwise.
+// The candidate is not in its own descendant scope, so the chain must admit the
+// root it was given without widening anything else.
+expect('terminal root matches visible', hasVisible([engine('css', '#shown')], 'true'), ['shown']);
+expect('terminal root drops for false', hasVisible([engine('css', '#shown')], 'false'), []);
+expect('terminal root matches invisible', hasVisible([engine('css', '#display-none')], 'false'), ['display-none']);
+expect('terminal root drops invisible for true', hasVisible([engine('css', '#display-none')], 'true'), []);
+expect('terminal root empty body means false', hasVisible([engine('css', '#shown')], ''), []);
+// The same scope rule already applied to CSS `:scope`; keep it pinned so the
+// root admission cannot regress them.
+function hasInner(source, inner) {
+  return run({
+    kind: 'filter',
+    source: { kind: 'selector', nativeParts: source },
+    has: { kind: 'selector', nativeParts: inner },
+  });
+}
+expect('terminal root matches :scope', hasInner([engine('css', '#shown')], [engine('css', ':scope')]), ['shown']);
+expect('terminal root does not match its own id selector', hasInner([engine('css', '#shown')], [engine('css', '#shown')]), []);
+
 // Repeated visibility work stays inside the existing matcher budget.
 const limited = elements.map(() => ({ states: { secure: false, hidden: false } }));
 const budget = matchQuery(
