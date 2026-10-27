@@ -25,7 +25,7 @@ The Rust port keeps named-engine detection, quoted text and XPath detection, esc
 
 Playwright builds `[<attribute>=${JSON.stringify(body)}]` and evaluates it with its CSS parser, piercing open roots unless the engine is a `:light` variant. The native interpreter reproduces that string bridge exactly, so the body is data and never re-parsed as a selector:
 
-- The body is the authored text after the first `=` with no unquoting or unescaping. `data-testid="a"` looks for the four-character value `"a"` including the quotes.
+- The body is the authored text after the first `=` with no unquoting or unescaping. `data-testid="a"` looks for the three-character value `"a"` including the quotes.
 - An empty body is legal and matches an empty attribute value; an absent attribute never matches. Native validation therefore accepts an empty body only for these engines.
 - `JSON.stringify` escapes then CSS decodes, so a newline body `a\nb` searches for `anb`, `a\fb` searches for `a` plus U+00FB, and `a\u0000b` searches for `au0000b`. A literal backslash body `a\b` still searches for `a\b`, and `a\\b` searches for two backslashes.
 - Bodies are case sensitive. The shared chain parser trims the whole part first, so trailing whitespace after the body disappears and whitespace directly after `=` remains part of the value, exactly as `parseSelectorString` behaves for every named engine.
