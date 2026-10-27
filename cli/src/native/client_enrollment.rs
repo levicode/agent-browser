@@ -18798,4 +18798,96 @@ mod tests {
         http.abort();
         chrome.kill();
     }
+    async fn pending_popup_owner_retirement_case(mode: &str) {
+        let (owner, _notices, log, emit, server, _broker, connection) =
+            fixture_with_client("normal", true).await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        let gate = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeAttachedProcessing, gate.clone());
+        emit.send(json!({"method":"Target.attachedToTarget","params":{
+            "sessionId":"pending-popup", "waitingForDebugger":true,
+            "targetInfo":{"targetId":"pending-popup-target", "type":"page",
+                "browserContextId":"owned-context", "openerId":"initial-target"}
+        }}))
+        .await
+        .unwrap();
+        gate.wait_entered().await;
+        assert!(owner
+            .index
+            .lock()
+            .unwrap()
+            .pending_enrollment
+            .contains_key("pending-popup"));
+        assert_eq!(*owner.stop.borrow(), CancelSignal::None);
+        if mode == "requested-before-owner" {
+            // A genuine cancellation already published before the owner's stop
+            // must not gain a retrospective retirement receipt.
+            owner.stop.send_replace(CancelSignal::Requested);
+        } else if mode == "hard-before-owner" {
+            owner.poison(ProtocolError::BrowserFailure);
+        }
+        owner.seal_for_owner_retirement(&super::super::client_browser::OwnerRetirement::for_test(
+            &owner.targets,
+        ));
+        let drained = tokio::time::timeout(Duration::from_secs(2), owner.drain()).await;
+        let failure = owner.index.lock().unwrap().failure.clone();
+        let pending = owner.index.lock().unwrap().pending_enrollment.len();
+        let popup_commands = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["sessionId"] == "pending-popup")
+            .count();
+        // Join/close the actual scripted peer before the baseline-red assertion.
+        // This test proves enrollment phase one only, never context destruction.
+        gate.release();
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+        assert_eq!(pending, 0);
+        assert_eq!(popup_commands, 0);
+        match mode {
+            "owner-only" => {
+                assert_eq!(
+                    drained.unwrap(),
+                    Ok(()),
+                    "owner retirement must not poison its drained pending popup"
+                );
+                assert_eq!(failure, None);
+            }
+            "requested-before-owner" => {
+                assert_eq!(drained.unwrap(), Err(ProtocolError::Cancelled));
+                assert_eq!(failure, Some(ProtocolError::Cancelled));
+            }
+            "hard-before-owner" => {
+                assert_eq!(drained.unwrap(), Err(ProtocolError::BrowserFailure));
+                assert_eq!(failure, Some(ProtocolError::BrowserFailure));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_popup_owned_retirement_does_not_poison_phase_one() {
+        pending_popup_owner_retirement_case("owner-only").await;
+    }
+
+    #[tokio::test]
+    async fn pending_popup_requested_cancel_cannot_borrow_later_owner_retirement() {
+        pending_popup_owner_retirement_case("requested-before-owner").await;
+    }
+
+    #[tokio::test]
+    async fn pending_popup_hard_failure_survives_owner_retirement() {
+        pending_popup_owner_retirement_case("hard-before-owner").await;
+    }
 }
