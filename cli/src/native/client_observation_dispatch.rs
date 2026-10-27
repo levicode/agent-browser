@@ -3149,15 +3149,24 @@ async fn viewport(
     Ok(json!({"width":width,"height":height}))
 }
 fn optional_observe_lease(operation: &OperationLease) -> OperationLease {
-    let remaining = operation.deadline.saturating_duration_since(Instant::now());
-    // Cleanup is independently retained. Tokio timers have millisecond
-    // granularity: allow one timer tick plus one millisecond for local result
-    // publication, not the old 20%/500ms strict-fallback restoration reserve.
+    optional_observe_lease_at(operation, Instant::now())
+}
+fn optional_observe_lease_at(operation: &OperationLease, now: Instant) -> OperationLease {
+    let remaining = operation.deadline.saturating_duration_since(now);
+    // Cleanup is independently retained. The locked Tokio timer rounds the
+    // deadline up to a millisecond, then parks for an integer tick difference
+    // from floor(now): together these can consume nearly two milliseconds.
+    // Keep a separate millisecond for publication and receiver scheduling.
+    // This is bounded local headroom, not the strict-fallback cleanup reserve
+    // and not a guarantee against arbitrary scheduler stalls. At <=3ms the
+    // optional lease is already expired, so its first check cannot admit work.
+    let timer_rounding = Duration::from_millis(2);
+    let publication = Duration::from_millis(1);
     OperationLease {
         is_callback: operation.is_callback,
         generation: operation.generation,
         sequence: operation.sequence,
-        deadline: operation.deadline - remaining.min(Duration::from_millis(2)),
+        deadline: operation.deadline - remaining.min(timer_rounding + publication),
         cancellation: operation.cancellation.clone(),
     }
 }
@@ -5883,6 +5892,53 @@ mod tests {
         blobs.check_budget_integrity().unwrap();
         server.abort();
         let _ = server.await;
+    }
+    #[test]
+    fn optional_observe_headroom_covers_two_timer_roundings_and_publication() {
+        let now = Instant::now();
+        for remaining in [
+            Duration::ZERO,
+            Duration::from_nanos(1),
+            Duration::from_millis(1),
+            Duration::from_millis(2),
+            Duration::from_millis(3),
+            Duration::from_nanos(3_000_001),
+            Duration::from_millis(80),
+            Duration::from_secs(4),
+        ] {
+            let mut parent = operation();
+            parent.deadline = now + remaining;
+            let optional = optional_observe_lease_at(&parent, now);
+            let reserve = remaining.min(Duration::from_millis(3));
+            assert_eq!(optional.deadline, parent.deadline - reserve);
+            assert_eq!(parent.deadline, now + remaining);
+            assert_eq!(
+                optional.deadline <= now,
+                remaining <= Duration::from_millis(3)
+            );
+        }
+    }
+    #[test]
+    fn optional_observe_headroom_preserves_owner_cancellation_and_expired_deadline() {
+        let now = Instant::now();
+        let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+        let parent = OperationLease {
+            is_callback: true,
+            generation: 9,
+            sequence: 17,
+            deadline: now + Duration::from_millis(80),
+            cancellation,
+        };
+        let optional = optional_observe_lease_at(&parent, now);
+        assert_eq!(optional.generation, parent.generation);
+        assert_eq!(optional.sequence, parent.sequence);
+        assert_eq!(optional.is_callback, parent.is_callback);
+        assert!(optional.cancellation.same_channel(&parent.cancellation));
+        cancel.send_replace(CancelSignal::Requested);
+        assert_eq!(*optional.cancellation.borrow(), CancelSignal::Requested);
+        let expired = optional_observe_lease_at(&parent, now + Duration::from_millis(81));
+        assert_eq!(expired.deadline, parent.deadline);
+        assert_eq!(parent.deadline, now + Duration::from_millis(80));
     }
     #[test]
     fn fallback_reserves_bounded_time_without_resetting_parent_deadline() {

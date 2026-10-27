@@ -1763,3 +1763,103 @@ async fn field_read_waits_for_debt_only_outside_a_live_callback_before_acquisiti
         server.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn short_optional_headroom_publishes_without_producer_or_cdp_work() {
+    use futures_util::FutureExt;
+    // This is the completed-semantic producer seam, not a renderer/tree proof.
+    // Its real peer rejects every CDP command, including animation and raw capture.
+    let (owner, server) = peer().await;
+    let refs = Arc::new(Mutex::new(RefMap::new()));
+    let dispatch = ObservationDispatch::new(refs.clone());
+    let mut publication = dispatch.publication.lock().await;
+    let revision = publication
+        .stage_revision(PublicationKind::Snapshot)
+        .unwrap();
+    let (staged_refs, id) = staged(&owner, &refs.lock().unwrap(), revision, 7);
+    let semantic = json!({"root":{"role":"document"},"revision":revision.to_string()});
+    let budget = owner.blobs.budget_changes().unwrap();
+    let (send, mut receive) = oneshot::channel();
+    let mut result_send = Some(send);
+    let receipt = ObservationResultReceipt::default();
+    let (_cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+    // The new short-budget case begins here, after all fixture setup. There is
+    // no deadline reset, sleep, yield, or awaited setup before the producer seam.
+    let operation = OperationLease {
+        is_callback: false,
+        generation: 1,
+        sequence: 1,
+        deadline: Instant::now() + Duration::from_millis(3),
+        cancellation,
+    };
+    let deadline = operation.deadline;
+    let attempt = match dispatch.prepare(owner.context(), observe(), operation) {
+        Ok(prepared) => {
+            assert_eq!(prepared.operation.deadline, deadline);
+            let context = CaptureContext {
+                page: prepared.context.page,
+                frames: vec![],
+                inventory_complete: true,
+            };
+            dispatch
+                .optional_observe_pixels(
+                    &context,
+                    &prepared.operation,
+                    prepared.capture.as_ref(),
+                    prepared.retirement_fence,
+                    &owner.blobs,
+                    &owner.scope,
+                    &mut publication,
+                    revision,
+                    &staged_refs,
+                    "input[type=password]".into(),
+                    semantic.clone(),
+                    &mut result_send,
+                    &receipt,
+                    None,
+                )
+                .now_or_never()
+                .expect("short optional cutoff must not wait for a timer, CDP, or cleanup")
+                .map_err(|failure| {
+                    assert!(!failure.cleanup_integrity_lost);
+                    failure.error
+                })
+        }
+        Err(error) => Err(error),
+    };
+    match attempt {
+        Ok(output) => {
+            // The send timestamp is an upper bound sampled after send; a
+            // later OS preemption must not turn this structural seam into a
+            // hard realtime test. Original80ms/4s cases time actual receipt.
+            assert!(receipt.optional_timing().publication_attempt.unwrap() <= deadline);
+            assert_eq!(receive.try_recv().unwrap().unwrap(), semantic);
+            assert!(output.handles.is_empty());
+            assert!(receipt.is_sealed_observation());
+            assert!(refs.lock().unwrap().get(&id).is_some());
+            assert_eq!(publication.published_revision, revision);
+        }
+        Err(error) => {
+            // Real OS preemption may exhaust this tiny lease before prepare or
+            // publication. Preserve its legitimate refusal; never reset it.
+            assert_eq!(error, ProtocolError::DeadlineExceeded);
+            assert!(Instant::now() >= deadline);
+            assert!(!receipt.is_sealed_observation());
+            assert!(receipt.optional_timing().result_sent.is_none());
+            assert!(matches!(
+                receive.try_recv(),
+                Err(oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(refs.lock().unwrap().ref_ids().is_empty());
+            assert_eq!(publication.published_revision, 0);
+        }
+    }
+    assert!(!receipt.cleanup_failed_before_publication());
+    assert!(
+        !budget.has_changed().unwrap(),
+        "even a transient producer charge is forbidden"
+    );
+    drop(publication);
+    owner.client.close().await;
+    server.await.unwrap();
+}
