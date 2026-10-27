@@ -23,13 +23,17 @@ pub enum CancelSignal {
     Requested,
     DeadlineExceeded,
     SessionClosed,
+    /// Private enrollment producer stop; no public/wire representation.
+    OwnerRetirement,
 }
 
 impl CancelSignal {
     pub(crate) fn error(self) -> Option<ProtocolError> {
         match self {
             Self::None => None,
-            Self::Requested | Self::SessionClosed => Some(ProtocolError::Cancelled),
+            Self::Requested | Self::SessionClosed | Self::OwnerRetirement => {
+                Some(ProtocolError::Cancelled)
+            }
             Self::DeadlineExceeded => Some(ProtocolError::DeadlineExceeded),
         }
     }
