@@ -721,8 +721,17 @@ impl RefMap {
         self.viewport_ref = None;
     }
 
-    /// Semantic tree-unavailable recovery retires both populations. Standalone
-    /// screenshots must not call this. The shared allocator never rolls back.
+    /// Semantic fallback removes all current element and located authority.
+    /// Durable document identities stay inert and bounded by existing admission
+    /// quotas; only fresh exact observation evidence can restore membership.
+    /// Viewport capability lifetime is separate, as with retire_all_references.
+    pub(crate) fn retire_semantic_authority(&mut self) {
+        self.observed_publication = None;
+        self.map.clear();
+    }
+
+    /// Retire both reference populations and their durable document identities.
+    /// The shared allocator never rolls back. Viewport lifetime is separate.
     pub fn retire_all_references(&mut self) {
         self.invalidate_all_documents();
     }
@@ -2703,6 +2712,180 @@ mod tests {
             .unwrap();
         assert_ne!(next, first);
         assert_ne!(next, pinned);
+    }
+
+    #[test]
+    fn semantic_fallback_keeps_only_inert_identity_until_fresh_exact_observation() {
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 7, 1);
+        let observed = refs.bind_exact(42, "button", "", strict_binding("doc"));
+        let located = refs
+            .try_bind_located(
+                42,
+                "button",
+                strict_binding("doc"),
+                located_issuance(),
+                None,
+            )
+            .unwrap();
+        let allocated = refs.next_ref_num();
+        let mut staged = refs.clone();
+        staged.retire_semantic_authority();
+        assert!(refs.get(&observed).is_some());
+        assert!(refs.get(&located).is_some());
+        assert!(staged.get(&observed).is_none());
+        assert!(staged.get(&located).is_none());
+        assert_eq!(staged.retained_identity_counts(), (0, 1));
+        assert_eq!(staged.next_ref_num(), allocated);
+        staged.begin_observation("scope", 7, 2);
+        assert!(staged.get(&observed).is_none());
+        assert_eq!(
+            staged.bind_exact(42, "button", "changed", strict_binding("doc")),
+            observed
+        );
+        let current = staged.get(&observed).unwrap();
+        assert!(current.is_current_observed(2));
+        assert!(!current.is_current_observed(1));
+        assert!(current.matches_reference("scope", 7, "page", "1"));
+        for revision in ["0", "2", "01", "999"] {
+            assert!(!current.matches_reference("scope", 7, "page", revision));
+        }
+        assert!(staged.get(&located).is_none());
+        assert_eq!(staged.next_ref_num(), allocated);
+    }
+
+    #[test]
+    fn semantic_fallback_does_not_merge_replaced_or_foreign_native_identity() {
+        for change in [
+            "backend",
+            "session",
+            "loader",
+            "frame",
+            "page",
+            "scope",
+            "generation",
+            "unknown",
+            "kind",
+            "origin",
+        ] {
+            let mut refs = RefMap::new();
+            refs.begin_observation("scope", 7, 1);
+            let old = refs.bind_exact(42, "button", "same name", strict_binding("doc"));
+            refs.retire_semantic_authority();
+            let mut binding = strict_binding("doc");
+            let mut backend = 42;
+            let mut scope = "scope";
+            let mut generation = 7;
+            match change {
+                "backend" => backend = 43,
+                "session" => binding.session = "other-session".into(),
+                "loader" => binding.loader = "other-document".into(),
+                "frame" => binding.frame = "other-frame".into(),
+                "page" => binding.page_session = "other-page".into(),
+                "scope" => scope = "other-scope",
+                "generation" => generation = 8,
+                "unknown" => {
+                    assert!(!refs.observe_document("page", Some("frame"), "session", None))
+                }
+                "kind" | "origin" => {}
+                _ => unreachable!(),
+            }
+            refs.begin_observation(scope, generation, 2);
+            let fresh = match change {
+                "kind" => refs
+                    .try_bind_readonly_pseudo(backend, "button", binding)
+                    .unwrap(),
+                "origin" => refs
+                    .try_bind_exact_with_origin(
+                        backend,
+                        "button",
+                        "same name",
+                        binding,
+                        Some(LiveQueryOrigin::new("other-source".into())),
+                    )
+                    .unwrap(),
+                _ => refs.bind_exact(backend, "button", "same name", binding),
+            };
+            assert_ne!(fresh, old, "{change}");
+            assert!(refs.get(&old).is_none(), "{change}");
+        }
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 7, 1);
+        let old = refs.bind_exact(42, "button", "", strict_binding("doc"));
+        refs.retire_semantic_authority();
+        refs.retire_owner_references();
+        assert_eq!(refs.retained_identity_counts(), (0, 0));
+        refs.begin_observation("scope", 7, 2);
+        assert_ne!(
+            refs.bind_exact(42, "button", "", strict_binding("doc")),
+            old
+        );
+    }
+
+    #[test]
+    fn semantic_fallback_retains_existing_durable_capacity_and_origin_byte_charges() {
+        let mut refs = RefMap::new();
+        refs.set_exact_limit_for_test(2);
+        refs.begin_observation("scope", 7, 1);
+        let old = refs.bind_exact(42, "button", "", strict_binding("doc"));
+        refs.bind_exact(43, "button", "", strict_binding("doc"));
+        let allocated = refs.next_ref_num();
+        for revision in 2..10 {
+            refs.retire_semantic_authority();
+            assert_eq!(refs.retained_identity_counts(), (0, 2));
+            refs.begin_observation("scope", 7, revision);
+            assert_eq!(
+                refs.bind_exact(42, "button", "", strict_binding("doc")),
+                old
+            );
+            assert_eq!(
+                refs.try_bind_exact(44, "button", "", strict_binding("doc")),
+                Err(RefAllocationError::Capacity)
+            );
+            assert_eq!(refs.retained_identity_counts(), (1, 2));
+            assert_eq!(refs.next_ref_num(), allocated);
+        }
+        let mut refs = RefMap::new();
+        let origin = LiveQueryOrigin::new("same".into());
+        refs.set_query_origin_byte_limit_for_test(2 * origin.source.len());
+        refs.begin_observation("scope", 7, 1);
+        let old = refs
+            .try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone()),
+            )
+            .unwrap();
+        refs.retire_semantic_authority();
+        assert_eq!(refs.retained_query_origin_bytes(), origin.source.len());
+        refs.begin_observation("scope", 7, 2);
+        assert_eq!(
+            refs.try_bind_exact_with_origin(
+                42,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone())
+            )
+            .unwrap(),
+            old
+        );
+        let allocated = refs.next_ref_num();
+        assert_eq!(
+            refs.try_bind_exact_with_origin(
+                43,
+                "button",
+                "",
+                strict_binding("doc"),
+                Some(origin.clone())
+            ),
+            Err(RefAllocationError::Capacity)
+        );
+        assert_eq!(refs.retained_query_origin_bytes(), 2 * origin.source.len());
+        assert_eq!(refs.retained_identity_counts(), (1, 1));
+        assert_eq!(refs.next_ref_num(), allocated);
     }
 
     #[test]

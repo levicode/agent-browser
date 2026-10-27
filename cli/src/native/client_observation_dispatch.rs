@@ -388,10 +388,17 @@ pub struct DispatchContext {
 /// Private evidence that only this dispatcher may issue after committing an
 /// independently complete Observe tree. It grants no cleanup or UI authority.
 #[derive(Clone, Default)]
-pub(crate) struct ObservationResultReceipt(Arc<AtomicBool>);
+pub(crate) struct ObservationResultReceipt {
+    sealed: Arc<AtomicBool>,
+    cleanup_failed_before_publication: Arc<AtomicBool>,
+}
 impl ObservationResultReceipt {
     pub(crate) fn is_sealed_observation(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.sealed.load(Ordering::Acquire)
+    }
+    pub(crate) fn cleanup_failed_before_publication(&self) -> bool {
+        self.cleanup_failed_before_publication
+            .load(Ordering::Acquire)
     }
 }
 pub struct DispatchTask {
@@ -1219,6 +1226,9 @@ impl ObservationDispatch {
                         || cleanup_lost.load(Ordering::SeqCst),
                 });
             }
+            // A captured cleanup failure survives even if the journal itself
+            // restored cleanly. Publication does not discharge remote resources.
+            let (pixels, geometry) = captured.map_err(failure)?;
             if published.load(Ordering::Acquire) {
                 // A late ACK can discharge custody, never publish pixels or
                 // restart final-proof reads after the optional acceptance cut.
@@ -1227,7 +1237,6 @@ impl ObservationDispatch {
                     handles: vec![],
                 });
             }
-            let (pixels, geometry) = captured.map_err(failure)?;
             geometry
                 .revalidate(&context.page.client, &pixel_operation)
                 .await
@@ -1313,7 +1322,7 @@ impl ObservationDispatch {
                         &mut refs,
                         staged.clone(),
                     );
-                    receipt.0.store(true, Ordering::Release);
+                    receipt.sealed.store(true, Ordering::Release);
                     published.store(true, Ordering::Release);
                     // The exact operation keeps cleanup custody even if the RPC
                     // receiver has gone away. There are no blob handles in this value.
@@ -1331,8 +1340,9 @@ impl ObservationDispatch {
                 let result = optional.await;
                 if let Err(error) = publication {
                     let mut rejected = failure(error);
-                    match &result {
-                        Err(cleanup) => rejected.cleanup_integrity_lost |= cleanup.cleanup_integrity_lost,
+                    match result {
+                        Err(cleanup) if cleanup.cleanup_integrity_lost => return Err(cleanup),
+                        Err(_) => {},
                         Ok(output) => rejected.cleanup_integrity_lost |= !release_handles(blobs, scope, &output.handles),
                     }
                     return Err(rejected);
@@ -1387,7 +1397,20 @@ impl ObservationDispatch {
             {
                 // Pixel-only refusal cannot revoke a separately completed tree.
                 // Cancellation, identity loss and supersession are not optional.
-                publish_semantic(result_send).map_err(failure)?;
+                // Known failure is published truthfully by the browser bridge;
+                // pending custody alone is not evidence of failed cleanup.
+                receipt
+                    .cleanup_failed_before_publication
+                    .store(error.cleanup_integrity_lost, Ordering::Release);
+                if let Err(rejected) = publish_semantic(result_send) {
+                    // A cancelled/stale publication must not erase an already
+                    // established resource or restoration cleanup failure.
+                    return Err(if error.cleanup_integrity_lost {
+                        error
+                    } else {
+                        failure(rejected)
+                    });
+                }
                 if error.cleanup_integrity_lost {
                     Err(error)
                 } else {
@@ -1890,9 +1913,9 @@ impl ObservationDispatch {
                 .lock()
                 .map_err(|_| failure(ProtocolError::ScopeUnavailable))?
                 .clone();
-            // A tree-unavailable semantic fallback retires located authority too.
+            // Fallback retires both current populations, not inert document identity.
             // Standalone pixels-only publication does not take this branch.
-            staged.retire_all_references();
+            staged.retire_semantic_authority();
             staged.begin_observation(&capture_context.page.identity_scope, operation.generation, revision);
             let selector = fallback_selector
                 .as_deref()
@@ -2856,13 +2879,14 @@ async fn viewport(
 }
 fn optional_observe_lease(operation: &OperationLease) -> OperationLease {
     let remaining = operation.deadline.saturating_duration_since(Instant::now());
-    // Cleanup is independently retained. Reserve only local result publication,
-    // not the old 20%/500ms restoration allowance used by strict fallback.
+    // Cleanup is independently retained. Tokio timers have millisecond
+    // granularity: allow one timer tick plus one millisecond for local result
+    // publication, not the old 20%/500ms strict-fallback restoration reserve.
     OperationLease {
         is_callback: operation.is_callback,
         generation: operation.generation,
         sequence: operation.sequence,
-        deadline: operation.deadline - remaining.min(Duration::from_millis(1)),
+        deadline: operation.deadline - remaining.min(Duration::from_millis(2)),
         cancellation: operation.cancellation.clone(),
     }
 }

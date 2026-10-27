@@ -7400,6 +7400,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn semantic_fallback_refs_refuse_before_fresh_evidence_then_keep_exact_issuance() {
+        let mut f = fixture("strict-query-one").await;
+        let first = NodeReference {
+            id: "@e1".into(),
+            revision: "1".into(),
+        };
+        let binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
+        let located = f
+            .refs
+            .try_bind_located(
+                42,
+                "textbox",
+                binding.clone(),
+                element::LocatedIssuance {
+                    identity_scope: "scope".into(),
+                    generation: 1,
+                    revision: 1,
+                },
+                None,
+            )
+            .unwrap();
+        let located = NodeReference {
+            id: format!("@{located}"),
+            revision: "1".into(),
+        };
+        f.refs.retire_semantic_authority();
+        f.log.lock().unwrap().clear();
+        let actions = ClientActions::default();
+        for reference in [&first, &located] {
+            let failure = actions
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &observed_fill_request("scope", reference, "retired"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, ProtocolError::StaleReference);
+            assert_eq!(failure.effects, Effects::NotDispatched);
+        }
+        assert!(f.log.lock().unwrap().is_empty());
+        f.refs.begin_observation("scope", 1, 2);
+        assert!(f.refs.get("e1").is_none());
+        assert_eq!(f.refs.bind_exact(42, "textbox", "", binding), "e1");
+        let mut context = f.context();
+        context.revision = 2;
+        context.observed_revision = 2;
+        actions
+            .execute(
+                context,
+                "browser.perform",
+                &observed_fill_request("scope", &first, "readmitted"),
+            )
+            .await
+            .unwrap();
+        assert!(f
+            .inputs()
+            .iter()
+            .any(|request| request["method"] == "Input.insertText"
+                && request["params"]["text"] == "readmitted"));
+        f.log.lock().unwrap().clear();
+        for revision in ["0", "2", "01", "999"] {
+            let mut context = f.context();
+            context.revision = 2;
+            context.observed_revision = 2;
+            let forged = NodeReference {
+                id: first.id.clone(),
+                revision: revision.into(),
+            };
+            let failure = actions
+                .execute(
+                    context,
+                    "browser.perform",
+                    &observed_fill_request("scope", &forged, "forged"),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, ProtocolError::StaleReference);
+            assert_eq!(failure.effects, Effects::NotDispatched);
+        }
+        let mut context = f.context();
+        context.revision = 2;
+        context.observed_revision = 2;
+        let failure = actions
+            .execute(
+                context,
+                "browser.perform",
+                &observed_fill_request("scope", &located, "retired-locator"),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(failure.error, ProtocolError::StaleReference);
+        assert_eq!(failure.effects, Effects::NotDispatched);
+        assert!(f.log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn viewport_stable_issuance_uses_current_geometry_and_recovery_publication_gate() {
         let mut f = fixture("normal").await;
         let first = f

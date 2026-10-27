@@ -5311,6 +5311,16 @@ mod tests {
             assert_eq!(result.ancestors.len(), 40);
             assert_eq!(result.label_ids.len(), 40);
             assert!(!result.simple_name_inventory);
+            // Readonly group disposal is handed off, not acknowledged by the
+            // semantic return. Await the real matching ACK before checking the
+            // final census or starting the peer's next sequential frame round.
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                while ledger.snapshot().object_debt != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("exact readonly group release did not settle");
             assert_eq!(
                 (ledger.snapshot().input_debt, ledger.snapshot().object_debt),
                 (0, 0)

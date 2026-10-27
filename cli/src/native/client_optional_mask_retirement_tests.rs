@@ -14,6 +14,7 @@ enum Case {
     MissingScreenshotAck,
     CancelInventory,
     CancelUnacknowledgedObject,
+    OptionalResourceShortDeadline,
     CancelShortUnacknowledgedObject,
     CancelDirtyRestore,
     CancelShortDirtyRestore,
@@ -179,7 +180,9 @@ async fn optional_mask_retirement(case: Case) {
                 method == "Page.captureScreenshot"
             } else if matches!(
                 case,
-                Case::CancelUnacknowledgedObject | Case::CancelShortUnacknowledgedObject
+                Case::CancelUnacknowledgedObject
+                    | Case::CancelShortUnacknowledgedObject
+                    | Case::OptionalResourceShortDeadline
             ) {
                 method == "Runtime.callFunctionOn" && group == Some("capture-1-frame")
             } else {
@@ -217,6 +220,7 @@ async fn optional_mask_retirement(case: Case) {
     let budget = if matches!(
         case,
         Case::OptionalShortDeadline
+            | Case::OptionalResourceShortDeadline
             | Case::OptionalScreenshotShortDeadline
             | Case::MissingScreenshotAck
             | Case::CancelInventory
@@ -277,9 +281,29 @@ async fn optional_mask_retirement(case: Case) {
         } else if case == Case::DetachedBeforeCutoff {
             owner.targets.detach(&owner.target).unwrap();
         } else if !screenshot
-            && !matches!(case, Case::OptionalDeadline | Case::OptionalShortDeadline)
+            && !matches!(
+                case,
+                Case::OptionalDeadline
+                    | Case::OptionalShortDeadline
+                    | Case::OptionalResourceShortDeadline
+            )
         {
             cancel.send_replace(CancelSignal::Requested);
+        }
+        if case == Case::OptionalResourceShortDeadline {
+            let result = tokio::time::timeout_at(deadline.into(), &mut task.result)
+                .await
+                .expect("resource custody must not consume the original 80ms result budget")
+                .expect("result sender retained");
+            published_at = Some(Instant::now());
+            assert!(task.receipt.is_sealed_observation());
+            assert!(!task.receipt.cleanup_failed_before_publication());
+            assert!(
+                !task.join.is_finished(),
+                "unacknowledged resource still needs settlement"
+            );
+            assert!(result.as_ref().unwrap().get("pixels").is_none());
+            early_result = Some(result);
         }
         #[cfg(feature = "acceptance-faults")]
         if screenshot {
@@ -328,8 +352,13 @@ async fn optional_mask_retirement(case: Case) {
     };
     let result_time = published_at.unwrap_or_else(Instant::now);
     let joined = task.join.await.unwrap();
-    if case == Case::MissingScreenshotAck {
-        assert!(joined.unwrap_err().cleanup_integrity_lost);
+    if matches!(
+        case,
+        Case::MissingScreenshotAck | Case::OptionalResourceShortDeadline
+    ) {
+        let failure = joined.unwrap_err();
+        assert_eq!(failure.error, ProtocolError::CleanupFailed);
+        assert!(failure.cleanup_integrity_lost);
     } else {
         joined.unwrap();
     }
@@ -352,6 +381,7 @@ async fn optional_mask_retirement(case: Case) {
             | Case::OptionalShortDeadline
             | Case::OptionalScreenshotShortDeadline
             | Case::MissingScreenshotAck
+            | Case::OptionalResourceShortDeadline
             | Case::PrivacyFailure
             | Case::GeometryFailure
     ) {
@@ -385,7 +415,10 @@ async fn optional_mask_retirement(case: Case) {
             assert!(entry.is_current_observed(1));
             assert_eq!(entry.exact_binding.as_ref().unwrap(), &owner.binding());
         }
-        if case != Case::MissingScreenshotAck {
+        if !matches!(
+            case,
+            Case::MissingScreenshotAck | Case::OptionalResourceShortDeadline
+        ) {
             let (action, _cancel) = operation(2);
             assert_eq!(dispatch.snapshot_for_action(&action).await.unwrap().0, 1);
         }
@@ -405,6 +438,7 @@ async fn optional_mask_retirement(case: Case) {
                 | Case::CancelShortDirtyRestore => ProtocolError::Cancelled,
                 Case::CancelUnacknowledgedObject
                 | Case::CancelShortUnacknowledgedObject
+                | Case::OptionalResourceShortDeadline
                 | Case::MissingScreenshotAck => ProtocolError::CleanupFailed,
                 Case::PrivacyFailure | Case::GeometryFailure => ProtocolError::PolicyDenied,
                 Case::SupersededBeforeCutoff => ProtocolError::StaleReference,
@@ -433,7 +467,9 @@ async fn optional_mask_retirement(case: Case) {
     assert_eq!(owner.client.pending_len().await, 0);
     if matches!(
         case,
-        Case::CancelShortUnacknowledgedObject | Case::MissingScreenshotAck
+        Case::CancelShortUnacknowledgedObject
+            | Case::MissingScreenshotAck
+            | Case::OptionalResourceShortDeadline
     ) {
         assert!(
             terminal >= deadline,
@@ -489,6 +525,7 @@ async fn optional_mask_retirement(case: Case) {
                 case,
                 Case::CancelUnacknowledgedObject
                     | Case::CancelShortUnacknowledgedObject
+                    | Case::OptionalResourceShortDeadline
                     | Case::PrivacyFailure
                     | Case::GeometryFailure
                     | Case::OptionalScreenshotShortDeadline
@@ -568,6 +605,7 @@ async fn optional_mask_retirement(case: Case) {
             case,
             Case::CancelUnacknowledgedObject
                 | Case::CancelShortUnacknowledgedObject
+                | Case::OptionalResourceShortDeadline
                 | Case::MissingScreenshotAck
                 | Case::CancelDirtyRestore
                 | Case::CancelShortDirtyRestore
@@ -775,4 +813,9 @@ async fn i10_t06_newer_admission_before_optional_cutoff_never_commits_old_stagin
 #[tokio::test]
 async fn i10_t06_detached_page_before_optional_cutoff_never_publishes_sealed_tree() {
     optional_mask_retirement(Case::DetachedBeforeCutoff).await;
+}
+
+#[tokio::test]
+async fn sealed_tree_keeps_unacknowledged_resource_failure_in_retained_join() {
+    optional_mask_retirement(Case::OptionalResourceShortDeadline).await;
 }

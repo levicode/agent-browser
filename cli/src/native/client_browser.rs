@@ -3278,11 +3278,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                     // Only the dispatcher can issue this receipt,
                                     // after the tree-only commit. Keep this same
                                     // registered producer alive through its join.
-                                    let _ = semantic_send.send(NativeOutcome {
+                                    let _ = semantic_send.send((NativeOutcome {
                                         retention: None,
                                         result: Ok(value.clone()),
                                         effects: Effects::Completed,
-                                    });
+                                    }, task.receipt.cleanup_failed_before_publication()));
                                 }
                             }
                             let cleanup = task.join.await;
@@ -3310,7 +3310,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let outcome = tokio::select! {
                 biased;
                 result = semantic_receive => match result {
-                    Ok(outcome) => outcome,
+                    Ok((outcome, cleanup_failed)) => {
+                        if cleanup_failed {
+                            // The immutable tree is already committed. Quarantine
+                            // before transport snapshots health, not before the
+                            // dispatcher's final cancellation/identity checks.
+                            let _ = self.broker.quarantine();
+                        }
+                        outcome
+                    },
                     Err(_) => retained.await,
                 },
                 outcome = &mut retained => outcome,

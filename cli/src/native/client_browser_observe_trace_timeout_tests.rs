@@ -31,6 +31,7 @@ struct Peer {
     task: tokio::task::JoinHandle<()>,
     protected_png: String,
     release: mpsc::UnboundedSender<()>,
+    disconnect: tokio::sync::oneshot::Sender<()>,
 }
 
 fn png(color: [u8; 4]) -> String {
@@ -58,6 +59,7 @@ async fn peer(case: Case) -> Peer {
     let unprotected = png([255, 0, 255, 255]);
     let (release_tx, mut release_rx) = mpsc::unbounded_channel::<()>();
     let peer_release = release_tx.clone();
+    let (disconnect, mut disconnect_rx) = tokio::sync::oneshot::channel();
     let task = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         stream.set_nodelay(true).unwrap();
@@ -73,6 +75,9 @@ async fn peer(case: Case) -> Peer {
         let mut release_job = None;
         loop {
             tokio::select! {
+                // Test peer teardown only. EOF is not a synthetic capture ACK
+                // and supplies no protection-restoration or clean-close proof.
+                _ = &mut disconnect_rx => break,
                 signal = release_rx.recv(), if held.is_some() => {
                     signal.expect("release owner remains alive");
                     let request = held.take().unwrap();
@@ -209,6 +214,7 @@ async fn peer(case: Case) -> Peer {
         task,
         protected_png,
         release: peer_release,
+        disconnect,
     }
 }
 
@@ -771,6 +777,34 @@ async fn optional_finish(peer: Peer, fixture: FramedFixture) -> Result<(), Strin
     cleanup
 }
 
+async fn optional_finish_failed(peer: Peer, fixture: FramedFixture, browser: &ClientBrowser) {
+    let cleanup = tokio::time::timeout(Duration::from_secs(10), fixture.finish())
+        .await
+        .expect("retained native shutdown stalled");
+    assert!(
+        cleanup.is_err(),
+        "unresolved protection must not report clean shutdown"
+    );
+    {
+        let owner = browser.owner.lock().await;
+        let owner = owner
+            .as_ref()
+            .expect("failed borrowed scope lost its owner");
+        assert!(owner
+            .targets
+            .protected_read_residual
+            .replacement_safe()
+            .is_err());
+    }
+    // Production deliberately retains this borrowed connection with failed
+    // protection custody. Only the independent test peer closes its socket.
+    peer.disconnect.send(()).expect("test peer already gone");
+    tokio::time::timeout(Duration::from_secs(2), peer.task)
+        .await
+        .expect("disconnected test peer not joined")
+        .unwrap();
+}
+
 #[tokio::test]
 async fn i10_t01_metadata_release_ack_is_not_the_eighty_ms_tree_deadline() {
     let (peer, browser, mut fixture, scope) = optional_fixture(Case::MetadataReleaseHeld).await;
@@ -842,7 +876,12 @@ async fn i10_t02_mask_probe_no_ack_returns_tree_without_late_screenshot() {
     )
     .await
     .expect("mask probe consumed immutable tree deadline");
-    assert_eq!(result["ok"], true);
+    assert_eq!(
+        result["ok"],
+        true,
+        "result={result} elapsed={:?}",
+        started.elapsed()
+    );
     assert!(result["data"].get("pixels").is_none());
     assert!(!browser.refs.lock().unwrap().ref_ids().is_empty());
     peer_reached(&peer, "DOMSnapshot.captureSnapshot").await;
@@ -991,8 +1030,7 @@ async fn i10_t03_permanent_raw_no_ack_keeps_tree_but_never_claims_clean_custody(
         .iter()
         .any(|request| request["params"]["functionDeclaration"]
             == "function(){return this.remove()}"));
-    // Shutdown is joined even when its honest result is failed cleanup.
-    let _ = optional_finish(peer, fixture).await;
+    optional_finish_failed(peer, fixture, &browser).await;
 }
 
 #[tokio::test]
@@ -1038,7 +1076,15 @@ async fn i10_t05_wrong_session_or_malformed_late_raw_ack_never_becomes_pixels() 
                 .count(),
             1
         );
-        let _ = optional_finish(peer, fixture).await;
+        if case == Case::OptionalWrongSessionHeld {
+            optional_finish_failed(peer, fixture, &browser).await;
+        } else {
+            // Malformed pixels are not publishable, but their correctly
+            // correlated ACK ends raw custody and permits actual restoration.
+            assert!(!journal.snapshot().integrity_lost);
+            assert!(peer.restoration_acked.load(Ordering::Acquire));
+            optional_finish(peer, fixture).await.unwrap();
+        }
     }
 }
 
@@ -1126,7 +1172,7 @@ async fn i10_t05_failed_optional_restore_emits_completed_quarantined_tree() {
         .unwrap()
         .iter()
         .any(|request| request["method"] == "Input.dispatchMouseEvent"));
-    let _ = optional_finish(peer, fixture).await;
+    optional_finish_failed(peer, fixture, &browser).await;
 }
 
 #[tokio::test]
