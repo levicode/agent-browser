@@ -1020,6 +1020,7 @@ fn hidden_proof_error(error: ObservationError) -> GeometryError {
             GeometryError::BackendFailure
         }
         ObservationError::InvalidArguments
+        | ObservationError::InvalidLocator
         | ObservationError::PolicyDenied
         | ObservationError::ResourceLimit => GeometryError::IncompleteInventory,
     }

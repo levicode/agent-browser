@@ -4,17 +4,31 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const source = fs.readFileSync(process.argv[2] || path.join(__dirname, '../../src/native/client_observation.rs'), 'utf8');
-const script = source.match(/const MATCH_QUERY: &str = r#"([\s\S]*?)"#;/)[1];
+const sourcePath = process.argv[2] || path.join(__dirname, '../../src/native/client_observation.rs');
+const source = fs.readFileSync(sourcePath, 'utf8');
+const script = require('./native-observation-script.cjs')(sourcePath, 'MATCH_QUERY');
 const matchQuery = eval(`(${script})`);
 let document;
 class Node {
-  constructor(nodeType) { this.nodeType = nodeType; this.childNodes = []; this.parentNode = null; this.connected = true; }
+  constructor(nodeType) { this.nodeType = nodeType; this._children = []; this.parentNode = null; this.connected = true; }
+  get childNodes() { return this._children; }
+  set childNodes(children) { this._children = children; }
   get ownerDocument() { return document; }
   get isConnected() { return this.connected; }
   get parentElement() { return this.parentNode?.nodeType === 1 ? this.parentNode : null; }
-  append(...children) { for (const child of children) { child.parentNode = this; this.childNodes.push(child); } return this; }
+  append(...children) { for (const child of children) { child.parentNode = this; this._children.push(child); } return this; }
   getRootNode() { let node = this; while (node.parentNode) node = node.parentNode; return node; }
+  // Native qSA walks the actual light tree, not an overridable childNodes
+  // getter. Shadow discovery belongs to production selectChain, not this DOM.
+  querySelectorAll(css) {
+    const found = [], pending = [...this._children].reverse();
+    while (pending.length) {
+      const node = pending.pop();
+      if (node.nodeType === 1 && node.matches(css)) found.push(node);
+      for (let i = node._children.length - 1; i >= 0; i--) pending.push(node._children[i]);
+    }
+    return found;
+  }
   contains(target) { for (let node = target; node; node = node.parentNode) if (node === this) return true; return false; }
 }
 class Element extends Node {
@@ -43,12 +57,56 @@ const filter = (source, hasText) => ({ kind: 'filter', source, hasText });
 const index = (source, index) => ({ kind: 'index', source, index });
 const displayValue = value => ({ kind: 'query', query: { kind: 'displayValue', value: str(value, true) } });
 const semantic = (extra = {}) => ({ states: {}, attributes: {}, ...extra });
+// Fixture expressions enter after native selector compilation. Selector
+// discovery still executes against the scripted document/light/shadow trees.
+// These are fixed compiler outputs for the literal CSS inputs below, not a
+// selector parser. Original expressions/expectations remain the test inputs.
+const compiledSelectors = new Map([
+  ['#raw', [{ engine: 'css', body: '#raw' }]],
+  ['#host', [{ engine: 'css', body: '#host' }]],
+  ['#closed-host', [{ engine: 'css', body: '#closed-host' }]],
+  ['#inside', [{ engine: 'css', body: '#inside' }]],
+  ['#wrapper', [{ engine: 'css', body: '#wrapper' }]],
+  ['#parent', [{ engine: 'css', body: '#parent' }]],
+  ['#head-child', [{ engine: 'css', body: '#head-child' }]],
+  ['#template', [{ engine: 'css', body: '#template' }]],
+  ['#commented', [{ engine: 'css', body: '#commented' }]],
+  ['#svg-style', [{ engine: 'css', body: '#svg-style' }]],
+  ['#blocks', [{ engine: 'css', body: '#blocks' }]],
+  ['#button', [{ engine: 'css', body: '#button' }]],
+  ['#editable-button', [{ engine: 'css', body: '#editable-button' }]],
+  ['#secret', [{ engine: 'css', body: '#secret' }]],
+  ['#secure-parent', [{ engine: 'css', body: '#secure-parent' }]],
+  ['#password', [{ engine: 'css', body: '#password' }]],
+  ['#protected-inside', [{ engine: 'css', body: '#protected-inside' }]],
+  ['#native-ancestor', [{ engine: 'css', body: '#native-ancestor' }]],
+  ['#plain', [{ engine: 'css', body: '#plain' }]],
+  ['#lazy', [{ engine: 'css', body: '#lazy' }]],
+  ['#cached', [{ engine: 'css', body: '#cached' }]],
+  ['#oversized', [{ engine: 'css', body: '#oversized' }]],
+  ['#deep', [{ engine: 'css', body: '#deep' }]],
+  ['#wide', [{ engine: 'css', body: '#wide' }]],
+  ['#stale', [{ engine: 'css', body: '#stale' }]],
+  ['#panel', [{ engine: 'css', body: '#panel' }]],
+  ['*', [{ engine: 'css', body: '*' }]],
+]);
+function compiledExpression(expression) {
+  const result = { ...expression };
+  if (expression.kind === 'selector') {
+    assert.ok(compiledSelectors.has(expression.selector), 'add an explicit compiler fixture for new selector inputs');
+    result.nativeParts = compiledSelectors.get(expression.selector);
+  }
+  for (const key of ['source', 'scope', 'has', 'left', 'right']) {
+    if (expression[key]) result[key] = compiledExpression(expression[key]);
+  }
+  return result;
+}
 function run(expression, elements, data = elements.map(() => semantic()), protectedAncestors = elements.map(() => false)) {
   const labels = elements.map(() => []), names = elements.map(() => null);
   // The optional source argument allows proving the fixture fails at the old
   // implementation without changing the tested expressions or DOM.
   if (!script.includes('secureSelector, protectedAncestors')) return matchQuery(expression, data, labels, names, ...elements);
-  return matchQuery(expression, data, labels, names, '.secure', protectedAncestors, ...elements);
+  return matchQuery(compiledExpression(expression), data, labels, names, '.secure', protectedAncestors, ...elements);
 }
 function matched(expression, elements, data, protectedAncestors) {
   const result = run(expression, elements, data, protectedAncestors);
@@ -88,12 +146,14 @@ console.log('PASS: original displayValue positions/filters, initial textarea tex
 // Matcher normalization follows hasText, not SemanticNode.text: string exact
 // is deliberately ignored by the original locator's Playwright filter option.
 const raw = new Element('div', 'raw').append(text('  A\u200b\u00ad\t b\u200c\u200d\nC  '));
+document.append(raw);
 for (const pattern of [str('a B\u200c\u200d c', true), regexp('^  A\\u200b\\u00ad\\t b\\u200c\\u200d\\nC  $', 'u'), regexp('^C', 'm'), regexp('a.*c', 'is')]) {
   assert.deepEqual(matched(filter(selector('raw'), pattern), [raw]), [0]);
 }
 assert.deepEqual(matched(filter(selector('raw'), str('a b c')), [raw]), []);
 assert.deepEqual(matched(filter(selector('raw'), regexp('A b')), [raw]), []);
 const twins = [new Element('div', 'one').append(text('same')), new Element('div', 'two').append(text('same'))];
+document.append(...twins);
 for (const flags of ['g', 'y', 'gy', 'iu']) assert.deepEqual(matched(filter({ kind: 'selector', selector: '*' }, regexp('same', flags)), twins), [0, 1]);
 assert.deepEqual(run(filter(selector('raw'), regexp('[', 'u')), [raw]), { error: 'invalid-arguments' });
 console.log('PASS: raw regexp flags, per-element regex state, exact-ignored substring and original whitespace normalization');
@@ -101,15 +161,21 @@ console.log('PASS: raw regexp flags, per-element regex state, exact-ignored subs
 // Text order is light children first, then open shadow text. Closed author
 // roots remain native candidates, but do not contribute through their host.
 const host = new Element('section', 'host').append(text('Light '));
+document.append(host);
 const open = host.attachShadow('open'); open.append(new Element('span').append(text('Open')));
 assert.deepEqual(matched(filter(selector('host'), regexp('^Light Open$')), [host]), [0]);
 const closedHost = new Element('section', 'closed-host').append(text('Outside'));
+document.append(closedHost);
 const closed = closedHost.attachShadow('closed');
 const inside = new Element('span', 'inside').append(text('Closed token')); closed.append(inside);
 assert.deepEqual(matched(filter(selector('closed-host'), str('Closed token')), [closedHost, inside]), []);
-assert.deepEqual(matched(filter(selector('inside'), str('Closed token')), [closedHost, inside]), [1]);
+// Original E2E locator contract stops at a closed root (e557432 web.mdx).
+// The migration-only fixture formerly expected [1] here from Element.matches.
+assert.deepEqual(matched(filter(selector('inside'), str('Closed token')), [closedHost, inside]), []);
+assert.deepEqual(matched({ kind: 'query', query: { kind: 'text', value: str('Closed token') } }, [closedHost, inside]), [1]);
 const hidden = new Element('span'); hidden.hidden = true; hidden.append(text('Hidden author text'));
 const wrapper = new Element('div', 'wrapper').append(hidden);
+document.append(wrapper);
 forbid(wrapper, 'innerText'); forbid(wrapper, 'textContent');
 assert.deepEqual(matched(filter(selector('wrapper'), str('Hidden author text')), [wrapper, hidden]), [0]);
 console.log('PASS: light/open root ordering, closed-root boundary, hidden DOM text independent from rendered metadata');
@@ -118,32 +184,39 @@ for (const tag of ['script', 'style', 'noscript']) {
   const skipped = new Element(tag).append(text('forbidden token'));
   forbid(skipped.childNodes[0], 'nodeValue', 'excluded tag text');
   const parent = new Element('div', 'parent').append(text('safe'), skipped);
+  document.append(parent);
   assert.deepEqual(matched(filter(selector('parent'), str('safe')), [parent, skipped]), [0]);
 }
 const headChild = new Element('title', 'head-child').append(text('head token')); document.head.append(headChild);
 forbid(headChild.childNodes[0], 'nodeValue', 'head text');
 assert.deepEqual(matched(filter(selector('head-child'), str('head token')), [headChild]), []);
 const template = new Element('template', 'template'); template.content = new Node(11).append(text('inert template contents'));
+document.append(template);
 assert.deepEqual(matched(filter(selector('template'), str('inert template contents')), [template]), []);
 const commented = new Element('div', 'commented').append(text('A'), new Node(8), text('B'));
+document.append(commented);
 forbid(commented.childNodes[1], 'nodeValue', 'comment text');
 assert.deepEqual(matched(filter(selector('commented'), regexp('^AB$')), [commented]), [0]);
 // Playwright's skipped tag names are HTML nodeName tokens, not localName:
 // an SVG style node has lowercase nodeName and is not an HTML STYLE node.
 const svgStyle = new Element('style', 'svg-style'); svgStyle.nodeName = 'style'; svgStyle.append(text('SVG authored text'));
+document.append(svgStyle);
 assert.deepEqual(matched(filter(selector('svg-style'), str('SVG authored text')), [svgStyle]), [0]);
 const blocks = new Element('div', 'blocks').append(text('A'), new Element('div').append(text('B')), text('C'));
+document.append(blocks);
 assert.deepEqual(matched(filter(selector('blocks'), regexp('^ABC$')), [blocks]), [0]);
 console.log('PASS: HTML script/style/noscript/head exclusions, SVG distinction, comments/templates and unrendered block boundaries');
 
 for (const type of ['submit', 'button', 'reset']) {
   const button = new Input(type, 'button'); button.value = `Public ${type}`;
+  document.append(button);
   assert.deepEqual(matched(filter(selector('button'), str(`PUBLIC ${type}`)), [button]), [0]);
   assert.deepEqual(matched(filter(selector('button'), regexp(`^Public ${type}$`)), [button]), [0]);
   button.secure = true; forbid(button, 'value', 'secure button value');
   assert.deepEqual(matched(filter(selector('button'), regexp('.*')), [button]), []);
 }
 const editableButton = new Input('button', 'editable-button'); editableButton.isContentEditable = true; forbid(editableButton, 'value');
+document.append(editableButton);
 assert.deepEqual(matched(filter(selector('editable-button'), regexp('.*')), [editableButton]), []);
 console.log('PASS: pinned public submit/button/reset labels only, security and editable ambiguity fail closed');
 
@@ -152,6 +225,7 @@ console.log('PASS: pinned public submit/button/reset labels only, security and e
 const secret = new Element('textarea', 'secret').append(text('never acquire this')); secret.secure = true;
 forbid(secret.childNodes[0], 'nodeValue', 'secure textarea initial text'); forbid(secret, 'value');
 const secureParent = new Element('div', 'secure-parent').append(text('public sibling'), secret);
+document.append(secureParent);
 for (const pattern of [str(''), regexp('.*'), regexp('^(?!never)')]) {
   assert.deepEqual(matched(filter(selector('secret'), pattern), [secret]), []);
   assert.deepEqual(matched(filter(selector('secure-parent'), pattern), [secureParent, secret]), []);
@@ -159,8 +233,10 @@ for (const pattern of [str(''), regexp('.*'), regexp('^(?!never)')]) {
 secret.secure = false;
 assert.deepEqual(matched(filter(selector('secret'), regexp('.*')), [secret], [semantic({ states: { secure: true } })]), []);
 const password = new Input('password', 'password'); forbid(password, 'value');
+document.append(password);
 assert.deepEqual(matched(filter(selector('password'), regexp('.*')), [password]), []);
 const secureHost = new Element('div', 'secure-host'); secureHost.secure = true;
+document.append(secureHost);
 const protectedClosed = secureHost.attachShadow('closed');
 const protectedInside = new Element('span', 'protected-inside').append(text('hidden secret')); protectedClosed.append(protectedInside);
 forbid(protectedInside.childNodes[0], 'nodeValue', 'secure composed ancestor text');
@@ -168,32 +244,41 @@ assert.deepEqual(matched(filter(selector('protected-inside'), regexp('.*')), [pr
 secureHost.secure = false;
 assert.deepEqual(matched(filter(selector('protected-inside'), regexp('.*')), [secureHost, protectedInside], [semantic({ states: { secure: true } }), semantic()]), []);
 const nativeAncestor = new Element('div', 'native-ancestor');
+document.append(nativeAncestor);
 forbid(nativeAncestor, 'childNodes', 'native proven closed-root secure ancestor');
 assert.deepEqual(matched(filter(selector('native-ancestor'), regexp('.*')), [nativeAncestor], [semantic()], [true]), []);
 const plain = new Element('div', 'plain');
+document.append(plain);
 assert.deepEqual(matched(filter(selector('plain'), regexp('^$')), [plain]), [0]);
 console.log('PASS: live/native secure nodes, descendants, closed-root ancestry and native ancestor proof never yield text or guessed matches');
 
 // CSS/role queries do not acquire any matcher text or impose matcher budgets.
 const lazy = new Element('button', 'lazy'); forbid(lazy, 'childNodes'); forbid(lazy, 'value');
+document.append(lazy);
 assert.deepEqual(matched(selector('lazy'), [lazy]), [0]);
 assert.deepEqual(matched({ kind: 'query', query: { kind: 'role', value: str('button'), name: str('Named') } }, [lazy], [semantic({ role: 'button', name: 'Named' })]), [0]);
 const cached = new Element('div', 'cached').append(text('stable')); let acquisitions = 0;
+document.append(cached);
 Object.defineProperty(cached.childNodes[0], 'nodeValue', { get() { acquisitions++; return 'stable'; } });
 assert.deepEqual(matched(filter(filter(selector('cached'), str('stable')), regexp('^stable$')), [cached]), [0]);
 assert.equal(acquisitions, 1);
 const largeRoots = Array.from({ length: 9 }, (_, i) => new Element('div', `large-${i}`).append(text('x'.repeat(1048576))));
+document.append(...largeRoots);
 assert.deepEqual(matched(filter({ kind: 'selector', selector: '*' }, regexp('^x')), largeRoots.slice(0, 8)), [0, 1, 2, 3, 4, 5, 6, 7]);
 assert.deepEqual(run(filter({ kind: 'selector', selector: '*' }, regexp('^x')), largeRoots), { error: 'resource-limit' });
 const oversized = new Element('div', 'oversized').append(text('x'.repeat(1048577)));
+document.append(oversized);
 assert.deepEqual(run(filter(selector('oversized'), str('x')), [oversized]), { error: 'resource-limit' });
 const deep = new Element('div', 'deep'); let cursor = deep;
+document.append(deep);
 for (let i = 0; i < 257; i++) { const child = new Element(); cursor.append(child); cursor = child; }
 cursor.append(text('bottom'));
 assert.deepEqual(run(filter(selector('deep'), str('bottom')), [deep]), { error: 'resource-limit' });
 const wide = new Element('div', 'wide'); wide.childNodes = Array(100001).fill(text('x'));
+document.append(wide);
 assert.deepEqual(run(filter(selector('wide'), str('x')), [wide]), { error: 'resource-limit' });
 const stale = new Element('div', 'stale'); stale.connected = false;
+document.append(stale);
 assert.deepEqual(run(filter(selector('stale'), str('x')), [stale]), { error: 'stale-reference' });
 assert.match(source, /Some\("resource-limit"\)=>return Err\(ObservationError::ResourceLimit\)/);
 console.log('PASS: lazy/cached text acquisition, bounded per-root/aggregate length/depth/pending work, stale identity and typed resource-limit mapping');
@@ -229,6 +314,7 @@ assert.deepEqual(matched(filter(visibleTwins, str('twin')), twinNodes, twinMetad
 assert.equal(twinMetadata[0].text, '');
 assert.equal(JSON.stringify(run(allTwins, twinNodes, twinMetadata)).includes('Decorative'), false);
 const scopedPanel = new Element('section', 'panel').append(hiddenTwin, visibleTwin);
+document.append(scopedPanel);
 assert.deepEqual(matched(textQuery(str('Decorative twin', true), true, selector('panel')), [scopedPanel, ...twinNodes], [semantic(), ...twinMetadata]), [2]);
 const hasVisibleTwin = { kind: 'filter', source: selector('panel'), has: visibleTwins };
 assert.deepEqual(matched(hasVisibleTwin, [scopedPanel, ...twinNodes], [semantic(), ...twinMetadata]), [0]);
@@ -311,4 +397,22 @@ console.log('PASS: private semantic text covers hidden twins, exact/regex, scope
   assert.deepEqual(matched(displayValue('shared'), elements, metadata), [2, 3, 4]);
   assert.deepEqual(selectors, elements.map(() => 'input:not([type="checkbox" i]):not([type="radio" i]),textarea,select'));
   console.log('PASS: original displayValue candidate selector retains text inputs/textarea/select and exactly excludes checkbox/radio');
+}
+
+// Selector discovery is tree-based even when native inventory contains a
+// closed-root handle. Semantic queries above intentionally have wider reach.
+{
+  const outer = new Element('div');
+  const openHost = new Element('div');
+  const openNode = new Element('span', 'raw'); openHost.attachShadow('open').append(openNode);
+  const closedHost = new Element('div');
+  const closedNode = new Element('span', 'raw'); closedHost.attachShadow('closed').append(closedNode);
+  const detached = new Element('span', 'raw'); detached.connected = false;
+  outer.append(openHost, closedHost); document.append(outer);
+  assert.equal(document.querySelectorAll('#raw').includes(openNode), false);
+  assert.equal(document.querySelectorAll('#raw').includes(closedNode), false);
+  assert.equal(document.querySelectorAll('#raw').includes(detached), false);
+  assert.deepEqual(matched(selector('raw'), [openNode, closedNode]), [0]);
+  assert.deepEqual(run(selector('raw'), [detached]), { error: 'stale-reference' });
+  console.log('PASS: selector discovery pierces open roots only; closed and detached nodes are not document CSS matches');
 }

@@ -11,35 +11,61 @@ fn purchase_expression() -> Value {
 }
 
 // Managed readonly groups use the exact operation sequence and a transport
-// allocator instance. A prefix match alone would accept another owner's read.
+// allocator instance. Pure semantic bounds also use this group custody; the
+// strict action object remains native-exact. A prefix-only match is not authority.
 fn locator_readonly_group(session: &str, group: &str, sequence: u64) -> bool {
     if session != "host-session" || sequence == 0 {
         return false;
     }
-    ["native-security-", "native-metadata-", "native-query-"]
-        .iter()
-        .any(|prefix| {
-            let Some(tail) = group.strip_prefix(prefix) else {
-                return false;
-            };
-            let Some((operation, instance)) = tail.split_once('-') else {
-                return false;
-            };
-            operation == sequence.to_string()
-                && instance
-                    .parse::<u64>()
-                    .is_ok_and(|id| id > 0 && id < u64::MAX && id.to_string() == instance)
-        })
+    [
+        "native-security-",
+        "native-metadata-",
+        "native-query-",
+        "native-semantic-box-",
+    ]
+    .iter()
+    .any(|prefix| {
+        let Some(tail) = group.strip_prefix(prefix) else {
+            return false;
+        };
+        let Some((operation, instance)) = tail.split_once('-') else {
+            return false;
+        };
+        operation == sequence.to_string()
+            && instance
+                .parse::<u64>()
+                .is_ok_and(|id| id > 0 && id < u64::MAX && id.to_string() == instance)
+    })
 }
 
 #[test]
 fn locator_readonly_group_requires_exact_owner_sequence_and_canonical_instance() {
-    for prefix in ["native-security", "native-metadata", "native-query"] {
-        assert!(locator_readonly_group(
-            "host-session",
-            &format!("{prefix}-7-13"),
-            7
-        ));
+    for prefix in [
+        "native-security",
+        "native-metadata",
+        "native-query",
+        "native-semantic-box",
+    ] {
+        let valid = format!("{prefix}-7-13");
+        assert!(locator_readonly_group("host-session", &valid, 7));
+        assert!(!locator_readonly_group("replacement-session", &valid, 7));
+        assert!(!locator_readonly_group("host-session", &valid, 8));
+        for suffix in [
+            "0",
+            "013",
+            "+13",
+            "13-extra",
+            "",
+            "x",
+            "18446744073709551615",
+            "18446744073709551616",
+        ] {
+            assert!(!locator_readonly_group(
+                "host-session",
+                &format!("{prefix}-7-{suffix}"),
+                7
+            ));
+        }
     }
     for group in [
         "native-security-7",
@@ -55,7 +81,7 @@ fn locator_readonly_group_requires_exact_owner_sequence_and_canonical_instance()
         "native-security-7-18446744073709551616",
         "other-security-7-13",
         "native-exact",
-        "native-semantic-box-7-13",
+        "native-semantic-box-8-13",
     ] {
         assert!(!locator_readonly_group("host-session", group, 7), "{group}");
     }

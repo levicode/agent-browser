@@ -883,7 +883,17 @@ impl Resolved {
                 d.fill_unsupported_target.store(true, Ordering::SeqCst);
                 Err(ProtocolError::NotActionable)
             }
-            Some("not-actionable") => Err(ProtocolError::NotActionable),
+            Some("not-actionable") => {
+                if !mutation && source == UPLOAD_ADMISSIBILITY {
+                    diagnostic::upload_preflight_refusal(
+                        ctx.operation.generation,
+                        ctx.operation.sequence,
+                        diagnostic::UploadRefusal::from_probe(value["diagnostic"].as_str()),
+                        !d.sent.load(Ordering::SeqCst),
+                    );
+                }
+                Err(ProtocolError::NotActionable)
+            }
             Some("invalid") => Err(ProtocolError::InvalidArguments),
             _ => Ok(value),
         }
@@ -1022,6 +1032,7 @@ fn live_query_error(
         }
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::InvalidLocator => ProtocolError::InvalidLocator,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::StaleReference
         | ObservationError::Superseded
@@ -1796,7 +1807,7 @@ async fn drag(
         None,
     )
     .await?;
-    drag_move_and_release(ctx, d, from, to, pace).await
+    drag_move_and_release(ctx, d, from, to, pace, false).await
 }
 async fn drag_move_and_release(
     ctx: &ActionContext<'_>,
@@ -1804,6 +1815,7 @@ async fn drag_move_and_release(
     from: Point,
     to: Point,
     pace: Option<Duration>,
+    hover_drop_target: bool,
 ) -> Result<(), ProtocolError> {
     let steps = pace
         .map(|p| (p.as_millis() / 16).max(2) as usize)
@@ -1823,6 +1835,13 @@ async fn drag_move_and_release(
         }
         .validate()?;
         pointer_event(ctx, d, "mouseMoved", Some(point), None, None, None).await?;
+    }
+    // A node drag historically visits the destination twice while held: the
+    // first move may only enter it, while the second produces HTML5 dragover.
+    // This is one gesture, never a retry of an uncertain press or move. Bare
+    // point drags and timed swipes retain their original pointer-only sequence.
+    if hover_drop_target {
+        pointer_event(ctx, d, "mouseMoved", Some(to), None, None, None).await?;
     }
     pointer_event(
         ctx,
@@ -2463,7 +2482,22 @@ impl ClientActions {
         d.readonly_preparation_enabled
             .store(readonly_preparation.is_some(), Ordering::SeqCst);
         action_stage("exact.resolve.dispatch");
-        let node = action_target(ctx, d, &request.reference).await?;
+        let node = match action_target(ctx, d, &request.reference).await {
+            Err(error) => {
+                if error == ProtocolError::NotActionable
+                    && matches!(&request.action, LocatorAction::SetInputFiles { .. })
+                {
+                    diagnostic::upload_preflight_refusal(
+                        ctx.operation.generation,
+                        ctx.operation.sequence,
+                        diagnostic::UploadRefusal::TargetResolution,
+                        !d.sent.load(Ordering::SeqCst),
+                    );
+                }
+                return Err(error);
+            }
+            Ok(node) => node,
+        };
         action_stage("exact.resolve.ack");
         d.preparation_enabled
             .store(preparation.is_some(), Ordering::SeqCst);
@@ -2657,7 +2691,7 @@ impl ClientActions {
                         other = Some(action_target(ctx, d, &target).await?);
                     }
                     let (to, _) = center(ctx, d, other.as_ref().unwrap(), true).await?;
-                    drag_move_and_release(ctx, d, from, to, None).await
+                    drag_move_and_release(ctx, d, from, to, None, true).await
                 }
                 .await;
                 let released = match other {
@@ -2765,7 +2799,14 @@ impl ClientActions {
             staged.push((relative, lease));
         }
         // Validate file-input and cardinality before creating files or dispatch.
-        node.call(ctx,d,false,r#"function(directory,count){if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};if(!(this instanceof HTMLInputElement)||this.type!=='file'||this.disabled||this.webkitdirectory!==directory||(!directory&&!this.multiple&&count>1))return {status:'not-actionable'};return true;}"#,vec![json!(directory_name.is_some()),json!(staged.len())]).await?;
+        node.call(
+            ctx,
+            d,
+            false,
+            UPLOAD_ADMISSIBILITY,
+            vec![json!(directory_name.is_some()), json!(staged.len())],
+        )
+        .await?;
         let deadline = ctx.operation.deadline;
         let cancellation = ctx.operation.cancellation.clone();
         let mut resources = self.uploads.lock().await;
@@ -2851,6 +2892,19 @@ async fn focus(
 // input mutation. Its refusal can therefore precede the mutation reservation.
 // PREPARE_FILL still rechecks every predicate after this read; a later race is
 // not a clean refusal and must retain the mutation path's Unknown effects.
+// Identical upload admission predicates; closed diagnostic tags describe only
+// the acknowledged read, never final cleanup, effects, retry, or authority.
+const UPLOAD_ADMISSIBILITY: &str = r#"function(directory,count){
+ if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};
+ if(!(this instanceof HTMLInputElement)||this.type!=='file'){
+  const diagnostic=this instanceof HTMLLabelElement?'label':(this.nodeType===3?'text-node':'not-file-input');
+  return {status:'not-actionable',diagnostic};
+ }
+ if(this.disabled)return {status:'not-actionable',diagnostic:'disabled'};
+ if(this.webkitdirectory!==directory)return {status:'not-actionable',diagnostic:'directory-mismatch'};
+ if(!directory&&!this.multiple&&count>1)return {status:'not-actionable',diagnostic:'multiple-mismatch'};
+ return true;
+}"#;
 const FILL_ADMISSIBILITY: &str = r#"function(){
  if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};
  if(this.matches(':disabled')||this.readOnly)return {status:'not-actionable'};
@@ -4012,6 +4066,7 @@ fn observation_action_error(
         | ObservationError::FrameAmbiguous(_) => ProtocolError::StaleReference,
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::InvalidLocator => ProtocolError::InvalidLocator,
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
         ObservationError::PolicyDenied => ProtocolError::PolicyDenied,
         ObservationError::BackendFailure => ProtocolError::BrowserFailure,
@@ -6364,6 +6419,51 @@ mod tests {
         assert_eq!(inputs.last().unwrap()["params"]["type"], "mouseReleased");
         assert_eq!(inputs.last().unwrap()["params"]["x"].as_f64(), Some(290.));
         assert_eq!(logged_query_matches(&f), 3);
+        assert_drag_handle_release_attempts(&f);
+    }
+    #[tokio::test]
+    async fn node_drag_repeats_destination_move_before_its_only_release() {
+        let mut f = fixture("strict-query-drag-second-drop").await;
+        let binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
+        let id = f.refs.bind_exact(43, "button", "Drop", binding);
+        ClientActions::default()
+            .execute(
+                f.context(),
+                "browser.perform",
+                &json!({
+                    "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                    "action":{"kind":"dragTo","target":{"id":format!("@{id}"),"revision":"1"}}
+                }),
+            )
+            .await
+            .unwrap();
+        let inputs = f.inputs();
+        let kinds: Vec<_> = inputs
+            .iter()
+            .map(|request| request["params"]["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "mouseMoved",
+                "mousePressed",
+                "mouseMoved",
+                "mouseMoved",
+                "mouseMoved",
+                "mouseReleased"
+            ]
+        );
+        for index in [3, 4] {
+            assert_eq!(inputs[index]["params"]["x"], inputs[5]["params"]["x"]);
+            assert_eq!(inputs[index]["params"]["y"], inputs[5]["params"]["y"]);
+            assert_eq!(inputs[index]["params"]["buttons"], 1);
+        }
+        assert_eq!(inputs[5]["params"]["buttons"], 0);
+        assert_eq!(
+            logged_query_matches(&f),
+            0,
+            "observed identity acquires no query authority"
+        );
         assert_drag_handle_release_attempts(&f);
     }
     #[tokio::test]

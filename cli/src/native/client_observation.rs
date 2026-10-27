@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, HashMap};
 mod author_projection;
 #[path = "client_observation/frame_policy.rs"]
 mod frame_policy;
+#[path = "client_observation/fresh_query.rs"]
+mod fresh_query;
 pub(crate) use frame_policy::ObservationFramePolicy;
 #[path = "client_observation/semantic_frame_proof.rs"]
 mod semantic_frame_proof;
@@ -24,12 +26,18 @@ pub(crate) use semantic_frame_proof::SemanticFrameProof;
 #[cfg(test)]
 #[path = "client_observation/composition_tests.rs"]
 pub(crate) mod composition_tests;
+#[path = "client_observation/selector.rs"]
+mod selector;
+#[cfg(test)]
+#[path = "client_observation/selector_expression_tests.rs"]
+mod selector_expression_tests;
 
 /// Public failures are semantic categories, never raw CDP text or string heuristics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ObservationError {
     InvalidArguments,
+    InvalidLocator,
     FrameNotFound(FrameSelectionIndex),
     FrameAmbiguous(FrameAmbiguity),
     UnsupportedCapability,
@@ -2835,6 +2843,14 @@ pub(crate) async fn query_fields(
     validate_expression(&options.expression, 0)?;
     let (path, expression) = split_frame_expression(&options.expression)?;
     let frame = query_frame(client, frames, &path, options, lease, false).await?;
+    if let Some(values) =
+        fresh_query::fields(client, frame, &expression, options, fields, lease).await?
+    {
+        validate_frame_ancestry(client, frames, frame, lease).await?;
+        validate_frame(client, query_root(frames)?, lease).await?;
+        check(lease)?;
+        return Ok(values);
+    }
     let evaluated = evaluate_query(client, frame, &expression, options, lease).await?;
     if evaluated.matches.len() > super::element::MAX_EXACT_REFERENCES {
         return Err(ObservationError::ResourceLimit);
@@ -3009,7 +3025,8 @@ fn project_read_fields(
 
 // Matching runs in the browser JavaScript realm to preserve the caller's JS
 // RegExp semantics (including flags); no Rust-regex approximation is used.
-const MATCH_QUERY: &str = r#"function(expression, data, labels, safeNames, secureSelector, protectedAncestors, ...elements) {
+const MATCH_QUERY: &str = concat!(
+    r#"function(expression, data, labels, safeNames, secureSelector, protectedAncestors, ...elements) {
  const norm=s=>String(s??'').replace(/[\u200b\u200c\u200d\ufeff]/g,'').replace(/\s+/g,' ').trim();
  function match(p,s,testId=false) { if(p.kind==='regexp') return new RegExp(p.source,p.flags).test(String(s??'')); if(testId)return String(s??'')===p.value; const a=norm(s),b=norm(p.value); return p.exact?a===b:a.toLowerCase().includes(b.toLowerCase()); }
  if(elements.some(e=>!e.isConnected||e.ownerDocument!==document))return {error:'stale-reference'};
@@ -3095,30 +3112,28 @@ const MATCH_QUERY: &str = r#"function(expression, data, labels, safeNames, secur
   if(q.kind==='text')return matchSemanticText(q.value,e);
   throw new Error('Unknown semantic query');
  }
- function evaluate(x,scope=all) {
+"#,
+    include_str!("client_observation/selector_query.js"),
+    r#"
+ function evaluate(x,scope=all,root=document) {
   switch(x.kind) {
-   case 'selector': {
-    if(x.selector.startsWith('//')||x.selector.startsWith('xpath=')) {
-     const xpath=x.selector.replace(/^xpath=/,'');
-     return scope.filter(i=>{const d=elements[i].ownerDocument; const r=d.evaluate(xpath,d,null,XPathResult.ORDERED_NODE_SNAPSHOT_TYPE,null); for(let j=0;j<r.snapshotLength;j++)if(r.snapshotItem(j)===elements[i])return true;return false;});
-    }
-    return scope.filter(i=>elements[i].nodeType===1&&elements[i].matches(x.selector));
-   }
+   case 'selector': return selectChain(x.nativeParts,scope,root);
    case 'query': {
-    const roots=x.scope?evaluate(x.scope,scope):null;
+    const roots=x.scope?evaluate(x.scope,scope,root):null;
     let candidates=roots?scope.filter(i=>roots.some(root=>contains(root,i))):scope;
     candidates=candidates.filter(i=>semantic(x.query,i));
     return candidates;
    }
-   case 'union': {const matches=new Set([...evaluate(x.left,scope),...evaluate(x.right,scope)]);return scope.filter(i=>matches.has(i));}
-   case 'filter': return evaluate(x.source,scope).filter(i=>(!x.hasText||matchFilterText(x.hasText,elements[i]))&&(!x.has||evaluate(x.has,scope.filter(j=>contains(i,j))).length>0));
-   case 'index': {const a=evaluate(x.source,scope);const i=x.index==='first'?0:x.index==='last'?a.length-1:x.index;return i>=0&&i<a.length?[a[i]]:[];}
+   case 'union': {const matches=new Set([...evaluate(x.left,scope,root),...evaluate(x.right,scope,root)]);return scope.filter(i=>matches.has(i));}
+   case 'filter': return evaluate(x.source,scope,root).filter(i=>(!x.hasText||matchFilterText(x.hasText,elements[i]))&&(!x.has||evaluate(x.has,scope.filter(j=>contains(i,j)),elements[i]).length>0));
+   case 'index': {const a=evaluate(x.source,scope,root);const i=x.index==='first'?0:x.index==='last'?a.length-1:x.index;return i>=0&&i<a.length?[a[i]]:[];}
    case 'frame': throw new Error('Frame expression must be resolved by native frame scope');
    default: throw new Error('Unknown locator expression');
   }
  }
- try { return {indices:evaluate(expression),redacted}; } catch(error) { return {error:error===matcherLimit?"resource-limit":"invalid-arguments"}; }
-}"#;
+ try { return {indices:evaluate(expression),redacted}; } catch(error) { return {error:error===matcherLimit?"resource-limit":error===invalidSelector?"invalid-locator":"invalid-arguments"}; }
+}"#
+);
 
 /// Query matching and publication are separate: each acquisition publishes fresh
 /// located IDs, while retained live sources later resolve without an allocator.
@@ -3594,12 +3609,12 @@ async fn evaluate_query(
         })).buffered(16).collect().await;
         let objects=collect_hint_results(objects)?;
         if objects.is_empty() { return Ok(QueryEvaluation { projection_count: 0, matches: Vec::new() }); }
-        let mut arguments=vec![json!({"value":expression}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
+        let mut arguments=vec![json!({"value":compile_selector_expression(expression)?}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
         arguments.extend(objects.iter().map(|id|json!({"objectId":id})));
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
         let value=&result["result"]["value"];
-        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
+        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("invalid-locator")=>return Err(ObservationError::InvalidLocator),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
         let indices:Vec<usize>=serde_json::from_value(value["indices"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         let redacted:Vec<usize>=serde_json::from_value(value["redacted"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         for index in redacted { let node=nodes.get_mut(index).ok_or(ObservationError::BackendFailure)?;scrub_ancestor_content(node); }
@@ -4529,7 +4544,46 @@ async fn enumerate_frames_impl(
     Ok(frames)
 }
 
-/// Validate natively before acquisition and return the effective display-value
+/// Parse selector syntax without dispatch or native request reclassification.
+fn parse_selector(source: &str) -> Result<Vec<selector::Part<'_>>, ObservationError> {
+    if source.is_empty() {
+        return Err(ObservationError::InvalidArguments);
+    }
+    selector::parse(source).map_err(|error| match error {
+        selector::ParseError::Invalid => ObservationError::InvalidLocator,
+        selector::ParseError::Unsupported => ObservationError::UnsupportedCapability,
+        selector::ParseError::Limit => ObservationError::ResourceLimit,
+    })
+}
+
+/// Compile only selector leaves of a validated expression for the renderer.
+/// The wire AST and retained live-query source keep their original selector.
+fn compile_selector_expression(expression: &LocatorExpression) -> Result<Value, ObservationError> {
+    fn compile(value: &mut Value) -> Result<(), ObservationError> {
+        if value["kind"] == "selector" {
+            let selector = value["selector"]
+                .as_str()
+                .ok_or(ObservationError::InvalidArguments)?;
+            let parts = parse_selector(selector)?
+                .into_iter()
+                .map(|part| json!({"engine": part.engine, "body": part.body}))
+                .collect::<Vec<_>>();
+            value["nativeParts"] = json!(parts);
+        }
+        for key in ["source", "scope", "has", "left", "right"] {
+            if let Some(child) = value.get_mut(key) {
+                compile(child)?;
+            }
+        }
+        Ok(())
+    }
+    let mut value =
+        serde_json::to_value(expression).map_err(|_| ObservationError::BackendFailure)?;
+    compile(&mut value)?;
+    Ok(value)
+}
+
+/// Validate natively before acquisition and return effective display-value
 /// provenance. Child queries and unions reset provenance; refinements preserve it.
 pub(crate) fn validate_expression(
     expression: &LocatorExpression,
@@ -4575,7 +4629,11 @@ fn validate_expression_with_budget(
             }
             Ok(display_value)
         }
-        LocatorExpression::Index { source, .. } | LocatorExpression::Frame { source, .. } => {
+        LocatorExpression::Index { source, .. } => {
+            validate_expression_with_budget(source, depth + 1, visited)
+        }
+        LocatorExpression::Frame { selector, source } => {
+            parse_selector(selector)?;
             validate_expression_with_budget(source, depth + 1, visited)
         }
         LocatorExpression::Union { left, right } => {
@@ -4587,9 +4645,7 @@ fn validate_expression_with_budget(
             Ok(false)
         }
         LocatorExpression::Selector { selector } => {
-            if selector.is_empty() {
-                return Err(ObservationError::InvalidArguments);
-            }
+            parse_selector(selector)?;
             Ok(false)
         }
     }

@@ -556,6 +556,108 @@ async fn install_source_masks(
     Ok(())
 }
 
+/// DOMSnapshot reports CSS pseudo-elements as nodeType 1, but resolveNode may
+/// expose CSSPseudoElement rather than a Node. Separate only native-proven
+/// generated nodes; never turn an arbitrary failed Element receiver into a skip.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CapturePseudoNodes {
+    indices: HashSet<usize>,
+    origins: Vec<i64>,
+}
+fn capture_pseudo_nodes(
+    document: &Value,
+    strings: &[Value],
+) -> Result<CapturePseudoNodes, CaptureReason> {
+    let nodes = &document["nodes"];
+    let types = nodes["nodeType"]
+        .as_array()
+        .ok_or(CaptureReason::MaskingUnproven)?;
+    let backends = nodes["backendNodeId"]
+        .as_array()
+        .ok_or(CaptureReason::MaskingUnproven)?;
+    if types.len() != backends.len() {
+        return Err(CaptureReason::MaskingUnproven);
+    }
+    if types.len() > MAX_DOM_NODES {
+        return Err(CaptureReason::BoundsExceeded);
+    }
+    let mut proof = CapturePseudoNodes::default();
+    let Some(rare) = nodes.get("pseudoType") else {
+        return Ok(proof);
+    };
+    let indices = rare["index"]
+        .as_array()
+        .ok_or(CaptureReason::MaskingUnproven)?;
+    let values = rare["value"]
+        .as_array()
+        .ok_or(CaptureReason::MaskingUnproven)?;
+    if indices.len() != values.len() {
+        return Err(CaptureReason::MaskingUnproven);
+    }
+    for (index, value) in indices.iter().zip(values) {
+        let index = index
+            .as_u64()
+            .filter(|i| *i < types.len() as u64)
+            .ok_or(CaptureReason::MaskingUnproven)? as usize;
+        let kind = value
+            .as_u64()
+            .and_then(|i| strings.get(i as usize))
+            .and_then(Value::as_str)
+            .ok_or(CaptureReason::MaskingUnproven)?;
+        // These generated boxes belong to their originating element's subtree.
+        // Other pseudo kinds (e.g. view-transition image copies) need a separate
+        // paint proof and must not inherit this bounded exclusion.
+        if types[index].as_u64() != Some(1)
+            || !matches!(kind, "before" | "after" | "marker")
+            || !proof.indices.insert(index)
+        {
+            return Err(CaptureReason::MaskingUnproven);
+        }
+        backends[index]
+            .as_i64()
+            .filter(|id| *id > 0)
+            .ok_or(CaptureReason::MaskingUnproven)?;
+    }
+    if proof.indices.is_empty() {
+        return Ok(proof);
+    }
+    let parents = nodes["parentIndex"]
+        .as_array()
+        .filter(|parents| parents.len() == types.len())
+        .ok_or(CaptureReason::MaskingUnproven)?;
+    let mut origins = HashSet::new();
+    for index in indices {
+        let mut cursor = index.as_u64().ok_or(CaptureReason::MaskingUnproven)? as usize;
+        let mut depth = 0;
+        loop {
+            depth += 1;
+            if depth > 256 {
+                return Err(CaptureReason::BoundsExceeded);
+            }
+            // Snapshot order is parent before child. This also rejects cycles,
+            // cross-document roots and missing or fabricated origin indices.
+            cursor = parents[cursor]
+                .as_u64()
+                .filter(|parent| *parent < cursor as u64)
+                .ok_or(CaptureReason::MaskingUnproven)? as usize;
+            if types[cursor].as_u64() != Some(1) {
+                return Err(CaptureReason::MaskingUnproven);
+            }
+            if !proof.indices.contains(&cursor) {
+                let backend = backends[cursor]
+                    .as_i64()
+                    .filter(|id| *id > 0)
+                    .ok_or(CaptureReason::MaskingUnproven)?;
+                if origins.insert(backend) {
+                    proof.origins.push(backend);
+                }
+                break;
+            }
+        }
+    }
+    Ok(proof)
+}
+
 fn source_mask_backend_ids(document: &Value, strings: &[Value]) -> Result<Vec<i64>, CaptureReason> {
     let nodes = &document["nodes"];
     let types = nodes["nodeType"]
@@ -567,6 +669,7 @@ fn source_mask_backend_ids(document: &Value, strings: &[Value]) -> Result<Vec<i6
     if types.len() != backends.len() {
         return Err(CaptureReason::MaskingUnproven);
     }
+    let pseudo = capture_pseudo_nodes(document, strings)?;
     let mut internal = HashSet::new();
     if let Some(rare) = nodes.get("shadowRootType") {
         let indices = rare["index"]
@@ -605,7 +708,11 @@ fn source_mask_backend_ids(document: &Value, strings: &[Value]) -> Result<Vec<i6
         .iter()
         .zip(backends)
         .enumerate()
-        .filter(|(i, (kind, _))| !internal.contains(i) && matches!(kind.as_u64(), Some(1 | 9 | 11)))
+        .filter(|(i, (kind, _))| {
+            !internal.contains(i)
+                && !pseudo.indices.contains(i)
+                && matches!(kind.as_u64(), Some(1 | 9 | 11))
+        })
         .map(|(_, (_, id))| {
             id.as_i64()
                 .filter(|id| *id > 0)
@@ -845,7 +952,28 @@ async fn masks(
             }
             let group = format!("capture-{}-{}", operation.sequence, id);
             let gathered = async {
-                let ids: Vec<_> = types.iter().zip(backends).filter(|(kind,_)| kind.as_u64()==Some(1)).map(|(_,id)|id.as_i64().ok_or(CaptureReason::MaskingUnproven)).collect::<Result<Vec<i64>,_>>()?;
+                let pseudo = capture_pseudo_nodes(document, strings)?;
+                // Generated content on any protected origin/ancestor remains
+                // refused, including attr(value), overflow and closed roots.
+                // Only real originating Elements enter this separate reader.
+                for batch in pseudo.origins.chunks(64) {
+                    let mut args = vec![json!({"value":request.secure_field_selector})];
+                    let handles: Vec<Result<Value,CaptureReason>> = futures_util::stream::iter(batch.iter().copied().map(|backend| { let group = &group; async move {
+                        let resolved = command(context, operation, &owned.binding.session, "DOM.resolveNode", json!({"backendNodeId":backend,"executionContextId":realm,"objectGroup":group})).await?;
+                        let object = resolved["object"]["objectId"].as_str().ok_or(CaptureReason::MaskingUnproven)?;
+                        Ok::<Value, CaptureReason>(json!({"objectId":object}))
+                    }})).buffered(16).collect().await;
+                    if handles.iter().any(|result| result.as_ref().err() == Some(&CaptureReason::CleanupFailed)) { return Err(CaptureReason::CleanupFailed); }
+                    args.extend(handles.into_iter().collect::<Result<Vec<_>,_>>()?);
+                    let response = command(context, operation, &owned.binding.session, "Runtime.callFunctionOn", json!({"executionContextId":realm,"functionDeclaration":PSEUDO_ORIGIN_READER,"arguments":args,"returnByValue":true,"objectGroup":group})).await?;
+                    if response.get("exceptionDetails").is_some() { return Err(CaptureReason::MaskingUnproven); }
+                    match response["result"]["value"].as_bool() {
+                        Some(true) => {},
+                        Some(false) => return Err(CaptureReason::UnsafeGeometry),
+                        None => return Err(CaptureReason::MaskingUnproven),
+                    }
+                }
+                let ids: Vec<_> = types.iter().zip(backends).enumerate().filter(|(index,(kind,_))| kind.as_u64()==Some(1) && !pseudo.indices.contains(index)).map(|(_,(_,id))|id.as_i64().ok_or(CaptureReason::MaskingUnproven)).collect::<Result<Vec<i64>,_>>()?;
                 let mut owner_paint_checked = false;
                 for batch in ids.chunks(64) {
                     let mut args = vec![json!({"value":request.secure_field_selector})];
@@ -934,6 +1062,25 @@ const OWNER_PAINT_READER: &str = r#"function(){
  const owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
  if(!connected.call(this)||owner.call(this)!==document)return false;
  for(let p=this;p;){if(getComputedStyle(p).filter!=='none')return false;p=p.parentElement||(p.getRootNode().host||null);}
+ return true;
+}"#;
+
+// A pseudo is not an Element receiver. Its native snapshot origin must be a
+// live ordinary Element outside every protected subtree; generated secret paint
+// is deliberately refused rather than assumed to fit the host border polygon.
+const PSEUDO_ORIGIN_READER: &str = r#"function(selector,...nodes){
+ const connected=Object.getOwnPropertyDescriptor(Node.prototype,'isConnected').get;
+ const owner=Object.getOwnPropertyDescriptor(Node.prototype,'ownerDocument').get;
+ const parent=Object.getOwnPropertyDescriptor(Node.prototype,'parentElement').get;
+ const root=Node.prototype.getRootNode,matches=Element.prototype.matches;
+ for(const node of nodes){
+  if(!connected.call(node)||owner.call(node)!==document)throw Error('stale');
+  let depth=0;for(let p=node;p;){
+   if(++depth>256)throw Error('depth');
+   if(matches.call(p,'input[type="password" i]')||matches.call(p,selector))return false;
+   p=parent.call(p)||(root.call(p).host||null);
+  }
+ }
  return true;
 }"#;
 
@@ -1519,3 +1666,7 @@ pub(super) mod retained_capture_test {
 #[cfg(test)]
 #[path = "client_capture_equivalence_tests.rs"]
 mod equivalence_tests;
+
+#[cfg(test)]
+#[path = "client_capture_pseudo_tests.rs"]
+mod pseudo_tests;

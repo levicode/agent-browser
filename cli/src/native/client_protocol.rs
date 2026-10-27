@@ -260,6 +260,7 @@ pub enum ProtocolError {
     DeadlineExceeded,
     Cancelled,
     InvalidArguments,
+    InvalidLocator,
     BrowserFailure,
     StaleScope,
     CleanupFailed,
@@ -302,6 +303,7 @@ impl Serialize for ProtocolError {
             Self::DeadlineExceeded => "deadline-exceeded",
             Self::Cancelled => "cancelled",
             Self::InvalidArguments => "invalid-arguments",
+            Self::InvalidLocator => "invalid-locator",
             Self::BrowserFailure => "browser-failure",
             Self::StaleScope => "stale-scope",
             Self::CleanupFailed => "cleanup-failed",
@@ -591,6 +593,28 @@ mod tests {
                 serde_json::json!({"code":expected})
             );
         }
+    }
+
+    #[test]
+    fn selector_errors_have_a_distinct_closed_wire_code() {
+        let vectors: Value =
+            serde_json::from_str(include_str!("../../tests/fixtures/client-protocol-v1.json"))
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(ProtocolError::InvalidLocator).unwrap(),
+            "invalid-locator"
+        );
+        assert_eq!(
+            serde_json::to_value(WireError {
+                code: ProtocolError::InvalidLocator
+            })
+            .unwrap(),
+            vectors["selectorErrors"][0]["error"]
+        );
+        assert_eq!(
+            serde_json::to_value(ProtocolError::InvalidArguments).unwrap(),
+            "invalid-arguments"
+        );
     }
 
     #[test]

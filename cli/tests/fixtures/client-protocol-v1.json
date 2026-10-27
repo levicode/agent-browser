@@ -923,5 +923,19 @@
         "count": 2
       }
     }
+  ],
+  "selectorErrors": [
+    {
+      "type": "result",
+      "id": "selector",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "invalid-locator"
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    }
   ]
 }

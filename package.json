@@ -14,7 +14,8 @@
     "skill-data",
     "skills",
     "cli/src/native/a11y/LICENSE-axe-core.txt",
-    "cli/src/native/a11y/LICENSE-axe-core-THIRD-PARTY.txt"
+    "cli/src/native/a11y/LICENSE-axe-core-THIRD-PARTY.txt",
+    "cli/src/native/client_observation/selector-NOTICE.md"
   ],
   "bin": {
     "agent-browser": "./bin/agent-browser.js"

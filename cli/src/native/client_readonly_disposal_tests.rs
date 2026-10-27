@@ -45,6 +45,7 @@ impl Peer {
                                 if child { root["childFrames"] = json!([{"frame":{"id":"child","parentId":"root","loaderId":"child-doc","url":"about:blank"}}]); }
                                 json!({"frameTree":root})
                             }
+                            "Page.getLayoutMetrics" => json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"offsetX":0,"offsetY":0,"scale":1},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}}),
                             "Page.createIsolatedWorld" => json!({"executionContextId":3}),
                             "DOM.getFrameOwner" => json!({"backendNodeId":2}),
                             // Deliberately reuse textual IDs across successive groups.
@@ -437,5 +438,121 @@ async fn old_readonly_group_release_after_new_same_text_acquisition_keeps_new_gr
         .unwrap()
         .iter()
         .any(|r| r["method"] == "Runtime.releaseObject"));
+    peer.close().await;
+}
+
+fn semantic_bounds_frame(peer: &Peer) -> ObservationFrame {
+    ObservationFrame {
+        binding: peer.binding(),
+        offset_x: 0.0,
+        offset_y: 0.0,
+        frame_path: vec![],
+        parent_frame_id: None,
+        owner_backend_id: None,
+        url: "about:blank".into(),
+    }
+}
+
+#[tokio::test]
+async fn strict_snapshot_semantic_bounds_debt_never_discharges_strict_polygon_object() {
+    let mut peer = Peer::new(false, false).await;
+    let frame = semantic_bounds_frame(&peer);
+    let geometry = peer
+        .journal
+        .scope(GeometrySnapshot::capture(
+            &peer.client,
+            "page",
+            &[frame.clone()],
+            &peer.operation,
+        ))
+        .await
+        .unwrap();
+    let operation = OperationLease {
+        is_callback: peer.operation.is_callback,
+        generation: peer.operation.generation,
+        sequence: peer.operation.sequence,
+        deadline: Instant::now() + Duration::from_millis(80),
+        cancellation: peer.operation.cancellation.clone(),
+    };
+    let bounds = tokio::time::timeout(
+        Duration::from_millis(80),
+        peer.journal
+            .scope(geometry.node_semantic_bounds(&peer.client, &frame, 1, &operation)),
+    )
+    .await
+    .expect("pure bounds waited for disposal ACK")
+    .unwrap();
+    assert_eq!(bounds.bounds().width, 10.0);
+    let group = peer.next_release().await;
+    assert_eq!(group["method"], "Runtime.releaseObjectGroup");
+    assert_eq!(peer.ledger.snapshot().object_debt, 1);
+    {
+        let strict = peer.journal.scope(geometry.node_border_polygons(
+            &peer.client,
+            &frame,
+            1,
+            &peer.operation,
+        ));
+        tokio::pin!(strict);
+        let object = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::select! {
+                _ = &mut strict => panic!("strict polygon skipped exact object release"),
+                release = peer.releases.recv() => release.unwrap(),
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(object["method"], "Runtime.releaseObject");
+        assert_eq!(object["params"]["objectId"], "reused-readonly-handle");
+        assert_eq!(peer.ledger.snapshot().object_debt, 2);
+        peer.ack(&group);
+        peer.wait_debt(1).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), &mut strict)
+                .await
+                .is_err(),
+            "readonly group ACK must not settle later strict object custody"
+        );
+        peer.ack(&object);
+        assert_eq!(strict.await.unwrap().len(), 1);
+    }
+    peer.wait_debt(0).await;
+    assert!(!peer.ledger.snapshot().integrity_lost);
+    peer.close().await;
+}
+
+#[tokio::test]
+async fn semantic_snapshot_rejects_strict_polygon_before_any_new_cdp_work() {
+    let peer = Peer::new(false, false).await;
+    let frame = semantic_bounds_frame(&peer);
+    let frames = [frame.clone()];
+    let proof = SemanticFrameProof::for_test(&frames, &[], "readonly-disposal", 1, &peer.operation);
+    let geometry = peer
+        .journal
+        .scope(GeometrySnapshot::capture_semantic(
+            &peer.client,
+            "page",
+            &frames,
+            &proof,
+            &ObservationFramePolicy::default(),
+            "readonly-disposal",
+            1,
+            &peer.operation,
+        ))
+        .await
+        .unwrap();
+    let before = peer.log.lock().unwrap().len();
+    assert!(matches!(
+        peer.journal
+            .scope(geometry.node_border_polygons(&peer.client, &frame, 1, &peer.operation))
+            .await,
+        Err(GeometryError::IncompleteInventory)
+    ));
+    assert_eq!(
+        peer.log.lock().unwrap().len(),
+        before,
+        "semantic snapshot must not acquire a strict action/pixel object"
+    );
+    assert_eq!(peer.ledger.snapshot().object_debt, 0);
     peer.close().await;
 }

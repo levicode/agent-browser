@@ -328,6 +328,13 @@ fn semantic_geometry_reply(request: &Value) -> Option<Value> {
                     }
                 }).collect::<Vec<_>>();
                 Some(json!({"result":{"value":values}}))
+            } else if declaration.starts_with("function(expression, data, labels, safeNames, secureSelector, protectedAncestors, ...elements)") {
+                let args = request["params"]["arguments"].as_array().unwrap();
+                assert_eq!(args.len(), 7);
+                assert!(args[6]["objectId"].as_str().unwrap().ends_with("node-2"));
+                assert_eq!(args[0]["value"]["query"]["value"]["value"], "Submit");
+                assert!(request["params"]["objectGroup"].as_str().unwrap().starts_with("native-query-"));
+                Some(json!({"result":{"value":{"indices":[0],"redacted":[]}}}))
             } else if request["params"]["objectGroup"]
                 .as_str()
                 .is_some_and(|group| group.starts_with("native-semantic-box-"))
@@ -1543,4 +1550,105 @@ async fn readonly_frame_owner_held_ack_publishes_both_documents_within_eighty_ms
     .unwrap();
     assert!(!browser.refs.lock().unwrap().ref_ids().is_empty());
     optional_finish(peer, fixture).await.unwrap();
+}
+
+// The RPC label does not turn a temporary semantic rectangle into an action
+// handle or mask polygon. These are real framed commands with an actual ACK held.
+async fn readonly_semantic_bounds_command(command: &str) {
+    let (peer, browser, mut fixture, scope) =
+        optional_fixture(Case::SemanticGeometryReleaseHeld).await;
+    let client = browser.page_lease(false).await.unwrap().client;
+    let ledger = client.debt_ledger().unwrap();
+    fixture.sequence += 1;
+    let mut args = json!({"identityScope":scope,"testIdAttribute":"data-testid",
+        "secureFieldSelector":FIXTURE_SECURE_SELECTOR});
+    if command == "browser.query" {
+        args["expression"] = json!({"kind":"query","query":{"kind":"text",
+            "value":{"kind":"string","value":"Submit","exact":true}}});
+    } else {
+        assert_eq!(command, "browser.trace");
+        args["options"] = json!({});
+    }
+    let started = Instant::now();
+    fixture
+        .write(json!({"type":"request","id":"readonly-semantic-bounds",
+        "generation":1,"operationSeq":fixture.sequence,"timeoutMs":80,
+        "command":command,"args":args}))
+        .await
+        .unwrap();
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "readonly-semantic-bounds"),
+    )
+    .await
+    .expect("semantic bounds waited for readonly disposal ACK");
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["effects"], "completed");
+    assert_eq!(result["scopeState"], "usable");
+    assert!(result["data"].get("pixels").is_none());
+    let node = if command == "browser.query" {
+        assert_eq!(result["data"]["nodes"].as_array().unwrap().len(), 1);
+        &result["data"]["nodes"][0]
+    } else {
+        assert_eq!(result["data"]["root"]["role"], "document");
+        result["data"]["root"]["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["role"] == "button")
+            .unwrap()
+    };
+    assert_eq!(node["name"], "Submit");
+    assert_eq!(node["rect"]["width"], 4.0);
+    assert!(ledger.snapshot().object_debt > 0);
+    assert!(!ledger.snapshot().integrity_lost);
+    let held = peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request["method"] == "Runtime.releaseObjectGroup"
+                && request["params"]["objectGroup"]
+                    .as_str()
+                    .is_some_and(|group| group.starts_with("native-semantic-box-"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0]["sessionId"], "host-session");
+    if command == "browser.trace" {
+        assert!(
+            browser.refs.lock().unwrap().ref_ids().is_empty(),
+            "trace rectangles are not published action references"
+        );
+    } else {
+        let id = node["ref"]["id"].as_str().unwrap().trim_start_matches('@');
+        assert!(browser.refs.lock().unwrap().get(id).is_some());
+    }
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["method"] == "Page.captureScreenshot"
+            || request["method"] == "Input.dispatchMouseEvent"));
+    peer.release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ledger.snapshot().object_debt != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn query_semantic_bounds_returns_before_exact_readonly_release_ack() {
+    readonly_semantic_bounds_command("browser.query").await;
+}
+#[tokio::test]
+async fn trace_semantic_bounds_returns_before_exact_readonly_release_ack_without_action_refs() {
+    readonly_semantic_bounds_command("browser.trace").await;
 }

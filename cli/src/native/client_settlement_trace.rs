@@ -31,6 +31,7 @@ pub(crate) enum SettlementPhase {
     ObservationPixelResult,
     FrameInventoryRejection,
     ReadonlyPrepareFailure,
+    UploadPreflightRefusal,
     TerminalCleanupCheckpoint,
     ServiceWorkerAdmission,
     ExecuteStarted,
@@ -167,6 +168,8 @@ pub(crate) enum MessageKind {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_refusal: Option<UploadRefusal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_cleanup_stage: Option<TerminalCleanupStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1158,6 +1161,62 @@ fn terminal_cleanup_checkpoint_into(capture: &Capture, stage: TerminalCleanupSta
         Facts {
             terminal_cleanup_stage: Some(stage),
             terminal_cleanup_ok: Some(ok),
+            ..Facts::default()
+        },
+    );
+}
+
+/// An upload refusal observed before staging/dispatch. Not a final outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum UploadRefusal {
+    Unknown,
+    TargetResolution,
+    Label,
+    TextNode,
+    NotFileInput,
+    Disabled,
+    DirectoryMismatch,
+    MultipleMismatch,
+}
+impl UploadRefusal {
+    pub(crate) fn from_probe(value: Option<&str>) -> Self {
+        match value {
+            Some("label") => Self::Label,
+            Some("text-node") => Self::TextNode,
+            Some("not-file-input") => Self::NotFileInput,
+            Some("disabled") => Self::Disabled,
+            Some("directory-mismatch") => Self::DirectoryMismatch,
+            Some("multiple-mismatch") => Self::MultipleMismatch,
+            _ => Self::Unknown,
+        }
+    }
+}
+pub(crate) fn upload_preflight_refusal(
+    generation: u64,
+    sequence: u64,
+    refusal: UploadRefusal,
+    zero_input: bool,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        upload_preflight_refusal_into(capture, generation, sequence, refusal, zero_input);
+    }
+}
+fn upload_preflight_refusal_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    refusal: UploadRefusal,
+    zero_input: bool,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::UploadPreflightRefusal,
+        Facts {
+            generation: Some(generation),
+            upload_refusal: Some(refusal),
+            zero_input: Some(zero_input),
             ..Facts::default()
         },
     );
@@ -2608,5 +2667,33 @@ mod protected_capture_diagnostic_tests {
                 | "protectedCaptureReason"
                 | "captureBudgetMs"
         )));
+    }
+}
+
+#[cfg(test)]
+mod upload_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn upload_preflight_is_closed_bounded_and_does_not_serialize_probe_text() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let sentinel = "private renderer value";
+        for (value, expected) in [
+            (Some("label"), "label"),
+            (Some("disabled"), "disabled"),
+            (Some(sentinel), "unknown"),
+            (None, "unknown"),
+        ] {
+            upload_preflight_refusal_into(&capture, 1, 2, UploadRefusal::from_probe(value), true);
+            let text = std::fs::read_to_string(file.path()).unwrap();
+            let line = text.lines().last().unwrap();
+            assert!(line.len() < MAX_RECORD_BYTES);
+            assert!(!line.contains(sentinel));
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(record["phase"], "UploadPreflightRefusal");
+            assert_eq!(record["uploadRefusal"], expected);
+            assert_eq!(record["zeroInput"], true);
+            assert!(record.get("effects").is_none());
+        }
     }
 }

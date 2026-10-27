@@ -4,12 +4,9 @@
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const source = fs.readFileSync(process.argv[2] || path.join(__dirname, '../../src/native/client_observation.rs'), 'utf8');
-const extract = name => {
-  const found = source.match(new RegExp(`const ${name}: &str = r#"([\\s\\S]*?)"#;`));
-  assert.ok(found, `${name} production script is present`);
-  return eval(`(${found[1]})`);
-};
+const sourcePath = process.argv[2] || path.join(__dirname, '../../src/native/client_observation.rs');
+const source = fs.readFileSync(sourcePath, 'utf8');
+const extract = name => eval(`(${require('./native-observation-script.cjs')(sourcePath, name)})`);
 const read = extract('METADATA');
 const match = extract('MATCH_QUERY');
 let document;

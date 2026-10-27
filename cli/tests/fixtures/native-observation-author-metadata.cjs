@@ -14,7 +14,8 @@ function css(values) {
 assert.equal(css({}).getPropertyValue('interactivity'), 'auto');
 assert.equal(css({ interactivity: 'inert' }).getPropertyValue('interactivity'), 'inert');
 assert.throws(() => css({}).getPropertyValue('unexpected-property'), assert.AssertionError);
-const source = fs.readFileSync(path.join(__dirname, '../../src/native/client_observation.rs'), 'utf8');
+const sourcePath = path.join(__dirname, '../../src/native/client_observation.rs');
+const source = fs.readFileSync(sourcePath, 'utf8');
 const script = source.match(/const METADATA: &str = r#"([\s\S]*?)"#;/)[1];
 let document;
 class Node {
@@ -203,8 +204,16 @@ assert.equal(read.call(editor, 'data-testid', '.secure', true).value, null);
 Element.prototype.querySelector = originalQuerySelector;
 console.log('PASS: editing-host rendered value, boundaries, exclusions, and secure protection');
 
-const matchScript = source.match(/const MATCH_QUERY: &str = r#"([\s\S]*?)"#;/)[1];
-const matchQuery = eval(`(${matchScript})`);
+const matchScript = require('./native-observation-script.cjs')(sourcePath, 'MATCH_QUERY');
+const productionMatchQuery = eval(`(${matchScript})`);
+function matchQuery(expression, ...args) {
+  // This metadata fixture starts after compilation, not at the wire parser.
+  if (expression.kind === 'selector') {
+    assert.equal(expression.selector, 'option');
+    expression = { ...expression, nativeParts: [{ engine: 'css', body: 'option' }] };
+  }
+  return productionMatchQuery(expression, ...args);
+}
 const target = new Element();
 const projected = [{ role: 'button', name: 'Log out', states: {}, attributes: {} }];
 for (const name of [{ kind: 'string', value: 'Log out', exact: true }, { kind: 'regexp', source: '^Log out$', flags: 'u' }]) {
@@ -624,6 +633,21 @@ for (const bounded of [false, true]) {
 assert.equal(read.call(hiddenSelect, 'data-testid', '.secure', false).states.hidden, true);
 const rawOptionFacts = read.call(directOption, 'data-testid', '.secure', false);
 const queryOptionFacts = [{ ...rawOptionFacts, role: 'option', name: 'Poland' }];
+// Mount the hidden select/option in a real fixture subtree. CSS discovery is
+// independent of visibility, but must still start from the document tree.
+hiddenSelect.childNodes = [directOption];
+document.documentElement.childNodes = [hiddenSelect];
+hiddenSelect.parentElement = document.documentElement;
+document.querySelectorAll = css => {
+  assert.ok(css === 'option' || css === '*');
+  const found = [], pending = [document.documentElement];
+  while (pending.length) {
+    const element = pending.pop();
+    if (css === '*' || element.matches(css)) found.push(element);
+    for (let i = element.childNodes.length - 1; i >= 0; i--) pending.push(element.childNodes[i]);
+  }
+  return found;
+};
 assert.deepEqual(matchQuery({ kind: 'selector', selector: 'option' }, queryOptionFacts, [[]], [null], '.secure', [false], directOption).indices, [0]);
 assert.deepEqual(matchQuery({ kind: 'query', query: { kind: 'role', value: { kind: 'string', value: 'option', exact: true } } }, queryOptionFacts, [[]], [null], '.secure', [false], directOption).indices, []);
 console.log('PASS: hidden select/option exact metadata, raw value, and selector-versus-role query contracts stay unchanged');

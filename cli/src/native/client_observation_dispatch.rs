@@ -3028,6 +3028,7 @@ fn observation_error(error: ObservationError) -> ProtocolError {
         ObservationError::ResourceLimit => ProtocolError::CapacityExceeded,
         ObservationError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
         ObservationError::InvalidArguments => ProtocolError::InvalidArguments,
+        ObservationError::InvalidLocator => ProtocolError::InvalidLocator,
         ObservationError::FrameNotFound(index) => ProtocolError::FrameNotFound(index),
         ObservationError::FrameAmbiguous(facts) => ProtocolError::FrameAmbiguous(facts),
         ObservationError::UnsupportedCapability => ProtocolError::UnsupportedCapability,
