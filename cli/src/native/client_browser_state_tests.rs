@@ -287,7 +287,72 @@ impl FramedFixture {
                         || frame["operationSeq"] != self.sequence
                         || frame["scopeState"] != "usable"
                     {
-                        return Err("fixture operation correlation or health failed".into());
+                        // Closed protocol facts only: never emit request args,
+                        // response data, IDs, URLs, or native error descriptions.
+                        let command = match name {
+                            "scope.open"
+                            | "scope.configure"
+                            | "network.routes.replace"
+                            | "page.activate"
+                            | "page.title" => name,
+                            _ => "other-fixture-command",
+                        };
+                        let health = match frame["scopeState"].as_str() {
+                            Some(value @ ("usable" | "quarantined" | "closed")) => value,
+                            _ => "missing-or-unknown",
+                        };
+                        let effects = match frame["effects"].as_str() {
+                            Some(value @ ("not-dispatched" | "completed" | "unknown")) => value,
+                            _ => "missing-or-unknown",
+                        };
+                        let code = match frame["error"]["code"].as_str() {
+                            Some(
+                                value @ ("invalid-frame"
+                                | "unsupported-protocol"
+                                | "unsupported-capability"
+                                | "stale-generation"
+                                | "scope-unavailable"
+                                | "sequence-reused"
+                                | "invalid-sequence"
+                                | "invalid-timeout"
+                                | "capacity-exceeded"
+                                | "operation-missing"
+                                | "decision-missing"
+                                | "decision-expired"
+                                | "decision-kind-mismatch"
+                                | "registry-missing"
+                                | "registry-in-use"
+                                | "identifier-exhausted"
+                                | "unsupported-command"
+                                | "deadline-exceeded"
+                                | "cancelled"
+                                | "invalid-arguments"
+                                | "browser-failure"
+                                | "stale-scope"
+                                | "cleanup-failed"
+                                | "stale-reference"
+                                | "policy-denied"
+                                | "not-actionable"
+                                | "locator-not-found"
+                                | "content-length-mismatch"
+                                | "redirect-body-unavailable"
+                                | "intercepted-pointer"
+                                | "checked-state-unchanged"
+                                | "checked-control-replaced"
+                                | "frame-not-found"
+                                | "frame-ambiguous"),
+                            ) => value,
+                            _ => "missing-or-unknown",
+                        };
+                        return Err(format!(
+                            "fixture operation correlation or health failed: {}",
+                            json!({
+                                "command":command,"expectedOperationSeq":self.sequence,
+                                "observedOperationSeq":frame["operationSeq"].as_u64(),
+                                "idMatches":frame["id"]==id,"duplicateResult":result.is_some(),
+                                "scopeState":health,"ok":frame["ok"].as_bool(),"effects":effects,"errorCode":code
+                            })
+                        ));
                     }
                     if frame["ok"] != true {
                         return Err(format!(

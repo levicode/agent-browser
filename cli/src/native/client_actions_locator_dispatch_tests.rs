@@ -14,9 +14,8 @@ const SELECT_MODE: &str = "legacy-locator-select-index";
 pub(super) async fn observed_request(mode: &str, request: &Value, elapsed: Duration) -> Value {
     let mut observed = request.clone();
     if mode == CLOCK_MODE {
-        observed["legacyObservedAtMicros"] = json!(
-            u64::try_from(elapsed.as_micros()).expect("fixture clock fits u64 microseconds")
-        );
+        observed["legacyObservedAtMicros"] =
+            json!(u64::try_from(elapsed.as_micros()).expect("fixture clock fits u64 microseconds"));
     }
     if request["method"] == "Runtime.callFunctionOn" {
         let source = request["params"]["functionDeclaration"].as_str();
@@ -223,8 +222,7 @@ async fn locator_clear_uses_exact_empty_value_then_fallback_delete() {
         .iter()
         .enumerate()
         .filter(|(_, request)| {
-            request["method"] == "Input.dispatchKeyEvent"
-                && request["params"]["key"] == "Delete"
+            request["method"] == "Input.dispatchKeyEvent" && request["params"]["key"] == "Delete"
         })
         .collect();
     assert_eq!(deletes.len(), 2);

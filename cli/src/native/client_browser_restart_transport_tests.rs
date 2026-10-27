@@ -956,6 +956,15 @@ async fn retired_startup_joins_late_target_before_next_attempt_identity() {
     );
     assert!(old.gate.enter(true).is_err());
     assert!(old.owner.lock().await.is_none());
+    let held_requests = old_log.lock().unwrap().clone();
+    assert!(
+        !held_requests.iter().any(|request| matches!(
+            request["method"].as_str(),
+            Some("Target.attachToTarget" | "Target.setAutoAttach")
+        )),
+        "target bootstrap preceded its held create ACK"
+    );
+    let held_request_count = held_requests.len();
     release.send(()).unwrap();
     assert!(
         tokio::time::timeout(bound, opening)
@@ -1002,13 +1011,66 @@ async fn retired_startup_joins_late_target_before_next_attempt_identity() {
         json!({"browserContextId":"synthetic-context"})
     );
     assert!(disposals[0].get("sessionId").is_none());
-    // Shutdown seals the gate while acquisition is retained. The late target
-    // is joined and destroyed before runtime enrollment can install autoattach,
-    // so this pre-enrollment path must not issue either enable or disable.
-    // Post-enrollment phase-two ACK barriers are covered separately above.
-    assert!(!old_requests
+    // Retained blank-page acquisition still completes prepare_domains after
+    // its late create ACK, including page-session iframe autoattach. The closed
+    // gate prevents later runtime enrollment/browser-level autoattach, not this
+    // already-owned bootstrap. Context disposal contains that exact session.
+    let phase_requests = old_requests.iter().enumerate().filter(|(_, request)| matches!(
+        request["method"].as_str(),
+        Some("Target.createBrowserContext" | "Target.createTarget" | "Target.attachToTarget"
+            | "Target.setAutoAttach" | "Target.disposeBrowserContext")
+    )).take(24).map(|(index, request)| json!({
+        "requestIndex":index,"afterHeldAckRelease":index>=held_request_count,
+        "method":request["method"],"sessionId":request.get("sessionId"),"params":request["params"]
+    })).collect::<Vec<_>>();
+    println!(
+        "RETIRED_STARTUP_CDP_PHASES {}",
+        json!({
+            "heldRequestCount":held_request_count,"totalRequestCount":old_requests.len(),"requests":phase_requests
+        })
+    );
+    let autoattach = old_requests
         .iter()
-        .any(|r| r["method"] == "Target.setAutoAttach"));
+        .enumerate()
+        .filter(|(_, request)| request["method"] == "Target.setAutoAttach")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        autoattach.len(),
+        1,
+        "unexpected bootstrap/enrollment autoattach: {phase_requests:?}"
+    );
+    let (autoattach_index, autoattach_request) = autoattach[0];
+    assert_eq!(autoattach_request["sessionId"], "session-1");
+    assert_eq!(
+        autoattach_request["params"],
+        json!({
+            "autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true
+        })
+    );
+    let attached = old_requests
+        .iter()
+        .enumerate()
+        .filter(|(_, request)| request["method"] == "Target.attachToTarget")
+        .collect::<Vec<_>>();
+    assert_eq!(attached.len(), 1);
+    let (attach_index, attach_request) = attached[0];
+    assert_eq!(
+        attach_request["params"],
+        json!({"targetId":"page-1","flatten":true})
+    );
+    assert!(attach_request.get("sessionId").is_none());
+    let dispose_index = old_requests
+        .iter()
+        .position(|request| request["method"] == "Target.disposeBrowserContext")
+        .unwrap();
+    assert!(
+        held_request_count <= attach_index
+            && attach_index < autoattach_index
+            && autoattach_index < dispose_index,
+        "bootstrap/containment order: {phase_requests:?}"
+    );
+    // Post-enrollment browser-level phase-two ACK barriers remain covered by
+    // the separate initialized-owner tests above; no such owner was published.
 
     // Only after actual old-owner cleanup/join, start a new real ClientBrowser.
     // The peer intentionally reuses textual context/page IDs: native authority

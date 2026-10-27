@@ -309,12 +309,26 @@ fn notice(fixture: &mut FramedFixture, frame: &Value) -> Result<(), String> {
     Ok(())
 }
 async fn correlated(fixture: &mut FramedFixture, id: &str) -> Result<Value, String> {
+    let phase = match id {
+        "refused-recording" => "recording start outcome",
+        "after-unknown" => "terminal ordinary-command refusal",
+        _ => return Err("unrecognized recording fixture phase".into()),
+    };
     for _ in 0..32 {
         let frame = tokio::time::timeout(Duration::from_secs(12), fixture.read())
             .await
             .map_err(|_| "recording result timed out")??;
         if frame["generation"] != 1 {
-            return Err("wrong result generation".into());
+            let kind = match frame["type"].as_str() {
+                Some("result") => "result",
+                Some("event") => "event",
+                Some("error") => "terminal error",
+                Some("closed") => "closed",
+                Some("control-result") => "control result",
+                _ => "unexpected",
+            };
+            // Closed categories only: never log an unvalidated frame body.
+            return Err(format!("{phase}: {kind} frame did not carry generation 1"));
         }
         if frame["type"] == "result" {
             if frame["id"] != id || frame["operationSeq"] != fixture.sequence {
@@ -330,7 +344,14 @@ async fn run(fault: Fault) {
     let mut peer = peer(fault).await;
     let broker = Arc::new(ClientSession::new());
     let browser = Arc::new(ClientBrowser::new(broker.clone()));
-    let mut fixture = FramedFixture::new(broker.clone(), browser.clone());
+    // Unknown retires ordinary admission. Negotiate the production terminal
+    // lane so the follow-up below receives a refusal, not an EOF/shutdown error.
+    // This does not permit recording.stop to execute or revive the old scope.
+    let mut fixture = FramedFixture::with_capabilities(
+        broker.clone(),
+        browser.clone(),
+        vec!["terminal.close/1".into()],
+    );
     let proof: Result<(),String> = async {
         let scope = setup(&mut fixture,&peer.endpoint).await?;
         let page = browser.page_lease(false).await.map_err(|e|format!("original page {e:?}"))?;
@@ -427,8 +448,10 @@ async fn run(fault: Fault) {
             fixture.write(json!({"type":"request","id":"after-unknown","generation":1,"operationSeq":fixture.sequence,
                 "timeoutMs":1000,"command":"recording.stop","args":{"identityScope":scope}})).await?;
             let rejected = correlated(&mut fixture,"after-unknown").await?;
-            if rejected["id"] != "after-unknown" || rejected["ok"] != false || rejected["effects"] != "not-dispatched" {
-                return Err(format!("quarantined follow-up was not rejected {rejected}"));
+            if rejected["id"] != "after-unknown" || rejected["ok"] != false || rejected["effects"] != "not-dispatched"
+                || rejected["error"]["code"] != "scope-unavailable" || rejected["scopeState"] != "quarantined"
+                || rejected.get("retention").is_some() || rejected.get("recovery").is_some() {
+                return Err("quarantined follow-up was not a closed terminal refusal".into());
             }
         }
         let requests = peer.requests.lock().unwrap();
@@ -441,11 +464,14 @@ async fn run(fault: Fault) {
     }.await;
     // Joining the real retained owner is mandatory even after a failed assertion.
     // Fault cases need not claim successful owner teardown, but never abort it.
-    let cleanup = fixture.finish().await;
+    drop(fixture.stream);
+    let cleanup = fixture.server.await;
     peer.task.abort();
     let _ = peer.task.await;
+    // A fault may prevent teardown proof, but a task panic is never that proof.
+    let cleanup = cleanup.expect("recording fixture server panicked during cleanup");
     if fault == Fault::None {
-        assert!(cleanup.is_ok(), "cleanup {cleanup:?}; proof {proof:?}");
+        assert!(cleanup, "cleanup unproven; proof {proof:?}");
     }
     proof.unwrap();
 }

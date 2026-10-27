@@ -270,6 +270,7 @@ async fn chromium_persistent_page_close_reopens_without_adopting_another_host_ta
     );
     let result: Result<(),String> = async {
         fixture.ready().await?;
+        println!("PERSISTENT_REOPEN_PHASE ready");
         let mut args = fixture_scope_open("connect",Some(&endpoint));
         args["context"] = "persistent".into();
         let opened = fixture.command("scope.open",args,10).await?;
@@ -280,6 +281,7 @@ async fn chromium_persistent_page_close_reopens_without_adopting_another_host_ta
         fixture.registry = 1;
         fixture.command("page.activate",json!({"identityScope":scope}),10).await?;
         assert_eq!(fixture.command("page.title",json!({"identityScope":scope}),10).await?["title"],"");
+        println!("PERSISTENT_REOPEN_PHASE initial-title-complete");
         let (old_target, old_context) = {
             let owner = browser.owner.lock().await;
             let owner = owner.as_ref().unwrap();
@@ -290,6 +292,7 @@ async fn chromium_persistent_page_close_reopens_without_adopting_another_host_ta
         assert_ne!(other,old_target);
         let closed = host.client.send_command("Target.closeTarget",Some(json!({"targetId":old_target})),None).await.map_err(|_|"application fixture tab close")?;
         assert_eq!(closed["success"],true);
+        println!("PERSISTENT_REOPEN_PHASE original-target-closed");
         fixture.sequence += 1;
         let sequence = fixture.sequence;
         fixture.write(json!({"type":"request","id":"real-reopen","generation":1,"operationSeq":sequence,"timeoutMs":15000,"command":"page.activate","args":{"identityScope":scope}})).await?;
@@ -319,7 +322,9 @@ async fn chromium_persistent_page_close_reopens_without_adopting_another_host_ta
             }
         }
         assert!(completed);
+        println!("PERSISTENT_REOPEN_PHASE reopen-result-complete");
         assert_eq!(fixture.command("page.title",json!({"identityScope":scope}),10).await?["title"],"");
+        println!("PERSISTENT_REOPEN_PHASE replacement-title-complete");
         let owner = browser.owner.lock().await;
         let owner = owner.as_ref().unwrap();
         assert_eq!(owner.identity_scope,scope);
