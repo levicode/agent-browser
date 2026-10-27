@@ -657,6 +657,8 @@ struct CdpTransport {
     bounded_method_taps: BoundedMethodTaps,
     next_tap_id: AtomicU64,
     #[cfg(test)]
+    activation_diagnostic_sequence: AtomicU64,
+    #[cfg(test)]
     worker_startup_decision_gate:
         std::sync::Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
     #[cfg(test)]
@@ -1171,6 +1173,8 @@ impl CdpClient {
                 bounded_method_taps,
                 next_tap_id: AtomicU64::new(1),
                 #[cfg(test)]
+                activation_diagnostic_sequence: AtomicU64::new(0),
+                #[cfg(test)]
                 worker_startup_decision_gate: std::sync::Mutex::new(None),
                 #[cfg(test)]
                 worker_startup_no_receipt_gate: std::sync::Mutex::new(None),
@@ -1448,8 +1452,18 @@ impl CdpClient {
         if self.owner.is_none() && journal.is_none() {
             return Err("Native CDP requires an owner-bound view".into());
         }
-        ledger
-            .reserve_command(journal.as_ref(), method, params, session)
+        let reserved = ledger.reserve_command(journal.as_ref(), method, params, session);
+        #[cfg(test)]
+        if let Err(error) = &reserved {
+            self.activation_diagnostic(
+                "cdp-admission",
+                Some(method),
+                "admission-refused",
+                Some(error),
+                None,
+            );
+        }
+        reserved
             .map(Some)
             .map_err(|_| "Native CDP command admission refused".to_string())
     }
@@ -1481,9 +1495,19 @@ impl CdpClient {
             _ => return Err("Native CDP reservation owner changed".into()),
         }
         if let Some(reservation) = reservation {
-            let submitted = reservation
-                .submit()
-                .map_err(|_| "Native CDP command admission revoked".to_string())?;
+            let submitted = reservation.submit();
+            #[cfg(test)]
+            if let Err(error) = &submitted {
+                self.activation_diagnostic(
+                    "cdp-submit",
+                    None,
+                    "admission-revoked",
+                    Some(error),
+                    None,
+                );
+            }
+            let submitted =
+                submitted.map_err(|_| "Native CDP command admission revoked".to_string())?;
             self.transport
                 .tracked_responses
                 .lock()
@@ -1498,9 +1522,23 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        let reservation = self.reserve_tracked_command(method, params.as_ref(), session_id)?;
-        self.send_reserved_command(method, params, session_id, reservation)
-            .await
+        let reservation = self.reserve_tracked_command(method, params.as_ref(), session_id);
+        #[cfg(test)]
+        self.activation_command_diagnostic(
+            "cdp-reserve",
+            method,
+            reservation.as_ref().map(|_| ()).map_err(String::as_str),
+        );
+        let result = self
+            .send_reserved_command(method, params, session_id, reservation?)
+            .await;
+        #[cfg(test)]
+        self.activation_command_diagnostic(
+            "cdp-result",
+            method,
+            result.as_ref().map(|_| ()).map_err(String::as_str),
+        );
+        result
     }
 
     /// Service-worker renderer domains may not acknowledge enable until the
@@ -2099,7 +2137,22 @@ impl CdpClient {
         response: CommandResponse,
         deadline: Option<std::time::Instant>,
     ) -> Result<Value, String> {
-        match self.await_command_reply(response, deadline).await {
+        let reply = self.await_command_reply(response, deadline).await;
+        #[cfg(test)]
+        self.activation_diagnostic(
+            "cdp-reply",
+            Some(method),
+            match &reply {
+                Ok(CommandReply::Success(_)) => "ok",
+                Ok(CommandReply::ErrorAck(_)) => "error-ack",
+                Ok(CommandReply::LocalFailure(_)) => "local-failure",
+                Err(CommandWaitFailure::ChannelClosed) => "channel-closed",
+                Err(CommandWaitFailure::Deadline) => "deadline",
+            },
+            None,
+            None,
+        );
+        match reply {
             Ok(CommandReply::Success(value)) => Ok(value),
             Ok(CommandReply::ErrorAck(error)) => Err(format!("CDP error ({}): {}", method, error)),
             Ok(CommandReply::LocalFailure(response)) => match response.error {
@@ -2358,6 +2411,134 @@ impl CdpClient {
             .send(Message::Text(json))
             .await
             .map_err(|e| format!("Failed to send raw CDP message: {}", e))
+    }
+
+    // One real-Chrome fixture arms this exact transport around its first
+    // activation only. Diagnostics never submit work or take owner/ledger locks.
+    #[cfg(test)]
+    pub(crate) fn set_activation_diagnostics_for_test(&self, enabled: bool) {
+        self.transport
+            .activation_diagnostic_sequence
+            .store(u64::from(enabled), Ordering::SeqCst);
+    }
+    #[cfg(test)]
+    fn activation_command_diagnostic(
+        &self,
+        stage: &'static str,
+        method: &str,
+        result: Result<(), &str>,
+    ) {
+        let outcome = match result {
+            Ok(()) => "ok",
+            Err(
+                "Native CDP owner changed"
+                | "Native CDP reservation owner changed"
+                | "Native cleanup owner changed",
+            ) => "owner-changed",
+            Err("Native CDP command admission refused") => "admission-refused",
+            Err("Native CDP command admission revoked") => "admission-revoked",
+            Err("CDP response channel closed") => "channel-closed",
+            Err(CONNECTION_CLOSED_ERROR) => "transport-closed",
+            Err(error) if error.starts_with("CDP error (") => "cdp-error",
+            Err(error) if error.starts_with("Failed to send CDP command:") => "send-failed",
+            Err(_) => "other-failure",
+        };
+        self.activation_diagnostic(stage, Some(method), outcome, None, None);
+    }
+    #[cfg(test)]
+    pub(crate) fn activation_diagnostic(
+        &self,
+        stage: &'static str,
+        method: Option<&str>,
+        outcome: &'static str,
+        error: Option<&ProtocolError>,
+        matches: Option<[bool; 4]>,
+    ) {
+        let Ok(sequence) = self.transport.activation_diagnostic_sequence.fetch_update(
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+            |value| {
+                ((value > 0 && value <= 128) || (value == 129 && stage == "ensure-result"))
+                    .then_some(value + 1)
+            },
+        ) else {
+            return;
+        };
+        // One terminal slot survives exhaustion of the detail budget, and is
+        // consumed atomically. Even repeated terminal calls cannot exceed 129.
+        // All supplied strings are projected to closed vocabulary. No raw
+        // message, parameter, URL, target/session/frame/loader ID can escape.
+        let stage = match stage {
+            "ensure-enter"
+            | "ensure-bypass"
+            | "ensure-serial"
+            | "ensure-navigation"
+            | "ensure-navigation-result"
+            | "ensure-flush"
+            | "ensure-flush-result"
+            | "ensure-complete"
+            | "ensure-result"
+            | "guard-check"
+            | "cdp-reserve"
+            | "cdp-reply"
+            | "cdp-result"
+            | "cdp-admission"
+            | "cdp-submit"
+            | "nav-enter"
+            | "nav-frame"
+            | "nav-subscribe"
+            | "nav-trigger-result"
+            | "nav-wait"
+            | "nav-event"
+            | "nav-origin-read"
+            | "nav-complete" => stage,
+            _ => "other-stage",
+        };
+        let method = method.map(|method| match method {
+            "Page.setLifecycleEventsEnabled"
+            | "Page.getFrameTree"
+            | "Page.navigate"
+            | "Runtime.evaluate"
+            | "Page.lifecycleEvent"
+            | "Page.frameNavigated"
+            | "Page.navigatedWithinDocument"
+            | "Inspector.detached"
+            | "Target.detachedFromTarget"
+            | "Target.getTargets"
+            | "Target.getTargetInfo"
+            | "Page.createIsolatedWorld"
+            | "Page.addScriptToEvaluateOnNewDocument"
+            | "Runtime.addBinding"
+            | "Runtime.runIfWaitingForDebugger"
+            | "Target.setAutoAttach"
+            | "Network.enable"
+            | "Page.enable"
+            | "Runtime.enable"
+            | "DOM.enable"
+            | "Fetch.enable"
+            | "Fetch.continueRequest"
+            | "Fetch.failRequest"
+            | "Fetch.continueWithAuth"
+            | "Runtime.getIsolateId"
+            | "Runtime.releaseObject"
+            | "Runtime.releaseObjectGroup" => method,
+            _ => "other-command-or-event",
+        });
+        let outcome = match outcome {
+            "entered" | "ok" | "failed" | "bypass" | "error-ack" | "local-failure"
+            | "channel-closed" | "deadline" | "owner-changed" | "admission-refused"
+            | "admission-revoked" | "transport-closed" | "cdp-error" | "send-failed"
+            | "other-failure" | "overflow" | "malformed-frame" | "download" | "error-text"
+            | "cancelled" | "received" => outcome,
+            _ => "other-outcome",
+        };
+        println!(
+            "PERSISTENT_ACTIVATION_DIAGNOSTIC {}",
+            serde_json::json!({
+                "sequence":sequence,"stage":stage,"method":method,"outcome":outcome,
+                "protocolError":error,"matches":matches,"limitReached":sequence >= 128,
+            })
+        );
     }
 
     #[cfg(test)]

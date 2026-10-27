@@ -279,7 +279,11 @@ async fn chromium_persistent_page_close_reopens_without_adopting_another_host_ta
         fixture.command("scope.configure",fixture_configuration(&scope,None),10).await?;
         fixture.command("network.routes.replace",fixture_routes(&scope),10).await?;
         fixture.registry = 1;
-        fixture.command("page.activate",json!({"identityScope":scope}),10).await?;
+        let activation_client = browser.owner.lock().await.as_ref().unwrap().manager.client.clone();
+        activation_client.set_activation_diagnostics_for_test(true);
+        let activation = fixture.command("page.activate",json!({"identityScope":scope}),10).await;
+        activation_client.set_activation_diagnostics_for_test(false);
+        activation?;
         assert_eq!(fixture.command("page.title",json!({"identityScope":scope}),10).await?["title"],"");
         println!("PERSISTENT_REOPEN_PHASE initial-title-complete");
         let (old_target, old_context) = {

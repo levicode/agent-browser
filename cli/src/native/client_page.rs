@@ -179,14 +179,37 @@ fn decode<T: serde::de::DeserializeOwned>(args: &Value) -> Result<T, ProtocolErr
     serde_json::from_value(args.clone()).map_err(|_| ProtocolError::InvalidArguments)
 }
 fn check(page: &BrowserExecutionLease, op: &OperationLease) -> Result<(), ProtocolError> {
-    page.permit.check()?;
+    let permitted = page.permit.check();
+    #[cfg(test)]
+    if let Err(error) = &permitted {
+        page.client
+            .activation_diagnostic("guard-check", None, "owner-changed", Some(error), None);
+    }
+    permitted?;
     if let Some(journal) = OperationJournalHandle::current() {
-        journal.check_application_submission()?;
+        let admitted = journal.check_application_submission();
+        #[cfg(test)]
+        if let Err(error) = &admitted {
+            page.client.activation_diagnostic(
+                "guard-check",
+                None,
+                "admission-revoked",
+                Some(error),
+                None,
+            );
+        }
+        admitted?;
     }
     if *op.cancellation.borrow() != CancelSignal::None {
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("guard-check", None, "cancelled", None, None);
         return Err(ProtocolError::Cancelled);
     }
     if Instant::now() >= op.deadline {
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("guard-check", None, "deadline", None, None);
         return Err(ProtocolError::DeadlineExceeded);
     }
     Ok(())
@@ -1121,6 +1144,9 @@ impl ClientPageState {
             &mut Option<NavigationInterruptionProof>,
         )>,
     ) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("nav-enter", None, "entered", None, None);
         let expected = navigation_wait(wait)?;
         if wait == "networkidle" {
             let state = self.state()?;
@@ -1142,11 +1168,20 @@ impl ClientPageState {
         )
         .await?;
         let tree = command(page, op, session, "Page.getFrameTree", json!({})).await?;
-        let frame = tree
-            .pointer("/frameTree/frame/id")
-            .and_then(Value::as_str)
-            .ok_or(ProtocolError::BrowserFailure)?
-            .to_owned();
+        let frame = tree.pointer("/frameTree/frame/id").and_then(Value::as_str);
+        #[cfg(test)]
+        page.client.activation_diagnostic(
+            "nav-frame",
+            None,
+            if frame.is_some() {
+                "ok"
+            } else {
+                "malformed-frame"
+            },
+            None,
+            None,
+        );
+        let frame = frame.ok_or(ProtocolError::BrowserFailure)?.to_owned();
         let previous_loader = tree
             .pointer("/frameTree/frame/loaderId")
             .and_then(Value::as_str)
@@ -1176,7 +1211,15 @@ impl ClientPageState {
         let mut events = page
             .client
             .subscribe_bounded_methods(methods, 256, 65_536)
-            .map_err(|_| ProtocolError::CapacityExceeded)?;
+            .map_err(|_| {
+                #[cfg(test)]
+                page.client
+                    .activation_diagnostic("nav-subscribe", None, "failed", None, None);
+                ProtocolError::CapacityExceeded
+            })?;
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("nav-subscribe", None, "ok", None, None);
         if wait == "networkidle" {
             self.state()?
                 .network
@@ -1194,19 +1237,52 @@ impl ClientPageState {
             &mut events,
             retirement,
         )
-        .await?;
+        .await;
+        #[cfg(test)]
+        page.client.activation_diagnostic(
+            "nav-trigger-result",
+            Some(method),
+            if response.is_ok() { "ok" } else { "failed" },
+            response.as_ref().err(),
+            None,
+        );
+        let response = response?;
         if response
             .get("errorText")
             .and_then(Value::as_str)
             .is_some_and(|s| !s.is_empty())
             || response.get("isDownload") == Some(&Value::Bool(true))
         {
+            #[cfg(test)]
+            page.client.activation_diagnostic(
+                "nav-trigger-result",
+                Some(method),
+                if response.get("isDownload") == Some(&Value::Bool(true)) {
+                    "download"
+                } else {
+                    "error-text"
+                },
+                None,
+                None,
+            );
             return Err(ProtocolError::BrowserFailure);
         }
         let mut loader = response
             .get("loaderId")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        #[cfg(test)]
+        page.client.activation_diagnostic(
+            "nav-wait",
+            None,
+            if method != "Page.navigate" || loader.is_some() {
+                "entered"
+            } else {
+                "bypass"
+            },
+            None,
+            None,
+        );
         if method != "Page.navigate" || loader.is_some() {
             let mut cancel = op.cancellation.clone();
             let mut reached = BTreeSet::new();
@@ -1214,19 +1290,70 @@ impl ClientPageState {
             loop {
                 check(page, op)?;
                 let event = tokio::select! {
-                    event=events.recv()=>event.map_err(|_|ProtocolError::BrowserFailure)?,
-                    _=cancel.changed()=>return Err(ProtocolError::Cancelled),
-                    _=tokio::time::sleep_until(op.deadline.into())=>return Err(ProtocolError::DeadlineExceeded),
+                    event=events.recv()=>event.map_err(|_error| {
+                        #[cfg(test)]
+                        page.client.activation_diagnostic("nav-event", None, if _error == "control event overflow" { "overflow" } else { "channel-closed" }, None, None);
+                        ProtocolError::BrowserFailure
+                    })?,
+                    _=cancel.changed()=> {
+                        #[cfg(test)]
+                        page.client.activation_diagnostic("nav-wait", None, "cancelled", None, None);
+                        return Err(ProtocolError::Cancelled);
+                    },
+                    _=tokio::time::sleep_until(op.deadline.into())=> {
+                        #[cfg(test)]
+                        page.client.activation_diagnostic("nav-wait", None, "deadline", None, None);
+                        return Err(ProtocolError::DeadlineExceeded);
+                    },
                 };
+                #[cfg(test)]
+                page.client.activation_diagnostic(
+                    "nav-event",
+                    Some(&event.method),
+                    "received",
+                    None,
+                    Some([
+                        event.session_id.as_deref() == session,
+                        event
+                            .params
+                            .get("frameId")
+                            .or_else(|| event.params.pointer("/frame/id"))
+                            .and_then(Value::as_str)
+                            == Some(&frame),
+                        event
+                            .params
+                            .get("loaderId")
+                            .or_else(|| event.params.pointer("/frame/loaderId"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|id| Some(id) == loader.as_deref()),
+                        event.params.get("name").and_then(Value::as_str) == Some(expected),
+                    ]),
+                );
                 if event.method == "Target.detachedFromTarget"
                     && event.params.get("sessionId").and_then(Value::as_str) == session
                 {
+                    #[cfg(test)]
+                    page.client.activation_diagnostic(
+                        "nav-event",
+                        Some("Target.detachedFromTarget"),
+                        "failed",
+                        None,
+                        None,
+                    );
                     return Err(ProtocolError::BrowserFailure);
                 }
                 if event.session_id.as_deref() != session {
                     continue;
                 }
                 if event.method == "Inspector.detached" {
+                    #[cfg(test)]
+                    page.client.activation_diagnostic(
+                        "nav-event",
+                        Some("Inspector.detached"),
+                        "failed",
+                        None,
+                        None,
+                    );
                     return Err(ProtocolError::BrowserFailure);
                 }
                 if event.method == "Page.navigatedWithinDocument"
@@ -1282,6 +1409,9 @@ impl ClientPageState {
         if wait == "networkidle" {
             self.wait_network_idle(page, op).await?;
         }
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("nav-origin-read", None, "entered", None, None);
         let value = bounded(
             page,
             op,
@@ -1291,7 +1421,16 @@ impl ClientPageState {
                 evaluate_on(&page.client, &page.page_session_id, "location.href"),
             ),
         )
-        .await?;
+        .await;
+        #[cfg(test)]
+        page.client.activation_diagnostic(
+            "nav-origin-read",
+            None,
+            if value.is_ok() { "ok" } else { "failed" },
+            value.as_ref().err(),
+            None,
+        );
+        let value = value?;
         // Same-document navigation from an attached profile's initial page
         // does not add a visited origin in the original context contract.
         if let Some(url) = value
@@ -1304,6 +1443,9 @@ impl ClientPageState {
                 self.state()?.origins.insert(origin);
             }
         }
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("nav-complete", None, "ok", None, None);
         Ok(())
     }
     async fn browser_is_mac(

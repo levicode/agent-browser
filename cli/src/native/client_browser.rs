@@ -495,9 +495,18 @@ impl PageActivation {
         operation: &super::client_session::OperationLease,
         dispatched: &mut bool,
     ) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("ensure-enter", None, "entered", None, None);
         if !self.borrowed || self.active.load(std::sync::atomic::Ordering::SeqCst) {
+            #[cfg(test)]
+            page.client
+                .activation_diagnostic("ensure-bypass", None, "bypass", None, None);
             return Ok(());
         }
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("ensure-serial", None, "entered", None, None);
         let mut cancellation = operation.cancellation.clone();
         check_lifecycle_budget(operation)?;
         let _serial = tokio::select! {
@@ -512,7 +521,11 @@ impl PageActivation {
         }
         let _navigation = self.network.begin_app_navigation(page, operation)?;
         *dispatched = true;
-        self.page_state
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("ensure-navigation", None, "entered", None, None);
+        let navigation = self
+            .page_state
             .execute(
                 page,
                 std::slice::from_ref(&page.page_session_id),
@@ -520,11 +533,35 @@ impl PageActivation {
                 "page.navigate",
                 &serde_json::json!({"url":"about:blank","waitUntil":"domcontentloaded"}),
             )
-            .await?;
-        self.enrollment.flush_app_events(page, operation).await?;
+            .await;
+        #[cfg(test)]
+        page.client.activation_diagnostic(
+            "ensure-navigation-result",
+            None,
+            if navigation.is_ok() { "ok" } else { "failed" },
+            navigation.as_ref().err(),
+            None,
+        );
+        navigation?;
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("ensure-flush", None, "entered", None, None);
+        let flushed = self.enrollment.flush_app_events(page, operation).await;
+        #[cfg(test)]
+        page.client.activation_diagnostic(
+            "ensure-flush-result",
+            None,
+            if flushed.is_ok() { "ok" } else { "failed" },
+            flushed.as_ref().err(),
+            None,
+        );
+        flushed?;
         page.permit.check()?;
         check_lifecycle_budget(operation)?;
         self.active.store(true, std::sync::atomic::Ordering::SeqCst);
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("ensure-complete", None, "ok", None, None);
         Ok(())
     }
 }
@@ -4026,7 +4063,10 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         if command == "page.activate" {
                             // Provider recording needs original ensurePage semantics without
                             // starting the native encoder or navigating an already active page.
-                            activation.ensure(&page, &lease, &mut dispatched).await?;
+                            let activated = activation.ensure(&page, &lease, &mut dispatched).await;
+                            #[cfg(test)]
+                            page.client.activation_diagnostic("ensure-result", None, if activated.is_ok() { "ok" } else { "failed" }, activated.as_ref().err(), None);
+                            activated?;
                             page.permit.check()?;
                             check_lifecycle_budget(&lease)?;
                             page_active.store(true, std::sync::atomic::Ordering::SeqCst);

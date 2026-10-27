@@ -286,7 +286,22 @@ async fn start(fixture: &mut FramedFixture, scope: &str, millis: u64) -> Result<
         )
         .await
 }
-fn notice(fixture: &mut FramedFixture, frame: &Value) -> Result<(), String> {
+fn callback_retirement_matches(frame: &Value, scope: &str, through: u64) -> bool {
+    frame["type"] == "event"
+        && frame["generation"] == 1
+        && through
+            .checked_add(1)
+            .is_some_and(|next| frame["sequence"] == next)
+        && frame["event"] == "scope.callbacks-retired"
+        && frame["payload"] == json!({"identityScope":scope,"throughEventSequence":through})
+        && frame.get("decision").is_none()
+}
+
+fn notice(
+    fixture: &mut FramedFixture,
+    frame: &Value,
+    callbacks_retired: &mut bool,
+) -> Result<(), String> {
     if frame["generation"] != 1
         || frame["type"] != "event"
         || frame["sequence"] != fixture.event_sequence + 1
@@ -299,6 +314,22 @@ fn notice(fixture: &mut FramedFixture, frame: &Value) -> Result<(), String> {
         {
             return Err("invalid native disconnect notice".into());
         }
+    } else if frame["event"] == "scope.callbacks-retired" {
+        // This is the production terminal callback fence, not an application
+        // notice or permission to resume the retired recording operation.
+        if *callbacks_retired
+            || !callback_retirement_matches(
+                frame,
+                fixture
+                    .scope
+                    .as_deref()
+                    .ok_or("retirement notice without scope")?,
+                fixture.event_sequence,
+            )
+        {
+            return Err("invalid or repeated native callback retirement notice".into());
+        }
+        *callbacks_retired = true;
     } else {
         validate_fixture_notice(frame)?;
         if frame["payload"]["identityScope"] != fixture.scope.as_deref().unwrap_or("") {
@@ -308,7 +339,11 @@ fn notice(fixture: &mut FramedFixture, frame: &Value) -> Result<(), String> {
     fixture.event_sequence += 1;
     Ok(())
 }
-async fn correlated(fixture: &mut FramedFixture, id: &str) -> Result<Value, String> {
+async fn correlated(
+    fixture: &mut FramedFixture,
+    id: &str,
+    callbacks_retired: &mut bool,
+) -> Result<Value, String> {
     let phase = match id {
         "refused-recording" => "recording start outcome",
         "after-unknown" => "terminal ordinary-command refusal",
@@ -336,7 +371,7 @@ async fn correlated(fixture: &mut FramedFixture, id: &str) -> Result<Value, Stri
             }
             return Ok(frame);
         }
-        notice(fixture, &frame)?;
+        notice(fixture, &frame, callbacks_retired)?;
     }
     Err("recording frame bound exceeded".into())
 }
@@ -352,6 +387,7 @@ async fn run(fault: Fault) {
         browser.clone(),
         vec!["terminal.close/1".into()],
     );
+    let mut callbacks_retired = false;
     let proof: Result<(),String> = async {
         let scope = setup(&mut fixture,&peer.endpoint).await?;
         let page = browser.page_lease(false).await.map_err(|e|format!("original page {e:?}"))?;
@@ -374,7 +410,7 @@ async fn run(fault: Fault) {
                     accepted = true;
                     break;
                 }
-                notice(&mut fixture,&frame)?;
+                notice(&mut fixture,&frame,&mut callbacks_retired)?;
             }
             if !accepted { return Err("cancel notice bound exceeded".into()); }
         } else if fault == Fault::Deadline {
@@ -403,7 +439,7 @@ async fn run(fault: Fault) {
             tokio::time::sleep(Duration::from_millis(2200)).await;
             peer.replies.send(Some(reply(late,false))).map_err(|_|"peer closed")?;
         }
-        let frame = correlated(&mut fixture,"refused-recording").await?;
+        let frame = correlated(&mut fixture,"refused-recording",&mut callbacks_retired).await?;
         if frame["ok"] != false { return Err("refused start succeeded".into()); }
         if fault == Fault::None {
             if frame["error"]["code"] != "browser-failure" || frame["effects"] != "completed" || frame["scopeState"] != "usable" {
@@ -447,7 +483,7 @@ async fn run(fault: Fault) {
             fixture.sequence += 1;
             fixture.write(json!({"type":"request","id":"after-unknown","generation":1,"operationSeq":fixture.sequence,
                 "timeoutMs":1000,"command":"recording.stop","args":{"identityScope":scope}})).await?;
-            let rejected = correlated(&mut fixture,"after-unknown").await?;
+            let rejected = correlated(&mut fixture,"after-unknown",&mut callbacks_retired).await?;
             if rejected["id"] != "after-unknown" || rejected["ok"] != false || rejected["effects"] != "not-dispatched"
                 || rejected["error"]["code"] != "scope-unavailable" || rejected["scopeState"] != "quarantined"
                 || rejected.get("retention").is_some() || rejected.get("recovery").is_some() {
@@ -512,5 +548,39 @@ async fn recording_start_refusal_cancel_and_deadline_remain_unknown() {
 async fn recording_start_refusal_owner_change_and_missing_start_ack_remain_unknown() {
     for fault in [Fault::OwnerDetached, Fault::StartMissingAck] {
         run(fault).await;
+    }
+}
+
+#[test]
+fn recording_callback_retirement_notice_requires_exact_closed_identity_and_order() {
+    let valid = json!({"type":"event","generation":1,"sequence":4,
+        "event":"scope.callbacks-retired","payload":{"identityScope":"scope","throughEventSequence":3}});
+    assert!(callback_retirement_matches(&valid, "scope", 3));
+    assert!(!callback_retirement_matches(&valid, "foreign", 3));
+    assert!(!callback_retirement_matches(&valid, "scope", 2));
+    assert!(!callback_retirement_matches(&valid, "scope", u64::MAX));
+    for field in ["type", "generation", "sequence", "event", "payload"] {
+        let mut malformed = valid.clone();
+        malformed.as_object_mut().unwrap().remove(field);
+        assert!(!callback_retirement_matches(&malformed, "scope", 3));
+    }
+    for (field, value) in [
+        ("type", json!("result")),
+        ("generation", json!(2)),
+        ("sequence", json!(5)),
+        ("event", json!("other")),
+        ("decision", Value::Null),
+        (
+            "payload",
+            json!({"identityScope":"scope","throughEventSequence":3,"extra":true}),
+        ),
+        (
+            "payload",
+            json!({"identityScope":"scope","throughEventSequence":2}),
+        ),
+    ] {
+        let mut malformed = valid.clone();
+        malformed[field] = value;
+        assert!(!callback_retirement_matches(&malformed, "scope", 3));
     }
 }

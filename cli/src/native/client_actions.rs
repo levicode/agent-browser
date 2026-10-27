@@ -3340,6 +3340,17 @@ impl RecordingLedger {
         }
     }
 }
+// The generic action wait reports a changed cancellation token as Cancelled.
+// Recording startup must preserve the broker's first-wins deadline cause, not
+// replace explicit cancellation or infer a deadline from wall-clock elapsed time.
+fn recording_start_interruption(error: ProtocolError, signal: CancelSignal) -> ProtocolError {
+    if error == ProtocolError::Cancelled && signal == CancelSignal::DeadlineExceeded {
+        ProtocolError::DeadlineExceeded
+    } else {
+        error
+    }
+}
+
 impl ClientActions {
     /// Settle only resources belonging to the exact terminal native connection.
     /// This does not prove host target, process, or evaluate termination, and
@@ -3623,7 +3634,11 @@ impl ClientActions {
         let receipt = authority
             .as_ref()
             .map(|_| Arc::new(recording::RecordingStartReceipt::default()));
-        let result = Self::begin_segment(ctx, d, &mut ledger, receipt.clone()).await;
+        let result = Self::begin_segment(ctx, d, &mut ledger, receipt.clone())
+            .await
+            .map_err(|error| {
+                recording_start_interruption(error, *ctx.operation.cancellation.borrow())
+            });
         let capture_session = ledger
             .current
             .as_ref()
@@ -4262,6 +4277,34 @@ impl FixtureOperations {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recording_start_preserves_only_exact_broker_deadline_cancellation() {
+        use super::{recording_start_interruption, CancelSignal, ProtocolError};
+        for signal in [
+            CancelSignal::None,
+            CancelSignal::Requested,
+            CancelSignal::SessionClosed,
+            CancelSignal::DeadlineExceeded,
+        ] {
+            assert_eq!(
+                recording_start_interruption(ProtocolError::Cancelled, signal),
+                if signal == CancelSignal::DeadlineExceeded {
+                    ProtocolError::DeadlineExceeded
+                } else {
+                    ProtocolError::Cancelled
+                }
+            );
+            for error in [
+                ProtocolError::BrowserFailure,
+                ProtocolError::CleanupFailed,
+                ProtocolError::StaleScope,
+                ProtocolError::DeadlineExceeded,
+            ] {
+                assert_eq!(recording_start_interruption(error.clone(), signal), error);
+            }
+        }
+    }
+
     use super::super::{
         cdp::client::CdpClient, client_blobs::BlobLimits, client_browser::ExecutionGate,
         client_targets::ClientTargets,
@@ -4867,7 +4910,10 @@ mod tests {
             // Only these synthetic, ordinary taps may install the async gate.
             assert!(matches!(
                 fixture.page.identity_scope.as_str(),
-                "preparation-controlled-inside-window" | "preparation-controlled-below-floor"
+                "preparation-controlled-inside-window"
+                    | "preparation-controlled-below-floor"
+                    | "preparation-intercepted"
+                    | "preparation-not-actionable"
             ));
             assert!(!fixture.op.is_callback);
             let binding = (
@@ -4912,7 +4958,10 @@ mod tests {
     ) {
         if !matches!(
             ctx.page.identity_scope.as_str(),
-            "preparation-controlled-inside-window" | "preparation-controlled-below-floor"
+            "preparation-controlled-inside-window"
+                | "preparation-controlled-below-floor"
+                | "preparation-intercepted"
+                | "preparation-not-actionable"
         ) || !matches!(attempt, Err(ProtocolError::NotActionable))
             || !dispatch.preparation_enabled.load(Ordering::SeqCst)
             || !dispatch.preparation_refusal.load(Ordering::SeqCst)
@@ -9582,10 +9631,18 @@ mod tests {
         // lease, not a copy with a deadline or cancellation channel rewritten.
         f.op = broker.admit(1, 1, 800).unwrap();
         assert!(broker.start(1, 1).unwrap());
-        let original_authority = owner
-            .capture_settled_input_authority(&f.page, &f.op)
-            .unwrap();
+        let original_authority = Arc::new(
+            owner
+                .capture_settled_input_authority(&f.page, &f.op)
+                .unwrap(),
+        );
         original_authority.check(&owner, &f.page, &f.op).unwrap();
+        // Positive settlement requires stopping inside the existing narrow
+        // classification window. Natural 16ms retry wakes can skip that window;
+        // use the existing exact-owner gate, not a wider production window.
+        let classification_gate = expected_completed
+            .then(|| PreparationClassificationBoundary::install(&f, original_authority.clone()));
+        let deadline = f.op.deadline;
         let revision = f.page.targets.inventory().unwrap().0;
         assert_eq!(state.held_modifiers().unwrap(), 0);
         assert_eq!(state.mouse_state().unwrap().buttons, 0);
@@ -9648,6 +9705,48 @@ mod tests {
             })
             .await
             .unwrap();
+        let mut gate_registration = None;
+        let mut positive_schedule_valid = !expected_completed;
+        if let Some(gate) = classification_gate {
+            let PreparationClassificationBoundary {
+                _registration,
+                entered,
+                release,
+                released,
+            } = gate;
+            gate_registration = Some(_registration);
+            let entered = tokio::time::timeout_at(deadline.into(), entered)
+                .await
+                .ok()
+                .and_then(Result::ok);
+            let entry_valid = entered.is_some_and(|entry| {
+                entry.deadline == deadline
+                    && entry.authority_valid
+                    && entry.remaining > Duration::from_millis(282) + entry.longest_attempt
+            });
+            if let Some(entry) = entered.filter(|_| entry_valid) {
+                // Same midpoint schedule as the existing controlled positive.
+                // Gate residence never changes longest_attempt or the 800ms lease.
+                let target_remaining = Duration::from_millis(266)
+                    + (Duration::from_millis(16) + entry.longest_attempt) / 2;
+                tokio::time::sleep_until((deadline - target_remaining).into()).await;
+            }
+            let release_sent = release.send(()).is_ok();
+            let released = tokio::time::timeout_at(deadline.into(), released)
+                .await
+                .ok()
+                .and_then(Result::ok);
+            positive_schedule_valid = entry_valid
+                && release_sent
+                && entered.zip(released).is_some_and(|(entry, receipt)| {
+                    receipt.release_received
+                        && receipt.authority_valid
+                        && preparation_classification_window(
+                            receipt.remaining,
+                            entry.longest_attempt,
+                        )
+                });
+        }
         let delivered = receive.await.unwrap();
         // These are the real settlement and next-admission calls, reached even
         // when the desired positive currently returns Unknown. No helper outcome
@@ -9680,6 +9779,13 @@ mod tests {
         };
         f.server.abort();
         let peer_stopped = (&mut f.server).await;
+        drop(gate_registration);
+        // A late scheduler wake is inconclusive, never a forged Completed receipt.
+        // All original protocol/ACK/effect assertions below remain mandatory.
+        assert!(
+            positive_schedule_valid,
+            "{mode}: positive classification schedule inconclusive"
+        );
 
         let method_requests = |method: &str| {
             requests
