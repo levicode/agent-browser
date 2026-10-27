@@ -58,7 +58,7 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             // fractional, non-finite and out-of-range inputs. The renderer
             // owns that coercion; Rust must not invent a different index rule.
             "nth" => {}
-            // Playwright 1.64.1 attributes engines read one exact attribute
+            // Playwright 1.64.1 attribute engines read one exact attribute
             // value and differ only in whether they pierce open shadow roots.
             // The body stays authored source: no unquoting or unescaping.
             "id" | "id:light" | "data-testid" | "data-testid:light" | "data-test-id"
