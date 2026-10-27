@@ -25,6 +25,11 @@ enum Race {
     HeldReleaseAfterReacquisition,
     Protected,
     InvalidLoader,
+    HeldReleaseWithoutRace,
+    Deadline,
+    Superseded,
+    ReleaseError,
+    ReleaseWrongSession,
 }
 struct Fixture {
     context: DispatchContext,
@@ -36,6 +41,7 @@ struct Fixture {
     samples: Arc<AtomicUsize>,
     log: Arc<Mutex<Vec<Value>>>,
     peer: tokio::task::JoinHandle<()>,
+    readonly_replies: tokio::sync::mpsc::UnboundedSender<Value>,
 }
 async fn ready(targets: &Arc<ClientTargets>) {
     targets
@@ -52,6 +58,11 @@ async fn ready(targets: &Arc<ClientTargets>) {
 }
 impl Fixture {
     async fn new(race: Race) -> Self {
+        Self::new_mode(race, false).await
+    }
+    async fn new_mode(race: Race, readonly: bool) -> Self {
+        let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+        let peer_dispatch = dispatch.clone();
         let targets = ClientTargets::new("context".into(), "scope".into());
         ready(&targets).await;
         let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
@@ -61,23 +72,47 @@ impl Fixture {
         let peer_samples = samples.clone();
         let log = Arc::new(Mutex::new(Vec::new()));
         let peer_log = log.clone();
+        let (readonly_replies, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let peer = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
+            if readonly {
+                stream.set_nodelay(true).unwrap();
+            }
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let mut trees = 0;
             let mut releases = 0;
             let mut reservation = None;
+            let mut delayed_final_ack = None;
+            let mut first_release_acked = false;
             let child = matches!(
                 race,
-                Race::HeldRelease | Race::HeldReleaseAfterReacquisition
+                Race::HeldRelease
+                    | Race::HeldReleaseAfterReacquisition
+                    | Race::HeldReleaseWithoutRace
+                    | Race::ReleaseError
+                    | Race::ReleaseWrongSession
             );
-            while let Some(Ok(Message::Text(text))) = socket.next().await {
+            loop {
+                let text = tokio::select! {
+                    reply = reply_rx.recv(), if readonly => {
+                        let Some(reply) = reply else { break; };
+                        if socket.send(Message::Text(reply.to_string())).await.is_err() { break; }
+                        continue;
+                    }
+                    message = socket.next() => match message {
+                        Some(Ok(Message::Text(text))) => text,
+                        _ => break,
+                    },
+                };
                 let request: Value = serde_json::from_str(&text).unwrap();
                 peer_log.lock().unwrap().push(request.clone());
                 let method = request["method"].as_str().unwrap();
                 let mut failed = false;
+                let mut delay_final_ack = false;
+                let mut flush_final_ack = false;
+                let mut wrong_session = false;
                 let result = match method {
                     "Page.getFrameTree" => {
                         trees += 1;
@@ -90,7 +125,16 @@ impl Fixture {
                         } else {
                             "fresh-loader"
                         };
-                        let mut result = json!({"frameTree":{"frame":{"id":"frame","loaderId":loader,"url":"about:blank"}}});
+                        let url = if readonly {
+                            if completed == 0 || race == Race::Protected {
+                                "https://fixture.invalid/old"
+                            } else {
+                                "https://fixture.invalid/fresh"
+                            }
+                        } else {
+                            "about:blank"
+                        };
+                        let mut result = json!({"frameTree":{"frame":{"id":"frame","loaderId":loader,"url":url}}});
                         if child {
                             result["frameTree"]["childFrames"] = json!([{"frame":{"id":"child","parentId":"frame","loaderId":loader,"url":"about:blank"}}]);
                         }
@@ -102,13 +146,17 @@ impl Fixture {
                             let invalidate = match race {
                                 Race::Continuous => true,
                                 Race::Protected => completed == 1,
-                                Race::InvalidLoader => false,
+                                Race::InvalidLoader | Race::HeldReleaseWithoutRace => false,
                                 _ => completed == 0,
                             };
                             if invalidate {
                                 peer_targets
                                     .invalidate_inventory_for(
-                                        InventoryRevisionEvent::Navigate,
+                                        if readonly {
+                                            InventoryRevisionEvent::SameDocument
+                                        } else {
+                                            InventoryRevisionEvent::Navigate
+                                        },
                                         "target",
                                     )
                                     .unwrap();
@@ -132,6 +180,12 @@ impl Fixture {
                                                 .unwrap(),
                                         );
                                     }
+                                    Race::Superseded => {
+                                        peer_dispatch.retire_interaction().await.unwrap()
+                                    }
+                                    Race::Deadline => {
+                                        tokio::time::sleep(Duration::from_millis(100)).await
+                                    }
                                     Race::Replacement => {
                                         peer_targets.detach("target").unwrap();
                                         ready(&peer_targets).await;
@@ -139,6 +193,18 @@ impl Fixture {
                                     _ => {}
                                 }
                             }
+                            // A real first release ACK must reach the reader
+                            // before the first failing frame-fence ACK. Holding
+                            // the second release is a separate sample's debt.
+                            delay_final_ack = readonly
+                                && matches!(
+                                    race,
+                                    Race::HeldReleaseAfterReacquisition
+                                        | Race::ReleaseError
+                                        | Race::ReleaseWrongSession
+                                )
+                                && completed == 0
+                                && !first_release_acked;
                         }
                         result
                     }
@@ -156,6 +222,32 @@ impl Fixture {
                             observation::FRAME_OWNER_GEOMETRY
                         );
                         json!({"result":{"value":{"x":0,"y":0,"selector":"iframe"}}})
+                    }
+                    "Runtime.releaseObjectGroup" if readonly && child => {
+                        let group = request["params"]["objectGroup"].as_str().unwrap();
+                        let suffix = group.strip_prefix("native-frame-owner-1-").unwrap();
+                        let instance = suffix.parse::<u64>().unwrap();
+                        assert!(instance > 0 && instance < u64::MAX);
+                        assert_eq!(instance.to_string(), suffix);
+                        releases += 1;
+                        if matches!(race, Race::HeldRelease | Race::HeldReleaseWithoutRace)
+                            || (race == Race::HeldReleaseAfterReacquisition && releases == 2)
+                        {
+                            continue;
+                        }
+                        if race == Race::ReleaseError {
+                            failed = true;
+                        }
+                        if race == Race::ReleaseWrongSession {
+                            wrong_session = true;
+                        }
+                        first_release_acked = true;
+                        flush_final_ack = true;
+                        json!({})
+                    }
+                    "Page.getLayoutMetrics" if readonly => {
+                        failed = true; // Stop only after the initial/protected prefix.
+                        json!({})
                     }
                     "Runtime.releaseObject" if child => {
                         releases += 1;
@@ -201,12 +293,30 @@ impl Fixture {
                     response["error"] =
                         json!({"code":-32000,"message":"stop after initial acquisition"});
                 }
+                if wrong_session {
+                    response["sessionId"] = "other-session".into();
+                }
+                if delay_final_ack {
+                    assert!(delayed_final_ack.replace(response).is_none());
+                    continue;
+                }
                 if socket
                     .send(Message::Text(response.to_string()))
                     .await
                     .is_err()
                 {
                     break;
+                }
+                if flush_final_ack {
+                    if let Some(response) = delayed_final_ack.take() {
+                        if socket
+                            .send(Message::Text(response.to_string()))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
             drop(reservation);
@@ -219,7 +329,11 @@ impl Fixture {
             generation: 1,
             sequence: 1,
             deadline: Instant::now()
-                + Duration::from_secs(if race == Race::Continuous { 1 } else { 5 }),
+                + if readonly {
+                    Duration::from_millis(80)
+                } else {
+                    Duration::from_secs(if race == Race::Continuous { 1 } else { 5 })
+                },
             cancellation,
         };
         let journal = ledger
@@ -274,11 +388,12 @@ impl Fixture {
             operation,
             journal,
             ledger,
-            dispatch: ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new()))),
+            dispatch,
             cancel,
             samples,
             log,
             peer,
+            readonly_replies,
         }
     }
 }
@@ -883,3 +998,6 @@ async fn trace_initial_inventory_settlement_requires_exact_current_owner() {
     client.close().await;
     fixture.peer.await.unwrap();
 }
+
+#[path = "client_observe_initial_inventory_tests.rs"]
+mod observe_tests;

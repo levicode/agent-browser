@@ -1,4 +1,4 @@
-//! Exact-owner scripted CDP evidence, not Chrome behavior.
+// Exact-owner scripted CDP evidence, not Chrome behavior.
 #[tokio::test]
 async fn peer_context_absence_runs_original_phase_two_without_native_dispose() {
     let (owner, _notices, log, _emit, server, _broker, connection) =

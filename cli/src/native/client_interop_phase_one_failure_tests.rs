@@ -1,6 +1,6 @@
-//! Full ClientBrowser/framed lifecycle, using the existing strict CDP peer.
-//! Hosted encoder dependency is explicit: native recording and child joins are real;
-//! only CDP replies are scripted. Page.stopScreencast receives an actual error ACK.
+// Full ClientBrowser/framed lifecycle, using the existing strict CDP peer.
+// Hosted encoder dependency is explicit: native recording and child joins are real;
+// only CDP replies are scripted. Page.stopScreencast receives an actual error ACK.
 #[tokio::test]
 #[ignore = "hosted ffmpeg: actual managed recorder stop failure during peer retirement"]
 async fn failed_peer_phase_one_still_contains_exact_context_on_terminal_shutdown() {
@@ -14,6 +14,7 @@ async fn failed_peer_phase_one_still_contains_exact_context_on_terminal_shutdown
     );
     let mut retired_enrollment = None;
     let mut recording_directory = None;
+    let mut terminal_notices = TerminalNotices::default();
     let result: Result<(), String> = async {
         let scope = setup(&mut fixture, &peer.endpoint).await?;
         // This ACK is the actual managed recorder startup, including its native
@@ -46,7 +47,7 @@ async fn failed_peer_phase_one_still_contains_exact_context_on_terminal_shutdown
             }}))
             .await?;
         let sequence = fixture.sequence;
-        let outcome = receive_result(&mut fixture, &id, sequence, 1).await?;
+        let outcome = receive_result(&mut fixture, &mut terminal_notices, &id, sequence, 1).await?;
         if outcome["ok"] != false
             || outcome["effects"] != "unknown"
             || outcome["error"]["code"] != "cleanup-failed"

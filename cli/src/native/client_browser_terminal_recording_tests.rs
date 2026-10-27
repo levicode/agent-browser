@@ -271,8 +271,91 @@ async fn setup(fixture: &mut FramedFixture, endpoint: &str) -> Result<String, St
     Ok(scope)
 }
 
+#[derive(Default)]
+struct TerminalNotices {
+    disconnect_expected: bool,
+    disconnected: bool,
+    callbacks_retired: bool,
+}
+fn terminal_notice_kind(frame: &Value) -> &'static str {
+    match frame["event"].as_str() {
+        Some("browser.disconnected") => "browser-disconnected",
+        Some("scope.callbacks-retired") => "callbacks-retired",
+        Some("app.log" | "app.navigation" | "registry-released") => "application",
+        _ => "other",
+    }
+}
+fn validate_terminal_notice(
+    frame: &Value,
+    scope: &str,
+    generation: u64,
+    through: u64,
+    notices: &mut TerminalNotices,
+) -> Result<(), String> {
+    if scope.is_empty() || scope.len() > 128 { return Err("terminal notice without exact scope".into()); }
+    let next = through.checked_add(1).filter(|next| *next <= crate::native::client_protocol::MAX_SAFE_SEQUENCE)
+        .ok_or("terminal notice sequence exhausted")?;
+    if frame["type"] != "event" || frame["generation"] != generation || frame["sequence"] != next {
+        return Err("wrong terminal notice generation/order".into());
+    }
+    match frame["event"].as_str() {
+        Some("browser.disconnected") => {
+            if !notices.disconnect_expected || notices.disconnected || frame != &json!({
+                "type":"event", "generation":generation, "sequence":next,
+                "event":"browser.disconnected", "payload":{"reason":"browser-connection-closed"}
+            }) {
+                return Err("invalid, unexpected or repeated native disconnect notice".into());
+            }
+            notices.disconnected = true;
+        }
+        Some("scope.callbacks-retired") => {
+            if scope.is_empty() || notices.callbacks_retired || frame != &json!({
+                "type":"event", "generation":generation, "sequence":next,
+                "event":"scope.callbacks-retired", "payload":{"identityScope":scope,"throughEventSequence":through}
+            }) {
+                return Err("invalid or repeated terminal callback retirement".into());
+            }
+            notices.callbacks_retired = true;
+        }
+        _ => {
+            validate_fixture_notice(frame)?;
+            let payload = &frame["payload"];
+            let expected = match frame["event"].as_str() {
+                Some("registry-released") => {
+                    // Transport registry retirement may predate scope binding.
+                    // Its optional scope cannot be invented or ignored if present.
+                    let mut expected = json!({"registryVersion":payload["registryVersion"]});
+                    if let Some(identity) = payload.get("identityScope") {
+                        if identity != scope { return Err("wrong registry notice scope".into()); }
+                        expected["identityScope"] = json!(scope);
+                    }
+                    expected
+                }
+                Some("app.log") => json!({"identityScope":scope,"source":payload["source"],
+                    "level":payload["level"],"text":payload["text"]}),
+                Some("app.navigation") => {
+                    if !payload["initiatedByOperation"].is_boolean() {
+                        return Err("invalid navigation initiation flag".into());
+                    }
+                    let mut expected = json!({"identityScope":scope,"kind":payload["kind"],
+                        "url":payload["url"],"initiatedByOperation":payload["initiatedByOperation"]});
+                    if let Some(name) = payload.get("frameName") { expected["frameName"] = name.clone(); }
+                    expected
+                }
+                _ => return Err("unknown terminal application notice".into()),
+            };
+            if frame != &json!({"type":"event","generation":generation,"sequence":next,
+                "event":frame["event"],"payload":expected}) {
+                return Err("invalid terminal application notice shape or scope".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn receive_result(
     fixture: &mut FramedFixture,
+    notices: &mut TerminalNotices,
     id: &str,
     sequence: u64,
     generation: u64,
@@ -290,15 +373,15 @@ async fn receive_result(
             }
             return Ok(frame);
         }
-        if frame["type"] != "event" || frame["sequence"] != fixture.event_sequence + 1 {
-            return Err("unexpected terminal notice".into());
-        }
+        validate_terminal_notice(&frame, fixture.scope.as_deref().ok_or("terminal notice without scope")?, generation, fixture.event_sequence, notices)
+            .map_err(|cause| format!("{cause}; kind={}; generationMatches={}; sequenceMatches={}; decisionAbsent={}",
+                terminal_notice_kind(&frame), frame["generation"] == generation,
+                frame["sequence"] == fixture.event_sequence + 1, frame.get("decision").is_none()))?;
         fixture.event_sequence += 1;
-        validate_fixture_notice(&frame)?;
     }
     Err("terminal notice bound exceeded".into())
 }
-async fn command(fixture: &mut FramedFixture, name: &str, args: Value) -> Result<Value, String> {
+async fn command(fixture: &mut FramedFixture, notices: &mut TerminalNotices, name: &str, args: Value) -> Result<Value, String> {
     fixture.sequence += 1;
     let id = format!("terminal-{}", fixture.sequence);
     fixture
@@ -307,7 +390,7 @@ async fn command(fixture: &mut FramedFixture, name: &str, args: Value) -> Result
         "timeoutMs":1000,"command":name,"args":args}),
         )
         .await?;
-    receive_result(fixture, &id, fixture.sequence, 1).await
+    receive_result(fixture, notices, &id, fixture.sequence, 1).await
 }
 fn completed(frame: Value) -> Result<Value, String> {
     if frame["ok"] != true
@@ -413,6 +496,7 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
     }
     let mut fixture =
         FramedFixture::with_capabilities(broker.clone(), browser.clone(), capabilities);
+    let mut notices = TerminalNotices { disconnect_expected: failed_command == "connection", ..Default::default() };
     let proof: Result<(), String> = async {
         let scope = setup(&mut fixture, &peer.endpoint).await?;
         {
@@ -462,7 +546,7 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
             failure_args["waitUntil"] = json!("load");
             peer.failure_armed.store(true, Ordering::SeqCst);
         }
-        let reset = command(&mut fixture, native_command, failure_args).await?;
+        let reset = command(&mut fixture, &mut notices, native_command, failure_args).await?;
         let failed = fixture.sequence;
         if native_command == "page.navigate" && !peer.failure_reached.load(Ordering::SeqCst) {
             return Err("real navigation did not reach its armed CDP fault".into());
@@ -484,7 +568,7 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
         if broker.health().map_err(|_| "health")?.1 != ScopeState::Quarantined {
             return Err("failed reset became usable".into());
         }
-        let denied = command(&mut fixture, "page.title", json!({"identityScope":scope})).await?;
+        let denied = command(&mut fixture, &mut notices, "page.title", json!({"identityScope":scope})).await?;
         if denied["ok"] != false
             || denied["effects"] != "not-dispatched"
             || denied["error"]["code"] != "scope-unavailable"
@@ -493,7 +577,7 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
         }
         let identity = json!({"identityScope":scope,"failedOperationSeq":failed});
         let collected = command(
-            &mut fixture,
+            &mut fixture, &mut notices,
             "recording.finalized.collect",
             identity.clone(),
         )
@@ -539,14 +623,14 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
             } else {
                 json!("foreign")
             };
-            let denied = command(&mut fixture, "recording.finalized.release", wrong).await?;
+            let denied = command(&mut fixture, &mut notices, "recording.finalized.release", wrong).await?;
             if denied["ok"] != false || denied["effects"] != "not-dispatched" {
                 return Err(format!("foreign {mutation} consumed a frozen artifact"));
             }
         }
         let repeated = completed(
             command(
-                &mut fixture,
+                &mut fixture, &mut notices,
                 "recording.finalized.collect",
                 identity.clone(),
             )
@@ -560,7 +644,7 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
             let mut read = base.clone();
             read["offset"] = json!(bytes.len());
             read["maxBytes"] = json!(262144);
-            let chunk = completed(command(&mut fixture, "recording.finalized.read", read).await?)?;
+            let chunk = completed(command(&mut fixture, &mut notices, "recording.finalized.read", read).await?)?;
             bytes.extend(
                 base64::engine::general_purpose::STANDARD
                     .decode(chunk["base64"].as_str().ok_or("chunk missing")?)
@@ -581,7 +665,7 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
         }
         for _ in 0..2 {
             let released = completed(
-                command(&mut fixture, "recording.finalized.release", base.clone()).await?,
+                command(&mut fixture, &mut notices, "recording.finalized.release", base.clone()).await?,
             )?;
             if released != json!({"released":true}) {
                 return Err("release receipt changed".into());
@@ -593,8 +677,14 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
         let mut read = base;
         read["offset"] = json!(0);
         read["maxBytes"] = json!(1);
-        if command(&mut fixture, "recording.finalized.read", read).await?["ok"] != false {
+        if command(&mut fixture, &mut notices, "recording.finalized.read", read).await?["ok"] != false {
             return Err("released bytes were resurrected".into());
+        }
+        if failed_command == "connection" {
+            // Accepted at most once by the closed decoder, and required for this
+            // explicit EOF fixture; not a substitute for its failed-result proof.
+            if !notices.disconnected { return Err("EOF fixture omitted its exact disconnect notice".into()); }
+            eprintln!("terminal recording EOF notices: disconnectOnce=true, callbacksRetired={}", notices.callbacks_retired);
         }
         // Decode only after transfer/release so it cannot extend the native cutoff.
         decode_video(&bytes).await?;
@@ -794,6 +884,85 @@ async fn poisoned_terminal_recording_custody_never_proves_closed() {
         (0, 0),
         "final owner drop lost original charge accounting"
     );
+}
+
+
+#[test]
+fn terminal_recording_notice_requires_exact_eof_and_callback_shapes() {
+    let disconnect = json!({"type":"event","generation":1,"sequence":4,
+        "event":"browser.disconnected","payload":{"reason":"browser-connection-closed"}});
+    // The old application-only helper rejects the production EOF shape.
+    assert!(validate_fixture_notice(&disconnect).is_err());
+    let mut notices = TerminalNotices { disconnect_expected: true, ..Default::default() };
+    assert_eq!(validate_terminal_notice(&disconnect, "scope", 1, 3, &mut notices), Ok(()));
+    assert!(notices.disconnected);
+    let retirement = json!({"type":"event","generation":1,"sequence":5,
+        "event":"scope.callbacks-retired","payload":{"identityScope":"scope","throughEventSequence":4}});
+    assert!(validate_fixture_notice(&retirement).is_err());
+    assert_eq!(validate_terminal_notice(&retirement, "scope", 1, 4, &mut notices), Ok(()));
+    assert!(notices.callbacks_retired);
+    let mut unexpected = TerminalNotices::default();
+    assert!(validate_terminal_notice(&disconnect, "scope", 1, 3, &mut unexpected).is_err());
+    assert!(!unexpected.disconnected);
+    for payload in [json!({"registryVersion":1}), json!({"registryVersion":1,"identityScope":"scope"})] {
+        let registry = json!({"type":"event","generation":1,"sequence":4,"event":"registry-released","payload":payload});
+        assert_eq!(validate_terminal_notice(&registry, "scope", 1, 3, &mut TerminalNotices::default()), Ok(()));
+    }
+    for (event, payload) in [
+        ("app.log", json!({"identityScope":"scope","source":"console","level":"info","text":"fixture"})),
+        ("app.navigation", json!({"identityScope":"scope","kind":"main","url":"about:blank","initiatedByOperation":true})),
+        ("app.navigation", json!({"identityScope":"scope","kind":"frame","url":"about:blank","initiatedByOperation":false,"frameName":"fixture"})),
+    ] {
+        let frame = json!({"type":"event","generation":1,"sequence":4,"event":event,"payload":payload});
+        assert_eq!(validate_terminal_notice(&frame, "scope", 1, 3, &mut TerminalNotices::default()), Ok(()));
+    }
+    let mut duplicate = disconnect.clone(); duplicate["sequence"] = json!(6);
+    assert!(validate_terminal_notice(&duplicate, "scope", 1, 5, &mut notices).is_err());
+}
+
+#[test]
+fn terminal_recording_notice_rejects_foreign_extra_duplicate_and_out_of_order_events() {
+    let disconnect = json!({"type":"event","generation":1,"sequence":4,
+        "event":"browser.disconnected","payload":{"reason":"browser-connection-closed"}});
+    for (field, value) in [
+        ("event", json!("unexpected.event")), ("generation", json!(2)), ("sequence", json!(3)),
+        ("decision", json!({"token":"not-allowed"})), ("extra", json!(true)),
+        ("payload", json!({"reason":"unproven-transport-error"})),
+        ("payload", json!({"reason":"browser-connection-closed","identityScope":"foreign"})),
+    ] {
+        let mut invalid = disconnect.clone(); invalid[field] = value;
+        let mut notices = TerminalNotices { disconnect_expected: true, ..Default::default() };
+        assert!(validate_terminal_notice(&invalid, "scope", 1, 3, &mut notices).is_err(), "accepted {field}");
+        assert!(!notices.disconnected && !notices.callbacks_retired);
+    }
+    for (event, payload) in [
+        ("registry-released", json!({"registryVersion":1,"identityScope":"foreign"})),
+        ("registry-released", json!({"registryVersion":1,"identityScope":null})),
+        ("registry-released", json!({"registryVersion":1,"extra":true})),
+        ("app.log", json!({"source":"console","level":"info","text":"fixture"})),
+        ("app.log", json!({"identityScope":"foreign","source":"console","level":"info","text":"fixture"})),
+        ("app.navigation", json!({"identityScope":"scope","kind":"main","url":"about:blank"})),
+        ("app.navigation", json!({"identityScope":"foreign","kind":"main","url":"about:blank","initiatedByOperation":true})),
+        ("app.navigation", json!({"identityScope":"scope","kind":"main","url":"about:blank","initiatedByOperation":true,"extra":true})),
+    ] {
+        let frame = json!({"type":"event","generation":1,"sequence":4,"event":event,"payload":payload});
+        assert!(validate_terminal_notice(&frame, "scope", 1, 3, &mut TerminalNotices::default()).is_err(), "accepted {event}");
+    }
+    let retirement = json!({"type":"event","generation":1,"sequence":4,
+        "event":"scope.callbacks-retired","payload":{"identityScope":"scope","throughEventSequence":3}});
+    for payload in [json!({"identityScope":"foreign","throughEventSequence":3}),
+        json!({"identityScope":"scope","throughEventSequence":2}),
+        json!({"identityScope":"scope","throughEventSequence":3,"extra":true})] {
+        let mut invalid = retirement.clone(); invalid["payload"] = payload;
+        assert!(validate_terminal_notice(&invalid, "scope", 1, 3, &mut TerminalNotices::default()).is_err());
+    }
+    let mut notices = TerminalNotices::default();
+    assert_eq!(validate_terminal_notice(&retirement, "scope", 1, 3, &mut notices), Ok(()));
+    let repeated = json!({"type":"event","generation":1,"sequence":5,
+        "event":"scope.callbacks-retired","payload":{"identityScope":"scope","throughEventSequence":4}});
+    assert!(validate_terminal_notice(&repeated, "scope", 1, 4, &mut notices).is_err());
+    assert!(validate_terminal_notice(&disconnect, "", 1, 3, &mut TerminalNotices::default()).is_err());
+    assert!(validate_terminal_notice(&disconnect, "scope", 1, u64::MAX, &mut TerminalNotices::default()).is_err());
 }
 
 include!("client_interop_phase_one_failure_tests.rs");

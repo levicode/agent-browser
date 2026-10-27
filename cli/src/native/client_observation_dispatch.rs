@@ -1205,6 +1205,92 @@ impl ObservationDispatch {
             }
         }
     }
+    // Only INITIAL Observe inventory can discard one revision-raced prefix.
+    // Neither a changed sample nor a queued release is usable proof for the next
+    // attempt. Semantic capture and every later protected/final proof stay strict.
+    async fn initial_observe_frames(
+        &self,
+        context: &DispatchContext,
+        operation: &OperationLease,
+        capture: Option<&Arc<CaptureAdmission>>,
+        retirement_fence: u64,
+        cleanup: &AtomicBool,
+        screenshot: Option<&ScreenshotFailureWitness>,
+    ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+        let check_owner = || {
+            self.check_initial_trace_owner(context, operation, retirement_fence)?;
+            let capture = capture.ok_or(ProtocolError::StaleReference)?;
+            let authority = self
+                .captures
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if authority.retirement_fence != retirement_fence
+                || capture.sequence != operation.sequence
+                || capture.owner.scope != context.scope
+                || !capture.owner.matches(&context.page, operation.generation)
+                || !authority
+                    .latest
+                    .iter()
+                    .any(|current| Arc::ptr_eq(current, capture))
+            {
+                return Err(ProtocolError::StaleReference);
+            }
+            Ok(())
+        };
+        check_owner()?;
+        let first =
+            frame_inventory_attempt_impl(&context.page, operation, Some(cleanup), screenshot, true)
+                .await;
+        let rejected = match first {
+            Ok(inventory) => {
+                check_owner()?;
+                // The original successful-read contract permits accounted
+                // readonly disposal debt; it never requires a release ACK here.
+                return Ok(inventory.frames);
+            }
+            Err(failure) => failure,
+        };
+        if !rejected.revision_only() {
+            return Err(rejected.record(screenshot));
+        }
+        check_owner()?;
+        if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+            return Err(rejected.record(screenshot));
+        }
+        tokio::task::yield_now().await;
+        check_owner()?;
+        if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+            return Err(rejected.record(screenshot));
+        }
+        // No loop: the old sample is discarded and a second raced sample fails.
+        let inventory =
+            frame_inventory_attempt_impl(&context.page, operation, Some(cleanup), screenshot, true)
+                .await
+                .map_err(|failure| failure.record(screenshot))?;
+        check_owner()?;
+        let ledger = context
+            .page
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        if cleanup.load(Ordering::SeqCst)
+            || !ledger.matches_owner(operation.generation, &context.scope.identity_scope)
+            || context
+                .page
+                .client
+                .check_cleanup_owner(&Some(ledger.clone()))
+                .is_err()
+            || ledger
+                .check_admission(super::client_debt::AdmissionClass::Reference)
+                .is_err()
+            || ledger.snapshot().integrity_lost
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        // NEW readonly debt belongs to the accepted second sample, not to the
+        // discarded first prefix. Its exact custody remains normally retained.
+        Ok(inventory.frames)
+    }
     /// Enrich an independently sealed tree without giving its result deadline to
     /// raw-pixel settlement. This future stays inside the original retained run,
     /// with its UI/publication guards, journal and exact capture ticket alive.
@@ -1803,7 +1889,7 @@ impl ObservationDispatch {
             || matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
             self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
         } else if matches!(&request, DispatchRequest::Observe(_)) {
-            verified_semantic_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup), screenshot).await
+            self.initial_observe_frames(&context, &operation, capture.as_ref(), retirement_fence, &observation_cleanup, screenshot).await
         } else {
             verified_frames_with_diagnostic(&context.page, &operation, Some(&observation_cleanup), screenshot).await
         }.map_err(failure)?;
@@ -4193,13 +4279,22 @@ mod tests {
         ] {
             semantic_timeout_fallback_admission(false, true, mode, true).await;
         }
-        // A semantic-only read owns no animation restore. Request initial pixels
-        // here so dirty restoration is a real owned effect, not a fabricated flag.
-        for mode in [
-            FallbackTestMode::SemanticPolicyBranch,
-            FallbackTestMode::SemanticCancel,
-        ] {
-            semantic_timeout_fallback_admission(true, true, mode, true).await;
+    }
+    #[cfg(feature = "acceptance-faults")]
+    #[tokio::test]
+    async fn semantic_failure_before_optional_pixels_never_creates_restore_debt() {
+        // Optional pixels start only after complete safe semantics. Policy and
+        // cancellation failures cannot own an animation restoration to fail,
+        // even when the caller requested pixels and allowed deadline fallback.
+        for pixels in [false, true] {
+            for mode in [
+                FallbackTestMode::SemanticPolicyBranch,
+                FallbackTestMode::PolicyGate,
+                FallbackTestMode::SemanticCancel,
+            ] {
+                semantic_timeout_fallback_admission_with_refs(pixels, true, mode, false, true)
+                    .await;
+            }
         }
     }
     #[cfg(feature = "acceptance-faults")]
@@ -4351,6 +4446,10 @@ mod tests {
             .write_to(&mut bytes, image::ImageFormat::Png)
             .unwrap();
         let png = base64::engine::general_purpose::STANDARD.encode(bytes.into_inner());
+        let faults = Arc::new(FaultController::default());
+        let token = faults.arm("scope", Phase::SemanticAcquire).unwrap();
+        let peer_faults = faults.clone();
+        let peer_token = token.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -4380,6 +4479,34 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push(request["method"].as_str().unwrap().to_owned());
+                let method = request["method"].as_str().unwrap();
+                if method.starts_with("Animation.")
+                    || matches!(
+                        method,
+                        "Page.setWebLifecycleState"
+                            | "DOMSnapshot.captureSnapshot"
+                            | "Page.captureScreenshot"
+                            | "Runtime.evaluate"
+                            | "Runtime.callFunctionOn"
+                            | "Runtime.releaseObjectGroup"
+                    )
+                {
+                    assert!(
+                        fallback
+                            && !matches!(
+                                mode,
+                                FallbackTestMode::SemanticPolicyBranch
+                                    | FallbackTestMode::PolicyGate
+                                    | FallbackTestMode::SemanticCancel
+                            ),
+                        "semantic refusal must not dispatch pixel work: {mode:?}, {method}"
+                    );
+                    assert_eq!(
+                        peer_faults.status("scope", &peer_token).unwrap().state,
+                        State::Expired,
+                        "pixel work must follow the actual semantic deadline: {method}"
+                    );
+                }
                 if request["method"]
                     .as_str()
                     .is_some_and(|method| method.starts_with("Animation."))
@@ -4530,8 +4657,6 @@ mod tests {
             permit: gate.enter(false).unwrap(),
             targets: targets.clone(),
         };
-        let faults = Arc::new(FaultController::default());
-        let token = faults.arm("scope", Phase::SemanticAcquire).unwrap();
         let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
         let operation = OperationLease {
             is_callback: false,
@@ -4679,6 +4804,11 @@ mod tests {
             })
             .await
             .unwrap();
+            assert_eq!(animation_commands.load(Ordering::SeqCst), 0);
+            assert_eq!(snapshots.load(Ordering::SeqCst), 0);
+            assert_eq!(captures.load(Ordering::SeqCst), 0);
+            assert!(source_commands.lock().unwrap().is_empty());
+            assert!(!budget_changes.has_changed().unwrap());
             cancel.send(CancelSignal::Requested).unwrap();
         }
         if capture_cancel {
@@ -4781,6 +4911,35 @@ mod tests {
         let semantic_policy = matches!(
             mode,
             FallbackTestMode::SemanticPolicyBranch | FallbackTestMode::PolicyGate
+        );
+        let semantic_failure = semantic_policy || mode == FallbackTestMode::SemanticCancel;
+        let expected_animation: &[&str] =
+            if !fallback || semantic_failure || mode == FallbackTestMode::Occupied {
+                &[]
+            } else if capture_unsettled {
+                &[
+                    "Animation.enable",
+                    "Animation.getPlaybackRate",
+                    "Animation.setPlaybackRate",
+                ]
+            } else {
+                &[
+                    "Animation.enable",
+                    "Animation.getPlaybackRate",
+                    "Animation.setPlaybackRate",
+                    "Animation.setPlaybackRate",
+                ]
+            };
+        assert_eq!(
+            commands
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|method| method.starts_with("Animation."))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            expected_animation,
+            "only the separately admitted fallback owns an animation cycle: {mode:?}"
         );
         assert_eq!(
             faults.status("scope", &token).unwrap().state,
@@ -4895,10 +5054,9 @@ mod tests {
                         | FallbackTestMode::SemanticCancel
                 );
             assert_eq!(captures.load(Ordering::SeqCst), usize::from(!pre_capture));
-            let semantic_failure = semantic_policy || mode == FallbackTestMode::SemanticCancel;
             assert_eq!(
                 animation_commands.load(Ordering::SeqCst),
-                if semantic_failure && !pixels {
+                if semantic_failure {
                     0
                 } else if capture_unsettled {
                     3
@@ -4936,7 +5094,7 @@ mod tests {
             );
             assert_eq!(targets.inventory().is_err(), integrity_lost_expected);
             assert_eq!(gate.enter(false).is_err(), authority_revoked);
-            if semantic_failure && !pixels {
+            if semantic_failure {
                 assert!(!budget_changes.has_changed().unwrap());
             }
             if mode == FallbackTestMode::PolicyGate {
@@ -5058,10 +5216,7 @@ mod tests {
             State::Expired
         );
         assert!(lifecycle.lock().unwrap().is_empty());
-        assert_eq!(
-            animation_commands.load(Ordering::SeqCst),
-            if pixels { 8 } else { 4 }
-        );
+        assert_eq!(animation_commands.load(Ordering::SeqCst), 4);
         let expected_source_cycle = ["holder", "verify", "verify", "remove", "release"];
         assert_eq!(
                 *source_commands.lock().unwrap(),
