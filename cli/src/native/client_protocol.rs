@@ -49,7 +49,8 @@ pub enum ClientMessage {
     },
 }
 
-/// Decision payloads never contain arbitrary browser commands or raw CDP IDs.
+/// Decisions never contain arbitrary browser commands. Exact raw IDs are accepted
+/// only by the closed, operation-owned interop creation rendezvous.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum Decision {
@@ -88,6 +89,17 @@ pub enum Decision {
         #[serde(rename = "promptText", default)]
         prompt_text: Option<String>,
     },
+    /// Acknowledges only the exact old context named by the pending operation.
+    InteropRetired {},
+    /// The lifecycle owner independently validates these untrusted identities.
+    InteropCreated {
+        #[serde(rename = "contextId")]
+        context_id: String,
+        #[serde(rename = "targetId")]
+        target_id: String,
+    },
+    /// Static refusal; the Node owner retains its actual local error/receipts.
+    InteropFailed {},
 }
 
 impl Decision {
@@ -162,7 +174,17 @@ impl Decision {
                 accept,
                 prompt_text,
             } => *accept || prompt_text.is_none(),
-            Self::Abort {} | Self::Auth { .. } | Self::CancelAuth {} => true,
+            Self::InteropCreated {
+                context_id,
+                target_id,
+            } => [context_id, target_id]
+                .iter()
+                .all(|id| !id.is_empty() && id.len() <= 1024 && !id.chars().any(char::is_control)),
+            Self::Abort {}
+            | Self::Auth { .. }
+            | Self::CancelAuth {}
+            | Self::InteropRetired {}
+            | Self::InteropFailed {} => true,
         };
         if valid {
             Ok(())
@@ -335,6 +357,8 @@ pub const DISCONNECTED_RECOVERY: &str = "scope.reconnect-quarantined/1";
 pub const PERSISTENT_PAGE_REOPEN: &str = "browser.persistent-page-reopen/1";
 /// Terminal immutable recording bytes only; never browser operation admission.
 pub const TERMINAL_RECORDING_ARTIFACTS: &str = "terminal.recording-artifacts/1";
+/// Operation-owned private PW context retirement/creation during reset/restore.
+pub const INTEROP_CONTEXT_REPLACEMENT: &str = "browser.interop-context-replacement/1";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecoveryDescriptor {

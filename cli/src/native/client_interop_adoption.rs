@@ -342,3 +342,124 @@ impl PreparedInteropBrowser {
 #[cfg(test)]
 #[path = "client_interop_adoption_tests.rs"]
 mod tests;
+
+impl OwnedBrowser {
+    /// Old context is already proved absent and phase two is settled. Snapshot
+    /// foreign contexts before asking PW to allocate; the manager never leaves custody.
+    pub(super) async fn interop_replacement_inventory(
+        &self,
+        op: &OperationLease,
+    ) -> Result<HashSet<String>, ProtocolError> {
+        let previous = self
+            .manager
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::StaleScope)?;
+        if !previous.replacement_ready() {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        let reply = bounded(
+            op,
+            self.manager.client.send_owner_cleanup(
+                Some(previous),
+                super::super::client_debt::OwnerCleanupCommand::InteropContextInventory,
+                op.deadline,
+            ),
+        )
+        .await?;
+        contexts(&reply)
+    }
+
+    pub(super) async fn replace_cleaned_interop_context(
+        &mut self,
+        op: &OperationLease,
+        before: &HashSet<String>,
+        context: &str,
+        target: &str,
+    ) -> Result<ReplacementLease, ProtocolError> {
+        valid_id(context)?;
+        valid_id(target)?;
+        if before.contains(context) {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        self.targets.protected_read_residual.replacement_safe()?;
+        let ids = self
+            .manager
+            .pages_list()
+            .into_iter()
+            .map(|page| page.target_id)
+            .collect();
+        self.manager.forget_disposed_targets(&ids);
+        self.replacement_actions = self.runtime.as_ref().map(|runtime| runtime.actions.clone());
+        self.runtime = None;
+        // The old context has phase-two proof; a not-yet-validated new context
+        // still belongs to Node. Failed metadata checks grant no destruction.
+        self.owns_context = false;
+        let lease = ReplacementLease::begin(&mut self.manager, op)?;
+        self.identity_scope = lease.identity_scope.clone();
+        self.context_id.clear();
+        let inventory = bounded(
+            op,
+            self.manager
+                .client
+                .send_command("Target.getBrowserContexts", Some(json!({})), None),
+        )
+        .await?;
+        if !contexts(&inventory)?.contains(context) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let info = bounded(
+            op,
+            self.manager.client.send_command(
+                "Target.getTargetInfo",
+                Some(json!({"targetId":target})),
+                None,
+            ),
+        )
+        .await?;
+        verify_page(&info, context, target)?;
+        // Exact context becomes native-owned before the first attachment yields.
+        self.context_id = context.to_owned();
+        self.owns_context = true;
+        lease.debt.bind_context(context)?;
+        lease.debt.bind_adopted_blank_target(context, target, op)?;
+        bounded(op, self.manager.adopt_verified_page(target, context)).await?;
+        let inventory = bounded(
+            op,
+            self.manager
+                .client
+                .send_command("Target.getBrowserContexts", Some(json!({})), None),
+        )
+        .await?;
+        if !contexts(&inventory)?.contains(context) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let info = bounded(
+            op,
+            self.manager.client.send_command(
+                "Target.getTargetInfo",
+                Some(json!({"targetId":target})),
+                None,
+            ),
+        )
+        .await?;
+        verify_page(&info, context, target)?;
+        check_lifecycle_budget(op)?;
+        let session = self
+            .manager
+            .active_session_id()
+            .map_err(|_| ProtocolError::StaleScope)?
+            .to_owned();
+        lease.debt.bind_session(context, target, &session)?;
+        self.targets = super::super::client_targets::ClientTargets::new_managed(
+            context.to_owned(),
+            self.identity_scope.clone(),
+        );
+        self.page_state = Arc::new(super::super::client_page::ClientPageState::new(
+            self.identity_scope.clone(),
+            context.to_owned(),
+        ));
+        self.ui = Arc::new(super::super::client_ui::UiGate::default());
+        Ok(lease)
+    }
+}

@@ -197,6 +197,10 @@ impl ClientBrowser {
         let tasks = self.tasks.clone();
         let refs = self.refs.clone();
         let retirement = self.retirement.clone();
+        #[cfg(test)]
+        let failure_snapshot = self.interop_retirement_failure_snapshot.clone();
+        #[cfg(test)]
+        let startup_uncertain = self.startup_uncertain.clone();
         let (reply, result) = tokio::sync::oneshot::channel();
         let mut slot = self.startup_task.lock().await;
         *slot = Some(tokio::spawn(async move {
@@ -238,6 +242,32 @@ impl ClientBrowser {
                 Ok(serde_json::Value::Null)
             }
             .await;
+            // Observe, never manufacture, the retained owner at the actual error
+            // boundary. execute_interop quarantines after this reply; transport
+            // may then finish terminal shutdown before the peer reads its result.
+            #[cfg(test)]
+            if result.is_err() {
+                let observer = failure_snapshot.lock().unwrap().take();
+                if let Some(observer) = observer {
+                    let owner = owner.lock().await;
+                    let snapshot = owner.as_ref().and_then(|resource| {
+                        resource
+                            .runtime
+                            .as_ref()
+                            .map(|runtime| InteropRetirementFailureSnapshot {
+                                identity_scope: resource.identity_scope.clone(),
+                                context_id: resource.context_id.clone(),
+                                phase: runtime
+                                    .peer_retirement
+                                    .load(std::sync::atomic::Ordering::Acquire),
+                                enrollment: runtime.enrollment.clone(),
+                                startup_uncertain: startup_uncertain
+                                    .load(std::sync::atomic::Ordering::SeqCst),
+                            })
+                    });
+                    let _ = observer.send(snapshot);
+                }
+            }
             let _ = reply.send(result);
         }));
         drop(slot);

@@ -13,6 +13,8 @@ use super::client_settlement_trace::{
 mod interop_adoption;
 #[path = "client_interop_preparation.rs"]
 mod interop_preparation;
+#[path = "client_interop_replacement.rs"]
+mod interop_replacement;
 #[path = "client_interop_wire.rs"]
 mod interop_wire;
 
@@ -471,7 +473,9 @@ struct ReplacementSeed {
 }
 
 struct OwnedRuntime {
-    // 0 live, 1 retained phase-one in progress/failed, 2 ready for exact peer finish.
+    /// Genuine PW context custody, retained across reset/restore replacements.
+    interop_context: bool,
+    // 0 live, 1 phase-one failed/pending, 2 full cleanup, 3 recording-preserving cleanup.
     peer_retirement: std::sync::atomic::AtomicU8,
     // Original attempts allow focused input; reconnect requires fresh evidence.
     observation_after: Option<u64>,
@@ -824,6 +828,24 @@ impl OwnedRuntime {
         Ok(())
     }
 
+    async fn begin_peer_replacement(&self) -> Result<(), ProtocolError> {
+        self.peer_retirement
+            .store(1, std::sync::atomic::Ordering::Release);
+        self.enrollment.seal();
+        self.enrollment.drain().await?;
+        let recording = self
+            .actions
+            .recording_page_closing(&self.scope.identity_scope, &self.blobs)
+            .await;
+        let uploads = self.actions.cleanup_scope_uploads().await;
+        recording?;
+        uploads?;
+        self.enrollment.prepare_peer_context_retirement().await?;
+        self.peer_retirement
+            .store(3, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     async fn contain_and_release(&self) -> Result<(), ProtocolError> {
         self.contain_and_release_mode(false).await
     }
@@ -836,12 +858,11 @@ impl OwnedRuntime {
         let drained = self.enrollment.drain().await;
         cleanup_trace::observe_cleanup(&diagnostics, CleanupPart::EnrollmentFallback, &drained);
         let drain_failed = drained.is_err();
-        let action_cleanup_failed = if self
+        let peer_phase = self
             .peer_retirement
-            .load(std::sync::atomic::Ordering::Acquire)
-            == 2
-        {
-            false // The retained peer-retirement phase one already joined it.
+            .load(std::sync::atomic::Ordering::Acquire);
+        let action_cleanup_failed = if peer_phase == 2 || (peer_phase == 3 && preserve_recording) {
+            false // Exact phase one joined this mode; terminal full cleanup still runs for 3.
         } else if preserve_recording {
             let recording = self
                 .actions
@@ -1302,6 +1323,7 @@ impl OwnedBrowser {
             enrollment: enrollment.clone(),
         });
         self.runtime = Some(OwnedRuntime {
+            interop_context: self.owns_context && reserved_page,
             peer_retirement: std::sync::atomic::AtomicU8::new(0),
             observation_after: None,
             enrollment: enrollment.clone(),
@@ -2319,7 +2341,21 @@ impl ScopeStartup {
     }
 }
 
+// Read-only evidence at the real phase-one error boundary. Holding enrollment
+// here grants no cleanup authority and does not keep the runtime owner installed.
+#[cfg(test)]
+struct InteropRetirementFailureSnapshot {
+    identity_scope: String,
+    context_id: String,
+    phase: u8,
+    enrollment: Arc<super::client_enrollment::ClientEnrollment>,
+    startup_uncertain: bool,
+}
+
 pub struct ClientBrowser {
+    #[cfg(test)]
+    interop_retirement_failure_snapshot:
+        Arc<Mutex<Option<tokio::sync::oneshot::Sender<Option<InteropRetirementFailureSnapshot>>>>>,
     #[cfg(test)]
     generic_admission_probe: Arc<Mutex<Option<GenericAdmissionProbe>>>,
     broker: Arc<super::client_session::ClientSession>,
@@ -2350,6 +2386,8 @@ impl ClientBrowser {
         let interop_preparation =
             interop_preparation::InteropPreparation::new(owner.clone(), broker.clone());
         Self {
+            #[cfg(test)]
+            interop_retirement_failure_snapshot: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             generic_admission_probe: Arc::new(Mutex::new(None)),
             broker,
@@ -2795,6 +2833,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             super::client_protocol::EXACT_OWNER_CONTINUATION,
             super::client_protocol::DISCONNECTED_RECOVERY,
             super::client_protocol::TERMINAL_RECORDING_ARTIFACTS,
+            super::client_protocol::INTEROP_CONTEXT_REPLACEMENT,
             "browser.scope/1",
             "browser.lifecycle/1",
             super::client_protocol::PERSISTENT_PAGE_REOPEN,
@@ -4994,6 +5033,7 @@ impl ClientBrowser {
                     .as_ref()
                     .ok_or(ProtocolError::ScopeUnavailable)?;
                 let options = runtime.creation_options.clone();
+                let interop = runtime.interop_context;
                 let actions = runtime.actions.clone();
                 recording_owner = Some(actions.clone());
                 let (policy, downloads) = {
@@ -5073,6 +5113,25 @@ impl ClientBrowser {
                     .runtime
                     .as_ref()
                     .ok_or(ProtocolError::ScopeUnavailable)?;
+                if interop {
+                    runtime.begin_peer_replacement().await?;
+                    let decision = interop_replacement::rendezvous(
+                        &broker,
+                        &sink,
+                        &operation,
+                        &scope,
+                        super::client_session::DecisionKind::InteropRetire,
+                        Some(&resource.context_id),
+                    )
+                    .await?;
+                    if !matches!(
+                        decision,
+                        super::client_protocol::Decision::InteropRetired {}
+                    ) {
+                        return Err(ProtocolError::DecisionKindMismatch);
+                    }
+                    runtime.enrollment.confirm_peer_context_retirement().await?;
+                }
                 let contained = runtime.contain_and_release_mode(true).await;
                 runtime.enrollment.retire_protected_read_after_destroy(
                     &resource.targets.protected_read_residual,
@@ -5082,7 +5141,35 @@ impl ClientBrowser {
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
                     .retire_owner_references();
                 check_lifecycle_budget(&operation)?;
-                let replacement_owner = resource.replace_cleaned_context(&operation).await?;
+                let replacement_owner = if interop {
+                    let before = resource.interop_replacement_inventory(&operation).await?;
+                    let decision = interop_replacement::rendezvous(
+                        &broker,
+                        &sink,
+                        &operation,
+                        &scope,
+                        super::client_session::DecisionKind::InteropCreate,
+                        None,
+                    )
+                    .await?;
+                    let super::client_protocol::Decision::InteropCreated {
+                        context_id,
+                        target_id,
+                    } = decision
+                    else {
+                        return Err(ProtocolError::DecisionKindMismatch);
+                    };
+                    resource
+                        .replace_cleaned_interop_context(
+                            &operation,
+                            &before,
+                            &context_id,
+                            &target_id,
+                        )
+                        .await?
+                } else {
+                    resource.replace_cleaned_context(&operation).await?
+                };
                 let authority = resource
                     .initialize_runtime(
                         gate.clone(),
@@ -5100,7 +5187,7 @@ impl ClientBrowser {
                                 actions: actions.clone(),
                                 owner: Some(replacement_owner),
                             }),
-                            reserved_page: false,
+                            reserved_page: interop,
                         },
                     )
                     .await?;
@@ -5239,7 +5326,7 @@ impl ClientBrowser {
                     .as_ref()
                     .ok_or(ProtocolError::ScopeUnavailable)?
                     .page_active
-                    .store(expose_page, std::sync::atomic::Ordering::SeqCst);
+                    .store(expose_page && !interop, std::sync::atomic::Ordering::SeqCst);
                 let watched_client = resource.manager.client.clone();
                 let watched_targets = resource.targets.clone();
                 let mut lost = watched_client.remote_connection_closed();
@@ -5257,7 +5344,11 @@ impl ClientBrowser {
                     }
                 }));
                 uncertain.store(false, std::sync::atomic::Ordering::SeqCst);
-                Ok(serde_json::json!({"identityScope":resource.identity_scope}))
+                Ok(if interop {
+                    serde_json::json!({"identityScope":resource.identity_scope, "activatePage":expose_page})
+                } else {
+                    serde_json::json!({"identityScope":resource.identity_scope})
+                })
             }
             .await;
             if accepted && result.is_err() {

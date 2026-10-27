@@ -58,6 +58,8 @@ pub enum DecisionKind {
     Request,
     Authentication,
     Dialog,
+    InteropRetire,
+    InteropCreate,
 }
 
 impl DecisionKind {
@@ -74,6 +76,14 @@ impl DecisionKind {
                 Self::Authentication,
                 Decision::Auth { .. } | Decision::CancelAuth {}
             ) | (Self::Dialog, Decision::Dialog { .. })
+                | (
+                    Self::InteropRetire,
+                    Decision::InteropRetired {} | Decision::InteropFailed {}
+                )
+                | (
+                    Self::InteropCreate,
+                    Decision::InteropCreated { .. } | Decision::InteropFailed {}
+                )
         )
     }
 }
@@ -578,6 +588,14 @@ impl ClientSession {
                 .decisions
                 .get(token)
                 .ok_or(ProtocolError::DecisionMissing)?;
+            // Lifecycle rendezvous tokens select metadata only; they never grant
+            // the callback-child browser authority of route/auth/dialog tokens.
+            if matches!(
+                pending.kind,
+                DecisionKind::InteropRetire | DecisionKind::InteropCreate
+            ) {
+                return Err(ProtocolError::InvalidArguments);
+            }
             if pending.selected.is_some() {
                 return Err(ProtocolError::DecisionMissing);
             }
@@ -1426,6 +1444,37 @@ impl ClientSession {
             Self::seal(&mut inner, ScopeState::Quarantined);
             return Err(ProtocolError::CapacityExceeded);
         }
+        // Interop is internal operation coordination, never background callback
+        // authority and never a way to revive a retired registry/resource scope.
+        if matches!(
+            kind,
+            DecisionKind::InteropRetire | DecisionKind::InteropCreate
+        ) {
+            let DecisionOwner::Operation(sequence) = owner else {
+                return Err(ProtocolError::InvalidArguments);
+            };
+            let operation = inner
+                .operations
+                .get(&sequence)
+                .ok_or(ProtocolError::OperationMissing)?;
+            if inner.decisions.values().any(|pending| {
+                pending.owner == owner
+                    && matches!(
+                        pending.kind,
+                        DecisionKind::InteropRetire | DecisionKind::InteropCreate
+                    )
+            }) {
+                return Err(ProtocolError::DecisionKindMismatch);
+            }
+            if !operation.started
+                || operation.callback_token.is_some()
+                || registry.is_some()
+                || resource_scope.is_some()
+                || eval_window.is_some()
+            {
+                return Err(ProtocolError::InvalidArguments);
+            }
+        }
         let policy_deadline = Instant::now() + Duration::from_millis(timeout_ms);
         let deadline = match owner {
             DecisionOwner::Operation(sequence) => {
@@ -1497,6 +1546,37 @@ impl ClientSession {
             registrations,
             outcome,
         })
+    }
+
+    /// Validate a lifecycle event against its actual admitted operation and one
+    /// pending token. This grants no ordinary scope/browser command authority.
+    pub(crate) fn validate_interop_decision(
+        &self,
+        operation: &OperationLease,
+        token: &str,
+        kind: DecisionKind,
+    ) -> Result<(), ProtocolError> {
+        let inner = self.lock()?;
+        Self::check_live_operation(&inner, operation)?;
+        let pending = inner
+            .decisions
+            .get(token)
+            .ok_or(ProtocolError::DecisionMissing)?;
+        if !matches!(
+            kind,
+            DecisionKind::InteropRetire | DecisionKind::InteropCreate
+        ) || pending.kind != kind
+            || pending.owner != DecisionOwner::Operation(operation.sequence)
+            || pending.registry.is_some()
+            || pending.resource_scope.is_some()
+            || pending.selected.is_some()
+        {
+            return Err(ProtocolError::DecisionKindMismatch);
+        }
+        if Instant::now() >= pending.deadline {
+            return Err(ProtocolError::DecisionExpired);
+        }
+        Ok(())
     }
 
     /// Capture the pending decision's original resource scope on the control
@@ -3282,3 +3362,188 @@ mod exact_retention_tests {
 #[cfg(test)]
 #[path = "client_preparation_deadline_tests.rs"]
 mod preparation_deadline_tests;
+
+#[cfg(test)]
+mod interop_replacement_decision_tests {
+    use super::*;
+
+    fn started(broker: &ClientSession) -> OperationLease {
+        let operation = broker.admit(1, 1, 1000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        operation
+    }
+
+    #[tokio::test]
+    async fn private_replacement_decisions_are_exact_typed_and_sequential() {
+        let broker = ClientSession::new();
+        let operation = started(&broker);
+        let retiring = broker
+            .decision(
+                1,
+                DecisionOwner::Operation(1),
+                DecisionKind::InteropRetire,
+                1000,
+                None,
+            )
+            .unwrap();
+        assert!(retiring.deadline <= operation.deadline);
+        broker
+            .validate_interop_decision(&operation, &retiring.token, DecisionKind::InteropRetire)
+            .unwrap();
+        assert!(matches!(
+            broker.decision(
+                1,
+                DecisionOwner::Operation(1),
+                DecisionKind::InteropCreate,
+                1000,
+                None
+            ),
+            Err(ProtocolError::DecisionKindMismatch)
+        ));
+        assert_eq!(
+            broker.resolve(
+                1,
+                &retiring.token,
+                Decision::InteropCreated {
+                    context_id: "new".into(),
+                    target_id: "page".into()
+                }
+            ),
+            Err(ProtocolError::DecisionKindMismatch)
+        );
+        assert!(matches!(
+            broker.admit_callback(1, 2, 1000, Some(&retiring.token)),
+            Err(ProtocolError::InvalidArguments)
+        ));
+        broker
+            .resolve(1, &retiring.token, Decision::InteropRetired {})
+            .unwrap();
+        assert!(matches!(
+            retiring.outcome.await.unwrap(),
+            DecisionOutcome::Selected(Decision::InteropRetired {})
+        ));
+        let creating = broker
+            .decision(
+                1,
+                DecisionOwner::Operation(1),
+                DecisionKind::InteropCreate,
+                1000,
+                None,
+            )
+            .unwrap();
+        assert!(creating.deadline <= operation.deadline);
+        assert_eq!(
+            broker.resolve(
+                1,
+                &creating.token,
+                Decision::Continue {
+                    overrides: Default::default()
+                }
+            ),
+            Err(ProtocolError::DecisionKindMismatch)
+        );
+        broker
+            .resolve(
+                1,
+                &creating.token,
+                Decision::InteropCreated {
+                    context_id: "new".into(),
+                    target_id: "page".into(),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            creating.outcome.await.unwrap(),
+            DecisionOutcome::Selected(Decision::InteropCreated { .. })
+        ));
+    }
+
+    #[test]
+    fn private_replacement_decisions_cannot_acquire_scope_or_unstarted_authority() {
+        let broker = ClientSession::new();
+        assert!(matches!(
+            broker.decision(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::InteropRetire,
+                1000,
+                None
+            ),
+            Err(ProtocolError::InvalidArguments)
+        ));
+        let operation = broker.admit(1, 1, 1000).unwrap();
+        assert!(matches!(
+            broker.decision(
+                1,
+                DecisionOwner::Operation(1),
+                DecisionKind::InteropRetire,
+                1000,
+                None
+            ),
+            Err(ProtocolError::InvalidArguments)
+        ));
+        assert!(broker.start(1, 1).unwrap());
+        let decision = broker
+            .decision(
+                1,
+                DecisionOwner::Operation(1),
+                DecisionKind::InteropRetire,
+                1000,
+                None,
+            )
+            .unwrap();
+        let forged = OperationLease {
+            generation: operation.generation,
+            sequence: operation.sequence,
+            deadline: operation.deadline + Duration::from_millis(1),
+            cancellation: operation.cancellation.clone(),
+            is_callback: false,
+        };
+        assert!(broker
+            .validate_interop_decision(&forged, &decision.token, DecisionKind::InteropRetire)
+            .is_err());
+        assert_eq!(
+            broker.validate_interop_decision(
+                &operation,
+                &decision.token,
+                DecisionKind::InteropCreate
+            ),
+            Err(ProtocolError::DecisionKindMismatch)
+        );
+        broker.cancel(1, 1).unwrap();
+        assert!(broker
+            .validate_interop_decision(&operation, &decision.token, DecisionKind::InteropRetire)
+            .is_err());
+        assert!(broker
+            .resolve(1, &decision.token, Decision::InteropRetired {})
+            .is_err());
+    }
+
+    #[test]
+    fn private_created_metadata_is_bounded_and_cannot_smuggle_commands() {
+        for bad in ["", "bad\ncontext"] {
+            assert!(Decision::InteropCreated {
+                context_id: bad.into(),
+                target_id: "page".into()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(Decision::InteropCreated {
+            context_id: "x".repeat(1025),
+            target_id: "page".into()
+        }
+        .validate()
+        .is_err());
+        assert!(serde_json::from_value::<Decision>(
+            serde_json::json!({"kind":"interop-retired", "command":"Browser.close"})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<Decision>(
+            serde_json::json!({"kind":"interop-created", "contextId":"context", "targetId":"page"})
+        )
+        .unwrap()
+        .validate()
+        .is_ok());
+    }
+}

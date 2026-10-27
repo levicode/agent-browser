@@ -432,6 +432,7 @@ pub(super) fn matching_facts(nodes: &[SemanticNode]) -> Value {
         .iter()
         .map(|node| json!({
             "role":node.role,"name":node.name,"level":node.level,"states":node.states,
+            "publicContentName":[node.public_content_name.is_some(),node.public_content_name],
             "labels":node.labels,"safeName":node.safe_public_name,"attributes":node.attributes,
             "text":node.text,"value":node.value
         }))

@@ -229,6 +229,9 @@ async fn negotiated_unknown_keeps_stable_owner_services_and_fresh_request_live()
                 accept: false,
                 prompt_text: None,
             },
+            DecisionKind::InteropRetire | DecisionKind::InteropCreate => {
+                unreachable!("this public callback matrix excludes private lifecycle decisions")
+            }
         };
         executor
             .broker

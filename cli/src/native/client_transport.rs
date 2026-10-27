@@ -546,6 +546,63 @@ impl ClientEventSink {
         }
         result.map(|()| true)
     }
+    /// Private operation-owned rendezvous, never a reopened ordinary scope sink.
+    /// The caller retains the original replacement supervisor and owner journal;
+    /// the control lane only selects a bounded, one-use typed response.
+    pub(crate) fn emit_interop_decision(
+        &self,
+        operation: &OperationLease,
+        identity_scope: &str,
+        kind: super::client_session::DecisionKind,
+        lease: &super::client_session::DecisionLease,
+        context_id: Option<&str>,
+    ) -> Result<(), ProtocolError> {
+        use super::client_session::DecisionKind;
+        if self.barrier.is_some()
+            || identity_scope.is_empty()
+            || lease.generation != operation.generation
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let phase = match (kind, context_id) {
+            (DecisionKind::InteropRetire, Some(id))
+                if !id.is_empty() && id.len() <= 1024 && !id.chars().any(char::is_control) =>
+            {
+                "retire"
+            }
+            (DecisionKind::InteropCreate, None) => "create",
+            _ => return Err(ProtocolError::InvalidArguments),
+        };
+        self.broker
+            .validate_interop_decision(operation, &lease.token, kind)?;
+        let left = lease
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(ProtocolError::DecisionExpired);
+        }
+        let mut payload = serde_json::json!({
+            "version": 1,
+            "identityScope": identity_scope,
+            "operationSeq": operation.sequence,
+            "phase": phase,
+        });
+        if let Some(id) = context_id {
+            payload["contextId"] = id.into();
+        }
+        self.emit(
+            "scope.interop.replacement".into(),
+            payload,
+            Some(DecisionNotice {
+                token: lease.token.clone(),
+                timeout_ms: u64::try_from(left.as_millis())
+                    .unwrap_or(MAX_TIMEOUT_MS)
+                    .min(MAX_TIMEOUT_MS)
+                    .max(1),
+            }),
+        )
+    }
+
     pub fn emit(
         &self,
         event: String,
@@ -1510,8 +1567,17 @@ where
                     };
                     match admitted {
                         Ok(lease) => {
-                            pending
-                                .insert(operation_seq, (id, generation, callback_token.is_some(), args.get("identityScope").and_then(serde_json::Value::as_str).map(str::to_owned)));
+                            pending.insert(
+                                operation_seq,
+                                (
+                                    id,
+                                    generation,
+                                    callback_token.is_some(),
+                                    args.get("identityScope")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(str::to_owned),
+                                ),
+                            );
                             let executor = executor.clone();
                             let broker = broker.clone();
                             operations.spawn(async move {

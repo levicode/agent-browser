@@ -99,6 +99,12 @@ pub struct SemanticNode {
     pub labels: Vec<String>,
     #[serde(skip)]
     pub(crate) safe_public_name: Option<String>,
+    // The historical E2E reader names listitem/status/alert from content, but
+    // role selection uses ARIA naming. None is unavailable; Some(None) is a
+    // proven anonymous public read. Never serialize this private proof or feed
+    // it into role matching, and clear it with every content-security scrub.
+    #[serde(skip)]
+    public_content_name: Option<Option<String>>,
     #[serde(rename = "ref")]
     pub reference: NodeReference,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -789,7 +795,8 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  // One bounded content-name proof with closed receiver shapes, not a general
  // accname implementation. Null is unavailable; empty is complete anonymous.
  // Headings retain the frame-global inventory for external simple IDREFs.
- // Plain alerts/status can use a positive receiver-local no-author-root proof.
+ // Historical E2E listitem/status/alert names use a receiver-local no-author-root
+ // proof. They are public read fields, never role-query naming evidence.
  function completeContentName(root,kind='button'){
    let count=0;const referenced=new Set();
    function embeddedInput(n){
@@ -835,7 +842,11 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
          if(n.childNodes.length||Array.from(n.attributes).some(a=>!['id','class','style','width','height','viewBox','x','y','xmlns'].includes(a.name)))return null;
          return '';
        }
-       if(!(n instanceof HTMLElement)||!['span','div','p','abbr','b','strong','em','i','small','br'].includes(n.localName))return null;
+       // For the historical container/message names, ordinary strike text and
+       // an unnamed plain button contribute their content, not .value or state.
+       // The attribute/role, secure, shadow and pseudo gates above still apply.
+       const publicContainer=['listitem','status','alert'].includes(kind);
+       if(!(n instanceof HTMLElement)||!(['span','div','p','abbr','b','strong','em','i','small','br'].includes(n.localName)||publicContainer&&['s','button'].includes(n.localName)))return null;
      }
      if(n.childNodes.length>512-count)return null;
      let out='';
@@ -1181,7 +1192,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  const tag=e?e.localName:'';
  let completeContentNameFact=null;
  const contentRole=e?.getAttribute('role')||'';
- const contentKind=contentRole==='heading'||!contentRole&&/^h[1-6]$/.test(tag)?'heading':['alert','status'].includes(contentRole)?contentRole:null;
+ const contentKind=contentRole==='listitem'||!contentRole&&tag==='li'?'listitem':contentRole==='heading'||!contentRole&&/^h[1-6]$/.test(tag)?'heading':['alert','status'].includes(contentRole)?contentRole:null;
  if(contentKind&&(contentKind==='heading'?simpleNameInventory:localNameInventory)&&e instanceof HTMLElement&&!hidden&&!secure&&!secureDescendants&&!protectedEditor&&
    associated.length===0&&!e.hasAttribute('aria-label')&&!e.hasAttribute('aria-labelledby')){
    const name=completeContentName(e,contentKind);
@@ -1795,15 +1806,35 @@ fn project_node_with_refs(
     if let Some(fact) = source_name_fact(
         data,
         "completeContentNameFact",
-        &["heading", "alert", "status"],
+        &["heading", "alert", "status", "listitem"],
     )? {
-        if node.role.as_deref() != Some(fact.source.as_str()) {
+        let role_matches = node.role.as_deref() == Some(fact.source.as_str());
+        // Author graphs also contain AX-omitted inert/aria-hidden receivers and
+        // their descendants. A plain li can prove its content without an AX
+        // listitem role. Decline that public-name fact, rather than rejecting
+        // the whole graph before compaction suppresses the subtree. This does
+        // not restore a role or relax other source/receiver mismatches.
+        let omitted_listitem = fact.source == "listitem"
+            && node.role.is_none()
+            && matches!(
+                ax_string(&ax.role).as_deref(),
+                None | Some("none" | "generic")
+            )
+            && node
+                .author
+                .as_ref()
+                .is_some_and(|facts| facts.node_type == 1 && facts.tag == "li")
+            && (data["attributes"]["role"].is_null()
+                || data["attributes"]["role"].as_str() == Some(""))
+            && data["__nativeReadonlyPseudo"] != true;
+        if !role_matches && !omitted_listitem {
             return Err(ObservationError::BackendFailure);
         }
         // This proof covers content and the receiver's own title, including a
         // proven empty embedded-control contribution. Explicit naming and the
         // final secure/IDREF sanitization remain higher priority.
-        if data["__nativeReadonlyPseudo"] != true
+        if role_matches
+            && data["__nativeReadonlyPseudo"] != true
             && data["states"]["secure"] != true
             && data["secureDescendants"] != true
             && data["redactName"] != true
@@ -1811,7 +1842,12 @@ fn project_node_with_refs(
             && data["attributes"]["aria-label"].is_null()
             && data["attributes"]["aria-labelledby"].is_null()
         {
-            node.name = (!fact.name.is_empty()).then_some(fact.name);
+            let name = (!fact.name.is_empty()).then_some(fact.name);
+            if fact.source == "heading" {
+                node.name = name;
+            } else {
+                node.public_content_name = Some(name);
+            }
         }
     }
     if let Some(fact) = source_name_fact(
@@ -1948,11 +1984,13 @@ fn project_node_with_refs(
         || node.safe_public_name.is_some()
     {
         node.name = node.safe_public_name.clone();
+        node.public_content_name = None;
     }
     if data["completeEmptyReference"] == true {
         // Empty referenced content is positive provenance, not permission to
         // restore a title or fall back to the element's own AX content.
         node.name = None;
+        node.public_content_name = None;
     }
     // Normalize the selected, security-approved name once for every consumer.
     // A title cannot resurrect a name removed by the secure-content policy.
@@ -1965,6 +2003,9 @@ fn project_node_with_refs(
         data["attributes"]["title"].as_str()
     };
     node.name = node.name.and_then(|name| reported_public_name(name, title));
+    node.public_content_name = node
+        .public_content_name
+        .map(|name| name.and_then(|name| reported_public_name(name, title)));
     node.safe_public_name = node
         .safe_public_name
         .and_then(|name| reported_public_name(name, None));
@@ -2028,6 +2069,9 @@ fn project_node_with_refs(
         node.attributes.remove("value");
     }
     if bounded {
+        if let Some(Some(name)) = &mut node.public_content_name {
+            *name = name.chars().take(256).collect();
+        }
         node.safe_public_name = node
             .safe_public_name
             .map(|name| name.chars().take(256).collect());
@@ -2705,6 +2749,9 @@ pub async fn observe(
         check(lease)
     )?;
     *refs = staged;
+    for root in &mut roots {
+        publish_content_names(root);
+    }
     Ok(Observation {
         semantic_frame_proof,
         identity_scope: identity_scope.into(),
@@ -3011,6 +3058,7 @@ fn project_read_fields(
         node.selection = None;
         node.attributes.remove("value");
     }
+    publish_content_names(&mut node);
     let mut result = serde_json::to_value(node).map_err(|_| ObservationError::BackendFailure)?;
     if let Some(fields) = fields {
         let names: Vec<String> = fields
@@ -3233,6 +3281,11 @@ pub async fn query(
     validate_frame_ancestry(client, frames, frame, lease).await?;
     check(lease)?;
     *refs = staged;
+    // Selection and its confirmation used ARIA names. Only the already-chosen
+    // public reads now receive the E2E reader's historical content names.
+    for node in &mut nodes {
+        publish_content_names(node);
+    }
     Ok(QueryResult {
         identity_scope: identity_scope.into(),
         revision,
@@ -4243,8 +4296,24 @@ async fn frame_dom(
         };
     Ok(dom)
 }
+// Called only at public return boundaries, after final security selection.
+// Internal matcher metadata and live-query resolution retain ARIA names.
+fn publish_content_names(node: &mut SemanticNode) {
+    let content_name = node.public_content_name.take();
+    if node.states.get("secure") != Some(&true)
+        && matches!(node.role.as_deref(), Some("listitem" | "status" | "alert"))
+    {
+        if let Some(name) = content_name {
+            node.name = name;
+        }
+    }
+    for child in &mut node.children {
+        publish_content_names(child);
+    }
+}
 fn scrub_content(node: &mut SemanticNode) {
     node.name = None;
+    node.public_content_name = None;
     node.text = None;
     node.value = None;
     node.selection = None;
@@ -5679,14 +5748,16 @@ mod tests {
 
     #[test]
     fn complete_content_names_preserve_empty_unavailable_and_explicit_authority() {
-        for role in ["heading", "alert", "status"] {
+        for role in ["heading", "alert", "status", "listitem"] {
             let mut native = ax("content", 42, &[]);
             native.role.as_mut().unwrap().value = Some(json!(role));
             let mut data = metadata();
             let project = |data: &Value| {
-                project_node(&frame(), 42, &native, &mut observed_refs(), 1, data, false)
-                    .unwrap()
-                    .name
+                let mut node =
+                    project_node(&frame(), 42, &native, &mut observed_refs(), 1, data, false)
+                        .unwrap();
+                publish_content_names(&mut node);
+                node.name
             };
             assert_eq!(project(&data).as_deref(), Some("Save"));
             data["completeContentNameFact"] = json!({"source":role,"name":"Content"});
@@ -5701,6 +5772,376 @@ mod tests {
             }
             data["redactName"] = json!(true);
             assert_eq!(project(&data), None);
+        }
+    }
+
+    #[test]
+    fn historical_content_names_do_not_become_role_matching_names() {
+        for role in ["listitem", "status", "alert"] {
+            for bounded in [false, true] {
+                let mut native = ax("content", 42, &[]);
+                native.role.as_mut().unwrap().value = Some(json!(role));
+                native.name = None;
+                let mut data = metadata();
+                data["author"] = json!({"tag":if role == "listitem" {"li"} else {"div"},"nodeType":1,"visible":true});
+                data["completeContentNameFact"] = json!({"source":role,"name":"Public content"});
+                let node = project_node(
+                    &frame(),
+                    42,
+                    &native,
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    bounded,
+                )
+                .unwrap();
+                assert!(
+                    node.name.is_none(),
+                    "{role}/{bounded}: ARIA selection stays anonymous"
+                );
+                assert!(query_match_metadata(&[node.clone()]).unwrap()[0]
+                    .get("name")
+                    .is_none());
+                let fields = project_read_fields(node.clone(), Some(&[ReadField::Name])).unwrap();
+                assert_eq!(fields["name"], "Public content");
+                let reference = node.reference.clone();
+                let mut public = node;
+                publish_content_names(&mut public);
+                assert_eq!(public.name.as_deref(), Some("Public content"));
+                assert_eq!(public.reference, reference);
+                assert!(public.public_content_name.is_none());
+                let wire = serde_json::to_value(public).unwrap();
+                assert!(wire.get("publicContentName").is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn historical_content_names_preserve_explicit_role_names_and_read_confirmation() {
+        for role in ["listitem", "status", "alert"] {
+            let mut native = ax("content", 42, &[]);
+            native.role.as_mut().unwrap().value = Some(json!(role));
+            let mut data = metadata();
+            data["completeContentNameFact"] = json!({"source":role,"name":"Content"});
+            for attribute in ["aria-label", "aria-labelledby"] {
+                data["attributes"] = json!({});
+                data["attributes"][attribute] = json!("Save");
+                let node =
+                    project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false)
+                        .unwrap();
+                assert_eq!(
+                    query_match_metadata(&[node.clone()]).unwrap()[0]["name"],
+                    "Save"
+                );
+                assert_eq!(
+                    project_read_fields(node, Some(&[ReadField::Name])).unwrap()["name"],
+                    "Save"
+                );
+            }
+            data["attributes"] = json!({});
+            let before =
+                project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false).unwrap();
+            data["completeContentNameFact"]["name"] = json!("Changed content");
+            let after =
+                project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false).unwrap();
+            assert_eq!(
+                query_match_metadata(&[before.clone()]).unwrap(),
+                query_match_metadata(&[after.clone()]).unwrap()
+            );
+            assert_ne!(
+                role_candidates::matching_facts(&[before.clone()]),
+                role_candidates::matching_facts(&[after])
+            );
+            let mut unavailable = before.clone();
+            unavailable.public_content_name = None;
+            let mut empty = before;
+            empty.public_content_name = Some(None);
+            assert_ne!(
+                role_candidates::matching_facts(&[unavailable]),
+                role_candidates::matching_facts(&[empty])
+            );
+        }
+    }
+
+    #[test]
+    fn historical_content_names_are_cleared_by_security_and_keep_proven_empty_distinct() {
+        let mut native = ax("content", 42, &[]);
+        native.role.as_mut().unwrap().value = Some(json!("listitem"));
+        let mut data = metadata();
+        data["completeContentNameFact"] = json!({"source":"listitem","name":"Content"});
+        for guard in ["secureDescendants", "redactName", "completeEmptyReference"] {
+            data[guard] = json!(true);
+            let node =
+                project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false).unwrap();
+            assert!(node.public_content_name.is_none());
+            assert!(project_read_fields(node, Some(&[ReadField::Name]))
+                .unwrap()
+                .get("name")
+                .is_none());
+            data[guard] = json!(false);
+        }
+        let node =
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false).unwrap();
+        let mut scrubbed = node.clone();
+        scrub_content(&mut scrubbed);
+        publish_content_names(&mut scrubbed);
+        assert!(scrubbed.name.is_none());
+        let mut ancestor = node.clone();
+        ancestor.safe_public_name = Some("Safe label".into());
+        scrub_ancestor_content(&mut ancestor);
+        publish_content_names(&mut ancestor);
+        assert_eq!(ancestor.name.as_deref(), Some("Safe label"));
+        let mut secure = node;
+        secure.states.insert("secure".into(), true);
+        publish_content_names(&mut secure);
+        assert_eq!(secure.name.as_deref(), Some("Save"));
+        assert!(secure.public_content_name.is_none());
+        data["completeContentNameFact"]["name"] = json!("");
+        let node =
+            project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false).unwrap();
+        assert_eq!(node.public_content_name, Some(None));
+        assert_eq!(
+            query_match_metadata(&[node.clone()]).unwrap()[0]["name"],
+            "Save"
+        );
+        assert!(project_read_fields(node, Some(&[ReadField::Name]))
+            .unwrap()
+            .get("name")
+            .is_none());
+    }
+
+    #[test]
+    fn historical_content_names_reject_invalid_proofs_and_bound_observation_only() {
+        let mut native = ax("content", 42, &[]);
+        native.role.as_mut().unwrap().value = Some(json!("listitem"));
+        let mut data = metadata();
+        for invalid in [
+            json!({"source":"status","name":"Wrong receiver"}),
+            json!({"source":"listitem","name":false}),
+            json!({"source":"listitem","name":"Content","extra":true}),
+            json!({"source":"listitem","name":"x".repeat(513)}),
+        ] {
+            data["completeContentNameFact"] = invalid;
+            assert!(matches!(
+                project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, true),
+                Err(ObservationError::BackendFailure)
+            ));
+        }
+        data["completeContentNameFact"] = json!({"source":"listitem","name":"x".repeat(300)});
+        for (bounded, expected) in [(true, 256), (false, 300)] {
+            let node = project_node(
+                &frame(),
+                42,
+                &native,
+                &mut observed_refs(),
+                1,
+                &data,
+                bounded,
+            )
+            .unwrap();
+            assert_eq!(
+                project_read_fields(node, Some(&[ReadField::Name])).unwrap()["name"]
+                    .as_str()
+                    .unwrap()
+                    .len(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn ax_omitted_listitem_content_facts_decline_without_weakening_validation() {
+        for role in [None, Some("none"), Some("generic")] {
+            for bounded in [false, true] {
+                let mut native = ax("omitted", 42, &[]);
+                native.role = role.map(|role| {
+                    serde_json::from_value(json!({"type":"role","value":role})).unwrap()
+                });
+                native.name = None;
+                let mut data = metadata();
+                data["author"] = json!({"tag":"li","nodeType":1,"visible":true});
+                data["completeContentNameFact"] =
+                    json!({"source":"listitem","name":"Suppressed row"});
+                let node = project_node(
+                    &frame(),
+                    42,
+                    &native,
+                    &mut observed_refs(),
+                    1,
+                    &data,
+                    bounded,
+                )
+                .unwrap();
+                assert!(node.role.is_none());
+                assert!(node.name.is_none());
+                assert!(node.public_content_name.is_none());
+                let fields = project_read_fields(node, Some(&[ReadField::Name])).unwrap();
+                assert!(fields.get("name").is_none());
+                // Omission only declines a valid plain-li fact. It cannot make
+                // malformed or conflicting source/receiver evidence acceptable.
+                for (field, value) in [
+                    (
+                        "completeContentNameFact",
+                        json!({"source":"status","name":"Wrong source"}),
+                    ),
+                    (
+                        "completeContentNameFact",
+                        json!({"source":"listitem","name":false}),
+                    ),
+                    (
+                        "completeContentNameFact",
+                        json!({"source":"listitem","name":"Name","extra":true}),
+                    ),
+                    (
+                        "completeContentNameFact",
+                        json!({"source":"listitem","name":"x".repeat(513)}),
+                    ),
+                    ("author", json!({"tag":"div","nodeType":1,"visible":true})),
+                    ("author", json!({"tag":"li","nodeType":3,"visible":true})),
+                    ("attributes", json!({"role":"button"})),
+                    ("__nativeReadonlyPseudo", json!(true)),
+                ] {
+                    let mut invalid = data.clone();
+                    invalid[field] = value;
+                    assert!(
+                        matches!(
+                            project_node(
+                                &frame(),
+                                42,
+                                &native,
+                                &mut observed_refs(),
+                                1,
+                                &invalid,
+                                bounded
+                            ),
+                            Err(ObservationError::BackendFailure)
+                        ),
+                        "{role:?}/{bounded}/{field}"
+                    );
+                }
+                for conflict in ["button", "paragraph", "StaticText"] {
+                    native.role = Some(
+                        serde_json::from_value(json!({"type":"role","value":conflict})).unwrap(),
+                    );
+                    assert!(
+                        matches!(
+                            project_node(
+                                &frame(),
+                                42,
+                                &native,
+                                &mut observed_refs(),
+                                1,
+                                &data,
+                                bounded
+                            ),
+                            Err(ObservationError::BackendFailure)
+                        ),
+                        "{conflict}/{bounded}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn suppressed_listitem_content_facts_reach_author_graph_compaction() {
+        let dom = json!({"nodeType":9,"backendNodeId":1,"children":[
+            {"nodeType":1,"backendNodeId":2,"children":[
+                {"nodeType":1,"backendNodeId":3,"children":[{"nodeType":3,"backendNodeId":4}]}
+            ]},
+            {"nodeType":1,"backendNodeId":5,"children":[{"nodeType":3,"backendNodeId":6}]}
+        ]});
+        let graph = author_projection::Graph::read(&dom).unwrap();
+        for omitted_role in [None, Some("none"), Some("generic")] {
+            for (attribute, value) in [("inert", ""), ("aria-hidden", "true")] {
+                for ancestor in [false, true] {
+                    let suppressed_backend = if ancestor { 2 } else { 3 };
+                    let rows = [
+                        (1, "", 9, Some("RootWebArea"), ""),
+                        (2, "ul", 1, Some("list"), ""),
+                        (3, "li", 1, omitted_role, "Suppressed row"),
+                        (4, "", 3, None, "Suppressed row"),
+                        (5, "button", 1, Some("button"), "Visible control"),
+                        (6, "", 3, Some("StaticText"), "Visible control"),
+                    ];
+                    let mut refs = observed_refs();
+                    let mut nodes = HashMap::new();
+                    for (backend, tag, kind, role, name) in rows {
+                        let mut native = ax("fixture", backend, &[]);
+                        native.role = role.map(|role| {
+                            serde_json::from_value(json!({"type":"role","value":role})).unwrap()
+                        });
+                        native.name = if backend == 5 || backend == 6 {
+                            Some(
+                                serde_json::from_value(json!({"type":"string","value":name}))
+                                    .unwrap(),
+                            )
+                        } else {
+                            None
+                        };
+                        let mut data = metadata();
+                        data["author"] = json!({"tag":tag,"nodeType":kind,"visible":true,
+                            "inline":kind==3,"breaking":tag=="button","suppress":backend==suppressed_backend,
+                            "text":if kind==3{name}else{""}});
+                        data["text"] = Value::Null;
+                        if kind != 1 {
+                            data["rect"] = Value::Null;
+                        }
+                        if backend == suppressed_backend {
+                            data["attributes"][attribute] = json!(value);
+                        }
+                        if backend == 3 {
+                            let content_name = if attribute == "aria-hidden" && !ancestor {
+                                ""
+                            } else {
+                                name
+                            };
+                            data["completeContentNameFact"] =
+                                json!({"source":"listitem","name":content_name});
+                        }
+                        let node =
+                            project_node(&frame(), backend, &native, &mut refs, 1, &data, true)
+                                .unwrap();
+                        if backend == 3 {
+                            assert!(node.role.is_none());
+                            assert!(node.public_content_name.is_none());
+                        }
+                        nodes.insert(backend, node);
+                    }
+                    let (mut roots, truncated) =
+                        author_projection::compact(&graph, nodes, 100).unwrap();
+                    assert!(!truncated);
+                    for root in &mut roots {
+                        publish_content_names(root);
+                    }
+                    let mut pending = roots.iter().collect::<Vec<_>>();
+                    let mut emitted = Vec::new();
+                    while let Some(node) = pending.pop() {
+                        let backend = refs
+                            .get(node.reference.id.trim_start_matches('@'))
+                            .unwrap()
+                            .backend_node_id
+                            .unwrap();
+                        emitted.push(backend);
+                        assert!(
+                            !matches!(backend, 3 | 4),
+                            "suppressed listitem ref was published"
+                        );
+                        if ancestor {
+                            assert_ne!(backend, 2, "suppressed ancestor ref was published");
+                        }
+                        if backend == 5 {
+                            assert_eq!(node.name.as_deref(), Some("Visible control"));
+                        }
+                        pending.extend(node.children.iter());
+                    }
+                    assert!(emitted.contains(&1));
+                    assert!(emitted.contains(&5));
+                    assert!(!serde_json::to_string(&roots)
+                        .unwrap()
+                        .contains("Suppressed row"));
+                }
+            }
         }
     }
 
@@ -8776,6 +9217,104 @@ mod tests {
         assert_eq!(close["success"], true, "{close}");
         run.unwrap();
     }
+    #[tokio::test]
+    #[ignore = "requires real installed Chromium; historical public names versus ARIA selection"]
+    async fn chromium_historical_public_content_name_contract() {
+        use super::super::actions::{execute_command, DaemonState};
+        let mut state = DaemonState::new();
+        let launch = execute_command(
+            &json!({"id":"content-name-launch","action":"launch","headless":true}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(launch["success"], true, "{launch}");
+        let run = async {
+            let mgr = state.browser.as_ref().ok_or("Missing browser")?;
+            let session = mgr.active_session_id()?;
+            mgr.client.send_command("Runtime.evaluate", Some(json!({"expression":r#"
+                document.body.innerHTML = '<ul>' +
+                  '<li id="file" data-testid="file"><span>report.pdf</span></li>' +
+                  '<li id="promo" data-testid="promo"><div><p>Wireless Headphones</p><p><s>$80.00</s> <strong>$40.00</strong> <span>50% OFF</span></p></div><p>Order confirmed</p></li>' +
+                  '<li id="unique" data-testid="unique"><span><strong>Cabin fresh</strong> 7 Pine Way, Bend</span><button>Delete</button></li>' +
+                  '<li id="named" data-testid="named" aria-label="Explicit">Other content</li>' +
+                  '<li id="protected" data-testid="protected"><span class="secure">synthetic-content-secret</span></li>' +
+                  '<li id="long" data-testid="long">' + 'x'.repeat(513) + '</li>' +
+                  '<li id="own-inert" data-testid="own-inert" inert><span>Suppressed own inert</span></li>' +
+                  '<li id="own-hidden" data-testid="own-hidden" aria-hidden="true"><span>Suppressed own hidden</span></li></ul>' +
+                  '<ul inert><li id="ancestor-inert" data-testid="ancestor-inert"><span>Suppressed ancestor inert</span></li></ul>' +
+                  '<ul aria-hidden="true"><li id="ancestor-hidden" data-testid="ancestor-hidden"><span>Suppressed ancestor hidden</span></li></ul>' +
+                  '<div id="status" data-testid="status" role="status">Status text</div>' +
+                  '<div id="alert" data-testid="alert" role="alert">Alert text</div>'; true
+            "#, "returnByValue":true})), Some(session)).await?;
+            let (mut lease, _sender) = lease();
+            lease.deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut refs = observed_refs();
+            let frames = enumerate_frames(&mgr.client, session, &HashMap::new(), &lease).await?;
+            let options = ObservationOptions { secure_field_selector: ".secure".into(), ..Default::default() };
+            let tree = observe(&mgr.client, &frames, &mut refs, "fixture", 1, &options, &lease).await?;
+            let mut observed = HashMap::new();
+            let mut pending = tree.roots.iter().collect::<Vec<_>>();
+            while let Some(node) = pending.pop() {
+                if let Some(id) = &node.test_id { observed.insert(id.as_str(), node); }
+                pending.extend(node.children.iter());
+            }
+            let serialized = serde_json::to_string(&tree).unwrap();
+            for id in ["own-inert", "own-hidden", "ancestor-inert", "ancestor-hidden"] {
+                if observed.contains_key(id) || serialized.contains(id) {
+                    return Err(format!("Suppressed listitem/ref was published for {id}"));
+                }
+            }
+            if serialized.contains("Suppressed ") {
+                return Err("Suppressed descendant text was published".into());
+            }
+            if serialized.contains("synthetic-content-secret") || serialized.contains("publicContentName") {
+                return Err("Private content proof or secure content reached observation wire".into());
+            }
+            for (id, role, expected) in [
+                ("file", "listitem", "report.pdf"),
+                ("promo", "listitem", "Wireless Headphones $80.00 $40.00 50% OFF Order confirmed"),
+                ("unique", "listitem", "Cabin fresh 7 Pine Way, Bend Delete"),
+                ("status", "status", "Status text"),
+                ("alert", "alert", "Alert text"),
+                ("named", "listitem", "Explicit"),
+            ] {
+                if observed.get(id).and_then(|node| node.name.as_deref()) != Some(expected) {
+                    return Err(format!("Historical observation name missing for {id}"));
+                }
+                for expression in [
+                    json!({"kind":"selector","selector":format!("#{id}")}),
+                    json!({"kind":"query","query":{"kind":"testId","value":{"kind":"string","value":id,"exact":true}}}),
+                ] {
+                    let selected: QueryOptions = serde_json::from_value(json!({"expression":expression,"secureFieldSelector":".secure"})).unwrap();
+                    let found = query(&mgr.client, &frames, &mut refs, "fixture", 1, &selected, &lease).await?;
+                    if found.nodes.len() != 1 || found.nodes[0].name.as_deref() != Some(expected) {
+                        return Err(format!("Historical located read name missing for {id}"));
+                    }
+                    let selected_read: ReadOptions = serde_json::from_value(json!({"ref":found.nodes[0].reference.id,"fields":["name"],"secureFieldSelector":".secure"})).unwrap();
+                    let value = read(&mgr.client, &frames, &mut refs, "fixture", 1, &selected_read, &lease).await?;
+                    if value["name"] != expected { return Err(format!("Historical exact read name missing for {id}")); }
+                }
+                let role_query: QueryOptions = serde_json::from_value(json!({"expression":{"kind":"query","query":{"kind":"role","value":{"kind":"string","value":role,"exact":true},"name":{"kind":"string","value":expected,"exact":true}}},"secureFieldSelector":".secure"})).unwrap();
+                let matches = query(&mgr.client, &frames, &mut refs, "fixture", 1, &role_query, &lease).await?;
+                let expected_count = usize::from(id == "named");
+                if matches.nodes.len() != expected_count {
+                    return Err(format!("Public content widened ARIA role selection for {id}"));
+                }
+            }
+            if observed.get("long").is_none_or(|node| node.name.is_some()) {
+                return Err("Incomplete long-name proof became a partial name".into());
+            }
+            Ok::<(), String>(())
+        }.await;
+        let close = execute_command(
+            &json!({"id":"content-name-close","action":"close"}),
+            &mut state,
+        )
+        .await;
+        assert_eq!(close["success"], true, "{close}");
+        run.unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires real Chromium; coordinate convention probe, not full geometry acceptance"]
     async fn chromium_native_same_process_frame_coordinate_convention() {

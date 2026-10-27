@@ -25,17 +25,21 @@ async fn failed_peer_phase_one_still_contains_exact_context_on_terminal_shutdown
         if browser.blobs.charged_for_test().1 != 1 {
             return Err("actual recorder reservation was not established".into());
         }
-        let actions = browser
-            .owner
-            .lock()
-            .await
-            .as_ref()
-            .and_then(|owner| owner.runtime.as_ref())
-            .ok_or("runtime missing")?
-            .actions
-            .clone();
+        let (actions, original_enrollment) = {
+            let owner = browser.owner.lock().await;
+            let runtime = owner
+                .as_ref()
+                .and_then(|owner| owner.runtime.as_ref())
+                .ok_or("runtime missing")?;
+            (runtime.actions.clone(), runtime.enrollment.clone())
+        };
         let (encoder_status, directory) = actions.recording_encoder_status_for_test().await;
         recording_directory = Some(directory);
+        // A successful terminal shutdown may already remove browser.owner before
+        // the peer reads the failed retire result. Observe its real error boundary
+        // instead; the hook neither changes state nor delays automatic retirement.
+        let (snapshot_sender, snapshot) = tokio::sync::oneshot::channel();
+        *browser.interop_retirement_failure_snapshot.lock().unwrap() = Some(snapshot_sender);
         // Test-only five-second request bound; no production cleanup extension.
         fixture.sequence += 1;
         let id = format!("peer-retire-{}", fixture.sequence);
@@ -59,23 +63,24 @@ async fn failed_peer_phase_one_still_contains_exact_context_on_terminal_shutdown
         if encoder_status() != (true, true) {
             return Err("the owned encoder did not actually join with success".into());
         }
-        let owner = browser.owner.lock().await;
-        let resource = owner.as_ref().ok_or("phase one dropped owner")?;
-        let runtime = resource.runtime.as_ref().ok_or("phase one lost runtime")?;
-        if runtime
-            .peer_retirement
-            .load(std::sync::atomic::Ordering::Acquire)
-            != 1
-        {
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(5), snapshot)
+            .await
+            .map_err(|_| "phase one error-boundary snapshot timed out")?
+            .map_err(|_| "phase one error-boundary observer dropped")?
+            .ok_or("phase one error boundary lost its actual runtime owner")?;
+        if snapshot.identity_scope != scope || snapshot.context_id != "synthetic-context" {
+            return Err("phase one snapshot did not retain the exact original identity".into());
+        }
+        if !Arc::ptr_eq(&snapshot.enrollment, &original_enrollment) {
+            return Err("phase one snapshot replaced the original enrollment".into());
+        }
+        if snapshot.phase != 1 {
             return Err("the intended partial phase one was not reached".into());
         }
-        if browser
-            .startup_uncertain
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
+        if snapshot.startup_uncertain {
             return Err("phase one invented allocation uncertainty".into());
         }
-        retired_enrollment = Some(runtime.enrollment.clone());
+        retired_enrollment = Some(snapshot.enrollment);
         Ok(())
     }
     .await;
