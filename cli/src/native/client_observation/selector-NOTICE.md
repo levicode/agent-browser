@@ -28,10 +28,9 @@ Playwright builds `[<attribute>=${JSON.stringify(body)}]` and evaluates it with 
 - The body is the authored text after the first `=` with no unquoting or unescaping. `data-testid="a"` looks for the four-character value `"a"` including the quotes.
 - An empty body is legal and matches an empty attribute value; an absent attribute never matches. Native validation therefore accepts an empty body only for these engines.
 - `JSON.stringify` escapes then CSS decodes, so a newline body `a\nb` searches for `anb`, `a\fb` searches for `a` plus U+00FB, and `a\u0000b` searches for `au0000b`. A literal backslash body `a\b` still searches for `a\b`, and `a\\b` searches for two backslashes.
-- Bodies are case sensitive, and leading or trailing whitespace is trimmed by the chain parser before the engine sees it, exactly as `parseSelectorString` does for every named engine.
+- Bodies are case sensitive. The shared chain parser trims the whole part first, so trailing whitespace after the body disappears and whitespace directly after `=` remains part of the value, exactly as `parseSelectorString` behaves for every named engine.
 - Plain engines pierce open roots through the existing traversal; `:light` variants stay in the light tree. No variant enters a closed root.
 
 The Playwright public locator layer additionally rejects a `:light` match as a deprecated selector. That refusal lives above the engine and is not reproduced here, so this adapter returns the engine result.
-
 
 This change affects the negotiated E2E session adapter. It does not change the legacy CLI or MCP selector parser, so their command help is unchanged.
