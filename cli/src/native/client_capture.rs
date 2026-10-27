@@ -8,7 +8,7 @@ use super::client_protected_read::{ProtectedReadJournal, ProtectedReadReason};
 use super::client_session::{CancelSignal, OperationLease};
 use base64::Engine;
 use futures_util::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
@@ -19,7 +19,8 @@ const MAX_PIXELS: u64 = 16_777_216;
 pub(super) const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DOM_NODES: usize = 100_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum CaptureReason {
     Cancelled,
     Superseded,
@@ -35,7 +36,8 @@ pub enum CaptureReason {
 }
 /// Internal provenance, not a public error category. In particular, a failed
 /// initial coverage probe is not a failed source-mask or post-capture proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub(crate) enum CapturePhase {
     Admission,
     IndependentCoverage,
@@ -49,11 +51,15 @@ pub(crate) struct CaptureAttemptFailure {
     pub reason: CaptureReason,
 }
 impl CapturePhase {
-    fn failure(self, reason: CaptureReason) -> CaptureAttemptFailure {
-        CaptureAttemptFailure {
+    fn failure(self, reason: CaptureReason, operation: &OperationLease) -> CaptureAttemptFailure {
+        let failure = CaptureAttemptFailure {
             phase: self,
             reason,
-        }
+        };
+        // Record the original refusal before optional observation maps or
+        // suppresses it. Closed facts only; diagnostics never affect authority.
+        super::client_settlement_trace::protected_capture_failure(operation, failure);
+        failure
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,10 +327,10 @@ pub(crate) async fn capture_under_journal(
         viewport(context, operation).await
     }
     .await
-    .map_err(|reason| CapturePhase::Admission.failure(reason))?;
+    .map_err(|reason| CapturePhase::Admission.failure(reason, operation))?;
     let before = masks(context, request, operation, geometry)
         .await
-        .map_err(|reason| CapturePhase::IndependentCoverage.failure(reason))?;
+        .map_err(|reason| CapturePhase::IndependentCoverage.failure(reason, operation))?;
     async {
         install_source_masks(context, request, operation, journal).await?;
         journal
@@ -333,7 +339,7 @@ pub(crate) async fn capture_under_journal(
             .map_err(source_mask_reason)
     }
     .await
-    .map_err(|reason| CapturePhase::SourceProtection.failure(reason))?;
+    .map_err(|reason| CapturePhase::SourceProtection.failure(reason, operation))?;
     let bytes = async {
         // Reuse canonical native screenshot capture, without annotations or IO.
         check(context, operation)?;
@@ -388,7 +394,7 @@ pub(crate) async fn capture_under_journal(
             .map_err(|_| CaptureReason::BrowserFailure)
     }
     .await
-    .map_err(|reason| CapturePhase::RawCapture.failure(reason))?;
+    .map_err(|reason| CapturePhase::RawCapture.failure(reason, operation))?;
     async {
         #[cfg(test)]
         equivalence_tests::after_raw_capture(context, operation).await?;
@@ -422,7 +428,7 @@ pub(crate) async fn capture_under_journal(
         )
     }
     .await
-    .map_err(|reason| CapturePhase::PostCaptureValidation.failure(reason))
+    .map_err(|reason| CapturePhase::PostCaptureValidation.failure(reason, operation))
 }
 /// Source masks track the controls rather than an earlier raster rectangle.
 /// The retained holder is created and journaled before installing any rule.

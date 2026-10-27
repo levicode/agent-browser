@@ -272,6 +272,8 @@ pub enum ProtocolError {
     InterceptedPointer,
     CheckedStateUnchanged,
     CheckedControlReplaced,
+    FillUnsupportedTarget,
+    NoEditableFocus,
     FrameNotFound(FrameSelectionIndex),
     FrameAmbiguous(FrameAmbiguity),
 }
@@ -312,6 +314,8 @@ impl Serialize for ProtocolError {
             Self::InterceptedPointer => "intercepted-pointer",
             Self::CheckedStateUnchanged => "checked-state-unchanged",
             Self::CheckedControlReplaced => "checked-control-replaced",
+            Self::FillUnsupportedTarget => "fill-unsupported-target",
+            Self::NoEditableFocus => "no-editable-focus",
             Self::FrameNotFound(_) => "frame-not-found",
             Self::FrameAmbiguous(_) => "frame-ambiguous",
         })
@@ -551,6 +555,11 @@ mod tests {
             (ProtocolError::StaleReference, "stale-reference"),
             (ProtocolError::PolicyDenied, "policy-denied"),
             (ProtocolError::NotActionable, "not-actionable"),
+            (
+                ProtocolError::FillUnsupportedTarget,
+                "fill-unsupported-target",
+            ),
+            (ProtocolError::NoEditableFocus, "no-editable-focus"),
             (ProtocolError::LocatorNotFound, "locator-not-found"),
             (
                 ProtocolError::ContentLengthMismatch,

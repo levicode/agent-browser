@@ -367,9 +367,13 @@ fn native_owned_group(group: &str, sequence: u64) -> bool {
             group == format!("{prefix}-{sequence}")
                 || group.starts_with(&format!("{prefix}-{sequence}-"))
         })
-        || ["native-hidden-proof", "native-onclick"]
-            .iter()
-            .any(|prefix| group.starts_with(&format!("{prefix}-{sequence}-")))
+        || [
+            "native-hidden-proof",
+            "native-onclick",
+            "native-frame-owner",
+        ]
+        .iter()
+        .any(|prefix| group.starts_with(&format!("{prefix}-{sequence}-")))
 }
 async fn command(
     client: &CdpClient,
@@ -1511,6 +1515,8 @@ fn project_node_with_refs(
             Some("h1" | "h2" | "h3" | "h4" | "h5" | "h6") => role = Some("heading".into()),
             Some("form") if data["formOwnName"] == false => role = None,
             Some("form") if data["formOwnName"] == true => role = Some("form".into()),
+            Some("table") => role = Some("table".into()),
+            Some("tr") => role = Some("row".into()),
             Some("thead" | "tbody" | "tfoot") => role = Some("rowgroup".into()),
             Some("canvas") => role = None,
             Some("svg") => role = Some("image".into()),
@@ -3801,7 +3807,15 @@ async fn hint_boolean(
     .flatten()
     {
         if handle != object && handles.insert(handle) {
-            result = settle_owner_object(client, session, handle, result).await;
+            // Managed hint replies were acquired into this exact native group.
+            // Its outer owner releases all auxiliary handles even on refusal;
+            // do not queue a raw objectId release that could race a later read.
+            let grouped = client.debt_ledger().is_some()
+                && client_debt::OperationJournalHandle::current().is_some()
+                && native_owned_group(group, lease.sequence);
+            if !grouped {
+                result = settle_owner_object(client, session, handle, result).await;
+            }
         }
     }
     result
@@ -4335,6 +4349,27 @@ pub async fn enumerate_frames(
     iframe_sessions: &HashMap<String, String>,
     lease: &OperationLease,
 ) -> Result<Vec<ObservationFrame>, ObservationError> {
+    enumerate_frames_impl(client, page_session, iframe_sessions, lease, false).await
+}
+/// Semantic Observe only. Ordinary action, screenshot and trace inventory
+/// retain the original exact-object release path.
+pub(crate) async fn enumerate_semantic_frames(
+    client: &CdpClient,
+    page_session: &str,
+    iframe_sessions: &HashMap<String, String>,
+    lease: &OperationLease,
+) -> Result<Vec<ObservationFrame>, ObservationError> {
+    let retained =
+        client.debt_ledger().is_some() && client_debt::OperationJournalHandle::current().is_some();
+    enumerate_frames_impl(client, page_session, iframe_sessions, lease, retained).await
+}
+async fn enumerate_frames_impl(
+    client: &CdpClient,
+    page_session: &str,
+    iframe_sessions: &HashMap<String, String>,
+    lease: &OperationLease,
+    readonly_disposal: bool,
+) -> Result<Vec<ObservationFrame>, ObservationError> {
     if iframe_sessions.len() > 256 {
         return Err(ObservationError::InvalidArguments);
     }
@@ -4427,19 +4462,34 @@ pub async fn enumerate_frames(
                 .as_i64()
                 .ok_or("Frame owner identity unavailable")?;
             let world=command(client,&parent.binding.session,"Page.createIsolatedWorld",json!({"frameId":parent.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
-            let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":"native-frame-enumeration"}),lease).await?;
-            let object = resolved["object"]["objectId"]
-                .as_str()
-                .ok_or("Frame owner unavailable")?;
-            let value=command(client,&parent.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":FRAME_OWNER_GEOMETRY,"returnByValue":true}),lease).await;
-            let value = value.and_then(|value| {
-                if value.get("exceptionDetails").is_some() {
-                    Err(ObservationError::StaleReference)
-                } else {
-                    Ok(value)
-                }
-            });
-            let value = settle_owner_object(client, &parent.binding.session, object, value).await?;
+            let value = if readonly_disposal {
+                let group = client
+                    .readonly_group_instance(&format!("native-frame-owner-{}", lease.sequence))
+                    .map_err(|_| ObservationError::ResourceLimit)?;
+                let result = async {
+                    let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":group}),lease).await?;
+                    let object = resolved["object"]["objectId"].as_str().ok_or("Frame owner unavailable")?;
+                    let value=command(client,&parent.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":FRAME_OWNER_GEOMETRY,"returnByValue":true,"objectGroup":group}),lease).await?;
+                    if value.get("exceptionDetails").is_some() { Err(ObservationError::StaleReference) } else { Ok(value) }
+                }.await;
+                // Includes malformed/exception handles: exact group custody is
+                // independent of whether the readonly proof was accepted.
+                settle_object_group(client, &parent.binding.session, &group, result, lease).await?
+            } else {
+                let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":"native-frame-enumeration"}),lease).await?;
+                let object = resolved["object"]["objectId"]
+                    .as_str()
+                    .ok_or("Frame owner unavailable")?;
+                let value=command(client,&parent.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":FRAME_OWNER_GEOMETRY,"returnByValue":true}),lease).await;
+                let value = value.and_then(|value| {
+                    if value.get("exceptionDetails").is_some() {
+                        Err(ObservationError::StaleReference)
+                    } else {
+                        Ok(value)
+                    }
+                });
+                settle_owner_object(client, &parent.binding.session, object, value).await?
+            };
             let data = &value["result"]["value"];
             descriptor.offset_x =
                 parent.offset_x + data["x"].as_f64().ok_or("Frame offset unavailable")?;
@@ -6980,6 +7030,53 @@ mod tests {
                 )
                 .unwrap();
                 assert_eq!(authored.role.as_deref(), Some("region"));
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_table_rows_keep_public_container_roles_without_rebinding() {
+        for bounded in [false, true] {
+            for (tag, layout_role, expected) in [
+                ("table", "LayoutTable", "table"),
+                ("tr", "LayoutTableRow", "row"),
+            ] {
+                for native_role in [None, Some("generic"), Some(layout_role)] {
+                    for (authored, expected) in [
+                        ("", expected),
+                        ("widget", expected),
+                        ("region", "region"),
+                        ("none", "none"),
+                        ("presentation", "presentation"),
+                    ] {
+                        let mut data = metadata();
+                        data["author"]["tag"] = json!(tag);
+                        data["attributes"]["role"] = json!(authored);
+                        let mut native = ax("container", 42, &[]);
+                        native.role.as_mut().unwrap().value = native_role.map(|value| json!(value));
+                        let mut refs = observed_refs();
+                        let node =
+                            project_node(&frame(), 42, &native, &mut refs, 1, &data, bounded)
+                                .unwrap();
+                        assert_eq!(
+                            node.role.as_deref(),
+                            Some(expected),
+                            "{tag}/{native_role:?}/{authored}/{bounded}"
+                        );
+                        assert_eq!(node.reference.id, "@e1");
+                        assert_eq!(node.reference.revision, "1");
+                        assert_eq!(refs.get("e1").unwrap().backend_node_id, Some(42));
+                        data["__nativeReadonlyPseudo"] = json!(true);
+                        let pseudo =
+                            project_node(&frame(), 43, &native, &mut refs, 1, &data, bounded)
+                                .unwrap();
+                        assert_eq!(
+                            pseudo.role.as_deref(),
+                            native_role.filter(|role| *role != "generic")
+                        );
+                        assert_ne!(pseudo.reference.id, node.reference.id);
+                    }
+                }
             }
         }
     }

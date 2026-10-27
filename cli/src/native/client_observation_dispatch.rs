@@ -91,7 +91,7 @@ impl ObserveFailureWitness {
     }
 }
 
-// Production, default-off evidence for one optional trace read. The cell
+// Production, default-off evidence for one trace or optional-pixel read. The cell
 // contains no browser authority and holds no lock across an await. It records
 // the first failed call site before restoration, but emits only after run returns.
 struct ScreenshotFailureWitness {
@@ -108,7 +108,8 @@ struct ScreenshotFailureState {
 impl ScreenshotFailureWitness {
     fn new(request: &DispatchRequest, operation: &OperationLease, enabled: bool) -> Option<Self> {
         let trace = matches!(request, DispatchRequest::TraceSemantic(_))
-            || matches!(request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace);
+            || matches!(request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace)
+            || matches!(request, DispatchRequest::Observe(request) if request.options.pixels);
         (enabled && trace).then(|| Self {
             generation: operation.generation,
             sequence: operation.sequence,
@@ -896,6 +897,10 @@ impl ObservationDispatch {
             // the outer owner nor unrelated spawned work inherits it.
             #[cfg(test)]
             let observed_cleanup = self.observed_cleanup_for_test.load(Ordering::SeqCst);
+            let optional_pixels =
+                matches!(&request, DispatchRequest::Observe(request) if request.options.pixels);
+            let diagnostic_generation = operation.generation;
+            let diagnostic_sequence = operation.sequence;
             let run = self.run(
                 context,
                 request,
@@ -914,8 +919,21 @@ impl ObservationDispatch {
                 Some(journal) => journal.scope(run).await,
                 None => run.await,
             };
-            if let (Some(witness), Err(failure)) = (screenshot, &output) {
-                witness.failure(&failure.error);
+            if optional_pixels {
+                diagnostic::observation_pixel_result(
+                    diagnostic_generation,
+                    diagnostic_sequence,
+                    output.is_ok(),
+                    output
+                        .as_ref()
+                        .is_ok_and(|output| output.value.get("pixels").is_some()),
+                    task_receipt.sealed.load(Ordering::Acquire),
+                );
+            }
+            if let Some(witness) = screenshot {
+                if let Err(failure) = &output {
+                    witness.failure(&failure.error);
+                }
                 witness.finish(Some(&targets));
             }
             if let Err(failure) = &mut output {
@@ -1151,18 +1169,25 @@ impl ObservationDispatch {
         semantic: Value,
         result_send: &mut Option<oneshot::Sender<Result<Value, DispatchFailure>>>,
         receipt: &ObservationResultReceipt,
+        screenshot: Option<&ScreenshotFailureWitness>,
     ) -> Result<Output, DispatchFailure> {
         let identity = &context.page.identity_scope;
         let cleanup_lost = AtomicBool::new(false);
-        let failure = |error: ProtocolError| DispatchFailure {
-            cleanup_integrity_lost: error == ProtocolError::CleanupFailed
-                || cleanup_lost.load(Ordering::SeqCst),
-            error,
-            identity_scope: identity.clone(),
+        let failure = |error: ProtocolError| {
+            if let Some(witness) = screenshot {
+                witness.failure(&error);
+            }
+            DispatchFailure {
+                cleanup_integrity_lost: error == ProtocolError::CleanupFailed
+                    || cleanup_lost.load(Ordering::SeqCst),
+                error,
+                identity_scope: identity.clone(),
+            }
         };
         let pixel_operation = optional_observe_lease(operation);
         let published = AtomicBool::new(false);
         let optional = async {
+            screenshot_stage(screenshot, ScreenshotStage::ProducerReservation);
             check(&context.page, &pixel_operation).map_err(failure)?;
             let producer = blobs
                 .reserve_bounded_producer(
@@ -1170,8 +1195,12 @@ impl ObservationDispatch {
                     client_capture::MAX_PNG_BYTES.min(blobs.producer_limit()),
                 )
                 .map_err(|error| failure(blob_error(error)))?;
+            screenshot_stage(screenshot, ScreenshotStage::ProtectedBarrier);
             let mut journal =
                 ProtectedReadJournal::begin(&context.page, operation).map_err(|error| {
+                    if let Some(witness) = screenshot {
+                        witness.failure(&protected_error(error.reason));
+                    }
                     DispatchFailure {
                         error: protected_error(error.reason),
                         identity_scope: error.identity_scope,
@@ -1179,10 +1208,12 @@ impl ObservationDispatch {
                     }
                 })?;
             let captured = async {
+                screenshot_stage(screenshot, ScreenshotStage::AnimationStabilization);
                 journal
                     .stabilize_animations()
                     .await
                     .map_err(protected_error)?;
+                screenshot_stage(screenshot, ScreenshotStage::ProtectedFrames);
                 let frames = verified_frames_with_cleanup(
                     &context.page,
                     &pixel_operation,
@@ -1190,6 +1221,7 @@ impl ObservationDispatch {
                 )
                 .await?;
                 same_frames(&context.frames, &frames)?;
+                screenshot_stage(screenshot, ScreenshotStage::Geometry);
                 let geometry = GeometrySnapshot::capture(
                     &context.page.client,
                     &context.page.page_session_id,
@@ -1198,6 +1230,7 @@ impl ObservationDispatch {
                 )
                 .await
                 .map_err(|error| geometry_error_with_cleanup(error, &cleanup_lost))?;
+                screenshot_stage(screenshot, ScreenshotStage::Capture);
                 let pixels = client_capture::capture_under_journal(
                     context,
                     &CaptureRequest {
@@ -1208,13 +1241,25 @@ impl ObservationDispatch {
                     &geometry,
                 )
                 .await
-                .map_err(|error| capture_error(error.reason))?;
+                .map_err(|error| {
+                    if let Some(witness) = screenshot {
+                        witness.capture_failure(error);
+                    }
+                    capture_error(error.reason)
+                })?;
                 Ok::<_, ProtocolError>((pixels, geometry))
             }
             .await;
+            if let (Some(witness), Err(error)) = (screenshot, &captured) {
+                witness.failure(error);
+            }
+            screenshot_stage(screenshot, ScreenshotStage::Restoration);
             // Even after publishing semantics, this exact owner must finish
             // source-mask/animation/raw custody. No detached cleanup task.
             if let Err(error) = journal.restore().await {
+                if let Some(witness) = screenshot {
+                    witness.failure(&protected_error(error.reason));
+                }
                 return Err(DispatchFailure {
                     error: captured
                         .as_ref()
@@ -1237,18 +1282,22 @@ impl ObservationDispatch {
                     handles: vec![],
                 });
             }
+            screenshot_stage(screenshot, ScreenshotStage::FinalGeometry);
             geometry
                 .revalidate(&context.page.client, &pixel_operation)
                 .await
                 .map_err(|error| failure(geometry_error_with_cleanup(error, &cleanup_lost)))?;
+            screenshot_stage(screenshot, ScreenshotStage::FinalBarrier);
             journal
                 .check()
                 .map_err(|error| failure(protected_error(error)))?;
+            screenshot_stage(screenshot, ScreenshotStage::FinalFrames);
             let current =
                 verified_frames_with_cleanup(&context.page, &pixel_operation, Some(&cleanup_lost))
                     .await
                     .map_err(failure)?;
             same_frames(&context.frames, &current).map_err(failure)?;
+            screenshot_stage(screenshot, ScreenshotStage::FinalViewport);
             if viewport(&context.page, &pixel_operation)
                 .await
                 .map_err(failure)?
@@ -1257,6 +1306,7 @@ impl ObservationDispatch {
                 return Err(failure(ProtocolError::StaleScope));
             }
             check(&context.page, &pixel_operation).map_err(failure)?;
+            screenshot_stage(screenshot, ScreenshotStage::BlobPublication);
             let image = blobs
                 .finish_producer(producer, pixels.png)
                 .map_err(|error| failure(blob_error(error)))?;
@@ -1336,6 +1386,9 @@ impl ObservationDispatch {
             _ = tokio::time::sleep_until(pixel_operation.deadline.into()) => {
                 // Do not cancel/drop the optional future: a raw ACK or a mask
                 // restore may still be outstanding. Only its output is cut off.
+                // The timeout wins here before later cleanup can overwrite the
+                // phase of the refused optional pixel result.
+                if let Some(witness) = screenshot { witness.failure(&ProtocolError::DeadlineExceeded); }
                 let publication = publish_semantic(result_send);
                 let result = optional.await;
                 if let Err(error) = publication {
@@ -1352,6 +1405,7 @@ impl ObservationDispatch {
         };
         match completed {
             Ok(output) if !published.load(Ordering::Acquire) => {
+                screenshot_stage(screenshot, ScreenshotStage::Publication);
                 let publish = self.commit_staged(
                     &context.page,
                     &pixel_operation,
@@ -1668,6 +1722,8 @@ impl ObservationDispatch {
         let frames = if matches!(&request, DispatchRequest::TraceSemantic(_))
             || matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
             self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
+        } else if matches!(&request, DispatchRequest::Observe(_)) {
+            verified_semantic_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup)).await
         } else {
             verified_frames_with_diagnostic(&context.page, &operation, Some(&observation_cleanup), screenshot).await
         }.map_err(failure)?;
@@ -1710,7 +1766,11 @@ impl ObservationDispatch {
             #[cfg(test)]
             witness.enter(ObserveFailureStage::ProtectedFrames);
             screenshot_stage(screenshot, ScreenshotStage::ProtectedFrames);
-            let frozen = verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?;
+            let frozen = if is_observe {
+                verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?
+            } else {
+                verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?
+            };
             same_frames(&capture_context.frames, &frozen)?;
             // Semantic capture proves which exact documents were projected,
             // including separate hidden/policy/depth/budget omissions. Acquire
@@ -1836,7 +1896,7 @@ impl ObservationDispatch {
                         }
                         let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                         geometry.revalidate(&capture_context.page.client, &operation).await.map_err(map_geometry)?;
-                        let current = verified_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
+                        let current = verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
                         same_frames(&capture_context.frames, &current)?;
                         if viewport(&capture_context.page, &operation).await? != value["viewport"] {
                             return Err(ProtocolError::StaleScope);
@@ -1848,7 +1908,7 @@ impl ObservationDispatch {
                         completed_optional = Some(self.optional_observe_pixels(
                             &capture_context, &operation, capture.as_ref(), retirement_fence,
                             &context.blobs, &context.scope, &mut publication, revision, &staged,
-                            request.secure_field_selector, value, result_send, receipt,
+                            request.secure_field_selector, value, result_send, receipt, screenshot,
                         ).await);
                         return Ok((Value::Null, None, None));
                     }
@@ -1947,8 +2007,11 @@ impl ObservationDispatch {
         }
         check(&capture_context.page, &operation).map_err(failure)?;
         screenshot_stage(screenshot, ScreenshotStage::FinalFrames);
-        let final_frames = verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot)
-            .await
+        let final_frames = if is_observe {
+            verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await
+        } else {
+            verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await
+        }
             .map_err(failure)?;
         same_frames(&capture_context.frames, &final_frames).map_err(failure)?;
         screenshot_stage(screenshot, ScreenshotStage::FinalViewport);
@@ -2337,6 +2400,16 @@ async fn command(
 }
 /// Derive frame/session ownership from native session evidence, never from the
 /// commonly equal but non-contractual target ID and frame ID strings.
+async fn verified_semantic_frames_with_cleanup(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+) -> Result<Vec<ObservationFrame>, ProtocolError> {
+    frame_inventory_attempt_impl(page, operation, cleanup, None, true)
+        .await
+        .map(|inventory| inventory.frames)
+        .map_err(|failure| failure.record(None))
+}
 pub async fn verified_frames(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
@@ -2500,6 +2573,15 @@ async fn frame_inventory_attempt(
     cleanup: Option<&AtomicBool>,
     screenshot: Option<&ScreenshotFailureWitness>,
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
+    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, false).await
+}
+async fn frame_inventory_attempt_impl(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+    screenshot: Option<&ScreenshotFailureWitness>,
+    readonly_disposal: bool,
+) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
     check(page, operation)?;
     let (revision, targets, inventory_before) = page
         .targets
@@ -2548,13 +2630,22 @@ async fn frame_inventory_attempt(
     }
     let lineage = page_lineage(&trees, &page.page_session_id)?;
     let mapping = lineage.iframe_sessions;
-    let frames =
+    let frames = if readonly_disposal {
+        observation::enumerate_semantic_frames(
+            &page.client,
+            &page.page_session_id,
+            &mapping,
+            operation,
+        )
+        .await
+    } else {
         observation::enumerate_frames(&page.client, &page.page_session_id, &mapping, operation)
             .await
-            .map_err(|error| match cleanup {
-                Some(cleanup) => observation_error_with_cleanup(error, cleanup),
-                None => observation_error(error),
-            })?;
+    }
+    .map_err(|error| match cleanup {
+        Some(cleanup) => observation_error_with_cleanup(error, cleanup),
+        None => observation_error(error),
+    })?;
     let root = main_frame(&frames)?;
     if root.binding.session != page.page_session_id {
         return Err(ProtocolError::StaleScope.into());
@@ -3322,6 +3413,34 @@ mod tests {
             .take_failure(|| panic!("success must not sample inventory"))
             .is_none());
     }
+    #[test]
+    fn optional_pixel_witness_is_opt_in_and_keeps_pre_capture_refusal_before_cleanup() {
+        let request = DispatchRequest::Observe(ObserveRequest {
+            options: ObserveFlags {
+                pixels: true,
+                ..ObserveFlags::default()
+            },
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password]".into(),
+        });
+        let operation = operation();
+        assert!(ScreenshotFailureWitness::new(&request, &operation, false).is_none());
+        let witness = ScreenshotFailureWitness::new(&request, &operation, true).unwrap();
+        witness.enter(ScreenshotStage::Geometry);
+        witness.failure(&ProtocolError::DeadlineExceeded);
+        witness.enter(ScreenshotStage::Restoration);
+        witness.failure(&ProtocolError::CleanupFailed);
+        let failure = witness
+            .take_failure(|| panic!("no inventory read for absent baseline"))
+            .unwrap();
+        assert_eq!(failure.stage, ScreenshotStage::Geometry);
+        assert_eq!(failure.capture_phase, ScreenshotCapturePhase::NotEntered);
+        assert_eq!(failure.error, ProtocolError::DeadlineExceeded);
+        assert!(witness
+            .take_failure(|| panic!("only one refusal"))
+            .is_none());
+    }
+
     #[test]
     fn semantic_trace_retains_first_inventory_failure_without_enabling_capture() {
         let trace = DispatchRequest::TraceSemantic(ObserveRequest {

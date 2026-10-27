@@ -1913,6 +1913,56 @@ impl CdpClient {
         )
     }
 
+    /// A direct queued detach, before registration began, grants no child
+    /// ownership. Retire only that candidate under original owner/ancestor fences.
+    pub(crate) fn finish_detached_queued_iframe(
+        &self,
+        expected: &Arc<OwnerDebtLedger>,
+        targets: &Arc<super::super::client_targets::ClientTargets>,
+        binding: (&str, &str),
+        parent: &super::super::client_targets::OwnedTarget,
+        root: &super::super::client_targets::OwnedTarget,
+        operation: &super::super::client_session::OperationLease,
+    ) -> Result<bool, ProtocolError> {
+        let (target, session) = binding;
+        let current = self
+            .transport
+            .debt_owner
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if self.transport.closed.load(Ordering::SeqCst)
+            || current
+                .as_ref()
+                .is_none_or(|current| !Arc::ptr_eq(expected, current))
+            || self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| !Arc::ptr_eq(owner, expected))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        targets.require_eval_owner(expected)?;
+        expected.with_detached_queued_iframe(
+            operation.generation,
+            targets,
+            binding,
+            parent,
+            root,
+            || {
+                targets.finish_detached_queued_iframe(target, session, parent, root, || {
+                    if *operation.cancellation.borrow()
+                        != super::super::client_session::CancelSignal::None
+                    {
+                        return Err(ProtocolError::Cancelled);
+                    }
+                    if std::time::Instant::now() >= operation.deadline {
+                        return Err(ProtocolError::DeadlineExceeded);
+                    }
+                    Ok(())
+                })
+            },
+        )
+    }
     /// Retains the same all-ACK receipt across publication and applied detach.
     /// The caller emits the existing lifecycle observation after index unlock.
     pub(crate) fn try_finish_acknowledged_worker_startup(
@@ -2972,6 +3022,108 @@ mod tests {
             transport.close().await;
             peer.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn readonly_disposal_capacity_refusal_keeps_exact_acquired_group_custody() {
+        use crate::native::client_debt::{
+            command_scope, native_object_group, CommandCategory, OperationKey,
+        };
+        let (transport, mut requests, replies, peer) = service_worker_test_peer().await;
+        let ledger = OwnerDebtLedger::new(1, "readonly-capacity".into());
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        transport.install_debt_ledger(ledger.clone()).unwrap();
+        let client = transport.owner_view(ledger.clone()).unwrap();
+        let group = client
+            .readonly_group_instance("native-semantic-box-1")
+            .unwrap();
+        let (read_client, read_journal, read_group) =
+            (client.clone(), journal.clone(), group.clone());
+        let read = tokio::spawn(async move {
+            read_journal
+                .scope(native_object_group(
+                    &read_group,
+                    command_scope(
+                        CommandCategory::ApplicationObject,
+                        false,
+                        read_client.send_command(
+                            "DOM.resolveNode",
+                            Some(json!({"backendNodeId":1,"objectGroup":read_group})),
+                            Some("page"),
+                        ),
+                    ),
+                ))
+                .await
+        });
+        let request = service_worker_request(&mut requests).await;
+        replies.send(json!({"id":request["id"],"sessionId":"page","result":{"object":{"objectId":"exact-owned"}}})).unwrap();
+        read.await.unwrap().unwrap();
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        let budget = &client.transport.disposal_budget;
+        let charge = budget.reserve(budget.maximum).unwrap();
+        assert!(journal
+            .scope(async { client.handoff_readonly_group_release("page", &group) })
+            .await
+            .is_err());
+        assert_eq!(
+            ledger.snapshot().object_debt,
+            1,
+            "capacity refusal cannot erase acquired group"
+        );
+        assert_eq!(
+            ledger.snapshot().outstanding_commands,
+            0,
+            "failed unsubmitted reservation must not consume a command slot"
+        );
+        assert_eq!(budget.used.load(Ordering::Acquire), budget.maximum);
+        assert!(
+            requests.try_recv().is_err(),
+            "refused handoff cannot write an unowned release"
+        );
+        drop(charge);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        // Reserve the real bounded channel slots without injecting commands or
+        // ACKs. A refused try_send must return both its byte and command quota.
+        let mut slots = Vec::new();
+        while let Ok(slot) = client.transport.disposal_tx.clone().try_reserve_owned() {
+            slots.push(slot);
+        }
+        assert_eq!(slots.len(), 32);
+        assert!(journal
+            .scope(async { client.handoff_readonly_group_release("page", &group) })
+            .await
+            .is_err());
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        drop(slots);
+        journal
+            .scope(async { client.handoff_readonly_group_release("page", &group) })
+            .await
+            .unwrap();
+        let release = service_worker_request(&mut requests).await;
+        assert_eq!(release["params"]["objectGroup"], group);
+        replies
+            .send(service_worker_response(&release, false))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ledger.snapshot().object_debt != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        transport.close().await;
+        peer.await.unwrap();
     }
 
     fn service_worker_test_owner(

@@ -3577,6 +3577,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             Some(ActionReason::InterceptedPointer) => ProtocolError::InterceptedPointer,
                             Some(ActionReason::CheckedStateUnchanged) => ProtocolError::CheckedStateUnchanged,
                             Some(ActionReason::ControlReplacedAfterClick) => ProtocolError::CheckedControlReplaced,
+                            Some(ActionReason::FillUnsupportedTarget) => ProtocolError::FillUnsupportedTarget,
+                            Some(ActionReason::NoEditableFocus) => ProtocolError::NoEditableFocus,
                             _ => failure.error,
                         };
                         (NativeOutcome { retention: None, result: Err(error), effects: if activation_dispatched && failure.effects == Effects::NotDispatched { Effects::Completed } else { failure.effects } }, failure.cleanup_failed)

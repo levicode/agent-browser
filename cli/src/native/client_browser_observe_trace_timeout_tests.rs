@@ -15,6 +15,8 @@ enum Case {
     OptionalRawHeld,
     OptionalRawNeverAck,
     MetadataReleaseHeld,
+    SemanticGeometryReleaseHeld,
+    SemanticFrameOwnerReleaseHeld,
     OptionalMaskHeld,
     OptionalWrongSessionHeld,
     OptionalMalformedHeld,
@@ -104,12 +106,27 @@ async fn peer(case: Case) -> Peer {
                         "Target.getTargets" => json!({"targetInfos":[target.clone()]}),
                         "Target.getTargetInfo" => { assert_eq!(request["params"]["targetId"], "host-page"); json!({"targetInfo":target.clone()}) },
                         "Target.attachToTarget" => { assert_eq!(request["params"]["targetId"], "host-page"); json!({"sessionId":"host-session"}) },
-                        "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":frame,"loaderId":loader,"url":"about:blank"}}}),
+                        "Page.getFrameTree" => {
+                            let mut root=json!({"frame":{"id":frame,"loaderId":loader,"url":"about:blank"}});
+                            if case == Case::SemanticFrameOwnerReleaseHeld { root["childFrames"]=json!([{"frame":{"id":"child-frame","parentId":frame,"loaderId":"child-doc","url":"about:blank"}}]); }
+                            json!({"frameTree":root})
+                        },
                         "Page.navigate" => { assert_eq!(request["params"]["url"], "about:blank"); loader="activation-loader"; json!({"frameId":frame,"loaderId":loader}) },
                         "Page.addScriptToEvaluateOnNewDocument" => json!({"identifier":format!("script-{}",request["id"])}),
-                        "Page.createIsolatedWorld" => { assert_eq!(request["params"]["frameId"], frame); json!({"executionContextId":1}) },
+                        "Page.createIsolatedWorld" => {
+                            if case == Case::SemanticFrameOwnerReleaseHeld && request["params"]["frameId"] == "child-frame" { json!({"executionContextId":2}) }
+                            else { assert_eq!(request["params"]["frameId"], frame); json!({"executionContextId":1}) }
+                        },
                         "Page.getLayoutMetrics" => json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}}),
-                        "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":1}}),
+                        "DOM.getDocument" => if case == Case::SemanticFrameOwnerReleaseHeld { json!({"root":{"nodeType":9,"backendNodeId":1,"childNodeCount":1,"children":[{"nodeType":1,"backendNodeId":2,"localName":"iframe","attributes":["id","child"],"childNodeCount":0,"children":[]}]}}) } else if case == Case::SemanticGeometryReleaseHeld { json!({"root":{"nodeType":9,"backendNodeId":1,"childNodeCount":1,"children":[{"nodeType":1,"backendNodeId":2,"localName":"button","attributes":[],"childNodeCount":0,"children":[]}]}}) } else { json!({"root":{"nodeType":9,"backendNodeId":1}}) },
+                        "DOM.getFrameOwner" if case == Case::SemanticFrameOwnerReleaseHeld => { assert_eq!(request["params"]["frameId"], "child-frame"); json!({"backendNodeId":2}) },
+                        "DOM.describeNode" if case == Case::SemanticFrameOwnerReleaseHeld => {
+                            match request["params"]["backendNodeId"].as_u64().unwrap() {
+                                2 => json!({"node":{"nodeType":1,"backendNodeId":2,"contentDocument":{"nodeType":9,"backendNodeId":3}}}),
+                                3 => json!({"node":{"nodeType":9,"backendNodeId":3,"childNodeCount":0,"children":[]}}),
+                                other => panic!("unexpected child document backend {other}"),
+                            }
+                        },
                         "DOMSnapshot.captureSnapshot" => {
                             if case == Case::OptionalMaskHeld { assert!(held.replace(request.clone()).is_none()); continue; }
                             json!({"strings":[frame],"documents":[{"frameId":0,"nodes":{"nodeType":[9],"backendNodeId":[1]}}]})
@@ -140,14 +157,20 @@ async fn peer(case: Case) -> Peer {
                                     other => panic!("unmodeled source-holder call: {other}"),
                                 }
                             }
-                            if case == Case::SemanticCorruption && declaration.contains("const read=") {
+                            if case == Case::SemanticFrameOwnerReleaseHeld {
+                                semantic_frame_reply(&request).unwrap_or_else(|| observation_reply(&request).expect("known semantic frame protocol"))
+                            } else if case == Case::SemanticGeometryReleaseHeld {
+                                semantic_geometry_reply(&request).unwrap_or_else(|| observation_reply(&request).expect("known semantic geometry protocol"))
+                            } else if case == Case::SemanticCorruption && declaration.contains("const read=") {
                                 json!({"result":{"value":[]}})
                             } else { observation_reply(&request).expect("known Observe/source-mask protocol") }
                         }
                         "Runtime.releaseObjectGroup" => {
                             let group=request["params"]["objectGroup"].as_str().unwrap();
                             if group.starts_with("capture-source-") { assert!(!source_holder); }
-                            if case == Case::MetadataReleaseHeld && group.starts_with("native-metadata-") && !readonly_held_once {
+                            if ((case == Case::MetadataReleaseHeld && group.starts_with("native-metadata-"))
+                                || (case == Case::SemanticGeometryReleaseHeld && group.starts_with("native-semantic-box-"))
+                                || (case == Case::SemanticFrameOwnerReleaseHeld && group.starts_with("native-frame-owner-"))) && !readonly_held_once {
                                 readonly_held_once = true;
                                 assert!(held.replace(request.clone()).is_none());
                                 continue;
@@ -173,8 +196,10 @@ async fn peer(case: Case) -> Peer {
                             }
                             json!({"data":protected})
                         }
-                        "Accessibility.getFullAXTree" => { assert_eq!(session, "host-session"); assert_eq!(request["params"]["frameId"], frame); observation_reply(&request).unwrap() },
-                        "DOM.resolveNode" => { assert_eq!(session, "host-session"); assert_eq!(request["params"]["backendNodeId"], 1); assert_eq!(request["params"]["executionContextId"], 1); observation_reply(&request).unwrap() },
+                        "Accessibility.getFullAXTree" => { assert_eq!(session, "host-session"); if case == Case::SemanticFrameOwnerReleaseHeld { semantic_frame_reply(&request).unwrap() } else { assert_eq!(request["params"]["frameId"], frame); if case == Case::SemanticGeometryReleaseHeld { semantic_geometry_reply(&request).unwrap() } else { observation_reply(&request).unwrap() } } },
+                        "DOM.resolveNode" => { assert_eq!(session, "host-session"); if case == Case::SemanticFrameOwnerReleaseHeld { semantic_frame_reply(&request).unwrap() } else { assert_eq!(request["params"]["executionContextId"], 1); if case == Case::SemanticGeometryReleaseHeld { semantic_geometry_reply(&request).unwrap() } else { assert_eq!(request["params"]["backendNodeId"], 1); observation_reply(&request).unwrap() } } },
+                        "DOM.getBoxModel" if case == Case::SemanticGeometryReleaseHeld => json!({"model":{"border":[1,1,5,1,5,5,1,5]}}),
+                        "DOM.getBoxModel" if case == Case::SemanticFrameOwnerReleaseHeld => json!({"model":{"border":[0,0,6,0,6,6,0,6],"content":[0,0,6,0,6,6,0,6]}}),
                         "Runtime.getProperties"|"Runtime.releaseObject" => { assert_eq!(session, "host-session"); observation_reply(&request).expect("known Observe method") },
                         "Input.dispatchMouseEvent" => { assert_eq!(session, "host-session"); assert!(matches!(request["params"]["type"].as_str(), Some("mouseMoved"|"mousePressed"|"mouseReleased"))); json!({}) },
                         "Page.enable"|"Runtime.enable"|"Network.enable"|"WebMCP.enable"|"DOM.enable"|"DOM.disable"|"Network.disable"|"Network.setBypassServiceWorker"|"Fetch.enable"|"Fetch.disable"|"Page.setLifecycleEventsEnabled"|"Target.setDiscoverTargets"|"Target.setAutoAttach"|"Runtime.runIfWaitingForDebugger"|"Page.removeScriptToEvaluateOnNewDocument"|"Emulation.setEmulatedMedia"|"Target.detachFromTarget"|"Browser.setDownloadBehavior"|"Animation.enable"|"Animation.disable" => json!({}),
@@ -215,6 +240,108 @@ async fn peer(case: Case) -> Peer {
         protected_png,
         release: peer_release,
         disconnect,
+    }
+}
+
+// Same-process child document: no detached-target or renderer enrollment is
+// fabricated. Inventory must preserve both native documents with owner debt.
+fn semantic_frame_reply(request: &Value) -> Option<Value> {
+    match request["method"].as_str()? {
+        "Accessibility.getFullAXTree" => {
+            if request["params"]["frameId"] == "child-frame" {
+                Some(
+                    json!({"nodes":[{"nodeId":"child-document","backendDOMNodeId":3,"role":{"type":"role","value":"RootWebArea"}}]}),
+                )
+            } else {
+                Some(json!({"nodes":[
+                    {"nodeId":"document","backendDOMNodeId":1,"childIds":["iframe"],"role":{"type":"role","value":"RootWebArea"}},
+                    {"nodeId":"iframe","parentId":"document","backendDOMNodeId":2,"role":{"type":"role","value":"Iframe"}}
+                ]}))
+            }
+        }
+        "DOM.resolveNode" => {
+            let backend = request["params"]["backendNodeId"].as_u64().unwrap();
+            assert!(matches!(backend, 1..=3));
+            assert_eq!(
+                request["params"]["executionContextId"],
+                if backend == 3 { 2 } else { 1 }
+            );
+            let group = request["params"]["objectGroup"].as_str().unwrap();
+            Some(
+                json!({"object":{"type":"object","subtype":"node","objectId":format!("{group}-node-{backend}")}}),
+            )
+        }
+        "Runtime.callFunctionOn" => {
+            let declaration = request["params"]["functionDeclaration"].as_str()?;
+            if declaration == crate::native::client_observation::FRAME_OWNER_GEOMETRY {
+                Some(json!({"result":{"value":{"x":0,"y":0,"selector":"#child"}}}))
+            } else if declaration.contains("const read=") {
+                let values=request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|argument| {
+                    if argument["objectId"].as_str().unwrap().ends_with("node-2") {
+                        json!({"attributes":{"id":"child"},"labels":[],"states":{},"rect":{"x":0,"y":0,"width":6,"height":6},"author":{"tag":"iframe","nodeType":1,"visible":true}})
+                    } else { json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}}) }
+                }).collect::<Vec<_>>();
+                Some(json!({"result":{"value":values}}))
+            } else if request["params"]["objectGroup"]
+                .as_str()
+                .is_some_and(|group| group.starts_with("native-semantic-box-"))
+            {
+                if declaration.contains("frameOwner") {
+                    Some(
+                        json!({"result":{"value":{"connected":true,"frameOwner":true,"width":6,"height":6}}}),
+                    )
+                } else {
+                    Some(json!({"result":{"value":true}}))
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+// A complete native semantic tree with an actual element rectangle, ensuring
+// browser.observe reaches semantic BOX_PROOF rather than the document-only path.
+fn semantic_geometry_reply(request: &Value) -> Option<Value> {
+    match request["method"].as_str()? {
+        "Accessibility.getFullAXTree" => Some(json!({"nodes":[
+            {"nodeId":"document","backendDOMNodeId":1,"childIds":["button"],"role":{"type":"role","value":"RootWebArea"}},
+            {"nodeId":"button","parentId":"document","backendDOMNodeId":2,"role":{"type":"role","value":"button"},"name":{"type":"computedString","value":"Submit"}}
+        ]})),
+        "DOM.resolveNode" => {
+            let backend = request["params"]["backendNodeId"].as_u64().unwrap();
+            assert!(matches!(backend, 1 | 2));
+            let group = request["params"]["objectGroup"].as_str().unwrap();
+            Some(json!({"object":{"objectId":format!("{group}-node-{backend}"),"subtype":"node"}}))
+        }
+        "Runtime.callFunctionOn" => {
+            let declaration = request["params"]["functionDeclaration"].as_str()?;
+            if declaration.contains("const read=") {
+                let values = request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|argument| {
+                    let object = argument["objectId"].as_str().unwrap();
+                    if object.ends_with("node-2") {
+                        json!({"attributes":{},"labels":[],"states":{},"rect":{"x":1,"y":1,"width":4,"height":4},"author":{"tag":"button","nodeType":1,"visible":true,"action":true}})
+                    } else {
+                        assert!(object.ends_with("node-1"));
+                        json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
+                    }
+                }).collect::<Vec<_>>();
+                Some(json!({"result":{"value":values}}))
+            } else if request["params"]["objectGroup"]
+                .as_str()
+                .is_some_and(|group| group.starts_with("native-semantic-box-"))
+            {
+                if declaration.contains("frameOwner") {
+                    Some(json!({"result":{"value":{"connected":true,"frameOwner":false}}}))
+                } else {
+                    Some(json!({"result":{"value":true}}))
+                }
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -1194,11 +1321,28 @@ async fn i10_t06_new_observe_after_tree_publication_cannot_receive_late_old_pixe
     assert_eq!(newer["ok"], true);
     assert!(newer["data"].get("pixels").is_none());
     assert_ne!(newer["data"]["revision"], first["data"]["revision"]);
-    let newer_viewport = newer["data"]["viewportRef"]["id"]
-        .as_str()
-        .unwrap()
-        .trim_start_matches('@');
-    assert!(browser.refs.lock().unwrap().get(newer_viewport).is_some());
+    let viewport = &newer["data"]["viewportRef"];
+    let page_session = browser.page_lease(false).await.unwrap().page_session_id;
+    {
+        let refs = browser.refs.lock().unwrap();
+        // Viewport authority is separate from DOM-node membership. Check the
+        // same full capability used by point actions, not the DOM-only map.
+        assert!(refs.matches_viewport_reference(
+            &scope,
+            1,
+            &page_session,
+            viewport["id"].as_str().unwrap(),
+            viewport["revision"].as_str().unwrap(),
+        ));
+        let root = newer["data"]["root"]["ref"]["id"]
+            .as_str()
+            .unwrap()
+            .trim_start_matches('@');
+        let revision = newer["data"]["revision"].as_str().unwrap().parse().unwrap();
+        assert!(refs.get(root).unwrap().is_current_observed(revision));
+        let old_revision = first["data"]["revision"].as_str().unwrap().parse().unwrap();
+        assert!(!refs.get(root).unwrap().is_current_observed(old_revision));
+    }
     assert!(peer.restoration_acked.load(Ordering::Acquire));
     assert_eq!(
         peer.log
@@ -1277,5 +1421,126 @@ async fn i10_t08_healthy_optional_pixels_after_old_cleanup_cutoff_still_publish(
         )
         .await
         .unwrap();
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn readonly_semantic_geometry_held_ack_publishes_complete_observe_within_eighty_ms() {
+    let (peer, browser, mut fixture, scope) =
+        optional_fixture(Case::SemanticGeometryReleaseHeld).await;
+    let client = browser.page_lease(false).await.unwrap().client;
+    let ledger = client.debt_ledger().unwrap();
+    let started = optional_request(&mut fixture, &scope, "geometry-debt-tree", false, 80).await;
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "geometry-debt-tree"),
+    )
+    .await
+    .expect("readonly geometry ACK consumed original Observe deadline");
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["effects"], "completed");
+    assert_eq!(result["data"]["root"]["role"], "document");
+    let button = result["data"]["root"]["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|node| node["role"] == "button")
+        .expect("actual semantic button missing");
+    assert_eq!(button["name"], "Submit");
+    assert_eq!(button["rect"]["width"], 4.0);
+    assert!(result["data"].get("pixels").is_none());
+    assert!(ledger.snapshot().object_debt > 0);
+    assert!(!ledger.snapshot().integrity_lost);
+    let held = peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request["method"] == "Runtime.releaseObjectGroup"
+                && request["params"]["objectGroup"]
+                    .as_str()
+                    .is_some_and(|group| group.starts_with("native-semantic-box-"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(held.len(), 1, "semantic geometry path was not reached");
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["method"] == "Runtime.releaseObject"));
+    peer.release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ledger.snapshot().object_debt != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!browser.refs.lock().unwrap().ref_ids().is_empty());
+    optional_finish(peer, fixture).await.unwrap();
+}
+
+#[tokio::test]
+async fn readonly_frame_owner_held_ack_publishes_both_documents_within_eighty_ms() {
+    let (peer, browser, mut fixture, scope) =
+        optional_fixture(Case::SemanticFrameOwnerReleaseHeld).await;
+    let client = browser.page_lease(false).await.unwrap().client;
+    let ledger = client.debt_ledger().unwrap();
+    let started = optional_request(&mut fixture, &scope, "frame-debt-tree", false, 80).await;
+    let result = tokio::time::timeout_at(
+        (started + Duration::from_millis(80)).into(),
+        optional_result(&mut fixture, "frame-debt-tree"),
+    )
+    .await
+    .expect("readonly frame owner ACK consumed original Observe deadline");
+    assert_eq!(result["ok"], true, "{result}");
+    assert_eq!(result["effects"], "completed");
+    let mut pending = vec![&result["data"]["root"]];
+    let mut documents = 0;
+    while let Some(node) = pending.pop() {
+        documents += usize::from(node["role"] == "document");
+        if let Some(children) = node["children"].as_array() {
+            pending.extend(children);
+        }
+    }
+    assert_eq!(
+        documents, 2,
+        "semantic child document was discarded: {result}"
+    );
+    assert!(result["data"].get("pixels").is_none());
+    assert!(ledger.snapshot().object_debt > 0);
+    assert!(!ledger.snapshot().integrity_lost);
+    let held = peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request["method"] == "Runtime.releaseObjectGroup"
+                && request["params"]["objectGroup"]
+                    .as_str()
+                    .is_some_and(|group| group.starts_with("native-frame-owner-"))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(!held.is_empty());
+    assert!(!peer
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|request| request["method"] == "Runtime.releaseObject"));
+    peer.release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while ledger.snapshot().object_debt != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!browser.refs.lock().unwrap().ref_ids().is_empty());
     optional_finish(peer, fixture).await.unwrap();
 }

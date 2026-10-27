@@ -3,7 +3,7 @@
 //! newly acquired element. Native enumeration instead resolves an owner object
 //! before the semantic lease exists, under the unchanged 80 ms parent deadline.
 //! Its late owner must be reclaimed, but no 60 ms successful fallback is claimed.
-//! Cleanup can outlive the business deadline. An exact, accounted object-release
+//! Cleanup can outlive the business deadline. An exact, accounted group-release
 //! debt is not an input debt or lost integrity: retained does not mean settled.
 use super::*;
 use crate::native::client_browser::settle_observation_dispatch;
@@ -53,6 +53,7 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
         let mut owner_response = None::<Value>;
         let mut cleanup_response = None::<Value>;
         let mut owner_requested = false;
+        let mut owner_group = None::<String>;
         let mut owner_acked_at = None;
         let mut cleanup_requested = false;
         loop {
@@ -90,7 +91,7 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
             assert_eq!(request["sessionId"], "session");
             log.lock().unwrap().push(request.clone());
             if owner_requested {
-                assert_eq!(method, "Runtime.releaseObject", "late owner must not resume geometry, frame enumeration, metadata or screenshot");
+                assert_eq!(method, "Runtime.releaseObjectGroup", "late owner must not resume geometry, frame enumeration, metadata or screenshot");
             }
             let result = match method {
                 "Page.getFrameTree" => json!({"frameTree":{
@@ -116,23 +117,32 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
                     json!({"backendNodeId":42})
                 }
                 "DOM.resolveNode" => {
+                    let group = request["params"]["objectGroup"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned();
+                    assert!(group.starts_with("native-frame-owner-8301-"));
                     assert_eq!(
                         request["params"],
-                        json!({"backendNodeId":42,"executionContextId":1,"objectGroup":"native-frame-enumeration"})
+                        json!({"backendNodeId":42,"executionContextId":1,"objectGroup":group})
                     );
+                    assert!(owner_group.replace(group.clone()).is_none());
                     assert!(!owner_requested);
                     owner_requested = true;
                     assert!(owner_response.replace(json!({"id":request["id"],"sessionId":"session","result":{"object":{"type":"object","subtype":"node","objectId":OBJECT}}})).is_none());
-                    reached_tx.take().unwrap().send(()).unwrap();
+                    reached_tx.take().unwrap().send(group).unwrap();
                     continue;
                 }
-                "Runtime.releaseObject" => {
+                "Runtime.releaseObjectGroup" => {
                     assert!(
                         owner_acked_at.is_some(),
                         "cleanup must own the actual late object reply"
                     );
                     assert!(!cleanup_requested, "exact owner must be released only once");
-                    assert_eq!(request["params"], json!({"objectId":OBJECT}));
+                    assert_eq!(
+                        request["params"],
+                        json!({"objectGroup":owner_group.as_ref().unwrap()})
+                    );
                     cleanup_requested = true;
                     assert!(cleanup_response
                         .replace(json!({"id":request["id"],"sessionId":"session","result":{}}))
@@ -191,12 +201,15 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
             )
         })
         .await;
-    tokio::time::timeout_at(deadline.into(), reached)
+    let group = tokio::time::timeout_at(deadline.into(), reached)
         .await
         .expect("actual owner acquisition must start inside the original 80 ms budget")
         .unwrap();
-    assert!(journal.has_accounted_object_creation("session"));
+    // Native groups charge one exact obligation rather than an individual
+    // object creation slot. The actual resolve command is still unacknowledged.
+    assert!(!journal.has_accounted_object_creation("session"));
     assert_eq!(journal.snapshot().object_debt, 1);
+    assert_eq!(ledger.snapshot().outstanding_commands, 1);
     tokio::time::sleep_until(deadline.into()).await;
     assert!(matches!(
         task.result.try_recv(),
@@ -208,13 +221,14 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
         .await
         .expect("late owner must reach its exact release, not disappear with the deadline")
         .unwrap();
-    // The real transport ledger records the returned object before delivering
-    // its waiter. It now owns a concrete object and its outstanding cleanup,
-    // not merely the peer's synthetic bookkeeping or an anonymous creation slot.
+    // The real late owner ACK settled acquisition before this exact group
+    // release was submitted. Group ownership never becomes raw objectId custody.
     assert!(!journal.has_accounted_object_creation("session"));
-    assert!(ledger.accounted_object_release("session", OBJECT));
-    assert!(!ledger.accounted_object_release("other-session", OBJECT));
-    assert!(!ledger.accounted_object_release("session", "other-object"));
+    assert!(!ledger.accounted_object_release("session", OBJECT));
+    let release = commands.lock().unwrap().last().unwrap().clone();
+    assert_eq!(release["method"], "Runtime.releaseObjectGroup");
+    assert_eq!(release["sessionId"], "session");
+    assert_eq!(release["params"]["objectGroup"], group);
     let pending = ledger.snapshot();
     assert_eq!(
         (
@@ -226,16 +240,17 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
     );
     assert!(!pending.integrity_lost);
     assert_eq!(journal.snapshot().object_debt, 1);
-    assert!(matches!(
-        task.result.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
+    // The failed semantic result may now return. Its owner acquisition has
+    // actually settled; only the independently accounted disposal ACK is held.
+
     let mut release_cleanup = Some(release_cleanup);
+    let mut cleanup_acked = Some(cleanup_acked);
     if !withhold_release_ack {
         release_cleanup.take().unwrap().send(()).unwrap();
     }
     // Watchdog only, not an extended operation budget. The parent is already
-    // expired; native acquisition/release settlement retains its existing bound.
+    // expired; the acquisition kept its existing bounded settlement and exact
+    // disposal has been handed off without claiming its ACK.
     let (output, cleanup) = tokio::time::timeout(Duration::from_secs(1), async {
         tokio::join!(task.result, task.join)
     })
@@ -267,6 +282,14 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
             (0, 0)
         );
     }
+    let fence_client = client.owner_view(ledger.clone()).unwrap();
+    if !withhold_release_ack {
+        tokio::time::timeout(Duration::from_secs(1), cleanup_acked.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        fence(&fence_client).await;
+    }
     let retained = ledger.snapshot();
     let outstanding = u32::from(withhold_release_ack);
     assert_eq!(
@@ -279,10 +302,7 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
     );
     assert!(!retained.integrity_lost);
     assert_eq!(journal.snapshot().object_debt, outstanding);
-    assert_eq!(
-        ledger.accounted_object_release("session", OBJECT),
-        withhold_release_ack
-    );
+    assert!(!ledger.accounted_object_release("session", OBJECT));
     // Existing admission allows bounded object-only debt below its capacity
     // limit. Input debt and lost integrity are different, blocking contracts.
     assert_eq!(ledger.check_admission(AdmissionClass::Reference), Ok(()));
@@ -307,13 +327,14 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
     if withhold_release_ack {
         release_cleanup.take().unwrap().send(()).unwrap();
     }
-    tokio::time::timeout(Duration::from_secs(1), cleanup_acked)
-        .await
-        .unwrap()
-        .unwrap();
+    if let Some(acked) = cleanup_acked {
+        tokio::time::timeout(Duration::from_secs(1), acked)
+            .await
+            .unwrap()
+            .unwrap();
+    }
     // The operation journal scope has ended. Bind this harness-only fence to
     // the exact owner without reviving the retired operation's authority.
-    let fence_client = client.owner_view(ledger.clone()).unwrap();
     fence(&fence_client).await;
     let cleared = ledger.snapshot();
     assert_eq!(
@@ -361,7 +382,7 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
                 "DOM.getFrameOwner",
                 "Page.createIsolatedWorld",
                 "DOM.resolveNode",
-                "Runtime.releaseObject",
+                "Runtime.releaseObjectGroup",
             ]
         );
     }

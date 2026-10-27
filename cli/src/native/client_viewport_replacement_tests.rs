@@ -99,7 +99,7 @@ async fn replacement_viewport_ack(success: bool) {
         .lock()
         .unwrap()
         .pending_enrollment
-        .contains(session));
+        .contains_key(session));
     assert!(f.owner.targets.inventory().is_err());
     assert!(!f
         .requests("Runtime.runIfWaitingForDebugger")
@@ -116,7 +116,7 @@ async fn replacement_viewport_ack(success: bool) {
             let settled = {
                 let index = f.owner.index.lock().unwrap();
                 if success {
-                    !index.pending_enrollment.contains(session)
+                    !index.pending_enrollment.contains_key(session)
                 } else {
                     index.failure.is_some()
                 }

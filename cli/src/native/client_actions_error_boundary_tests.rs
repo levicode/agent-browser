@@ -192,7 +192,14 @@ async fn exercise(mode: &'static str, sensitive: bool, succeeds: bool, raced: bo
             }
         );
         assert!(!failure.cleanup_failed);
-        assert_eq!(failure.reason, None);
+        assert_eq!(
+            failure.reason,
+            if mode.ends_with("-div") {
+                Some(ActionReason::FillUnsupportedTarget)
+            } else {
+                None
+            }
+        );
         assert!(!format!("{failure:?}").contains(value));
         failure.effects
     };

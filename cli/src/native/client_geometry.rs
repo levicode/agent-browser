@@ -930,7 +930,14 @@ async fn read_proofs(
                 loader: parent.loader.clone(),
                 actionable: false,
             };
-            let (model, size) = read_exact_box(client, &parent_binding, backend, operation).await?;
+            let (model, size) = read_exact_box(
+                client,
+                &parent_binding,
+                backend,
+                operation,
+                semantic.is_some(),
+            )
+            .await?;
             let size = size.ok_or(GeometryError::InvalidGeometry)?;
             let target = frames
                 .get_mut(&binding.frame)
@@ -1468,7 +1475,7 @@ impl GeometrySnapshot {
             return Err(GeometryError::StaleIdentity);
         }
         let (model, _) =
-            read_exact_box_impl(client, &frame.binding, backend, operation, false).await?;
+            read_exact_box_impl(client, &frame.binding, backend, operation, false, true).await?;
         self.project_semantic_quad(
             &frame.binding.frame,
             quad_points(&model["model"]["border"])?,
@@ -1493,7 +1500,7 @@ impl GeometrySnapshot {
         {
             return Err(GeometryError::StaleIdentity);
         }
-        let (model, _) = read_exact_box(client, &frame.binding, backend, operation).await?;
+        let (model, _) = read_exact_box(client, &frame.binding, backend, operation, false).await?;
         Ok(vec![self.project_native_quad(
             &frame.binding.frame,
             quad(&model["model"]["border"])?,
@@ -1518,8 +1525,9 @@ async fn read_exact_box(
     binding: &element::ExactBinding,
     backend: i64,
     operation: &OperationLease,
+    readonly_disposal: bool,
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
-    read_exact_box_impl(client, binding, backend, operation, true).await
+    read_exact_box_impl(client, binding, backend, operation, true, readonly_disposal).await
 }
 async fn read_exact_box_impl(
     client: &CdpClient,
@@ -1527,10 +1535,68 @@ async fn read_exact_box_impl(
     backend: i64,
     operation: &OperationLease,
     require_owner_size: bool,
+    readonly_disposal: bool,
+) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
+    check(operation)?;
+    if readonly_disposal
+        && client.debt_ledger().is_some()
+        && super::client_debt::OperationJournalHandle::current().is_some()
+    {
+        // A group, not a textual objectId, owns this complete readonly read.
+        // Never reuse its name while an earlier release is queued or unacked.
+        let group = client
+            .readonly_group_instance(&format!("native-semantic-box-{}", operation.sequence))
+            .map_err(|_| GeometryError::BackendFailure)?;
+        let result = super::client_debt::native_object_group(
+            &group,
+            read_exact_box_inner(
+                client,
+                binding,
+                backend,
+                operation,
+                require_owner_size,
+                Some(&group),
+            ),
+        )
+        .await;
+        if super::client_actions::release_readonly_group_accounted(client, &binding.session, &group)
+            .await
+        {
+            return result;
+        }
+        return Err(GeometryError::CleanupFailed {
+            primary: result.err().map(Box::new),
+        });
+    }
+    read_exact_box_inner(
+        client,
+        binding,
+        backend,
+        operation,
+        require_owner_size,
+        None,
+    )
+    .await
+}
+async fn read_exact_box_inner(
+    client: &CdpClient,
+    binding: &element::ExactBinding,
+    backend: i64,
+    operation: &OperationLease,
+    require_owner_size: bool,
+    readonly_group: Option<&str>,
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
     check(operation)?;
     let mut cancel = operation.cancellation.clone();
-    let resolution = element::resolve_exact_object_typed(client, binding, backend);
+    let resolution = async {
+        match readonly_group {
+            Some(group) => {
+                element::resolve_exact_object_in_readonly_group(client, binding, backend, group)
+                    .await
+            }
+            None => element::resolve_exact_object_typed(client, binding, backend).await,
+        }
+    };
     tokio::pin!(resolution);
     let (resolved, interrupted) = tokio::select! {
         result=&mut resolution=>(Some(result),None),
@@ -1554,8 +1620,9 @@ async fn read_exact_box_impl(
         },
     };
     let object = resolved.map_err(|error| match error {
-        // The typed resolver proves any acquired object was released before
-        // reporting retirement. Preserve a cancellation already observed here.
+        // The strict resolver released acquired objects; readonly resolution
+        // leaves them with the outer exact group owner. Neither case converts
+        // retirement into success. Preserve cancellation already observed here.
         element::ExactResolutionError::Superseded => {
             check(operation).err().unwrap_or(GeometryError::Superseded)
         }
@@ -1566,8 +1633,9 @@ async fn read_exact_box_impl(
         },
     })?;
     if let Some(primary) = interrupted {
-        return if super::client_actions::release_object_accounted(client, &binding.session, &object)
-            .await
+        return if readonly_group.is_some()
+            || super::client_actions::release_object_accounted(client, &binding.session, &object)
+                .await
         {
             Err(primary)
         } else {
@@ -1588,11 +1656,16 @@ async fn read_exact_box_impl(
         .await?;
         // Recheck the same object against the isolated realm document after
         // geometry, not merely the frame loader: adoption can keep a node connected.
+        let mut params =
+            json!({"objectId":object,"functionDeclaration":BOX_PROOF,"returnByValue":true});
+        if let Some(group) = readonly_group {
+            params["objectGroup"] = group.into();
+        }
         let proof = command(
             client,
             &binding.session,
             "Runtime.callFunctionOn",
-            json!({"objectId":object,"functionDeclaration":BOX_PROOF,"returnByValue":true}),
+            params,
             operation,
         )
         .await?;
@@ -1624,6 +1697,11 @@ async fn read_exact_box_impl(
         Ok((model, size))
     }
     .await;
+    if readonly_group.is_some() {
+        // The outer group owner releases successful, refused and auxiliary
+        // handles together. It never transfers a staged action reference.
+        return result;
+    }
     let released = tokio::time::timeout(Duration::from_millis(250), async {
         let mut complete = true;
         for object in owned_objects {
@@ -2768,3 +2846,7 @@ mod tests {
         result.unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "client_readonly_disposal_tests.rs"]
+mod readonly_disposal_tests;

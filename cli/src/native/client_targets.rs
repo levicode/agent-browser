@@ -1475,6 +1475,45 @@ impl ClientTargets {
         }
         Ok(())
     }
+    /// No child tenure exists in the queued phase. The enrollment index retains
+    /// its direct-detach event and proves registration never started. This fence
+    /// checks only original known ancestors and absence, without minting a child.
+    pub(super) fn finish_detached_queued_iframe(
+        &self,
+        target: &str,
+        session: &str,
+        parent: &OwnedTarget,
+        root: &OwnedTarget,
+        check_bounds: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed
+            || state.integrity_lost
+            || state.protected_read
+            || root.kind != "page"
+            || !matches!(parent.kind.as_str(), "page" | "iframe")
+            // Auxiliary classification can retain cleanup ownership before
+            // ordinary registration. Candidate retirement cannot bypass it.
+            || state.auxiliary.values().any(|entry| entry.target == target)
+            || state
+                .targets
+                .values()
+                .any(|current| current.target_id == target || current.session_id == session)
+            || [parent, root].iter().any(|ticket| {
+                !Arc::ptr_eq(&self.attachment_owner, &ticket.tenure.owner)
+                    || !state.targets.get(&ticket.target_id).is_some_and(|current| {
+                        current.purpose == Some(TargetPurpose::Application)
+                            && current.same_initialization_attachment(ticket)
+                    })
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        check_bounds()
+    }
     /// Only the directly matched application page may carry this receipt.
     /// Registry removal or a cascaded descendant detach is not equivalent proof.
     pub(super) fn observe_media_detach(
@@ -1616,7 +1655,7 @@ impl ClientTargets {
     pub(crate) fn publish_restart_ready<T>(
         &self,
         replacement: &OwnedTarget,
-        pending: &HashSet<String>,
+        pending: impl Fn(&str) -> bool,
         known: impl Fn(&OwnedTarget) -> bool,
         enrollment_ready: bool,
         publish: impl FnOnce() -> Result<T, ProtocolError>,
@@ -1657,7 +1696,7 @@ impl ClientTargets {
                 || !target.resumed
                 || target.resume_pending
             {
-                if !pending.contains(&target.session_id) {
+                if !pending(&target.session_id) {
                     return Err(ProtocolError::ScopeUnavailable);
                 }
                 configuring = true;
@@ -3417,6 +3456,34 @@ mod tests {
         }
         registry
     }
+    #[test]
+    fn queued_iframe_retirement_cannot_bypass_auxiliary_cleanup_owner() {
+        let registry = auxiliary_registry();
+        registry
+            .attached("ctx", "root".into(), "root-session".into(), "page".into())
+            .unwrap();
+        let root = registry.owned_target("root").unwrap();
+        let mut auxiliary = registry
+            .reserve_auxiliary_attachment("scope", "target", "primary")
+            .unwrap();
+        auxiliary.claim("recorder").unwrap();
+        registry.detach("target").unwrap();
+        assert!(registry.owned_target("target").is_err());
+        assert_eq!(
+            registry.finish_detached_queued_iframe("target", "candidate", &root, &root, || Ok(())),
+            Err(super::ProtocolError::StaleScope)
+        );
+        // Even a completed recorder tombstone is not ordinary queued ownership.
+        auxiliary.detached("recorder").unwrap();
+        assert_eq!(
+            registry.finish_detached_queued_iframe("target", "candidate", &root, &root, || Ok(())),
+            Err(super::ProtocolError::StaleScope)
+        );
+        assert!(registry
+            .finish_detached_queued_iframe("new-child", "new-session", &root, &root, || Ok(()))
+            .is_ok());
+    }
+
     #[tokio::test]
     async fn auxiliary_event_before_ack_waits_exact_claim_not_next_candidate() {
         let registry = auxiliary_registry();

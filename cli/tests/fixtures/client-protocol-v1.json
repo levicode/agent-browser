@@ -180,7 +180,9 @@
     "redirect-body-unavailable",
     "intercepted-pointer",
     "checked-state-unchanged",
-    "checked-control-replaced"
+    "checked-control-replaced",
+    "fill-unsupported-target",
+    "no-editable-focus"
   ],
   "validDecision": [
     {

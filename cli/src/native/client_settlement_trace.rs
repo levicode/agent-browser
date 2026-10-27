@@ -27,6 +27,8 @@ pub(crate) enum SettlementPhase {
     TargetInventorySummary,
     TargetObservationLost,
     ScreenshotFirstFailure,
+    ProtectedCaptureFailure,
+    ObservationPixelResult,
     FrameInventoryRejection,
     ReadonlyPrepareFailure,
     TerminalCleanupCheckpoint,
@@ -244,6 +246,16 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_phase: Option<ScreenshotCapturePhase>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_capture_phase: Option<super::client_capture::CapturePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_capture_reason: Option<super::client_capture::CaptureReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_budget_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pixels_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub early_semantic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_after_failure: Option<InventoryAfterFailure>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_us: Option<u64>,
@@ -311,6 +323,7 @@ impl Facts {
     fn clamp(&mut self, overflow: &mut bool) {
         for value in [
             &mut self.generation,
+            &mut self.capture_budget_ms,
             &mut self.attachment_ordinal,
             &mut self.inventory_ordinal,
             &mut self.target_ordinal,
@@ -922,6 +935,88 @@ impl ServiceWorkerAdmission {
         );
         result
     }
+}
+
+/// Native optional-pixel publication facts, not an adapter transfer receipt.
+pub(crate) fn observation_pixel_result(
+    generation: u64,
+    sequence: u64,
+    accepted: bool,
+    pixels: bool,
+    early_semantic: bool,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        observation_pixel_result_into(
+            capture,
+            generation,
+            sequence,
+            accepted,
+            pixels,
+            early_semantic,
+        );
+    }
+}
+
+fn observation_pixel_result_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    accepted: bool,
+    pixels: bool,
+    early_semantic: bool,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ObservationPixelResult,
+        Facts {
+            generation: Some(generation),
+            accepted: Some(accepted),
+            pixels_available: Some(pixels),
+            early_semantic: Some(early_semantic),
+            ..Facts::default()
+        },
+    );
+}
+
+/// Original protected-capture refusal, before callers map it to an optional
+/// missing image. Reuses the default-off bounded cleanup sink without renderer data.
+pub(crate) fn protected_capture_failure(
+    operation: &super::client_session::OperationLease,
+    failure: super::client_capture::CaptureAttemptFailure,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        let remaining = operation
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        protected_capture_failure_into(
+            capture,
+            operation.generation,
+            operation.sequence,
+            failure,
+            remaining.as_millis().min(SAFE_INTEGER as u128) as u64,
+        );
+    }
+}
+fn protected_capture_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: super::client_capture::CaptureAttemptFailure,
+    capture_budget_ms: u64,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ProtectedCaptureFailure,
+        Facts {
+            generation: Some(generation),
+            protected_capture_phase: Some(failure.phase),
+            protected_capture_reason: Some(failure.reason),
+            capture_budget_ms: Some(capture_budget_ms),
+            ..Facts::default()
+        },
+    );
 }
 
 /// Closed call-site evidence for optional trace screenshots, not protocol authority.
@@ -2431,5 +2526,87 @@ mod terminal_cleanup_tests {
                     | "terminalCleanupOk"
             )));
         }
+    }
+}
+
+#[cfg(test)]
+mod protected_capture_diagnostic_tests {
+    use super::*;
+    use crate::native::client_capture::{CaptureAttemptFailure, CapturePhase, CaptureReason};
+
+    #[test]
+    fn optional_pixel_native_result_uses_only_three_boolean_result_facts() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        observation_pixel_result_into(&capture, 1, 2, true, false, true);
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert!(text.trim().len() < MAX_RECORD_BYTES);
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["phase"], "ObservationPixelResult");
+        assert_eq!(value["accepted"], true);
+        assert_eq!(value["pixelsAvailable"], false);
+        assert_eq!(value["earlySemantic"], true);
+        assert!(value.as_object().unwrap().keys().all(|key| matches!(
+            key.as_str(),
+            "schemaVersion"
+                | "source"
+                | "pid"
+                | "record"
+                | "operationSeq"
+                | "phase"
+                | "droppedBefore"
+                | "emittedBefore"
+                | "suppressedBefore"
+                | "overflow"
+                | "generation"
+                | "accepted"
+                | "pixelsAvailable"
+                | "earlySemantic"
+        )));
+    }
+
+    #[test]
+    fn protected_capture_refusal_keeps_original_phase_reason_and_bounded_payload() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        protected_capture_failure_into(
+            &capture,
+            u64::MAX,
+            u64::MAX,
+            CaptureAttemptFailure {
+                phase: CapturePhase::IndependentCoverage,
+                reason: CaptureReason::UnsafeGeometry,
+            },
+            u64::MAX,
+        );
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("ProtectedCaptureFailure"))
+            .unwrap();
+        assert!(line.len() < MAX_RECORD_BYTES);
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["protectedCapturePhase"], "independent-coverage");
+        assert_eq!(value["protectedCaptureReason"], "unsafe-geometry");
+        assert_eq!(value["captureBudgetMs"], SAFE_INTEGER);
+        assert_eq!(value["generation"], SAFE_INTEGER);
+        assert_eq!(value["operationSeq"], SAFE_INTEGER);
+        assert!(value.as_object().unwrap().keys().all(|key| matches!(
+            key.as_str(),
+            "schemaVersion"
+                | "source"
+                | "pid"
+                | "record"
+                | "operationSeq"
+                | "phase"
+                | "droppedBefore"
+                | "emittedBefore"
+                | "suppressedBefore"
+                | "overflow"
+                | "generation"
+                | "protectedCapturePhase"
+                | "protectedCaptureReason"
+                | "captureBudgetMs"
+        )));
     }
 }

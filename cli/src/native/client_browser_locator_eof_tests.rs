@@ -10,6 +10,72 @@ fn purchase_expression() -> Value {
     json!({"kind":"query","query":{"kind":"text","value":{"kind":"string","value":"Purchase","exact":true}}})
 }
 
+// Managed readonly groups use the exact operation sequence and a transport
+// allocator instance. A prefix match alone would accept another owner's read.
+fn locator_readonly_group(session: &str, group: &str, sequence: u64) -> bool {
+    if session != "host-session" || sequence == 0 {
+        return false;
+    }
+    ["native-security-", "native-metadata-", "native-query-"]
+        .iter()
+        .any(|prefix| {
+            let Some(tail) = group.strip_prefix(prefix) else {
+                return false;
+            };
+            let Some((operation, instance)) = tail.split_once('-') else {
+                return false;
+            };
+            operation == sequence.to_string()
+                && instance
+                    .parse::<u64>()
+                    .is_ok_and(|id| id > 0 && id < u64::MAX && id.to_string() == instance)
+        })
+}
+
+#[test]
+fn locator_readonly_group_requires_exact_owner_sequence_and_canonical_instance() {
+    for prefix in ["native-security", "native-metadata", "native-query"] {
+        assert!(locator_readonly_group(
+            "host-session",
+            &format!("{prefix}-7-13"),
+            7
+        ));
+    }
+    for group in [
+        "native-security-7",
+        "native-security-8-13",
+        "native-security-07-13",
+        "native-security-7-0",
+        "native-security-7-013",
+        "native-security-7-+13",
+        "native-security-7-13-extra",
+        "native-security-7-",
+        "native-security-7-x",
+        "native-security-7-18446744073709551615",
+        "native-security-7-18446744073709551616",
+        "other-security-7-13",
+        "native-exact",
+        "native-semantic-box-7-13",
+    ] {
+        assert!(!locator_readonly_group("host-session", group, 7), "{group}");
+    }
+    assert!(!locator_readonly_group(
+        "replacement-session",
+        "native-security-7-13",
+        7
+    ));
+    assert!(!locator_readonly_group(
+        "host-session",
+        "native-security-7-13",
+        8
+    ));
+    assert!(!locator_readonly_group(
+        "host-session",
+        "native-security-0-13",
+        0
+    ));
+}
+
 #[derive(Debug)]
 struct Handle {
     backend: Option<i64>,
@@ -23,6 +89,7 @@ struct LocatorModel {
     realm_destroyed: bool,
     input_count: usize,
     query_count: usize,
+    expected_operation_seq: u64,
     exact_action: Option<String>,
     sent_release_acks: Vec<String>,
 }
@@ -76,11 +143,11 @@ impl LocatorModel {
                 let group = p["objectGroup"].as_str().unwrap();
                 assert!(
                     group == "native-exact"
-                        || ["native-security-", "native-metadata-", "native-query-"]
-                            .iter()
-                            .any(|prefix| group
-                                .strip_prefix(prefix)
-                                .is_some_and(|n| n.parse::<u64>().is_ok()))
+                        || locator_readonly_group(
+                            request["sessionId"].as_str().unwrap_or(""),
+                            group,
+                            self.expected_operation_seq,
+                        )
                 );
                 let object = self.object(Some(backend), group);
                 if group == "native-exact" && self.query_count == 2 {
@@ -405,19 +472,39 @@ async fn framed_locator_release(hold_release: bool) {
             owner.page_state.clone(),
         )
     };
+    peer.model.lock().unwrap().expected_operation_seq = framed.sequence + 1;
     let located = framed.command("browser.query", json!({"identityScope":scope,"expression":purchase_expression(),"testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR}), 5).await.unwrap();
     assert_eq!(located["nodes"].as_array().unwrap().len(), 1);
     let reference = located["nodes"][0]["ref"].clone();
     assert!(reference["id"].is_string() && reference["revision"].is_string());
     assert_eq!(peer.model.lock().unwrap().query_count, 1);
+    // Query completion hands off readonly disposal; zero debt still requires
+    // the real reader ACKs. This does not extend the request's original budget.
+    bounded(async {
+        while ledger.snapshot().object_debt != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
     assert_eq!(ledger.snapshot().object_debt, 0);
     framed.sequence += 1;
+    peer.model.lock().unwrap().expected_operation_seq = framed.sequence;
     let key = OperationKey {
         generation: 1,
         operation_seq: framed.sequence,
     };
     framed.write(json!({"type":"request","id":"p06-locator","generation":1,"operationSeq":key.operation_seq,"timeoutMs":5000,"command":"browser.perform","args":{"identityScope":scope,"ref":reference,"action":{"kind":"tap"}}})).await.unwrap();
     bounded(peer.release.recv()).await.unwrap();
+    // The action's exact object ACK stays held in the EOF case. Wait only for
+    // independently acknowledged readonly groups from locator re-evaluation.
+    if hold_release {
+        bounded(async {
+            while ledger.snapshot().object_debt != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
     let exact = peer.model.lock().unwrap().exact_action.clone().unwrap();
     if hold_release {
         assert_eq!(
@@ -497,6 +584,12 @@ async fn framed_locator_release(hold_release: bool) {
         assert_eq!(result["ok"], true, "locator control failed: {result}");
         assert_eq!(result["effects"], "completed");
         assert_eq!(result["scopeState"], "usable");
+        bounded(async {
+            while ledger.snapshot().object_debt != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
         assert_eq!(ledger.snapshot().input_debt, 0);
         assert_eq!(ledger.snapshot().object_debt, 0);
         assert!(!ledger.snapshot().integrity_lost);

@@ -1222,6 +1222,45 @@ impl OwnerDebtLedger {
     pub(super) fn initialization_retirement_notifier(&self) -> Arc<tokio::sync::Notify> {
         self.changed.clone()
     }
+    /// A never-registered iframe has no child tenure or resume reservation.
+    /// Only exact queued event retirement may call this ancestor/owner fence.
+    pub(super) fn with_detached_queued_iframe(
+        &self,
+        generation: u64,
+        targets: &super::client_targets::ClientTargets,
+        binding: (&str, &str),
+        parent: &super::client_targets::OwnedTarget,
+        root: &super::client_targets::OwnedTarget,
+        commit: impl FnOnce() -> Result<(), ProtocolError>,
+    ) -> Result<bool, ProtocolError> {
+        let (target, session) = binding;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !self.matches_owner(generation, &targets.identity_scope)
+            || state.retired
+            || state.integrity_lost
+            || state.context_id.as_deref() != Some(targets.context_id.as_str())
+            || state.targets.contains_key(session)
+            || state.targets.values().any(|known| known == target)
+            || [parent, root].iter().any(|ancestor| {
+                state.targets.get(&ancestor.session_id) != Some(&ancestor.target_id)
+            })
+            || state.commands.values().any(|command| {
+                command.provenance.session.as_deref() == Some(session)
+                    || command.provenance.target.as_deref() == Some(target)
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if state.eval_publication_pending {
+            return Ok(false);
+        }
+        invalidate_eval(&mut state);
+        commit()?;
+        Ok(true)
+    }
     /// Candidate classification only. Absence cannot complete retirement:
     /// enrollment still requires its exact applied detach and original tenure.
     pub(super) fn worker_startup_session_unbound(

@@ -327,7 +327,7 @@ mod media_detach_tests {
             loop {
                 {
                     let index = f.owner.index.lock().unwrap();
-                    if index.pending_enrollment.contains("queued")
+                    if index.pending_enrollment.contains_key("queued")
                         && index.sessions.contains_key("queued")
                     {
                         assert!(!index.sessions["queued"].application);

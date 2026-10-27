@@ -30,6 +30,8 @@ pub enum ActionReason {
     InterceptedPointer,
     CheckedStateUnchanged,
     ControlReplacedAfterClick,
+    FillUnsupportedTarget,
+    NoEditableFocus,
 }
 #[derive(Debug)]
 pub struct ActionFailure {
@@ -45,6 +47,8 @@ struct Dispatch {
     intercepted: AtomicBool,
     checked_unchanged: AtomicBool,
     checked_replaced: AtomicBool,
+    fill_unsupported_target: AtomicBool,
+    no_editable_focus: AtomicBool,
     acknowledged_postcondition: AtomicBool,
     recording_start_refusal: Mutex<Option<RecordingStartRefusal>>,
     settled_replacement_prefix: Mutex<Option<Arc<SettledReplacementPrefix>>>,
@@ -181,6 +185,14 @@ impl Dispatch {
                 Some(ActionReason::ControlReplacedAfterClick)
             } else if self.checked_unchanged.load(Ordering::SeqCst) {
                 Some(ActionReason::CheckedStateUnchanged)
+            } else if !self.sent.load(Ordering::SeqCst) && !self.cleanup.load(Ordering::SeqCst) {
+                if self.fill_unsupported_target.load(Ordering::SeqCst) {
+                    Some(ActionReason::FillUnsupportedTarget)
+                } else if self.no_editable_focus.load(Ordering::SeqCst) {
+                    Some(ActionReason::NoEditableFocus)
+                } else {
+                    None
+                }
             } else {
                 None
             },
@@ -867,6 +879,10 @@ impl Resolved {
                 d.intercepted.store(true, Ordering::SeqCst);
                 Err(ProtocolError::NotActionable)
             }
+            Some("fill-unsupported-target") if !mutation && source == FILL_ADMISSIBILITY => {
+                d.fill_unsupported_target.store(true, Ordering::SeqCst);
+                Err(ProtocolError::NotActionable)
+            }
             Some("not-actionable") => Err(ProtocolError::NotActionable),
             Some("invalid") => Err(ProtocolError::InvalidArguments),
             _ => Ok(value),
@@ -1124,7 +1140,7 @@ impl ClientActions {
         args: &Value,
     ) -> Result<Value, ActionFailure> {
         let d = Dispatch::default();
-        let result = self.execute_inner(&ctx, &d, name, args).await;
+        let mut result = self.execute_inner(&ctx, &d, name, args).await;
         let settled_prefix = matches!(&result, Err(ProtocolError::Cancelled))
             && settle_replacement_cancellation(&ctx, &d).await;
         if result.is_err()
@@ -1144,6 +1160,16 @@ impl ClientActions {
                 .is_some_and(|proof| proof.check(&ctx))
             {
                 d.acknowledged_postcondition.store(true, Ordering::SeqCst);
+            }
+        }
+        // New no-input reasons are usable only while the exact operation is
+        // still current after cleanup; a late refusal cannot authorize fallback.
+        if result == Err(ProtocolError::NotActionable)
+            && (d.fill_unsupported_target.load(Ordering::SeqCst)
+                || d.no_editable_focus.load(Ordering::SeqCst))
+        {
+            if let Err(error) = ctx.check() {
+                result = Err(error);
             }
         }
         #[cfg(test)]
@@ -2833,7 +2859,7 @@ const FILL_ADMISSIBILITY: &str = r#"function(){
   return true;
  }
  if(this instanceof HTMLTextAreaElement||this.isContentEditable)return true;
- return {status:'not-actionable'};
+ return {status:'fill-unsupported-target'};
 }"#;
 const PREPARE_FILL: &str = r#"function(value){
  if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};
@@ -4071,6 +4097,8 @@ async fn require_editable_focus(
             }
         }
     }
+    ctx.check()?;
+    d.no_editable_focus.store(true, Ordering::SeqCst);
     Err(ProtocolError::NotActionable)
 }
 
@@ -7168,6 +7196,39 @@ mod tests {
             Effects::Unknown
         );
     }
+    #[test]
+    fn clean_keyboard_reasons_never_hide_mutation_cleanup_or_authority_loss() {
+        for focus in [false, true] {
+            let d = Dispatch::default();
+            if focus {
+                d.no_editable_focus.store(true, Ordering::SeqCst);
+            } else {
+                d.fill_unsupported_target.store(true, Ordering::SeqCst);
+            }
+            let reason = if focus {
+                ActionReason::NoEditableFocus
+            } else {
+                ActionReason::FillUnsupportedTarget
+            };
+            assert_eq!(d.failure(ProtocolError::NotActionable).reason, Some(reason));
+            for error in [
+                ProtocolError::StaleReference,
+                ProtocolError::StaleScope,
+                ProtocolError::Cancelled,
+                ProtocolError::DeadlineExceeded,
+                ProtocolError::CleanupFailed,
+            ] {
+                assert_eq!(d.failure(error).reason, None);
+            }
+            d.cleanup.store(true, Ordering::SeqCst);
+            assert_eq!(d.failure(ProtocolError::NotActionable).reason, None);
+            d.cleanup.store(false, Ordering::SeqCst);
+            d.mark();
+            let failure = d.failure(ProtocolError::NotActionable);
+            assert_eq!(failure.reason, None);
+            assert_eq!(failure.effects, Effects::Unknown);
+        }
+    }
     #[tokio::test]
     async fn focused_document_is_released_before_editable_leaf_and_keyboard_dispatch() {
         let f = fixture("focus-root-leaf").await;
@@ -7230,6 +7291,15 @@ mod tests {
             assert_eq!(failure.error, error, "{mode}");
             assert_eq!(failure.effects, Effects::NotDispatched, "{mode}");
             assert_eq!(failure.cleanup_failed, cleanup, "{mode}");
+            assert_eq!(
+                failure.reason,
+                if mode == "focus-root-only" {
+                    Some(ActionReason::NoEditableFocus)
+                } else {
+                    None
+                },
+                "{mode}"
+            );
             assert!(f.inputs().is_empty(), "{mode}");
             assert!(
                 f.log
@@ -9801,6 +9871,10 @@ mod tests {
                     Some(ActionReason::ControlReplacedAfterClick) => {
                         ProtocolError::CheckedControlReplaced
                     }
+                    Some(ActionReason::FillUnsupportedTarget) => {
+                        ProtocolError::FillUnsupportedTarget
+                    }
+                    Some(ActionReason::NoEditableFocus) => ProtocolError::NoEditableFocus,
                     None => failure.error.clone(),
                 };
                 let outcome = NativeOutcome {
@@ -10132,6 +10206,10 @@ mod tests {
                     Some(ActionReason::ControlReplacedAfterClick) => {
                         ProtocolError::CheckedControlReplaced
                     }
+                    Some(ActionReason::FillUnsupportedTarget) => {
+                        ProtocolError::FillUnsupportedTarget
+                    }
+                    Some(ActionReason::NoEditableFocus) => ProtocolError::NoEditableFocus,
                     None => failure.error.clone(),
                 };
                 let outcome = NativeOutcome {
@@ -10866,6 +10944,12 @@ mod tests {
                                     }
                                     Some(ActionReason::ControlReplacedAfterClick) => {
                                         ProtocolError::CheckedControlReplaced
+                                    }
+                                    Some(ActionReason::FillUnsupportedTarget) => {
+                                        ProtocolError::FillUnsupportedTarget
+                                    }
+                                    Some(ActionReason::NoEditableFocus) => {
+                                        ProtocolError::NoEditableFocus
                                     }
                                     None => failure.error,
                                 }),

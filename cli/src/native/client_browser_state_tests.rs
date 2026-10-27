@@ -339,6 +339,8 @@ impl FramedFixture {
                                 | "intercepted-pointer"
                                 | "checked-state-unchanged"
                                 | "checked-control-replaced"
+                                | "fill-unsupported-target"
+                                | "no-editable-focus"
                                 | "frame-not-found"
                                 | "frame-ambiguous"),
                             ) => value,

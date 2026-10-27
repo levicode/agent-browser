@@ -269,7 +269,7 @@ struct Index {
     failure: Option<ProtocolError>,
     application_epoch: u64,
     applied_watermark: u64,
-    pending_enrollment: HashSet<String>,
+    pending_enrollment: HashMap<String, Option<QueuedIframe>>,
     reconciled: bool,
     popup_opened: HashSet<String>,
     retiring_pages: HashMap<String, String>,
@@ -745,6 +745,7 @@ enum CaptureTestPoint {
     BeforeWorkerRetirementWait,
     BeforeIframeRetirementWait,
     BeforeIframeConfigurationCommit,
+    BeforeQueuedIframeRegistration,
 }
 #[cfg(test)]
 struct CaptureTestGate {
@@ -822,12 +823,13 @@ impl SettledInputAuthority {
 enum InitializationOutcome {
     Initialized,
     DetachedChild,
+    DetachedQueuedChild,
     FailedRetired(super::cdp::client::ServiceWorkerStartupFailure),
 }
 impl InitializationOutcome {
     fn result(self) -> Result<(), ProtocolError> {
         match self {
-            Self::Initialized | Self::DetachedChild => Ok(()),
+            Self::Initialized | Self::DetachedChild | Self::DetachedQueuedChild => Ok(()),
             Self::FailedRetired(failure) => Err(failure.error()),
         }
     }
@@ -839,6 +841,19 @@ struct IframeInitialization {
     root: OwnedTarget,
     watermark: Option<BoundedEventWatermark>,
     ledger: Option<Arc<super::client_debt::OwnerDebtLedger>>,
+}
+
+/// Exact queued event facts, not a registered child or fabricated tenure. This
+/// lives only in the existing MAX_TASKS-bounded pending enrollment storage.
+struct QueuedIframe {
+    target: String,
+    parent: OwnedTarget,
+    root: OwnedTarget,
+    ledger: Arc<super::client_debt::OwnerDebtLedger>,
+    watermark: BoundedEventWatermark,
+    operation: OperationLease,
+    registration_started: bool,
+    detached_at: Option<u64>,
 }
 
 #[derive(Default)]
@@ -1506,7 +1521,7 @@ impl ClientEnrollment {
         if index.pending_enrollment.len() >= MAX_TASKS {
             return Err(ProtocolError::CapacityExceeded);
         }
-        if index.pending_enrollment.contains(&session) {
+        if index.pending_enrollment.contains_key(&session) {
             return Err(ProtocolError::StaleScope);
         }
         if retired_parent {
@@ -1520,8 +1535,62 @@ impl ClientEnrollment {
             // tombstone grants no context, registration or adoption authority.
             index.retired_page_sessions.insert(session.clone());
         }
-        index.pending_enrollment.insert(session.clone());
+        let candidate = self.queued_iframe_candidate(&index, event, &session)?;
+        index.pending_enrollment.insert(session.clone(), candidate);
         Ok(Some(session))
+    }
+    fn queued_iframe_candidate(
+        &self,
+        index: &Index,
+        event: &CdpEvent,
+        session: &str,
+    ) -> Result<Option<QueuedIframe>, ProtocolError> {
+        let info = &event.params["targetInfo"];
+        if info["browserContextId"].as_str() != Some(self.targets.context_id.as_str())
+            || info["type"].as_str() != Some("iframe")
+            || index.sessions.contains_key(session)
+        {
+            return Ok(None);
+        }
+        let Some(parent) = event
+            .session_id
+            .as_ref()
+            .and_then(|session| index.sessions.get(session))
+            .filter(|parent| parent.application && !parent.observation_only)
+        else {
+            return Ok(None);
+        };
+        let Some(root) = index
+            .sessions
+            .get(&parent.root)
+            .filter(|root| root.kind == "page" && root.application && !root.observation_only)
+        else {
+            return Ok(None);
+        };
+        let Some(ledger) = self.client.debt_ledger() else {
+            return Ok(None);
+        };
+        let Some(watermark) = self
+            .event_watermark
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .clone()
+        else {
+            return Ok(None);
+        };
+        let target = field(info, "targetId")?.to_owned();
+        let parent = self.targets.owned_target(&parent.target)?;
+        let root = self.targets.owned_target(&root.target)?;
+        Ok(Some(QueuedIframe {
+            target,
+            parent,
+            root,
+            ledger,
+            watermark,
+            operation: self.operation(),
+            registration_started: false,
+            detached_at: None,
+        }))
     }
     fn mark_event_applied(&self, sequence: u64) -> Result<(), ProtocolError> {
         let mut index = self
@@ -2596,7 +2665,7 @@ impl ClientEnrollment {
                 if index.sessions.values().any(|entry| {
                     (entry.application || entry.observation_only)
                         && !entry.resumed
-                        && !index.pending_enrollment.contains(&entry.session)
+                        && !index.pending_enrollment.contains_key(&entry.session)
                 }) {
                     return Err(ProtocolError::ScopeUnavailable);
                 }
@@ -2607,7 +2676,7 @@ impl ClientEnrollment {
                         }
                         self.targets.publish_restart_ready(
                             replacement,
-                            &index.pending_enrollment,
+                            |session| index.pending_enrollment.contains_key(session),
                             |target| {
                                 index.sessions.get(&target.session_id).is_some_and(|entry| {
                                     entry.target == target.target_id && entry.kind == target.kind
@@ -3400,6 +3469,20 @@ impl ClientEnrollment {
             .index
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(Some(candidate)) = index.pending_enrollment.get_mut(session) {
+            if kind != "iframe"
+                || candidate.target != target
+                || parent != Some(candidate.parent.session_id.as_str())
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            if candidate.detached_at.is_some() && !candidate.registration_started {
+                return Err(ProtocolError::StaleReference);
+            }
+            // End candidate-only retirement before any binding, duplicate
+            // disposition or native target registration may commit effects.
+            candidate.registration_started = true;
+        }
         if index.borrowed_retired_targets.contains(target) {
             return Ok(None);
         }
@@ -3599,7 +3682,9 @@ impl ClientEnrollment {
             Ok(InitializationOutcome::Initialized) => {
                 return Ok(InitializationOutcome::Initialized)
             }
-            Ok(InitializationOutcome::DetachedChild) => unreachable!(),
+            Ok(
+                InitializationOutcome::DetachedChild | InitializationOutcome::DetachedQueuedChild,
+            ) => unreachable!(),
             Ok(InitializationOutcome::FailedRetired(failure)) => {
                 if let Some(mut value) = diagnostic {
                     value.generation = op.generation;
@@ -4542,7 +4627,7 @@ impl ClientEnrollment {
                     break Ok(());
                 },
                 completed = tasks.join_next(), if !tasks.is_empty() => {
-                    match completed { Some(Ok(Ok(InitializationOutcome::Initialized | InitializationOutcome::DetachedChild))) => {}, Some(Ok(Ok(InitializationOutcome::FailedRetired(_failure)))) => {}, Some(Ok(Err(error))) => break Err(error), Some(Err(_)) => break Err(ProtocolError::BrowserFailure), None=>{} }
+                    match completed { Some(Ok(Ok(InitializationOutcome::Initialized | InitializationOutcome::DetachedChild | InitializationOutcome::DetachedQueuedChild))) => {}, Some(Ok(Ok(InitializationOutcome::FailedRetired(_failure)))) => {}, Some(Ok(Err(error))) => break Err(error), Some(Err(_)) => break Err(ProtocolError::BrowserFailure), None=>{} }
                 },
                 event = events.recv() => {
                     let event = match event {
@@ -4579,7 +4664,7 @@ impl ClientEnrollment {
                             }
                             drop(event); result
                         });
-                    } else if let Err(error) = self.event_internal(&event, Some(event.budget_lease())) { break Err(error); }
+                    } else if let Err(error) = self.event_internal(&event, Some(event.budget_lease()), Some(sequence)) { break Err(error); }
                     if let Err(error)=self.mark_event_applied(sequence) { break Err(error); }
                     self.changed.notify_waiters();
                 }
@@ -4640,9 +4725,11 @@ impl ClientEnrollment {
         while let Some(completed) = tasks.join_next().await {
             if !matches!(
                 completed,
-                Ok(Ok(
-                    InitializationOutcome::Initialized | InitializationOutcome::DetachedChild | InitializationOutcome::FailedRetired(_)
-                )) | Ok(Err(ProtocolError::Cancelled))
+                Ok(Ok(InitializationOutcome::Initialized
+                    | InitializationOutcome::DetachedChild
+                    | InitializationOutcome::DetachedQueuedChild
+                    | InitializationOutcome::FailedRetired(_)))
+                    | Ok(Err(ProtocolError::Cancelled))
             ) && result.is_ok()
             {
                 self.poison(ProtocolError::CleanupFailed);
@@ -5284,6 +5371,148 @@ impl ClientEnrollment {
             &self.operation(),
         )
         .await?;
+        if self.retire_queued_iframe(&event).await? {
+            return Ok(InitializationOutcome::DetachedQueuedChild);
+        }
+        let result = self.attached_inner(event.clone()).await;
+        if matches!(
+            &result,
+            Err(ProtocolError::BrowserFailure
+                | ProtocolError::StaleReference
+                | ProtocolError::StaleScope)
+        ) && self.retire_queued_iframe(&event).await?
+        {
+            return Ok(InitializationOutcome::DetachedQueuedChild);
+        }
+        result
+    }
+    async fn retire_queued_iframe(&self, event: &CdpEvent) -> Result<bool, ProtocolError> {
+        let session = field(&event.params, "sessionId")?;
+        let operation = {
+            let index = self
+                .index
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            let Some(Some(candidate)) = index.pending_enrollment.get(session) else {
+                return Ok(false);
+            };
+            if candidate.registration_started || candidate.detached_at.is_none() {
+                return Ok(false);
+            }
+            OperationLease {
+                is_callback: candidate.operation.is_callback,
+                generation: candidate.operation.generation,
+                sequence: candidate.operation.sequence,
+                deadline: candidate.operation.deadline,
+                cancellation: candidate.operation.cancellation.clone(),
+            }
+        };
+        bounded(&operation, async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                self.check_restart_operation(&operation)?;
+                self.network.check_worker_startup(&operation)?;
+                let publication = {
+                    let index = self
+                        .index
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    let Some(Some(candidate)) = index.pending_enrollment.get(session) else {
+                        return Err(ProtocolError::StaleScope);
+                    };
+                    candidate.ledger.initialization_retirement_notifier()
+                };
+                let published = publication.notified();
+                tokio::pin!(published);
+                published.as_mut().enable();
+                {
+                    let index = self
+                        .index
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if let Some(error) = &index.failure {
+                        return Err(error.clone());
+                    }
+                    let Some(Some(candidate)) = index.pending_enrollment.get(session) else {
+                        return Err(ProtocolError::StaleScope);
+                    };
+                    if candidate.registration_started
+                        || candidate.operation.deadline != operation.deadline
+                        || candidate.operation.generation != operation.generation
+                        || !candidate
+                            .operation
+                            .cancellation
+                            .same_channel(&operation.cancellation)
+                        || event.params["targetInfo"]["targetId"].as_str()
+                            != Some(candidate.target.as_str())
+                        || event.params["targetInfo"]["type"].as_str() != Some("iframe")
+                        || event.params["targetInfo"]["browserContextId"].as_str()
+                            != Some(self.targets.context_id.as_str())
+                        || event.session_id.as_deref() != Some(candidate.parent.session_id.as_str())
+                        || index.sessions.contains_key(session)
+                        || index
+                            .sessions
+                            .values()
+                            .any(|current| current.target == candidate.target)
+                        || !index
+                            .sessions
+                            .get(&candidate.parent.session_id)
+                            .is_some_and(|parent| {
+                                parent.target == candidate.parent.target_id
+                                    && parent.root == candidate.root.session_id
+                                    && parent.application
+                                    && !parent.observation_only
+                            })
+                        || !index
+                            .sessions
+                            .get(&candidate.root.session_id)
+                            .is_some_and(|root| {
+                                root.target == candidate.root.target_id
+                                    && root.kind == "page"
+                                    && root.application
+                                    && !root.observation_only
+                            })
+                        || self
+                            .event_watermark
+                            .lock()
+                            .map_err(|_| ProtocolError::ScopeUnavailable)?
+                            .as_ref()
+                            .is_none_or(|current| !candidate.watermark.same_subscription(current))
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    let detached_at = candidate.detached_at.ok_or(ProtocolError::StaleScope)?;
+                    let received = candidate
+                        .watermark
+                        .received()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if detached_at == 0 || detached_at > received {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    if index.applied_watermark >= detached_at
+                        && self.client.finish_detached_queued_iframe(
+                            &candidate.ledger,
+                            &self.targets,
+                            (&candidate.target, session),
+                            &candidate.parent,
+                            &candidate.root,
+                            &operation,
+                        )?
+                    {
+                        return Ok(true);
+                    }
+                }
+                tokio::select! { _ = changed => {}, _ = &mut published => {} }
+            }
+        })
+        .await
+    }
+    async fn attached_inner(
+        &self,
+        event: CdpEvent,
+    ) -> Result<InitializationOutcome, ProtocolError> {
         let session = field(&event.params, "sessionId")?.to_owned();
         let mut info = event
             .params
@@ -5459,11 +5688,27 @@ impl ClientEnrollment {
             super::client_targets::AuxiliaryDisposition::Ordinary => {}
         }
         #[cfg(test)]
+        if kind == "iframe" {
+            self.pause_capture_at(
+                CaptureTestPoint::BeforeQueuedIframeRegistration,
+                &self.operation(),
+            )
+            .await?;
+        }
+        #[cfg(test)]
         self.trace_capture_admission(CaptureLifecycleStep::RegisteringAttached, target, &session);
         match ServiceWorkerAdmission::observe_sync(
             admission.as_ref(),
             WorkerAdmissionStep::Register,
-            || self.register_with_initialization(context, target, &session, kind, event.session_id.as_deref()),
+            || {
+                self.register_with_initialization(
+                    context,
+                    target,
+                    &session,
+                    kind,
+                    event.session_id.as_deref(),
+                )
+            },
         )? {
             Some((entry, initialization)) => {
                 self.diagnostic_registration(
@@ -5471,8 +5716,13 @@ impl ClientEnrollment {
                     super::client_settlement_trace::DiagnosticTargetOrigin::AutoAttach,
                     0,
                 );
-                self.initialize_observed(entry, &self.operation(), admission.as_ref(), initialization)
-                    .await
+                self.initialize_observed(
+                    entry,
+                    &self.operation(),
+                    admission.as_ref(),
+                    initialization,
+                )
+                .await
             }
             None => {
                 let same = self
@@ -5813,12 +6063,13 @@ impl ClientEnrollment {
         Ok(())
     }
     fn event(&self, event: &CdpEvent) -> Result<(), ProtocolError> {
-        self.event_internal(event, None)
+        self.event_internal(event, None, None)
     }
     fn event_internal(
         &self,
         event: &CdpEvent,
         budget: Option<super::cdp::client::EventBudgetLease>,
+        sequence: Option<u64>,
     ) -> Result<(), ProtocolError> {
         if event.method == "Target.detachedFromTarget" {
             let session = field(&event.params, "sessionId")?;
@@ -5827,6 +6078,22 @@ impl ClientEnrollment {
                     .index
                     .lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if !index.sessions.contains_key(session) {
+                    if let Some(sequence) = sequence {
+                        if let Some(Some(candidate)) = index.pending_enrollment.get_mut(session) {
+                            if !candidate.registration_started {
+                                if event.params.get("targetId").is_some_and(|target| {
+                                    target.as_str() != Some(candidate.target.as_str())
+                                }) || event.session_id.as_deref().is_some_and(|parent| {
+                                    parent != candidate.parent.session_id.as_str()
+                                }) {
+                                    return Err(ProtocolError::InvalidFrame);
+                                }
+                                candidate.detached_at.get_or_insert(sequence);
+                            }
+                        }
+                    }
+                }
                 if let Some(entry) = index.sessions.get(session) {
                     // A supplied identity must agree for page detach too. A
                     // conflicting event cannot mint a closed-page candidate.
@@ -5838,10 +6105,15 @@ impl ClientEnrollment {
                         return Err(ProtocolError::InvalidFrame);
                     }
                     if entry.kind == "iframe" && !entry.observation_only {
-                        if event.session_id.as_deref().is_some_and(|parent| entry.parent.as_deref() != Some(parent)) {
+                        if event
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|parent| entry.parent.as_deref() != Some(parent))
+                        {
                             return Err(ProtocolError::InvalidFrame);
                         }
-                        self.targets.observe_iframe_detach(&entry.target, &entry.session)?;
+                        self.targets
+                            .observe_iframe_detach(&entry.target, &entry.session)?;
                     }
                     if entry.kind == "page" && entry.application && !entry.observation_only {
                         if let Some(target) = event.params.get("targetId") {
@@ -6978,10 +7250,17 @@ mod tests {
             let mut realm_loader = "synthetic-loader".to_owned();
             let mut whitespace = HashMap::<String, bool>::new();
             let mut closed_targets = std::collections::HashSet::<String>::new();
+            let mut queued_child_detached = false;
             loop {
                 tokio::select! {
                     event=emitted.recv()=> {
                         let Some(event)=event else {break};
+                        if mode=="iframe-queued-detach" && event["method"]=="Target.attachedToTarget" && event["params"]["sessionId"]=="child" {
+                            queued_child_detached = false;
+                        }
+                        if mode=="iframe-queued-detach" && event["method"]=="Target.detachedFromTarget" && event["params"]["sessionId"]=="child" {
+                            queued_child_detached = true;
+                        }
                         if event["method"]=="Page.frameNavigated" {
                             if let Some(loader)=event["params"]["frame"]["loaderId"].as_str() { realm_loader=loader.to_owned(); }
                         }
@@ -6992,6 +7271,11 @@ mod tests {
                         let request:Value=serde_json::from_str(&text).unwrap();
                         recorded.lock().unwrap().push(request.clone());
                         let method=request["method"].as_str().unwrap();
+                        if mode=="iframe-queued-detach" && queued_child_detached && request["sessionId"]=="child" {
+                            socket.send(Message::Text(json!({"id":request["id"],"sessionId":"child",
+                                "error":{"code":-32000,"message":"No session with given id"}}).to_string())).await.unwrap();
+                            continue;
+                        }
                         if mode.starts_with("sw-startup-") && request["sessionId"]=="worker-session" {
                             if mode=="sw-startup-retired" && method=="Runtime.runIfWaitingForDebugger" {
                                 worker_held.push(request.clone());
@@ -7659,7 +7943,7 @@ mod tests {
             .lock()
             .unwrap()
             .pending_enrollment
-            .insert("pending".into());
+            .insert("pending".into(), None);
         assert_eq!(
             proof.check(&owner, &page, &op),
             Err(ProtocolError::ScopeUnavailable)
@@ -7817,7 +8101,7 @@ mod tests {
                         .insert("older-target".into(), "older-root".into());
                 }
                 "pending-enrollment" => {
-                    index.pending_enrollment.insert("late-child".into());
+                    index.pending_enrollment.insert("late-child".into(), None);
                 }
                 "pending-event" => index.applied_watermark = 6,
                 "borrowed-restart" => index.borrowed_restart = Some(1),
@@ -7993,7 +8277,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .pending_enrollment
-                    .contains(session);
+                    .contains_key(session);
                 let blocked = proof.check(&owner, &page, &op);
                 // Release the exact command before checking the outcome, so a
                 // regression does not strand the retained cleanup task.
@@ -8011,7 +8295,7 @@ mod tests {
                 assert_eq!(blocked, Err(ProtocolError::ScopeUnavailable));
                 {
                     let index = owner.index.lock().unwrap();
-                    assert!(!index.pending_enrollment.contains(session));
+                    assert!(!index.pending_enrollment.contains_key(session));
                     assert!(index.retired_page_sessions.contains(session));
                     assert!(!index.sessions.contains_key(session));
                     assert_eq!(
@@ -8137,7 +8421,7 @@ mod tests {
                         .lock()
                         .unwrap()
                         .pending_enrollment
-                        .contains("late-child")
+                        .contains_key("late-child")
                     {
                         break;
                     }
@@ -8151,7 +8435,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pending_enrollment
-                .contains("late-grandchild");
+                .contains_key("late-grandchild");
             let blocked = proof.check(&owner, &page, &op);
             if failed_ack {
                 emit.send(json!({"id":grandchild["id"],"sessionId":"late-child",
@@ -8191,7 +8475,7 @@ mod tests {
                         let settled = {
                             let index = owner.index.lock().unwrap();
                             index.failure.is_some()
-                                && !index.pending_enrollment.contains("late-grandchild")
+                                && !index.pending_enrollment.contains_key("late-grandchild")
                         };
                         if settled {
                             break;
@@ -8220,7 +8504,7 @@ mod tests {
                 for session in ["late-child", "late-grandchild"] {
                     assert!(index.retired_page_sessions.contains(session));
                     assert!(!index.sessions.contains_key(session));
-                    assert!(!index.pending_enrollment.contains(session));
+                    assert!(!index.pending_enrollment.contains_key(session));
                 }
                 assert_eq!(
                     index.retiring_pages.get("old-target").map(String::as_str),
@@ -8280,7 +8564,7 @@ mod tests {
         {
             let mut index = owner.index.lock().unwrap();
             assert!(!index.retired_page_sessions.contains("unknown-child"));
-            assert!(!index.pending_enrollment.contains("unknown-child"));
+            assert!(!index.pending_enrollment.contains_key("unknown-child"));
             assert!(!index.sessions.contains_key("unknown-child"));
             index
                 .retiring_pages
@@ -8317,7 +8601,7 @@ mod tests {
             assert!(index.applied_watermark < owner.realm_watermark().unwrap().received().unwrap());
             assert_eq!(index.retired_page_sessions.len(), MAX_FRAMES);
             assert!(!index.retired_page_sessions.contains("unknown-child"));
-            assert!(!index.pending_enrollment.contains("unknown-child"));
+            assert!(!index.pending_enrollment.contains_key("unknown-child"));
         }
         assert!(proof.check(&owner, &page, &op).is_err());
         drop(page);
@@ -9649,7 +9933,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .pending_enrollment
-                    .contains("second-session"));
+                    .contains_key("second-session"));
             }
             drained.release();
             assert_eq!(
@@ -11042,7 +11326,7 @@ mod tests {
             index.applied_watermark -= 1;
             index
                 .pending_enrollment
-                .insert("private-pending-session".into());
+                .insert("private-pending-session".into(), None);
             index
                 .retiring_pages
                 .insert("browser-ui-target".into(), "browser-ui-session".into());
@@ -11733,13 +12017,13 @@ mod tests {
             applied_watermark: 1,
             ..Default::default()
         };
-        index.pending_enrollment.insert("first".into());
+        index.pending_enrollment.insert("first".into(), None);
         assert!(!capture_admission_ready(&index, 1));
         index.pending_enrollment.remove("first");
         // A second event is reader-admitted but not yet synchronously applied.
         assert!(!capture_admission_ready(&index, 2));
         index.applied_watermark = 2;
-        index.pending_enrollment.insert("second".into());
+        index.pending_enrollment.insert("second".into(), None);
         assert!(!capture_admission_ready(&index, 2));
         index.pending_enrollment.remove("second");
         assert!(capture_admission_ready(&index, 2));
@@ -13148,7 +13432,7 @@ mod tests {
                         .lock()
                         .unwrap()
                         .pending_enrollment
-                        .insert("pending".into());
+                        .insert("pending".into(), None);
                 }
                 "cancelled" => {
                     op.cancellation = rx;
@@ -13191,7 +13475,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pending_enrollment
-                .insert("pending".into());
+                .insert("pending".into(), None);
             assert!(owner.publish_initialized(&authority).is_err());
             owner.index.lock().unwrap().pending_enrollment.clear();
             if failed {
@@ -13630,7 +13914,7 @@ mod tests {
         {
             let index = owner.index.lock().unwrap();
             assert!(index.failure.is_none());
-            assert!(index.pending_enrollment.contains("worker-session"));
+            assert!(index.pending_enrollment.contains_key("worker-session"));
             assert!(!index.sessions["worker-session"].resumed);
         }
         assert!(!owner
@@ -13688,7 +13972,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pending_enrollment
-                .contains("worker-session")
+                .contains_key("worker-session")
             {
                 tokio::task::yield_now().await;
             }
@@ -13807,7 +14091,8 @@ mod tests {
             loop {
                 let finished = {
                     let index = owner.index.lock().unwrap();
-                    index.failure.is_some() || !index.pending_enrollment.contains("worker-session")
+                    index.failure.is_some()
+                        || !index.pending_enrollment.contains_key("worker-session")
                 };
                 if finished {
                     break;
@@ -13824,7 +14109,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pending_enrollment
-                .contains("worker-session")
+                .contains_key("worker-session")
             {
                 tokio::task::yield_now().await;
             }
@@ -13962,7 +14247,7 @@ mod tests {
             .lock()
             .unwrap()
             .pending_enrollment
-            .contains("worker-session"));
+            .contains_key("worker-session"));
         // Release the already-fixed None unchanged. This is not a retry, a
         // fabricated detach, a receipt grant, or a delayed business command.
         release.send(()).unwrap();
@@ -13976,7 +14261,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .pending_enrollment
-                    .contains("worker-session")
+                    .contains_key("worker-session")
                 {
                     break;
                 }
@@ -14576,7 +14861,7 @@ mod tests {
             .lock()
             .unwrap()
             .pending_enrollment
-            .contains("worker-session"));
+            .contains_key("worker-session"));
         assert!(!owner
             .targets
             .owned_target("worker-target")
@@ -14597,7 +14882,7 @@ mod tests {
         {
             let index = owner.index.lock().unwrap();
             assert!(index.applied_watermark < watermark.received().unwrap());
-            assert!(index.pending_enrollment.contains("worker-session"));
+            assert!(index.pending_enrollment.contains_key("worker-session"));
             assert!(!index.sessions["worker-session"].resumed);
             assert!(index.failure.is_none());
         }
@@ -14609,7 +14894,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pending_enrollment
-                .contains("worker-session")
+                .contains_key("worker-session")
             {
                 tokio::task::yield_now().await;
             }
@@ -14623,7 +14908,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .pending_enrollment
-                .contains("worker-session")
+                .contains_key("worker-session")
             {
                 tokio::task::yield_now().await;
             }
@@ -15131,6 +15416,552 @@ mod tests {
         server.abort();
     }
     #[tokio::test]
+    async fn iframe_detach_while_attachment_is_queued_preserves_original_host() {
+        for point in [
+            CaptureTestPoint::BeforeAttachedProcessing,
+            CaptureTestPoint::BeforeQueuedIframeRegistration,
+        ] {
+            for target_id_supplied in [false, true] {
+                let (owner, _notices, log, emit, server, _broker, connection) =
+                    fixture_with_client("iframe-queued-detach", true).await;
+                owner
+                    .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                    .await
+                    .unwrap();
+                owner.start(&owner.operation()).await.unwrap();
+                let host = owner.targets.owned_target("initial-target").unwrap();
+                let queued = CaptureTestGate::new();
+                owner
+                    .capture_test_gates
+                    .lock()
+                    .unwrap()
+                    .insert(point, queued.clone());
+                emit.send(json!({"method":"Target.attachedToTarget","sessionId":"initial",
+                    "params":{"sessionId":"child","waitingForDebugger":true,"targetInfo":{
+                        "targetId":"iframe-target","type":"iframe","browserContextId":"owned-context"}}}))
+                    .await.unwrap();
+                queued.wait_entered().await;
+                assert!(owner
+                    .index
+                    .lock()
+                    .unwrap()
+                    .pending_enrollment
+                    .contains_key("child"));
+                assert!(!owner.index.lock().unwrap().sessions.contains_key("child"));
+                let watermark = owner.realm_watermark().unwrap();
+                let before = watermark.received().unwrap();
+                let mut detached = json!({"method":"Target.detachedFromTarget","sessionId":"initial", "params":{"sessionId":"child"}});
+                if target_id_supplied {
+                    detached["params"]["targetId"] = json!("iframe-target");
+                }
+                emit.send(detached).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let received = watermark.received().unwrap();
+                        if received > before
+                            && owner.index.lock().unwrap().applied_watermark >= received
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                queued.release();
+                let settled = tokio::time::timeout(
+                    Duration::from_secs(2),
+                    owner.drain_capture_watermark(&watermark, &owner.operation()),
+                )
+                .await;
+                let host_preserved = owner
+                    .targets
+                    .owned_target("initial-target")
+                    .is_ok_and(|current| current.same_attachment(&host));
+                let child_commands = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request["sessionId"] == "child")
+                    .count();
+                let _ = owner.close().await;
+                connection.close().await;
+                server.abort();
+                assert!(
+                    matches!(settled, Ok(Ok(()))),
+                    "queued child retirement poisoned the host: {settled:?}"
+                );
+                assert!(host_preserved);
+                assert_eq!(
+                    child_commands, 0,
+                    "detached queued attachment must not be initialized"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_iframe_retirement_rejects_changed_identity_bounds_and_shared_owner() {
+        for obstruction in [
+            "wrong-target",
+            "wrong-parent",
+            "root-detach",
+            "parent-detach",
+            "root-reused",
+            "ledger-lost",
+            "network-revoked",
+            "wrong-generation",
+            "expired",
+            "cancelled",
+            "watermark-replaced",
+        ] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                fixture_with_client("iframe-queued-detach", true).await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let parent = if obstruction == "parent-detach" {
+                owner
+                    .attached(attach(
+                        "owned-context",
+                        "parent-target",
+                        "parent",
+                        "iframe",
+                        Some("initial"),
+                    ))
+                    .await
+                    .unwrap();
+                "parent"
+            } else {
+                "initial"
+            };
+            let queued = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeAttachedProcessing, queued.clone());
+            emit.send(json!({"method":"Target.attachedToTarget","sessionId":parent,
+                "params":{"sessionId":"child","waitingForDebugger":true,"targetInfo":{
+                    "targetId":"iframe-target","type":"iframe","browserContextId":"owned-context"}}})).await.unwrap();
+            queued.wait_entered().await;
+            assert!(owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_enrollment
+                .get("child")
+                .is_some_and(Option::is_some));
+            let watermark = owner.realm_watermark().unwrap();
+            let before = watermark.received().unwrap();
+            let mut detached = json!({"method":"Target.detachedFromTarget","sessionId":parent,
+                "params":{"sessionId":"child","targetId":"iframe-target"}});
+            if obstruction == "wrong-target" {
+                detached["params"]["targetId"] = json!("wrong-target");
+            }
+            if obstruction == "wrong-parent" {
+                detached["sessionId"] = json!("wrong-parent");
+            }
+            emit.send(detached).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let received = watermark.received().ok();
+                    let index = owner.index.lock().unwrap();
+                    if index.failure.is_some()
+                        || received.is_some_and(|received| {
+                            received > before && index.applied_watermark >= received
+                        })
+                    {
+                        break;
+                    }
+                    drop(index);
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let mut replacement_events = None;
+            let mut cancellation = None;
+            match obstruction {
+                "root-detach" | "parent-detach" => {
+                    let (session, target) = if obstruction == "root-detach" {
+                        ("initial", "initial-target")
+                    } else {
+                        ("parent", "parent-target")
+                    };
+                    let before = watermark.received().unwrap();
+                    emit.send(json!({"method":"Target.detachedFromTarget","params":{"sessionId":session,"targetId":target}})).await.unwrap();
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        while watermark.received().unwrap() == before {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .unwrap();
+                }
+                "root-reused" => {
+                    owner.targets.detach("initial-target").unwrap();
+                    owner
+                        .targets
+                        .attached(
+                            "owned-context",
+                            "initial-target".into(),
+                            "initial".into(),
+                            "page".into(),
+                        )
+                        .unwrap();
+                }
+                "ledger-lost" => connection.debt_ledger().unwrap().connection_lost(),
+                "network-revoked" => owner.network.revoke().unwrap(),
+                "expired" | "wrong-generation" | "cancelled" => {
+                    let mut index = owner.index.lock().unwrap();
+                    let candidate = index
+                        .pending_enrollment
+                        .get_mut("child")
+                        .unwrap()
+                        .as_mut()
+                        .unwrap();
+                    if obstruction == "expired" {
+                        candidate.operation.deadline = Instant::now();
+                    }
+                    if obstruction == "wrong-generation" {
+                        candidate.operation.generation += 1;
+                    }
+                    if obstruction == "cancelled" {
+                        let (cancel, receiver) = watch::channel(CancelSignal::Requested);
+                        candidate.operation.cancellation = receiver;
+                        cancellation = Some(cancel);
+                    }
+                }
+                "watermark-replaced" => {
+                    let events = owner
+                        .client
+                        .subscribe_bounded_methods(EVENTS, 256, 128 * 1024 * 1024)
+                        .unwrap();
+                    *owner.event_watermark.lock().unwrap() = Some(events.watermark());
+                    replacement_events = Some(events);
+                }
+                _ => {}
+            }
+            queued.release();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                owner.drain_capture_watermark(&watermark, &owner.operation()),
+            )
+            .await;
+            let child_commands = log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["sessionId"] == "child")
+                .count();
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            drop(replacement_events);
+            drop(cancellation);
+            assert!(
+                matches!(result, Ok(Err(_))),
+                "{obstruction} was excused by queued detach: {result:?}"
+            );
+            assert_eq!(
+                child_commands, 0,
+                "{obstruction} dispatched child initialization"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_iframe_pending_lifetime_excludes_aba_and_requeue_does_not_inherit_detach() {
+        let (owner, _notices, log, emit, server, _broker, connection) =
+            fixture_with_client("iframe-queued-detach", true).await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        let host = owner.targets.owned_target("initial-target").unwrap();
+        let event = attach(
+            "owned-context",
+            "iframe-target",
+            "child",
+            "iframe",
+            Some("initial"),
+        );
+        let first = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeAttachedProcessing, first.clone());
+        emit.send(
+            json!({"method":event.method,"sessionId":event.session_id,"params":event.params}),
+        )
+        .await
+        .unwrap();
+        first.wait_entered().await;
+        // The exact native pump admission rejects reuse while the old worker
+        // still owns the pending key. A duplicate is not a replacement entry.
+        assert_eq!(
+            owner.register_pending_event(&event),
+            Err(ProtocolError::StaleScope)
+        );
+        let watermark = owner.realm_watermark().unwrap();
+        let before = watermark.received().unwrap();
+        emit.send(
+            json!({"method":"Target.detachedFromTarget","sessionId":"initial",
+            "params":{"sessionId":"child","targetId":"iframe-target"}}),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let received = watermark.received().unwrap();
+                if received > before && owner.index.lock().unwrap().applied_watermark >= received {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(owner.index.lock().unwrap().pending_enrollment["child"]
+            .as_ref()
+            .unwrap()
+            .detached_at
+            .is_some());
+        assert_eq!(
+            owner.register_pending_event(&event),
+            Err(ProtocolError::StaleScope)
+        );
+        first.release();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            owner.drain_capture_watermark(&watermark, &owner.operation()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(!owner
+            .index
+            .lock()
+            .unwrap()
+            .pending_enrollment
+            .contains_key("child"));
+        assert!(owner.targets.owned_target("iframe-target").is_err());
+        assert!(!log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["sessionId"] == "child"));
+
+        // Production removal happens only after the first attached_observed
+        // future returned. The same text may now form a fresh pending entry,
+        // but the old directly observed detach cannot be inherited by it.
+        let second = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeAttachedProcessing, second.clone());
+        emit.send(
+            json!({"method":event.method,"sessionId":event.session_id,"params":event.params}),
+        )
+        .await
+        .unwrap();
+        second.wait_entered().await;
+        {
+            let index = owner.index.lock().unwrap();
+            let current = index.pending_enrollment["child"].as_ref().unwrap();
+            assert!(current.detached_at.is_none());
+            assert!(!current.registration_started);
+        }
+        assert!(!owner.retire_queued_iframe(&event).await.unwrap());
+        assert_eq!(
+            owner.register_pending_event(&event),
+            Err(ProtocolError::StaleScope)
+        );
+        second.release();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            owner.drain_capture_watermark(&watermark, &owner.operation()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(owner
+            .targets
+            .owned_target("iframe-target")
+            .unwrap()
+            .capture_ready());
+        assert!(owner
+            .targets
+            .owned_target("initial-target")
+            .unwrap()
+            .same_attachment(&host));
+        assert_eq!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["sessionId"] == "child"
+                    && request["method"] == "Runtime.runIfWaitingForDebugger")
+                .count(),
+            1
+        );
+        owner.close().await.unwrap();
+        connection.close().await;
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn queued_iframe_retirement_requires_exact_native_direct_detach() {
+        for event_kind in ["other-session", "destroyed-target", "unsequenced"] {
+            let (owner, _notices, _log, emit, server, _broker, connection) =
+                fixture_with_client("iframe-queued-detach", true).await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let queued = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeAttachedProcessing, queued.clone());
+            let attached = attach(
+                "owned-context",
+                "iframe-target",
+                "child",
+                "iframe",
+                Some("initial"),
+            );
+            emit.send(json!({"method":attached.method,"sessionId":attached.session_id,"params":attached.params})).await.unwrap();
+            queued.wait_entered().await;
+            let watermark = owner.realm_watermark().unwrap();
+            let before = watermark.received().unwrap();
+            if event_kind == "unsequenced" {
+                owner
+                    .event(&CdpEvent {
+                        method: "Target.detachedFromTarget".into(),
+                        session_id: Some("initial".into()),
+                        params: json!({"sessionId":"child","targetId":"iframe-target"}),
+                    })
+                    .unwrap();
+            } else {
+                let event = if event_kind == "other-session" {
+                    json!({"method":"Target.detachedFromTarget","sessionId":"initial","params":{"sessionId":"other","targetId":"iframe-target"}})
+                } else {
+                    json!({"method":"Target.targetDestroyed","params":{"targetId":"iframe-target"}})
+                };
+                emit.send(event).await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        let received = watermark.received().unwrap();
+                        if received > before
+                            && owner.index.lock().unwrap().applied_watermark >= received
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+            assert!(owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_enrollment
+                .get("child")
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .detached_at
+                .is_none());
+            assert!(!owner
+                .retire_queued_iframe(&attach(
+                    "owned-context",
+                    "iframe-target",
+                    "child",
+                    "iframe",
+                    Some("initial")
+                ))
+                .await
+                .unwrap());
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_foreign_or_unknown_context_iframe_never_acquires_owned_retirement() {
+        for context in [Some("foreign-context"), None] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                fixture_with_client("iframe-queued-detach", true).await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let queued = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeAttachedProcessing, queued.clone());
+            let mut event = json!({"method":"Target.attachedToTarget","sessionId":"initial",
+                "params":{"sessionId":"child","waitingForDebugger":true,"targetInfo":{"targetId":"iframe-target","type":"iframe"}}});
+            if let Some(context) = context {
+                event["params"]["targetInfo"]["browserContextId"] = json!(context);
+            }
+            emit.send(event).await.unwrap();
+            queued.wait_entered().await;
+            assert!(owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_enrollment
+                .get("child")
+                .is_none());
+            let before = owner.realm_watermark().unwrap().received().unwrap();
+            emit.send(json!({"method":"Target.detachedFromTarget","sessionId":"initial","params":{"sessionId":"child","targetId":"iframe-target"}})).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while owner.realm_watermark().unwrap().received().unwrap() == before {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            queued.release();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !log.lock().unwrap().iter().any(|request| {
+                    request["method"] == "Target.detachFromTarget"
+                        && request["params"]["sessionId"] == "child"
+                }) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(!log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|request| request["sessionId"] == "child"
+                    && request["method"] != "Runtime.runIfWaitingForDebugger"));
+            assert!(owner.targets.owned_target("iframe-target").is_err());
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
     async fn iframe_detach_before_initialization_uses_atomic_registration_tickets() {
         for obstruction in [
             "none",
@@ -15350,7 +16181,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .pending_enrollment
-                    .contains("child")
+                    .contains_key("child")
                 {
                     tokio::task::yield_now().await;
                 }

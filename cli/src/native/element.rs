@@ -1590,6 +1590,17 @@ pub async fn resolve_exact_object_typed(
     let context = create_exact_realm(client, binding).await?;
     resolve_exact_object_in_realm_typed(client, binding, backend, context).await
 }
+/// Temporary semantic-geometry objects belong to the caller's unique native
+/// group. That caller retains group custody on every success or refusal.
+pub(crate) async fn resolve_exact_object_in_readonly_group(
+    client: &CdpClient,
+    binding: &ExactBinding,
+    backend: i64,
+    group: &str,
+) -> Result<String, ExactResolutionError> {
+    let context = create_exact_realm(client, binding).await?;
+    resolve_exact_object_in_realm_impl(client, binding, backend, context, Some(group)).await
+}
 // Ordinary actions do not have this Observe-only task-local context. Stop
 // before new proof/acquisition commands, never inside mandatory handle release.
 fn check_capture_retirement() -> Result<(), ExactResolutionError> {
@@ -1624,9 +1635,18 @@ pub async fn resolve_exact_object_in_realm_typed(
     backend: i64,
     context: i64,
 ) -> Result<String, ExactResolutionError> {
+    resolve_exact_object_in_realm_impl(client, binding, backend, context, None).await
+}
+async fn resolve_exact_object_in_realm_impl(
+    client: &CdpClient,
+    binding: &ExactBinding,
+    backend: i64,
+    context: i64,
+    readonly_group: Option<&str>,
+) -> Result<String, ExactResolutionError> {
     check_capture_retirement()?;
     let result = client.send_command("DOM.resolveNode", Some(serde_json::json!({
-        "backendNodeId": backend, "executionContextId": context, "objectGroup": "native-exact"
+        "backendNodeId": backend, "executionContextId": context, "objectGroup": readonly_group.unwrap_or("native-exact")
     })), Some(&binding.session)).await?;
     let object = result["object"]["objectId"]
         .as_str()
@@ -1634,13 +1654,15 @@ pub async fn resolve_exact_object_in_realm_typed(
         .to_string();
     let proof: Result<(), ExactResolutionError> = async {
         check_capture_retirement()?;
-        let result = super::client_debt::command_scope(super::client_debt::CommandCategory::ApplicationRead, false, client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
+        let mut params = serde_json::json!({
             "objectId": object, "functionDeclaration": "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }", "returnByValue": true
-        })), Some(&binding.session))).await?;
+        });
+        if let Some(group) = readonly_group { params["objectGroup"] = group.into(); }
+        let result = super::client_debt::command_scope(super::client_debt::CommandCategory::ApplicationRead, false, client.send_command("Runtime.callFunctionOn", Some(params), Some(&binding.session))).await?;
         let mut seen = std::collections::HashSet::new();
         let mut cleanup_failed = false;
         for handle in [result["result"]["objectId"].as_str(), result["exceptionDetails"]["exception"]["objectId"].as_str()].into_iter().flatten() {
-            if handle != object && seen.insert(handle) { cleanup_failed |= !release_exact_handle(client, &binding.session, handle).await; }
+            if readonly_group.is_none() && handle != object && seen.insert(handle) { cleanup_failed |= !release_exact_handle(client, &binding.session, handle).await; }
         }
         let result = if result.get("exceptionDetails").is_some() { Err(ExactResolutionError::BackendFailure) } else {
             match result["result"]["value"].as_bool() {
@@ -1652,7 +1674,9 @@ pub async fn resolve_exact_object_in_realm_typed(
         if cleanup_failed { Err(ExactResolutionError::CleanupFailed { primary: result.err().map(Box::new) }) } else { result }
     }.await;
     if let Err(error) = proof {
-        if !release_exact_handle(client, &binding.session, &object).await {
+        if readonly_group.is_none()
+            && !release_exact_handle(client, &binding.session, &object).await
+        {
             return Err(ExactResolutionError::CleanupFailed {
                 primary: Some(Box::new(error)),
             });
