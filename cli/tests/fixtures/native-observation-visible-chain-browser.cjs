@@ -9,8 +9,6 @@
 //        node cli/tests/fixtures/native-observation-visible-chain-browser.cjs
 // Requires an already installed playwright-core 1.64.1 (set PLAYWRIGHT_CORE_DIR
 // to its extracted package directory). Never installs anything.
-const assert = require('node:assert/strict');
-const fs = require('node:fs');
 const path = require('node:path');
 
 const coreDir = process.env.PLAYWRIGHT_CORE_DIR;
