@@ -226,7 +226,9 @@ fn capture_with_any_nth_is_an_invalid_locator_through_every_scope() {
     // Pinned 1.64.1 refuses any top-level nth combined with a capture, so the
     // native expression layer must reach the same INVALID_LOCATOR result
     // wherever the selector sits: a direct selector, an index scope, a filter
-    // has, a union branch, or a frame selector.
+    // has, a union branch, or a frame selector. The frame case refuses for a
+    // different pinned reason ("Can not capture the selector before diving
+    // into the frame"), but both land in this adapter's invalid-locator class.
     for selector in [
         "css=li >> nth=0 >> *visible=true",
         "css=li >> *visible=true >> nth=0",
