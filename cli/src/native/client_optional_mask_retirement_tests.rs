@@ -363,6 +363,31 @@ async fn optional_mask_retirement(case: Case) {
         joined.unwrap();
     }
     let terminal = Instant::now();
+    // Preserve every original assertion and budget. Emit only closed test case,
+    // protocol outcome/custody facts and offsets from the original deadline.
+    // Print after the join, never on the producer's critical publication path.
+    let timing = task.receipt.optional_timing();
+    let relative_us = |at: Instant| -> i128 {
+        if at >= deadline {
+            at.duration_since(deadline).as_micros() as i128
+        } else {
+            -(deadline.duration_since(at).as_micros() as i128)
+        }
+    };
+    eprintln!(
+        "native-optional-mask-timing case={:?} ok={} error={} dirty={} sealed={} cutoff_deadline_us={:?} cutoff_selected_us={:?} attempt_us={:?} sent_us={:?} received_us={} joined_us={}",
+        case,
+        result.is_ok(),
+        serde_json::to_string(&result.as_ref().err().map(|failure| &failure.error)).unwrap(),
+        result.as_ref().err().is_some_and(|failure| failure.cleanup_integrity_lost),
+        task.receipt.is_sealed_observation(),
+        timing.cutoff_deadline.map(relative_us),
+        timing.cutoff_selected.map(relative_us),
+        timing.publication_attempt.map(relative_us),
+        timing.result_sent.map(relative_us),
+        relative_us(result_time),
+        relative_us(terminal),
+    );
     if matches!(
         case,
         Case::OptionalDeadline

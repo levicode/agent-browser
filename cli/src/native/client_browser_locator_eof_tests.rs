@@ -274,6 +274,14 @@ impl LocatorModel {
         } else if source == "function() { const p=Node.prototype; return Object.getOwnPropertyDescriptor(p,'isConnected').get.call(this) === true && (this === document || Object.getOwnPropertyDescriptor(p,'ownerDocument').get.call(this) === document); }" {
             self.node(&p["objectId"], 7);
             json!({"result":{"value":true}})
+        } else if source == "function(){\n if(!this.isConnected||this.ownerDocument!==document)return {status:'stale'};\n return true;\n}" {
+            self.node(&p["objectId"], 7);
+            assert_eq!(Some(object), self.exact_action.as_deref());
+            assert_eq!(self.input_count, 1, "connectivity proof must follow hover and precede press");
+            assert_eq!(p["arguments"], json!([]));
+            assert_eq!(p["awaitPromise"], true);
+            assert_eq!(p["returnByValue"], true);
+            json!({"result":{"value":true}})
         } else if source == crate::native::client_geometry::BOX_PROOF {
             self.node(&p["objectId"], 7);
             json!({"result":{"value":{"connected":true,"frameOwner":false}}})

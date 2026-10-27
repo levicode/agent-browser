@@ -414,8 +414,36 @@ pub struct DispatchContext {
 pub(crate) struct ObservationResultReceipt {
     sealed: Arc<AtomicBool>,
     cleanup_failed_before_publication: Arc<AtomicBool>,
+    #[cfg(test)]
+    optional_timing: Arc<Mutex<OptionalPublicationTiming>>,
+}
+// Test-only causal timestamps, not scheduling hooks or publication authority.
+// Only the producer writes these fields; the fixture reads after the joined run.
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct OptionalPublicationTiming {
+    cutoff_deadline: Option<Instant>,
+    cutoff_selected: Option<Instant>,
+    publication_attempt: Option<Instant>,
+    result_sent: Option<Instant>,
 }
 impl ObservationResultReceipt {
+    #[cfg(test)]
+    fn optional_timing(&self) -> OptionalPublicationTiming {
+        *self.optional_timing.lock().unwrap()
+    }
+    #[cfg(test)]
+    fn mark_optional_cutoff(&self) {
+        self.optional_timing.lock().unwrap().cutoff_selected = Some(Instant::now());
+    }
+    #[cfg(test)]
+    fn mark_publication_attempt(&self) {
+        self.optional_timing.lock().unwrap().publication_attempt = Some(Instant::now());
+    }
+    #[cfg(test)]
+    fn mark_result_sent(&self) {
+        self.optional_timing.lock().unwrap().result_sent = Some(Instant::now());
+    }
     pub(crate) fn is_sealed_observation(&self) -> bool {
         self.sealed.load(Ordering::Acquire)
     }
@@ -970,10 +998,12 @@ impl ObservationDispatch {
             }
             match output {
                 Ok(output) => {
-                    if send
-                        .take()
-                        .is_some_and(|send| send.send(Ok(output.value)).is_err())
-                        && !release_handles(&blobs, &scope, &output.handles)
+                    if send.take().is_some_and(|send| {
+                        let delivered = send.send(Ok(output.value));
+                        #[cfg(test)]
+                        task_receipt.mark_result_sent();
+                        delivered.is_err()
+                    }) && !release_handles(&blobs, &scope, &output.handles)
                     {
                         targets.seal();
                         return Err(DispatchFailure {
@@ -989,7 +1019,10 @@ impl ObservationDispatch {
                     }
                     match send.take() {
                         Some(send) => {
-                            if let Err(Err(error)) = send.send(Err(error)) {
+                            let delivered = send.send(Err(error));
+                            #[cfg(test)]
+                            task_receipt.mark_result_sent();
+                            if let Err(Err(error)) = delivered {
                                 if error.cleanup_integrity_lost {
                                     return Err(error);
                                 }
@@ -1207,6 +1240,11 @@ impl ObservationDispatch {
             }
         };
         let pixel_operation = optional_observe_lease(operation);
+        #[cfg(test)]
+        {
+            receipt.optional_timing.lock().unwrap().cutoff_deadline =
+                Some(pixel_operation.deadline);
+        }
         let published = AtomicBool::new(false);
         let optional = async {
             screenshot_stage(screenshot, ScreenshotStage::ProducerReservation);
@@ -1352,6 +1390,8 @@ impl ObservationDispatch {
         // cancellation, generation ticket and supersession, not new UI admission.
         let mut publish_semantic =
             |result_send: &mut Option<oneshot::Sender<Result<Value, DispatchFailure>>>| {
+                #[cfg(test)]
+                receipt.mark_publication_attempt();
                 check(&context.page, operation)?;
                 let authority = self
                     .captures
@@ -1399,6 +1439,8 @@ impl ObservationDispatch {
                     // The exact operation keeps cleanup custody even if the RPC
                     // receiver has gone away. There are no blob handles in this value.
                     let _ = send.send(Ok(semantic.clone()));
+                    #[cfg(test)]
+                    receipt.mark_result_sent();
                 }
                 Ok::<(), ProtocolError>(())
             };
@@ -1406,6 +1448,8 @@ impl ObservationDispatch {
             biased;
             result = &mut optional => result,
             _ = tokio::time::sleep_until(pixel_operation.deadline.into()) => {
+                #[cfg(test)]
+                receipt.mark_optional_cutoff();
                 // Do not cancel/drop the optional future: a raw ACK or a mask
                 // restore may still be outstanding. Only its output is cut off.
                 // The timeout wins here before later cleanup can overwrite the
@@ -1759,7 +1803,7 @@ impl ObservationDispatch {
             || matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
             self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
         } else if matches!(&request, DispatchRequest::Observe(_)) {
-            verified_semantic_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup)).await
+            verified_semantic_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup), screenshot).await
         } else {
             verified_frames_with_diagnostic(&context.page, &operation, Some(&observation_cleanup), screenshot).await
         }.map_err(failure)?;
@@ -1803,7 +1847,7 @@ impl ObservationDispatch {
             witness.enter(ObserveFailureStage::ProtectedFrames);
             screenshot_stage(screenshot, ScreenshotStage::ProtectedFrames);
             let frozen = if is_observe {
-                verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?
+                verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?
             } else {
                 verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?
             };
@@ -1942,7 +1986,7 @@ impl ObservationDispatch {
                         screenshot_stage(screenshot, ScreenshotStage::FinalGeometry);
                         geometry.revalidate(&capture_context.page.client, &operation).await.map_err(map_geometry)?;
                         screenshot_stage(screenshot, ScreenshotStage::FinalFrames);
-                        let current = verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await?;
+                        let current = verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?;
                         same_frames(&capture_context.frames, &current)?;
                         screenshot_stage(screenshot, ScreenshotStage::FinalViewport);
                         if viewport(&capture_context.page, &operation).await? != value["viewport"] {
@@ -2057,7 +2101,7 @@ impl ObservationDispatch {
         check(&capture_context.page, &operation).map_err(failure)?;
         screenshot_stage(screenshot, ScreenshotStage::FinalFrames);
         let final_frames = if is_observe {
-            verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup)).await
+            verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await
         } else {
             verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await
         }
@@ -2453,11 +2497,12 @@ async fn verified_semantic_frames_with_cleanup(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
     cleanup: Option<&AtomicBool>,
+    screenshot: Option<&ScreenshotFailureWitness>,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
-    frame_inventory_attempt_impl(page, operation, cleanup, None, true)
+    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, true)
         .await
         .map(|inventory| inventory.frames)
-        .map_err(|failure| failure.record(None))
+        .map_err(|failure| failure.record(screenshot))
 }
 pub async fn verified_frames(
     page: &BrowserExecutionLease,

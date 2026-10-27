@@ -3,11 +3,14 @@
 //! encoder children, private files and quota reservations are production-owned.
 use super::*;
 use futures_util::{SinkExt, StreamExt};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio_tungstenite::tungstenite::Message;
 
 struct Peer {
     endpoint: String,
     requests: Arc<Mutex<Vec<Value>>>,
+    failure_armed: Arc<AtomicBool>,
+    failure_reached: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
 fn reply(request: &Value, error: bool) -> Value {
@@ -33,6 +36,10 @@ async fn peer(
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let log = requests.clone();
+    let failure_armed = Arc::new(AtomicBool::new(false));
+    let armed = failure_armed.clone();
+    let failure_reached = Arc::new(AtomicBool::new(false));
+    let reached = failure_reached.clone();
     let mut jpeg = std::io::Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(image::RgbImage::from_pixel(
         320,
@@ -154,7 +161,10 @@ async fn peer(
                 }
                 "Page.navigate" => {
                     assert_eq!(session, "session-1");
-                    if loader == "activated-loader" && failure.is_some() {
+                    // page.activate need not navigate. Arm this fault only after
+                    // the test joined its real first recording, not via loader text.
+                    if armed.load(Ordering::SeqCst) && failure.is_some() {
+                        assert!(!reached.swap(true, Ordering::SeqCst), "failed navigation was replayed");
                         if failure == Some("disconnect") {
                             let _ = socket.close(None).await;
                             return;
@@ -228,6 +238,8 @@ async fn peer(
     Peer {
         endpoint,
         requests,
+        failure_armed,
+        failure_reached,
         task,
     }
 }
@@ -448,9 +460,13 @@ async fn run_with_failure(negotiated: bool, clean_stop: bool, failed_command: &s
             actions.recording_page_closing(&scope, &browser.blobs).await.map_err(|e| format!("real segment finalization: {e:?}"))?;
             failure_args["url"] = json!("about:blank");
             failure_args["waitUntil"] = json!("load");
+            peer.failure_armed.store(true, Ordering::SeqCst);
         }
         let reset = command(&mut fixture, native_command, failure_args).await?;
         let failed = fixture.sequence;
+        if native_command == "page.navigate" && !peer.failure_reached.load(Ordering::SeqCst) {
+            return Err("real navigation did not reach its armed CDP fault".into());
+        }
         if reset["ok"] != false
             || reset["error"]["code"]
                 != if clean_stop {

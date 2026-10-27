@@ -641,12 +641,38 @@ async fn recording_missing_second_file_returns_first_real_segment_without_anothe
         f.journal(0, &closing).scope(actions.recording_page_closing("recording-wire", &f.blobs)).await.map_err(|e| format!("first close {e:?}"))?;
         let second = f.operation(4);
         f.journal(1, &second).scope(actions.recording_page_opened(f.context(1, &second))).await.map_err(action_error)?;
-        // Both producers are real. Remove only the second private path while
-        // its encoder retains the FD: the subsequent independent read fails.
-        let missing_path = actions.recording.lock().await.current.as_ref().ok_or("missing current recorder")?.state.output_path.clone();
-        std::fs::remove_file(&missing_path).map_err(|_| "inject second-file read failure")?;
+        // First-frame readiness acknowledges a pipe write, not FFmpeg opening
+        // its output. Join the actual second producer before removing its file;
+        // do not sleep, seed finished bytes, or manufacture encoder success.
+        // The public stop below still owns the independent file read and must
+        // not repeat either already-completed physical capture stop.
+        let missing_path = {
+            let mut ledger = actions.recording.lock().await;
+            let owned = ledger.current.as_mut().ok_or("missing current recorder")?;
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(f.deadline),
+                recording::stop_recording_task(&mut owned.state),
+            ).await.map_err(|_| "second encoder join exceeded the original fixture deadline")?
+                .map_err(|e| format!("second actual stop: {e}"))?;
+            if !owned.state.encoder_complete.load(Ordering::SeqCst)
+                || !owned.state.encoder_succeeded.load(Ordering::SeqCst)
+                || owned.state.capture_task.is_some() || owned.bytes.is_some() || owned.read_job.is_some()
+            {
+                return Err("second producer was not independently joined before the read fault".into());
+            }
+            owned.state.output_path.clone()
+        };
+        let metadata = std::fs::metadata(&missing_path).map_err(|e| format!("second actual encoder output: {e}"))?;
+        if !metadata.is_file() || metadata.len() == 0 { return Err("second encoder produced no owned file".into()); }
+        std::fs::remove_file(&missing_path).map_err(|e| format!("inject second-file read failure: {e}"))?;
         let stop = f.operation(5);
-        let output = f.journal(1, &stop).scope(actions.execute(f.context(1, &stop), "recording.stop", &args)).await.map_err(action_error)?;
+        let stop_journal = f.journal(1, &stop);
+        let public_stop_calls = std::sync::atomic::AtomicUsize::new(0);
+        let public_stop = || {
+            public_stop_calls.fetch_add(1, Ordering::SeqCst);
+            stop_journal.scope(actions.execute(f.context(1, &stop), "recording.stop", &args))
+        };
+        let output = public_stop().await.map_err(action_error)?;
         let segments = output["segments"].as_array().ok_or("missing safe segments")?;
         if output["missingSegment"] != 2 || output.as_object().map(|o| o.len()) != Some(3) || segments.len() != 1 {
             return Err(format!("missing-file receipt lost safe output: {output}"));
@@ -660,6 +686,9 @@ async fn recording_missing_second_file_returns_first_real_segment_without_anothe
         decoded_segment(&f, &segments[0], (320, 200)).await?;
         if f.requests.lock().unwrap().len() != requests {
             return Err("safe byte read issued a browser command".into());
+        }
+        if public_stop_calls.load(Ordering::SeqCst) != 1 {
+            return Err("partial transfer retried the public recording.stop".into());
         }
         Ok(())
     }.await;
