@@ -992,13 +992,23 @@ async fn retired_startup_joins_late_target_before_next_attempt_identity() {
             .count(),
         1
     );
-    assert!(old_requests
+    let disposals = old_requests
         .iter()
-        .any(|r| r["method"] == "Target.disposeBrowserContext"
-            && r["params"]["browserContextId"] == "synthetic-context"));
-    assert!(old_requests
+        .filter(|r| r["method"] == "Target.disposeBrowserContext")
+        .collect::<Vec<_>>();
+    assert_eq!(disposals.len(), 1);
+    assert_eq!(
+        disposals[0]["params"],
+        json!({"browserContextId":"synthetic-context"})
+    );
+    assert!(disposals[0].get("sessionId").is_none());
+    // Shutdown seals the gate while acquisition is retained. The late target
+    // is joined and destroyed before runtime enrollment can install autoattach,
+    // so this pre-enrollment path must not issue either enable or disable.
+    // Post-enrollment phase-two ACK barriers are covered separately above.
+    assert!(!old_requests
         .iter()
-        .any(|r| r["method"] == "Target.setAutoAttach" && r["params"]["autoAttach"] == false));
+        .any(|r| r["method"] == "Target.setAutoAttach"));
 
     // Only after actual old-owner cleanup/join, start a new real ClientBrowser.
     // The peer intentionally reuses textual context/page IDs: native authority

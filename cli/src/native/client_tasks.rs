@@ -44,6 +44,14 @@ impl Tasks {
 }
 impl RetainedTasks {
     #[cfg(test)]
+    pub(crate) fn operation_journal_result_for_test(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> Option<(super::client_debt::OperationJournalHandle, bool)> {
+        self.operations.journal_result_for_test(key)
+    }
+
+    #[cfg(test)]
     pub(crate) fn expire_recovery_window_for_test(&self, key: super::client_debt::OperationKey) {
         self.operations.expire_recovery_window_for_test(key);
     }

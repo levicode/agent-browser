@@ -49,6 +49,7 @@ async fn peer(
         let mut attaches = 0;
         let mut contexts = 0;
         let mut loader = "initial-loader";
+        let mut isolated_world: Option<(&str, i64)> = None;
         loop {
             let incoming = socket.next().await;
             let Some(Ok(Message::Text(text))) = incoming else {
@@ -106,11 +107,37 @@ async fn peer(
                     json!({})
                 }
                 "Page.getFrameTree" => {
+                    assert_eq!(session, "session-1");
+                    assert!(page.is_some(), "frame tree belongs to a live fixture page");
                     json!({"frameTree":{"frame":{"id":"frame-session-1","loaderId":loader,
                     "url":"about:blank","securityOrigin":"null"}}})
                 }
+                "Page.createIsolatedWorld" => {
+                    // Real managed recording admission enumerates its one owned
+                    // document before geometry. Do not substitute a ready frame.
+                    assert_eq!(session, "session-1");
+                    assert_eq!(
+                        page.as_ref().expect("world requested for gone page")["browserContextId"],
+                        "synthetic-context"
+                    );
+                    assert_eq!(
+                        request["params"],
+                        json!({
+                            "frameId":"frame-session-1", "worldName":"agent-browser-native-observation"
+                        })
+                    );
+                    let context = if loader == "initial-loader" { 7 } else { 8 };
+                    isolated_world = Some((loader, context));
+                    json!({"executionContextId":context})
+                }
                 "Page.addScriptToEvaluateOnNewDocument" => json!({"identifier":"synthetic-script"}),
                 "Runtime.evaluate" => {
+                    assert_eq!(session, "session-1");
+                    assert!(page.is_some(), "evaluation belongs to a live fixture page");
+                    assert_eq!(request["params"]["returnByValue"], true);
+                    if let Some(context) = request["params"].get("contextId") {
+                        assert_eq!(isolated_world, Some((loader, context.as_i64().unwrap())));
+                    }
                     match request["params"]["expression"].as_str().unwrap_or("") {
                         "[window.innerWidth, window.innerHeight]" => {
                             json!({"result":{"type":"object","value":[320,200]}})
@@ -121,12 +148,13 @@ async fn peer(
                         "location.href" => {
                             json!({"result":{"type":"string","value":"about:blank"}})
                         }
-                        _ => json!({"result":{"type":"object","value":{"value":17}}}),
+                        other => panic!("unmodeled recording Runtime.evaluate expression: {other}"),
                     }
                 }
                 "Page.navigate" => {
                     assert_eq!(session, "session-1");
                     loader = "activated-loader";
+                    isolated_world = None;
                     after.push(json!({"method":"Page.frameNavigated","sessionId":session,"params":{"frame":{
                         "id":"frame-session-1","loaderId":loader,"url":"about:blank","securityOrigin":"null"}}}));
                     after.push(

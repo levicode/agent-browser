@@ -129,7 +129,21 @@ struct EventBarrier {
     scope_gate: std::sync::Arc<ScopeEmissionGate>,
     deadline: std::time::Instant,
     state: std::sync::Mutex<EventBarrierState>,
+    reopened_result: std::sync::Mutex<Option<super::client_restart::ReopenedResultIdentity>>,
     changed: tokio::sync::Notify,
+}
+/// Non-owning identity of one exact staging barrier; retaining a reopen proof
+/// must not create a sink/barrier reference cycle.
+#[derive(Clone)]
+pub(super) struct ReopenedResultBinding(std::sync::Weak<EventBarrier>);
+impl ReopenedResultBinding {
+    pub(super) fn matches(&self, sink: &ClientEventSink) -> bool {
+        self.0.upgrade().is_some_and(|barrier| {
+            sink.barrier
+                .as_ref()
+                .is_some_and(|current| std::sync::Arc::ptr_eq(&barrier, current))
+        })
+    }
 }
 enum EventBarrierState {
     Holding(Vec<StagedEvent>),
@@ -180,6 +194,11 @@ impl ClientEventSink {
             },
             receiver,
         )
+    }
+    #[cfg(test)]
+    pub(crate) fn negotiate_reopen_for_test(&self) {
+        self.persistent_page_reopen
+            .store(true, std::sync::atomic::Ordering::Release);
     }
     /// Native lifecycle-only. No waiting task or action lock is held by the
     /// barrier: the actual result writer performs publication after flush.
@@ -260,6 +279,7 @@ impl ClientEventSink {
             scope_gate,
             deadline: operation.deadline,
             state: std::sync::Mutex::new(EventBarrierState::Holding(Vec::new())),
+            reopened_result: std::sync::Mutex::new(None),
             changed: tokio::sync::Notify::new(),
         });
         order.barriers.insert(key, barrier.clone());
@@ -306,6 +326,66 @@ impl ClientEventSink {
         }
         Ok(())
     }
+    pub(super) fn reopened_result_binding(&self) -> Result<ReopenedResultBinding, ProtocolError> {
+        Ok(ReopenedResultBinding(std::sync::Arc::downgrade(
+            self.barrier.as_ref().ok_or(ProtocolError::StaleScope)?,
+        )))
+    }
+
+    /// Only the create-only reopen's typed owner proof can bind a command result
+    /// without a public identityScope field. Confirmation is not publication.
+    pub(super) fn confirm_reopened_result(
+        &self,
+        source: &Self,
+        operation: &OperationLease,
+        proof: &super::client_restart::ReopenedResultIdentity,
+    ) -> Result<(), ProtocolError> {
+        let barrier = self.barrier.as_ref().ok_or(ProtocolError::StaleScope)?;
+        self.validate_stage(source, operation, &barrier.identity_scope)?;
+        if !self.persistent_page_reopen_negotiated()
+            || !proof.matches(
+                self,
+                operation.generation,
+                operation.sequence,
+                &barrier.identity_scope,
+            )
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let _order = self
+            .sequence
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.check_open()?;
+        if *operation.cancellation.borrow() != super::client_session::CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= barrier.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let state = barrier
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if barrier
+            .scope_gate
+            .closed
+            .load(std::sync::atomic::Ordering::Acquire)
+            || !matches!(*state, EventBarrierState::Holding(_))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut confirmed = barrier
+            .reopened_result
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if confirmed.is_some() {
+            return Err(ProtocolError::InvalidSequence);
+        }
+        *confirmed = Some(proof.clone());
+        Ok(())
+    }
+
     pub(crate) fn is_publication_pending(&self) -> Result<bool, ProtocolError> {
         let generation = self.check_open()?;
         let Some(barrier) = &self.barrier else {
@@ -705,13 +785,27 @@ impl ClientEventSink {
         if !ok || *scope_state != ScopeState::Usable || *effects != Effects::Completed {
             return Ok(());
         }
-        if data
-            .as_ref()
-            .and_then(|value| value.get("identityScope"))
-            .and_then(serde_json::Value::as_str)
-            != Some(barrier.identity_scope.as_str())
-        {
-            return Err(ProtocolError::StaleScope);
+        let publication = Self {
+            barrier: Some(barrier.clone()),
+            ..self.clone()
+        };
+        match data.as_ref().and_then(|value| value.get("identityScope")) {
+            Some(serde_json::Value::String(scope)) if scope == &barrier.identity_scope => {}
+            None if data.is_some()
+                && barrier
+                    .reopened_result
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    .as_ref()
+                    .is_some_and(|proof| {
+                        proof.matches(
+                            &publication,
+                            *generation,
+                            *operation_seq,
+                            &barrier.identity_scope,
+                        )
+                    }) => {}
+            _ => return Err(ProtocolError::StaleScope),
         }
         self.check_open()?;
         if barrier

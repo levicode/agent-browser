@@ -140,6 +140,20 @@ pub(crate) struct OperationRegistry {
     pub(crate) changed: Notify,
 }
 impl OperationRegistry {
+    /// Read-only test observation of the exact registered producer and whether
+    /// transport fixed its native result, rather than a terminal fallback.
+    #[cfg(test)]
+    pub(crate) fn journal_result_for_test(
+        &self,
+        key: OperationKey,
+    ) -> Option<(OperationJournalHandle, bool)> {
+        self.entries
+            .lock()
+            .ok()?
+            .get(&key)
+            .map(|entry| (entry.journal.clone(), entry.result_fixed))
+    }
+
     pub(crate) fn begin_protected_cleanup(&self, key: OperationKey) -> Option<Instant> {
         let entries = self.entries.lock().ok()?;
         let entry = entries.get(&key)?;

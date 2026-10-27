@@ -123,6 +123,13 @@ async fn peer() -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>)
                     assert!(matches!(expression, "document.title" | "location.href"));
                     json!({"result":{"type":"string","value":if expression=="document.title" { session } else { "about:blank" }}})
                 }
+                "Network.disable" => {
+                    // Borrowed-page cleanup releases observation only for the
+                    // application's exact session, never another host tab.
+                    assert!(matches!(session, "initial-session" | "replacement-session"));
+                    assert_eq!(request["params"], json!({}));
+                    json!({})
+                }
                 "Page.enable"
                 | "Runtime.enable"
                 | "Network.enable"
@@ -214,7 +221,7 @@ async fn persistent_closed_page_dispatch_is_negotiated_and_refresh_precedes_resu
                         if negotiated {
                             assert!(refresh.is_some());
                             assert_eq!(frame["ok"],true);
-                            assert_eq!(frame["data"]["activated"],true);
+                            assert_eq!(frame["data"],json!({"activated":true}));
                         } else {
                             assert_eq!(frame["ok"],false);
                             assert_eq!(frame["error"]["code"],"unsupported-capability");
@@ -303,7 +310,7 @@ async fn chromium_persistent_page_close_reopens_without_adopting_another_host_ta
                     assert!(refreshed);
                     assert_eq!(frame["id"],"real-reopen");
                     assert_eq!(frame["ok"],true,"{frame}");
-                    assert_eq!(frame["data"]["activated"],true);
+                    assert_eq!(frame["data"],json!({"activated":true}));
                     assert_eq!(frame["scopeState"],"usable");
                     completed = true;
                     break;

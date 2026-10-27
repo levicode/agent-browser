@@ -4448,7 +4448,7 @@ impl ClientBrowser {
                 tasks.check_input_dispatch(key)?;
                 page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?.check_admission(super::client_debt::AdmissionClass::Input)?;
                 let staged = event_sink.stage_until_result(&operation, &scope)?;
-                let context = super::client_restart::RestartContext::new_persistent_reopen(&page, &enrollment, &ui, &exclusive, &operation).await?.with_staged_sink(staged);
+                let context = super::client_restart::RestartContext::new_persistent_reopen(&page, &enrollment, &ui, &exclusive, &operation).await?.with_staged_sink(staged.clone());
                 // Exact detach has already cleared this session's held input;
                 // never send release keys to a detached/replacement session.
                 actions.recording_page_closing(&scope, &blobs).await?;
@@ -4484,8 +4484,9 @@ impl ClientBrowser {
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
                     actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page: &next, operation: &operation, page_state: &page_state, refs: &references, revision, iframe_sessions: &sessions, observation_frames: &frames, blobs: &blobs, geometry: &geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| failure.error)?;
                 }
-                replacement.publish_ready(&context, || {
+                replacement.publish_reopened_ready(&context, |proof| {
                     next.permit.check()?;
+                    staged.confirm_reopened_result(&event_sink, &operation, proof)?;
                     // Queue the exact-owner refresh before the operation result,
                     // not behind its result-staged application events.
                     event_sink.emit("scope.page-reopened".into(), serde_json::json!({

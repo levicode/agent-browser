@@ -510,6 +510,9 @@ async fn frame_only_projection_preserves_primary_error_and_cleanup_flag() {
 
 #[test]
 fn all_production_action_contexts_consume_the_verified_renderer_map() {
+    // Ordinary actions plus four recording page-open hooks: borrowed-page
+    // reopen, restart, reset replacement, and reconnect replacement. Each new
+    // constructor must retain the paired verified frames/session inventory.
     let source = include_str!("client_browser.rs")
         .split_whitespace()
         .collect::<String>();
@@ -517,15 +520,15 @@ fn all_production_action_contexts_consume_the_verified_renderer_map() {
         source
             .matches("super::client_actions::ActionContext{")
             .count(),
-        4
+        5
     );
     assert_eq!(
         source
             .matches("VerifiedFrameInventory{frames,iframe_sessions:sessions")
             .count(),
-        4
+        5
     );
-    assert_eq!(source.matches("::verified_frame_inventory(").count(), 3);
+    assert_eq!(source.matches("::verified_frame_inventory(").count(), 4);
     assert_eq!(
         source.matches("::verified_action_frame_inventory(").count(),
         1
@@ -534,7 +537,7 @@ fn all_production_action_contexts_consume_the_verified_renderer_map() {
         source
             .matches("iframe_sessions:&sessions,observation_frames:&frames")
             .count(),
-        4
+        5
     );
     assert!(!source.contains("filter(|frame|frame.parent_frame_id.is_some())"));
 }

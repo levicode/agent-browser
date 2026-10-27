@@ -861,10 +861,12 @@ mod tests {
                 assert_eq!(ledger.snapshot().outstanding_commands, 0);
                 assert!(!ledger.snapshot().integrity_lost);
             }
-            client.close().await;
+            // An owner view cannot close the shared transport. This fixture owns
+            // the raw connection, so close that owner before joining its peer.
+            raw.close().await;
             tokio::time::timeout(Duration::from_secs(2), peer)
                 .await
-                .unwrap()
+                .unwrap_or_else(|_| panic!("screenshot peer did not close: {mode}"))
                 .unwrap();
         }
     }

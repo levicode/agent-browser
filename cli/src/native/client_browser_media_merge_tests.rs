@@ -1,6 +1,6 @@
 //! Public queued-media obligation through the actual framed transport and
 //! ClientBrowser executor. The peer controls native ACKs, never producer state.
-//! These are intentional pending regressions until queued admission is repaired.
+//! Receipts remain fail-closed when a predecessor loses configuration integrity.
 use super::*;
 use crate::native::client_debt::{OperationKey, OwnerDebtLedger};
 use crate::native::client_operation_state::OperationRetentionStatus;
@@ -240,14 +240,23 @@ impl Fixture {
     }
 
     async fn finish(self) {
-        let cleanup = bounded(self.framed.finish()).await;
+        assert!(self.finish_result().await, "native cleanup was not proven");
+    }
+
+    async fn finish_result(self) -> bool {
+        // Observe the real shutdown verdict without confusing a panicked
+        // framed owner with an intentional negative cleanup receipt.
+        drop(self.framed.stream);
+        let cleanup = bounded(self.framed.server)
+            .await
+            .expect("framed native owner panicked");
         self.peer.abort();
         match self.peer.await {
             Ok(()) => {}
             Err(error) if error.is_cancelled() => {}
             Err(error) => panic!("CDP peer panicked: {error}"),
         }
-        cleanup.unwrap();
+        cleanup
     }
 }
 
@@ -312,22 +321,100 @@ async fn actual_queued_media_merges_partial_updates_and_new_attachment_inherits_
 #[tokio::test]
 async fn actual_queued_media_does_not_dispatch_after_predecessor_configuration_failure() {
     let mut f = Fixture::new().await;
+    let targets = f.browser.page_lease(false).await.unwrap().targets.clone();
     let first_key = f.send(json!({"colorScheme":"dark"})).await;
     let first = bounded(f.media.recv()).await.unwrap();
     features(&first, false);
     let second_key = f.queue_second(5000).await;
+    // Retain observations of the actual registered journals before the ACK.
+    // Clean fixed entries may be removed before their framed result is read.
+    let journals = [first_key, second_key].map(|key| {
+        let (journal, fixed) = f
+            .browser
+            .tasks
+            .operation_journal_result_for_test(key)
+            .expect("queued producer must be registered");
+        assert!(!fixed);
+        journal
+    });
     f.ack(&first, false);
     let [first, second] = f.pair([first_key, second_key]).await;
     assert_eq!(first["ok"], false);
     assert_eq!(first["effects"], "unknown");
+    assert_eq!(first["scopeState"], "quarantined");
     assert_eq!(second["ok"], false);
-    assert_eq!(second["effects"], "not-dispatched");
+    assert!(targets.check_settlement_integrity().is_err());
+    assert!(targets.inventory().is_err());
+    assert!(!journals[0].local_integrity_intact());
+    for ((key, dispatched), (handle, result)) in [(first_key, true), (second_key, false)]
+        .into_iter()
+        .zip(journals.iter().zip([&first, &second]))
+    {
+        let journal = handle.snapshot();
+        assert_eq!(journal.mutation_dispatched, dispatched);
+        assert!(journal.local_producers_finished);
+        assert!(journal.submission_revoked);
+        // config_gate is released before the retained supervisor joins its
+        // monitor and seals targets. Native settlement and transport publication
+        // can therefore cross that seal at different points. Classify by actual
+        // result-fix evidence, not by the observed receipt we want to accept.
+        match f.browser.tasks.operation_journal_result_for_test(key) {
+            Some((retained, fixed)) => {
+                assert!(retained.same_operation(handle));
+                assert_eq!(result["effects"], "unknown");
+                assert_eq!(result["scopeState"], "quarantined");
+                if fixed {
+                    // A dirty native completion was published normally.
+                    assert!(!handle.local_integrity_intact());
+                    assert!(matches!(
+                        f.browser.operation_retention_status(key),
+                        OperationRetentionStatus::IntegrityLost(_)
+                    ));
+                } else {
+                    // Transport shutdown joins retained work, then synthesizes
+                    // Cancelled/Unknown for started pending RPCs without fixing
+                    // their native result. This says nothing about dispatch or
+                    // the producer's independent local integrity classification.
+                    assert_eq!(result["error"]["code"], "cancelled");
+                }
+            }
+            None => {
+                // Only a clean native completion fixed before removal can take
+                // this path. It must be the non-dispatched queued operation.
+                assert_eq!(key, second_key);
+                assert!(handle.local_integrity_intact());
+                assert_eq!(result["effects"], "not-dispatched");
+                assert!(matches!(
+                    result["scopeState"].as_str(),
+                    Some("usable" | "quarantined")
+                ));
+                assert!(matches!(
+                    f.browser.operation_retention_status(key),
+                    OperationRetentionStatus::NotRegistered
+                ));
+            }
+        }
+    }
     assert_eq!(
         f.media_writes(),
         1,
         "failed predecessor must not permit a replay or second media mutation"
     );
-    f.finish().await;
+    let log = f.log.clone();
+    let cleanup = f.finish_result().await;
+    assert!(
+        !cleanup,
+        "failed configuration must not claim clean shutdown"
+    );
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == MEDIA)
+            .count(),
+        1,
+        "shutdown must not replay either media mutation"
+    );
 }
 
 async fn queued_interruption_case(explicit_cancel: bool) {

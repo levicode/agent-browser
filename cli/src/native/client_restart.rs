@@ -191,6 +191,31 @@ pub(crate) struct RestartedPage {
     generation: u64,
     sequence: u64,
     attachment: OwnedTarget,
+    reopened_result: Option<ReopenedResultIdentity>,
+}
+
+/// Native-only result identity. Only a completed create-only reopen can mint
+/// it, and only its exact sink, operation and scope may consume it after flush.
+#[derive(Clone)]
+pub(super) struct ReopenedResultIdentity {
+    generation: u64,
+    sequence: u64,
+    identity_scope: String,
+    sink: super::client_transport::ReopenedResultBinding,
+}
+impl ReopenedResultIdentity {
+    pub(super) fn matches(
+        &self,
+        sink: &ClientEventSink,
+        generation: u64,
+        sequence: u64,
+        identity_scope: &str,
+    ) -> bool {
+        self.sink.matches(sink)
+            && self.generation == generation
+            && self.sequence == sequence
+            && self.identity_scope == identity_scope
+    }
 }
 impl RestartedPage {
     /// Validate immediately before owner publication under the retained permits.
@@ -220,6 +245,32 @@ impl RestartedPage {
         }
         Ok(())
     }
+    /// Keep ordinary command payloads unchanged while confirming the exact
+    /// reopened owner under the same publication fence as its identity refresh.
+    pub(super) async fn publish_reopened_ready<T>(
+        &self,
+        context: &RestartContext<'_>,
+        publish: impl FnOnce(&ReopenedResultIdentity) -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        let proof = self
+            .reopened_result
+            .as_ref()
+            .ok_or(ProtocolError::StaleScope)?;
+        let sink = context
+            .staged_sink
+            .as_ref()
+            .ok_or(ProtocolError::StaleScope)?;
+        if !proof.matches(
+            sink,
+            context.operation.generation,
+            context.operation.sequence,
+            &context.page.identity_scope,
+        ) {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.publish_ready(context, || publish(proof)).await
+    }
+
     /// Validate retained owner authority before waiting, then publish under the
     /// enrollment/reader/inventory fence. The closure cannot reacquire them.
     pub(crate) async fn publish_ready<T>(
@@ -404,7 +455,16 @@ pub(crate) async fn reopen_closed_page(
                 return Err(ProtocolError::StaleReference);
             }
         }
-        create_replacement(context, &mut journal, &HashSet::new()).await
+        let mut page = create_replacement(context, &mut journal, &HashSet::new()).await?;
+        if let Some(sink) = &context.staged_sink {
+            page.reopened_result = Some(ReopenedResultIdentity {
+                generation: context.operation.generation,
+                sequence: context.operation.sequence,
+                identity_scope: context.page.identity_scope.clone(),
+                sink: sink.reopened_result_binding()?,
+            });
+        }
+        Ok(page)
     }
     .await;
     result.map_err(|error| {
@@ -496,6 +556,7 @@ async fn create_replacement(
         generation: context.operation.generation,
         sequence: context.operation.sequence,
         attachment,
+        reopened_result: None,
     };
     page.validate(context)?;
     if let Some(admission) = borrowed_admission {
@@ -591,6 +652,7 @@ mod tests {
     struct Fixture {
         enrollment: Arc<ClientEnrollment>,
         network: Arc<ClientNetwork>,
+        sink: ClientEventSink,
         ui: Arc<UiGate>,
         page: BrowserExecutionLease,
         operation: OperationLease,
@@ -802,7 +864,7 @@ mod tests {
         let network = Arc::new(ClientNetwork::new(
             client.clone(),
             broker,
-            sink,
+            sink.clone(),
             BlobScope {
                 generation: 1,
                 identity_scope: "same-scope".into(),
@@ -860,6 +922,7 @@ mod tests {
         Fixture {
             enrollment,
             network,
+            sink,
             ui,
             page,
             operation,
@@ -913,6 +976,165 @@ mod tests {
             .persistent_reopen_candidate(&fixture.page, &fixture.operation)
             .await
             .unwrap());
+    }
+
+    #[tokio::test]
+    async fn reopened_result_proof_preserves_payload_and_exact_publication_fence() {
+        use super::super::client_protocol::{Effects, ScopeState, ServerMessage, WireError};
+        for mode in [
+            "activate",
+            "null",
+            "unconfirmed",
+            "missing-data",
+            "wrong-scope",
+            "malformed-scope",
+            "failed",
+            "unknown",
+            "quarantined",
+            "closed",
+        ] {
+            let mut fixture = make_fixture("persistent").await;
+            fixture.sink.negotiate_reopen_for_test();
+            close_application_root(&fixture).await;
+            let exclusive = exclusive(&fixture).await;
+            let staged = fixture
+                .sink
+                .stage_until_result(&fixture.operation, "same-scope")
+                .unwrap();
+            let context = RestartContext::new_persistent_reopen(
+                &fixture.page,
+                &fixture.enrollment,
+                &fixture.ui,
+                &exclusive,
+                &fixture.operation,
+            )
+            .await
+            .unwrap()
+            .with_staged_sink(staged.clone());
+            let page = reopen_closed_page(&context).await.unwrap();
+            page.publish_reopened_ready(&context, |proof| {
+                assert!(proof.matches(&staged, 1, 1, "same-scope"));
+                assert!(!proof.matches(&staged, 2, 1, "same-scope"));
+                assert!(!proof.matches(&staged, 1, 2, "same-scope"));
+                assert!(!proof.matches(&staged, 1, 1, "other-scope"));
+                let (foreign, _) = ClientEventSink::test_channel(Arc::new(ClientSession::new()));
+                assert_eq!(
+                    staged.confirm_reopened_result(&foreign, &fixture.operation, proof),
+                    Err(ProtocolError::StaleScope)
+                );
+                let foreign_stage = foreign
+                    .stage_until_result(&fixture.operation, "same-scope")
+                    .unwrap();
+                assert!(!proof.matches(&foreign_stage, 1, 1, "same-scope"));
+                let (_cancelled, cancellation) =
+                    tokio::sync::watch::channel(CancelSignal::Requested);
+                let cancelled = OperationLease {
+                    is_callback: false,
+                    generation: 1,
+                    sequence: 1,
+                    deadline: fixture.operation.deadline,
+                    cancellation,
+                };
+                assert_eq!(
+                    staged.confirm_reopened_result(&fixture.sink, &cancelled, proof),
+                    Err(ProtocolError::Cancelled)
+                );
+                let expired = OperationLease {
+                    is_callback: false,
+                    generation: 1,
+                    sequence: 1,
+                    deadline: Instant::now(),
+                    cancellation: fixture.operation.cancellation.clone(),
+                };
+                assert_eq!(
+                    staged.confirm_reopened_result(&fixture.sink, &expired, proof),
+                    Err(ProtocolError::DeadlineExceeded)
+                );
+                if mode != "unconfirmed" {
+                    staged.confirm_reopened_result(&fixture.sink, &fixture.operation, proof)?;
+                    assert_eq!(
+                        staged.confirm_reopened_result(&fixture.sink, &fixture.operation, proof),
+                        Err(ProtocolError::InvalidSequence)
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .unwrap();
+            while fixture._notices.try_recv().is_ok() {}
+            staged
+                .emit(
+                    "reopen-test".into(),
+                    json!({"identityScope":"same-scope"}),
+                    None,
+                )
+                .unwrap();
+            assert!(staged.is_publication_pending().unwrap());
+            assert!(
+                fixture._notices.try_recv().is_err(),
+                "proof is not a writer flush"
+            );
+            let data = match mode {
+                "null" => Value::Null,
+                "wrong-scope" => json!({"activated":true,"identityScope":"other-scope"}),
+                "malformed-scope" => json!({"activated":true,"identityScope":null}),
+                _ => json!({"activated":true}),
+            };
+            let message = ServerMessage::Result {
+                recovery: None,
+                retention: None,
+                id: "reopen".into(),
+                generation: 1,
+                operation_seq: 1,
+                ok: mode != "failed",
+                data: (mode != "missing-data").then_some(data.clone()),
+                error: (mode == "failed").then_some(WireError {
+                    code: ProtocolError::Cancelled,
+                }),
+                effects: if mode == "unknown" {
+                    Effects::Unknown
+                } else {
+                    Effects::Completed
+                },
+                scope_state: if mode == "quarantined" {
+                    ScopeState::Quarantined
+                } else {
+                    ScopeState::Usable
+                },
+            };
+            if mode == "closed" {
+                fixture.sink.close_publications_for_test();
+            }
+            let result = fixture.sink.acknowledge_result_for_test(&message);
+            if matches!(
+                mode,
+                "unconfirmed" | "missing-data" | "wrong-scope" | "malformed-scope"
+            ) {
+                assert_eq!(result, Err(ProtocolError::StaleScope), "{mode}");
+            } else {
+                result.unwrap();
+            }
+            if matches!(mode, "activate" | "null") {
+                assert!(
+                    matches!(fixture._notices.try_recv().unwrap(), ServerMessage::Event { event, .. } if event == "reopen-test")
+                );
+                assert!(!staged.is_publication_pending().unwrap());
+            } else {
+                assert!(
+                    fixture._notices.try_recv().is_err(),
+                    "{mode} released an event"
+                );
+                assert!(staged
+                    .emit("late".into(), json!({"identityScope":"same-scope"}), None)
+                    .is_err());
+            }
+            if let ServerMessage::Result { data: observed, .. } = message {
+                assert_eq!(observed, (mode != "missing-data").then_some(data));
+            }
+            drop(context);
+            drop(exclusive);
+            fixture.close().await;
+        }
     }
 
     #[tokio::test]
@@ -1348,6 +1570,10 @@ mod tests {
             ));
             let context = context(&fixture, &permit);
             let page = replace_pages(&context).await.unwrap();
+            assert!(
+                page.reopened_result.is_none(),
+                "ordinary restart cannot mint a reopen result proof"
+            );
             page.validate(&context).unwrap();
             page.publish_ready(&context, || Ok(())).await.unwrap();
             assert_eq!(page.target_id, "replacement");
