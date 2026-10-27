@@ -2,6 +2,18 @@
 // The parser has validated engines, positions and capture placement before CDP.
 const invalidSelector = {};
 const selectorIndex = new Map(elements.map((element, index) => [element, index]));
+// Playwright 1.64.1 attribute engines build `[<attribute>=${JSON.stringify(body)}]`
+// and query it with browser CSS. The authored body is data, never a selector.
+const attributeEngines = new Set([
+  'id', 'id:light',
+  'data-testid', 'data-testid:light',
+  'data-test-id', 'data-test-id:light',
+  'data-test', 'data-test:light',
+]);
+function attributeSelector(part) {
+  const attribute = part.engine.endsWith(':light') ? part.engine.slice(0, -6) : part.engine;
+  return `[${attribute}=${JSON.stringify(part.body)}]`;
+}
 function selectChain(parts, scope, root) {
   const allowed = new Set(scope);
   let roots = [root];
@@ -29,17 +41,22 @@ function selectChain(parts, scope, root) {
           if (element.nodeType === 1) found.add(element);
         }
       } else {
+        // Anything the parser did not classify is never reinterpreted as CSS.
+        if (part.engine !== 'css' && part.engine !== 'css:light' && !attributeEngines.has(part.engine)) throw invalidSelector;
+        const attribute = attributeEngines.has(part.engine);
+        const css = attribute ? attributeSelector(part) : part.body;
+        const pierce = attribute ? !part.engine.endsWith(':light') : part.engine !== 'css:light';
         const pending = [[current, 0]];
         while (pending.length) {
           const [searchRoot, depth] = pending.pop();
           matcherStep();
           if (depth > 256) throw matcherLimit;
           let matches;
-          try { matches = searchRoot.querySelectorAll(part.body); } catch { throw invalidSelector; }
+          try { matches = searchRoot.querySelectorAll(css); } catch { throw invalidSelector; }
           for (const element of matches) { matcherStep(); found.add(element); }
           // querySelectorAll cannot return its root for :scope alone.
-          if (part.body.trim() === ':scope' && searchRoot.nodeType === 1) found.add(searchRoot);
-          if (part.engine === 'css:light') continue;
+          if (!attribute && part.body.trim() === ':scope' && searchRoot.nodeType === 1) found.add(searchRoot);
+          if (!pierce) continue;
           const shadows = [];
           if (searchRoot.shadowRoot) shadows.push(searchRoot.shadowRoot);
           for (const element of searchRoot.querySelectorAll('*')) {

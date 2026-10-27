@@ -81,3 +81,51 @@ fn nested_selector_leaves_compile_without_changing_semantic_queries() {
     );
     assert_eq!(serde_json::to_value(expression).unwrap(), original);
 }
+
+#[test]
+fn attribute_engines_compile_inside_the_existing_chain() {
+    let source = r#"main >> data-testid=row >> nth=-1 >> *data-test-id:light=cell"#;
+    let expression = LocatorExpression::Selector {
+        selector: source.into(),
+    };
+    assert_eq!(validate_expression(&expression, 0), Ok(false));
+    let compiled = compile_selector_expression(&expression).unwrap();
+    assert_eq!(compiled["selector"], source);
+    assert_eq!(
+        compiled["nativeParts"],
+        json!([
+            {"engine":"css","body":"main"},
+            {"engine":"data-testid","body":"row"},
+            {"engine":"nth","body":"-1"},
+            {"engine":"data-test-id:light","body":"cell"},
+        ])
+    );
+    for selector in [
+        "id=row",
+        "id:light=row",
+        "data-testid=",
+        r#"data-testid="a\"b""#,
+        r#"data-test="a >> b""#,
+        "data-test-id=日本",
+    ] {
+        let expression = LocatorExpression::Selector {
+            selector: selector.into(),
+        };
+        assert_eq!(validate_expression(&expression, 0), Ok(false), "{selector}");
+        assert!(
+            compile_selector_expression(&expression).is_ok(),
+            "{selector}"
+        );
+    }
+    for selector in [
+        "role=button",
+        "data-k=row",
+        "div >>",
+        "*data-testid=row >> css=div >> nth=0",
+    ] {
+        let expression = LocatorExpression::Selector {
+            selector: selector.into(),
+        };
+        assert!(validate_expression(&expression, 0).is_err(), "{selector}");
+    }
+}

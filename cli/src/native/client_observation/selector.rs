@@ -58,18 +58,15 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             // fractional, non-finite and out-of-range inputs. The renderer
             // owns that coercion; Rust must not invent a different index rule.
             "nth" => {}
+            // Playwright 1.64.1 attributes engines read one exact attribute
+            // value and differ only in whether they pierce open shadow roots.
+            // The body stays authored source: no unquoting or unescaping.
+            "id" | "id:light" | "data-testid" | "data-testid:light" | "data-test-id"
+            | "data-test-id:light" | "data-test" | "data-test:light" => {}
             // These Playwright engines are not CSS. Never pass their source
             // to Element.matches or silently reinterpret their semantics.
             "text"
             | "text:light"
-            | "id"
-            | "id:light"
-            | "data-testid"
-            | "data-testid:light"
-            | "data-test-id"
-            | "data-test-id:light"
-            | "data-test"
-            | "data-test:light"
             | "role"
             | "_react"
             | "_vue"
@@ -157,7 +154,16 @@ fn append<'a>(
         }
         engine = name;
     }
-    if body.trim_matches(js_whitespace).is_empty() && engine != "nth" {
+    // Playwright's attribute engines accept an empty body, which matches an
+    // empty attribute value. Every other engine rejects one.
+    let attribute_engine = engine.strip_suffix(":light").unwrap_or(engine);
+    if body.trim_matches(js_whitespace).is_empty()
+        && engine != "nth"
+        && !matches!(
+            attribute_engine,
+            "id" | "data-testid" | "data-test-id" | "data-test"
+        )
+    {
         return Err(ParseError::Invalid);
     }
     parts.push(Part { engine, body });
@@ -281,6 +287,77 @@ mod tests {
         );
         assert_eq!(parse("role=button"), Err(ParseError::Unsupported));
         assert_eq!(parse("not-an-engine=button"), Err(ParseError::Invalid));
+    }
+
+    #[test]
+    fn attribute_engines_keep_authored_bodies_literal() {
+        for selector in [
+            "id=row",
+            "id:light=row",
+            "data-testid=row",
+            "data-testid:light=row",
+            "data-test-id=row",
+            "data-test-id:light=row",
+            "data-test=row",
+            "data-test:light=row",
+        ] {
+            let parts = parse(selector).unwrap();
+            assert_eq!(parts.len(), 1, "{selector}");
+            assert_eq!(parts[0].engine, selector.split('=').next().unwrap());
+            assert_eq!(parts[0].body, "row");
+        }
+        for (body, expected_engine) in [
+            (r#""a\"b""#, "data-testid"),
+            (r#"a\\b"#, "data-testid"),
+            (r#"x[y"#, "data-test-id"),
+            ("日本", "data-test"),
+            (r#""a >> b""#, "data-test:light"),
+        ] {
+            let selector = format!("{expected_engine}={body}");
+            assert_eq!(parse(&selector).unwrap()[0].body, body, "{selector}");
+        }
+    }
+
+    #[test]
+    fn attribute_engines_accept_empty_bodies_but_other_engines_do_not() {
+        for engine in [
+            "id",
+            "id:light",
+            "data-testid",
+            "data-testid:light",
+            "data-test-id",
+            "data-test-id:light",
+            "data-test",
+            "data-test:light",
+        ] {
+            let selector = format!("{engine}=");
+            assert_eq!(parse(&selector).unwrap()[0].body, "", "{selector}");
+        }
+        for selector in ["css=", "css:light=", "xpath=", "text="] {
+            assert_eq!(parse(selector), Err(ParseError::Invalid), "{selector}");
+        }
+    }
+
+    #[test]
+    fn attribute_engines_still_reject_capture_inputs_and_foreign_engines() {
+        // Capture placement is independent of the engine, so the existing
+        // final-only rule keeps applying to attribute parts.
+        assert!(parse("*data-testid=row").is_ok());
+        assert!(parse("css=div >> *data-testid:light=row").is_ok());
+        assert_eq!(
+            parse("*data-testid=row >> css=div"),
+            Err(ParseError::Invalid)
+        );
+        assert_eq!(
+            parse("data-testid=row >> *css=div >> nth=0"),
+            Err(ParseError::Invalid)
+        );
+        assert_eq!(
+            parse("data-testid=row >> css=div >> *nth=0 >> css=div"),
+            Err(ParseError::Invalid)
+        );
+        assert_eq!(parse("role=button"), Err(ParseError::Unsupported));
+        assert_eq!(parse("data-k=row"), Err(ParseError::Invalid));
     }
 
     #[test]
