@@ -35,6 +35,7 @@ pub struct OwnedTarget {
 struct AttachmentTenure {
     lineage: AttachmentLineage,
     query_revision: AtomicU64,
+    query_attribution_invalid: AtomicBool,
     owner: Arc<()>,
     retained_initialization: AtomicBool,
     observed_media_detach: AtomicBool,
@@ -85,7 +86,7 @@ impl RetainedInitialization {
         session: String,
         kind: String,
         root: Option<OwnedTarget>,
-        rootless_auxiliary: bool,
+        verified_self_root: bool,
     ) -> Result<bool, ProtocolError> {
         if self.target.is_some() || !Arc::ptr_eq(&self.registry, registry) {
             return Err(ProtocolError::StaleScope);
@@ -98,7 +99,7 @@ impl RetainedInitialization {
             true,
             root.as_ref(),
             true,
-            rootless_auxiliary,
+            verified_self_root,
         )?;
         if let Some(target) = &attached {
             // The registry marked the exact fresh tenure under its insertion
@@ -1305,7 +1306,7 @@ impl ClientTargets {
         session: String,
         kind: String,
         root: Option<&OwnedTarget>,
-        rootless_auxiliary: bool,
+        verified_self_root: bool,
     ) -> Result<bool, ProtocolError> {
         self.attach_inner(
             context,
@@ -1315,7 +1316,7 @@ impl ClientTargets {
             false,
             root,
             true,
-            rootless_auxiliary,
+            verified_self_root,
         )
         .map(|target| target.is_some())
     }
@@ -1328,7 +1329,7 @@ impl ClientTargets {
         retained: bool,
         root: Option<&OwnedTarget>,
         enrolled: bool,
-        rootless_auxiliary: bool,
+        verified_self_root: bool,
     ) -> Result<Option<OwnedTarget>, ProtocolError> {
         if context_id != self.context_id {
             return Ok(None);
@@ -1367,7 +1368,7 @@ impl ClientTargets {
                 }
             }
             let lineage = if enrolled {
-                AttachmentLineage::enrolled(&kind, root, rootless_auxiliary)?
+                AttachmentLineage::enrolled(&kind, root, verified_self_root)?
             } else {
                 AttachmentLineage::Unknown
             };
@@ -1913,6 +1914,50 @@ impl ClientTargets {
             }
             Ok(())
         })
+    }
+    pub(super) fn mark_query_attribution_invalid(&self, target: &str, session: &str) {
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        if let Some(current) = state
+            .targets
+            .get(target)
+            .filter(|value| value.session_id == session)
+        {
+            current
+                .tenure
+                .query_attribution_invalid
+                .store(true, Ordering::Release);
+        }
+    }
+    pub(super) fn observe_query_target_info(
+        &self,
+        target: &str,
+        session: &str,
+        kind: Option<&str>,
+        parentless: bool,
+    ) {
+        let Ok(state) = self.state.lock() else {
+            return;
+        };
+        let Some(current) = state
+            .targets
+            .get(target)
+            .filter(|value| value.session_id == session)
+        else {
+            return;
+        };
+        if kind != Some(current.kind.as_str())
+            || (matches!(
+                &current.tenure.lineage,
+                AttachmentLineage::UnpartitionedDependency
+            ) && !parentless)
+        {
+            current
+                .tenure
+                .query_attribution_invalid
+                .store(true, Ordering::Release);
+        }
     }
     pub fn inventory(&self) -> Result<(u64, Vec<OwnedTarget>), ProtocolError> {
         self.inventory_with_diagnostic(false)

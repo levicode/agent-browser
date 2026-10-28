@@ -255,6 +255,11 @@ struct FrameOwner {
     session: String,
     parent: Option<String>,
 }
+struct PendingQueryAttribution {
+    target: String,
+    kind: String,
+    invalid: bool,
+}
 #[derive(Default)]
 struct Index {
     realm_serial: u64,
@@ -275,6 +280,9 @@ struct Index {
     application_epoch: u64,
     applied_watermark: u64,
     pending_enrollment: HashMap<String, Option<QueuedIframe>>,
+    // Bounded by the same pending-enrollment MAX_TASKS admission. Never a
+    // target ownership grant; retains metadata invalidation before registration.
+    pending_query_attribution: HashMap<String, PendingQueryAttribution>,
     reconciled: bool,
     popup_opened: HashSet<String>,
     retiring_pages: HashMap<String, String>,
@@ -775,6 +783,8 @@ struct CaptureSnapshot {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CaptureTestPoint {
     RestartWaiting,
+    RestartPageResumeWaiting,
+    BeforeInitializationResumeRelease,
     AfterInitialDrain,
     BeforeInfo,
     AfterInfoAck,
@@ -1649,6 +1659,21 @@ impl ClientEnrollment {
             index.retired_page_sessions.insert(session.clone());
         }
         let candidate = self.queued_iframe_candidate(&index, event, &session)?;
+        let info = &event.params["targetInfo"];
+        if let (Some(target), Some(kind)) = (info["targetId"].as_str(), info["type"].as_str()) {
+            // Preserve existing deferred malformed-event errors, but never
+            // retain unbounded raw metadata or mint opaque proof without it.
+            if valid_id(target).is_ok() && valid_id(kind).is_ok() {
+                index.pending_query_attribution.insert(
+                    session.clone(),
+                    PendingQueryAttribution {
+                        target: target.to_owned(),
+                        kind: kind.to_owned(),
+                        invalid: false,
+                    },
+                );
+            }
+        }
         index.pending_enrollment.insert(session.clone(), candidate);
         Ok(Some(session))
     }
@@ -2729,38 +2754,67 @@ impl ClientEnrollment {
         session: &str,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
+        let mut original: Option<OwnedTarget> = None;
         loop {
             let changed = self.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
+            // ResumePermit::drop clears resume_pending and notifies the
+            // registry, not the enrollment index. Arm both before inspection.
+            let targets_changed = self.targets.changed();
+            tokio::pin!(targets_changed);
+            targets_changed.as_mut().enable();
             self.check_restart_operation(op)?;
-            let entry = self
-                .index
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?
-                .sessions
-                .get(session)
-                .cloned()
-                .ok_or(ProtocolError::StaleReference)?;
-            if entry.target != target || entry.kind != "page" || entry.root != session {
-                return Err(ProtocolError::StaleReference);
-            }
-            if entry.resumed
-                && (entry.application
-                    || (entry.observation_only
-                        && self
-                            .index
-                            .lock()
-                            .map_err(|_| ProtocolError::ScopeUnavailable)?
-                            .retiring_pages
-                            .get(target)
-                            .map(String::as_str)
-                            == Some(session)))
-            {
+            let ready = {
+                let index = self
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                let entry = index
+                    .sessions
+                    .get(session)
+                    .ok_or(ProtocolError::StaleReference)?;
+                if entry.target != target || entry.kind != "page" || entry.root != session {
+                    return Err(ProtocolError::StaleReference);
+                }
+                if !entry.observation_only {
+                    let current = self.targets.initializing_root_ticket(target, session)?;
+                    if current.session_id != session
+                        || current.kind != "page"
+                        || original
+                            .as_ref()
+                            .is_some_and(|ticket| !ticket.same_initialization_attachment(&current))
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    if original.is_none() {
+                        original = Some(current.clone());
+                    }
+                    // Index resumed is published before the retained resume
+                    // permit drops. Never capture that still-pending snapshot.
+                    entry.application && entry.resumed && current.capture_ready()
+                } else {
+                    // Borrowed observer retirement has no owned-target ticket.
+                    // Preserve its existing exact-root retirement admission.
+                    entry.resumed
+                        && entry.observation_only
+                        && index.retiring_pages.get(target).map(String::as_str) == Some(session)
+                }
+            };
+            if ready {
                 return Ok(());
             }
+            #[cfg(test)]
+            if let Some(waiting) = self
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .remove(&CaptureTestPoint::RestartPageResumeWaiting)
+            {
+                waiting.entered.add_permits(1);
+            }
             bounded(op, async {
-                changed.await;
+                tokio::select! { _ = changed => {}, _ = targets_changed => {} }
                 Ok(())
             })
             .await?;
@@ -3605,7 +3659,7 @@ impl ClientEnrollment {
         kind: &str,
         parent: Option<&str>,
     ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
-        self.register_with_custody(context, target, session, kind, parent, None)
+        self.register_with_custody(context, target, session, kind, parent, None, false)
     }
     fn register_with_custody(
         &self,
@@ -3615,6 +3669,7 @@ impl ClientEnrollment {
         kind: &str,
         parent: Option<&str>,
         custody: Option<&mut super::client_targets::RetainedInitialization>,
+        opaque_parentless: bool,
     ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
         if context != self.targets.context_id {
             return Ok(None);
@@ -3709,8 +3764,17 @@ impl ClientEnrollment {
         } else {
             None
         };
-        let rootless_auxiliary =
-            parent.is_none() && root == session && matches!(kind, "browser" | "tab" | "browser_ui");
+        let pending_query = index
+            .pending_query_attribution
+            .get(session)
+            .filter(|pending| pending.target == target && pending.kind == kind);
+        let pending_query_invalid = pending_query.is_some_and(|pending| pending.invalid);
+        let opaque_pending_verified = pending_query.is_some_and(|pending| !pending.invalid)
+            && index.pending_enrollment.contains_key(session);
+        let verified_self_root = parent.is_none()
+            && root == session
+            && (matches!(kind, "browser" | "tab" | "browser_ui")
+                || (kind == "other" && opaque_parentless && opaque_pending_verified));
         if let Some(custody) = custody {
             custody.attach_with_ancestry(
                 &self.targets,
@@ -3719,7 +3783,7 @@ impl ClientEnrollment {
                 session.into(),
                 kind.into(),
                 root_ticket,
-                rootless_auxiliary,
+                verified_self_root,
             )?;
         } else {
             self.targets.attached_enrolled_with_ancestry(
@@ -3728,8 +3792,13 @@ impl ClientEnrollment {
                 session.into(),
                 kind.into(),
                 root_ticket.as_ref(),
-                rootless_auxiliary,
+                verified_self_root,
             )?;
+        }
+        if pending_query_invalid {
+            // Index is still held: no query can observe this insertion before
+            // the exact new tenure receives its retained invalidation history.
+            self.targets.mark_query_attribution_invalid(target, session);
         }
         let entry = Attribution {
             target: target.into(),
@@ -3890,7 +3959,15 @@ impl ClientEnrollment {
             .await;
         let error = match result {
             Ok(InitializationOutcome::Initialized) => {
-                return Ok(InitializationOutcome::Initialized)
+                #[cfg(test)]
+                if entry.kind == "page" {
+                    self.pause_initialization_at(
+                        CaptureTestPoint::BeforeInitializationResumeRelease,
+                        op,
+                    )
+                    .await?;
+                }
+                return Ok(InitializationOutcome::Initialized);
             }
             Ok(
                 InitializationOutcome::DetachedChild
@@ -5140,7 +5217,11 @@ impl ClientEnrollment {
                             // independently seals on panic or task abandonment.
                             drop(custody);
                             if let Some(session)=pending {
-                                owner.index.lock().map_err(|_|ProtocolError::ScopeUnavailable)?.pending_enrollment.remove(&session);
+                                {
+                                    let mut index=owner.index.lock().map_err(|_|ProtocolError::ScopeUnavailable)?;
+                                    index.pending_enrollment.remove(&session);
+                                    index.pending_query_attribution.remove(&session);
+                                }
                                 owner.changed.notify_waiters();
                             }
                             drop(event); result
@@ -6289,6 +6370,7 @@ impl ClientEnrollment {
                     kind,
                     event.session_id.as_deref(),
                     custody,
+                    info.get("parentId").is_none() && info.get("parentFrameId").is_none(),
                 )
             },
         )? {
@@ -6827,20 +6909,50 @@ impl ClientEnrollment {
                 .get("targetInfo")
                 .ok_or(ProtocolError::InvalidFrame)?;
             let target = field(info, "targetId")?;
-            let entry = self
-                .index
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?
-                .sessions
-                .values()
-                .find(|entry| entry.target == target)
-                .cloned();
-            if entry.is_some_and(|entry| entry.application) {
-                self.bump_application_epoch()?;
-                self.targets.invalidate_inventory_for(
-                    super::client_settlement_trace::InventoryRevisionEvent::Info,
+            let entry = {
+                let mut index = self
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                // The attached task may not have registered yet. Preserve this
+                // applied event against its exact pending target/session instead
+                // of allowing the original attach metadata to erase history.
+                for pending in index
+                    .pending_query_attribution
+                    .values_mut()
+                    .filter(|pending| pending.target == target)
+                {
+                    if info.get("type").and_then(Value::as_str) != Some(pending.kind.as_str())
+                        || (pending.kind == "other"
+                            && (info.get("parentId").is_some()
+                                || info.get("parentFrameId").is_some()))
+                    {
+                        pending.invalid = true;
+                    }
+                }
+                index
+                    .sessions
+                    .values()
+                    .find(|entry| entry.target == target)
+                    .cloned()
+            };
+            if let Some(entry) = entry {
+                // TargetInfo.type is required; absent/malformed or changed type
+                // cannot silently reclassify this immutable query tenure. This
+                // query-only mark neither edits the kind nor poisons the owner.
+                self.targets.observe_query_target_info(
                     target,
-                )?;
+                    &entry.session,
+                    info.get("type").and_then(Value::as_str),
+                    info.get("parentId").is_none() && info.get("parentFrameId").is_none(),
+                );
+                if entry.application {
+                    self.bump_application_epoch()?;
+                    self.targets.invalidate_inventory_for(
+                        super::client_settlement_trace::InventoryRevisionEvent::Info,
+                        target,
+                    )?;
+                }
             }
             return Ok(());
         }
@@ -7767,6 +7879,144 @@ mod tests {
             ),
             "actual gate failure borrowed later owner retirement: {failure:?}"
         );
+    }
+
+    async fn restart_waits_for_resume_release_case(mode: &str) {
+        let (owner, _notices, log, emit, server, _broker, connection) =
+            fixture_with_explicit_context_ownership("owner-retirement", true, true).await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        let release = CaptureTestGate::new();
+        owner.capture_test_gates.lock().unwrap().insert(
+            CaptureTestPoint::BeforeInitializationResumeRelease,
+            release.clone(),
+        );
+        emit.send(json!({"method":"Target.attachedToTarget","params":{
+            "sessionId":"popup-session","waitingForDebugger":true,"targetInfo":{
+                "targetId":"popup-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
+        release.wait_entered().await;
+        assert!(owner.index.lock().unwrap().sessions["popup-session"].resumed);
+        let pending = owner.targets.owned_target("popup-target").unwrap();
+        assert!(pending.configured && pending.resumed);
+        assert!(
+            !pending.capture_ready(),
+            "retained resume permit must still own publication"
+        );
+        let waiting = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::RestartPageResumeWaiting, waiting.clone());
+        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: owner.generation,
+            sequence: 17,
+            deadline: Instant::now() + Duration::from_secs(if mode == "deadline" { 1 } else { 5 }),
+            cancellation,
+        };
+        let task_owner = owner.clone();
+        let mut waiter = tokio::spawn(async move {
+            task_owner
+                .wait_restart_page_ready("popup-target", "popup-session", &operation)
+                .await
+        });
+        let early = tokio::select! {
+            result = &mut waiter => Some(result.unwrap()),
+            _ = waiting.wait_entered() => None,
+        };
+        let mut unrelated = None;
+        if early.is_none() && mode == "success" {
+            let gate = CaptureTestGate::new();
+            owner.capture_test_gates.lock().unwrap().insert(
+                CaptureTestPoint::BeforeInitializationResumeRelease,
+                gate.clone(),
+            );
+            emit.send(json!({"method":"Target.attachedToTarget","params":{
+                "sessionId":"unrelated-session","waitingForDebugger":true,"targetInfo":{
+                    "targetId":"unrelated-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
+            gate.wait_entered().await;
+            unrelated = Some(gate);
+        }
+        if mode == "cancel" {
+            cancel.send_replace(CancelSignal::Requested);
+        }
+        if mode == "success" || early.is_some() {
+            release.release.add_permits(1);
+        }
+        let was_early = early.is_some();
+        let result = match early {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(3), waiter)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        if mode != "success" && !was_early {
+            release.release.add_permits(1);
+        }
+        if let Some(unrelated) = unrelated {
+            assert!(
+                !owner
+                    .targets
+                    .owned_target("unrelated-target")
+                    .unwrap()
+                    .capture_ready(),
+                "selected readiness must not wait for unrelated initializer"
+            );
+            unrelated.release.add_permits(1);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !owner.index.lock().unwrap().pending_enrollment.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ready = owner.targets.owned_target("popup-target").unwrap();
+        let resumes = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request["sessionId"] == "popup-session"
+                    && request["method"] == "Runtime.runIfWaitingForDebugger"
+            })
+            .count();
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            !was_early,
+            "readiness returned before exact ResumePermit release: {result:?}"
+        );
+        assert_eq!(
+            result,
+            match mode {
+                "cancel" => Err(ProtocolError::Cancelled),
+                "deadline" => Err(ProtocolError::DeadlineExceeded),
+                _ => Ok(()),
+            }
+        );
+        assert!(ready.capture_ready());
+        assert_eq!(resumes, 1, "readiness wait must not replay resume");
+    }
+    #[tokio::test]
+    async fn restart_page_ready_waits_exact_resume_release_not_unrelated_initializers() {
+        restart_waits_for_resume_release_case("success").await;
+    }
+    #[tokio::test]
+    async fn restart_page_ready_resume_release_wait_honors_independent_cancel() {
+        restart_waits_for_resume_release_case("cancel").await;
+    }
+    #[tokio::test]
+    async fn restart_page_ready_resume_release_wait_keeps_original_deadline() {
+        restart_waits_for_resume_release_case("deadline").await;
     }
 
     #[tokio::test]

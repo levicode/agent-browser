@@ -62,7 +62,10 @@ fn selected_entry(index: &Index, target: &OwnedTarget, root: &str) -> Result<boo
     {
         return Err(ProtocolError::StaleScope);
     }
-    if matches!(entry.kind.as_str(), "browser" | "tab" | "browser_ui") {
+    if matches!(
+        entry.kind.as_str(),
+        "browser" | "tab" | "browser_ui" | "other"
+    ) {
         return if entry.root == entry.session
             && entry.parent.is_none()
             && entry.application
@@ -808,8 +811,9 @@ mod retained_peer_tests {
                 .publish_initialization(|| Ok(()))
                 .unwrap();
             // Actual framed auto-attachment and initialization of the auxiliary
-            // kinds present in ordinary Chromium. They are not page renderers.
-            for kind in ["browser_ui", "tab", "browser"] {
+            // kinds present in ordinary Chromium. Opaque other is a mandatory
+            // dependency, never asserted to be non-rendering or disjoint.
+            for kind in ["browser_ui", "tab", "browser", "other"] {
                 let session = format!("aux-{kind}-session");
                 let target = format!("aux-{kind}-target");
                 emit.send(json!({"method":"Target.attachedToTarget","params":{
@@ -1009,6 +1013,9 @@ mod retained_peer_tests {
                         .is_some_and(|d| d.starts_with("function(expression"))));
             assert!(commands.iter().any(|r| r["method"] == "DOM.getBoxModel"));
             assert!(commands.iter().all(|r| r["sessionId"] != "popup-session"));
+            assert!(commands
+                .iter()
+                .all(|r| r["sessionId"] != "aux-other-session"));
             assert!(!owner.index.lock().unwrap().pending_enrollment.is_empty());
             drop(journal);
             assert!(owner.targets.inventory().is_err());
@@ -1330,5 +1337,294 @@ mod query_world_event_counterexample {
         assert_eq!(recovered, Ok(()));
         assert!(healthy);
         assert_eq!(op.deadline, deadline);
+    }
+}
+
+#[cfg(test)]
+mod opaque_dependency_event_tests {
+    use super::*;
+    async fn apply(
+        owner: &Arc<ClientEnrollment>,
+        emit: &tokio::sync::mpsc::Sender<Value>,
+        value: Value,
+    ) {
+        let watermark = owner.realm_watermark().unwrap();
+        let before = watermark.received().unwrap();
+        emit.send(value).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let received = watermark.received().unwrap();
+                let done = {
+                    let index = owner.index.lock().unwrap();
+                    received > before
+                        && index.applied_watermark >= received
+                        && index.pending_enrollment.is_empty()
+                };
+                if done {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    fn attached(parent: Option<(&str, Value)>) -> Value {
+        let mut info =
+            json!({"targetId":"opaque-target","type":"other","browserContextId":"owned-context"});
+        if let Some((key, value)) = parent {
+            info[key] = value;
+        }
+        json!({"method":"Target.attachedToTarget","params":{"sessionId":"opaque-session","waitingForDebugger":true,"targetInfo":info}})
+    }
+    #[tokio::test]
+    async fn query_other_pending_metadata_history_survives_registration() {
+        for change in [
+            "untouched",
+            "same",
+            "unrelated",
+            "different",
+            "missing",
+            "malformed",
+            "parent",
+            "parent-frame",
+            "null-parent",
+            "restored",
+        ] {
+            let (owner, _notices, _log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-query",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            owner
+                .client
+                .debt_ledger()
+                .unwrap()
+                .publish_initialization(|| Ok(()))
+                .unwrap();
+            let gate = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeAttachedProcessing, gate.clone());
+            emit.send(attached(None)).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+                .await
+                .unwrap();
+            {
+                let index = owner.index.lock().unwrap();
+                assert!(index.pending_enrollment.contains_key("opaque-session"));
+                assert!(index
+                    .pending_query_attribution
+                    .contains_key("opaque-session"));
+                assert!(!index.sessions.contains_key("opaque-session"));
+            }
+            assert!(owner.targets.owned_target("opaque-target").is_err());
+            if change != "untouched" {
+                let mut info = json!({"targetId":"opaque-target","type":"other","browserContextId":"owned-context"});
+                match change {
+                    "unrelated" => info["targetId"] = json!("unrelated-target"),
+                    "different" | "restored" => info["type"] = json!("page"),
+                    "missing" => {
+                        info.as_object_mut().unwrap().remove("type");
+                    }
+                    "malformed" => info["type"] = json!(7),
+                    "parent" => info["parentId"] = json!("initial-target"),
+                    "parent-frame" => info["parentFrameId"] = json!("frame-initial"),
+                    "null-parent" => info["parentId"] = Value::Null,
+                    _ => {}
+                }
+                apply_while_registration_held(&owner, &emit, info).await;
+                if change == "restored" {
+                    apply_while_registration_held(&owner, &emit, json!({"targetId":"opaque-target","type":"other","browserContextId":"owned-context"})).await;
+                }
+            }
+            let permitted = matches!(change, "untouched" | "same" | "unrelated");
+            assert_eq!(
+                owner.index.lock().unwrap().pending_query_attribution["opaque-session"].invalid,
+                !permitted,
+                "{change}"
+            );
+            gate.release();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !owner.index.lock().unwrap().pending_enrollment.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(owner
+                .index
+                .lock()
+                .unwrap()
+                .pending_query_attribution
+                .is_empty());
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&initial).unwrap();
+            let authority = owner
+                .page_query_authority(
+                    &page,
+                    &owner.targets.owned_target("initial-target").unwrap(),
+                )
+                .unwrap();
+            let mut op = owner.operation();
+            op.sequence = 2;
+            assert_eq!(authority.acquire(&page, &op).is_ok(), permitted, "{change}");
+            assert!(owner.targets.inventory().is_ok(), "{change}");
+            assert!(owner.index.lock().unwrap().failure.is_none(), "{change}");
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+        }
+    }
+    async fn apply_while_registration_held(
+        owner: &Arc<ClientEnrollment>,
+        emit: &tokio::sync::mpsc::Sender<Value>,
+        info: Value,
+    ) {
+        let watermark = owner.realm_watermark().unwrap();
+        let before = watermark.received().unwrap();
+        emit.send(json!({"method":"Target.targetInfoChanged","params":{"targetInfo":info}}))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let received = watermark.received().unwrap();
+                if received > before && owner.index.lock().unwrap().applied_watermark >= received {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .contains_key("opaque-session"));
+    }
+    #[tokio::test]
+    async fn query_other_changed_or_malformed_type_invalidates_fresh_proof_until_new_tenure() {
+        for change in ["same", "different", "missing", "malformed", "parent"] {
+            let (owner, _notices, _log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-query",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            owner
+                .client
+                .debt_ledger()
+                .unwrap()
+                .publish_initialization(|| Ok(()))
+                .unwrap();
+            apply(&owner, &emit, attached(None)).await;
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&initial).unwrap();
+            let authority = owner
+                .page_query_authority(
+                    &page,
+                    &owner.targets.owned_target("initial-target").unwrap(),
+                )
+                .unwrap();
+            let mut op = owner.operation();
+            op.sequence = 2;
+            let proof = authority.acquire(&page, &op).unwrap();
+            let old = owner.targets.owned_target("opaque-target").unwrap();
+            let mut info = json!({"targetId":"opaque-target","type":"other","browserContextId":"owned-context"});
+            match change {
+                "different" => info["type"] = json!("page"),
+                "missing" => {
+                    info.as_object_mut().unwrap().remove("type");
+                }
+                "malformed" => info["type"] = json!(7),
+                "parent" => info["parentId"] = json!("initial-target"),
+                _ => {}
+            }
+            apply(
+                &owner,
+                &emit,
+                json!({"method":"Target.targetInfoChanged","params":{"targetInfo":info}}),
+            )
+            .await;
+            assert!(proof.check(&page, &op).is_err(), "{change}");
+            assert_eq!(
+                authority.acquire(&page, &op).is_ok(),
+                change == "same",
+                "{change}"
+            );
+            assert!(owner.targets.inventory().is_ok());
+            assert!(owner.index.lock().unwrap().failure.is_none());
+            apply(&owner,&emit,json!({"method":"Target.detachedFromTarget","params":{"sessionId":"opaque-session","targetId":"opaque-target"}})).await;
+            apply(&owner, &emit, attached(None)).await;
+            assert!(!old.same_initialization_attachment(
+                &owner.targets.owned_target("opaque-target").unwrap()
+            ));
+            assert!(authority.acquire(&page, &op).is_ok());
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+        }
+    }
+    #[tokio::test]
+    async fn query_other_parent_targetinfo_cannot_mint_self_root_dependency() {
+        for parent in [
+            ("parentId", json!("initial-target")),
+            ("parentFrameId", json!("frame-initial")),
+            ("parentId", Value::Null),
+        ] {
+            let (owner, _notices, _log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-query",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            owner
+                .client
+                .debt_ledger()
+                .unwrap()
+                .publish_initialization(|| Ok(()))
+                .unwrap();
+            apply(&owner, &emit, attached(Some(parent))).await;
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&initial).unwrap();
+            let authority = owner
+                .page_query_authority(
+                    &page,
+                    &owner.targets.owned_target("initial-target").unwrap(),
+                )
+                .unwrap();
+            assert!(authority.acquire(&page, &owner.operation()).is_err());
+            assert!(owner.targets.inventory().is_ok());
+            assert!(owner.index.lock().unwrap().failure.is_none());
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+        }
     }
 }

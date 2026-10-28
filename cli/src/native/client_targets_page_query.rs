@@ -13,16 +13,20 @@ pub(super) enum AttachmentLineage {
     // Explicitly enrolled rootless browser/tab/UI target. Not an independent
     // worker: it must be ready and remains excluded by every selected barrier.
     ReadyAuxiliary,
+    // Not proven disjoint or non-rendering. Participates in every query proof
+    // with global-style readiness, exact tenure and revision dependencies.
+    UnpartitionedDependency,
 }
 impl AttachmentLineage {
     pub(super) fn enrolled(
         kind: &str,
         root: Option<&OwnedTarget>,
-        rootless_auxiliary: bool,
+        verified_self_root: bool,
     ) -> Result<Self, ProtocolError> {
         match (kind, root) {
             ("page", None) => Ok(Self::PageRoot),
-            ("browser" | "tab" | "browser_ui", None) if rootless_auxiliary => {
+            ("other", None) if verified_self_root => Ok(Self::UnpartitionedDependency),
+            ("browser" | "tab" | "browser_ui", None) if verified_self_root => {
                 Ok(Self::ReadyAuxiliary)
             }
             ("iframe" | "worker" | "shared_worker" | "service_worker", Some(root))
@@ -65,7 +69,9 @@ impl ProtectedExclusion {
             return true;
         }
         match &tenure.lineage {
-            AttachmentLineage::Unknown | AttachmentLineage::ReadyAuxiliary => true,
+            AttachmentLineage::Unknown
+            | AttachmentLineage::ReadyAuxiliary
+            | AttachmentLineage::UnpartitionedDependency => true,
             AttachmentLineage::PageRoot => Arc::ptr_eq(&root.tenure, tenure),
             AttachmentLineage::DocumentRoot(document) => {
                 !Arc::ptr_eq(&root.tenure.owner, &document.tenure.owner)
@@ -95,7 +101,9 @@ impl Registry {
                 };
                 root.tenure.query_revision.store(next, Ordering::Release);
             }
-            AttachmentLineage::Unknown | AttachmentLineage::ReadyAuxiliary => {
+            AttachmentLineage::Unknown
+            | AttachmentLineage::ReadyAuxiliary
+            | AttachmentLineage::UnpartitionedDependency => {
                 let Some(next) = self.query_unknown_revision.checked_add(1) else {
                     self.lose_integrity();
                     return Err(ProtocolError::IdentifierExhausted);
@@ -120,18 +128,28 @@ impl Registry {
                 .targets
                 .get(&root.target_id)
                 .is_some_and(|current| current.same_initialization_attachment(root)),
-            AttachmentLineage::Unknown | AttachmentLineage::ReadyAuxiliary => true,
+            AttachmentLineage::Unknown
+            | AttachmentLineage::ReadyAuxiliary
+            | AttachmentLineage::UnpartitionedDependency => true,
             _ => false,
         }
     }
 }
 impl OwnedTarget {
     pub(crate) fn query_lineage_matches(&self, root: Option<&OwnedTarget>) -> bool {
+        if self
+            .tenure
+            .query_attribution_invalid
+            .load(Ordering::Acquire)
+        {
+            return false;
+        }
         match (&self.tenure.lineage, root) {
             (AttachmentLineage::PageRoot, Some(root)) => self.same_initialization_attachment(root),
             (AttachmentLineage::DocumentRoot(original), Some(root)) => {
                 original.same_initialization_attachment(root)
             }
+            (AttachmentLineage::UnpartitionedDependency, None) => self.kind == "other",
             (AttachmentLineage::ReadyAuxiliary, None) => {
                 matches!(self.kind.as_str(), "browser" | "tab" | "browser_ui")
             }
@@ -148,6 +166,8 @@ impl OwnedTarget {
 pub(crate) struct SelectedPageTargetSnapshot {
     pub(crate) targets: Vec<OwnedTarget>,
     revisions: Vec<u64>,
+    dependencies: Vec<OwnedTarget>,
+    dependency_revisions: Vec<u64>,
     unknown_revision: u64,
 }
 
@@ -274,6 +294,7 @@ impl ClientTargets {
             return Err(refuse(ProtocolError::StaleScope, Reason::SelectedNotReady));
         }
         let mut targets = Vec::new();
+        let mut dependencies = Vec::new();
         let relation = ProtectedExclusion::Selected {
             token: Arc::new(()),
             root: selected.clone(),
@@ -288,8 +309,21 @@ impl ClientTargets {
             if matches!(&target.tenure.lineage, AttachmentLineage::Unknown) {
                 return Err(refuse_target(Reason::UnknownLineage, target));
             }
+            if target
+                .tenure
+                .query_attribution_invalid
+                .load(Ordering::Acquire)
+            {
+                return Err(refuse_target(Reason::AttributionInvalid, target));
+            }
             let relevant = classify(target, &state.targets)
                 .map_err(|error| refuse(error, Reason::AttributionInvalid))?;
+            if matches!(
+                &target.tenure.lineage,
+                AttachmentLineage::ReadyAuxiliary | AttachmentLineage::UnpartitionedDependency
+            ) {
+                dependencies.push(target.clone());
+            }
             // Workers rooted in this document are not frame renderers, but their
             // in-flight resume must still exclude starting a protected query.
             if relation.excludes_tenure(&target.tenure) && !target.capture_ready() {
@@ -319,6 +353,11 @@ impl ClientTargets {
             }
         }
         targets.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        dependencies.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+        let dependency_revisions: Vec<_> = dependencies
+            .iter()
+            .map(|target| target.tenure.query_revision.load(Ordering::Acquire))
+            .collect();
         if !targets
             .iter()
             .any(|target| target.same_attachment(selected))
@@ -330,7 +369,13 @@ impl ClientTargets {
             .map(|target| target.tenure.query_revision.load(Ordering::Acquire))
             .collect();
         if let Some(expected) = expected {
-            if revisions != expected.revisions
+            if dependency_revisions != expected.dependency_revisions
+                || dependencies.len() != expected.dependencies.len()
+                || dependencies
+                    .iter()
+                    .zip(&expected.dependencies)
+                    .any(|(a, b)| !a.same_attachment(b))
+                || revisions != expected.revisions
                 || state.query_unknown_revision != expected.unknown_revision
                 || targets.len() != expected.targets.len()
                 || targets
@@ -344,6 +389,8 @@ impl ClientTargets {
         let snapshot = SelectedPageTargetSnapshot {
             targets,
             revisions,
+            dependencies,
+            dependency_revisions,
             unknown_revision: state.query_unknown_revision,
         };
         // Commit while index, watermark and registry fences are all retained.
@@ -420,6 +467,164 @@ mod tests {
             |target, _| Ok(target.target_id == "main"),
             |snapshot| Ok(snapshot.clone()),
         )
+    }
+    #[tokio::test]
+    async fn query_other_is_ready_exact_dependency_not_excluded_subtree() {
+        let (registry, main) = fixture().await;
+        let mut custody = RetainedInitialization::new(registry.clone());
+        custody
+            .attach_with_ancestry(
+                &registry,
+                "ctx",
+                "opaque".into(),
+                "opaque-session".into(),
+                "other".into(),
+                None,
+                true,
+            )
+            .unwrap();
+        assert!(snapshot(&registry, &main, true).is_err());
+        assert!(registry
+            .operation_settlement_integrity_diagnostic(false)
+            .0
+            .is_ok());
+        registry.configured("opaque").unwrap();
+        registry
+            .resume_permit("opaque")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        custody.finish(false).unwrap();
+        let (proof, guard) = snapshot(&registry, &main, true).unwrap();
+        assert_eq!(proof.targets.len(), 1);
+        assert_eq!(proof.dependencies.len(), 1);
+        assert_eq!(proof.dependencies[0].kind, "other");
+        assert!(registry
+            .state
+            .lock()
+            .unwrap()
+            .live_resume_excluded(&proof.dependencies[0].tenure));
+        assert!(registry
+            .reserve_creation(TargetPurpose::Application)
+            .is_err());
+        drop(guard);
+        registry
+            .invalidate_inventory_for(diagnostic::InventoryRevisionEvent::Info, "opaque")
+            .unwrap();
+        assert!(registry
+            .with_selected_page_targets(
+                &main,
+                Some(&proof),
+                None,
+                false,
+                |t, _| Ok(t.target_id == "main"),
+                |_| Ok(())
+            )
+            .is_err());
+        assert!(snapshot(&registry, &main, false).is_ok());
+    }
+    #[tokio::test]
+    async fn query_other_and_auxiliary_dependency_changes_cannot_restore_old_proof() {
+        for kind in ["other", "browser_ui"] {
+            let (registry, main) = fixture().await;
+            registry
+                .attached_enrolled_with_ancestry(
+                    "ctx",
+                    "dependency".into(),
+                    "dep-session".into(),
+                    kind.into(),
+                    None,
+                    true,
+                )
+                .unwrap();
+            registry.configured("dependency").unwrap();
+            registry
+                .resume_permit("dependency")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            let (proof, _) = snapshot(&registry, &main, false).unwrap();
+            let old = registry.owned_target("dependency").unwrap();
+            registry.detach("dependency").unwrap();
+            registry
+                .attached_enrolled_with_ancestry(
+                    "ctx",
+                    "dependency".into(),
+                    "dep-session".into(),
+                    kind.into(),
+                    None,
+                    true,
+                )
+                .unwrap();
+            registry.configured("dependency").unwrap();
+            registry
+                .resume_permit("dependency")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            assert!(
+                !old.same_initialization_attachment(&registry.owned_target("dependency").unwrap())
+            );
+            assert!(registry
+                .with_selected_page_targets(
+                    &main,
+                    Some(&proof),
+                    None,
+                    false,
+                    |t, _| Ok(t.target_id == "main"),
+                    |_| Ok(())
+                )
+                .is_err());
+            assert!(snapshot(&registry, &main, false).is_ok());
+        }
+    }
+    #[tokio::test]
+    async fn query_other_unverified_or_document_parent_stays_unknown() {
+        for provenance in ["plain", "unverified", "document-parent", "arbitrary-kind"] {
+            let (registry, main) = fixture().await;
+            if provenance == "plain" {
+                registry
+                    .attached(
+                        "ctx",
+                        "opaque".into(),
+                        "opaque-session".into(),
+                        "other".into(),
+                    )
+                    .unwrap();
+            } else {
+                registry
+                    .attached_enrolled_with_ancestry(
+                        "ctx",
+                        "opaque".into(),
+                        "opaque-session".into(),
+                        if provenance == "arbitrary-kind" {
+                            "unknown-future"
+                        } else {
+                            "other"
+                        }
+                        .into(),
+                        if provenance == "document-parent" {
+                            Some(&main)
+                        } else {
+                            None
+                        },
+                        provenance != "unverified",
+                    )
+                    .unwrap();
+            }
+            registry.configured("opaque").unwrap();
+            registry
+                .resume_permit("opaque")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            assert!(snapshot(&registry, &main, false).is_err(), "{provenance}");
+            assert!(registry.inventory().is_ok());
+        }
     }
     #[tokio::test]
     async fn selected_query_known_auxiliary_requires_ready_and_keeps_global_exclusion() {

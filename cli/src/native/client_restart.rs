@@ -259,8 +259,7 @@ impl RestartedPage {
             || target.session_id != self.session_id
             || target.kind != "page"
             || target.purpose != Some(TargetPurpose::Application)
-            || !target.configured
-            || !target.resumed
+            || !target.capture_ready()
         {
             return Err(ProtocolError::StaleScope);
         }
@@ -1561,6 +1560,49 @@ mod tests {
             Err(ProtocolError::CapacityExceeded)
         );
     }
+    #[tokio::test]
+    async fn replacement_validation_rejects_snapshot_with_retained_resume_permit() {
+        // Inert registry-level validation control; no synthetic CDP ACK is
+        // claimed. The enrollment test exercises the real managed-ACK race.
+        let fixture = make_fixture("normal").await;
+        let exclusive = exclusive(&fixture).await;
+        let context = context(&fixture, &exclusive);
+        let registry = context.page.targets.clone();
+        registry
+            .attached(
+                "owned-context",
+                "pending-replacement".into(),
+                "pending-session".into(),
+                "page".into(),
+            )
+            .unwrap();
+        registry.configured("pending-replacement").unwrap();
+        let mut resume = registry.resume_permit("pending-replacement").await.unwrap();
+        resume.complete_retained().unwrap();
+        let mut page = RestartedPage {
+            target_id: "pending-replacement".into(),
+            session_id: "pending-session".into(),
+            closed_targets: vec![],
+            coordinator: fixture.enrollment.clone(),
+            registry: registry.clone(),
+            source_target: context.page.target_id.clone(),
+            source_session: context.page.page_session_id.clone(),
+            generation: context.operation.generation,
+            sequence: context.operation.sequence,
+            attachment: registry.owned_target("pending-replacement").unwrap(),
+            reopened_result: None,
+        };
+        assert_eq!(page.validate(&context), Err(ProtocolError::StaleScope));
+        drop(resume);
+        // Clearing the live permit cannot repair an earlier pending snapshot.
+        assert_eq!(page.validate(&context), Err(ProtocolError::StaleScope));
+        page.attachment = registry.owned_target("pending-replacement").unwrap();
+        page.validate(&context).unwrap();
+        drop(context);
+        drop(exclusive);
+        fixture.close().await;
+    }
+
     #[tokio::test]
     async fn restart_replaces_only_pages_and_keeps_context_worker_and_route_tenure() {
         for mode in [
