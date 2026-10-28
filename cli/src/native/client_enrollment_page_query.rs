@@ -875,6 +875,7 @@ mod tests {
             application: true,
             observation_only: false,
             observer_paused: None,
+            init_paused_by_attachment: false,
             resumed: true,
         }
     }
