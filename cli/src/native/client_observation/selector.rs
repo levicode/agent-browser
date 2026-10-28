@@ -53,11 +53,14 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
     }
     for part in &parts {
         match part.engine {
-            "css" | "css:light" | "xpath" | "xpath:light" => {}
+            "css" | "css:light" | "xpath" | "xpath:light" | "text" | "text:light" => {}
             // Playwright uses JavaScript Number + Array.slice here, including
             // fractional, non-finite and out-of-range inputs. The renderer
             // owns that coercion; Rust must not invent a different index rule.
             "nth" => {}
+            // Nested bodies remain authored JSON for the bounded private renderer compiler.
+            "internal:has" | "internal:has-not" | "internal:and" | "internal:or"
+            | "internal:chain" => {}
             // Playwright 1.64.1 attribute engines read one exact attribute
             // value and differ only in whether they pierce open shadow roots.
             // The body stays authored source: no unquoting or unescaping.
@@ -70,18 +73,11 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             "visible" => {}
             // These Playwright engines are not CSS. Never pass their source
             // to Element.matches or silently reinterpret their semantics.
-            "text"
-            | "text:light"
-            | "role"
+            "role"
             | "_react"
             | "_vue"
-            | "internal:has"
-            | "internal:has-not"
             | "internal:has-text"
             | "internal:has-not-text"
-            | "internal:and"
-            | "internal:or"
-            | "internal:chain"
             | "internal:role"
             | "internal:text"
             | "internal:label"
@@ -301,15 +297,68 @@ mod tests {
     #[test]
     fn unsupported_engines_are_not_misclassified_as_css() {
         assert_eq!(
-            parse("text=Bob's >> css=span"),
-            Err(ParseError::Unsupported)
+            parse("text=Bob's >> css=span").unwrap()[0],
+            Part {
+                engine: "text",
+                body: "Bob's"
+            }
         );
         assert_eq!(
-            parse("text=\"hello >> there\" >> css=span"),
-            Err(ParseError::Unsupported)
+            parse("text=\"hello >> there\" >> css=span").unwrap()[0],
+            Part {
+                engine: "text",
+                body: "\"hello >> there\""
+            }
         );
         assert_eq!(parse("role=button"), Err(ParseError::Unsupported));
         assert_eq!(parse("not-an-engine=button"), Err(ParseError::Invalid));
+    }
+
+    #[test]
+    fn raw_internal_composition_bodies_are_preserved_for_renderer_validation() {
+        for engine in [
+            "internal:has",
+            "internal:has-not",
+            "internal:and",
+            "internal:or",
+            "internal:chain",
+        ] {
+            let source = format!("css=section >> {engine}=\"css=#a\"");
+            let parts = parse(&source).unwrap();
+            assert_eq!(parts[1].engine, engine);
+            assert_eq!(parts[1].body, "\"css=#a\"");
+        }
+        assert_eq!(
+            parse(r#"css=section >> internal:has={"selector":"css=#a"}"#).unwrap()[1].body,
+            r#"{"selector":"css=#a"}"#
+        );
+        assert_eq!(parse("internal:role=button"), Err(ParseError::Unsupported));
+    }
+
+    #[test]
+    fn raw_text_baseline_bodies_remain_authored_data() {
+        for (source, engine, body) in [
+            ("text=alpha beta", "text", "alpha beta"),
+            (r#"text="Alpha Beta""#, "text", r#""Alpha Beta""#),
+            (r#"text=/^Alpha\s+Beta$/"#, "text", r#"/^Alpha\s+Beta$/"#),
+            (r#""Alpha Beta""#, "text", r#""Alpha Beta""#),
+            ("text:light=Gamma", "text:light", "Gamma"),
+        ] {
+            assert_eq!(
+                parse(source).unwrap(),
+                vec![Part { engine, body }],
+                "{source}"
+            );
+        }
+        assert_eq!(
+            parse("css=#text-a >> text=Alpha").unwrap()[1],
+            Part {
+                engine: "text",
+                body: "Alpha"
+            }
+        );
+        assert_eq!(parse("internal:text=Alpha"), Err(ParseError::Unsupported));
+        assert_eq!(parse("role=button"), Err(ParseError::Unsupported));
     }
 
     #[test]
@@ -522,12 +571,9 @@ mod tests {
         assert!(parse("nth >> *css=div").is_ok());
         assert_eq!(parse("nth >> *css=div").unwrap()[0].engine, "css");
         assert_eq!(parse("css=li >> nth >> *css=div").unwrap()[1].engine, "css");
-        // A quoted text part is still unsupported, not an nth capture refusal.
-        assert_eq!(
-            parse("css=li >> \"nth=0\" >> *css=div"),
-            Err(ParseError::Unsupported)
-        );
-        assert_eq!(parse("text=nth >> *css=div"), Err(ParseError::Unsupported));
+        // Quoted text and literal nth text are supported, not an nth capture refusal.
+        assert!(parse(r#"css=li >> "nth=0" >> *css=div"#).is_ok());
+        assert!(parse("text=nth >> *css=div").is_ok());
         // Unsupported and unknown engines keep their existing classification
         // instead of being relabelled by the new capture rule.
         assert_eq!(
@@ -536,7 +582,7 @@ mod tests {
         );
         assert_eq!(
             parse("css=li >> nth=0 >> text=Hello >> *css=div"),
-            Err(ParseError::Unsupported)
+            Err(ParseError::Invalid)
         );
         assert_eq!(
             parse("css=li >> nth=0 >> bogus=1 >> *css=div"),

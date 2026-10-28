@@ -1,4 +1,4 @@
-// CSS/XPath chain execution stays inside the existing isolated query realm.
+// Selector chain execution stays inside the existing isolated query realm.
 // The parser has validated engines, positions and capture placement before CDP.
 const invalidSelector = {};
 const selectorIndex = new Map(elements.map((element, index) => [element, index]));
@@ -55,7 +55,10 @@ function visibleRoot(root, body) {
   if (root.nodeType !== 1) return false;
   return elementVisible(root) === (body === 'true');
 }
-function selectChain(parts, scope, root) {
+function selectChain(parts, scope, root, depth = 0) {
+  parts = compileRawInternalParts(parts, depth);
+  // Complete AST classification before traversal, not fallback after failure.
+  prepareRawCssPrograms(parts);
   const allowed = new Set(scope);
   // A chain can legitimately produce the very root it was given: the visible
   // engine returns the root itself when it matches, and CSS `:scope` already
@@ -70,6 +73,11 @@ function selectChain(parts, scope, root) {
   let roots = [root];
   for (const part of parts) {
     matcherStep();
+    if (rawInternalEngines.has(part.engine)) {
+      roots = evaluateRawInternalPart(part, roots, scope, root, depth);
+      if (roots.length > 100000) throw matcherLimit;
+      continue;
+    }
     if (part.engine === 'nth') {
       const index = Number(part.body);
       const start = index === -1 ? roots.length - 1 : index;
@@ -81,6 +89,27 @@ function selectChain(parts, scope, root) {
     // widens the chain nor pierces again.
     if (part.engine === 'visible') {
       roots = roots.filter(root => { matcherStep(); return visibleRoot(root, part.body); });
+      continue;
+    }
+    if (part.engine === 'text' || part.engine === 'text:light') {
+      const textMatches = new Set();
+      for (const current of roots) {
+        matcherStep();
+        for (const element of selectRawText(current, part.body, part.engine === 'text:light', allowed)) textMatches.add(element);
+      }
+      roots = [...textMatches];
+      if (roots.length > 100000) throw matcherLimit;
+      continue;
+    }
+    const cssProgram = rawCssProgram(part);
+    if (cssProgram && cssProgram.extended) {
+      const matches = new Set();
+      for (const current of roots) {
+        matcherStep();
+        for (const element of selectOwnedRawCss(current, cssProgram, part.engine === 'css:light')) matches.add(element);
+      }
+      roots = [...matches];
+      if (roots.length > 100000) throw matcherLimit;
       continue;
     }
     const found = new Set();

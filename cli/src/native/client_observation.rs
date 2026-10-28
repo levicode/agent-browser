@@ -3178,6 +3178,13 @@ const MATCH_QUERY: &str = concat!(
  }
 "#,
     include_str!("client_observation/selector_query.js"),
+    include_str!("client_observation/selector_text_matcher.js"),
+    include_str!("client_observation/selector_text_query.js"),
+    include_str!("client_observation/selector_internal_query.js"),
+    include_str!("client_observation/selector_css_parser.js"),
+    include_str!("client_observation/selector_css_evaluator.js"),
+    include_str!("client_observation/selector_css_policy.js"),
+    include_str!("client_observation/selector_css_owner.js"),
     include_str!("client_observation/selector_public_check.js"),
     r#"
  function evaluate(x,scope=all,root=document) {
@@ -3208,7 +3215,7 @@ const MATCH_QUERY: &str = concat!(
  try {
   const indices=hasDeprecatedLightSelector(expression)?evaluatePublicLightExpression(expression):evaluate(expression);
   return {indices,redacted};
- } catch(error) { return {error:error===deprecatedLightSelector?"deprecated-selector":error===matcherLimit?"resource-limit":error===invalidSelector?"invalid-locator":"invalid-arguments"}; }
+ } catch(error) { return {error:(error===rawInternalSelectorUnsupported||error===rawCssUnavailable)?"unsupported-capability":(error===rawTextSelectorError||error===rawInternalSelectorError||error===rawCssSelectorError)?"raw-selector-error":error===deprecatedLightSelector?"deprecated-selector":error===matcherLimit?"resource-limit":error===invalidSelector?"invalid-locator":"invalid-arguments"}; }
 }"#
 );
 
@@ -3713,7 +3720,7 @@ async fn evaluate_query(
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
         let value=&result["result"]["value"];
-        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("invalid-locator")=>return Err(ObservationError::InvalidLocator),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some("deprecated-selector")=>return Err(ObservationError::BackendFailure),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
+        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("invalid-locator")=>return Err(ObservationError::InvalidLocator),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some("unsupported-capability")=>return Err(ObservationError::UnsupportedCapability),Some("deprecated-selector")=>return Err(ObservationError::BackendFailure),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
         let indices:Vec<usize>=serde_json::from_value(value["indices"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         let redacted:Vec<usize>=serde_json::from_value(value["redacted"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         (indices,redacted)

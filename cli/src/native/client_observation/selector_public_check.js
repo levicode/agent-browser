@@ -1,9 +1,9 @@
 // Original E2E/Playwright public-query checks are not selector-engine rules.
-// Attribute/XPath :light engines remain usable in unchecked nested projections.
-// This path covers the five supported deprecated engines, never css:light.
+// Attribute/XPath/text :light engines remain usable in unchecked nested projections.
+// This path covers the supported deprecated engines, never css:light.
 const deprecatedLightSelector = {};
 const deprecatedLightEngines = new Set([
-  'id:light', 'data-testid:light', 'data-test-id:light', 'data-test:light', 'xpath:light',
+  'id:light', 'data-testid:light', 'data-test-id:light', 'data-test:light', 'xpath:light', 'text:light',
 ]);
 function hasDeprecatedLightSelector(x) {
   // validate_expression already bounds depth/nodes; do not charge ordinary queries.
