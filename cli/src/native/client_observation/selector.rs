@@ -15,6 +15,7 @@ pub(super) struct Part<'a> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ParseError {
     Invalid,
+    TrailingSyntax,
     Unsupported,
     Limit,
 }
@@ -46,6 +47,17 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
             chars.next();
             start = index + 2;
         }
+    }
+    // Public e557 count-stage observation: a missing final chain part is an
+    // engine syntax failure, not the E2E-specific invalid-capture contract.
+    // Keep capture and other parser refusal classes unchanged.
+    if !parts.is_empty()
+        && parts.len() < 256
+        && capture.is_none()
+        && parts.iter().all(|part| matches!(part.engine, "css" | "css:light"))
+        && selector[start..].trim_matches(js_whitespace).is_empty()
+    {
+        return Err(ParseError::TrailingSyntax);
     }
     append(&selector[start..], &mut parts, &mut capture)?;
     if capture.is_some_and(|index| index + 1 != parts.len()) {
@@ -257,9 +269,27 @@ mod tests {
             assert!(parse(selector).is_ok(), "{selector}");
         }
         assert_eq!(parse("((//div)[2])").unwrap()[0].engine, "xpath");
-        for selector in ["css=", "", " ", "div >>", ">> div", "div >> >> span"] {
+        for selector in ["css=", "", " ", ">> div", "div >> >> span"] {
             assert_eq!(parse(selector), Err(ParseError::Invalid), "{selector}");
         }
+    }
+
+    #[test]
+    fn trailing_chain_syntax_keeps_engine_error_separate_from_capture() {
+        for selector in ["div >>", "css=div >> ", "div >> span >>"] {
+            assert_eq!(parse(selector), Err(ParseError::TrailingSyntax));
+        }
+        for selector in ["*css=ul >> li", "*css=ul >>", ">> div", "div >> >> span", "role=button >>", "text=x >>"] {
+            assert_eq!(parse(selector), Err(ParseError::Invalid));
+        }
+        assert!(parse("css=[data-x='a >>']").is_ok());
+        let chain = |count| std::iter::repeat_n("div", count).collect::<Vec<_>>().join(" >> ");
+        assert_eq!(parse(&(chain(255) + " >>")), Err(ParseError::TrailingSyntax));
+        assert_eq!(parse(&(chain(256) + " >>")), Err(ParseError::Limit));
+        assert_eq!(parse(&(chain(257) + " >>")), Err(ParseError::Limit));
+        assert_eq!(parse(&chain(255)).unwrap().len(), 255);
+        assert_eq!(parse(&chain(256)).unwrap().len(), 256);
+        assert_eq!(parse(&chain(257)), Err(ParseError::Limit));
     }
 
     #[test]

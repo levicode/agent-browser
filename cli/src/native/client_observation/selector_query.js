@@ -1,6 +1,13 @@
 // Selector chain execution stays inside the existing isolated query realm.
 // The parser has validated engines, positions and capture placement before CDP.
 const invalidSelector = {};
+// Native XPath syntax DOMExceptions are engine errors on the original public route.
+const rawXPathSelectorError = {};
+const nativeDOMExceptionName = typeof DOMException === "function" ? Object.getOwnPropertyDescriptor(DOMException.prototype, "name")?.get : undefined;
+function isNativeXPathSyntaxError(error) {
+  if (!nativeDOMExceptionName) return false;
+  try { return Reflect.apply(nativeDOMExceptionName, error, []) === "SyntaxError"; } catch { return false; }
+}
 const selectorIndex = new Map(elements.map((element, index) => [element, index]));
 // Playwright 1.64.1 attribute engines build `[<attribute>=${JSON.stringify(body)}]`
 // and query it with browser CSS. The authored body is data, never a selector.
@@ -122,7 +129,11 @@ function selectChain(parts, scope, root, depth = 0) {
         let matches;
         try {
           matches = document.evaluate(xpath, current, null, XPathResult.ORDERED_NODE_ITERATOR_TYPE, null);
-        } catch { throw invalidSelector; }
+        } catch (error) {
+          if (error === matcherLimit) throw error;
+          if (isNativeXPathSyntaxError(error)) throw rawXPathSelectorError;
+          throw invalidSelector;
+        }
         for (let element = matches.iterateNext(); element; element = matches.iterateNext()) {
           matcherStep();
           if (element.nodeType === 1) found.add(element);

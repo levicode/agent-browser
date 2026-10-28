@@ -3215,7 +3215,7 @@ const MATCH_QUERY: &str = concat!(
  try {
   const indices=hasDeprecatedLightSelector(expression)?evaluatePublicLightExpression(expression):evaluate(expression);
   return {indices,redacted};
- } catch(error) { return {error:(error===rawInternalSelectorUnsupported||error===rawCssUnavailable)?"unsupported-capability":(error===rawTextSelectorError||error===rawInternalSelectorError||error===rawCssSelectorError)?"raw-selector-error":error===deprecatedLightSelector?"deprecated-selector":error===matcherLimit?"resource-limit":error===invalidSelector?"invalid-locator":"invalid-arguments"}; }
+ } catch(error) { return {error:(error===rawInternalSelectorUnsupported||error===rawCssUnavailable)?"unsupported-capability":(error===rawTextSelectorError||error===rawInternalSelectorError||error===rawCssSelectorError||error===rawXPathSelectorError)?"raw-selector-error":error===deprecatedLightSelector?"deprecated-selector":error===matcherLimit?"resource-limit":error===invalidSelector?"invalid-locator":"invalid-arguments"}; }
 }"#
 );
 
@@ -4694,6 +4694,7 @@ fn parse_selector(source: &str) -> Result<Vec<selector::Part<'_>>, ObservationEr
     }
     selector::parse(source).map_err(|error| match error {
         selector::ParseError::Invalid => ObservationError::InvalidLocator,
+        selector::ParseError::TrailingSyntax => ObservationError::BackendFailure,
         selector::ParseError::Unsupported => ObservationError::UnsupportedCapability,
         selector::ParseError::Limit => ObservationError::ResourceLimit,
     })
