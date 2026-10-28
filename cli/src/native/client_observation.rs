@@ -3178,6 +3178,7 @@ const MATCH_QUERY: &str = concat!(
  }
 "#,
     include_str!("client_observation/selector_query.js"),
+    include_str!("client_observation/selector_public_check.js"),
     r#"
  function evaluate(x,scope=all,root=document) {
   switch(x.kind) {
@@ -3188,14 +3189,26 @@ const MATCH_QUERY: &str = concat!(
     candidates=candidates.filter(i=>semantic(x.query,i));
     return candidates;
    }
-   case 'union': {const matches=new Set([...evaluate(x.left,scope,root),...evaluate(x.right,scope,root)]);return scope.filter(i=>matches.has(i));}
+   case 'union': {
+    const matches=new Set([...evaluate(x.left,scope,root),...evaluate(x.right,scope,root)]);
+    const ordered=scope.filter(i=>matches.has(i));
+    // A scoped selector may return its issued Element root (visible/:scope).
+    // Preserve that result before descendants, without admitting an unmatched
+    // root or widening either branch's search scope.
+    const rootIndex=root.nodeType===1?selectorIndex.get(root):undefined;
+    if(rootIndex!==undefined&&matches.has(rootIndex)&&!ordered.includes(rootIndex))ordered.unshift(rootIndex);
+    return ordered;
+   }
    case 'filter': return evaluate(x.source,scope,root).filter(i=>(!x.hasText||matchFilterText(x.hasText,elements[i]))&&(!x.has||evaluate(x.has,scope.filter(j=>contains(i,j)),elements[i]).length>0));
    case 'index': {const a=evaluate(x.source,scope,root);const i=x.index==='first'?0:x.index==='last'?a.length-1:x.index;return i>=0&&i<a.length?[a[i]]:[];}
    case 'frame': throw new Error('Frame expression must be resolved by native frame scope');
    default: throw new Error('Unknown locator expression');
   }
  }
- try { return {indices:evaluate(expression),redacted}; } catch(error) { return {error:error===matcherLimit?"resource-limit":error===invalidSelector?"invalid-locator":"invalid-arguments"}; }
+ try {
+  const indices=hasDeprecatedLightSelector(expression)?evaluatePublicLightExpression(expression):evaluate(expression);
+  return {indices,redacted};
+ } catch(error) { return {error:error===deprecatedLightSelector?"deprecated-selector":error===matcherLimit?"resource-limit":error===invalidSelector?"invalid-locator":"invalid-arguments"}; }
 }"#
 );
 
@@ -3700,7 +3713,7 @@ async fn evaluate_query(
         let result=command(client,session,"Runtime.callFunctionOn",json!({"objectId":objects[0],"functionDeclaration":MATCH_QUERY,"arguments":arguments,"returnByValue":true,"objectGroup":group}),lease).await?;
         if result.get("exceptionDetails").is_some(){return Err(ObservationError::BackendFailure);}
         let value=&result["result"]["value"];
-        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("invalid-locator")=>return Err(ObservationError::InvalidLocator),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
+        match value["error"].as_str(){Some("stale-reference")=>return Err(ObservationError::StaleReference),Some("invalid-arguments")=>return Err(ObservationError::InvalidArguments),Some("invalid-locator")=>return Err(ObservationError::InvalidLocator),Some("resource-limit")=>return Err(ObservationError::ResourceLimit),Some("deprecated-selector")=>return Err(ObservationError::BackendFailure),Some(_)=>return Err(ObservationError::BackendFailure),None=>{}}
         let indices:Vec<usize>=serde_json::from_value(value["indices"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         let redacted:Vec<usize>=serde_json::from_value(value["redacted"].clone()).map_err(|_|ObservationError::BackendFailure)?;
         (indices,redacted)

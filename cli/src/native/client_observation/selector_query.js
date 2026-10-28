@@ -14,8 +14,59 @@ function attributeSelector(part) {
   const attribute = part.engine.endsWith(':light') ? part.engine.slice(0, -6) : part.engine;
   return `[${attribute}=${JSON.stringify(part.body)}]`;
 }
+// Playwright 1.64.1 `_createVisibleEngine` compares the authored body to the
+// exact string "true" and filters the root with `isElementVisible`, which is
+// `computeBox(element).visible`. That is rendering visibility, not the E2E
+// reader's semantic `hidden` state. Port it as-is: display:contents inspects
+// light-tree element children and text ranges; every other element needs
+// checkVisibility() and a non-empty client rect. Opacity is not consulted.
+function visibleStyle(node) {
+  const view = node.ownerDocument && node.ownerDocument.defaultView;
+  return view ? view.getComputedStyle(node) : null;
+}
+function visibleTextNode(node) {
+  const range = node.ownerDocument.createRange();
+  range.selectNode(node);
+  const box = range.getBoundingClientRect();
+  return box.width > 0 && box.height > 0;
+}
+function elementVisible(element, depth = 0) {
+  matcherStep();
+  if (depth > 256) throw matcherLimit;
+  const style = visibleStyle(element);
+  if (!style) return true;
+  if (style.display === 'contents') {
+    // No box exists for the element itself; Playwright asks its light-tree
+    // children and direct text nodes instead, never its shadow root.
+    for (let child = element.firstChild; child; child = child.nextSibling) {
+      matcherStep();
+      if (child.nodeType === 1 && elementVisible(child, depth + 1)) return true;
+      if (child.nodeType === 3 && visibleTextNode(child)) return true;
+    }
+    return false;
+  }
+  // Playwright calls checkVisibility() with no arguments, then requires an
+  // explicitly visible computed visibility value.
+  if (!element.checkVisibility() || style.visibility !== 'visible') return false;
+  const box = element.getBoundingClientRect();
+  return box.width > 0 && box.height > 0;
+}
+function visibleRoot(root, body) {
+  if (root.nodeType !== 1) return false;
+  return elementVisible(root) === (body === 'true');
+}
 function selectChain(parts, scope, root) {
   const allowed = new Set(scope);
+  // A chain can legitimately produce the very root it was given: the visible
+  // engine returns the root itself when it matches, and CSS `:scope` already
+  // does the same. Playwright's `has` engine evaluates the inner selector with
+  // the candidate element as scope and accepts that match, but the candidate
+  // is not in its own descendant scope, so admit the root explicitly. `allowed`
+  // holds inventory indices, so add the root's index rather than the element.
+  // The root is always a document or one of the issued elements, so this can
+  // never widen the candidate inventory or reach a node outside it.
+  const rootIndex = root.nodeType === 1 ? selectorIndex.get(root) : undefined;
+  if (rootIndex !== undefined) allowed.add(rootIndex);
   let roots = [root];
   for (const part of parts) {
     matcherStep();
@@ -23,6 +74,13 @@ function selectChain(parts, scope, root) {
       const index = Number(part.body);
       const start = index === -1 ? roots.length - 1 : index;
       roots = roots.slice(start, start + 1);
+      continue;
+    }
+    // Playwright's visible engine has only `queryAll`: it keeps or drops each
+    // current root in place. It is not a descendant search, so it neither
+    // widens the chain nor pierces again.
+    if (part.engine === 'visible') {
+      roots = roots.filter(root => { matcherStep(); return visibleRoot(root, part.body); });
       continue;
     }
     const found = new Set();

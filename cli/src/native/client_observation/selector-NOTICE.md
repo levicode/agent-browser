@@ -13,7 +13,7 @@ The source was read from the pinned `playwright-core@1.64.1` development depende
 
 `75d1d55b9c31acbb40f9c63f6f1d93db593d73164d96330649f1d82d2fa16001`
 
-The Rust port keeps named-engine detection, quoted text and XPath detection, escapes, chain boundaries, and capture parsing. Native validation adds a 65,536-byte input limit, a 256-part limit, final-only capture, and an explicit engine allowlist. CSS, css:light, XPath, xpath:light, nth, and the attribute engines below are implemented by this change. Positions retain Playwright's JavaScript Number and Array.slice coercion. Other known Playwright engines return unsupported-capability rather than being interpreted as CSS. This is not a copy of the Playwright browser runtime.
+The Rust port keeps named-engine detection, quoted text and XPath detection, escapes, chain boundaries, and capture parsing. Native validation adds a 65,536-byte input limit, a 256-part limit, final-only capture, the pinned nth-with-capture refusal, and an explicit engine allowlist. CSS, css:light, XPath, xpath:light, nth, the attribute engines below, and `visible` are implemented by this change. Positions retain Playwright's JavaScript Number and Array.slice coercion. Other known Playwright engines return unsupported-capability rather than being interpreted as CSS. This is not a copy of the Playwright browser runtime.
 
 `selector_query.js` is the native chain interpreter. Its CSS calls use browser CSS semantics, not Playwright's custom CSS evaluator. Playwright-only pseudo-classes and cross-shadow CSS combinators remain separate compatibility work. CSS chain steps search open roots; XPath does not pierce shadow roots. Neither crosses a closed root.
 
@@ -32,5 +32,60 @@ Playwright builds `[<attribute>=${JSON.stringify(body)}]` and evaluates it with 
 - Plain engines pierce open roots through the existing traversal; `:light` variants stay in the light tree. No variant enters a closed root.
 
 The Playwright public locator layer additionally rejects a `:light` match as a deprecated selector. That refusal lives above the engine and is not reproduced here, so this adapter returns the engine result.
+
+## Visible engine
+
+`visible` follows `_createVisibleEngine` in the same pinned bundle. SHA-256 of that method through the line before `_createInternalChainEngine`:
+
+`31fd112748a2f2c0cf1ff20c2a8fec40efa8c967c3430e3d0ad6d9c2ef5eb02a`
+
+It is a `queryAll` engine with no `matches`/`query` form: for each current chain root it returns that root when `isElementVisible(root)` equals `body === "true"`, and nothing otherwise. Three consequences are reproduced exactly:
+
+- The body is compared to the exact string `true`. `visible=false`, `visible=`, `visible=TRUE`, `visible= true` and `visible="true"` all ask for invisible roots; only `visible=true` asks for visible ones. Native validation therefore accepts an empty body for this engine.
+- A document/root node that is not an Element never survives, in either direction. `visible=true` and `visible=false` are both empty as the first chain part.
+- The step filters the roots already selected by the previous part. It is not a descendant search, does not re-enter open shadow roots, and cannot enter a closed root.
+
+The pinned helpers this depends on, each hashed through the line before the next symbol:
+
+- `computeBox` through the line before `isElementVisible`: `4bf7c24ead72290045e62662cee6c68783d293a315ac257653cdd8f31fc86a0d`
+- `isElementVisible` through the line before `var kTextNodeRange`: `125d32f1ee4e56e756167ba9643f6a2cf154a3044399245266934ec5172ba70c`
+- `isVisibleTextNode` through the line before `function elementSafeTagName`: `4d1130355e08deeada248df05fd5f73d90d405f39b06bf4ae307f8a37c7012aa`
+- `isElementStyleVisibilityVisible` through the line before `function isListBoxSelect`: `c23401047f83bc9a9f95092af0710d091fae187b5de26689d2be1cfe39a2b10b`
+
+`selector_query.js` inlines the subset those helpers read. `getElementComputedStyle` becomes the document's `getComputedStyle`; the cache and the WebKit `<option>` workaround are omitted because this adapter does not negotiate WebKit. The result:
+
+- `display: contents` has no box for `checkVisibility`. The element is visible when a light-tree element child is visible or a direct text node range has positive width and height. Its own `visibility` is not consulted, and its shadow root is not inspected.
+- Every other element needs `checkVisibility()` (called with no arguments, so content-visibility and flat-tree state participate) and a computed `visibility` of `visible`, then a client rect with positive width and height. `opacity` is ignored.
+- Zero-area boxes are invisible. `content-visibility: hidden` boxes that still have a positive rect are visible in Chromium, matching the pinned implementation rather than a semantic "hidden" reading.
+
+This is Playwright rendering visibility, not the E2E reader's semantic `hidden` state and not the native `renderVisible` observation helper. It reads no input value, attribute, accessible name or closed-root inventory, and every root check charges the existing `matcherStep` budget. The `display: contents` walk reuses that same budget and adds the existing 256-level depth bound, so a pathological nesting chain is refused as a resource limit where Playwright would recurse without one. A final-only capture (`*visible=true` as the last part) stays a no-op, which is also what Playwright's capture rewrite produces when the capture is at the last part.
+
+### Root matching in a chain
+
+`visible` can return the very element a chain started from, as CSS `:scope` already can. Playwright's `has` engine evaluates its inner selector with the candidate element as scope and accepts that element as a match, so `locator('#row').filter({ has: locator('visible=true') })` keeps `#row` when it is visible. The native chain therefore admits the root it was given; every other result still has to be one of the issued elements, so this cannot widen the candidate inventory, read a closed root, or fabricate a node outside the acquisition.
+
+## Capture and nth
+
+Pinned Playwright refuses any `nth` combined with a capture. The refusal lives in `InjectedScript.querySelectorAll` in the same pinned bundle, whose opening capture branch runs before the capture rewrite and before any engine dispatch. SHA-256 of that method through the line before `_queryEngineAll(part, root) {`:
+
+`bd3afc7f2ce001bc6292b19bda832a29d75b2a5f608322ab448cd35da606c3ec`
+
+The relevant pinned source is:
+
+```js
+if (selector.capture !== void 0) {
+  if (selector.parts.some((part) => part.name === "nth"))
+    throw this.createStacklessError(`Can't query n-th element in a request with the capture.`);
+```
+
+Three consequences are reproduced:
+
+- The predicate is over every *top-level* parsed part, matched on the resolved engine name `nth`. Position is irrelevant: `nth` before the capture, after it, on the captured part itself and repeated all fail. Sign and value are irrelevant too, so `nth=-1`, `nth=NaN`, `nth=Infinity` and the empty `nth=` body all fail when a capture is present.
+- The check is structural, not textual. `div:nth-child(2)`, `div[data-x="nth=0"]`, `data-testid=nth=0`, `*css=nth`, and a bare `nth` word (which Playwright parses as CSS with body `nth`) do not name the engine and stay legal alongside a capture.
+- Nested selectors are separate parser results. A capture in the outer chain with an `nth` only inside a nested engine body keeps the outer chain's parts free of `nth`, so pinned Playwright accepts it; a capture inside a nested body is refused there on its own. The native adapter does not implement those nested engines at all, so this only documents why the rule is evaluated per parser result and never over raw text.
+
+Native ordering: the rule runs after the engine allowlist because an engine this adapter does not implement must keep returning unsupported-capability rather than being relabelled as an invalid locator. For a selector containing only implemented engines the result matches pinned Playwright exactly: `INVALID_LOCATOR`. A chain that mixes an unimplemented engine with `nth` plus a capture is still refused, only under the adapter's own classification.
+
+Capture placement itself is unchanged. The adapter still requires the single capture to be the final part, which is stricter than pinned Playwright's capture rewrite; that bounded-subset difference is recorded in the provenance summary above and is not widened here.
 
 This change affects the negotiated E2E session adapter. It does not change the legacy CLI or MCP selector parser, so their command help is unchanged.

@@ -144,7 +144,14 @@ closedRoot.append(closedInner); elements.push(closedInner);
 assert.equal(closedHost.shadowRoot, null, 'closed roots are not exposed');
 assert.ok(!main.descendants().includes(closedInner), 'closed roots are unreachable from light traversal');
 
-const matchQuery = eval(`(${script})`);
+// Preserve the original raw-engine assertions independently of the public
+// deprecation gate. This explicit white-box entrypoint changes only dispatch;
+// selector bodies, scope, acquisition and security predicates are unchanged.
+const publicMatchQuery = eval(`(${script})`);
+const publicDispatch = 'const indices=hasDeprecatedLightSelector(expression)?evaluatePublicLightExpression(expression):evaluate(expression);';
+assert.ok(script.includes(publicDispatch), 'public compatibility dispatch is present');
+const rawScript = script.replace(publicDispatch, 'const indices=evaluate(expression);');
+const matchQuery = eval(`(${rawScript})`);
 function run(expr) {
   const data = elements.map(() => ({ states: { secure: false, hidden: false } }));
   const labels = elements.map(() => []);
@@ -238,3 +245,18 @@ expect('nth negative', ids(chain(engine('data-testid', 'one'), engine('nth', '-1
 expect('attribute body is not css', ids(chain(engine('data-testid', 'div'))), []);
 assert.throws(() => run({ kind: 'selector', nativeParts: [{ engine: 'unknown', body: 'x' }] }), undefined);
 console.log(`PASS: ${checks} attribute selector interpreter checks against an explicit DOM double. Not a browser/E2E proof.`);
+
+// Separately test the unchanged production/public entrypoint, not raw dispatch.
+function publicResult(parts) {
+  return publicMatchQuery({kind:'selector',nativeParts:parts},
+    elements.map(()=>({states:{secure:false,hidden:false}})),
+    elements.map(()=>[]),elements.map(()=>null),'.secure',elements.map(()=>false),...elements);
+}
+for (const family of ['id','data-testid','data-test-id','data-test']) {
+  const body = ({'id':'light-plain','data-testid':'one','data-test-id':'dtid','data-test':'dt'})[family];
+  assert.equal(publicResult(chain(engine(family+':light',body))).error,'deprecated-selector');
+  assert.deepEqual(publicResult(chain(engine(family+':light','inner-closed'))).indices,[]);
+  assert.equal(publicResult(chain(engine('css','main'),engine(family+':light',body))).error,'deprecated-selector');
+}
+assert.deepEqual(publicResult(chain(engine('data-testid:light','inner-open'))).indices,[]);
+console.log('PASS: 13 production public deprecated-light refusal/miss controls; all original raw-engine assertions retained separately.');
