@@ -400,6 +400,8 @@ pub struct DispatchContext {
     #[cfg(feature = "acceptance-faults")]
     pub faults: Arc<super::client_test_faults::FaultController>,
     pub page: BrowserExecutionLease,
+    /// Runtime-issued selected-page authority; never reconstructed from wire IDs.
+    pub(crate) query_authority: Option<super::client_enrollment::PageQueryAuthority>,
     /// Native attachment tenure captured with the page and policy, before any
     /// retained-registration await. Never rebound from current registry state.
     pub attachment: super::client_targets::OwnedTarget,
@@ -1062,6 +1064,7 @@ impl ObservationDispatch {
         blobs: &BlobStore,
         blob_scope: &BlobScope,
         handles: &[String],
+        query_partition: Option<&super::client_enrollment::PageAcquisitionProof>,
     ) -> Result<(), ProtocolError> {
         let authority = self
             .captures
@@ -1107,12 +1110,23 @@ impl ObservationDispatch {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         check(page, operation)?;
-        blobs
-            .bind_page_captures(blob_scope, handles, &authority.page_blob_tenure)
-            .map_err(blob_error)?;
-        publication.commit_refs(kind, revision, &mut refs, staged);
-        Ok(())
+        let commit = || {
+            blobs
+                .bind_page_captures(blob_scope, handles, &authority.page_blob_tenure)
+                .map_err(blob_error)?;
+            publication.commit_refs(kind, revision, &mut refs, staged);
+            Ok(())
+        };
+        // Preserve captures -> refs before adding index -> watermark -> targets.
+        // Never enter captures while holding the registry: capture admission
+        // itself checks target tenure under its captures lock.
+        if let Some(partition) = query_partition {
+            partition.with_publication(page, operation, commit)
+        } else {
+            commit()
+        }
     }
+
     fn check_initial_trace_owner(
         &self,
         context: &DispatchContext,
@@ -1238,9 +1252,15 @@ impl ObservationDispatch {
             Ok(())
         };
         check_owner()?;
-        let first =
-            frame_inventory_attempt_impl(&context.page, operation, Some(cleanup), screenshot, true)
-                .await;
+        let first = frame_inventory_attempt_impl(
+            &context.page,
+            operation,
+            Some(cleanup),
+            screenshot,
+            true,
+            None,
+        )
+        .await;
         let rejected = match first {
             Ok(inventory) => {
                 check_owner()?;
@@ -1263,10 +1283,16 @@ impl ObservationDispatch {
             return Err(rejected.record(screenshot));
         }
         // No loop: the old sample is discarded and a second raced sample fails.
-        let inventory =
-            frame_inventory_attempt_impl(&context.page, operation, Some(cleanup), screenshot, true)
-                .await
-                .map_err(|failure| failure.record(screenshot))?;
+        let inventory = frame_inventory_attempt_impl(
+            &context.page,
+            operation,
+            Some(cleanup),
+            screenshot,
+            true,
+            None,
+        )
+        .await
+        .map_err(|failure| failure.record(screenshot))?;
         check_owner()?;
         let ledger = context
             .page
@@ -1571,6 +1597,7 @@ impl ObservationDispatch {
                     blobs,
                     scope,
                     &output.handles,
+                    None,
                 );
                 if let Err(error) = publish {
                     if !release_handles(blobs, scope, &output.handles) {
@@ -1691,6 +1718,16 @@ impl ObservationDispatch {
             observation::validate_expression(&query.options.expression, 0)
                 .map_err(map_observation)
                 .map_err(failure)?;
+        }
+        // Classify already received attachments before acquiring UI/publication.
+        // This is not a wait for unrelated initializer readiness or task exit.
+        if matches!(&request, DispatchRequest::Query(_)) {
+            if let Some(authority) = &context.query_authority {
+                authority
+                    .wait_classified(&context.page, &operation)
+                    .await
+                    .map_err(failure)?;
+            }
         }
         let protected = !matches!(&request, DispatchRequest::ReadFields(_))
             && !matches!(&request, DispatchRequest::Query(q) if q.purpose == QueryPurpose::Fixture);
@@ -1885,13 +1922,23 @@ impl ObservationDispatch {
         #[cfg(test)]
         witness.enter(ObserveFailureStage::InitialFrames);
         screenshot_stage(screenshot, ScreenshotStage::InitialFrames);
+        let query_partition = if matches!(&request, DispatchRequest::Query(_)) {
+            context
+                .query_authority
+                .as_ref()
+                .map(|authority| authority.acquire(&context.page, &operation))
+                .transpose()
+                .map_err(failure)?
+        } else {
+            None
+        };
         let frames = if matches!(&request, DispatchRequest::TraceSemantic(_))
             || matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
             self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
         } else if matches!(&request, DispatchRequest::Observe(_)) {
             self.initial_observe_frames(&context, &operation, capture.as_ref(), retirement_fence, &observation_cleanup, screenshot).await
         } else {
-            verified_frames_with_diagnostic(&context.page, &operation, Some(&observation_cleanup), screenshot).await
+            query_frames(&context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref()).await
         }.map_err(failure)?;
         let fallback_selector = match &request {
             DispatchRequest::Observe(request) if request.options.pixel_fallback => {
@@ -1911,9 +1958,10 @@ impl ObservationDispatch {
         screenshot_stage(screenshot, ScreenshotStage::ProtectedBarrier);
         let mut journal = if protected {
             Some(
-                ProtectedReadJournal::begin(
+                ProtectedReadJournal::begin_query(
                     &capture_context.page,
                     &operation,
+                    query_partition.as_ref(),
                 )
                 .map_err(|e| DispatchFailure {
                     error: protected_error(e.reason),
@@ -1935,7 +1983,7 @@ impl ObservationDispatch {
             let frozen = if is_observe {
                 verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?
             } else {
-                verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?
+                query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref()).await?
             };
             same_frames(&capture_context.frames, &frozen)?;
             // Semantic capture proves which exact documents were projected,
@@ -2189,7 +2237,7 @@ impl ObservationDispatch {
         let final_frames = if is_observe {
             verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await
         } else {
-            verified_frames_with_diagnostic(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await
+            query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref()).await
         }
             .map_err(failure)?;
         same_frames(&capture_context.frames, &final_frames).map_err(failure)?;
@@ -2233,7 +2281,7 @@ impl ObservationDispatch {
                 journal.check().map_err(protected_error)?;
             }
             self.commit_staged(&capture_context.page, &operation, capture.as_ref(), trace.as_ref(), retirement_fence,
-                &mut publication, publication_kind, revision, staged, &context.blobs, &context.scope, &handles)?;
+                &mut publication, publication_kind, revision, staged, &context.blobs, &context.scope, &handles, query_partition.as_ref())?;
             Ok::<(), ProtocolError>(())
         })();
         if let Err(error) = publish {
@@ -2585,7 +2633,7 @@ async fn verified_semantic_frames_with_cleanup(
     cleanup: Option<&AtomicBool>,
     screenshot: Option<&ScreenshotFailureWitness>,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
-    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, true)
+    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, true, None)
         .await
         .map(|inventory| inventory.frames)
         .map_err(|failure| failure.record(screenshot))
@@ -2753,7 +2801,27 @@ async fn frame_inventory_attempt(
     cleanup: Option<&AtomicBool>,
     screenshot: Option<&ScreenshotFailureWitness>,
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
-    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, false).await
+    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, false, None).await
+}
+#[cfg(test)]
+pub(crate) async fn selected_query_frames_for_test(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    partition: &super::client_enrollment::PageAcquisitionProof,
+) -> Result<Vec<ObservationFrame>, ProtocolError> {
+    query_frames(page, operation, None, None, Some(partition)).await
+}
+async fn query_frames(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    cleanup: Option<&AtomicBool>,
+    screenshot: Option<&ScreenshotFailureWitness>,
+    partition: Option<&super::client_enrollment::PageAcquisitionProof>,
+) -> Result<Vec<ObservationFrame>, ProtocolError> {
+    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, false, partition)
+        .await
+        .map(|inventory| inventory.frames)
+        .map_err(|error| error.record(screenshot))
 }
 async fn frame_inventory_attempt_impl(
     page: &BrowserExecutionLease,
@@ -2761,11 +2829,16 @@ async fn frame_inventory_attempt_impl(
     cleanup: Option<&AtomicBool>,
     screenshot: Option<&ScreenshotFailureWitness>,
     readonly_disposal: bool,
+    partition: Option<&super::client_enrollment::PageAcquisitionProof>,
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
     check(page, operation)?;
-    let (revision, targets, inventory_before) = page
-        .targets
-        .inventory_with_diagnostic(screenshot.is_some())?;
+    let (revision, targets, inventory_before) = if let Some(partition) = partition {
+        partition.check(page, operation)?;
+        (0, partition.targets().to_vec(), None)
+    } else {
+        page.targets
+            .inventory_with_diagnostic(screenshot.is_some())?
+    };
     if let Some(witness) = screenshot {
         witness.revision(revision);
     }
@@ -2864,22 +2937,26 @@ async fn frame_inventory_attempt_impl(
             return Err(ProtocolError::UnsupportedCapability.into());
         }
     }
-    let fence = page.targets.check_acquisition_revision(
-        revision,
-        inventory_before.as_ref(),
-        main,
-        screenshot.map_or(
-            diagnostic::FrameInventoryPass::Initial,
-            ScreenshotFailureWitness::frame_pass,
-        ),
-        screenshot.is_some(),
-    );
-    if let Err(error) = fence.result {
-        return Err(FrameInventoryFailure::Fence {
-            error,
-            revision_only: fence.revision_only,
-            diagnostic: fence.diagnostic,
-        });
+    if let Some(partition) = partition {
+        partition.check(page, operation)?;
+    } else {
+        let fence = page.targets.check_acquisition_revision(
+            revision,
+            inventory_before.as_ref(),
+            main,
+            screenshot.map_or(
+                diagnostic::FrameInventoryPass::Initial,
+                ScreenshotFailureWitness::frame_pass,
+            ),
+            screenshot.is_some(),
+        );
+        if let Err(error) = fence.result {
+            return Err(FrameInventoryFailure::Fence {
+                error,
+                revision_only: fence.revision_only,
+                diagnostic: fence.diagnostic,
+            });
+        }
     }
     check(page, operation)?;
     Ok(VerifiedFrameInventory {
@@ -3931,6 +4008,7 @@ mod tests {
             };
             blobs.activate_scope(scope.clone()).unwrap();
             let context = || DispatchContext {
+                query_authority: None,
                 #[cfg(feature = "acceptance-faults")]
                 faults: Arc::new(super::super::client_test_faults::FaultController::default()),
                 attachment: targets.owned_target("target").unwrap(),
@@ -4105,6 +4183,7 @@ mod tests {
             let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
             let task = dispatch.start(
                 DispatchContext {
+                    query_authority: None,
                     #[cfg(feature = "acceptance-faults")]
                     faults: Arc::new(super::super::client_test_faults::FaultController::default()),
                     attachment: page.targets.owned_target(&page.target_id).unwrap(),
@@ -4773,6 +4852,7 @@ mod tests {
         let start_dispatch = || {
             dispatch.clone().start(
                 DispatchContext {
+                    query_authority: None,
                     faults: faults.clone(),
                     attachment: page.targets.owned_target(&page.target_id).unwrap(),
                     page,
@@ -5644,6 +5724,7 @@ mod tests {
             cancellation,
         };
         let task = dispatch.start(DispatchContext {
+            query_authority: None,
             #[cfg(feature="acceptance-faults")]
             faults:Arc::new(super::super::client_test_faults::FaultController::default()),
             attachment: page.targets.owned_target(&page.target_id).unwrap(),
@@ -5819,6 +5900,7 @@ mod tests {
         };
         let task = dispatch.clone().start(
             DispatchContext {
+                query_authority: None,
                 #[cfg(feature = "acceptance-faults")]
                 faults: Arc::new(super::super::client_test_faults::FaultController::default()),
                 attachment: page.targets.owned_target(&page.target_id).unwrap(),

@@ -62,6 +62,7 @@ impl Owner {
     }
     fn context(&self) -> DispatchContext {
         DispatchContext {
+            query_authority: None,
             #[cfg(feature = "acceptance-faults")]
             faults: Arc::new(super::super::client_test_faults::FaultController::default()),
             attachment: self.targets.owned_target(&self.target).unwrap(),
@@ -165,6 +166,7 @@ fn commit(
         &prepared.context.scope,
         // These helpers stage references only, with no encoded pixel handles.
         &[],
+        None,
     )
 }
 
@@ -851,6 +853,7 @@ fn commit_trace(
         &prepared.context.scope,
         // These helpers stage references only, with no encoded pixel handles.
         &[],
+        None,
     )
 }
 #[tokio::test]
@@ -1470,6 +1473,7 @@ async fn uncertainty_retirement_fences_additive_trace_and_capture_without_recycl
                 &capture.context.blobs,
                 &capture.context.scope,
                 &handles,
+                None,
             ),
             Err(ProtocolError::StaleReference)
         );

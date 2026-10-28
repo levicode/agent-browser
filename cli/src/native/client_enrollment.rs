@@ -1,6 +1,8 @@
 //! One scope-owned target enrollment supervisor. Target metadata is inspected
 //! before any page/network domain; foreign sessions are detached immediately.
 //! The authoritative identity/purpose registry remains ClientTargets.
+#[path = "client_enrollment_page_query.rs"]
+mod page_query;
 use super::cdp::client::{BoundedEventWatermark, BoundedMethodEvents, CdpClient};
 use super::cdp::types::CdpEvent;
 use super::client_app_events::{AppNavigationContext, AppNavigationKind};
@@ -13,6 +15,7 @@ use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
 use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
+pub(crate) use page_query::{PageAcquisitionProof, PageQueryAuthority, SelectedPageReadBarrier};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -263,6 +266,8 @@ struct Index {
     borrowed_restart_sequence: u64,
     borrowed_retired_targets: HashSet<String>,
     detached_application_roots: HashMap<String, String>,
+    // Historical active roots only; ordinary popup reattachment keeps a fresh tenure.
+    detached_active_roots: HashSet<String>,
     borrowed_blank: Option<Arc<BorrowedBlankState>>,
     sessions: HashMap<String, Attribution>,
     frames: HashMap<String, FrameOwner>,
@@ -892,7 +897,7 @@ impl InitializationOutcome {
 
 /// Only a specialized initialization wait can mint this receipt. It records
 /// the exact authorized producer stop observed at that wait, not later state.
-struct ExactOwnerStop {
+pub(super) struct ExactOwnerStop {
     targets: Arc<ClientTargets>,
     generation: u64,
     cancellation: watch::Receiver<CancelSignal>,
@@ -905,6 +910,10 @@ impl std::fmt::Debug for ExactOwnerStop {
     }
 }
 impl ExactOwnerStop {
+    pub(super) fn authorizes_targets(&self, targets: &Arc<ClientTargets>) -> bool {
+        Arc::ptr_eq(&self.targets, targets)
+    }
+
     fn authorizes(&self, owner: &ClientEnrollment) -> bool {
         Arc::ptr_eq(&self.targets, &owner.targets)
             && self.generation == owner.generation
@@ -3596,6 +3605,17 @@ impl ClientEnrollment {
         kind: &str,
         parent: Option<&str>,
     ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
+        self.register_with_custody(context, target, session, kind, parent, None)
+    }
+    fn register_with_custody(
+        &self,
+        context: &str,
+        target: &str,
+        session: &str,
+        kind: &str,
+        parent: Option<&str>,
+        custody: Option<&mut super::client_targets::RetainedInitialization>,
+    ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
         if context != self.targets.context_id {
             return Ok(None);
         }
@@ -3626,15 +3646,18 @@ impl ClientEnrollment {
         if index.borrowed_retired_targets.contains(target) {
             return Ok(None);
         }
-        // Reused text is not a resurrected application-root tenure. Keep the
-        // exact detach candidate unambiguous until its owner opens a new page.
-        if matches!(
-            self.ownership,
-            ScopeOwnership::BorrowedTargets(_) | ScopeOwnership::IsolatedContext
-        ) && index
-            .detached_application_roots
-            .iter()
-            .any(|(old_target, old_session)| old_target == target || old_session == session)
+        // A closed active root cannot be revived by reusing its target/session
+        // text. Non-active isolated popups may re-enroll with a fresh tenure;
+        // their old media/observation tickets must still fail exact-tenure checks.
+        let borrowed = matches!(self.ownership, ScopeOwnership::BorrowedTargets(_));
+        if (borrowed || matches!(self.ownership, ScopeOwnership::IsolatedContext))
+            && index
+                .detached_application_roots
+                .iter()
+                .any(|(old_target, old_session)| {
+                    (borrowed || index.detached_active_roots.contains(old_target))
+                        && (old_target == target || old_session == session)
+                })
         {
             return Err(ProtocolError::StaleScope.into());
         }
@@ -3670,8 +3693,40 @@ impl ClientEnrollment {
                 None => return Err(ProtocolError::StaleReference.into()),
             }
         };
-        self.targets
-            .attached(context, target.into(), session.into(), kind.into())?;
+        let root_ticket = if root != session {
+            let root_entry = index
+                .sessions
+                .get(&root)
+                .ok_or(ProtocolError::StaleReference)?;
+            if root_entry.kind == "page" {
+                Some(
+                    self.targets
+                        .initializing_root_ticket(&root_entry.target, &root_entry.session)?,
+                )
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        if let Some(custody) = custody {
+            custody.attach_with_root(
+                &self.targets,
+                context,
+                target.into(),
+                session.into(),
+                kind.into(),
+                root_ticket,
+            )?;
+        } else {
+            self.targets.attached_enrolled(
+                context,
+                target.into(),
+                session.into(),
+                kind.into(),
+                root_ticket.as_ref(),
+            )?;
+        }
         let entry = Attribution {
             target: target.into(),
             session: session.into(),
@@ -4152,7 +4207,7 @@ impl ClientEnrollment {
                     // Keep the original error outside the bounded retirement
                     // wait. Cancellation/deadline cannot turn it into success.
                     let retired = self
-                        .finish_retired_worker_startup(
+                        .finish_retired_worker_startup_observed(
                             &entry,
                             retirement,
                             permit,
@@ -4160,23 +4215,18 @@ impl ClientEnrollment {
                             wait_for_exact_detach,
                         )
                         .await;
-                    if let Err(error) = retired {
+                    if let Err(retirement_failure) = retired {
                         self.network.quarantine_worker_startup()?;
-                        // This private producer keeps its earlier hard failure
-                        // through retirement. A separately owned operation still
-                        // reports its own cancellation after quarantine. Channel
-                        // identity is fixed; no later stop state mints success.
-                        return Err(if error == ProtocolError::Cancelled
-                            && op.generation == self.generation
-                            && op.sequence == 0
-                            && !op.is_callback
-                            && op.cancellation.same_channel(&self.stop.subscribe())
-                        {
-                            failure.error()
-                        } else {
-                            error
-                        }
-                        .into());
+                        // A stop observed by the local scope guard cannot
+                        // replace an already observed hard startup failure.
+                        // Consume the private receipt here: never publish it
+                        // as successful owner retirement or StoppedByOwner.
+                        let error = self.failed_worker_retirement_error(
+                            op,
+                            failure.error(),
+                            retirement_failure,
+                        );
+                        return Err(error.into());
                     }
                     return Ok(InitializationOutcome::FailedRetired(failure));
                 }
@@ -4458,38 +4508,132 @@ impl ClientEnrollment {
     }
     /// This task is itself pending and retains config_gate. Wait only for the
     /// existing event loop's applied boundary, never a global enrollment drain.
+    fn failed_worker_retirement_error(
+        &self,
+        op: &OperationLease,
+        original: ProtocolError,
+        retirement_failure: InitFailure,
+    ) -> ProtocolError {
+        match retirement_failure {
+            InitFailure::OwnedStop(stop) if stop.authorizes(self) => original,
+            InitFailure::OwnedStop(_) => ProtocolError::StaleScope,
+            InitFailure::Operation(error) => {
+                // Fixed producer identity preserves the existing cancellation
+                // precedence; no later stop state reclassifies a returned error.
+                let own_initialization = !op.is_callback
+                    && op.sequence == 0
+                    && op.generation == self.generation
+                    && op.cancellation.same_channel(&self.stop.subscribe());
+                if error == ProtocolError::Cancelled && own_initialization {
+                    original
+                } else {
+                    error
+                }
+            }
+        }
+    }
+    fn observed_worker_retirement_scope_stop(&self, op: &OperationLease) -> InitFailure {
+        match self.initialization_cancel(op, *self.stop.borrow()) {
+            owned @ InitFailure::OwnedStop(_) => owned,
+            // Ordinary scope closure/foreign cancellation retains the original
+            // guard error. This path grants no exact owner-stop receipt.
+            InitFailure::Operation(_) => ProtocolError::StaleScope.into(),
+        }
+    }
+    fn check_worker_retirement_operation(&self, op: &OperationLease) -> InitResult<()> {
+        // Same validation/failure order as check_restart_operation. Only the
+        // actual local sealed-owner guard records its source before returning.
+        if matches!(&self.ownership, ScopeOwnership::TrackedTargets(allowed) | ScopeOwnership::BorrowedTargets(allowed)
+            if allowed.len() > MAX_SESSIONS || allowed.iter().any(|id| valid_id(id).is_err()))
+        {
+            return Err(ProtocolError::InvalidArguments.into());
+        }
+        if matches!(&self.ownership, ScopeOwnership::IsolatedContext)
+            && self.targets.context_id.is_empty()
+        {
+            return Err(ProtocolError::PolicyDenied.into());
+        }
+        if let Some(error) = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .failure
+            .clone()
+        {
+            return Err(error.into());
+        }
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(self.observed_worker_retirement_scope_stop(op));
+        }
+        if op.generation != self.generation {
+            return Err(ProtocolError::StaleGeneration.into());
+        }
+        if *op.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled.into());
+        }
+        if Instant::now() >= op.deadline {
+            return Err(ProtocolError::DeadlineExceeded.into());
+        }
+        Ok(())
+    }
     async fn finish_retired_worker_startup(
+        &self,
+        entry: &Attribution,
+        retirement: super::cdp::client::WorkerStartupRetirement,
+        permit: super::client_targets::ResumePermit,
+        op: &OperationLease,
+        wait_for_exact_detach: bool,
+    ) -> Result<(), ProtocolError> {
+        self.finish_retired_worker_startup_observed(
+            entry,
+            retirement,
+            permit,
+            op,
+            wait_for_exact_detach,
+        )
+        .await
+        .map_err(|failure| match failure {
+            InitFailure::Operation(error) => error,
+            // This helper's receipt originates only at the historical
+            // StaleScope local guard. Other callers retain that API.
+            InitFailure::OwnedStop(_) => ProtocolError::StaleScope,
+        })
+    }
+    async fn finish_retired_worker_startup_observed(
         &self,
         entry: &Attribution,
         mut retirement: super::cdp::client::WorkerStartupRetirement,
         mut permit: super::client_targets::ResumePermit,
         op: &OperationLease,
         wait_for_exact_detach: bool,
-    ) -> Result<(), ProtocolError> {
+    ) -> InitResult<()> {
         if wait_for_exact_detach && !retirement.failed_terminal() {
-            return Err(ProtocolError::StaleScope);
+            return Err(ProtocolError::StaleScope.into());
         }
         let watermark = self.realm_watermark()?;
-        let result = bounded(op, async {
+        let result = bounded(op, async { Ok(async {
             loop {
                 let mut publication_pending = false;
                 let changed = self.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                self.check_restart_operation(op)?;
+                self.check_worker_retirement_operation(op)?;
                 self.network.check_worker_startup(op)?;
                 retirement.check_bound()?;
                 {
                     let index = self.index.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
-                    if let Some(error) = &index.failure { return Err(error.clone()); }
-                    if self.sealed.load(Ordering::Acquire) || op.generation != self.generation {
-                        return Err(ProtocolError::StaleScope);
+                    if let Some(error) = &index.failure { return Err(error.clone().into()); }
+                    if self.sealed.load(Ordering::Acquire) {
+                        return Err(self.observed_worker_retirement_scope_stop(op));
                     }
-                    if *op.cancellation.borrow() != CancelSignal::None { return Err(ProtocolError::Cancelled); }
-                    if Instant::now() >= op.deadline { return Err(ProtocolError::DeadlineExceeded); }
+                    if op.generation != self.generation {
+                        return Err(ProtocolError::StaleScope.into());
+                    }
+                    if *op.cancellation.borrow() != CancelSignal::None { return Err(ProtocolError::Cancelled.into()); }
+                    if Instant::now() >= op.deadline { return Err(ProtocolError::DeadlineExceeded.into()); }
                     if self.event_watermark.lock().map_err(|_| ProtocolError::ScopeUnavailable)?
                         .as_ref().is_none_or(|current| !watermark.same_subscription(current)) {
-                        return Err(ProtocolError::StaleScope);
+                        return Err(ProtocolError::StaleScope.into());
                     }
                     // received() releases its short routes lock before taking
                     // transport owner -> ledger -> targets. No readiness or
@@ -4511,11 +4655,11 @@ impl ClientEnrollment {
                                 // responsibility, not Ready or new business
                                 // authority, while this exact tenure is live.
                                 if !permit.original_worker_attachment_present()? {
-                                    return Err(ProtocolError::StaleReference);
+                                    return Err(ProtocolError::StaleReference.into());
                                 }
                             } else if !retirement.all_acknowledged()
                                 || !permit.original_worker_attachment_present()? {
-                                return Err(ProtocolError::StaleReference);
+                                return Err(ProtocolError::StaleReference.into());
                             }
                         } else {
                             match self.client.finish_retired_worker_startup(
@@ -4526,7 +4670,7 @@ impl ClientEnrollment {
                                     retirement = pending;
                                     publication_pending = true;
                                 }
-                                _ => return Err(ProtocolError::StaleScope),
+                                _ => return Err(ProtocolError::StaleScope.into()),
                             }
                         }
                     }
@@ -4543,12 +4687,12 @@ impl ClientEnrollment {
                 }
                 let deadline = retirement.deadline();
                 tokio::select! { biased;
-                    _ = retirement.cancelled() => return Err(ProtocolError::Cancelled),
-                    _ = tokio::time::sleep_until(deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                    _ = retirement.cancelled() => return Err(ProtocolError::Cancelled.into()),
+                    _ = tokio::time::sleep_until(deadline.into()) => return Err(ProtocolError::DeadlineExceeded.into()),
                     _ = changed => {},
                 }
             }
-        }).await;
+        }.await) }).await.map_err(InitFailure::Operation).and_then(|result| result);
         // Permit::drop relocks the ledger to release resuming. All outer index,
         // transport-owner and ledger guards must have gone before it runs.
         drop(permit);
@@ -4975,13 +5119,22 @@ impl ClientEnrollment {
                         if tasks.len() >= MAX_TASKS { break Err(ProtocolError::CapacityExceeded); }
                         let pending=match self.register_pending_event(&event) { Ok(pending)=>pending, Err(error)=>break Err(error) };
                         let owner = self.clone();
+                        // Stage custody before spawn. Registration occurs only
+                        // while this retained future owns the non-cloneable guard.
+                        let mut custody = super::client_targets::RetainedInitialization::new(owner.targets.clone());
                         tasks.spawn(async move {
-                            let result = match owner.attached_observed((*event).clone()).await {
-                                Err(InitFailure::OwnedStop(stop)) if stop.authorizes(&owner) => Ok(InitializationOutcome::StoppedByOwner),
+                            let result = match owner.attached_observed_with_custody((*event).clone(), Some(&mut custody)).await {
+                                Err(InitFailure::OwnedStop(stop)) if stop.authorizes(&owner) => custody.stop_retired(&stop).map(|()| InitializationOutcome::StoppedByOwner),
                                 Err(error) => Err(error.into_protocol()),
-                                Ok(outcome) => Ok(outcome),
+                                Ok(outcome) => {
+                                    let detached = matches!(&outcome, InitializationOutcome::DetachedChild | InitializationOutcome::DetachedQueuedChild | InitializationOutcome::FailedRetired(_));
+                                    custody.finish(detached).map(|()| outcome)
+                                },
                             };
                             if let Err(error)=&result { owner.poison(error.clone()); }
+                            // Error publication precedes custody release; Drop
+                            // independently seals on panic or task abandonment.
+                            drop(custody);
                             if let Some(session)=pending {
                                 owner.index.lock().map_err(|_|ProtocolError::ScopeUnavailable)?.pending_enrollment.remove(&session);
                                 owner.changed.notify_waiters();
@@ -5772,6 +5925,13 @@ impl ClientEnrollment {
             .and_then(InitializationOutcome::result)
     }
     async fn attached_observed(&self, event: CdpEvent) -> InitResult<InitializationOutcome> {
+        self.attached_observed_with_custody(event, None).await
+    }
+    async fn attached_observed_with_custody(
+        &self,
+        event: CdpEvent,
+        custody: Option<&mut super::client_targets::RetainedInitialization>,
+    ) -> InitResult<InitializationOutcome> {
         #[cfg(test)]
         self.pause_initialization_at(
             CaptureTestPoint::BeforeAttachedProcessing,
@@ -5781,7 +5941,7 @@ impl ClientEnrollment {
         if self.retire_queued_iframe(&event).await? {
             return Ok(InitializationOutcome::DetachedQueuedChild);
         }
-        let result = self.attached_inner(event.clone()).await;
+        let result = self.attached_inner(event.clone(), custody).await;
         if matches!(
             &result,
             Err(InitFailure::Operation(
@@ -5921,7 +6081,11 @@ impl ClientEnrollment {
         })
         .await
     }
-    async fn attached_inner(&self, event: CdpEvent) -> InitResult<InitializationOutcome> {
+    async fn attached_inner(
+        &self,
+        event: CdpEvent,
+        custody: Option<&mut super::client_targets::RetainedInitialization>,
+    ) -> InitResult<InitializationOutcome> {
         let session = field(&event.params, "sessionId")?.to_owned();
         let mut info = event
             .params
@@ -6114,12 +6278,13 @@ impl ClientEnrollment {
             admission.as_ref(),
             WorkerAdmissionStep::Register,
             || {
-                self.register_with_initialization(
+                self.register_with_custody(
                     context,
                     target,
                     &session,
                     kind,
                     event.session_id.as_deref(),
+                    custody,
                 )
             },
         )? {
@@ -6600,6 +6765,17 @@ impl ClientEnrollment {
                     index
                         .detached_application_roots
                         .insert(entry.target.clone(), entry.session.clone());
+                    // The index lock serializes this historical fact with
+                    // set_active_root (the same index -> active_root order).
+                    // Record only after the existing bounded map insertion.
+                    if *self
+                        .active_root
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?
+                        == entry.session
+                    {
+                        index.detached_active_roots.insert(entry.target.clone());
+                    }
                 }
                 for entry in removed.iter().filter(|entry| entry.observation_only) {
                     if index.retired_observer_sessions.len() >= MAX_FRAMES {
@@ -7590,6 +7766,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn retained_autoattach_custody_preserves_real_pending_ack_and_failure() {
+        for fail in [false, true] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let ledger = owner.client.debt_ledger().unwrap();
+            emit.send(json!({"method":"Target.attachedToTarget","params":{
+                "sessionId":"popup-session","waitingForDebugger":true,"targetInfo":{
+                    "targetId":"popup-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
+            let held = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let request = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|request| {
+                            request["sessionId"] == "popup-session"
+                                && request["method"] == "Runtime.enable"
+                        })
+                        .cloned();
+                    if let Some(request) = request {
+                        break request;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(owner
+                .targets
+                .operation_settlement_integrity_diagnostic(false)
+                .0
+                .is_ok());
+            assert!(owner.targets.inventory().is_err());
+            assert!(!owner
+                .targets
+                .owned_target("popup-target")
+                .unwrap()
+                .capture_ready());
+            assert!(ledger.snapshot().outstanding_commands >= 1);
+            let response = if fail {
+                json!({"id":held["id"],"sessionId":"popup-session","error":{"code":-32000,"message":"controlled initializer error"}})
+            } else {
+                json!({"id":held["id"],"sessionId":"popup-session","result":{}})
+            };
+            emit.send(response).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while !owner.index.lock().unwrap().pending_enrollment.is_empty() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let failure = owner.index.lock().unwrap().failure.clone();
+            let usable = owner
+                .targets
+                .operation_settlement_integrity_diagnostic(false)
+                .0
+                .is_ok();
+            let ready = owner
+                .targets
+                .owned_target("popup-target")
+                .is_ok_and(|target| target.capture_ready());
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+            assert_eq!(
+                failure,
+                if fail {
+                    Some(ProtocolError::BrowserFailure)
+                } else {
+                    None
+                }
+            );
+            assert_eq!(usable, !fail);
+            assert_eq!(ready, !fail);
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_initializer_stop_receipt_rejects_other_owner_generation_and_channel() {
+        let (owner, _notices, _log, _emit, server, _broker, connection) =
+            fixture_with_client("owner-retirement", true).await;
+        let mut custody =
+            super::super::client_targets::RetainedInitialization::new(owner.targets.clone());
+        custody
+            .attach(
+                &owner.targets,
+                "owned-context",
+                "pending-target".into(),
+                "pending-session".into(),
+                "page".into(),
+            )
+            .unwrap();
+        assert_eq!(
+            owner
+                .targets
+                .retained_initialization_state_for_test("pending-target"),
+            (true, None, false)
+        );
+        owner.seal_for_owner_retirement(&super::super::client_browser::OwnerRetirement::for_test(
+            &owner.targets,
+        ));
+        let result: InitResult<()> = owner
+            .bounded_initialization(&owner.operation(), std::future::pending())
+            .await;
+        let Err(InitFailure::OwnedStop(proof)) = result else {
+            panic!("missing exact stop receipt")
+        };
+        assert_eq!(
+            owner
+                .targets
+                .retained_initialization_state_for_test("pending-target"),
+            (true, Some(false), false)
+        );
+        assert!(proof.authorizes(&owner));
+        custody.stop_retired(&proof).unwrap();
+        drop(custody);
+        assert_eq!(
+            owner
+                .targets
+                .retained_initialization_state_for_test("pending-target"),
+            (false, Some(false), false)
+        );
+        assert!(owner.targets.check_settlement_integrity().is_err());
+        assert!(owner
+            .targets
+            .operation_settlement_integrity_diagnostic(false)
+            .0
+            .is_err());
+        let foreign = ClientTargets::new("foreign".into(), "foreign".into());
+        foreign.seal_admission();
+        let mut other = super::super::client_targets::RetainedInitialization::new(foreign);
+        assert_eq!(other.stop_retired(&proof), Err(ProtocolError::StaleScope));
+        let wrong_generation = ExactOwnerStop {
+            targets: proof.targets.clone(),
+            generation: proof.generation + 1,
+            cancellation: proof.cancellation.clone(),
+        };
+        assert!(!wrong_generation.authorizes(&owner));
+        let (_tx, cancellation) = watch::channel(CancelSignal::OwnerRetirement);
+        let wrong_channel = ExactOwnerStop {
+            targets: proof.targets.clone(),
+            generation: proof.generation,
+            cancellation,
+        };
+        assert!(!wrong_channel.authorizes(&owner));
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+    }
+
+    #[tokio::test]
     async fn typed_owned_stop_retains_dispatched_initialization_debt_until_real_ack() {
         let (owner, _notices, log, emit, server, _broker, connection) =
             fixture_with_client("owner-retirement-runtime-held", true).await;
@@ -8053,7 +8393,7 @@ mod tests {
     ) {
         fixture_with_explicit_context_ownership(mode, managed, false).await
     }
-    async fn fixture_with_explicit_context_ownership(
+    pub(super) async fn fixture_with_explicit_context_ownership(
         mode: &'static str,
         managed: bool,
         owns_context: bool,
@@ -8165,7 +8505,7 @@ mod tests {
                         }
                         if method=="Target.detachFromTarget" {detach_count+=1;}
                         if mode=="hold-timezone" && method=="Emulation.setTimezoneOverride" { continue; }
-                        if (mode=="popup-runtime-held" || mode=="owner-retirement-runtime-held") && method=="Runtime.enable" && request["sessionId"]=="popup-session" { continue; }
+                        if (mode=="popup-runtime-held" || mode=="owner-retirement-runtime-held" || mode=="owner-retirement-runtime-held-query") && method=="Runtime.enable" && request["sessionId"]=="popup-session" { continue; }
                         let settings_error = match (mode, method) {
                             ("locale-already", "Emulation.setLocaleOverride") => Some("Another locale override is already in effect"),
                             ("timezone-already", "Emulation.setTimezoneOverride") => Some("Timezone override is already in effect"),
@@ -8212,6 +8552,7 @@ mod tests {
                         let mut result=match method {
                             "DOM.getDocument"=>json!({"root":{"nodeId":1,"children":if whitespace.get(request["sessionId"].as_str().unwrap())==Some(&true) {vec![json!({"nodeId":2,"nodeType":3,"nodeValue":" "})]}else{vec![]}}}),
                             "Page.createIsolatedWorld" if mode.starts_with("realm-resolve-reuse")=>json!({"executionContextId":7}),
+                            "Page.createIsolatedWorld" if mode=="owner-retirement-runtime-held-query"=>json!({"executionContextId":7}),
                             "DOM.resolveNode" if mode.starts_with("realm-resolve-reuse")=>json!({"object":{"objectId":"replacement-handle","subtype":"node"}}),
                             "Runtime.callFunctionOn" if mode.starts_with("realm-resolve-reuse")=>json!({"result":{"value":true}}),
                             "Page.getLayoutMetrics"=>json!({"cssVisualViewport":{"clientWidth":800.,"clientHeight":600.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":800.,"clientHeight":600.}}),
@@ -8659,6 +9000,19 @@ mod tests {
     ) {
         let watermark = owner.realm_watermark().unwrap();
         let before = watermark.received().unwrap();
+        // Scripted fixture identities only. Preserve the failing operation and
+        // error; do not turn cancellation into a successful watermark receipt.
+        let method = event["method"].as_str().unwrap_or("missing").to_owned();
+        let session = event["params"]["sessionId"]
+            .as_str()
+            .or_else(|| event["sessionId"].as_str())
+            .unwrap_or("missing")
+            .to_owned();
+        let target = event["params"]["targetId"]
+            .as_str()
+            .or_else(|| event["params"]["targetInfo"]["targetId"].as_str())
+            .unwrap_or("missing")
+            .to_owned();
         emit.send(event).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), async {
             while watermark.received().unwrap() == before {
@@ -8667,7 +9021,16 @@ mod tests {
             owner
                 .drain_capture_watermark(&watermark, &owner.operation())
                 .await
-                .unwrap();
+                .unwrap_or_else(|error| {
+                    let state = owner.index.try_lock().ok().map(|index| {
+                        (index.failure.clone(), index.pending_enrollment.len())
+                    });
+                    panic!(
+                        "realm_emit drain failed: method={method} session={session} target={target} error={error:?} stop={:?} sealed={} index={state:?}",
+                        *owner.stop.borrow(),
+                        owner.sealed.load(Ordering::Acquire),
+                    );
+                });
         })
         .await
         .unwrap();
@@ -15667,6 +16030,86 @@ mod tests {
     #[tokio::test]
     async fn service_worker_error_ack_never_reaches_ready_commit_gate() {
         failed_worker_pending_wait_case(FailedWorkerWaitCase::Deadline).await;
+    }
+
+    #[tokio::test]
+    async fn failed_worker_retirement_scope_guard_keeps_exact_source_and_failure_precedence() {
+        for mode in [
+            "owned",
+            "wrong-generation",
+            "wrong-channel",
+            "earlier-failure",
+            "ordinary-close",
+        ] {
+            let (owner, _notices, _log, _emit, server, _broker, connection) =
+                fixture_with_client("owner-retirement", true).await;
+            let mut op = owner.operation();
+            let (_other, other_cancellation) = watch::channel(CancelSignal::OwnerRetirement);
+            match mode {
+                "wrong-generation" => op.generation += 1,
+                "wrong-channel" => op.cancellation = other_cancellation,
+                "earlier-failure" => owner.poison(ProtocolError::BrowserFailure),
+                _ => {}
+            }
+            if mode == "ordinary-close" {
+                owner.seal();
+            } else {
+                owner.seal_for_owner_retirement(
+                    &super::super::client_browser::OwnerRetirement::for_test(&owner.targets),
+                );
+            }
+            let checked = owner.check_worker_retirement_operation(&op);
+            let valid = match (mode, &checked) {
+                ("owned", Err(InitFailure::OwnedStop(proof))) => proof.authorizes(&owner),
+                ("earlier-failure", Err(InitFailure::Operation(ProtocolError::BrowserFailure))) => {
+                    true
+                }
+                (
+                    "wrong-generation" | "wrong-channel" | "ordinary-close",
+                    Err(InitFailure::Operation(ProtocolError::StaleScope)),
+                ) => true,
+                _ => false,
+            };
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+            assert!(
+                valid,
+                "{mode}: unexpected retirement guard result {checked:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_worker_retirement_ordinary_errors_cannot_borrow_later_owner_stop() {
+        let (owner, _notices, _log, _emit, server, _broker, connection) =
+            fixture_with_client("owner-retirement", true).await;
+        let op = owner.operation();
+        // The returned errors are already ordinary; later sealing cannot
+        // reclassify their origin or mint a successful-retirement receipt.
+        let returned = [
+            ProtocolError::StaleScope,
+            ProtocolError::StaleReference,
+            ProtocolError::DeadlineExceeded,
+        ];
+        owner.seal_for_owner_retirement(&super::super::client_browser::OwnerRetirement::for_test(
+            &owner.targets,
+        ));
+        for error in returned {
+            assert_eq!(
+                owner.failed_worker_retirement_error(
+                    &op,
+                    ProtocolError::BrowserFailure,
+                    InitFailure::Operation(error.clone())
+                ),
+                error
+            );
+        }
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
     }
 
     #[tokio::test]

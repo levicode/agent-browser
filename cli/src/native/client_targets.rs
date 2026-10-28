@@ -1,10 +1,14 @@
 //! Owned target identity and creation-purpose reservations. Browser attachment
 //! waits on this registry before configuration/resume; no URL or timing guess
 //! assigns a bootstrap target to a generic request handler.
+#[path = "client_targets_page_query.rs"]
+mod page_query;
 use super::client_protocol::ProtocolError;
 use super::client_settlement_trace as diagnostic;
+use page_query::{AttachmentLineage, ProtectedExclusion};
+pub(crate) use page_query::{SelectedPageTargetBarrier, SelectedPageTargetSnapshot};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -29,10 +33,142 @@ pub struct OwnedTarget {
 }
 #[derive(Debug, Default)]
 struct AttachmentTenure {
+    lineage: AttachmentLineage,
+    query_revision: AtomicU64,
     owner: Arc<()>,
+    retained_initialization: AtomicBool,
     observed_media_detach: AtomicBool,
     observed_detach: AtomicBool,
     observed_iframe_detach: AtomicBool,
+}
+/// Non-cloneable custody of one supervisor-retained initializer. This is not
+/// configuration, capture, resume, CDP retirement, or owner-retirement proof.
+pub(super) struct RetainedInitialization {
+    registry: Arc<ClientTargets>,
+    target: Option<OwnedTarget>,
+    root: Option<OwnedTarget>,
+}
+impl RetainedInitialization {
+    pub(super) fn new(registry: Arc<ClientTargets>) -> Self {
+        Self {
+            registry,
+            target: None,
+            root: None,
+        }
+    }
+    pub(super) fn attach(
+        &mut self,
+        registry: &Arc<ClientTargets>,
+        context: &str,
+        target: String,
+        session: String,
+        kind: String,
+    ) -> Result<bool, ProtocolError> {
+        self.attach_with_root(registry, context, target, session, kind, None)
+    }
+    pub(super) fn attach_with_root(
+        &mut self,
+        registry: &Arc<ClientTargets>,
+        context: &str,
+        target: String,
+        session: String,
+        kind: String,
+        root: Option<OwnedTarget>,
+    ) -> Result<bool, ProtocolError> {
+        if self.target.is_some() || !Arc::ptr_eq(&self.registry, registry) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let attached =
+            registry.attach_inner(context, target, session, kind, true, root.as_ref(), true)?;
+        if let Some(target) = &attached {
+            // The registry marked the exact fresh tenure under its insertion
+            // lock. No await or fallible work separates insertion and custody.
+            if target
+                .tenure
+                .retained_initialization
+                .load(Ordering::Acquire)
+            {
+                self.target = Some(target.clone());
+                self.root = root;
+            }
+        }
+        Ok(attached.is_some())
+    }
+    pub(super) fn finish(&mut self, detached: bool) -> Result<(), ProtocolError> {
+        let Some(target) = &self.target else {
+            return Ok(());
+        };
+        let state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let original_absent = !state.targets.values().any(|current| {
+            current.target_id == target.target_id || current.session_id == target.session_id
+        });
+        let root_retired = self.root.as_ref().is_some_and(|root| {
+            root.tenure.observed_media_detach.load(Ordering::Acquire)
+                && !state.targets.values().any(|current| {
+                    current.target_id == root.target_id || current.session_id == root.session_id
+                })
+        });
+        let exactly_detached = original_absent
+            && (target.tenure.observed_detach.load(Ordering::Acquire)
+                || target.tenure.observed_iframe_detach.load(Ordering::Acquire)
+                || target.tenure.observed_media_detach.load(Ordering::Acquire)
+                || root_retired);
+        let valid = exactly_detached
+            || (!detached
+                && state.targets.get(&target.target_id).is_some_and(|current| {
+                    current.same_initialization_attachment(target) && current.capture_ready()
+                }));
+        if !valid {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        target
+            .tenure
+            .retained_initialization
+            .store(false, Ordering::Release);
+        drop(state);
+        self.target = None;
+        Ok(())
+    }
+    pub(super) fn stop_retired(
+        &mut self,
+        proof: &super::client_enrollment::ExactOwnerStop,
+    ) -> Result<(), ProtocolError> {
+        let state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !proof.authorizes_targets(&self.registry) || !state.sealed {
+            return Err(ProtocolError::StaleScope);
+        }
+        // Revoke only ordinary-operation custody. The frozen retirement
+        // inventory and all unready attachments/CDP debt remain unchanged.
+        if let Some(target) = &self.target {
+            target
+                .tenure
+                .retained_initialization
+                .store(false, Ordering::Release);
+        }
+        drop(state);
+        self.target = None;
+        Ok(())
+    }
+}
+impl Drop for RetainedInitialization {
+    fn drop(&mut self) {
+        if let Some(target) = self.target.take() {
+            // Publish loss BEFORE removing custody, including panic/abort.
+            self.registry.seal();
+            target
+                .tenure
+                .retained_initialization
+                .store(false, Ordering::Release);
+        }
+    }
 }
 impl OwnedTarget {
     pub(super) fn same_initialization_attachment(&self, other: &Self) -> bool {
@@ -75,6 +211,7 @@ impl OwnedTarget {
 #[derive(Default)]
 struct Registry {
     revision: u64,
+    query_unknown_revision: u64,
     revision_history: Option<RevisionHistory>,
     sealed: bool,
     integrity_lost: bool,
@@ -86,7 +223,7 @@ struct Registry {
     bootstrap_cleanup_reservations: HashSet<u64>,
     unknown_bootstrap_create: bool,
     resuming: usize,
-    protected_read: bool,
+    protected_read: Option<ProtectedExclusion>,
     enrollment_ready: bool,
     targets: HashMap<String, OwnedTarget>,
     diagnostic_identities: Option<HashMap<String, u64>>,
@@ -342,6 +479,7 @@ pub struct InventoryStamp {
     pub targets: Vec<OwnedTarget>,
 }
 pub struct ProtectedTargetBarrier {
+    token: Arc<()>,
     registry: Arc<ClientTargets>,
     pub stamp: InventoryStamp,
 }
@@ -365,7 +503,13 @@ impl ProtectedTargetBarrier {
 impl Drop for ProtectedTargetBarrier {
     fn drop(&mut self) {
         if let Ok(mut state) = self.registry.state.lock() {
-            state.protected_read = false;
+            if state
+                .protected_read
+                .as_ref()
+                .is_some_and(|exclusion| exclusion.matches_token(&self.token))
+            {
+                state.protected_read = None;
+            }
         }
         self.registry.changed.notify_waiters();
     }
@@ -426,7 +570,10 @@ impl ResumePermit {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if state.sealed
             || state.integrity_lost
-            || state.protected_read
+            || state
+                .protected_read
+                .as_ref()
+                .is_some_and(|exclusion| exclusion.excludes_tenure(&self.tenure))
             || state.resuming == 0
             || !self.tenure.observed_detach.load(Ordering::Acquire)
             || state
@@ -467,7 +614,7 @@ impl ResumePermit {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.integrity_lost || state.protected_read || state.resuming == 0 {
+        if state.integrity_lost || state.live_resume_excluded(&self.tenure) || state.resuming == 0 {
             return Err(ProtocolError::StaleScope);
         }
         self.complete_locked(&mut state, check_bounds)
@@ -656,7 +803,7 @@ impl ClientTargets {
         if state.sealed
             || state.reservations != 0
             || state.resuming != 0
-            || state.protected_read
+            || state.protected_read.is_some()
             || state
                 .targets
                 .values()
@@ -682,7 +829,7 @@ impl ClientTargets {
             || !state.enrollment_ready
             || state.reservations != 0
             || state.resuming != 0
-            || state.protected_read
+            || state.protected_read.is_some()
             || state
                 .targets
                 .values()
@@ -702,7 +849,7 @@ impl ClientTargets {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if state.sealed
             || !state.enrollment_ready
-            || state.protected_read
+            || state.protected_read.is_some()
             || state.reservations != 0
             || state.resuming != 0
             || state
@@ -716,8 +863,12 @@ impl ClientTargets {
         {
             return Err(ProtocolError::ScopeUnavailable);
         }
-        state.protected_read = true;
+        let token = Arc::new(());
+        state.protected_read = Some(ProtectedExclusion::Global {
+            token: token.clone(),
+        });
         Ok(ProtectedTargetBarrier {
+            token,
             registry: self.clone(),
             stamp: InventoryStamp {
                 revision: state.revision,
@@ -787,7 +938,7 @@ impl ClientTargets {
                 if !eligible || target.resumed || target.resume_pending {
                     return Err(ProtocolError::InvalidArguments);
                 }
-                if !state.protected_read {
+                if !state.live_resume_excluded(&target.tenure) {
                     let session_id = target.session_id.clone();
                     let tenure = target.tenure.clone();
                     let resuming = state
@@ -821,7 +972,7 @@ impl ClientTargets {
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed || state.protected_read {
+        if state.sealed || state.protected_read.is_some() {
             return Err(ProtocolError::StaleScope);
         }
         let reservations = state
@@ -960,7 +1111,7 @@ impl ClientTargets {
         {
             return Err(ProtocolError::ScopeUnavailable);
         }
-        if state.protected_read
+        if state.protected_read.is_some()
             || state
                 .auxiliary
                 .values()
@@ -1112,8 +1263,32 @@ impl ClientTargets {
         session_id: String,
         kind: String,
     ) -> Result<bool, ProtocolError> {
+        self.attach_inner(context_id, target_id, session_id, kind, false, None, false)
+            .map(|target| target.is_some())
+    }
+    pub(super) fn attached_enrolled(
+        &self,
+        context: &str,
+        target: String,
+        session: String,
+        kind: String,
+        root: Option<&OwnedTarget>,
+    ) -> Result<bool, ProtocolError> {
+        self.attach_inner(context, target, session, kind, false, root, true)
+            .map(|target| target.is_some())
+    }
+    fn attach_inner(
+        &self,
+        context_id: &str,
+        target_id: String,
+        session_id: String,
+        kind: String,
+        retained: bool,
+        root: Option<&OwnedTarget>,
+        enrolled: bool,
+    ) -> Result<Option<OwnedTarget>, ProtocolError> {
         if context_id != self.context_id {
-            return Ok(false);
+            return Ok(None);
         }
         self.eval_invalidation(|revoke| {
             revoke();
@@ -1137,6 +1312,22 @@ impl ClientTargets {
             {
                 return Err(ProtocolError::InvalidArguments);
             }
+            if let Some(root) = root {
+                if root.kind != "page"
+                    || !Arc::ptr_eq(&root.tenure.owner, &self.attachment_owner)
+                    || !state
+                        .targets
+                        .get(&root.target_id)
+                        .is_some_and(|current| current.same_initialization_attachment(root))
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+            }
+            let lineage = if enrolled {
+                AttachmentLineage::enrolled(&kind, root)?
+            } else {
+                AttachmentLineage::Unknown
+            };
             let purpose = if state.reservations == 0 {
                 Some(TargetPurpose::Application)
             } else {
@@ -1146,26 +1337,31 @@ impl ClientTargets {
                 .revision
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
+            state.note_query_membership_change(&lineage)?;
             let diagnostic = state.diagnostic_attachment(&target_id);
             let tenure = Arc::new(AttachmentTenure {
+                lineage,
                 owner: self.attachment_owner.clone(),
+                retained_initialization: AtomicBool::new(
+                    retained && purpose == Some(TargetPurpose::Application),
+                ),
                 ..Default::default()
             });
             let observed_tenure = diagnostic::inventory_enabled().then(|| tenure.clone());
-            state.targets.insert(
-                target_id.clone(),
-                OwnedTarget {
-                    target_id,
-                    session_id,
-                    kind,
-                    purpose,
-                    configured: false,
-                    resumed: false,
-                    resume_pending: false,
-                    tenure,
-                    diagnostic,
-                },
-            );
+            let target = OwnedTarget {
+                target_id,
+                session_id,
+                kind,
+                purpose,
+                configured: false,
+                resumed: false,
+                resume_pending: false,
+                tenure,
+                diagnostic,
+            };
+            state
+                .targets
+                .insert(target.target_id.clone(), target.clone());
             if let Some(tenure) = observed_tenure {
                 state.note_revision_enabled(
                     diagnostic::InventoryRevisionEvent::Attach,
@@ -1174,7 +1370,7 @@ impl ClientTargets {
             }
             drop(state);
             self.changed.notify_waiters();
-            Ok(true)
+            Ok(Some(target))
         })
     }
     /// The create reply and attach event may arrive in either order. The
@@ -1366,6 +1562,29 @@ impl ClientTargets {
         }
         Ok(())
     }
+    /// Exact page-root identity only, including an unclassified reservation
+    /// phase. This grants no Application, Ready, capture or retirement authority.
+    pub(super) fn initializing_root_ticket(
+        &self,
+        target: &str,
+        session: &str,
+    ) -> Result<OwnedTarget, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.sealed || state.integrity_lost {
+            return Err(ProtocolError::StaleScope);
+        }
+        let root = state
+            .targets
+            .get(target)
+            .ok_or(ProtocolError::StaleReference)?;
+        if root.kind != "page" || root.session_id != session {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(root.clone())
+    }
     /// Capture registration identity even while a creation reservation has not
     /// classified purpose. This grants neither Application nor Ready authority.
     pub(super) fn initializing_iframe_tickets(
@@ -1438,7 +1657,10 @@ impl ClientTargets {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if state.sealed
             || state.integrity_lost
-            || state.protected_read
+            || state
+                .protected_read
+                .as_ref()
+                .is_some_and(|exclusion| exclusion.excludes_iframe(child, root))
             || child.kind != "iframe"
             || root.kind != "page"
             || !Arc::ptr_eq(&self.attachment_owner, &child.tenure.owner)
@@ -1492,7 +1714,7 @@ impl ClientTargets {
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if state.sealed
             || state.integrity_lost
-            || state.protected_read
+            || state.protected_read.as_ref().is_some_and(|exclusion| exclusion.excludes_queued_iframe(parent, root))
             || root.kind != "page"
             || !matches!(parent.kind.as_str(), "page" | "iframe")
             // Auxiliary classification can retain cleanup ownership before
@@ -1565,6 +1787,9 @@ impl ClientTargets {
                 .lock()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
             let removed = state.targets.remove(target_id);
+            if let Some(target) = &removed {
+                state.note_query_membership_change(&target.tenure.lineage)?;
+            }
             if removed.is_some() {
                 state.revision = state
                     .revision
@@ -1618,6 +1843,25 @@ impl ClientTargets {
                 .revision
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
+            // Query-only exact-document fence; the original global revision
+            // and all capture/cleanup consumers remain unchanged.
+            if let Some(tenure) = target
+                .and_then(|id| state.targets.get(id))
+                .map(|target| target.tenure.clone())
+            {
+                let Some(next) = tenure.query_revision.load(Ordering::Acquire).checked_add(1)
+                else {
+                    state.lose_integrity();
+                    return Err(ProtocolError::IdentifierExhausted);
+                };
+                tenure.query_revision.store(next, Ordering::Release);
+            } else {
+                let Some(next) = state.query_unknown_revision.checked_add(1) else {
+                    state.lose_integrity();
+                    return Err(ProtocolError::IdentifierExhausted);
+                };
+                state.query_unknown_revision = next;
+            }
             if diagnostic::inventory_enabled() {
                 let attachment = target
                     .and_then(|target| state.targets.get(target))
@@ -1667,7 +1911,7 @@ impl ClientTargets {
         if state.sealed
             || state.integrity_lost
             || !state.enrollment_ready
-            || state.protected_read
+            || state.protected_read.is_some()
             || state.reservations != 0
             || state
                 .auxiliary
@@ -1842,7 +2086,7 @@ impl ClientTargets {
             || !state.enrollment_ready
             || state.reservations != 0
             || state.resuming != 0
-            || state.protected_read
+            || state.protected_read.is_some()
             || !state.bootstrap_creations.is_empty()
             || !state.native_bootstrap_cleanup.is_empty()
             || !state.bootstrap_cleanup_reservations.is_empty()
@@ -1872,7 +2116,7 @@ impl ClientTargets {
             || !state.targets.is_empty()
             || state.reservations != 0
             || state.resuming != 0
-            || state.protected_read
+            || state.protected_read.is_some()
             || !state.bootstrap_creations.is_empty()
             || !state.native_bootstrap_cleanup.is_empty()
             || !state.bootstrap_cleanup_reservations.is_empty()
@@ -1969,12 +2213,48 @@ impl ClientTargets {
         }
     }
     #[cfg(test)]
+    pub(super) fn retained_initialization_state_for_test(
+        &self,
+        target: &str,
+    ) -> (bool, Option<bool>, bool) {
+        let state = self.state.lock().unwrap();
+        (
+            state.targets[target]
+                .tenure
+                .retained_initialization
+                .load(Ordering::Acquire),
+            state.owner_retirement_inventory,
+            state.integrity_lost,
+        )
+    }
+    #[cfg(test)]
     pub(crate) fn check_settlement_integrity(&self) -> Result<(), ProtocolError> {
         self.settlement_integrity_diagnostic(false).0
     }
     pub(crate) fn settlement_integrity_diagnostic(
         &self,
         observe: bool,
+    ) -> (
+        Result<(), ProtocolError>,
+        super::client_settlement_trace::InventorySnapshot,
+    ) {
+        self.settlement_integrity_diagnostic_inner(observe, false)
+    }
+    /// Operation-local completion may leave unrelated initialization with its
+    /// exact retained producer. This does not relax full inventory callers.
+    pub(crate) fn operation_settlement_integrity_diagnostic(
+        &self,
+        observe: bool,
+    ) -> (
+        Result<(), ProtocolError>,
+        super::client_settlement_trace::InventorySnapshot,
+    ) {
+        self.settlement_integrity_diagnostic_inner(observe, true)
+    }
+    fn settlement_integrity_diagnostic_inner(
+        &self,
+        observe: bool,
+        allow_retained_initialization: bool,
     ) -> (
         Result<(), ProtocolError>,
         super::client_settlement_trace::InventorySnapshot,
@@ -1988,7 +2268,19 @@ impl ClientTargets {
             Default::default()
         };
         let result = if state.integrity_lost
-            || !state.inventory_complete()
+            || !(state.inventory_complete()
+                || (allow_retained_initialization
+                    && !state.sealed
+                    && state.reservations == 0
+                    && state.targets.values().all(|target| {
+                        target.purpose.is_some()
+                            && (target.configured
+                                || (Arc::ptr_eq(&target.tenure.owner, &self.attachment_owner)
+                                    && target
+                                        .tenure
+                                        .retained_initialization
+                                        .load(Ordering::Acquire)))
+                    })))
             || (state.sealed && state.owner_retirement_inventory != Some(true))
         {
             Err(ProtocolError::ScopeUnavailable)
@@ -2387,6 +2679,297 @@ impl Drop for CreationReservation {
 mod tests {
     use super::{ClientTargets, ProtocolError};
 
+    #[test]
+    fn retained_initializer_root_ticket_is_exact_and_cascade_releases_no_readiness() {
+        for obstruction in ["none", "foreign", "replaced", "detached", "unobserved"] {
+            let registry = ClientTargets::new("ctx".into(), "scope".into());
+            registry
+                .attached("ctx", "root".into(), "root-session".into(), "page".into())
+                .unwrap();
+            let root = if obstruction == "foreign" {
+                let other = ClientTargets::new("ctx".into(), "scope".into());
+                other
+                    .attached("ctx", "root".into(), "root-session".into(), "page".into())
+                    .unwrap();
+                other.owned_target("root").unwrap()
+            } else {
+                registry.owned_target("root").unwrap()
+            };
+            if obstruction == "replaced" {
+                registry.detach("root").unwrap();
+                registry
+                    .attached("ctx", "root".into(), "root-session".into(), "page".into())
+                    .unwrap();
+            }
+            if obstruction == "detached" {
+                registry.detach("root").unwrap();
+            }
+            let mut custody = super::RetainedInitialization::new(registry.clone());
+            let attached = custody.attach_with_root(
+                &registry,
+                "ctx",
+                "child".into(),
+                "child-session".into(),
+                "iframe".into(),
+                Some(root),
+            );
+            if matches!(obstruction, "foreign" | "replaced" | "detached") {
+                assert_eq!(attached, Err(ProtocolError::StaleScope));
+                assert!(!registry.state.lock().unwrap().targets.contains_key("child"));
+                continue;
+            }
+            attached.unwrap();
+            if obstruction != "unobserved" {
+                registry
+                    .observe_media_detach("root", "root-session")
+                    .unwrap();
+            }
+            registry.detach("root").unwrap();
+            registry.detach("child").unwrap();
+            assert_eq!(custody.finish(true).is_ok(), obstruction == "none");
+            drop(custody);
+            assert_eq!(
+                registry.state.lock().unwrap().integrity_lost,
+                obstruction == "unobserved"
+            );
+            assert!(registry.state.lock().unwrap().targets.is_empty());
+        }
+    }
+
+    #[test]
+    fn retained_initializer_unclassified_root_identity_does_not_grant_settlement() {
+        let registry = ClientTargets::new("ctx".into(), "scope".into());
+        let reservation = registry
+            .reserve_creation(super::TargetPurpose::Application)
+            .unwrap();
+        registry
+            .attached("ctx", "root".into(), "root-session".into(), "page".into())
+            .unwrap();
+        assert!(registry.owned_target("root").is_err());
+        let root = registry
+            .initializing_root_ticket("root", "root-session")
+            .unwrap();
+        assert_eq!(root.purpose, None);
+        assert!(!root.capture_ready());
+        let mut custody = super::RetainedInitialization::new(registry.clone());
+        custody
+            .attach_with_root(
+                &registry,
+                "ctx",
+                "child".into(),
+                "child-session".into(),
+                "iframe".into(),
+                Some(root),
+            )
+            .unwrap();
+        assert!(registry
+            .operation_settlement_integrity_diagnostic(false)
+            .0
+            .is_err());
+        assert!(registry.inventory().is_err());
+        assert!(!registry.state.lock().unwrap().integrity_lost);
+        drop(reservation);
+        // Classification is not configuration, nor a retroactive custody mint.
+        assert!(registry
+            .operation_settlement_integrity_diagnostic(false)
+            .0
+            .is_err());
+        assert!(!registry.state.lock().unwrap().targets["child"]
+            .tenure
+            .retained_initialization
+            .load(std::sync::atomic::Ordering::Acquire));
+        drop(custody);
+    }
+    fn retained_initializer(
+        registry: &std::sync::Arc<ClientTargets>,
+    ) -> super::RetainedInitialization {
+        let mut custody = super::RetainedInitialization::new(registry.clone());
+        custody
+            .attach(
+                registry,
+                "ctx",
+                "popup".into(),
+                "popup-session".into(),
+                "page".into(),
+            )
+            .unwrap();
+        custody
+    }
+    #[test]
+    fn retained_initializer_custody_covers_only_operation_completion() {
+        let registry = ClientTargets::new("ctx".into(), "scope".into());
+        let custody = retained_initializer(&registry);
+        assert!(registry
+            .operation_settlement_integrity_diagnostic(false)
+            .0
+            .is_ok());
+        assert!(registry.check_settlement_integrity().is_err());
+        assert!(registry.inventory().is_err());
+        let target = registry.owned_target("popup").unwrap();
+        assert!(!target.configured && !target.resumed && !target.capture_ready());
+        drop(custody);
+        assert!(registry.state.lock().unwrap().integrity_lost);
+        assert!(registry
+            .operation_settlement_integrity_diagnostic(false)
+            .0
+            .is_err());
+    }
+    #[test]
+    fn retained_initializer_never_covers_untracked_or_reserved_work() {
+        for reserved in [false, true] {
+            let registry = ClientTargets::new("ctx".into(), "scope".into());
+            let custody = retained_initializer(&registry);
+            let reservation = if reserved {
+                Some(
+                    registry
+                        .reserve_creation(super::TargetPurpose::Application)
+                        .unwrap(),
+                )
+            } else {
+                registry
+                    .attached(
+                        "ctx",
+                        "untracked".into(),
+                        "untracked-session".into(),
+                        "page".into(),
+                    )
+                    .unwrap();
+                None
+            };
+            assert!(registry
+                .operation_settlement_integrity_diagnostic(false)
+                .0
+                .is_err());
+            assert!(!registry.state.lock().unwrap().integrity_lost);
+            drop(custody);
+            drop(reservation);
+        }
+    }
+    #[tokio::test]
+    async fn retained_initializer_success_releases_only_exact_custody() {
+        let registry = ClientTargets::new("ctx".into(), "scope".into());
+        let mut custody = retained_initializer(&registry);
+        assert!(custody.finish(false).is_err());
+        registry.configured("popup").unwrap();
+        registry
+            .resume_permit("popup")
+            .await
+            .unwrap()
+            .complete()
+            .unwrap();
+        custody.finish(false).unwrap();
+        drop(custody);
+        assert!(registry.check_settlement_integrity().is_ok());
+        assert!(!registry
+            .owned_target("popup")
+            .unwrap()
+            .tenure
+            .retained_initialization
+            .load(std::sync::atomic::Ordering::Acquire));
+        assert!(!registry.state.lock().unwrap().integrity_lost);
+    }
+    #[test]
+    fn retained_initializer_rejects_foreign_registry_and_identical_text_reattachment() {
+        let registry = ClientTargets::new("ctx".into(), "scope".into());
+        let other = ClientTargets::new("ctx".into(), "scope".into());
+        let mut custody = super::RetainedInitialization::new(registry.clone());
+        assert_eq!(
+            custody.attach(
+                &other,
+                "ctx",
+                "popup".into(),
+                "popup-session".into(),
+                "page".into()
+            ),
+            Err(ProtocolError::StaleScope)
+        );
+        assert!(other.state.lock().unwrap().targets.is_empty());
+        custody
+            .attach(
+                &registry,
+                "ctx",
+                "popup".into(),
+                "popup-session".into(),
+                "page".into(),
+            )
+            .unwrap();
+        registry.detach("popup").unwrap();
+        registry
+            .attached("ctx", "popup".into(), "popup-session".into(), "page".into())
+            .unwrap();
+        assert!(registry
+            .operation_settlement_integrity_diagnostic(false)
+            .0
+            .is_err());
+        assert!(custody.finish(false).is_err());
+        assert!(custody.finish(true).is_err());
+        drop(custody);
+        assert!(registry.state.lock().unwrap().integrity_lost);
+    }
+    #[tokio::test]
+    async fn retained_initializer_abort_and_panic_poison_before_custody_disappears() {
+        for panic in [false, true] {
+            let registry = ClientTargets::new("ctx".into(), "scope".into());
+            let custody = retained_initializer(&registry);
+            let (entered, observed) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _custody = custody;
+                entered.send(()).unwrap();
+                if panic {
+                    panic!("controlled retained initializer panic");
+                }
+                std::future::pending::<()>().await;
+            });
+            observed.await.unwrap();
+            if !panic {
+                task.abort();
+            }
+            assert!(task.await.is_err());
+            let state = registry.state.lock().unwrap();
+            assert!(state.sealed && state.integrity_lost);
+            assert!(!state.targets["popup"]
+                .tenure
+                .retained_initialization
+                .load(std::sync::atomic::Ordering::Acquire));
+            drop(state);
+            assert!(registry
+                .operation_settlement_integrity_diagnostic(false)
+                .0
+                .is_err());
+        }
+    }
+    #[test]
+    fn retained_initializer_owner_retirement_keeps_strict_frozen_inventory() {
+        let registry = ClientTargets::new("ctx".into(), "scope".into());
+        let custody = retained_initializer(&registry);
+        registry.seal_for_owner_retirement(
+            &super::super::client_browser::OwnerRetirement::for_test(&registry),
+        );
+        assert_eq!(
+            registry.state.lock().unwrap().owner_retirement_inventory,
+            Some(false)
+        );
+        assert!(registry
+            .operation_settlement_integrity_diagnostic(false)
+            .0
+            .is_err());
+        assert!(registry.check_settlement_integrity().is_err());
+        drop(custody);
+        assert_eq!(
+            registry.state.lock().unwrap().owner_retirement_inventory,
+            Some(false)
+        );
+    }
+    #[test]
+    fn retained_initializer_observed_detach_is_not_generic_target_absence() {
+        let registry = ClientTargets::new("ctx".into(), "scope".into());
+        let mut custody = retained_initializer(&registry);
+        registry.detach("popup").unwrap();
+        assert!(custody.finish(true).is_err());
+        drop(custody);
+        assert!(registry.state.lock().unwrap().integrity_lost);
+    }
+
     #[tokio::test]
     async fn sealed_observation_comparison_ignores_only_health_not_attachment_tenure() {
         for mode in ["sealed", "removed", "replacement"] {
@@ -2716,7 +3299,9 @@ mod tests {
     #[tokio::test]
     async fn service_worker_startup_replacement_while_waiting_is_rejected() {
         let targets = startup_worker();
-        targets.state.lock().unwrap().protected_read = true;
+        targets.state.lock().unwrap().protected_read = Some(ProtectedExclusion::Global {
+            token: Arc::new(()),
+        });
         let future = targets.service_worker_startup_permit("worker", "session");
         tokio::pin!(future);
         assert!(
@@ -2733,7 +3318,7 @@ mod tests {
                 "service_worker".into(),
             )
             .unwrap();
-        targets.state.lock().unwrap().protected_read = false;
+        targets.state.lock().unwrap().protected_read = None;
         targets.changed.notify_waiters();
         assert!(matches!(future.await, Err(ProtocolError::StaleScope)));
         assert_eq!(targets.state.lock().unwrap().resuming, 0);
@@ -2756,7 +3341,9 @@ mod tests {
     #[tokio::test]
     async fn service_worker_startup_waits_for_protected_read_without_setting_configured() {
         let targets = startup_worker();
-        targets.state.lock().unwrap().protected_read = true;
+        targets.state.lock().unwrap().protected_read = Some(ProtectedExclusion::Global {
+            token: Arc::new(()),
+        });
         let future = targets.service_worker_startup_permit("worker", "session");
         tokio::pin!(future);
         assert!(
@@ -2768,7 +3355,7 @@ mod tests {
             let mut state = targets.state.lock().unwrap();
             assert_eq!(state.resuming, 0);
             assert!(!state.targets["worker"].configured);
-            state.protected_read = false;
+            state.protected_read = None;
         }
         targets.changed.notify_waiters();
         let permit = future.await.unwrap();
@@ -3064,7 +3651,11 @@ mod tests {
                 match case {
                     "reservation" => state.reservations = 1,
                     "resuming" => state.resuming = 1,
-                    "protected" => state.protected_read = true,
+                    "protected" => {
+                        state.protected_read = Some(ProtectedExclusion::Global {
+                            token: Arc::new(()),
+                        })
+                    }
                     "bootstrap" => {
                         state.bootstrap_creations.insert(1, None);
                     }
