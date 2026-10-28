@@ -451,6 +451,19 @@ impl PageQueryAuthority {
                     return Err(refuse(ProtocolError::StaleScope, Reason::WatermarkPending));
                 }
                 if index.applied_watermark < received {
+                    #[cfg(test)]
+                    if stage == Stage::FinalFrames {
+                        if let Some(gate) = owner
+                            .capture_test_gates
+                            .lock()
+                            .unwrap()
+                            .remove(&CaptureTestPoint::QueryEventPrefixObserved)
+                        {
+                            // Receipt identifies this exact real final boundary;
+                            // it never pauses or changes the pending decision.
+                            gate.entered.add_permits(1);
+                        }
+                    }
                     return Ok(QueryBoundary::Pending(QueryEventPrefix {
                         watermark: watermark.clone(),
                         received,
@@ -672,7 +685,11 @@ impl PageAcquisitionProof {
                 false,
                 Stage::Publication,
                 &self.watermark,
-                &mut Some(|_, _, _| publish()),
+                &mut Some(
+                    |_: &[Attribution],
+                     _: &SelectedPageTargetSnapshot,
+                     _: &BoundedEventWatermark| publish(),
+                ),
             )
             .map(|progress| progress.map(|(value, _)| value))
     }
@@ -1853,6 +1870,14 @@ mod retained_peer_tests {
                 let dispatch = ObservationDispatch::new(refs.clone());
                 let query_page = owner.lease(&initial).unwrap();
                 let world_gate = scoped.then(CaptureTestGate::new);
+                let boundary_gate = scoped.then(CaptureTestGate::new);
+                if let Some(gate) = &boundary_gate {
+                    owner
+                        .capture_test_gates
+                        .lock()
+                        .unwrap()
+                        .insert(CaptureTestPoint::QueryEventPrefixObserved, gate.clone());
+                }
                 if let Some(gate) = &world_gate {
                     owner
                         .capture_test_gates
@@ -1875,6 +1900,9 @@ mod retained_peer_tests {
                     .await;
                 let mut result_receiver = task.result;
                 let mut content_before = 0;
+                let mut ui_was_held = false;
+                let mut refs_were_private = false;
+                let mut early_result = None;
                 if let Some(gate) = &world_gate {
                     tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
                         .await
@@ -1888,21 +1916,34 @@ mod retained_peer_tests {
                         .cloned()
                         .unwrap();
                     emit.send(json!({"id":world["id"],"sessionId":world["sessionId"],"result":{"executionContextId":7}})).await.unwrap();
+                    // Both old and candidate source emit this receipt only
+                    // after the real watermark predicate has selected pending.
+                    // ACK send alone is not a proof the query consumed it.
+                    tokio::time::timeout(
+                        Duration::from_secs(2),
+                        boundary_gate.as_ref().unwrap().wait_entered(),
+                    )
+                    .await
+                    .unwrap();
+                    eprintln!(
+                        "FINAL_QUERY_PREFIX_OBSERVED phase=final-frames command_ack_consumed=true"
+                    );
                     let blocked_ui = ui.enter(true, false, op.deadline, op.cancellation.clone());
                     tokio::pin!(blocked_ui);
-                    assert!(matches!(
+                    ui_was_held = matches!(
                         futures_util::poll!(&mut blocked_ui),
                         std::task::Poll::Pending
-                    ));
+                    );
                     assert!(
                         owner.index.lock().unwrap().applied_watermark
                             < owner.realm_watermark().unwrap().received().unwrap()
                     );
-                    assert!(matches!(
-                        result_receiver.try_recv(),
-                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-                    ));
-                    assert!(refs.lock().unwrap().ref_ids().is_empty());
+                    early_result = match result_receiver.try_recv() {
+                        Ok(result) => Some(result),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+                        Err(error) => panic!("query result channel closed: {error:?}"),
+                    };
+                    refs_were_private = refs.lock().unwrap().ref_ids().is_empty();
                     // Matcher has already run before the final frame event.
                     content_before = log
                         .lock()
@@ -1918,8 +1959,12 @@ mod retained_peer_tests {
                     assert!(content_before > 0);
                     gate.release.add_permits(1);
                 }
-                let received =
-                    tokio::time::timeout(Duration::from_secs(2), &mut result_receiver).await;
+                let received = match early_result {
+                    Some(result) => Ok(Ok(result)),
+                    None => {
+                        tokio::time::timeout(Duration::from_secs(2), &mut result_receiver).await
+                    }
+                };
                 if received.is_err() {
                     // Release the real held ACK and retain/join the task before failing.
                     // This is a test observation bound, not a renewed operation budget.
@@ -1946,6 +1991,7 @@ mod retained_peer_tests {
                     continue;
                 }
                 let result = result.unwrap();
+                assert!(ui_was_held && refs_were_private);
                 let content_after = log
                     .lock()
                     .unwrap()
@@ -3057,5 +3103,123 @@ mod atomic_query_boundary_tests {
         connection.close().await;
         server.abort();
         let _ = server.await;
+    }
+    #[tokio::test]
+    async fn actual_query_commit_pending_preserves_staged_refs_and_retirement_fence() {
+        for retire in [false, true] {
+            let (owner, _notices, _log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-query",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&entry).unwrap();
+            let selected = owner.targets.owned_target("initial-target").unwrap();
+            let authority = owner.page_query_authority(&page, &selected).unwrap();
+            let mut op = owner.operation();
+            op.sequence = 2;
+            let original_deadline = op.deadline;
+            let proof = authority.acquire(&page, &op).unwrap();
+            let ui = owner.network.ui_gate_for_test();
+            let ui_permit = ui
+                .enter(true, false, op.deadline, op.cancellation.clone())
+                .await
+                .unwrap();
+            let barrier = proof.begin_read(&page, &op).unwrap();
+            use crate::native::client_blobs::{BlobLimits, BlobScope, BlobStore};
+            use crate::native::client_observation_dispatch::ObservationDispatch;
+            use crate::native::element::{ExactBinding, RefMap};
+            let refs = Arc::new(Mutex::new(RefMap::new()));
+            let dispatch = ObservationDispatch::new(refs.clone());
+            let mut staged = refs.lock().unwrap().clone();
+            let binding = ExactBinding {
+                page_session: "initial".into(),
+                session: "initial".into(),
+                frame: "frame-initial".into(),
+                loader: "synthetic-loader".into(),
+                actionable: true,
+            };
+            let staged_id = staged
+                .try_bind_exact(7, "button", "selected", binding.clone())
+                .unwrap();
+            let blobs = BlobStore::new(BlobLimits::default()).unwrap();
+            let scope = BlobScope {
+                generation: op.generation,
+                identity_scope: page.identity_scope.clone(),
+            };
+            blobs.activate_scope(scope.clone()).unwrap();
+            let event = hold_event(&owner, &emit, 91).await;
+            {
+                let commit = dispatch
+                    .commit_query_staged_for_test(&page, &op, &proof, staged, &blobs, &scope);
+                tokio::pin!(commit);
+                assert!(matches!(
+                    futures_util::poll!(&mut commit),
+                    std::task::Poll::Pending
+                ));
+                assert!(dispatch.query_commit_short_locks_available_for_test());
+                assert!(refs.lock().unwrap().ref_ids().is_empty());
+                if retire {
+                    // Real retirement advances captures before awaiting the
+                    // publication mutex held by the pending original commit.
+                    let retirement = dispatch.retire_interaction();
+                    tokio::pin!(retirement);
+                    assert!(matches!(
+                        futures_util::poll!(&mut retirement),
+                        std::task::Poll::Pending
+                    ));
+                    assert!(dispatch.query_commit_short_locks_available_for_test());
+                    assert!(refs.lock().unwrap().ref_ids().is_empty());
+                    event.release.add_permits(1);
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(2), &mut commit)
+                            .await
+                            .unwrap(),
+                        Err(ProtocolError::StaleReference)
+                    );
+                    tokio::time::timeout(Duration::from_secs(2), &mut retirement)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert!(refs.lock().unwrap().ref_ids().is_empty());
+                } else {
+                    event.release.add_permits(1);
+                    assert_eq!(
+                        tokio::time::timeout(Duration::from_secs(2), &mut commit)
+                            .await
+                            .unwrap(),
+                        Ok(1)
+                    );
+                    let committed = refs.lock().unwrap();
+                    assert_eq!(committed.ref_ids().len(), 1);
+                    assert!(committed.ref_ids().contains(&staged_id));
+                    assert_eq!(
+                        committed.get(&staged_id).unwrap().exact_binding.as_ref(),
+                        Some(&binding)
+                    );
+                }
+            }
+            assert_eq!(op.deadline, original_deadline);
+            // A discarded staged native identifier is never recycled.
+            let next = refs
+                .lock()
+                .unwrap()
+                .try_bind_exact(8, "button", "next", binding)
+                .unwrap();
+            assert_ne!(next, staged_id);
+            drop(barrier);
+            drop(ui_permit);
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+        }
     }
 }

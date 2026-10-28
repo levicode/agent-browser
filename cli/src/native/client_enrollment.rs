@@ -784,6 +784,7 @@ struct CaptureSnapshot {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CaptureTestPoint {
+    QueryEventPrefixObserved,
     RestartWaiting,
     RestartPageResumeWaiting,
     BeforeInitializationResumeRelease,
@@ -8677,6 +8678,7 @@ mod tests {
             let mut inventory_reads = 0;
             let mut query_world_emitted = false;
             let mut query_frame_reads = 0usize;
+            let mut query_matcher_seen = false;
             let mut realm_loader = "synthetic-loader".to_owned();
             let mut whitespace = HashMap::<String, bool>::new();
             let mut closed_targets = std::collections::HashSet::<String>::new();
@@ -8786,8 +8788,12 @@ mod tests {
                             let body=if mode=="large-first-request" {"b".repeat(1536*1024)} else {String::new()};
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
                         }
-                        if mode=="owner-retirement-runtime-held-dispatch-final" && method=="Page.getFrameTree" && request["sessionId"]=="initial" { query_frame_reads += 1; }
-                        if mode=="owner-retirement-runtime-held-dispatch-final" && method=="Page.createIsolatedWorld" && query_frame_reads >= 7 && !query_world_emitted {
+                        if mode=="owner-retirement-runtime-held-dispatch-final" && method=="Runtime.callFunctionOn" && request["params"]["functionDeclaration"].as_str().is_some_and(|declaration| declaration.starts_with("function(expression")) {
+                            query_matcher_seen = true;
+                            query_frame_reads = 0;
+                        }
+                        if mode=="owner-retirement-runtime-held-dispatch-final" && query_matcher_seen && method=="Page.getFrameTree" && request["sessionId"]=="initial" { query_frame_reads += 1; }
+                        if mode=="owner-retirement-runtime-held-dispatch-final" && query_matcher_seen && method=="Page.createIsolatedWorld" && query_frame_reads >= 2 && !query_world_emitted {
                             query_world_emitted = true;
                             socket.send(Message::Text(realm_created(7,"final-world-event").to_string())).await.unwrap();
                             continue;

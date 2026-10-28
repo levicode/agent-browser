@@ -1250,6 +1250,48 @@ impl ObservationDispatch {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn commit_query_staged_for_test(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+        partition: &super::client_enrollment::PageAcquisitionProof,
+        staged: RefMap,
+        blobs: &BlobStore,
+        scope: &BlobScope,
+    ) -> Result<u64, ProtocolError> {
+        let fence = self.publication_fence()?;
+        let mut publication = self.publication.lock().await;
+        let revision = publication.stage_revision(PublicationKind::AdditiveQuery)?;
+        self.commit_staged_query(
+            page,
+            operation,
+            None,
+            None,
+            fence,
+            &mut publication,
+            PublicationKind::AdditiveQuery,
+            revision,
+            staged,
+            blobs,
+            scope,
+            &[],
+            partition,
+        )
+        .await?;
+        Ok(publication.published_revision)
+    }
+    #[cfg(test)]
+    pub(crate) fn query_commit_short_locks_available_for_test(&self) -> bool {
+        let Ok(_captures) = self.captures.try_lock() else {
+            return false;
+        };
+        let Ok(_refs) = self.refs.try_lock() else {
+            return false;
+        };
+        self.publication.try_lock().is_err()
+    }
+
     fn check_initial_trace_owner(
         &self,
         context: &DispatchContext,
