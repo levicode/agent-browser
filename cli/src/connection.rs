@@ -965,6 +965,7 @@ fn isolated_client_env_allowed(key: &str) -> bool {
             "AGENT_BROWSER_SOCKET_DIR"
                 | "AGENT_BROWSER_NAMESPACE"
                 | "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE"
+                | "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE"
         )
         || (cfg!(feature = "acceptance-faults") && key == "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
 }
@@ -1020,6 +1021,7 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "AGENT_BROWSER_SOCKET_DIR",
         "AGENT_BROWSER_NAMESPACE",
         "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE",
+        "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE",
     ] {
         assert!(isolated_client_env_allowed(preserved));
     }
@@ -1035,6 +1037,9 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE_EXTRA",
         "AGENT_BROWSER_CLEANUP_DIAGNOSTIC",
         "AGENT_BROWSER_CLEANUP_OTHER",
+        "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE_EXTRA",
+        "AGENT_BROWSER_QUERY_DIAGNOSTIC",
+        "AGENT_BROWSER_QUERY_OTHER",
     ] {
         assert!(!isolated_client_env_allowed(removed));
     }

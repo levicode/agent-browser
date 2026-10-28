@@ -1335,6 +1335,8 @@ fn upload_preflight_refusal_into(
 pub(crate) enum QueryScopeStage {
     WarmWorlds,
     InitialFrames,
+    InitialFramesEntry,
+    InitialFramesExit,
     ProtectedFrames,
     FinalFrames,
     Classification,
@@ -3093,6 +3095,8 @@ mod query_frame_phase_schema_test {
         for (phase, value) in [
             (QueryScopeStage::WarmWorlds, "warm-worlds"),
             (QueryScopeStage::InitialFrames, "initial-frames"),
+            (QueryScopeStage::InitialFramesEntry, "initial-frames-entry"),
+            (QueryScopeStage::InitialFramesExit, "initial-frames-exit"),
             (QueryScopeStage::ProtectedFrames, "protected-frames"),
             (QueryScopeStage::FinalFrames, "final-frames"),
         ] {

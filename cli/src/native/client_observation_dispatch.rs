@@ -2943,7 +2943,7 @@ async fn frame_inventory_attempt_impl(
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
     check(page, operation)?;
     let (revision, targets, inventory_before) = if let Some(partition) = partition {
-        partition.check(page, operation)?;
+        partition.check_frame_boundary(page, operation, true)?;
         (0, partition.targets().to_vec(), None)
     } else {
         page.targets
@@ -3048,7 +3048,7 @@ async fn frame_inventory_attempt_impl(
         }
     }
     if let Some(partition) = partition {
-        partition.check(page, operation)?;
+        partition.check_frame_boundary(page, operation, false)?;
     } else {
         let fence = page.targets.check_acquisition_revision(
             revision,

@@ -455,6 +455,23 @@ impl PageAcquisitionProof {
         })
         .await
     }
+    pub(crate) fn check_frame_boundary(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        entering: bool,
+    ) -> Result<(), ProtocolError> {
+        let stage = if self.recheck_stage == Stage::InitialFrames {
+            if entering {
+                Stage::InitialFramesEntry
+            } else {
+                Stage::InitialFramesExit
+            }
+        } else {
+            self.recheck_stage
+        };
+        self.diagnostic_phase(stage).check(page, op)
+    }
     pub(crate) fn targets(&self) -> &[OwnedTarget] {
         &self.targets.targets
     }
