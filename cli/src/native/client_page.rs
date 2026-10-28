@@ -18,7 +18,7 @@ use super::client_debt::{
     OperationKey, ScopeCleanupCommand,
 };
 use super::client_protocol::ProtocolError;
-use super::client_session::{CancelSignal, OperationLease};
+use super::client_session::{CancelSignal, ObservedOperationFailure, OperationLease};
 use super::interaction::{char_to_key_info, key_text, named_key_info};
 
 #[path = "client_navigation_retirement.rs"]
@@ -214,6 +214,78 @@ fn check(page: &BrowserExecutionLease, op: &OperationLease) -> Result<(), Protoc
     }
     Ok(())
 }
+fn check_initialization(
+    page: &BrowserExecutionLease,
+    op: &OperationLease,
+) -> Result<(), ObservedOperationFailure> {
+    let permitted = page.permit.check();
+    #[cfg(test)]
+    if let Err(error) = &permitted {
+        page.client
+            .activation_diagnostic("guard-check", None, "owner-changed", Some(error), None);
+    }
+    permitted?;
+    if let Some(journal) = OperationJournalHandle::current() {
+        let admitted = journal.check_application_submission();
+        #[cfg(test)]
+        if let Err(error) = &admitted {
+            page.client.activation_diagnostic(
+                "guard-check",
+                None,
+                "admission-revoked",
+                Some(error),
+                None,
+            );
+        }
+        admitted?;
+    }
+    if let Err(observed) = ObservedOperationFailure::check_cancelled(op) {
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("guard-check", None, "cancelled", None, None);
+        return Err(observed);
+    }
+    if Instant::now() >= op.deadline {
+        #[cfg(test)]
+        page.client
+            .activation_diagnostic("guard-check", None, "deadline", None, None);
+        return Err(ProtocolError::DeadlineExceeded.into());
+    }
+    Ok(())
+}
+// This typed variant is only for retained initializer configuration. A raw
+// failed reply uses the original ordinary postcheck/error precedence and can
+// never acquire a benign stop receipt from a later owner retirement.
+async fn bounded_initialization_component<T>(
+    page: &BrowserExecutionLease,
+    op: &OperationLease,
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, ObservedOperationFailure> {
+    check_initialization(page, op)?;
+    let mut cancel = op.cancellation.clone();
+    tokio::select! {
+        value = future => match value {
+            Ok(value) => { check_initialization(page, op)?; Ok(value) },
+            Err(_) => { check(page, op)?; Err(ProtocolError::BrowserFailure.into()) },
+        },
+        _ = cancel.changed() => Err(ObservedOperationFailure::changed(op, &cancel)),
+        _ = tokio::time::sleep_until(op.deadline.into()) => Err(ProtocolError::DeadlineExceeded.into()),
+    }
+}
+async fn command_initialization_component(
+    page: &BrowserExecutionLease,
+    op: &OperationLease,
+    session: Option<&str>,
+    method: &str,
+    args: Value,
+) -> Result<Value, ObservedOperationFailure> {
+    bounded_initialization_component(
+        page,
+        op,
+        page.client.send_command(method, Some(args), session),
+    )
+    .await
+}
 async fn bounded<T>(
     page: &BrowserExecutionLease,
     op: &OperationLease,
@@ -395,6 +467,16 @@ impl ClientPageState {
             return Err(ProtocolError::StaleScope);
         }
         check(page, op)
+    }
+    fn validate_initialization(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<(), ObservedOperationFailure> {
+        if self.identity_scope != page.identity_scope || self.context_id.is_empty() {
+            return Err(ProtocolError::StaleScope.into());
+        }
+        check_initialization(page, op)
     }
     /// Owner registers root pages and descendant OOPIFs BEFORE Network.enable
     /// and before target resume. Popup roots are distinct from the active page.
@@ -632,7 +714,17 @@ impl ClientPageState {
         session: &str,
         op: &OperationLease,
     ) -> Result<u64, ProtocolError> {
-        self.validate(page, op)?;
+        self.apply_to_new_session_initialization(page, session, op)
+            .await
+            .map_err(ObservedOperationFailure::into_protocol)
+    }
+    pub(crate) async fn apply_to_new_session_initialization(
+        &self,
+        page: &BrowserExecutionLease,
+        session: &str,
+        op: &OperationLease,
+    ) -> Result<u64, ObservedOperationFailure> {
+        self.validate_initialization(page, op)?;
         // Serialize only configuration writes for this target. This lock never
         // blocks navigation, callback reads, or another target's enrollment.
         let session_lock = self
@@ -644,10 +736,10 @@ impl ClientPageState {
         let mut cancel = op.cancellation.clone();
         let _configuration = tokio::select! {
             guard = session_lock.lock() => guard,
-            _ = cancel.changed() => return Err(ProtocolError::Cancelled),
-            _ = tokio::time::sleep_until(op.deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+            _ = cancel.changed() => return Err(ObservedOperationFailure::changed(op, &cancel)),
+            _ = tokio::time::sleep_until(op.deadline.into()) => return Err(ProtocolError::DeadlineExceeded.into()),
         };
-        self.validate(page, op)?;
+        self.validate_initialization(page, op)?;
         let (config, installed) = {
             let s = self.state()?;
             (
@@ -657,7 +749,7 @@ impl ClientPageState {
         };
         for (index, source) in config.scripts.iter().enumerate().skip(installed) {
             self.state()?.uncertain_scripts.insert(session.into());
-            let installed_script = command(
+            let installed_script = command_initialization_component(
                 page,
                 op,
                 Some(session),
@@ -670,7 +762,7 @@ impl ClientPageState {
                 .and_then(Value::as_str)
                 .is_some_and(|id| !id.is_empty())
             {
-                return Err(ProtocolError::BrowserFailure);
+                return Err(ProtocolError::BrowserFailure.into());
             }
             {
                 let mut state = self.state()?;
@@ -688,7 +780,7 @@ impl ClientPageState {
                     .or_default()
                     .push(index);
             }
-            self.validate(page, op)?;
+            self.validate_initialization(page, op)?;
         }
         let mut features = Vec::new();
         if let Some(value) = &config.color_scheme {
@@ -700,7 +792,7 @@ impl ClientPageState {
         // Unspecified media must leave the browser's own preferences alone.
         // Explicit no-preference values remain declarations and are applied.
         if !features.is_empty() {
-            command(
+            command_initialization_component(
                 page,
                 op,
                 Some(session),
@@ -2535,6 +2627,111 @@ mod tests {
         task.abort();
     }
 
+    #[tokio::test]
+    async fn component_page_lock_wait_observes_exact_stop_without_releasing_lock() {
+        use std::future::Future;
+        for signal in [CancelSignal::OwnerRetirement, CancelSignal::Requested] {
+            let (page, log, server) = mock("normal").await;
+            let state = ClientPageState::new("scope".into(), "context".into());
+            let lock = Arc::new(tokio::sync::Mutex::new(()));
+            state
+                .state()
+                .unwrap()
+                .configuration_locks
+                .insert("held-session".into(), lock.clone());
+            let held = lock.lock().await;
+            let (op, sender) = operation();
+            let future = state.apply_to_new_session_initialization(&page, "held-session", &op);
+            tokio::pin!(future);
+            let pending = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(future.as_mut().poll(cx).is_pending())
+            })
+            .await;
+            assert!(
+                pending,
+                "must reach actual retained configuration lock wait"
+            );
+            sender.send_replace(signal);
+            let result = future.await;
+            let Err(ObservedOperationFailure::Stopped(observed)) = result else {
+                panic!("missing actual selected stop observation")
+            };
+            let (captured, observed_signal) = observed.into_parts();
+            assert_eq!(observed_signal, signal);
+            assert!(captured.cancellation.same_channel(&op.cancellation));
+            assert_eq!(captured.sequence, op.sequence);
+            assert!(log.lock().unwrap().is_empty());
+            drop(held);
+            server.abort();
+            let _ = server.await;
+        }
+    }
+    #[tokio::test]
+    async fn component_page_failed_reply_cannot_borrow_later_owner_stop() {
+        let (page, _log, server) = mock("normal").await;
+        let (op, sender) = operation();
+        let result = bounded_initialization_component(&page, &op, async {
+            sender.send_replace(CancelSignal::OwnerRetirement);
+            Err::<(), String>("controlled failure".into())
+        })
+        .await;
+        // Original ordinary postcheck precedes raw error mapping. It may retain
+        // Cancelled, but must NEVER mint a successful owner-retirement receipt.
+        assert!(matches!(
+            result,
+            Err(ObservedOperationFailure::Operation(
+                ProtocolError::Cancelled
+            ))
+        ));
+        let (op, _sender) = operation();
+        let result = bounded_initialization_component(&page, &op, async {
+            Err::<(), String>("controlled failure".into())
+        })
+        .await;
+        assert!(matches!(
+            result,
+            Err(ObservedOperationFailure::Operation(
+                ProtocolError::BrowserFailure
+            ))
+        ));
+        server.abort();
+        let _ = server.await;
+    }
+    #[tokio::test]
+    async fn component_page_success_postcheck_keeps_stop_and_failure_precedence() {
+        let (page, _log, server) = mock("normal").await;
+        let (op, sender) = operation();
+        let result = bounded_initialization_component(&page, &op, async {
+            sender.send_replace(CancelSignal::OwnerRetirement);
+            Ok::<(), String>(())
+        })
+        .await;
+        assert!(matches!(result, Err(ObservedOperationFailure::Stopped(_))));
+        let wrong = ClientPageState::new("wrong-scope".into(), "context".into());
+        assert!(matches!(
+            wrong
+                .apply_to_new_session_initialization(&page, "session", &op)
+                .await,
+            Err(ObservedOperationFailure::Operation(
+                ProtocolError::StaleScope
+            ))
+        ));
+        let (mut expired, _sender) = operation();
+        expired.deadline = Instant::now();
+        assert!(matches!(
+            bounded_initialization_component(
+                &page,
+                &expired,
+                std::future::pending::<Result<(), String>>()
+            )
+            .await,
+            Err(ObservedOperationFailure::Operation(
+                ProtocolError::DeadlineExceeded
+            ))
+        ));
+        server.abort();
+        let _ = server.await;
+    }
     fn operation() -> (OperationLease, watch::Sender<CancelSignal>) {
         let (sender, cancellation) = watch::channel(CancelSignal::None);
         (

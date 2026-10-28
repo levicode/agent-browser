@@ -16,7 +16,7 @@ use super::client_debt::ScopeCleanupCommand;
 use super::client_protocol::{Decision, DecisionNotice, ProtocolError, RequestOverrides};
 use super::client_session::{
     CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
-    OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
+    ObservedOperationFailure, OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
 };
 use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_transport::ClientEventSink;
@@ -536,6 +536,16 @@ impl ClientNetwork {
         operation: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
     ) -> Result<(), ProtocolError> {
+        self.configure_session_observed_initialization(session, operation, admission)
+            .await
+            .map_err(ObservedOperationFailure::into_protocol)
+    }
+    pub(crate) async fn configure_session_observed_initialization(
+        &self,
+        session: ApplicationSession,
+        operation: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
+    ) -> Result<(), ObservedOperationFailure> {
         self.prepare_session(session, operation, admission, false)
             .await
     }
@@ -549,6 +559,16 @@ impl ClientNetwork {
         operation: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
     ) -> Result<(), ProtocolError> {
+        self.prepare_service_worker_session_initialization(session, operation, admission)
+            .await
+            .map_err(ObservedOperationFailure::into_protocol)
+    }
+    pub(crate) async fn prepare_service_worker_session_initialization(
+        &self,
+        session: ApplicationSession,
+        operation: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
+    ) -> Result<(), ObservedOperationFailure> {
         self.prepare_session(session, operation, admission, true)
             .await
     }
@@ -622,13 +642,12 @@ impl ClientNetwork {
         operation: &OperationLease,
         admission: Option<&ServiceWorkerAdmission>,
         service_worker: bool,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), ObservedOperationFailure> {
         self.check()?;
-        if operation.generation != self.scope.generation
-            || *operation.cancellation.borrow() != CancelSignal::None
-        {
-            return Err(ProtocolError::Cancelled);
+        if operation.generation != self.scope.generation {
+            return Err(ProtocolError::Cancelled.into());
         }
+        ObservedOperationFailure::check_cancelled(operation)?;
         let policy = *self
             .policy
             .lock()
@@ -644,7 +663,7 @@ impl ClientNetwork {
                 .lock()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
             if sessions.len() >= 128 || sessions.contains_key(&id) {
-                return Err(ProtocolError::CapacityExceeded);
+                return Err(ProtocolError::CapacityExceeded.into());
             }
             let (configuration_ready, _) = tokio::sync::watch::channel(false);
             sessions.insert(
@@ -669,9 +688,9 @@ impl ClientNetwork {
         }).await;
         if !matches!(result, Ok(Ok(()))) {
             self.broker.quarantine()?;
-            return Err(ProtocolError::BrowserFailure);
+            return Err(ProtocolError::BrowserFailure.into());
         }
-        self.check()
+        self.check().map_err(Into::into)
     }
 
     /// Opens this exact session's managed network callbacks. Page enrollment
@@ -684,15 +703,21 @@ impl ClientNetwork {
         session: &str,
         operation: &OperationLease,
     ) -> Result<(), ProtocolError> {
+        self.configuration_committed_initialization(session, operation)
+            .map_err(ObservedOperationFailure::into_protocol)
+    }
+    pub(crate) fn configuration_committed_initialization(
+        &self,
+        session: &str,
+        operation: &OperationLease,
+    ) -> Result<(), ObservedOperationFailure> {
         self.check()?;
         if operation.generation != self.scope.generation {
-            return Err(ProtocolError::StaleGeneration);
+            return Err(ProtocolError::StaleGeneration.into());
         }
-        if *operation.cancellation.borrow() != CancelSignal::None {
-            return Err(ProtocolError::Cancelled);
-        }
+        ObservedOperationFailure::check_cancelled(operation)?;
         if std::time::Instant::now() >= operation.deadline {
-            return Err(ProtocolError::DeadlineExceeded);
+            return Err(ProtocolError::DeadlineExceeded.into());
         }
         let sessions = self
             .sessions
@@ -5071,6 +5096,63 @@ mod bridge_tests {
         transfer.retire().unwrap();
         replacement.close().await.unwrap();
         server.abort();
+    }
+    #[tokio::test]
+    async fn component_network_typed_guards_keep_generation_deadline_and_public_contracts() {
+        let (network, _events, _commands, server) = fixture().await;
+        let (cancel, mut operation) = download_operation();
+        cancel.send_replace(CancelSignal::OwnerRetirement);
+        operation.generation += 1;
+        let session = || ApplicationSession {
+            session_id: "not-installed".into(),
+            root_page_session: "not-installed".into(),
+            active_page: false,
+        };
+        for worker in [false, true] {
+            assert!(matches!(
+                network
+                    .prepare_session(session(), &operation, None, worker)
+                    .await,
+                Err(ObservedOperationFailure::Operation(
+                    ProtocolError::Cancelled
+                ))
+            ));
+        }
+        assert!(matches!(
+            network.configuration_committed_initialization("not-installed", &operation),
+            Err(ObservedOperationFailure::Operation(
+                ProtocolError::StaleGeneration
+            ))
+        ));
+        operation.generation = network.scope.generation;
+        for worker in [false, true] {
+            assert!(matches!(
+                network
+                    .prepare_session(session(), &operation, None, worker)
+                    .await,
+                Err(ObservedOperationFailure::Stopped(_))
+            ));
+        }
+        assert_eq!(
+            network.configuration_committed("not-installed", &operation),
+            Err(ProtocolError::Cancelled)
+        );
+        operation.deadline = std::time::Instant::now();
+        // Existing cancellation-before-deadline ordering is unchanged.
+        assert!(matches!(
+            network.configuration_committed_initialization("not-installed", &operation),
+            Err(ObservedOperationFailure::Stopped(_))
+        ));
+        cancel.send_replace(CancelSignal::None);
+        assert!(matches!(
+            network.configuration_committed_initialization("not-installed", &operation),
+            Err(ObservedOperationFailure::Operation(
+                ProtocolError::DeadlineExceeded
+            ))
+        ));
+        network.close().await.unwrap();
+        server.abort();
+        let _ = server.await;
     }
     fn download_operation() -> (tokio::sync::watch::Sender<CancelSignal>, OperationLease) {
         let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);

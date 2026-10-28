@@ -5065,6 +5065,7 @@ impl ClientBrowser {
         operation: super::client_session::OperationLease,
     ) -> super::client_transport::NativeOutcome {
         use super::client_protocol::Effects;
+        use super::client_settlement_trace::ScopeReplacementStage;
         use super::client_transport::NativeOutcome;
         if operation.is_callback {
             return NativeOutcome {
@@ -5116,6 +5117,7 @@ impl ClientBrowser {
         *slot = Some(tokio::spawn(async move {
             let _transition = transition;
             let mut accepted = false;
+            let mut failure_stage = ScopeReplacementStage::AcceptedState;
             let mut recording_owner = None;
             let result = async {
                 check_lifecycle_budget(&operation)?;
@@ -5185,12 +5187,14 @@ impl ClientBrowser {
                     .map(|prepared| prepared.accept(&operation))
                     .transpose()
                     .map_err(|failure| failure.error)?;
+                failure_stage = ScopeReplacementStage::StopOwner;
                 retirement
                     .lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
                     .stop(false);
                 #[cfg(feature = "acceptance-faults")]
                 faults.retire_scope(&scope)?;
+                failure_stage = ScopeReplacementStage::StopConnectionWatch;
                 {
                     let mut watch = connection_watch.lock().await;
                     if let Some(old) = watch.as_mut() {
@@ -5203,12 +5207,16 @@ impl ClientBrowser {
                     }
                     *watch = None;
                 }
+                failure_stage = ScopeReplacementStage::BeginTransition;
                 gate.begin_transition()?;
                 // Owner mutex cannot remain held while admitted operations are
                 // finishing their captured ownership checks.
                 drop(journal);
+                failure_stage = ScopeReplacementStage::DrainOperations;
                 gate.drained().await?;
+                failure_stage = ScopeReplacementStage::DrainTasks;
                 tasks.drain_current().await?;
+                failure_stage = ScopeReplacementStage::ValidateOldScope;
                 let mut journal = owner.lock().await;
                 let resource = journal.as_mut().ok_or(ProtocolError::StaleScope)?;
                 if resource.identity_scope != scope {
@@ -5222,6 +5230,7 @@ impl ClientBrowser {
                     .as_ref()
                     .ok_or(ProtocolError::ScopeUnavailable)?;
                 if interop {
+                    failure_stage = ScopeReplacementStage::BeginPeerReplacement;
                     runtime.begin_peer_replacement().await?;
                     #[cfg(test)]
                     if let Some(sender) = phase_one_snapshot
@@ -5239,6 +5248,7 @@ impl ClientBrowser {
                             enrollment: runtime.enrollment.clone(),
                         });
                     }
+                    failure_stage = ScopeReplacementStage::RetirePeerRendezvous;
                     let decision = interop_replacement::rendezvous(
                         &broker,
                         &sink,
@@ -5254,19 +5264,24 @@ impl ClientBrowser {
                     ) {
                         return Err(ProtocolError::DecisionKindMismatch);
                     }
+                    failure_stage = ScopeReplacementStage::ConfirmPeerRetirement;
                     runtime.enrollment.confirm_peer_context_retirement().await?;
                 }
+                failure_stage = ScopeReplacementStage::ContainRelease;
                 let contained = runtime.contain_and_release_mode(true).await;
                 runtime.enrollment.retire_protected_read_after_destroy(
                     &resource.targets.protected_read_residual,
                 )?;
                 contained?;
+                failure_stage = ScopeReplacementStage::RetireReferences;
                 refs.lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
                     .retire_owner_references();
                 check_lifecycle_budget(&operation)?;
                 let replacement_owner = if interop {
+                    failure_stage = ScopeReplacementStage::ReplacementInventory;
                     let before = resource.interop_replacement_inventory(&operation).await?;
+                    failure_stage = ScopeReplacementStage::CreatePeerRendezvous;
                     let decision = interop_replacement::rendezvous(
                         &broker,
                         &sink,
@@ -5283,6 +5298,7 @@ impl ClientBrowser {
                     else {
                         return Err(ProtocolError::DecisionKindMismatch);
                     };
+                    failure_stage = ScopeReplacementStage::AdoptPeerReplacement;
                     resource
                         .replace_cleaned_interop_context(
                             &operation,
@@ -5292,8 +5308,10 @@ impl ClientBrowser {
                         )
                         .await?
                 } else {
+                    failure_stage = ScopeReplacementStage::CreateNativeReplacement;
                     resource.replace_cleaned_context(&operation).await?
                 };
+                failure_stage = ScopeReplacementStage::InitializeRuntime;
                 let authority = resource
                     .initialize_runtime(
                         gate.clone(),
@@ -5315,6 +5333,7 @@ impl ClientBrowser {
                         },
                     )
                     .await?;
+                failure_stage = ScopeReplacementStage::RestoreState;
                 let expose_page = state.is_none() || was_recording;
                 {
                     let page = resource.lease(authority.enter(&resource.targets)?)?;
@@ -5371,6 +5390,7 @@ impl ClientBrowser {
                             resource.page_state.record_origin(&page, &origin)?;
                         }
                     }
+                    failure_stage = ScopeReplacementStage::RecordingReady;
                     if was_recording {
                         let debt = page
                             .client
@@ -5427,6 +5447,7 @@ impl ClientBrowser {
                         .await??;
                     }
                 }
+                failure_stage = ScopeReplacementStage::PublishInitialization;
                 loop {
                     check_lifecycle_budget(&operation)?;
                     match resource
@@ -5445,6 +5466,7 @@ impl ClientBrowser {
                         Err(error) => return Err(error),
                     }
                 }
+                failure_stage = ScopeReplacementStage::PublishResult;
                 resource
                     .runtime
                     .as_ref()
@@ -5475,6 +5497,16 @@ impl ClientBrowser {
                 })
             }
             .await;
+            if accepted {
+                if let Err(error) = &result {
+                    cleanup_trace::scope_replacement_refusal(
+                        operation.generation,
+                        operation.sequence,
+                        failure_stage,
+                        error,
+                    );
+                }
+            }
             if accepted && result.is_err() {
                 gate.seal();
                 // The exact failed transition captured this attempt's actions

@@ -47,6 +47,75 @@ pub struct OperationLease {
     pub cancellation: watch::Receiver<CancelSignal>,
 }
 
+/// A stop observed at the exact operation-channel guard/select that returned it.
+/// This carries no owner/registry authority; only enrollment may classify its
+/// own exact producer channel as lifecycle retirement. Fields stay private.
+pub(crate) struct OperationStopObservation {
+    operation: OperationLease,
+    signal: CancelSignal,
+}
+impl std::fmt::Debug for OperationStopObservation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationStopObservation")
+            .field("signal", &self.signal)
+            .finish_non_exhaustive()
+    }
+}
+impl OperationStopObservation {
+    pub(crate) fn into_parts(self) -> (OperationLease, CancelSignal) {
+        (self.operation, self.signal)
+    }
+}
+/// Internal provenance for the narrow cross-component initialization paths.
+/// Public APIs project this one-way to their original ProtocolError contract.
+#[derive(Debug)]
+pub(crate) enum ObservedOperationFailure {
+    Operation(ProtocolError),
+    Stopped(OperationStopObservation),
+}
+impl From<ProtocolError> for ObservedOperationFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self::Operation(error)
+    }
+}
+impl ObservedOperationFailure {
+    pub(crate) fn into_protocol(self) -> ProtocolError {
+        match self {
+            Self::Operation(error) => error,
+            Self::Stopped(_) => ProtocolError::Cancelled,
+        }
+    }
+    fn observed(op: &OperationLease, signal: CancelSignal) -> Self {
+        if signal == CancelSignal::None {
+            return ProtocolError::Cancelled.into();
+        }
+        Self::Stopped(OperationStopObservation {
+            operation: OperationLease {
+                is_callback: op.is_callback,
+                generation: op.generation,
+                sequence: op.sequence,
+                deadline: op.deadline,
+                cancellation: op.cancellation.clone(),
+            },
+            signal,
+        })
+    }
+    pub(crate) fn check_cancelled(op: &OperationLease) -> Result<(), Self> {
+        let signal = *op.cancellation.borrow();
+        if signal == CancelSignal::None {
+            Ok(())
+        } else {
+            Err(Self::observed(op, signal))
+        }
+    }
+    pub(crate) fn changed(op: &OperationLease, channel: &watch::Receiver<CancelSignal>) -> Self {
+        if !channel.same_channel(&op.cancellation) {
+            return ProtocolError::StaleScope.into();
+        }
+        Self::observed(op, *channel.borrow())
+    }
+}
+
 struct Operation {
     eval_window: Option<super::client_debt::EvalWindowHandle>,
     callback_token: Option<String>,

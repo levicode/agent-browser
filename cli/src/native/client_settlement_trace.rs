@@ -21,6 +21,7 @@ pub(crate) enum SettlementPhase {
     CleanupFirstFailure,
     CleanupResult,
     RestartPostCreateRefused,
+    ScopeReplacementRefused,
     InventorySnapshot,
     TargetAttribution,
     TargetLifecycle,
@@ -185,6 +186,8 @@ pub(crate) struct Facts {
     pub terminal_cleanup_ok: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_post_create_stage: Option<RestartPostCreateStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_replacement_stage: Option<ScopeReplacementStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment_ordinal: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1665,6 +1668,63 @@ fn restart_post_create_refusal_into(
         Facts {
             generation: Some(generation),
             restart_post_create_stage: Some(stage),
+            error: Some(error.clone()),
+            ..Facts::default()
+        },
+    );
+}
+
+/// The retained scope-replacement failure boundary, before replacement seals
+/// the owner. These closed stages contain no browser/session/target payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScopeReplacementStage {
+    AcceptedState,
+    StopOwner,
+    StopConnectionWatch,
+    BeginTransition,
+    DrainOperations,
+    DrainTasks,
+    ValidateOldScope,
+    BeginPeerReplacement,
+    RetirePeerRendezvous,
+    ConfirmPeerRetirement,
+    ContainRelease,
+    RetireReferences,
+    ReplacementInventory,
+    AdoptPeerReplacement,
+    CreateNativeReplacement,
+    InitializeRuntime,
+    RestoreState,
+    RecordingReady,
+    PublishInitialization,
+    PublishResult,
+    CreatePeerRendezvous,
+}
+pub(crate) fn scope_replacement_refusal(
+    generation: u64,
+    sequence: u64,
+    stage: ScopeReplacementStage,
+    error: &ProtocolError,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        scope_replacement_refusal_into(capture, generation, sequence, stage, error);
+    }
+}
+fn scope_replacement_refusal_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    stage: ScopeReplacementStage,
+    error: &ProtocolError,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ScopeReplacementRefused,
+        Facts {
+            generation: Some(generation),
+            scope_replacement_stage: Some(stage),
             error: Some(error.clone()),
             ..Facts::default()
         },
@@ -3210,5 +3270,114 @@ mod critical_query_stream_tests {
         let dir = tempfile::tempdir().unwrap();
         assert!(query_capture(Some(dir.path())).is_none());
         assert!(query_capture(Some(&dir.path().join("missing.jsonl"))).is_none());
+    }
+}
+
+#[cfg(test)]
+mod scope_replacement_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn scope_replacement_refusal_has_closed_bounded_schema() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let error = ProtocolError::Cancelled;
+        for (stage, label) in [
+            (ScopeReplacementStage::AcceptedState, "accepted-state"),
+            (ScopeReplacementStage::StopOwner, "stop-owner"),
+            (
+                ScopeReplacementStage::StopConnectionWatch,
+                "stop-connection-watch",
+            ),
+            (ScopeReplacementStage::BeginTransition, "begin-transition"),
+            (ScopeReplacementStage::DrainOperations, "drain-operations"),
+            (ScopeReplacementStage::DrainTasks, "drain-tasks"),
+            (
+                ScopeReplacementStage::ValidateOldScope,
+                "validate-old-scope",
+            ),
+            (
+                ScopeReplacementStage::BeginPeerReplacement,
+                "begin-peer-replacement",
+            ),
+            (
+                ScopeReplacementStage::RetirePeerRendezvous,
+                "retire-peer-rendezvous",
+            ),
+            (
+                ScopeReplacementStage::ConfirmPeerRetirement,
+                "confirm-peer-retirement",
+            ),
+            (ScopeReplacementStage::ContainRelease, "contain-release"),
+            (ScopeReplacementStage::RetireReferences, "retire-references"),
+            (
+                ScopeReplacementStage::ReplacementInventory,
+                "replacement-inventory",
+            ),
+            (
+                ScopeReplacementStage::AdoptPeerReplacement,
+                "adopt-peer-replacement",
+            ),
+            (
+                ScopeReplacementStage::CreateNativeReplacement,
+                "create-native-replacement",
+            ),
+            (
+                ScopeReplacementStage::InitializeRuntime,
+                "initialize-runtime",
+            ),
+            (ScopeReplacementStage::RestoreState, "restore-state"),
+            (ScopeReplacementStage::RecordingReady, "recording-ready"),
+            (
+                ScopeReplacementStage::PublishInitialization,
+                "publish-initialization",
+            ),
+            (ScopeReplacementStage::PublishResult, "publish-result"),
+            (
+                ScopeReplacementStage::CreatePeerRendezvous,
+                "create-peer-rendezvous",
+            ),
+        ] {
+            scope_replacement_refusal_into(&capture, 3, 5, stage, &error);
+            let text = std::fs::read_to_string(file.path()).unwrap();
+            let line = text.lines().last().unwrap();
+            assert!(line.len() < MAX_RECORD_BYTES);
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["phase"], "ScopeReplacementRefused");
+            assert_eq!(value["scopeReplacementStage"], label);
+            assert_eq!(value["error"], "cancelled");
+            assert_eq!(value["generation"], 3);
+            assert_eq!(value["operationSeq"], 5);
+            assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "schemaVersion"
+                    | "source"
+                    | "pid"
+                    | "record"
+                    | "operationSeq"
+                    | "phase"
+                    | "droppedBefore"
+                    | "emittedBefore"
+                    | "suppressedBefore"
+                    | "overflow"
+                    | "generation"
+                    | "scopeReplacementStage"
+                    | "error"
+            )));
+        }
+        assert_eq!(error, ProtocolError::Cancelled);
+    }
+    #[test]
+    fn scope_replacement_facts_do_not_add_outcome_or_identity_authority() {
+        let value = serde_json::to_value(Facts {
+            generation: Some(1),
+            scope_replacement_stage: Some(ScopeReplacementStage::StopOwner),
+            error: Some(ProtocolError::Cancelled),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":1,"scopeReplacementStage":"stop-owner","error":"cancelled"})
+        );
     }
 }
