@@ -250,8 +250,17 @@ pub(super) fn plan_diagnostic(
         if let Some(id) = parsed.backend_d_o_m_node_id {
             ax_backend.insert(id, parsed.clone());
         }
-        if ax_rows.insert(parsed.node_id, row).is_some() {
-            return Err(failure(Stage::CandidatePlanDuplicateAx, ObservationError::BackendFailure));
+        match ax_rows.entry(parsed.node_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => { entry.insert(row); }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                // A repeated serialization of the exact same raw row adds no
+                // facts. Compare every field, including unknown/frame/parent
+                // fields omitted by AXNode; retain the first occurrence.
+                // Raw response and row-count budgets were charged above.
+                if *entry.get() != row {
+                    return Err(failure(Stage::CandidatePlanDuplicateAx, ObservationError::BackendFailure));
+                }
+            }
         }
     }
     let mut ids = Vec::new();
@@ -509,6 +518,7 @@ mod tests {
                     }
                     "duplicate-ax" => {
                         a["nodes"][1] = a["nodes"][0].clone();
+                        a["nodes"][1]["frameId"] = json!("different-frame");
                         Some(Stage::CandidatePlanDuplicateAx)
                     }
                     "ax-rows" => {
@@ -543,6 +553,43 @@ mod tests {
         }
     }
 
+    #[test]
+    fn identical_raw_ax_duplicates_are_lossless_but_any_conflict_refuses() {
+        let (dom, ax, options) = fixture();
+        let expected = plan(&dom, &ax, &options.expression, &options).unwrap();
+        let mut duplicate = ax.clone();
+        duplicate["nodes"].as_array_mut().unwrap().insert(1, ax["nodes"][0].clone());
+        assert_eq!(plan(&dom, &duplicate, &options.expression, &options).unwrap(), expected);
+        // First, middle and final positions all retain exactly the same facts.
+        duplicate["nodes"].as_array_mut().unwrap().push(ax["nodes"][1].clone());
+        assert_eq!(plan(&dom, &duplicate, &options.expression, &options).unwrap(), expected);
+        for (field, value) in [
+            ("frameId", json!("different-frame")),
+            ("parentId", json!("different-parent")),
+            ("childIds", json!(["different-child"])),
+            ("backendDOMNodeId", json!(987)),
+            ("ignored", json!(true)),
+            ("role", json!({"type":"role","value":"different-role"})),
+            ("unknownFutureField", json!({"nested":[1,2,3]})),
+            ("nodeId", json!(3)),
+        ] {
+            let mut conflict = ax.clone();
+            let mut row = ax["nodes"][0].clone();
+            row[field] = value;
+            conflict["nodes"].as_array_mut().unwrap().push(row);
+            let witness = query_diagnostic::QueryReadWitness::schema_test(true);
+            assert_eq!(plan_diagnostic(&dom, &conflict, &options.expression, &options, Some(&witness)),
+                Err(ObservationError::BackendFailure), "{field}");
+            assert_eq!(witness.schema_test_stage(),
+                crate::native::client_settlement_trace::QueryReadStage::CandidatePlanDuplicateAx);
+        }
+    }
+    #[test]
+    fn identical_duplicates_still_pay_the_original_raw_row_budget() {
+        let (dom, ax, options) = fixture();
+        let repeated = json!({"nodes":vec![ax["nodes"][0].clone();100_001]});
+        assert_eq!(plan(&dom, &repeated, &options.expression, &options), Err(ObservationError::ResourceLimit));
+    }
     fn plan_of(d: &Value, a: &Value, o: &QueryOptions) -> Plan {
         plan(d, a, &o.expression, o).unwrap().unwrap()
     }
