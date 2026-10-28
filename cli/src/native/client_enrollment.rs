@@ -8673,6 +8673,7 @@ mod tests {
             let mut worker_held = Vec::<Value>::new();
             let mut detach_count = 0;
             let mut inventory_reads = 0;
+            let mut query_world_emitted = false;
             let mut realm_loader = "synthetic-loader".to_owned();
             let mut whitespace = HashMap::<String, bool>::new();
             let mut closed_targets = std::collections::HashSet::<String>::new();
@@ -8759,7 +8760,7 @@ mod tests {
                         }
                         if method=="Target.detachFromTarget" {detach_count+=1;}
                         if mode=="hold-timezone" && method=="Emulation.setTimezoneOverride" { continue; }
-                        if (mode=="popup-runtime-held" || mode=="owner-retirement-runtime-held" || mode=="owner-retirement-runtime-held-query" || mode=="owner-retirement-runtime-held-dispatch") && method=="Runtime.enable" && request["sessionId"]=="popup-session" { continue; }
+                        if (mode=="popup-runtime-held" || mode=="owner-retirement-runtime-held" || mode=="owner-retirement-runtime-held-query" || mode.starts_with("owner-retirement-runtime-held-dispatch")) && method=="Runtime.enable" && request["sessionId"]=="popup-session" { continue; }
                         let settings_error = match (mode, method) {
                             ("locale-already", "Emulation.setLocaleOverride") => Some("Another locale override is already in effect"),
                             ("timezone-already", "Emulation.setTimezoneOverride") => Some("Timezone override is already in effect"),
@@ -8781,6 +8782,13 @@ mod tests {
                         if (mode=="first-request" || mode=="large-first-request" || mode=="hold-timezone" || (mode=="popup-held-dispose" && request["sessionId"]=="popup-session")) && method=="Fetch.enable" {
                             let body=if mode=="large-first-request" {"b".repeat(1536*1024)} else {String::new()};
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
+                        }
+                        if mode=="owner-retirement-runtime-held-dispatch-world" && method=="Page.createIsolatedWorld" && !query_world_emitted {
+                            query_world_emitted = true;
+                            socket.send(Message::Text(realm_created(7,"dispatch-world-event").to_string())).await.unwrap();
+                            // First world ACK is released only after the test
+                            // observes the real enrollment application gate.
+                            continue;
                         }
                         if mode=="owner-retirement-query-world-event" && method=="Page.createIsolatedWorld" {
                             // Real framed event before the independently correlated ACK.
@@ -8811,13 +8819,13 @@ mod tests {
                             whitespace.entry(session).or_insert(method=="DOM.enable" && request["params"]["includeWhitespace"]=="all");
                         }
                         let mut result=match method {
-                            "DOM.getDocument" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"root":{"nodeId":1,"nodeType":9,"backendNodeId":1,"children":[{"nodeId":7,"nodeType":1,"backendNodeId":7}]}}),
-                            "Page.createIsolatedWorld" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"executionContextId":7}),
-                            "Accessibility.getFullAXTree" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"nodes":[{"nodeId":"selected","backendDOMNodeId":7,"role":{"type":"role","value":"button"}}]}),
-                            "DOM.resolveNode" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"object":{"objectId":"selected-object","subtype":"node"}}),
-                            "DOM.getBoxModel" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"model":{"border":[10,20,30,20,30,40,10,40]}}),
-                            "Runtime.getProperties" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]}),
-                            "Runtime.callFunctionOn" if mode=="owner-retirement-runtime-held-dispatch"=>{
+                            "DOM.getDocument" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>json!({"root":{"nodeId":1,"nodeType":9,"backendNodeId":1,"children":[{"nodeId":7,"nodeType":1,"backendNodeId":7}]}}),
+                            "Page.createIsolatedWorld" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>json!({"executionContextId":7}),
+                            "Accessibility.getFullAXTree" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>json!({"nodes":[{"nodeId":"selected","backendDOMNodeId":7,"role":{"type":"role","value":"button"}}]}),
+                            "DOM.resolveNode" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>json!({"object":{"objectId":"selected-object","subtype":"node"}}),
+                            "DOM.getBoxModel" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>json!({"model":{"border":[10,20,30,20,30,40,10,40]}}),
+                            "Runtime.getProperties" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]}),
+                            "Runtime.callFunctionOn" if mode.starts_with("owner-retirement-runtime-held-dispatch")=>{
                                 let declaration=request["params"]["functionDeclaration"].as_str().unwrap();
                                 if declaration.contains("Array.from(result)") {json!({"result":{"objectId":"security"}})}
                                 else if declaration.starts_with("function(expression") {json!({"result":{"value":{"indices":[0],"redacted":[]}}})}

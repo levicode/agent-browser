@@ -1183,8 +1183,12 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"credential":{
     #[cfg(unix)]
     #[tokio::test]
     async fn credential_plugin_failure_does_not_echo_plugin_error() {
+        use crate::test_utils::EnvGuard;
         use std::os::unix::fs::PermissionsExt;
 
+        // The shell fixture invokes cat through PATH. Serialize with tests that
+        // alter process environment, just like the successful credential case.
+        let _guard = EnvGuard::new(&["PATH"]);
         let dir = tempfile::tempdir().unwrap();
         let plugin_path = dir.path().join("mock-failing-credential-plugin");
         std::fs::write(
@@ -1218,7 +1222,33 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":false,"error":"secr
         .await
         .unwrap_err();
 
-        assert!(err.contains("success=false"));
+        // Never print err: protocol fields and plugin error text are untrusted
+        // and may contain credentials. Only this closed category is diagnostic.
+        let category = if err.starts_with("Failed to start plugin ") {
+            "spawn"
+        } else if err.starts_with("Failed to encode plugin request:") {
+            "encode-request"
+        } else if err.starts_with("Failed to write plugin request:") {
+            "write-request"
+        } else if err == "Plugin 'mock' timed out" {
+            "timeout"
+        } else if err.starts_with("Plugin 'mock' failed:") {
+            "wait-process"
+        } else if err == "Plugin 'mock' exited unsuccessfully" {
+            "exit-status"
+        } else if err == "Plugin 'mock' returned invalid JSON" {
+            "invalid-json"
+        } else if err.starts_with("Plugin 'mock' used unsupported protocol ") {
+            "unsupported-protocol"
+        } else if err == "Plugin 'mock' returned success=false" {
+            "expected-negative-response"
+        } else {
+            "other"
+        };
+        assert!(
+            err.contains("success=false"),
+            "credential fixture returned category={category}"
+        );
         assert!(!err.contains("secret-token-value"));
     }
 

@@ -17,6 +17,7 @@ pub(crate) struct PageAcquisitionProof {
     entries: Vec<Attribution>,
     targets: SelectedPageTargetSnapshot,
     watermark: BoundedEventWatermark,
+    recheck_stage: Stage,
 }
 pub(crate) struct SelectedPageReadBarrier {
     proof: PageAcquisitionProof,
@@ -381,6 +382,7 @@ impl PageQueryAuthority {
                     entries: entries.to_vec(),
                     targets: targets.clone(),
                     watermark: watermark.clone(),
+                    recheck_stage: Stage::Recheck,
                 })
             },
         )
@@ -388,6 +390,71 @@ impl PageQueryAuthority {
     }
 }
 impl PageAcquisitionProof {
+    pub(crate) fn diagnostic_phase(&self, stage: Stage) -> Self {
+        let mut proof = self.clone();
+        proof.recheck_stage = stage;
+        proof
+    }
+    /// Apply only the received event prefix captured after metadata/world RPCs.
+    /// Caller is the pre-UI query phase; this never waits for target readiness.
+    pub(crate) async fn wait_received_prefix(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        let owner = &self.authority.owner;
+        let prefix = self
+            .watermark
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        bounded(op, async {
+            loop {
+                let changed = owner.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                owner.check_restart_operation(op)?;
+                page.permit.check()?;
+                let applied = {
+                    let index = owner
+                        .index
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if let Some(error) = &index.failure {
+                        return Err(error.clone());
+                    }
+                    if !index.reconciled
+                        || owner.sealed.load(Ordering::Acquire)
+                        || index.borrowed_restart.is_some()
+                    {
+                        return Err(ProtocolError::ScopeUnavailable);
+                    }
+                    let subscription = owner
+                        .event_watermark
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if subscription
+                        .as_ref()
+                        .is_none_or(|current| !self.watermark.same_subscription(current))
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    self.watermark
+                        .with_received(|received| {
+                            if index.applied_watermark > received || received < prefix {
+                                return Err(ProtocolError::StaleScope);
+                            }
+                            Ok(index.applied_watermark >= prefix)
+                        })
+                        .map_err(|_| ProtocolError::ScopeUnavailable)??
+                };
+                if applied {
+                    return Ok(());
+                }
+                changed.await;
+            }
+        })
+        .await
+    }
     pub(crate) fn targets(&self) -> &[OwnedTarget] {
         &self.targets.targets
     }
@@ -403,7 +470,7 @@ impl PageAcquisitionProof {
                 Some(self),
                 None,
                 false,
-                Stage::Recheck,
+                self.recheck_stage,
                 |_, _, _| Ok(()),
             )
             .map(|_| ())
@@ -942,6 +1009,317 @@ mod retained_peer_tests {
                     .scope(async { dispatch.start_prepared(prepared) })
                     .await;
                 let mut result_receiver = task.result;
+                let received =
+                    tokio::time::timeout(Duration::from_secs(2), &mut result_receiver).await;
+                if received.is_err() {
+                    // Release the real held ACK and retain/join the task before failing.
+                    // This is a test observation bound, not a renewed operation budget.
+                    emit.send(json!({"id":held["id"],"sessionId":"popup-session","result":{}}))
+                        .await
+                        .unwrap();
+                    let completion = tokio::time::timeout(Duration::from_secs(3), task.join).await;
+                    let _ = owner.close().await;
+                    connection.close().await;
+                    server.abort();
+                    let _ = server.await;
+                    panic!("query waited for unrelated initializer; scoped={scoped}; cleanup={completion:?}");
+                }
+                let result = received.unwrap().unwrap();
+                task.join.await.unwrap().unwrap();
+                if !scoped {
+                    let failure =
+                        result.expect_err("strict global inventory must reject held popup");
+                    assert_eq!(failure.error, ProtocolError::ScopeUnavailable);
+                    assert!(!failure.cleanup_integrity_lost);
+                    assert!(refs.lock().unwrap().ref_ids().is_empty());
+                    assert!(owner.index.lock().unwrap().failure.is_none());
+                    assert!(!owner.index.lock().unwrap().pending_enrollment.is_empty());
+                    continue;
+                }
+                let result = result.unwrap();
+                assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    result["nodes"][0]["rect"],
+                    json!({"x":10.0,"y":20.0,"width":20.0,"height":20.0})
+                );
+                let id = result["nodes"][0]["ref"]["id"].as_str().unwrap();
+                assert_eq!(
+                    refs.lock()
+                        .unwrap()
+                        .get(id.trim_start_matches('@'))
+                        .unwrap()
+                        .backend_node_id,
+                    Some(7)
+                );
+                assert!(refs
+                    .lock()
+                    .unwrap()
+                    .get(id.trim_start_matches('@'))
+                    .unwrap()
+                    .matches_scope(&page.identity_scope, op.generation, "initial"));
+                assert_eq!(
+                    refs.lock()
+                        .unwrap()
+                        .get(id.trim_start_matches('@'))
+                        .unwrap()
+                        .exact_binding
+                        .as_ref()
+                        .unwrap()
+                        .session,
+                    "initial"
+                );
+                assert_eq!(op.deadline, original_deadline);
+            }
+            journal.finish_local_producers();
+            let commands = log.lock().unwrap()[before..].to_vec();
+            assert!(commands
+                .iter()
+                .any(|r| r["method"] == "Runtime.callFunctionOn"
+                    && r["params"]["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with("function(expression"))));
+            assert!(commands.iter().any(|r| r["method"] == "DOM.getBoxModel"));
+            assert!(commands.iter().all(|r| r["sessionId"] != "popup-session"));
+            assert!(commands
+                .iter()
+                .all(|r| r["sessionId"] != "aux-other-session"));
+            assert!(!owner.index.lock().unwrap().pending_enrollment.is_empty());
+            drop(journal);
+            assert!(owner.targets.inventory().is_err());
+            assert!(
+                !owner
+                    .targets
+                    .owned_target("popup-target")
+                    .unwrap()
+                    .configured
+            );
+            assert!(outstanding >= 1);
+            assert!(debt.snapshot().outstanding_commands >= outstanding);
+            // No pending command is declared settled by the page partition.
+            let response = if fail {
+                json!({"id":held["id"],"sessionId":"popup-session","error":{"code":-32000,"message":"controlled initializer error"}})
+            } else {
+                json!({"id":held["id"],"sessionId":"popup-session","result":{}})
+            };
+            emit.send(response).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if owner.index.lock().unwrap().pending_enrollment.is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let checked = proof.check(&page, &op);
+            let error = owner.index.lock().unwrap().failure.clone();
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+            if fail {
+                assert_eq!(checked, Err(ProtocolError::BrowserFailure));
+                assert_eq!(error, Some(ProtocolError::BrowserFailure));
+            } else {
+                assert_eq!(checked, Ok(()));
+                assert_eq!(error, None);
+            }
+        }
+    }
+    #[tokio::test]
+    async fn protected_query_dispatch_waits_world_prefix_without_waiting_popup_initializer() {
+        for fail in [false, true] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-dispatch-world",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            owner
+                .client
+                .debt_ledger()
+                .unwrap()
+                .publish_initialization(|| Ok(()))
+                .unwrap();
+            // Actual framed auto-attachment and initialization of the auxiliary
+            // kinds present in ordinary Chromium. Opaque other is a mandatory
+            // dependency, never asserted to be non-rendering or disjoint.
+            for kind in ["browser_ui", "tab", "browser", "other"] {
+                let session = format!("aux-{kind}-session");
+                let target = format!("aux-{kind}-target");
+                emit.send(json!({"method":"Target.attachedToTarget","params":{
+                    "sessionId":session,"waitingForDebugger":true,"targetInfo":{
+                    "targetId":target,"type":kind,"browserContextId":"owned-context"}}}))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if owner
+                            .targets
+                            .owned_target(&target)
+                            .is_ok_and(|t| t.configured && t.resumed)
+                            && owner.index.lock().unwrap().pending_enrollment.is_empty()
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let index = owner.index.lock().unwrap();
+                let entry = &index.sessions[&session];
+                assert_eq!(entry.root, session);
+                assert!(entry.parent.is_none());
+            }
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&initial).unwrap();
+            let selected = owner.targets.owned_target("initial-target").unwrap();
+            let authority = owner.page_query_authority(&page, &selected).unwrap();
+            let gate = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeAttachedProcessing, gate.clone());
+            let mut op = owner.operation();
+            op.sequence = 2;
+            let original_deadline = op.deadline;
+            emit.send(json!({"method":"Target.attachedToTarget","params":{
+                "sessionId":"popup-session","waitingForDebugger":true,"targetInfo":{
+                "targetId":"popup-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
+            gate.wait_entered().await;
+            let classification = authority.wait_classified(&page, &op);
+            tokio::pin!(classification);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut classification)
+                    .await
+                    .is_err()
+            );
+            gate.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(2), &mut classification)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(op.deadline, original_deadline);
+            let held = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(request) = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|request| {
+                            request["sessionId"] == "popup-session"
+                                && request["method"] == "Runtime.enable"
+                        })
+                        .cloned()
+                    {
+                        break request;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let debt = owner.client.debt_ledger().unwrap();
+            let outstanding = debt.snapshot().outstanding_commands;
+            let proof = authority.acquire(&page, &op).unwrap();
+            assert_eq!(proof.targets().len(), 1);
+            assert_eq!(
+                debt.check_admission(crate::native::client_debt::AdmissionClass::Reference),
+                Ok(())
+            );
+            let before = log.lock().unwrap().len();
+            let journal = debt
+                .operation(
+                    crate::native::client_debt::OperationKey {
+                        generation: op.generation,
+                        operation_seq: op.sequence,
+                    },
+                    page.target_id.clone(),
+                    page.page_session_id.clone(),
+                )
+                .unwrap();
+            journal.bind_operation(&op).unwrap();
+            use crate::native::client_blobs::{BlobScope, BlobStore};
+            use crate::native::client_observation_dispatch::{
+                DispatchContext, DispatchRequest, ObservationDispatch, QueryPurpose, QueryRequest,
+                ReadPolicy,
+            };
+            use crate::native::element::RefMap;
+            let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
+            let scope = BlobScope {
+                generation: op.generation,
+                identity_scope: page.identity_scope.clone(),
+            };
+            blobs.activate_scope(scope.clone()).unwrap();
+            let ui = owner.network.ui_gate_for_test();
+            assert!(owner.network.uses_ui_gate(&ui));
+            for scoped in [false, true] {
+                let refs = Arc::new(std::sync::Mutex::new(RefMap::new()));
+                let dispatch = ObservationDispatch::new(refs.clone());
+                let query_page = owner.lease(&initial).unwrap();
+                let world_gate = scoped.then(CaptureTestGate::new);
+                if let Some(gate) = &world_gate {
+                    owner
+                        .capture_test_gates
+                        .lock()
+                        .unwrap()
+                        .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+                }
+                let prepared = dispatch.prepare(DispatchContext {
+                query_authority: scoped.then(|| authority.clone()),
+                #[cfg(feature="acceptance-faults")]
+                faults: Arc::new(crate::native::client_test_faults::FaultController::default()),
+                attachment: selected.clone(), page: query_page, ui: ui.clone(), blobs: blobs.clone(), scope: scope.clone(),
+                policy: ReadPolicy { frame_policy: Default::default(), test_id_attribute: "data-testid".into(), secure_field_selector: "input[type=password]".into() },
+            }, DispatchRequest::Query(QueryRequest {
+                purpose: QueryPurpose::Protected,
+                options: serde_json::from_value(json!({"expression":{"kind":"selector","selector":"#selected"},"secureFieldSelector":"input[type=password]"})).unwrap(),
+            }), OperationLease { is_callback: op.is_callback, generation: op.generation, sequence: op.sequence, deadline: op.deadline, cancellation: op.cancellation.clone() }).unwrap();
+                let task = journal
+                    .scope(async { dispatch.start_prepared(prepared) })
+                    .await;
+                let mut result_receiver = task.result;
+                if let Some(gate) = &world_gate {
+                    tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+                        .await
+                        .unwrap();
+                    let world = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|request| request["method"] == "Page.createIsolatedWorld")
+                        .cloned()
+                        .unwrap();
+                    emit.send(json!({"id":world["id"],"sessionId":world["sessionId"],"result":{"executionContextId":7}})).await.unwrap();
+                    let available = tokio::time::timeout(
+                        Duration::from_secs(2),
+                        ui.enter(true, false, op.deadline, op.cancellation.clone()),
+                    )
+                    .await
+                    .unwrap()
+                    .unwrap();
+                    assert!(
+                        owner.index.lock().unwrap().applied_watermark
+                            < owner.realm_watermark().unwrap().received().unwrap()
+                    );
+                    assert!(matches!(
+                        result_receiver.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ));
+                    assert!(refs.lock().unwrap().ref_ids().is_empty());
+                    drop(available);
+                    gate.release.add_permits(1);
+                }
                 let received =
                     tokio::time::timeout(Duration::from_secs(2), &mut result_receiver).await;
                 if received.is_err() {
@@ -1626,5 +2004,201 @@ mod opaque_dependency_event_tests {
             server.abort();
             let _ = server.await;
         }
+    }
+}
+
+#[cfg(test)]
+mod query_prefix_preparation_tests {
+    use super::*;
+    #[tokio::test]
+    async fn query_world_prefix_releases_ui_and_preserves_deadline_cancel_and_revision() {
+        for outcome in ["success", "cancel", "deadline", "revision"] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-query-world-event",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            owner
+                .client
+                .debt_ledger()
+                .unwrap()
+                .publish_initialization(|| Ok(()))
+                .unwrap();
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&initial).unwrap();
+            let selected = owner.targets.owned_target("initial-target").unwrap();
+            let authority = owner.page_query_authority(&page, &selected).unwrap();
+            let (sender, cancellation) = watch::channel(CancelSignal::None);
+            let op = OperationLease {
+                is_callback: false,
+                generation: owner.generation,
+                sequence: 2,
+                deadline: Instant::now() + Duration::from_secs(2),
+                cancellation,
+            };
+            let original_deadline = op.deadline;
+            let proof = authority.acquire(&page, &op).unwrap();
+            let gate = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+            let ui = owner.network.ui_gate_for_test();
+            assert!(owner.network.uses_ui_gate(&ui));
+            let debt = owner.client.debt_ledger().unwrap();
+            let journal = debt
+                .operation(
+                    crate::native::client_debt::OperationKey {
+                        generation: op.generation,
+                        operation_seq: op.sequence,
+                    },
+                    page.target_id.clone(),
+                    page.page_session_id.clone(),
+                )
+                .unwrap();
+            journal.bind_operation(&op).unwrap();
+            let preparation = journal.scope(
+                crate::native::client_observation_dispatch::warm_query_worlds_for_test(
+                    &page, &op, &proof, &ui,
+                ),
+            );
+            tokio::pin!(preparation);
+            tokio::select! {
+                _ = gate.wait_entered() => {},
+                early = &mut preparation => panic!("preparation ended before actual world event: {early:?}"),
+            }
+            let held = log
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|request| request["method"] == "Page.createIsolatedWorld")
+                .cloned()
+                .unwrap();
+            emit.send(json!({"id":held["id"],"sessionId":held["sessionId"],"result":{"executionContextId":7}})).await.unwrap();
+            // Progress the real preparation while requiring the SAME exclusive
+            // UI gate to become available before event application is released.
+            let enter = ui.enter(true, false, op.deadline, op.cancellation.clone());
+            tokio::pin!(enter);
+            let available = tokio::select! {
+                result = &mut enter => result.unwrap(),
+                early = &mut preparation => panic!("event prefix did not retain pending result: {early:?}"),
+            };
+            assert!(
+                owner.index.lock().unwrap().applied_watermark
+                    < owner.realm_watermark().unwrap().received().unwrap()
+            );
+            drop(available);
+            assert!(matches!(
+                futures_util::poll!(&mut preparation),
+                std::task::Poll::Pending
+            ));
+            let result = if outcome == "cancel" {
+                sender.send_replace(CancelSignal::Requested);
+                preparation.await
+            } else if outcome == "deadline" {
+                preparation.await
+            } else {
+                if outcome == "revision" {
+                    owner
+                        .targets
+                        .invalidate_inventory_for(
+                            crate::native::client_settlement_trace::InventoryRevisionEvent::Info,
+                            "initial-target",
+                        )
+                        .unwrap();
+                }
+                gate.release.add_permits(1);
+                preparation.await
+            };
+            if matches!(outcome, "cancel" | "deadline") {
+                gate.release.add_permits(1);
+            }
+            let watermark = owner.realm_watermark().unwrap();
+            owner
+                .drain_capture_watermark(&watermark, &owner.operation())
+                .await
+                .unwrap();
+            assert_eq!(op.deadline, original_deadline);
+            match outcome {
+                "success" => assert_eq!(result, Ok(())),
+                "cancel" => assert_eq!(result, Err(ProtocolError::Cancelled)),
+                "deadline" => assert_eq!(result, Err(ProtocolError::DeadlineExceeded)),
+                _ => assert!(result.is_err()),
+            }
+            assert!(owner.index.lock().unwrap().failure.is_none());
+            journal.finish_local_producers();
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+        }
+    }
+    #[tokio::test]
+    async fn query_world_preparation_keeps_callback_denial_and_exclusive_serialization() {
+        let (owner, _notices, log, _emit, server, _broker, connection) =
+            super::super::tests::fixture_with_explicit_context_ownership(
+                "owner-retirement-runtime-held-query",
+                true,
+                true,
+            )
+            .await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        owner
+            .client
+            .debt_ledger()
+            .unwrap()
+            .publish_initialization(|| Ok(()))
+            .unwrap();
+        let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+        let page = owner.lease(&initial).unwrap();
+        let selected = owner.targets.owned_target("initial-target").unwrap();
+        let authority = owner.page_query_authority(&page, &selected).unwrap();
+        let mut op = owner.operation();
+        op.sequence = 2;
+        let proof = authority.acquire(&page, &op).unwrap();
+        let ui = owner.network.ui_gate_for_test();
+        let before = log.lock().unwrap().len();
+        op.is_callback = true;
+        assert_eq!(
+            crate::native::client_observation_dispatch::warm_query_worlds_for_test(
+                &page, &op, &proof, &ui
+            )
+            .await,
+            Err(ProtocolError::InvalidArguments)
+        );
+        assert_eq!(log.lock().unwrap().len(), before);
+        op.is_callback = false;
+        let held = ui
+            .enter(true, false, op.deadline, op.cancellation.clone())
+            .await
+            .unwrap();
+        let preparation = crate::native::client_observation_dispatch::warm_query_worlds_for_test(
+            &page, &op, &proof, &ui,
+        );
+        tokio::pin!(preparation);
+        assert!(matches!(
+            futures_util::poll!(&mut preparation),
+            std::task::Poll::Pending
+        ));
+        assert_eq!(log.lock().unwrap().len(), before);
+        drop(preparation);
+        drop(held);
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
     }
 }

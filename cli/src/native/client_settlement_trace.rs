@@ -1287,6 +1287,10 @@ fn upload_preflight_refusal_into(
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum QueryScopeStage {
+    WarmWorlds,
+    InitialFrames,
+    ProtectedFrames,
+    FinalFrames,
     Classification,
     Acquire,
     Recheck,
@@ -3026,5 +3030,24 @@ mod restart_post_create_diagnostic_tests {
             value,
             serde_json::json!({"generation":1,"restartPostCreateStage":"bind-owner","error":"stale-scope"})
         );
+    }
+}
+
+#[cfg(test)]
+mod query_frame_phase_schema_test {
+    use super::QueryScopeStage;
+    #[test]
+    fn query_frame_phase_diagnostic_is_closed_and_content_free() {
+        for (phase, value) in [
+            (QueryScopeStage::WarmWorlds, "warm-worlds"),
+            (QueryScopeStage::InitialFrames, "initial-frames"),
+            (QueryScopeStage::ProtectedFrames, "protected-frames"),
+            (QueryScopeStage::FinalFrames, "final-frames"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(phase).unwrap(),
+                serde_json::json!(value)
+            );
+        }
     }
 }

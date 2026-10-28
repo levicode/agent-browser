@@ -1772,6 +1772,28 @@ impl ObservationDispatch {
         } else if matches!(&request, DispatchRequest::ReadFields(_)) {
             return Err(failure(ProtocolError::ScopeUnavailable));
         }
+        // Warm only isolated-world identities in a first ordinary UI permit.
+        // No DOM, selector, geometry or semantic result is read here. The same
+        // original proof is retained through all later protected checks.
+        let query_partition = if matches!(&request, DispatchRequest::Query(_)) {
+            context
+                .query_authority
+                .as_ref()
+                .map(|authority| authority.acquire(&context.page, &operation))
+                .transpose()
+                .map_err(failure)?
+        } else {
+            None
+        };
+        if let Some(partition) = query_partition.as_ref() {
+            tokio::select! {
+                result = prepare_query_worlds(&context.page, &operation, partition, &context.ui, protected) => result.map_err(failure)?,
+                _ = observation::capture_retired() => {
+                    check(&context.page, &operation).map_err(failure)?;
+                    return Err(failure(ProtocolError::StaleReference));
+                }
+            }
+        }
         screenshot_stage(screenshot, ScreenshotStage::UiAdmission);
         let _ui = tokio::select! {
             result = context.ui.enter(protected, operation.is_callback,
@@ -1922,23 +1944,13 @@ impl ObservationDispatch {
         #[cfg(test)]
         witness.enter(ObserveFailureStage::InitialFrames);
         screenshot_stage(screenshot, ScreenshotStage::InitialFrames);
-        let query_partition = if matches!(&request, DispatchRequest::Query(_)) {
-            context
-                .query_authority
-                .as_ref()
-                .map(|authority| authority.acquire(&context.page, &operation))
-                .transpose()
-                .map_err(failure)?
-        } else {
-            None
-        };
         let frames = if matches!(&request, DispatchRequest::TraceSemantic(_))
             || matches!(&request, DispatchRequest::Screenshot(request) if request.purpose == ScreenshotPurpose::Trace) {
             self.initial_trace_frames(&context, &operation, retirement_fence, &observation_cleanup, screenshot).await
         } else if matches!(&request, DispatchRequest::Observe(_)) {
             self.initial_observe_frames(&context, &operation, capture.as_ref(), retirement_fence, &observation_cleanup, screenshot).await
         } else {
-            query_frames(&context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref()).await
+            query_frames(&context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::InitialFrames)).as_ref()).await
         }.map_err(failure)?;
         let fallback_selector = match &request {
             DispatchRequest::Observe(request) if request.options.pixel_fallback => {
@@ -1983,7 +1995,7 @@ impl ObservationDispatch {
             let frozen = if is_observe {
                 verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await?
             } else {
-                query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref()).await?
+                query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::ProtectedFrames)).as_ref()).await?
             };
             same_frames(&capture_context.frames, &frozen)?;
             // Semantic capture proves which exact documents were projected,
@@ -2237,7 +2249,7 @@ impl ObservationDispatch {
         let final_frames = if is_observe {
             verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await
         } else {
-            query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref()).await
+            query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::FinalFrames)).as_ref()).await
         }
             .map_err(failure)?;
         same_frames(&capture_context.frames, &final_frames).map_err(failure)?;
@@ -2810,6 +2822,104 @@ pub(crate) async fn selected_query_frames_for_test(
     partition: &super::client_enrollment::PageAcquisitionProof,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
     query_frames(page, operation, None, None, Some(partition)).await
+}
+/// Metadata RPCs use the SAME UI admission as the final query. Drop that
+/// permit before awaiting event application; never retain publication/barriers.
+async fn prepare_query_worlds(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    partition: &super::client_enrollment::PageAcquisitionProof,
+    ui: &Arc<UiGate>,
+    protected: bool,
+) -> Result<(), ProtocolError> {
+    let partition = partition.diagnostic_phase(diagnostic::QueryScopeStage::WarmWorlds);
+    let permit = ui
+        .enter(
+            protected,
+            operation.is_callback,
+            operation.deadline,
+            operation.cancellation.clone(),
+        )
+        .await?;
+    warm_query_worlds(page, operation, &partition).await?;
+    drop(permit);
+    partition.wait_received_prefix(page, operation).await?;
+    partition.check(page, operation)
+}
+/// Only exact frame/world metadata, never DOM/geometry/selector projection.
+async fn warm_query_worlds(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    partition: &super::client_enrollment::PageAcquisitionProof,
+) -> Result<(), ProtocolError> {
+    let partition = partition.diagnostic_phase(diagnostic::QueryScopeStage::WarmWorlds);
+    partition.check(page, operation)?;
+    let mut trees = Vec::new();
+    for target in partition.targets() {
+        if !matches!(target.kind.as_str(), "page" | "iframe") {
+            return Err(ProtocolError::StaleScope);
+        }
+        let tree = command(
+            page,
+            operation,
+            &target.session_id,
+            "Page.getFrameTree",
+            json!({}),
+        )
+        .await?;
+        trees.push((target.session_id.clone(), target.kind == "page", tree));
+    }
+    let lineage = page_lineage(&trees, &page.page_session_id)?;
+    if lineage.parents.len() > 256 || lineage.iframe_sessions.len() > 256 {
+        return Err(ProtocolError::InvalidArguments);
+    }
+    // Frame ancestry, never opener metadata, selects the exact CDP session.
+    for frame in lineage.parents.keys() {
+        let mut ancestor = frame;
+        let mut session = page.page_session_id.as_str();
+        let mut resolved = false;
+        for _ in 0..=lineage.parents.len() {
+            if let Some(owner) = lineage.iframe_sessions.get(ancestor) {
+                session = owner;
+                resolved = true;
+                break;
+            }
+            match lineage.parents.get(ancestor) {
+                Some(Some(parent)) => ancestor = parent,
+                Some(None) => {
+                    resolved = true;
+                    break;
+                }
+                None => return Err(ProtocolError::StaleScope),
+            }
+        }
+        if !resolved
+            || !partition
+                .targets()
+                .iter()
+                .any(|target| target.session_id == session)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        command(
+            page,
+            operation,
+            session,
+            "Page.createIsolatedWorld",
+            json!({"frameId":frame,"worldName":"agent-browser-native-observation"}),
+        )
+        .await?;
+    }
+    Ok(())
+}
+#[cfg(test)]
+pub(crate) async fn warm_query_worlds_for_test(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    partition: &super::client_enrollment::PageAcquisitionProof,
+    ui: &Arc<UiGate>,
+) -> Result<(), ProtocolError> {
+    prepare_query_worlds(page, operation, partition, ui, true).await
 }
 async fn query_frames(
     page: &BrowserExecutionLease,
