@@ -440,6 +440,46 @@ impl ExactRealmTicket {
     }
 }
 
+/// Exact native detach authority for create-only same-context reopen. This is
+/// not context disposal, borrowed adoption, or quarantine-unseal authority.
+/// Only enrollment can construct it after observing the active root receipt.
+enum ClosedPageReopenMode {
+    Isolated,
+    Borrowed,
+}
+pub(crate) struct ClosedPageReopenProof {
+    owner: Arc<ClientEnrollment>,
+    operation: OperationLease,
+    target: String,
+    session: String,
+    mode: ClosedPageReopenMode,
+}
+impl ClosedPageReopenProof {
+    pub(crate) fn is_isolated(&self) -> bool {
+        matches!(self.mode, ClosedPageReopenMode::Isolated)
+    }
+    pub(crate) fn check(
+        &self,
+        owner: &Arc<ClientEnrollment>,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        exact_restart_operation(&self.owner, &self.operation, op)?;
+        page.permit.check()?;
+        if !Arc::ptr_eq(owner, &self.owner)
+            || !Arc::ptr_eq(&page.targets, &self.owner.targets)
+            || !Arc::ptr_eq(&page.client, &self.owner.client)
+            || page.identity_scope != self.owner.targets.identity_scope
+            || page.target_id != self.target
+            || page.page_session_id != self.session
+            || self.is_isolated() != matches!(self.owner.ownership, ScopeOwnership::IsolatedContext)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+}
+
 /// Explicit restart authority, not ordinary borrowed-resource ownership.
 /// It names one original operation and never grants a context disposal right.
 pub(crate) struct BorrowedRestartPermit {
@@ -752,6 +792,7 @@ enum CaptureTestPoint {
 struct CaptureTestGate {
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
+    passed: tokio::sync::Semaphore,
 }
 #[cfg(test)]
 impl CaptureTestGate {
@@ -759,10 +800,18 @@ impl CaptureTestGate {
         Arc::new(Self {
             entered: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
+            passed: tokio::sync::Semaphore::new(0),
         })
     }
     async fn wait_entered(&self) {
         tokio::time::timeout(Duration::from_secs(2), self.entered.acquire())
+            .await
+            .unwrap()
+            .unwrap()
+            .forget();
+    }
+    async fn wait_passed(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.passed.acquire())
             .await
             .unwrap()
             .unwrap()
@@ -2084,6 +2133,7 @@ impl ClientEnrollment {
                 Ok(())
             })
             .await?;
+            gate.passed.add_permits(1);
         }
         Ok(())
     }
@@ -2383,8 +2433,10 @@ impl ClientEnrollment {
     ) -> Result<bool, ProtocolError> {
         self.check_restart_operation(op)?;
         page.permit.check()?;
-        if !matches!(self.ownership, ScopeOwnership::BorrowedTargets(_))
-            || !Arc::ptr_eq(&page.client, &self.client)
+        if !matches!(
+            self.ownership,
+            ScopeOwnership::BorrowedTargets(_) | ScopeOwnership::IsolatedContext
+        ) || !Arc::ptr_eq(&page.client, &self.client)
             || !Arc::ptr_eq(&page.targets, &self.targets)
             || page.identity_scope != self.targets.identity_scope
         {
@@ -2479,12 +2531,42 @@ impl ClientEnrollment {
         }
     }
 
+    pub(crate) async fn closed_page_reopen_proof(
+        self: &Arc<Self>,
+        page: &BrowserExecutionLease,
+        ui_gate: &Arc<super::client_ui::UiGate>,
+        op: &OperationLease,
+    ) -> Result<ClosedPageReopenProof, ProtocolError> {
+        if op.is_callback || op.sequence == 0 || !self.network.uses_ui_gate(ui_gate) {
+            return Err(ProtocolError::PolicyDenied);
+        }
+        if !self.persistent_page_detached(page, op).await? {
+            return Err(ProtocolError::StaleReference);
+        }
+        Ok(ClosedPageReopenProof {
+            owner: self.clone(),
+            operation: copy_operation(op),
+            target: page.target_id.clone(),
+            session: page.page_session_id.clone(),
+            mode: match self.ownership {
+                ScopeOwnership::IsolatedContext => ClosedPageReopenMode::Isolated,
+                ScopeOwnership::BorrowedTargets(_) => ClosedPageReopenMode::Borrowed,
+                ScopeOwnership::TrackedTargets(_) => {
+                    return Err(ProtocolError::UnsupportedCapability)
+                }
+            },
+        })
+    }
+
     pub(crate) async fn borrowed_reopen_permit(
         self: &Arc<Self>,
         page: &BrowserExecutionLease,
         ui_gate: &Arc<super::client_ui::UiGate>,
         op: &OperationLease,
     ) -> Result<BorrowedRestartPermit, ProtocolError> {
+        if !matches!(self.ownership, ScopeOwnership::BorrowedTargets(_)) {
+            return Err(ProtocolError::UnsupportedCapability);
+        }
         if op.is_callback || op.sequence == 0 || !self.network.uses_ui_gate(ui_gate) {
             return Err(ProtocolError::PolicyDenied);
         }
@@ -3546,11 +3628,13 @@ impl ClientEnrollment {
         }
         // Reused text is not a resurrected application-root tenure. Keep the
         // exact detach candidate unambiguous until its owner opens a new page.
-        if matches!(self.ownership, ScopeOwnership::BorrowedTargets(_))
-            && index
-                .detached_application_roots
-                .iter()
-                .any(|(old_target, old_session)| old_target == target || old_session == session)
+        if matches!(
+            self.ownership,
+            ScopeOwnership::BorrowedTargets(_) | ScopeOwnership::IsolatedContext
+        ) && index
+            .detached_application_roots
+            .iter()
+            .any(|(old_target, old_session)| old_target == target || old_session == session)
         {
             return Err(ProtocolError::StaleScope.into());
         }
@@ -4078,7 +4162,16 @@ impl ClientEnrollment {
                         .await;
                     if let Err(error) = retired {
                         self.network.quarantine_worker_startup()?;
-                        return Err(if error == ProtocolError::Cancelled {
+                        // This private producer keeps its earlier hard failure
+                        // through retirement. A separately owned operation still
+                        // reports its own cancellation after quarantine. Channel
+                        // identity is fixed; no later stop state mints success.
+                        return Err(if error == ProtocolError::Cancelled
+                            && op.generation == self.generation
+                            && op.sequence == 0
+                            && !op.is_callback
+                            && op.cancellation.same_channel(&self.stop.subscribe())
+                        {
                             failure.error()
                         } else {
                             error
@@ -15185,6 +15278,7 @@ mod tests {
         ExactDetach,
         Deadline,
         OperationCancel,
+        OwnerRetirement,
         WrongSession,
         TargetDestroyed,
         ReplacedWatermark,
@@ -15204,7 +15298,12 @@ mod tests {
                 waiting.clone(),
             );
         }
-        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        let (cancel, independent_cancellation) = watch::channel(CancelSignal::None);
+        let cancellation = if case == FailedWorkerWaitCase::OwnerRetirement {
+            owner.stop.subscribe()
+        } else {
+            independent_cancellation
+        };
         let separate_operation_cancel = !cancellation.same_channel(&owner.stop.subscribe());
         let mut startup = None;
         let mut replacement_stream = None;
@@ -15294,7 +15393,9 @@ mod tests {
                 replacement_stream = Some(events);
                 owner.changed.notify_waiters();
             }
-            waiting.release();
+            if case != FailedWorkerWaitCase::OwnerRetirement {
+                waiting.release();
+            }
             let event = match case {
                 FailedWorkerWaitCase::ExactDetach => Some(json!({
                     "method":"Target.detachedFromTarget",
@@ -15366,6 +15467,14 @@ mod tests {
             if case == FailedWorkerWaitCase::OperationCancel {
                 // Not owner.stop and not the fixture's bootstrap cancellation.
                 cancel.send_replace(CancelSignal::Requested);
+            } else if case == FailedWorkerWaitCase::OwnerRetirement {
+                // Leave the test hook successfully before stopping the owner.
+                // Only production retirement waits may observe this cancellation.
+                waiting.release();
+                waiting.wait_passed().await;
+                owner.seal_for_owner_retirement(
+                    &super::super::client_browser::OwnerRetirement::for_test(&owner.targets),
+                );
             }
             let outcome = tokio::time::timeout(Duration::from_secs(2), startup.as_mut().unwrap())
                 .await
@@ -15447,15 +15556,18 @@ mod tests {
         );
         assert!(joined_error.contains("Runtime.enable: CDP error (Runtime.enable)"));
         assert!(joined_error.contains("synthetic observer failure"));
-        assert!(
-            separate_operation_cancel && ready_unused && no_ready,
-            "{case:?}"
-        );
-        assert_eq!(
-            stop_after,
-            CancelSignal::None,
-            "{case:?}: owner stop was not the trigger"
-        );
+        assert!(ready_unused && no_ready, "{case:?}");
+        if case == FailedWorkerWaitCase::OwnerRetirement {
+            assert!(!separate_operation_cancel);
+            assert_eq!(stop_after, CancelSignal::OwnerRetirement);
+        } else {
+            assert!(separate_operation_cancel, "{case:?}");
+            assert_eq!(
+                stop_after,
+                CancelSignal::None,
+                "{case:?}: owner stop was not the trigger"
+            );
+        }
         assert_eq!(debt_after.outstanding_commands, 0, "{case:?}");
         assert!(!debt_after.integrity_lost, "{case:?}");
         assert_eq!(
@@ -15490,6 +15602,7 @@ mod tests {
             _ => {
                 let expected = match case {
                     FailedWorkerWaitCase::OperationCancel => ProtocolError::Cancelled,
+                    FailedWorkerWaitCase::OwnerRetirement => ProtocolError::BrowserFailure,
                     FailedWorkerWaitCase::ReplacedWatermark => ProtocolError::StaleScope,
                     _ => ProtocolError::DeadlineExceeded,
                 };
@@ -15559,6 +15672,11 @@ mod tests {
     #[tokio::test]
     async fn service_worker_failed_live_pending_wait_honors_independent_operation_cancel() {
         failed_worker_pending_wait_case(FailedWorkerWaitCase::OperationCancel).await;
+    }
+
+    #[tokio::test]
+    async fn service_worker_failed_live_pending_wait_preserves_error_ack_on_owner_retirement() {
+        failed_worker_pending_wait_case(FailedWorkerWaitCase::OwnerRetirement).await;
     }
 
     #[tokio::test]
@@ -19464,7 +19582,7 @@ mod tests {
     }
     async fn pending_popup_owner_retirement_case(mode: &str) {
         let (owner, _notices, log, emit, server, _broker, connection) =
-            fixture_with_client("owner-retirement", true).await;
+            fixture_with_explicit_context_ownership("owner-retirement", true, true).await;
         owner
             .enroll_existing("initial-target", "initial", "page", &owner.operation())
             .await
@@ -19510,8 +19628,17 @@ mod tests {
             .iter()
             .filter(|request| request["sessionId"] == "pending-popup")
             .count();
+        // A failed producer invokes isolated-context containment. Match the
+        // coordinator's ownership instead of denying its actual disposal RPC.
+        let context_disposals = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "Target.disposeBrowserContext")
+            .count();
         // Join/close the actual scripted peer before the baseline-red assertion.
-        // This test proves enrollment phase one only, never context destruction.
+        // This proves phase-one failure preservation and scripted containment,
+        // not context destruction in a real browser.
         gate.release();
         let _ = owner.close().await;
         connection.close().await;
@@ -19538,6 +19665,7 @@ mod tests {
             }
             _ => unreachable!(),
         }
+        assert_eq!(context_disposals, usize::from(mode != "owner-only"));
     }
 
     #[tokio::test]

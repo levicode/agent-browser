@@ -16,6 +16,13 @@ async fn peer_with_navigation(
     fenced_navigation: bool,
     close_during_navigation: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    peer_with_mode(fenced_navigation, close_during_navigation, false).await
+}
+async fn peer_with_mode(
+    fenced_navigation: bool,
+    close_during_navigation: bool,
+    isolated: bool,
+) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -38,6 +45,12 @@ async fn peer_with_navigation(
                 info("foreign-host", "foreign-context"),
             ),
         ]);
+        if isolated {
+            pages.remove("application");
+            pages.remove("unrelated-host");
+        }
+        let mut context_live = false;
+        let mut initial_created = false;
         let mut watching = false;
         let mut navigations = 0;
         while let Some(Ok(Message::Text(text))) = socket.next().await {
@@ -49,8 +62,25 @@ async fn peer_with_navigation(
             let mut after = Vec::new();
             let mut navigation_closed = false;
             let result = match method {
+                "Target.createBrowserContext" if isolated => {
+                    context_live = true;
+                    json!({"browserContextId":"persistent-context"})
+                }
+                "Target.disposeBrowserContext" if isolated => {
+                    assert_eq!(request["params"]["browserContextId"], "persistent-context");
+                    context_live = false;
+                    for (target, sid) in [
+                        ("application", "initial-session"),
+                        ("replacement", "replacement-session"),
+                    ] {
+                        if pages.remove(target).is_some() {
+                            after.push(json!({"method":"Target.detachedFromTarget","params":{"sessionId":sid,"targetId":target}}));
+                        }
+                    }
+                    json!({})
+                }
                 "Target.getBrowserContexts" => {
-                    json!({"browserContextIds":["foreign-context"],"defaultBrowserContextId":"persistent-context"})
+                    json!({"browserContextIds":if isolated && context_live { vec!["foreign-context", "persistent-context"] } else { vec!["foreign-context"] },"defaultBrowserContextId":"persistent-context"})
                 }
                 "Target.getTargets" => {
                     json!({"targetInfos":pages.values().cloned().collect::<Vec<_>>()})
@@ -72,9 +102,23 @@ async fn peer_with_navigation(
                 "Target.setAutoAttach" => {
                     if session.is_empty() && request["params"]["autoAttach"] == true && !watching {
                         watching = true;
-                        after.push(attachment("unrelated-host", "host-observer"));
+                        if !isolated {
+                            after.push(attachment("unrelated-host", "host-observer"));
+                        }
                     }
                     json!({})
+                }
+                "Target.createTarget" if isolated && !initial_created => {
+                    assert_eq!(
+                        request["params"],
+                        json!({"browserContextId":"persistent-context","url":"about:blank"})
+                    );
+                    initial_created = true;
+                    pages.insert(
+                        "application".into(),
+                        info("application", "persistent-context"),
+                    );
+                    json!({"targetId":"application"})
                 }
                 "Target.createTarget" => {
                     assert_eq!(
@@ -207,20 +251,37 @@ async fn peer_with_navigation(
 
 #[tokio::test]
 async fn persistent_closed_page_dispatch_is_negotiated_and_refresh_precedes_results() {
+    closed_page_dispatch_for_mode(false).await;
+}
+
+#[tokio::test]
+async fn isolated_closed_page_dispatch_is_negotiated_and_preserves_context_owner() {
+    closed_page_dispatch_for_mode(true).await;
+}
+
+async fn closed_page_dispatch_for_mode(isolated: bool) {
     for negotiated in [false, true] {
-        let (endpoint, log, peer) = peer().await;
+        let (endpoint, log, peer) = peer_with_mode(false, false, isolated).await;
         let broker = Arc::new(ClientSession::new());
         let browser = Arc::new(ClientBrowser::new(broker.clone()));
         let capabilities = if negotiated {
-            vec![super::super::super::client_protocol::PERSISTENT_PAGE_REOPEN.into()]
+            vec![if isolated {
+                super::super::super::client_protocol::ISOLATED_PAGE_REOPEN.into()
+            } else {
+                super::super::super::client_protocol::PERSISTENT_PAGE_REOPEN.into()
+            }]
         } else {
-            vec![]
+            vec![if isolated {
+                super::super::super::client_protocol::PERSISTENT_PAGE_REOPEN.into()
+            } else {
+                super::super::super::client_protocol::ISOLATED_PAGE_REOPEN.into()
+            }]
         };
         let mut fixture = FramedFixture::with_capabilities(broker, browser.clone(), capabilities);
         let result: Result<(), String> = async {
             fixture.ready().await?;
             let mut args = fixture_scope_open("connect",Some(&endpoint));
-            args["context"] = "persistent".into();
+            args["context"] = if isolated { "isolated" } else { "persistent" }.into();
             let opened = fixture.command("scope.open",args,5).await?;
             let scope = opened["identityScope"].as_str().unwrap().to_owned();
             fixture.scope = Some(scope.clone());
@@ -279,9 +340,15 @@ async fn persistent_closed_page_dispatch_is_negotiated_and_refresh_precedes_resu
                 assert_eq!(fixture.command("page.title",json!({"identityScope":scope}),5).await?["title"],"replacement-session");
             }
             let commands = log.lock().unwrap().clone();
-            assert_eq!(commands.iter().filter(|c| c["method"]=="Target.createTarget").count(),usize::from(negotiated));
+            assert_eq!(commands.iter().filter(|c| c["method"]=="Target.createTarget").count(),usize::from(negotiated) + usize::from(isolated));
             assert_eq!(commands.iter().filter(|c| c["method"]=="Page.navigate").count(),1);
-            assert!(!commands.iter().any(|c| matches!(c["method"].as_str(),Some("Target.createBrowserContext"|"Target.disposeBrowserContext"))));
+            assert_eq!(commands.iter().filter(|c| c["method"] == "Target.createBrowserContext").count(), usize::from(isolated));
+            assert!(!commands.iter().any(|c| c["method"] == "Target.disposeBrowserContext"));
+            let owner = browser.owner.lock().await;
+            let owner = owner.as_ref().unwrap();
+            assert_eq!(owner.owns_context, isolated);
+            assert_eq!(owner.borrowed_targets.is_none(), isolated);
+            assert_eq!(owner.context_id, "persistent-context");
             Ok(())
         }.await;
         let cleaned = fixture.finish().await;

@@ -965,6 +965,7 @@ mod tests {
             "browser.scope/1",
             "browser.lifecycle/1",
             "browser.persistent-page-reopen/1",
+            "browser.isolated-page-reopen/1",
             "browser.evaluate/1",
             "browser.page/1",
             "browser.page-identity-fence/1",

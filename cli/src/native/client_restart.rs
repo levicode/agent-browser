@@ -6,7 +6,7 @@
 //! without resetting their allocator. Publication and the next recording hook
 //! remain owner responsibilities; a successful page proof is not publication.
 use super::client_browser::BrowserExecutionLease;
-use super::client_enrollment::{BorrowedRestartPermit, ClientEnrollment};
+use super::client_enrollment::{BorrowedRestartPermit, ClientEnrollment, ClosedPageReopenProof};
 use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
 use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
@@ -32,6 +32,7 @@ pub(crate) struct RestartContext<'a> {
     ui: &'a UiPermit,
     operation: &'a OperationLease,
     borrowed: Option<BorrowedRestartPermit>,
+    closed_page: Option<ClosedPageReopenProof>,
     staged_sink: Option<ClientEventSink>,
 }
 impl<'a> RestartContext<'a> {
@@ -49,6 +50,7 @@ impl<'a> RestartContext<'a> {
             ui,
             operation,
             borrowed: None,
+            closed_page: None,
             staged_sink: None,
         };
         context.check()?;
@@ -72,6 +74,7 @@ impl<'a> RestartContext<'a> {
             ui,
             operation,
             borrowed: None,
+            closed_page: None,
             staged_sink: None,
         };
         context.check()?;
@@ -80,7 +83,7 @@ impl<'a> RestartContext<'a> {
     }
     /// Automatic reopen can create one blank only after an exact native root
     /// detach. It cannot close another page or reuse explicit restart authority.
-    pub(crate) async fn new_persistent_reopen(
+    pub(crate) async fn new_closed_page_reopen(
         page: &'a BrowserExecutionLease,
         enrollment: &'a Arc<ClientEnrollment>,
         ui_gate: &'a Arc<UiGate>,
@@ -94,14 +97,21 @@ impl<'a> RestartContext<'a> {
             ui,
             operation,
             borrowed: None,
+            closed_page: None,
             staged_sink: None,
         };
         context.check()?;
-        context.borrowed = Some(
-            enrollment
-                .borrowed_reopen_permit(page, ui_gate, operation)
-                .await?,
-        );
+        let proof = enrollment
+            .closed_page_reopen_proof(page, ui_gate, operation)
+            .await?;
+        if !proof.is_isolated() {
+            context.borrowed = Some(
+                enrollment
+                    .borrowed_reopen_permit(page, ui_gate, operation)
+                    .await?,
+            );
+        }
+        context.closed_page = Some(proof);
         Ok(context)
     }
 
@@ -128,6 +138,12 @@ impl<'a> RestartContext<'a> {
         }
         if Instant::now() >= self.operation.deadline {
             return Err(ProtocolError::DeadlineExceeded);
+        }
+        if let Some(proof) = &self.closed_page {
+            proof.check(self.enrollment, self.page, self.operation)?;
+            if proof.is_isolated() == self.borrowed.is_some() {
+                return Err(ProtocolError::PolicyDenied);
+            }
         }
         if let Some(permit) = &self.borrowed {
             permit.check(self.operation)?;
@@ -201,6 +217,7 @@ pub(super) struct ReopenedResultIdentity {
     generation: u64,
     sequence: u64,
     identity_scope: String,
+    isolated: bool,
     sink: super::client_transport::ReopenedResultBinding,
 }
 impl ReopenedResultIdentity {
@@ -211,7 +228,11 @@ impl ReopenedResultIdentity {
         sequence: u64,
         identity_scope: &str,
     ) -> bool {
-        self.sink.matches(sink)
+        (if self.isolated {
+            sink.isolated_page_reopen_negotiated()
+        } else {
+            sink.persistent_page_reopen_negotiated()
+        }) && self.sink.matches(sink)
             && self.generation == generation
             && self.sequence == sequence
             && self.identity_scope == identity_scope
@@ -439,7 +460,7 @@ pub(crate) async fn reopen_closed_page(
     let mut journal = RestartFailure::new(context);
     let result = async {
         context.check()?;
-        if context.borrowed.is_none() {
+        if context.closed_page.is_none() {
             return Err(ProtocolError::PolicyDenied);
         }
         let inventory = context.command("Target.getTargets", json!({})).await?;
@@ -461,6 +482,11 @@ pub(crate) async fn reopen_closed_page(
                 generation: context.operation.generation,
                 sequence: context.operation.sequence,
                 identity_scope: context.page.identity_scope.clone(),
+                isolated: context
+                    .closed_page
+                    .as_ref()
+                    .ok_or(ProtocolError::PolicyDenied)?
+                    .is_isolated(),
                 sink: sink.reopened_result_binding()?,
             });
         }
@@ -785,7 +811,19 @@ mod tests {
                                 "late-popup" => "popup-session",
                                 _ => "replacement-session",
                             };
-                            after.push(json!({"method":"Target.detachedFromTarget","params":{"sessionId":session,"targetId":target}}));
+                            if !mode.ends_with("missing-detach") {
+                                let receipt_session = if mode.ends_with("wrong-detach-session") {
+                                    "unrelated-session"
+                                } else {
+                                    session
+                                };
+                                let receipt_target = if mode.ends_with("wrong-detach-root") {
+                                    "foreign"
+                                } else {
+                                    target
+                                };
+                                after.push(json!({"method":"Target.detachedFromTarget","params":{"sessionId":receipt_session,"targetId":receipt_target}}));
+                            }
                             if mode.ends_with("late-popup") && !popup_added {
                                 popup_added = true;
                                 targets.insert(
@@ -1001,7 +1039,7 @@ mod tests {
                 .sink
                 .stage_until_result(&fixture.operation, "same-scope")
                 .unwrap();
-            let context = RestartContext::new_persistent_reopen(
+            let context = RestartContext::new_closed_page_reopen(
                 &fixture.page,
                 &fixture.enrollment,
                 &fixture.ui,
@@ -1139,7 +1177,12 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_closed_application_reopens_one_blank_without_closing_host_tabs() {
-        for mode in ["persistent", "persistent-ack-before-attach"] {
+        for mode in [
+            "persistent",
+            "persistent-ack-before-attach",
+            "isolated",
+            "isolated-ack-before-attach",
+        ] {
             let fixture = make_fixture(mode).await;
             assert!(!fixture
                 .enrollment
@@ -1148,7 +1191,7 @@ mod tests {
                 .unwrap());
             close_application_root(&fixture).await;
             let exclusive = exclusive(&fixture).await;
-            let context = RestartContext::new_persistent_reopen(
+            let context = RestartContext::new_closed_page_reopen(
                 &fixture.page,
                 &fixture.enrollment,
                 &fixture.ui,
@@ -1189,13 +1232,18 @@ mod tests {
                         | "Page.navigate"
                 )
             )));
-            assert_eq!(
-                context.borrowed.as_ref().unwrap().prepare_page_retirement(
-                    &info("host-page", "page", "owned-context"),
-                    &fixture.operation
-                ),
-                Err(ProtocolError::PolicyDenied)
-            );
+            if fixture.persistent {
+                assert_eq!(
+                    context.borrowed.as_ref().unwrap().prepare_page_retirement(
+                        &info("host-page", "page", "owned-context"),
+                        &fixture.operation
+                    ),
+                    Err(ProtocolError::PolicyDenied)
+                );
+            } else {
+                assert!(context.borrowed.is_none());
+                assert!(context.closed_page.as_ref().unwrap().is_isolated());
+            }
             drop(context);
             drop(exclusive);
             // The old exact session cannot authorize another replacement after
@@ -1211,136 +1259,232 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_detach_without_target_closure_never_reopens() {
-        let fixture = make_fixture("persistent").await;
-        fixture
-            .page
-            .client
-            .send_command(
-                "Target.detachFromTarget",
-                Some(json!({"sessionId":"old-session"})),
-                None,
+        for mode in ["persistent", "isolated"] {
+            let fixture = make_fixture(mode).await;
+            fixture
+                .page
+                .client
+                .send_command(
+                    "Target.detachFromTarget",
+                    Some(json!({"sessionId":"old-session"})),
+                    None,
+                )
+                .await
+                .unwrap();
+            fixture
+                .page
+                .client
+                .send_command("Target.getTargets", Some(json!({})), None)
+                .await
+                .unwrap();
+            let exclusive = exclusive(&fixture).await;
+            let context = RestartContext::new_closed_page_reopen(
+                &fixture.page,
+                &fixture.enrollment,
+                &fixture.ui,
+                &exclusive,
+                &fixture.operation,
             )
             .await
             .unwrap();
-        fixture
-            .page
-            .client
-            .send_command("Target.getTargets", Some(json!({})), None)
-            .await
-            .unwrap();
-        let exclusive = exclusive(&fixture).await;
-        let context = RestartContext::new_persistent_reopen(
-            &fixture.page,
-            &fixture.enrollment,
-            &fixture.ui,
-            &exclusive,
-            &fixture.operation,
-        )
-        .await
-        .unwrap();
-        let failure = match reopen_closed_page(&context).await {
-            Err(error) => error,
-            Ok(_) => panic!("a live host target was replaced"),
-        };
-        assert_eq!(failure.error, ProtocolError::StaleReference);
-        assert!(!failure.effects_started);
-        assert!(!fixture
-            .log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c["method"] == "Target.createTarget" || c["method"] == "Target.closeTarget"));
-        drop(context);
-        drop(exclusive);
-        fixture.close().await;
+            let failure = match reopen_closed_page(&context).await {
+                Err(error) => error,
+                Ok(_) => panic!("a live host target was replaced"),
+            };
+            assert_eq!(failure.error, ProtocolError::StaleReference);
+            assert!(!failure.effects_started);
+            assert!(!fixture.log.lock().unwrap().iter().any(|c| c["method"]
+                == "Target.createTarget"
+                || c["method"] == "Target.closeTarget"));
+            drop(context);
+            drop(exclusive);
+            fixture.close().await;
+        }
     }
 
     #[tokio::test]
     async fn persistent_reopen_requires_exact_owner_ui_and_noncallback_operation() {
-        let mut fixture = make_fixture("persistent").await;
-        let foreign = make_fixture("persistent").await;
-        close_application_root(&fixture).await;
-        let exclusive = exclusive(&fixture).await;
-        assert!(RestartContext::new_persistent_reopen(
-            &fixture.page,
-            &foreign.enrollment,
-            &fixture.ui,
-            &exclusive,
-            &fixture.operation
-        )
-        .await
-        .is_err());
-        assert!(RestartContext::new_persistent_reopen(
-            &fixture.page,
-            &fixture.enrollment,
-            &foreign.ui,
-            &exclusive,
-            &fixture.operation
-        )
-        .await
-        .is_err());
-        fixture.operation.is_callback = true;
-        assert!(RestartContext::new_persistent_reopen(
-            &fixture.page,
-            &fixture.enrollment,
-            &fixture.ui,
-            &exclusive,
-            &fixture.operation
-        )
-        .await
-        .is_err());
-        assert!(!fixture
-            .log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c["method"] == "Target.createTarget"));
-        drop(exclusive);
-        fixture.close().await;
-        foreign.close().await;
+        for mode in ["persistent", "isolated"] {
+            let mut fixture = make_fixture(mode).await;
+            let foreign = make_fixture(mode).await;
+            close_application_root(&fixture).await;
+            let exclusive = exclusive(&fixture).await;
+            assert!(RestartContext::new_closed_page_reopen(
+                &fixture.page,
+                &foreign.enrollment,
+                &fixture.ui,
+                &exclusive,
+                &fixture.operation
+            )
+            .await
+            .is_err());
+            assert!(RestartContext::new_closed_page_reopen(
+                &fixture.page,
+                &fixture.enrollment,
+                &foreign.ui,
+                &exclusive,
+                &fixture.operation
+            )
+            .await
+            .is_err());
+            fixture.operation.is_callback = true;
+            assert!(RestartContext::new_closed_page_reopen(
+                &fixture.page,
+                &fixture.enrollment,
+                &fixture.ui,
+                &exclusive,
+                &fixture.operation
+            )
+            .await
+            .is_err());
+            assert!(!fixture
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c["method"] == "Target.createTarget"));
+            drop(exclusive);
+            fixture.close().await;
+            foreign.close().await;
+        }
     }
 
     #[tokio::test]
     async fn persistent_reopen_never_revives_same_text_detached_root_tenure() {
-        let fixture = make_fixture("persistent").await;
-        close_application_root(&fixture).await;
-        fixture
-            .page
-            .client
-            .send_command(
-                "Target.attachToTarget",
-                Some(json!({"targetId":"old-page","flatten":true})),
-                None,
-            )
-            .await
-            .unwrap();
-        fixture
-            .page
-            .client
-            .send_command("Target.getTargets", Some(json!({})), None)
-            .await
-            .unwrap();
-        assert!(fixture
-            .enrollment
-            .persistent_page_detached(&fixture.page, &fixture.operation)
-            .await
-            .is_err());
-        assert!(!fixture
-            .log
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|c| c["method"] == "Target.createTarget"));
-        fixture.close().await;
+        for mode in ["persistent", "isolated"] {
+            let fixture = make_fixture(mode).await;
+            close_application_root(&fixture).await;
+            fixture
+                .page
+                .client
+                .send_command(
+                    "Target.attachToTarget",
+                    Some(json!({"targetId":"old-page","flatten":true})),
+                    None,
+                )
+                .await
+                .unwrap();
+            fixture
+                .page
+                .client
+                .send_command("Target.getTargets", Some(json!({})), None)
+                .await
+                .unwrap();
+            assert!(fixture
+                .enrollment
+                .persistent_page_detached(&fixture.page, &fixture.operation)
+                .await
+                .is_err());
+            assert!(!fixture
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c["method"] == "Target.createTarget"));
+            fixture.close().await;
+        }
     }
 
     #[tokio::test]
     async fn persistent_reopen_lost_create_ack_is_unknown_and_never_replayed() {
-        let mut fixture = make_fixture("persistent-create-no-ack").await;
-        close_application_root(&fixture).await;
-        fixture.operation.deadline = Instant::now() + Duration::from_millis(150);
+        for mode in ["persistent-create-no-ack", "isolated-create-no-ack"] {
+            let mut fixture = make_fixture(mode).await;
+            close_application_root(&fixture).await;
+            fixture.operation.deadline = Instant::now() + Duration::from_millis(150);
+            let exclusive = exclusive(&fixture).await;
+            let context = RestartContext::new_closed_page_reopen(
+                &fixture.page,
+                &fixture.enrollment,
+                &fixture.ui,
+                &exclusive,
+                &fixture.operation,
+            )
+            .await
+            .unwrap();
+            let failure = match reopen_closed_page(&context).await {
+                Err(error) => error,
+                Ok(_) => panic!("unknown create was published"),
+            };
+            assert_eq!(failure.error, ProtocolError::DeadlineExceeded);
+            assert!(
+                failure.effects_started
+                    && failure.create_outcome_unknown
+                    && failure.cleanup_integrity_lost
+            );
+            drop(context);
+            drop(exclusive);
+            fixture.operation.deadline = Instant::now() + Duration::from_secs(1);
+            assert!(fixture
+                .enrollment
+                .persistent_page_detached(&fixture.page, &fixture.operation)
+                .await
+                .is_err());
+            assert_eq!(
+                fixture
+                    .log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|c| c["method"] == "Target.createTarget")
+                    .count(),
+                1
+            );
+            fixture.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_inventory_absence_without_exact_detach_never_grants_creation() {
+        for mode in [
+            "isolated-missing-detach",
+            "isolated-wrong-detach-session",
+            "isolated-wrong-detach-root",
+        ] {
+            let mut fixture = make_fixture(mode).await;
+            fixture
+                .page
+                .client
+                .send_command(
+                    "Target.closeTarget",
+                    Some(json!({"targetId":"old-page"})),
+                    None,
+                )
+                .await
+                .unwrap();
+            fixture.operation.deadline = Instant::now() + Duration::from_millis(150);
+            assert!(
+                fixture
+                    .enrollment
+                    .persistent_reopen_candidate(&fixture.page, &fixture.operation)
+                    .await
+                    .is_err(),
+                "{mode}"
+            );
+            assert!(!fixture
+                .log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|c| c["method"] == "Target.createTarget"));
+            fixture.close().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_closed_proof_is_exact_operation_and_cannot_unseal_or_borrow() {
+        let fixture = make_fixture("isolated").await;
         let exclusive = exclusive(&fixture).await;
-        let context = RestartContext::new_persistent_reopen(
+        assert!(RestartContext::new_closed_page_reopen(
+            &fixture.page,
+            &fixture.enrollment,
+            &fixture.ui,
+            &exclusive,
+            &fixture.operation
+        )
+        .await
+        .is_err());
+        close_application_root(&fixture).await;
+        let context = RestartContext::new_closed_page_reopen(
             &fixture.page,
             &fixture.enrollment,
             &fixture.ui,
@@ -1349,34 +1493,42 @@ mod tests {
         )
         .await
         .unwrap();
-        let failure = match reopen_closed_page(&context).await {
-            Err(error) => error,
-            Ok(_) => panic!("unknown create was published"),
-        };
-        assert_eq!(failure.error, ProtocolError::DeadlineExceeded);
-        assert!(
-            failure.effects_started
-                && failure.create_outcome_unknown
-                && failure.cleanup_integrity_lost
-        );
-        drop(context);
-        drop(exclusive);
-        fixture.operation.deadline = Instant::now() + Duration::from_secs(1);
+        assert!(context.borrowed.is_none());
         assert!(fixture
             .enrollment
-            .persistent_page_detached(&fixture.page, &fixture.operation)
+            .borrowed_reopen_permit(&fixture.page, &fixture.ui, &fixture.operation)
             .await
             .is_err());
+        let proof = context.closed_page.as_ref().unwrap();
+        assert!(proof.is_isolated());
+        let mut other = OperationLease {
+            is_callback: false,
+            generation: fixture.operation.generation,
+            sequence: fixture.operation.sequence + 1,
+            deadline: fixture.operation.deadline,
+            cancellation: fixture.operation.cancellation.clone(),
+        };
         assert_eq!(
-            fixture
-                .log
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|c| c["method"] == "Target.createTarget")
-                .count(),
-            1
+            proof.check(&fixture.enrollment, &fixture.page, &other),
+            Err(ProtocolError::StaleScope)
         );
+        other.sequence = fixture.operation.sequence;
+        let (_sender, receiver) = tokio::sync::watch::channel(CancelSignal::None);
+        other.cancellation = receiver;
+        assert_eq!(
+            proof.check(&fixture.enrollment, &fixture.page, &other),
+            Err(ProtocolError::StaleScope)
+        );
+        fixture.page.targets.seal();
+        assert!(reopen_closed_page(&context).await.is_err());
+        assert!(!fixture
+            .log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c["method"] == "Target.createTarget"));
+        drop(context);
+        drop(exclusive);
         fixture.close().await;
     }
 

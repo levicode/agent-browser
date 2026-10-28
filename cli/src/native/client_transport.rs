@@ -187,8 +187,13 @@ pub struct ClientEventSink {
     open: std::sync::Arc<std::sync::atomic::AtomicBool>,
     barrier: Option<std::sync::Arc<EventBarrier>>,
     persistent_page_reopen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    isolated_page_reopen: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl ClientEventSink {
+    pub(crate) fn isolated_page_reopen_negotiated(&self) -> bool {
+        self.isolated_page_reopen
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
     pub(crate) fn persistent_page_reopen_negotiated(&self) -> bool {
         self.persistent_page_reopen
             .load(std::sync::atomic::Ordering::Acquire)
@@ -206,6 +211,7 @@ impl ClientEventSink {
                 open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
                 barrier: None,
                 persistent_page_reopen: Default::default(),
+                isolated_page_reopen: Default::default(),
             },
             receiver,
         )
@@ -357,14 +363,12 @@ impl ClientEventSink {
     ) -> Result<(), ProtocolError> {
         let barrier = self.barrier.as_ref().ok_or(ProtocolError::StaleScope)?;
         self.validate_stage(source, operation, &barrier.identity_scope)?;
-        if !self.persistent_page_reopen_negotiated()
-            || !proof.matches(
-                self,
-                operation.generation,
-                operation.sequence,
-                &barrier.identity_scope,
-            )
-        {
+        if !proof.matches(
+            self,
+            operation.generation,
+            operation.sequence,
+            &barrier.identity_scope,
+        ) {
             return Err(ProtocolError::StaleScope);
         }
         let _order = self
@@ -1159,6 +1163,7 @@ where
         open: sink_open.clone(),
         barrier: None,
         persistent_page_reopen: Default::default(),
+        isolated_page_reopen: Default::default(),
     };
     let (drain, mut drain_requested) = tokio::sync::oneshot::channel::<()>();
     let (failed, mut failure) = tokio::sync::oneshot::channel::<()>();
@@ -1304,6 +1309,15 @@ where
             && capabilities
                 .iter()
                 .any(|capability| capability == PERSISTENT_PAGE_REOPEN),
+        std::sync::atomic::Ordering::Release,
+    );
+    sink.isolated_page_reopen.store(
+        required_capabilities
+            .iter()
+            .any(|capability| capability == ISOLATED_PAGE_REOPEN)
+            && capabilities
+                .iter()
+                .any(|capability| capability == ISOLATED_PAGE_REOPEN),
         std::sync::atomic::Ordering::Release,
     );
     let terminal_recording_negotiated = terminal_close_negotiated
@@ -3634,6 +3648,7 @@ mod tests {
             open: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             barrier: None,
             persistent_page_reopen: Default::default(),
+            isolated_page_reopen: Default::default(),
         };
         let threads: Vec<_> = (0..16)
             .map(|_| {

@@ -2893,6 +2893,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             "browser.scope/1",
             "browser.lifecycle/1",
             super::client_protocol::PERSISTENT_PAGE_REOPEN,
+            super::client_protocol::ISOLATED_PAGE_REOPEN,
             "browser.evaluate/1",
             "browser.page/1",
             super::client_protocol::PAGE_IDENTITY_FENCE,
@@ -4710,7 +4711,7 @@ async fn await_retained(
 }
 
 impl ClientBrowser {
-    /// Reopen only a proven-closed persistent application root. This runs before
+    /// Reopen only a proven-closed isolated or borrowed application root. This runs before
     /// dispatch of the caller's command, never as a retry after a command error.
     async fn ensure_persistent_page(
         &self,
@@ -4720,17 +4721,17 @@ impl ClientBrowser {
         use super::client_protocol::Effects;
         use super::client_transport::NativeOutcome;
         let captured = async {
-            let (candidate, enrollment) = {
+            let (candidate, enrollment, isolated) = {
                 let owner = self.owner.lock().await;
                 let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
                 if owner.identity_scope != scope { return Err(ProtocolError::StaleScope); }
-                if owner.owns_context || owner.borrowed_targets.is_none() { return Ok(None); }
+                if owner.owns_context == owner.borrowed_targets.is_some() { return Err(ProtocolError::StaleScope); }
                 let runtime = owner.runtime.as_ref().ok_or(ProtocolError::ScopeUnavailable)?;
-                (owner.lease(self.gate.enter(operation.is_callback)?)?, runtime.enrollment.clone())
+                (owner.lease(self.gate.enter(operation.is_callback)?)?, runtime.enrollment.clone(), owner.owns_context)
             };
             if !enrollment.persistent_reopen_candidate(&candidate, operation).await? { return Ok(None); }
             if operation.is_callback { return Err(ProtocolError::StaleReference); }
-            if !self.event_sink.get().is_some_and(|sink| sink.persistent_page_reopen_negotiated()) {
+            if !self.event_sink.get().is_some_and(|sink| if isolated { sink.isolated_page_reopen_negotiated() } else { sink.persistent_page_reopen_negotiated() }) {
                 return Err(ProtocolError::UnsupportedCapability);
             }
             drop(candidate);
@@ -4743,7 +4744,7 @@ impl ClientBrowser {
             };
             let owner = self.owner.lock().await;
             let owner = owner.as_ref().ok_or(ProtocolError::StaleScope)?;
-            if owner.identity_scope != scope || owner.owns_context || owner.borrowed_targets.is_none() { return Err(ProtocolError::StaleScope); }
+            if owner.identity_scope != scope || owner.owns_context != isolated || owner.owns_context == owner.borrowed_targets.is_some() { return Err(ProtocolError::StaleScope); }
             let runtime = owner.runtime.as_ref().ok_or(ProtocolError::ScopeUnavailable)?;
             let page = owner.lease(self.gate.enter(false)?)?;
             Ok(Some((transition, page, owner.ui.clone(), owner.page_state.clone(), runtime.enrollment.clone(), runtime.actions.clone(), runtime.input_gate.clone(), runtime.blobs.clone(), runtime.page_active.clone())))
@@ -4812,7 +4813,7 @@ impl ClientBrowser {
                 tasks.check_input_dispatch(key)?;
                 page.client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?.check_admission(super::client_debt::AdmissionClass::Input)?;
                 let staged = event_sink.stage_until_result(&operation, &scope)?;
-                let context = super::client_restart::RestartContext::new_persistent_reopen(&page, &enrollment, &ui, &exclusive, &operation).await?.with_staged_sink(staged.clone());
+                let context = super::client_restart::RestartContext::new_closed_page_reopen(&page, &enrollment, &ui, &exclusive, &operation).await?.with_staged_sink(staged.clone());
                 // Exact detach has already cleared this session's held input;
                 // never send release keys to a detached/replacement session.
                 actions.recording_page_closing(&scope, &blobs).await?;
@@ -4837,7 +4838,10 @@ impl ClientBrowser {
                     owner.manager.forget_disposed_targets(&std::iter::once(page.target_id.clone()).collect());
                     owner.manager.register_discovered_page(&replacement.target_id, &replacement.session_id, "about:blank".into(), String::new(), "page".into());
                     if !owner.manager.restore_target_binding(&replacement.target_id, "about:blank") || owner.manager.active_session_id().ok() != Some(replacement.session_id.as_str()) { return Err(ProtocolError::StaleScope); }
-                    owner.borrowed_targets = Some(vec![replacement.target_id.clone()]);
+                    if !owner.owns_context {
+                        if owner.borrowed_targets.is_none() { return Err(ProtocolError::StaleScope); }
+                        owner.borrowed_targets = Some(vec![replacement.target_id.clone()]);
+                    } else if owner.borrowed_targets.is_some() { return Err(ProtocolError::StaleScope); }
                     owner.runtime.as_mut().ok_or(ProtocolError::ScopeUnavailable)?.observation_after = Some(observation_after);
                     (owner.lease(gate.enter(false)?)?, previous_identity, owner.recovery_identity())
                 };
@@ -6215,6 +6219,7 @@ mod tests {
             "scope",
             "lifecycle",
             "persistent-page-reopen",
+            "isolated-page-reopen",
             "evaluate",
             "page",
             "page-identity-fence",
