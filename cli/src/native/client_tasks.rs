@@ -276,7 +276,7 @@ impl RetainedTasks {
                 let (settlement, inventory) = if already_dirty && !observe_inventory {
                     (Ok(()), Default::default())
                 } else {
-                    task_targets.settlement_integrity_diagnostic(observe_inventory)
+                    task_targets.operation_settlement_integrity_diagnostic(observe_inventory)
                 };
                 if settlement.is_err() {
                     super::client_settlement_trace::inventory_snapshot(
@@ -635,6 +635,87 @@ mod tests {
                 expected
             );
             assert!(!second.snapshot().mutation_dispatched);
+        }
+    }
+
+    #[tokio::test]
+    async fn unrelated_retained_initializer_does_not_quarantine_completed_operation() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        for retained in [false, true] {
+            let tasks = RetainedTasks::default();
+            let broker = Arc::new(ClientSession::new());
+            let lease = broker.admit(1, 1, 5000).unwrap();
+            assert!(broker.start(1, 1).unwrap());
+            let targets = ClientTargets::new("ctx".into(), "scope".into());
+            let ledger = OwnerDebtLedger::unpublished(&lease, "scope".into(), false).unwrap();
+            ledger.bind_context("ctx").unwrap();
+            ledger
+                .bind_session("ctx", "selected", "selected-session")
+                .unwrap();
+            let key = OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            };
+            let journal = ledger
+                .operation(key, "selected".into(), "selected-session".into())
+                .unwrap();
+            journal.bind_operation(&lease).unwrap();
+            let mut custody =
+                super::super::client_targets::RetainedInitialization::new(targets.clone());
+            if retained {
+                custody
+                    .attach(
+                        &targets,
+                        "ctx",
+                        "popup".into(),
+                        "popup-session".into(),
+                        "page".into(),
+                    )
+                    .unwrap();
+            } else {
+                targets
+                    .attached("ctx", "popup".into(), "popup-session".into(), "page".into())
+                    .unwrap();
+            }
+            let receive = tasks
+                .start_operation(
+                    "scope".into(),
+                    targets.clone(),
+                    broker.clone(),
+                    journal,
+                    lease.cancellation.clone(),
+                    async { (complete(), false) },
+                )
+                .await
+                .unwrap();
+            let outcome = tokio::time::timeout(Duration::from_secs(1), receive)
+                .await
+                .unwrap()
+                .unwrap();
+            if retained {
+                assert_eq!(outcome.result, Ok(serde_json::Value::Null));
+                assert_eq!(outcome.effects, Effects::Completed);
+                assert_eq!(tasks.drain().await, Ok(()));
+                assert!(targets
+                    .operation_settlement_integrity_diagnostic(false)
+                    .0
+                    .is_ok());
+                assert!(targets.inventory().is_err());
+                // Finish the separate initializer; never grant readiness from
+                // the unrelated operation's successful completion.
+                targets.configured("popup").unwrap();
+                targets
+                    .resume_permit("popup")
+                    .await
+                    .unwrap()
+                    .complete()
+                    .unwrap();
+                custody.finish(false).unwrap();
+            } else {
+                assert_eq!(outcome.result, Err(ProtocolError::CleanupFailed));
+                assert_eq!(outcome.effects, Effects::Unknown);
+                assert_eq!(tasks.drain().await, Err(ProtocolError::CleanupFailed));
+            }
         }
     }
 

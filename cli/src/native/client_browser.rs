@@ -1159,7 +1159,7 @@ impl OwnedBrowser {
                 .active_target_id()
                 .map_err(|_| ProtocolError::BrowserFailure)?
                 .to_owned();
-            targets.attached(
+            targets.attached_enrolled(
                 &context_id,
                 target_id.clone(),
                 manager
@@ -1167,6 +1167,7 @@ impl OwnedBrowser {
                     .map_err(|_| ProtocolError::BrowserFailure)?
                     .to_owned(),
                 "page".into(),
+                None,
             )?;
             // owned_blank_page has already acknowledged domain initialization and
             // resume on this synthetic initial page. Later targets use enrollment.
@@ -3497,8 +3498,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     .policy
                     .clone()
                     .ok_or(ProtocolError::ScopeUnavailable)?;
+                let query_authority = Some(
+                    runtime
+                        .enrollment
+                        .page_query_authority(&page, &attachment)?,
+                );
                 Ok(DispatchContext {
                     page,
+                    query_authority,
                     attachment,
                     ui: owner.ui.clone(),
                     blobs: runtime.blobs.clone(),

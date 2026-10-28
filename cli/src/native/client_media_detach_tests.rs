@@ -439,6 +439,37 @@ mod media_detach_tests {
     }
 
     #[tokio::test]
+    async fn closed_active_root_text_stays_rejected_after_active_selection_changes() {
+        for (target, session) in [
+            ("popup-target", "popup"),
+            ("another-target", "popup"),
+            ("popup-target", "another-session"),
+        ] {
+            let f = fixture().await;
+            f.owner.set_active_root("popup").unwrap();
+            realm_emit(&f.owner, &f.emit, detach("popup-target", "popup")).await;
+            f.owner.set_active_root("initial").unwrap();
+            let recorded_active = f
+                .owner
+                .index
+                .lock()
+                .unwrap()
+                .detached_active_roots
+                .contains("popup-target");
+            let refusal = f
+                .owner
+                .register("owned-context", target, session, "page", None)
+                .err();
+            finish(f).await;
+            assert!(
+                recorded_active,
+                "Active-root history must survive later selection changes"
+            );
+            assert_eq!(refusal, Some(ProtocolError::StaleScope));
+        }
+    }
+
+    #[tokio::test]
     async fn media_cancelled_operation_is_not_rescued_by_exact_popup_detach() {
         let f = fixture().await;
         hold(&f, "popup");

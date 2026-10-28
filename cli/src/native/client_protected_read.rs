@@ -39,7 +39,7 @@ pub struct ProtectedReadFailure {
 pub struct ProtectedReadJournal<'a> {
     page: &'a BrowserExecutionLease,
     operation: &'a OperationLease,
-    barrier: ProtectedTargetBarrier,
+    barrier: ReadBarrier,
     sessions: Vec<String>,
     record: Arc<Record>,
     cleanup_deadline: Option<Instant>,
@@ -49,10 +49,39 @@ pub struct ProtectedReadJournal<'a> {
     stabilization_completed: bool,
     command_cleanup_lost: std::sync::atomic::AtomicBool,
 }
+enum ReadBarrier {
+    Global(ProtectedTargetBarrier),
+    Selected(super::client_enrollment::SelectedPageReadBarrier),
+}
+impl ReadBarrier {
+    fn quarantine(&self) {
+        match self {
+            Self::Global(barrier) => barrier.quarantine(),
+            Self::Selected(barrier) => barrier.quarantine(),
+        }
+    }
+    fn check(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+    ) -> Result<(), super::client_protocol::ProtocolError> {
+        match self {
+            Self::Global(barrier) => barrier.check(),
+            Self::Selected(barrier) => barrier.check(page, operation),
+        }
+    }
+}
 impl<'a> ProtectedReadJournal<'a> {
     pub fn begin(
         page: &'a BrowserExecutionLease,
         operation: &'a OperationLease,
+    ) -> Result<Self, ProtectedReadFailure> {
+        Self::begin_query(page, operation, None)
+    }
+    pub(crate) fn begin_query(
+        page: &'a BrowserExecutionLease,
+        operation: &'a OperationLease,
+        partition: Option<&super::client_enrollment::PageAcquisitionProof>,
     ) -> Result<Self, ProtectedReadFailure> {
         let failure = |reason| ProtectedReadFailure {
             reason,
@@ -73,16 +102,30 @@ impl<'a> ProtectedReadJournal<'a> {
                 return Err(failure(ProtectedReadReason::StaleScope));
             }
         }
-        let barrier = page
-            .targets
-            .protected_read_barrier()
-            .map_err(|_| failure(ProtectedReadReason::IncompleteInventory))?;
-        if barrier.stamp.identity_scope != page.identity_scope {
-            return Err(failure(ProtectedReadReason::StaleScope));
-        }
+        let barrier = match partition {
+            Some(partition) => ReadBarrier::Selected(
+                partition
+                    .begin_read(page, operation)
+                    .map_err(|_| failure(ProtectedReadReason::IncompleteInventory))?,
+            ),
+            None => {
+                let barrier = page
+                    .targets
+                    .protected_read_barrier()
+                    .map_err(|_| failure(ProtectedReadReason::IncompleteInventory))?;
+                if barrier.stamp.identity_scope != page.identity_scope {
+                    return Err(failure(ProtectedReadReason::StaleScope));
+                }
+                ReadBarrier::Global(barrier)
+            }
+        };
+        let targets = match &barrier {
+            ReadBarrier::Global(barrier) => barrier.stamp.targets.as_slice(),
+            ReadBarrier::Selected(barrier) => barrier.targets(),
+        };
         let mut sessions = Vec::new();
         let mut main = false;
-        for target in &barrier.stamp.targets {
+        for target in targets {
             if target.purpose != Some(TargetPurpose::Application) {
                 return Err(failure(ProtectedReadReason::IncompleteInventory));
             }
@@ -166,7 +209,7 @@ impl<'a> ProtectedReadJournal<'a> {
             .check()
             .map_err(|_| ProtectedReadReason::StaleScope)?;
         self.barrier
-            .check()
+            .check(self.page, self.operation)
             .map_err(|_| ProtectedReadReason::StaleScope)?;
         if *self.operation.cancellation.borrow() != CancelSignal::None {
             return Err(ProtectedReadReason::Cancelled);

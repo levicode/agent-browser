@@ -293,6 +293,10 @@ async fn closed_page_dispatch_for_mode(isolated: bool) {
             fixture.command("page.activate",json!({"identityScope":scope}),5).await?;
             let first = fixture.command("page.title",json!({"identityScope":scope}),5).await?;
             assert_eq!(first["title"],"initial-session");
+            // Persistent adoption resets its existing page once; isolated startup
+            // creates about:blank directly and must not navigate implicitly.
+            let initial_navigations = log.lock().unwrap().iter().filter(|c| c["method"] == "Page.navigate").count();
+            assert_eq!(initial_navigations, usize::from(!isolated));
             let client = browser.owner.lock().await.as_ref().unwrap().manager.client.clone();
             client.send_command("Target.closeTarget",Some(json!({"targetId":"application"})),None).await.unwrap();
             let start = fixture.sequence + 1;
@@ -341,7 +345,8 @@ async fn closed_page_dispatch_for_mode(isolated: bool) {
             }
             let commands = log.lock().unwrap().clone();
             assert_eq!(commands.iter().filter(|c| c["method"]=="Target.createTarget").count(),usize::from(negotiated) + usize::from(isolated));
-            assert_eq!(commands.iter().filter(|c| c["method"]=="Page.navigate").count(),1);
+            // Reopen is create-only in both modes: no navigation was added.
+            assert_eq!(commands.iter().filter(|c| c["method"]=="Page.navigate").count(),initial_navigations);
             assert_eq!(commands.iter().filter(|c| c["method"] == "Target.createBrowserContext").count(), usize::from(isolated));
             assert!(!commands.iter().any(|c| c["method"] == "Target.disposeBrowserContext"));
             let owner = browser.owner.lock().await;

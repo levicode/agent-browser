@@ -62,6 +62,7 @@ impl Owner {
     }
     fn context(&self) -> DispatchContext {
         DispatchContext {
+            query_authority: None,
             #[cfg(feature = "acceptance-faults")]
             faults: Arc::new(super::super::client_test_faults::FaultController::default()),
             attachment: self.targets.owned_target(&self.target).unwrap(),

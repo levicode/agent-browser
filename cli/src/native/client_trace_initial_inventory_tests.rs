@@ -363,6 +363,7 @@ impl Fixture {
         };
         blobs.activate_scope(scope.clone()).unwrap();
         let context = DispatchContext {
+            query_authority: None,
             #[cfg(feature = "acceptance-faults")]
             faults: Arc::new(crate::native::client_test_faults::FaultController::default()),
             attachment: targets.owned_target("target").unwrap(),
