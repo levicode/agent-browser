@@ -8505,7 +8505,7 @@ mod tests {
                         }
                         if method=="Target.detachFromTarget" {detach_count+=1;}
                         if mode=="hold-timezone" && method=="Emulation.setTimezoneOverride" { continue; }
-                        if (mode=="popup-runtime-held" || mode=="owner-retirement-runtime-held" || mode=="owner-retirement-runtime-held-query") && method=="Runtime.enable" && request["sessionId"]=="popup-session" { continue; }
+                        if (mode=="popup-runtime-held" || mode=="owner-retirement-runtime-held" || mode=="owner-retirement-runtime-held-query" || mode=="owner-retirement-runtime-held-dispatch") && method=="Runtime.enable" && request["sessionId"]=="popup-session" { continue; }
                         let settings_error = match (mode, method) {
                             ("locale-already", "Emulation.setLocaleOverride") => Some("Another locale override is already in effect"),
                             ("timezone-already", "Emulation.setTimezoneOverride") => Some("Timezone override is already in effect"),
@@ -8550,6 +8550,20 @@ mod tests {
                             whitespace.entry(session).or_insert(method=="DOM.enable" && request["params"]["includeWhitespace"]=="all");
                         }
                         let mut result=match method {
+                            "DOM.getDocument" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"root":{"nodeId":1,"nodeType":9,"backendNodeId":1,"children":[{"nodeId":7,"nodeType":1,"backendNodeId":7}]}}),
+                            "Page.createIsolatedWorld" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"executionContextId":7}),
+                            "Accessibility.getFullAXTree" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"nodes":[{"nodeId":"selected","backendDOMNodeId":7,"role":{"type":"role","value":"button"}}]}),
+                            "DOM.resolveNode" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"object":{"objectId":"selected-object","subtype":"node"}}),
+                            "DOM.getBoxModel" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"model":{"border":[10,20,30,20,30,40,10,40]}}),
+                            "Runtime.getProperties" if mode=="owner-retirement-runtime-held-dispatch"=>json!({"result":[{"name":"focused","value":{"type":"object","subtype":"null","value":null}}]}),
+                            "Runtime.callFunctionOn" if mode=="owner-retirement-runtime-held-dispatch"=>{
+                                let declaration=request["params"]["functionDeclaration"].as_str().unwrap();
+                                if declaration.contains("Array.from(result)") {json!({"result":{"objectId":"security"}})}
+                                else if declaration.starts_with("function(expression") {json!({"result":{"value":{"indices":[0],"redacted":[]}}})}
+                                else if declaration.contains("const read=") {json!({"result":{"value":[{"attributes":{},"labels":[],"states":{"secure":false,"hidden":false},"text":"Selected","rect":{"x":10,"y":20,"width":20,"height":20}}]}})}
+                                else if declaration.contains("frameOwner") {json!({"result":{"value":{"connected":true,"frameOwner":false}}})}
+                                else {json!({"result":{"value":true}})}
+                            },
                             "DOM.getDocument"=>json!({"root":{"nodeId":1,"children":if whitespace.get(request["sessionId"].as_str().unwrap())==Some(&true) {vec![json!({"nodeId":2,"nodeType":3,"nodeValue":" "})]}else{vec![]}}}),
                             "Page.createIsolatedWorld" if mode.starts_with("realm-resolve-reuse")=>json!({"executionContextId":7}),
                             "Page.createIsolatedWorld" if mode=="owner-retirement-runtime-held-query"=>json!({"executionContextId":7}),

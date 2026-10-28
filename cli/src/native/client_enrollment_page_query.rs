@@ -676,6 +676,247 @@ mod retained_peer_tests {
             }
         }
     }
+    /// Real framed Runtime.enable ACK is held by the existing enrollment peer.
+    /// Exercises the production protected-query dispatcher, admission, selector,
+    /// geometry, restoration and reference publication against modeled CDP.
+    /// This is not real Chromium or the outer native wire decoder.
+    #[tokio::test]
+    async fn protected_query_dispatch_publishes_selected_ref_while_popup_ack_is_pending() {
+        for fail in [false, true] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-dispatch",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            owner
+                .client
+                .debt_ledger()
+                .unwrap()
+                .publish_initialization(|| Ok(()))
+                .unwrap();
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&initial).unwrap();
+            let selected = owner.targets.owned_target("initial-target").unwrap();
+            let authority = owner.page_query_authority(&page, &selected).unwrap();
+            let gate = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeAttachedProcessing, gate.clone());
+            let mut op = owner.operation();
+            op.sequence = 2;
+            let original_deadline = op.deadline;
+            emit.send(json!({"method":"Target.attachedToTarget","params":{
+                "sessionId":"popup-session","waitingForDebugger":true,"targetInfo":{
+                "targetId":"popup-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
+            gate.wait_entered().await;
+            let classification = authority.wait_classified(&page, &op);
+            tokio::pin!(classification);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut classification)
+                    .await
+                    .is_err()
+            );
+            gate.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(2), &mut classification)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(op.deadline, original_deadline);
+            let held = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(request) = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|request| {
+                            request["sessionId"] == "popup-session"
+                                && request["method"] == "Runtime.enable"
+                        })
+                        .cloned()
+                    {
+                        break request;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let debt = owner.client.debt_ledger().unwrap();
+            let outstanding = debt.snapshot().outstanding_commands;
+            let proof = authority.acquire(&page, &op).unwrap();
+            assert_eq!(proof.targets().len(), 1);
+            assert_eq!(
+                debt.check_admission(crate::native::client_debt::AdmissionClass::Reference),
+                Ok(())
+            );
+            let before = log.lock().unwrap().len();
+            let journal = debt
+                .operation(
+                    crate::native::client_debt::OperationKey {
+                        generation: op.generation,
+                        operation_seq: op.sequence,
+                    },
+                    page.target_id.clone(),
+                    page.page_session_id.clone(),
+                )
+                .unwrap();
+            journal.bind_operation(&op).unwrap();
+            use crate::native::client_blobs::{BlobScope, BlobStore};
+            use crate::native::client_observation_dispatch::{
+                DispatchContext, DispatchRequest, ObservationDispatch, QueryPurpose, QueryRequest,
+                ReadPolicy,
+            };
+            use crate::native::element::RefMap;
+            let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
+            let scope = BlobScope {
+                generation: op.generation,
+                identity_scope: page.identity_scope.clone(),
+            };
+            blobs.activate_scope(scope.clone()).unwrap();
+            let ui = owner.network.ui_gate_for_test();
+            assert!(owner.network.uses_ui_gate(&ui));
+            for scoped in [false, true] {
+                let refs = Arc::new(std::sync::Mutex::new(RefMap::new()));
+                let dispatch = ObservationDispatch::new(refs.clone());
+                let query_page = owner.lease(&initial).unwrap();
+                let prepared = dispatch.prepare(DispatchContext {
+                query_authority: scoped.then(|| authority.clone()),
+                #[cfg(feature="acceptance-faults")]
+                faults: Arc::new(crate::native::client_test_faults::FaultController::default()),
+                attachment: selected.clone(), page: query_page, ui: ui.clone(), blobs: blobs.clone(), scope: scope.clone(),
+                policy: ReadPolicy { frame_policy: Default::default(), test_id_attribute: "data-testid".into(), secure_field_selector: "input[type=password]".into() },
+            }, DispatchRequest::Query(QueryRequest {
+                purpose: QueryPurpose::Protected,
+                options: serde_json::from_value(json!({"expression":{"kind":"selector","selector":"#selected"},"secureFieldSelector":"input[type=password]"})).unwrap(),
+            }), OperationLease { is_callback: op.is_callback, generation: op.generation, sequence: op.sequence, deadline: op.deadline, cancellation: op.cancellation.clone() }).unwrap();
+                let task = journal
+                    .scope(async { dispatch.start_prepared(prepared) })
+                    .await;
+                let mut result_receiver = task.result;
+                let received =
+                    tokio::time::timeout(Duration::from_secs(2), &mut result_receiver).await;
+                if received.is_err() {
+                    // Release the real held ACK and retain/join the task before failing.
+                    // This is a test observation bound, not a renewed operation budget.
+                    emit.send(json!({"id":held["id"],"sessionId":"popup-session","result":{}}))
+                        .await
+                        .unwrap();
+                    let completion = tokio::time::timeout(Duration::from_secs(3), task.join).await;
+                    let _ = owner.close().await;
+                    connection.close().await;
+                    server.abort();
+                    let _ = server.await;
+                    panic!("query waited for unrelated initializer; scoped={scoped}; cleanup={completion:?}");
+                }
+                let result = received.unwrap().unwrap();
+                task.join.await.unwrap().unwrap();
+                if !scoped {
+                    let failure =
+                        result.expect_err("strict global inventory must reject held popup");
+                    assert_eq!(failure.error, ProtocolError::ScopeUnavailable);
+                    assert!(!failure.cleanup_integrity_lost);
+                    assert!(refs.lock().unwrap().ref_ids().is_empty());
+                    assert!(owner.index.lock().unwrap().failure.is_none());
+                    assert!(!owner.index.lock().unwrap().pending_enrollment.is_empty());
+                    continue;
+                }
+                let result = result.unwrap();
+                assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    result["nodes"][0]["rect"],
+                    json!({"x":10.0,"y":20.0,"width":20.0,"height":20.0})
+                );
+                let id = result["nodes"][0]["ref"]["id"].as_str().unwrap();
+                assert_eq!(
+                    refs.lock()
+                        .unwrap()
+                        .get(id.trim_start_matches('@'))
+                        .unwrap()
+                        .backend_node_id,
+                    Some(7)
+                );
+                assert!(refs
+                    .lock()
+                    .unwrap()
+                    .get(id.trim_start_matches('@'))
+                    .unwrap()
+                    .matches_scope(&page.identity_scope, op.generation, "initial"));
+                assert_eq!(
+                    refs.lock()
+                        .unwrap()
+                        .get(id.trim_start_matches('@'))
+                        .unwrap()
+                        .exact_binding
+                        .as_ref()
+                        .unwrap()
+                        .session,
+                    "initial"
+                );
+                assert_eq!(op.deadline, original_deadline);
+            }
+            journal.finish_local_producers();
+            let commands = log.lock().unwrap()[before..].to_vec();
+            assert!(commands
+                .iter()
+                .any(|r| r["method"] == "Runtime.callFunctionOn"
+                    && r["params"]["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with("function(expression"))));
+            assert!(commands.iter().any(|r| r["method"] == "DOM.getBoxModel"));
+            assert!(commands.iter().all(|r| r["sessionId"] != "popup-session"));
+            assert!(!owner.index.lock().unwrap().pending_enrollment.is_empty());
+            drop(journal);
+            assert!(owner.targets.inventory().is_err());
+            assert!(
+                !owner
+                    .targets
+                    .owned_target("popup-target")
+                    .unwrap()
+                    .configured
+            );
+            assert!(outstanding >= 1);
+            assert!(debt.snapshot().outstanding_commands >= outstanding);
+            // No pending command is declared settled by the page partition.
+            let response = if fail {
+                json!({"id":held["id"],"sessionId":"popup-session","error":{"code":-32000,"message":"controlled initializer error"}})
+            } else {
+                json!({"id":held["id"],"sessionId":"popup-session","result":{}})
+            };
+            emit.send(response).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if owner.index.lock().unwrap().pending_enrollment.is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let checked = proof.check(&page, &op);
+            let error = owner.index.lock().unwrap().failure.clone();
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+            if fail {
+                assert_eq!(checked, Err(ProtocolError::BrowserFailure));
+                assert_eq!(error, Some(ProtocolError::BrowserFailure));
+            } else {
+                assert_eq!(checked, Ok(()));
+                assert_eq!(error, None);
+            }
+        }
+    }
     #[tokio::test]
     async fn query_classification_wait_keeps_original_cancel_and_deadline_without_owner_poison() {
         for cancel in [false, true] {
