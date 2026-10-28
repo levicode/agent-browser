@@ -95,6 +95,9 @@ pub(crate) use SettlementPhase as Phase;
 
 const PATH_ENV: &str = "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE";
 const CLEANUP_PATH_ENV: &str = "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE";
+const QUERY_PATH_ENV: &str = "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE";
+const QUERY_MAX_RECORDS: usize = 128;
+const QUERY_MAX_BYTES: usize = 64 * 1024;
 const MAX_RECORDS: usize = 2048;
 const MAX_BYTES: usize = 256 * 1024;
 const MAX_RECORD_BYTES: usize = 512;
@@ -548,10 +551,27 @@ pub(crate) enum CleanupResult {
 }
 
 static CLEANUP_SINK: OnceLock<Option<Capture>> = OnceLock::new();
+// Separate opt-in budget/file; ordinary lifecycle volume cannot consume it.
+// This remains best-effort: contention and I/O loss are explicit, not success.
+static QUERY_SINK: OnceLock<Option<Capture>> = OnceLock::new();
 static CLEANUP_OWNERS: AtomicU64 = AtomicU64::new(0);
 const MAX_CLEANUP_ATTEMPT: u64 = SAFE_INTEGER >> 8;
 
 pub(super) fn initialize_cleanup() {
+    let mut query_created = false;
+    let query_capture = QUERY_SINK.get_or_init(|| {
+        query_created = true;
+        query_capture(
+            std::env::var_os(QUERY_PATH_ENV)
+                .map(PathBuf::from)
+                .as_deref(),
+        )
+    });
+    if query_created {
+        if let Some(capture) = query_capture {
+            record_capture(capture, 0, Phase::CaptureStarted, Facts::default());
+        }
+    }
     let mut created = false;
     let capture = CLEANUP_SINK.get_or_init(|| {
         created = true;
@@ -566,6 +586,32 @@ pub(super) fn initialize_cleanup() {
             record_capture(capture, 0, Phase::CaptureStarted, Facts::default());
         }
     }
+}
+fn query_capture(path: Option<&Path>) -> Option<Capture> {
+    Some(Capture {
+        source: Source::Native,
+        sink: Mutex::new(AppendSink::open(path?, QUERY_MAX_RECORDS, QUERY_MAX_BYTES).ok()?),
+        counters: Counters::default(),
+    })
+}
+fn critical_query_refusal(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    stage: QueryScopeStage,
+    reason: QueryScopeReason,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::QueryScopeRefusal,
+        Facts {
+            generation: Some(generation),
+            query_scope_stage: Some(stage),
+            query_scope_reason: Some(reason),
+            ..Facts::default()
+        },
+    );
 }
 fn cleanup_capture(path: Option<&Path>) -> Option<Capture> {
     Some(Capture {
@@ -1329,6 +1375,9 @@ pub(crate) fn query_scope_refusal(
     stage: QueryScopeStage,
     reason: QueryScopeReason,
 ) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        critical_query_refusal(capture, generation, sequence, stage, reason);
+    }
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
         record_capture(
             capture,
@@ -1351,6 +1400,9 @@ pub(crate) fn query_target_refusal(
     reason: QueryScopeReason,
     target: Option<DiagnosticAttachment>,
 ) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        critical_query_refusal(capture, generation, sequence, stage, reason);
+    }
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
         record_capture(
             capture,
@@ -3049,5 +3101,110 @@ mod query_frame_phase_schema_test {
                 serde_json::json!(value)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod critical_query_stream_tests {
+    use super::*;
+    #[test]
+    fn critical_query_stream_is_independent_bounded_and_closed() {
+        let ordinary = tempfile::NamedTempFile::new().unwrap();
+        let critical = tempfile::NamedTempFile::new().unwrap();
+        let ordinary_capture = Capture {
+            source: Source::Native,
+            sink: Mutex::new(AppendSink::open(ordinary.path(), 2, 2048).unwrap()),
+            counters: Counters::default(),
+        };
+        for _ in 0..8 {
+            record_capture(
+                &ordinary_capture,
+                0,
+                Phase::TargetLifecycle,
+                Facts::default(),
+            );
+        }
+        let capture = query_capture(Some(critical.path())).unwrap();
+        record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+        critical_query_refusal(
+            &capture,
+            9,
+            17,
+            QueryScopeStage::FinalFrames,
+            QueryScopeReason::WatermarkPending,
+        );
+        let lines = std::fs::read_to_string(critical.path()).unwrap();
+        let values: Vec<serde_json::Value> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(values.len(), 2);
+        let refusal = &values[1];
+        assert_eq!(refusal["phase"], "QueryScopeRefusal");
+        assert_eq!(refusal["generation"], 9);
+        assert_eq!(refusal["operationSeq"], 17);
+        assert_eq!(refusal["queryScopeStage"], "final-frames");
+        assert_eq!(refusal["queryScopeReason"], "watermark-pending");
+        assert_eq!(refusal["droppedBefore"], 0);
+        for key in [
+            "targetOrdinal",
+            "attachmentOrdinal",
+            "targetKind",
+            "url",
+            "selector",
+            "payload",
+        ] {
+            assert!(refusal.get(key).is_none());
+        }
+        for _ in 0..QUERY_MAX_RECORDS + 5 {
+            critical_query_refusal(
+                &capture,
+                9,
+                18,
+                QueryScopeStage::Acquire,
+                QueryScopeReason::UnknownLineage,
+            );
+        }
+        let bytes = std::fs::read(critical.path()).unwrap();
+        assert!(bytes.len() <= QUERY_MAX_BYTES);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.lines().count() <= QUERY_MAX_RECORDS);
+        assert_eq!(text.matches("CaptureLimitReached").count(), 1);
+        assert!(capture.counters.dropped.load(Ordering::Relaxed) > 0);
+    }
+    #[test]
+    fn critical_query_stream_contention_is_explicit_not_lossless() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = query_capture(Some(file.path())).unwrap();
+        let held = capture.sink.lock().unwrap();
+        critical_query_refusal(
+            &capture,
+            1,
+            3,
+            QueryScopeStage::Acquire,
+            QueryScopeReason::UnknownLineage,
+        );
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 1);
+        drop(held);
+        critical_query_refusal(
+            &capture,
+            1,
+            4,
+            QueryScopeStage::InitialFrames,
+            QueryScopeReason::WatermarkPending,
+        );
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        assert_eq!(value["droppedBefore"], 1);
+        assert_eq!(value["operationSeq"], 4);
+        assert_eq!(value["record"], 1);
+    }
+    #[test]
+    fn critical_query_stream_requires_explicit_existing_regular_file() {
+        assert!(query_capture(None).is_none());
+        assert!(query_capture(Some(Path::new("relative.jsonl"))).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(query_capture(Some(dir.path())).is_none());
+        assert!(query_capture(Some(&dir.path().join("missing.jsonl"))).is_none());
     }
 }
