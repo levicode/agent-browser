@@ -1218,3 +1218,117 @@ mod retained_peer_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod query_world_event_counterexample {
+    use super::*;
+    /// Characterizes current refusal, not an acceptance assertion that the
+    /// timing-sensitive refusal is desirable. The event comes from the peer
+    /// in response to production Page.createIsolatedWorld before its ACK.
+    #[tokio::test]
+    async fn selected_query_own_world_event_pending_application_refuses_then_recovers() {
+        let (owner, _notices, log, emit, server, _broker, connection) =
+            super::super::tests::fixture_with_explicit_context_ownership(
+                "owner-retirement-query-world-event",
+                true,
+                true,
+            )
+            .await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        owner
+            .client
+            .debt_ledger()
+            .unwrap()
+            .publish_initialization(|| Ok(()))
+            .unwrap();
+        let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+        let page = owner.lease(&initial).unwrap();
+        let selected = owner.targets.owned_target("initial-target").unwrap();
+        let authority = owner.page_query_authority(&page, &selected).unwrap();
+        let mut op = owner.operation();
+        op.sequence = 2;
+        let deadline = op.deadline;
+        let proof = authority.acquire(&page, &op).unwrap();
+        let gate = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+        let debt = owner.client.debt_ledger().unwrap();
+        let journal = debt
+            .operation(
+                crate::native::client_debt::OperationKey {
+                    generation: op.generation,
+                    operation_seq: op.sequence,
+                },
+                page.target_id.clone(),
+                page.page_session_id.clone(),
+            )
+            .unwrap();
+        journal.bind_operation(&op).unwrap();
+        let acquisition = journal.scope(
+            crate::native::client_observation_dispatch::selected_query_frames_for_test(
+                &page, &op, &proof,
+            ),
+        );
+        tokio::pin!(acquisition);
+        tokio::select! {
+            _ = gate.wait_entered() => {},
+            early = &mut acquisition => {
+                // Preserve failure while releasing any actual pending command.
+                let held = log.lock().unwrap().iter().rev().find(|request| request["method"]=="Page.createIsolatedWorld").cloned();
+                if let Some(held) = held {
+                    emit.send(json!({"id":held["id"],"sessionId":held["sessionId"],"result":{"executionContextId":7}})).await.unwrap();
+                }
+                gate.release.add_permits(1);
+                journal.finish_local_producers();
+                let _ = owner.close().await;
+                connection.close().await;
+                server.abort(); let _ = server.await;
+                panic!("frame acquisition ended before event gate: {early:?}");
+            },
+        }
+        let held = log
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|request| {
+                request["method"] == "Page.createIsolatedWorld" && request["sessionId"] == "initial"
+            })
+            .cloned()
+            .unwrap();
+        emit.send(json!({"id":held["id"],"sessionId":held["sessionId"],"result":{"executionContextId":7}})).await.unwrap();
+        let watermark = owner.realm_watermark().unwrap();
+        let unapplied =
+            owner.index.lock().unwrap().applied_watermark < watermark.received().unwrap();
+        let refused = tokio::time::timeout(Duration::from_secs(2), &mut acquisition).await;
+        gate.release.add_permits(1);
+        owner
+            .drain_capture_watermark(&watermark, &op)
+            .await
+            .unwrap();
+        let recovered = proof.check(&page, &op);
+        let healthy = owner.index.lock().unwrap().failure.is_none();
+        let world_sent = log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|request| request["method"] == "Page.createIsolatedWorld");
+        journal.finish_local_producers();
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+        assert!(unapplied && world_sent);
+        assert!(matches!(refused, Ok(Err(ProtocolError::ScopeUnavailable))));
+        assert_eq!(recovered, Ok(()));
+        assert!(healthy);
+        assert_eq!(op.deadline, deadline);
+    }
+}

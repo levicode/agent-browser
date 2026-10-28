@@ -8532,6 +8532,13 @@ mod tests {
                             let body=if mode=="large-first-request" {"b".repeat(1536*1024)} else {String::new()};
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
                         }
+                        if mode=="owner-retirement-query-world-event" && method=="Page.createIsolatedWorld" {
+                            // Real framed event before the independently correlated ACK.
+                            socket.send(Message::Text(realm_created(7,"query-world-event").to_string())).await.unwrap();
+                            // The test releases this exact ACK only after the real
+                            // event-application gate has been observed entered.
+                            continue;
+                        }
                         if mode.starts_with("realm-resolve-reuse") {
                             if method=="Page.createIsolatedWorld" {
                                 socket.send(Message::Text(realm_created(7,"before-resolve").to_string())).await.unwrap();
@@ -8571,6 +8578,7 @@ mod tests {
                             "DOM.getDocument"=>json!({"root":{"nodeId":1,"children":if whitespace.get(request["sessionId"].as_str().unwrap())==Some(&true) {vec![json!({"nodeId":2,"nodeType":3,"nodeValue":" "})]}else{vec![]}}}),
                             "Page.createIsolatedWorld" if mode.starts_with("realm-resolve-reuse")=>json!({"executionContextId":7}),
                             "Page.createIsolatedWorld" if mode=="owner-retirement-runtime-held-query"=>json!({"executionContextId":7}),
+                            "Page.createIsolatedWorld" if mode=="owner-retirement-query-world-event"=>json!({"executionContextId":7}),
                             "DOM.resolveNode" if mode.starts_with("realm-resolve-reuse")=>json!({"object":{"objectId":"replacement-handle","subtype":"node"}}),
                             "Runtime.callFunctionOn" if mode.starts_with("realm-resolve-reuse")=>json!({"result":{"value":true}}),
                             "Page.getLayoutMetrics"=>json!({"cssVisualViewport":{"clientWidth":800.,"clientHeight":600.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":800.,"clientHeight":600.}}),
