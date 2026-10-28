@@ -203,7 +203,7 @@ impl ClientTargets {
         classify: impl Fn(&OwnedTarget, &HashMap<String, OwnedTarget>) -> Result<bool, ProtocolError>,
         publish: impl FnOnce(&SelectedPageTargetSnapshot) -> Result<T, ProtocolError>,
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
-        use diagnostic::QueryScopeReason as Reason;
+        use crate::native::client_settlement_trace::QueryScopeReason as Reason;
         let refuse = |error, reason| {
             if let Some((generation, sequence, stage)) = diagnostic_context {
                 diagnostic::query_scope_refusal(generation, sequence, stage, reason);
