@@ -1,6 +1,9 @@
 //! Explicit query authority. Neither registry membership nor diagnostic roots
 //! are sufficient to exclude another renderer from a selected page read.
 use super::*;
+use crate::native::client_settlement_trace::{
+    query_scope_refusal, QueryScopeReason as Reason, QueryScopeStage as Stage,
+};
 use crate::native::client_targets::{SelectedPageTargetBarrier, SelectedPageTargetSnapshot};
 
 #[derive(Clone)]
@@ -118,6 +121,10 @@ impl PageQueryAuthority {
         page: &BrowserExecutionLease,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
+        let refuse = |error, reason| {
+            query_scope_refusal(op.generation, op.sequence, Stage::Classification, reason);
+            error
+        };
         let owner = &self.owner;
         let watermark = owner.realm_watermark()?;
         bounded(op, async {
@@ -125,14 +132,18 @@ impl PageQueryAuthority {
                 let changed = owner.changed.notified();
                 tokio::pin!(changed);
                 changed.as_mut().enable();
-                owner.check_restart_operation(op)?;
-                page.permit.check()?;
+                owner
+                    .check_restart_operation(op)
+                    .map_err(|error| refuse(error, Reason::OwnerHealth))?;
+                page.permit
+                    .check()
+                    .map_err(|error| refuse(error, Reason::OwnerHealth))?;
                 if !Arc::ptr_eq(&owner.client, &page.client)
                     || !Arc::ptr_eq(&owner.targets, &page.targets)
                     || self.selected.target_id != page.target_id
                     || self.selected.session_id != page.page_session_id
                 {
-                    return Err(ProtocolError::StaleScope);
+                    return Err(refuse(ProtocolError::StaleScope, Reason::OwnerIdentity));
                 }
                 let classified = {
                     let index = owner
@@ -140,13 +151,13 @@ impl PageQueryAuthority {
                         .lock()
                         .map_err(|_| ProtocolError::ScopeUnavailable)?;
                     if let Some(error) = &index.failure {
-                        return Err(error.clone());
+                        return Err(refuse(error.clone(), Reason::OwnerHealth));
                     }
                     if !index.reconciled
                         || owner.sealed.load(Ordering::Acquire)
                         || index.borrowed_restart.is_some()
                     {
-                        return Err(ProtocolError::ScopeUnavailable);
+                        return Err(refuse(ProtocolError::ScopeUnavailable, Reason::IndexHealth));
                     }
                     let subscription = owner
                         .event_watermark
@@ -156,12 +167,18 @@ impl PageQueryAuthority {
                         .as_ref()
                         .is_none_or(|current| !watermark.same_subscription(current))
                     {
-                        return Err(ProtocolError::StaleScope);
+                        return Err(refuse(
+                            ProtocolError::StaleScope,
+                            Reason::SubscriptionChanged,
+                        ));
                     }
                     watermark
                         .with_received(|received| {
                             if index.applied_watermark > received {
-                                return Err(ProtocolError::StaleScope);
+                                return Err(refuse(
+                                    ProtocolError::StaleScope,
+                                    Reason::WatermarkPending,
+                                ));
                             }
                             Ok(index.applied_watermark == received
                                 && index
@@ -186,22 +203,31 @@ impl PageQueryAuthority {
         expected: Option<&PageAcquisitionProof>,
         held: Option<&SelectedPageTargetBarrier>,
         acquire_barrier: bool,
+        stage: Stage,
         publish: impl FnOnce(
             &[Attribution],
             &SelectedPageTargetSnapshot,
             &BoundedEventWatermark,
         ) -> Result<T, ProtocolError>,
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        let refuse = |error, reason| {
+            query_scope_refusal(op.generation, op.sequence, stage, reason);
+            error
+        };
         let owner = &self.owner;
-        owner.check_restart_operation(op)?;
-        page.permit.check()?;
+        owner
+            .check_restart_operation(op)
+            .map_err(|error| refuse(error, Reason::OwnerHealth))?;
+        page.permit
+            .check()
+            .map_err(|error| refuse(error, Reason::OwnerHealth))?;
         if !Arc::ptr_eq(&owner.client, &page.client)
             || !Arc::ptr_eq(&owner.targets, &page.targets)
             || self.selected.target_id != page.target_id
             || self.selected.session_id != page.page_session_id
             || owner.targets.identity_scope != page.identity_scope
         {
-            return Err(ProtocolError::StaleScope);
+            return Err(refuse(ProtocolError::StaleScope, Reason::OwnerIdentity));
         }
         let watermark = match expected {
             Some(proof) => proof.watermark.clone(),
@@ -212,17 +238,23 @@ impl PageQueryAuthority {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if let Some(error) = &index.failure {
-            return Err(error.clone());
+            return Err(refuse(error.clone(), Reason::OwnerHealth));
         }
         if owner.sealed.load(Ordering::Acquire)
             || !index.reconciled
             || index.borrowed_restart.is_some()
-            || index
-                .pending_enrollment
-                .keys()
-                .any(|session| !index.sessions.contains_key(session))
         {
-            return Err(ProtocolError::ScopeUnavailable);
+            return Err(refuse(ProtocolError::ScopeUnavailable, Reason::IndexHealth));
+        }
+        if index
+            .pending_enrollment
+            .keys()
+            .any(|session| !index.sessions.contains_key(session))
+        {
+            return Err(refuse(
+                ProtocolError::ScopeUnavailable,
+                Reason::PendingClassification,
+            ));
         }
         let mut entries: Vec<_> = index
             .sessions
@@ -237,7 +269,10 @@ impl PageQueryAuthority {
         if expected.is_some_and(|proof| {
             !Arc::ptr_eq(&proof.authority.owner, owner) || proof.entries != entries
         }) {
-            return Err(ProtocolError::StaleScope);
+            return Err(refuse(
+                ProtocolError::StaleScope,
+                Reason::AttributionChanged,
+            ));
         }
         let subscription = owner
             .event_watermark
@@ -247,18 +282,25 @@ impl PageQueryAuthority {
             .as_ref()
             .is_none_or(|current| !watermark.same_subscription(current))
         {
-            return Err(ProtocolError::StaleScope);
+            return Err(refuse(
+                ProtocolError::StaleScope,
+                Reason::SubscriptionChanged,
+            ));
         }
         watermark
             .with_received(|received| {
                 if index.applied_watermark != received {
-                    return Err(ProtocolError::ScopeUnavailable);
+                    return Err(refuse(
+                        ProtocolError::ScopeUnavailable,
+                        Reason::WatermarkPending,
+                    ));
                 }
-                owner.targets.with_selected_page_targets(
+                owner.targets.with_selected_page_targets_diagnostic(
                     &self.selected,
                     expected.map(|proof| &proof.targets),
                     held,
                     acquire_barrier,
+                    Some((op.generation, op.sequence, stage)),
                     |target, registered| {
                         let relevant = selected_entry(&index, target, &self.selected.session_id)?;
                         let entry = index
@@ -280,7 +322,10 @@ impl PageQueryAuthority {
                             None
                         };
                         if !target.query_lineage_matches(root) {
-                            return Err(ProtocolError::StaleScope);
+                            return Err(refuse(
+                                ProtocolError::StaleScope,
+                                Reason::TargetSetChanged,
+                            ));
                         }
                         Ok(relevant)
                     },
@@ -295,13 +340,19 @@ impl PageQueryAuthority {
                                 })
                             })
                         {
-                            return Err(ProtocolError::StaleScope);
+                            return Err(refuse(
+                                ProtocolError::StaleScope,
+                                Reason::TargetSetChanged,
+                            ));
                         }
                         if *op.cancellation.borrow() != CancelSignal::None {
-                            return Err(ProtocolError::Cancelled);
+                            return Err(refuse(ProtocolError::Cancelled, Reason::OriginalBudget));
                         }
                         if Instant::now() >= op.deadline {
-                            return Err(ProtocolError::DeadlineExceeded);
+                            return Err(refuse(
+                                ProtocolError::DeadlineExceeded,
+                                Reason::OriginalBudget,
+                            ));
                         }
                         publish(&entries, targets, &watermark)
                     },
@@ -320,6 +371,7 @@ impl PageQueryAuthority {
             None,
             None,
             false,
+            Stage::Acquire,
             |entries, targets, watermark| {
                 Ok(PageAcquisitionProof {
                     authority: self.clone(),
@@ -342,7 +394,15 @@ impl PageAcquisitionProof {
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
         self.authority
-            .with_partition(page, op, Some(self), None, false, |_, _, _| Ok(()))
+            .with_partition(
+                page,
+                op,
+                Some(self),
+                None,
+                false,
+                Stage::Recheck,
+                |_, _, _| Ok(()),
+            )
             .map(|_| ())
     }
     pub(crate) fn with_publication<T>(
@@ -352,7 +412,15 @@ impl PageAcquisitionProof {
         publish: impl FnOnce() -> Result<T, ProtocolError>,
     ) -> Result<T, ProtocolError> {
         self.authority
-            .with_partition(page, op, Some(self), None, false, |_, _, _| publish())
+            .with_partition(
+                page,
+                op,
+                Some(self),
+                None,
+                false,
+                Stage::Publication,
+                |_, _, _| publish(),
+            )
             .map(|(value, _)| value)
     }
     pub(crate) fn begin_read(
@@ -360,9 +428,15 @@ impl PageAcquisitionProof {
         page: &BrowserExecutionLease,
         op: &OperationLease,
     ) -> Result<SelectedPageReadBarrier, ProtocolError> {
-        let (_, guard) =
-            self.authority
-                .with_partition(page, op, Some(self), None, true, |_, _, _| Ok(()))?;
+        let (_, guard) = self.authority.with_partition(
+            page,
+            op,
+            Some(self),
+            None,
+            true,
+            Stage::BarrierAcquire,
+            |_, _, _| Ok(()),
+        )?;
         Ok(SelectedPageReadBarrier {
             proof: self.clone(),
             guard: guard.ok_or(ProtocolError::ScopeUnavailable)?,
@@ -397,6 +471,7 @@ impl SelectedPageReadBarrier {
                 Some(&self.proof),
                 Some(&self.guard),
                 false,
+                Stage::BarrierCheck,
                 |_, _, _| publish(),
             )
             .map(|(value, _)| value)

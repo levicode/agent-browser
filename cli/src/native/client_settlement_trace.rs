@@ -31,6 +31,7 @@ pub(crate) enum SettlementPhase {
     ObservationPixelResult,
     FrameInventoryRejection,
     ReadonlyPrepareFailure,
+    QueryScopeRefusal,
     UploadPreflightRefusal,
     TerminalCleanupCheckpoint,
     ServiceWorkerAdmission,
@@ -168,6 +169,10 @@ pub(crate) enum MessageKind {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_scope_stage: Option<QueryScopeStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_scope_reason: Option<QueryScopeReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upload_refusal: Option<UploadRefusal>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1272,6 +1277,60 @@ fn upload_preflight_refusal_into(
             ..Facts::default()
         },
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum QueryScopeStage {
+    Classification,
+    Acquire,
+    Recheck,
+    BarrierAcquire,
+    BarrierCheck,
+    Publication,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum QueryScopeReason {
+    OwnerHealth,
+    OwnerIdentity,
+    IndexHealth,
+    PendingClassification,
+    SubscriptionChanged,
+    WatermarkPending,
+    AttributionChanged,
+    AttributionInvalid,
+    RegistryHealth,
+    CreationDebt,
+    UnclaimedAuxiliary,
+    GuardMismatch,
+    AlreadyProtected,
+    SelectedNotReady,
+    UnknownLineage,
+    RelatedNotReady,
+    UnretainedUnrelated,
+    TargetSetChanged,
+    OriginalBudget,
+}
+pub(crate) fn query_scope_refusal(
+    generation: u64,
+    sequence: u64,
+    stage: QueryScopeStage,
+    reason: QueryScopeReason,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryScopeRefusal,
+            Facts {
+                generation: Some(generation),
+                query_scope_stage: Some(stage),
+                query_scope_reason: Some(reason),
+                ..Facts::default()
+            },
+        );
+    }
 }
 
 pub(crate) fn readonly_prepare_failure(
@@ -2747,5 +2806,28 @@ mod upload_diagnostic_tests {
             assert_eq!(record["zeroInput"], true);
             assert!(record.get("effects").is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod query_scope_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn query_scope_diagnostics_are_closed_and_contain_no_target_payload() {
+        let value = serde_json::to_value(Facts {
+            generation: Some(3),
+            query_scope_stage: Some(QueryScopeStage::Recheck),
+            query_scope_reason: Some(QueryScopeReason::WatermarkPending),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":3,"queryScopeStage":"recheck","queryScopeReason":"watermark-pending"})
+        );
+        assert_eq!(
+            serde_json::to_value(Phase::QueryScopeRefusal).unwrap(),
+            "QueryScopeRefusal"
+        );
     }
 }

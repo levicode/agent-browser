@@ -183,36 +183,83 @@ impl ClientTargets {
         classify: impl Fn(&OwnedTarget, &HashMap<String, OwnedTarget>) -> Result<bool, ProtocolError>,
         publish: impl FnOnce(&SelectedPageTargetSnapshot) -> Result<T, ProtocolError>,
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        self.with_selected_page_targets_diagnostic(
+            selected,
+            expected,
+            held,
+            acquire_barrier,
+            None,
+            classify,
+            publish,
+        )
+    }
+    pub(crate) fn with_selected_page_targets_diagnostic<T>(
+        self: &Arc<Self>,
+        selected: &OwnedTarget,
+        expected: Option<&SelectedPageTargetSnapshot>,
+        held: Option<&SelectedPageTargetBarrier>,
+        acquire_barrier: bool,
+        diagnostic_context: Option<(u64, u64, diagnostic::QueryScopeStage)>,
+        classify: impl Fn(&OwnedTarget, &HashMap<String, OwnedTarget>) -> Result<bool, ProtocolError>,
+        publish: impl FnOnce(&SelectedPageTargetSnapshot) -> Result<T, ProtocolError>,
+    ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        use diagnostic::QueryScopeReason as Reason;
+        let refuse = |error, reason| {
+            if let Some((generation, sequence, stage)) = diagnostic_context {
+                diagnostic::query_scope_refusal(generation, sequence, stage, reason);
+            }
+            error
+        };
         let mut state = self
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state.sealed
-            || state.integrity_lost
-            || !state.enrollment_ready
-            || state.reservations != 0
-            || state.unknown_bootstrap_create
-            || state
-                .auxiliary
-                .values()
-                .any(|entry| !entry.detached && entry.claimed_session.is_none())
-            || held.is_some_and(|guard| {
-                !Arc::ptr_eq(&guard.registry, self)
-                    || !state
-                        .protected_read
-                        .as_ref()
-                        .is_some_and(|exclusion| exclusion.matches_token(&guard.token))
-            })
-            || (acquire_barrier && (held.is_some() || state.protected_read.is_some()))
+        if state.sealed || state.integrity_lost || !state.enrollment_ready {
+            return Err(refuse(
+                ProtocolError::ScopeUnavailable,
+                Reason::RegistryHealth,
+            ));
+        }
+        if state.reservations != 0 || state.unknown_bootstrap_create {
+            return Err(refuse(
+                ProtocolError::ScopeUnavailable,
+                Reason::CreationDebt,
+            ));
+        }
+        if state
+            .auxiliary
+            .values()
+            .any(|entry| !entry.detached && entry.claimed_session.is_none())
         {
-            return Err(ProtocolError::ScopeUnavailable);
+            return Err(refuse(
+                ProtocolError::ScopeUnavailable,
+                Reason::UnclaimedAuxiliary,
+            ));
+        }
+        if held.is_some_and(|guard| {
+            !Arc::ptr_eq(&guard.registry, self)
+                || !state
+                    .protected_read
+                    .as_ref()
+                    .is_some_and(|exclusion| exclusion.matches_token(&guard.token))
+        }) {
+            return Err(refuse(
+                ProtocolError::ScopeUnavailable,
+                Reason::GuardMismatch,
+            ));
+        }
+        if acquire_barrier && (held.is_some() || state.protected_read.is_some()) {
+            return Err(refuse(
+                ProtocolError::ScopeUnavailable,
+                Reason::AlreadyProtected,
+            ));
         }
         let main = state
             .targets
             .get(&selected.target_id)
             .ok_or(ProtocolError::StaleReference)?;
         if !main.same_attachment(selected) || main.kind != "page" || !main.capture_ready() {
-            return Err(ProtocolError::StaleScope);
+            return Err(refuse(ProtocolError::StaleScope, Reason::SelectedNotReady));
         }
         let mut targets = Vec::new();
         let relation = ProtectedExclusion::Selected {
@@ -224,17 +271,27 @@ impl ClientTargets {
                 || target.purpose.is_none()
                 || matches!(&target.tenure.lineage, AttachmentLineage::Unknown)
             {
-                return Err(ProtocolError::ScopeUnavailable);
+                return Err(refuse(
+                    ProtocolError::ScopeUnavailable,
+                    Reason::UnknownLineage,
+                ));
             }
-            let relevant = classify(target, &state.targets)?;
+            let relevant = classify(target, &state.targets)
+                .map_err(|error| refuse(error, Reason::AttributionInvalid))?;
             // Workers rooted in this document are not frame renderers, but their
             // in-flight resume must still exclude starting a protected query.
             if relation.excludes_tenure(&target.tenure) && !target.capture_ready() {
-                return Err(ProtocolError::ScopeUnavailable);
+                return Err(refuse(
+                    ProtocolError::ScopeUnavailable,
+                    Reason::RelatedNotReady,
+                ));
             }
             if relevant {
                 if !target.capture_ready() || !matches!(target.kind.as_str(), "page" | "iframe") {
-                    return Err(ProtocolError::ScopeUnavailable);
+                    return Err(refuse(
+                        ProtocolError::ScopeUnavailable,
+                        Reason::RelatedNotReady,
+                    ));
                 }
                 targets.push(target.clone());
             } else if !target.capture_ready()
@@ -243,7 +300,10 @@ impl ClientTargets {
                     .retained_initialization
                     .load(Ordering::Acquire)
             {
-                return Err(ProtocolError::ScopeUnavailable);
+                return Err(refuse(
+                    ProtocolError::ScopeUnavailable,
+                    Reason::UnretainedUnrelated,
+                ));
             }
         }
         targets.sort_by(|a, b| a.session_id.cmp(&b.session_id));
@@ -251,7 +311,7 @@ impl ClientTargets {
             .iter()
             .any(|target| target.same_attachment(selected))
         {
-            return Err(ProtocolError::StaleScope);
+            return Err(refuse(ProtocolError::StaleScope, Reason::TargetSetChanged));
         }
         let revisions: Vec<_> = targets
             .iter()
@@ -266,7 +326,7 @@ impl ClientTargets {
                     .zip(&expected.targets)
                     .any(|(a, b)| !a.same_attachment(b))
             {
-                return Err(ProtocolError::StaleScope);
+                return Err(refuse(ProtocolError::StaleScope, Reason::TargetSetChanged));
             }
         }
         let snapshot = SelectedPageTargetSnapshot {
