@@ -784,6 +784,7 @@ struct CaptureSnapshot {
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CaptureTestPoint {
+    QueryFinalFramesStarted,
     QueryEventPrefixObserved,
     RestartWaiting,
     RestartPageResumeWaiting,
@@ -808,6 +809,7 @@ enum CaptureTestPoint {
 }
 #[cfg(test)]
 struct CaptureTestGate {
+    observed: AtomicBool,
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
     passed: tokio::sync::Semaphore,
@@ -816,6 +818,7 @@ struct CaptureTestGate {
 impl CaptureTestGate {
     fn new() -> Arc<Self> {
         Arc::new(Self {
+            observed: AtomicBool::new(false),
             entered: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
             passed: tokio::sync::Semaphore::new(0),
@@ -8663,6 +8666,22 @@ mod tests {
         Arc<ClientSession>,
         Arc<CdpClient>,
     ) {
+        fixture_with_query_phase(mode, managed, owns_context, None).await
+    }
+    pub(super) async fn fixture_with_query_phase(
+        mode: &'static str,
+        managed: bool,
+        owns_context: bool,
+        final_query_phase: Option<Arc<CaptureTestGate>>,
+    ) -> (
+        Arc<ClientEnrollment>,
+        Notices,
+        Log,
+        tokio::sync::mpsc::Sender<Value>,
+        JoinHandle<()>,
+        Arc<ClientSession>,
+        Arc<CdpClient>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let log: Log = Arc::default();
@@ -8677,8 +8696,6 @@ mod tests {
             let mut detach_count = 0;
             let mut inventory_reads = 0;
             let mut query_world_emitted = false;
-            let mut query_frame_reads = 0usize;
-            let mut query_matcher_seen = false;
             let mut realm_loader = "synthetic-loader".to_owned();
             let mut whitespace = HashMap::<String, bool>::new();
             let mut closed_targets = std::collections::HashSet::<String>::new();
@@ -8788,12 +8805,7 @@ mod tests {
                             let body=if mode=="large-first-request" {"b".repeat(1536*1024)} else {String::new()};
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
                         }
-                        if mode=="owner-retirement-runtime-held-dispatch-final" && method=="Runtime.callFunctionOn" && request["params"]["functionDeclaration"].as_str().is_some_and(|declaration| declaration.starts_with("function(expression")) {
-                            query_matcher_seen = true;
-                            query_frame_reads = 0;
-                        }
-                        if mode=="owner-retirement-runtime-held-dispatch-final" && query_matcher_seen && method=="Page.getFrameTree" && request["sessionId"]=="initial" { query_frame_reads += 1; }
-                        if mode=="owner-retirement-runtime-held-dispatch-final" && query_matcher_seen && method=="Page.createIsolatedWorld" && query_frame_reads >= 2 && !query_world_emitted {
+                        if mode=="owner-retirement-runtime-held-dispatch-final" && final_query_phase.as_ref().is_some_and(|phase| phase.observed.load(Ordering::SeqCst)) && method=="Page.createIsolatedWorld" && request["sessionId"]=="initial" && !query_world_emitted {
                             query_world_emitted = true;
                             socket.send(Message::Text(realm_created(7,"final-world-event").to_string())).await.unwrap();
                             continue;

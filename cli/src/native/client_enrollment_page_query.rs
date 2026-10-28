@@ -595,6 +595,22 @@ impl PageQueryAuthority {
 }
 impl PageAcquisitionProof {
     pub(crate) fn diagnostic_phase(&self, stage: Stage) -> Self {
+        #[cfg(test)]
+        if stage == Stage::FinalFrames {
+            if let Some(gate) = self
+                .authority
+                .owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .remove(&CaptureTestPoint::QueryFinalFramesStarted)
+            {
+                // Observe the real caller's phase, without pausing or changing
+                // production authority. The peer may now emit a real CDP event.
+                gate.observed.store(true, Ordering::SeqCst);
+                gate.entered.add_permits(1);
+            }
+        }
         let mut proof = self.clone();
         proof.recheck_stage = stage;
         proof
@@ -1733,11 +1749,13 @@ mod retained_peer_tests {
     #[tokio::test]
     async fn protected_query_dispatch_catches_final_event_without_content_replay() {
         for fail in [false, true] {
+            let final_query_phase = CaptureTestGate::new();
             let (owner, _notices, log, emit, server, _broker, connection) =
-                super::super::tests::fixture_with_explicit_context_ownership(
+                super::super::tests::fixture_with_query_phase(
                     "owner-retirement-runtime-held-dispatch-final",
                     true,
                     true,
+                    Some(final_query_phase.clone()),
                 )
                 .await;
             owner
@@ -1871,6 +1889,12 @@ mod retained_peer_tests {
                 let query_page = owner.lease(&initial).unwrap();
                 let world_gate = scoped.then(CaptureTestGate::new);
                 let boundary_gate = scoped.then(CaptureTestGate::new);
+                if scoped {
+                    owner.capture_test_gates.lock().unwrap().insert(
+                        CaptureTestPoint::QueryFinalFramesStarted,
+                        final_query_phase.clone(),
+                    );
+                }
                 if let Some(gate) = &boundary_gate {
                     owner
                         .capture_test_gates
@@ -1904,6 +1928,8 @@ mod retained_peer_tests {
                 let mut refs_were_private = false;
                 let mut early_result = None;
                 if let Some(gate) = &world_gate {
+                    final_query_phase.wait_entered().await;
+                    eprintln!("FINAL_QUERY_PHASE_STARTED phase=final-frames");
                     tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
                         .await
                         .unwrap();
