@@ -4887,6 +4887,7 @@ impl ClientBrowser {
         operation: super::client_session::OperationLease,
     ) -> super::client_transport::NativeOutcome {
         use super::client_protocol::Effects;
+        use super::client_settlement_trace::RestartPostCreateStage;
         use super::client_transport::NativeOutcome;
         let captured = async {
             if operation.is_callback { return Err(ProtocolError::InvalidArguments); }
@@ -4953,6 +4954,7 @@ impl ClientBrowser {
             let _transition = transition;
             let mut effects = false;
             let mut dirty = false;
+            let mut restart_failure_stage = None;
             let result = async {
                 page.permit.check()?;
                 let exclusive = ui.enter(true, false, operation.deadline, operation.cancellation.clone()).await?;
@@ -4982,8 +4984,11 @@ impl ClientBrowser {
                     dirty |= failure.cleanup_integrity_lost || failure.effects_started;
                     failure.error
                 })?;
+                restart_failure_stage = Some(RestartPostCreateStage::ValidateReplacement);
                 replacement.validate(&context)?;
+                restart_failure_stage = Some(RestartPostCreateStage::CleanupUploads);
                 actions.cleanup_scope_uploads().await.inspect_err(|_| { dirty = true; if let Some(cell) = &diagnostics { cell.failure(CleanupPart::Upload); } })?;
+                restart_failure_stage = Some(RestartPostCreateStage::BindOwner);
                 let (next, recovery_identity) = {
                     let mut owner = owner.lock().await;
                     let owner = owner.as_mut().ok_or(ProtocolError::StaleScope)?;
@@ -4995,23 +5000,29 @@ impl ClientBrowser {
                     if borrowed { owner.borrowed_targets = Some(vec![replacement.target_id.clone()]); }
                     (owner.lease(gate.enter(false)?)?, owner.recovery_identity())
                 };
+                restart_failure_stage = Some(RestartPostCreateStage::PublishIdentity);
                 replacement.publish_ready(&context, || next.permit.check()).await?;
                 if cleanup_trace::inventory_enabled() {
                     cleanup_trace::inventory_snapshot(operation.generation, operation.sequence,
                         cleanup_trace::InventoryPoint::RestartReady, next.targets.inventory_diagnostic());
                 }
+                restart_failure_stage = Some(RestartPostCreateStage::RecordingReady);
                 if actions.is_recording_armed().await? {
                     let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
                     let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
                     actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
                 }
+                restart_failure_stage = Some(RestartPostCreateStage::PublishResult);
                 replacement.publish_ready(&context, || {
                     next.permit.check()?;
                     active.store(true, std::sync::atomic::Ordering::SeqCst);
                     Ok(serde_json::json!({"identityScope":scope,"recoveryIdentity":recovery_identity}))
                 }).await
             }.await;
+            if let (Err(error), Some(stage)) = (&result, restart_failure_stage) {
+                cleanup_trace::restart_post_create_refusal(operation.generation, operation.sequence, stage, error);
+            }
             // Any failed destructive restart cannot be replayed against its new
             // page. Retain the original context for normal lifecycle containment.
             dirty |= effects && result.is_err();

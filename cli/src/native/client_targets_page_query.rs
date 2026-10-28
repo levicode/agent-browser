@@ -210,6 +210,18 @@ impl ClientTargets {
             }
             error
         };
+        let refuse_target = |reason, target: &OwnedTarget| {
+            if let Some((generation, sequence, stage)) = diagnostic_context {
+                diagnostic::query_target_refusal(
+                    generation,
+                    sequence,
+                    stage,
+                    reason,
+                    target.diagnostic_snapshot(),
+                );
+            }
+            ProtocolError::ScopeUnavailable
+        };
         let mut state = self
             .state
             .lock()
@@ -267,14 +279,14 @@ impl ClientTargets {
             root: selected.clone(),
         };
         for target in state.targets.values() {
-            if !Arc::ptr_eq(&target.tenure.owner, &self.attachment_owner)
-                || target.purpose.is_none()
-                || matches!(&target.tenure.lineage, AttachmentLineage::Unknown)
-            {
-                return Err(refuse(
-                    ProtocolError::ScopeUnavailable,
-                    Reason::UnknownLineage,
-                ));
+            if !Arc::ptr_eq(&target.tenure.owner, &self.attachment_owner) {
+                return Err(refuse_target(Reason::ForeignOwner, target));
+            }
+            if target.purpose.is_none() {
+                return Err(refuse_target(Reason::UnclassifiedPurpose, target));
+            }
+            if matches!(&target.tenure.lineage, AttachmentLineage::Unknown) {
+                return Err(refuse_target(Reason::UnknownLineage, target));
             }
             let relevant = classify(target, &state.targets)
                 .map_err(|error| refuse(error, Reason::AttributionInvalid))?;

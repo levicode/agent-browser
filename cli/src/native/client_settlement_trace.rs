@@ -20,6 +20,7 @@ pub(crate) enum SettlementPhase {
     CleanupStarted,
     CleanupFirstFailure,
     CleanupResult,
+    RestartPostCreateRefused,
     InventorySnapshot,
     TargetAttribution,
     TargetLifecycle,
@@ -179,6 +180,8 @@ pub(crate) struct Facts {
     pub terminal_cleanup_stage: Option<TerminalCleanupStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_cleanup_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_post_create_stage: Option<RestartPostCreateStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment_ordinal: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -602,7 +605,8 @@ macro_rules! diagnostic_enum {
     };
 }
 diagnostic_enum!(DiagnosticTargetKind {
-    Other,
+    Unrecognized,
+    CdpOther,
     Page,
     Iframe,
     Worker,
@@ -645,6 +649,7 @@ diagnostic_enum!(DiagnosticTargetStage {
 impl DiagnosticTargetKind {
     pub(crate) fn from_native(kind: &str) -> Self {
         match kind {
+            "other" => Self::CdpOther,
             "page" => Self::Page,
             "iframe" => Self::Iframe,
             "worker" => Self::Worker,
@@ -655,7 +660,7 @@ impl DiagnosticTargetKind {
             "tab" => Self::Tab,
             "webview" => Self::Webview,
             "background_page" => Self::BackgroundPage,
-            _ => Self::Other,
+            _ => Self::Unrecognized,
         }
     }
 }
@@ -1306,6 +1311,8 @@ pub(crate) enum QueryScopeReason {
     GuardMismatch,
     AlreadyProtected,
     SelectedNotReady,
+    ForeignOwner,
+    UnclassifiedPurpose,
     UnknownLineage,
     RelatedNotReady,
     UnretainedUnrelated,
@@ -1327,6 +1334,31 @@ pub(crate) fn query_scope_refusal(
                 generation: Some(generation),
                 query_scope_stage: Some(stage),
                 query_scope_reason: Some(reason),
+                ..Facts::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn query_target_refusal(
+    generation: u64,
+    sequence: u64,
+    stage: QueryScopeStage,
+    reason: QueryScopeReason,
+    target: Option<DiagnosticAttachment>,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryScopeRefusal,
+            Facts {
+                generation: Some(generation),
+                query_scope_stage: Some(stage),
+                query_scope_reason: Some(reason),
+                attachment_ordinal: target.map(|value| value.attachment),
+                target_ordinal: target.map(|value| value.target),
+                target_kind: target.map(|value| value.kind),
                 ..Facts::default()
             },
         );
@@ -1539,6 +1571,48 @@ fn inventory_snapshot_into(
         }
     }
 }
+/// The exact post-create boundary returning an error, before restart seals
+/// the owner. These closed stages contain no browser/session/target payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum RestartPostCreateStage {
+    ValidateReplacement,
+    CleanupUploads,
+    BindOwner,
+    PublishIdentity,
+    RecordingReady,
+    PublishResult,
+}
+pub(crate) fn restart_post_create_refusal(
+    generation: u64,
+    sequence: u64,
+    stage: RestartPostCreateStage,
+    error: &ProtocolError,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        restart_post_create_refusal_into(capture, generation, sequence, stage, error);
+    }
+}
+fn restart_post_create_refusal_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    stage: RestartPostCreateStage,
+    error: &ProtocolError,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::RestartPostCreateRefused,
+        Facts {
+            generation: Some(generation),
+            restart_post_create_stage: Some(stage),
+            error: Some(error.clone()),
+            ..Facts::default()
+        },
+    );
+}
+
 // Exhaustion disables observation instead of aliasing a previous identity.
 #[allow(deprecated)]
 fn next_cleanup_ordinal(counter: &AtomicU64, limit: u64) -> Option<u64> {
@@ -2828,6 +2902,129 @@ mod query_scope_diagnostic_tests {
         assert_eq!(
             serde_json::to_value(Phase::QueryScopeRefusal).unwrap(),
             "QueryScopeRefusal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_target_kind_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn query_target_kind_distinguishes_exact_other_from_unrecognized_without_raw_values() {
+        assert_eq!(
+            DiagnosticTargetKind::from_native("other"),
+            DiagnosticTargetKind::CdpOther
+        );
+        assert_eq!(
+            DiagnosticTargetKind::from_native("browser_ui"),
+            DiagnosticTargetKind::BrowserUi
+        );
+        for raw in ["", "unlisted-private-kind", "OTHER", "other-private-suffix"] {
+            assert_eq!(
+                DiagnosticTargetKind::from_native(raw),
+                DiagnosticTargetKind::Unrecognized
+            );
+            assert_eq!(
+                serde_json::to_value(DiagnosticTargetKind::from_native(raw)).unwrap(),
+                "unrecognized"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(DiagnosticTargetKind::from_native("other")).unwrap(),
+            "cdp-other"
+        );
+    }
+    #[test]
+    fn query_lineage_refusal_reasons_are_distinct_closed_labels() {
+        assert_eq!(
+            serde_json::to_value(QueryScopeReason::ForeignOwner).unwrap(),
+            "foreign-owner"
+        );
+        assert_eq!(
+            serde_json::to_value(QueryScopeReason::UnclassifiedPurpose).unwrap(),
+            "unclassified-purpose"
+        );
+        assert_eq!(
+            serde_json::to_value(QueryScopeReason::UnknownLineage).unwrap(),
+            "unknown-lineage"
+        );
+        let value = serde_json::to_value(Facts {
+            generation: Some(1),
+            attachment_ordinal: Some(5),
+            target_ordinal: Some(5),
+            target_kind: Some(DiagnosticTargetKind::CdpOther),
+            query_scope_stage: Some(QueryScopeStage::Acquire),
+            query_scope_reason: Some(QueryScopeReason::UnknownLineage),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":1,"attachmentOrdinal":5,"targetOrdinal":5,"targetKind":"cdp-other","queryScopeStage":"acquire","queryScopeReason":"unknown-lineage"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod restart_post_create_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn restart_post_create_refusal_has_closed_bounded_schema() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let error = ProtocolError::StaleScope;
+        for (stage, label) in [
+            (
+                RestartPostCreateStage::ValidateReplacement,
+                "validate-replacement",
+            ),
+            (RestartPostCreateStage::CleanupUploads, "cleanup-uploads"),
+            (RestartPostCreateStage::BindOwner, "bind-owner"),
+            (RestartPostCreateStage::PublishIdentity, "publish-identity"),
+            (RestartPostCreateStage::RecordingReady, "recording-ready"),
+            (RestartPostCreateStage::PublishResult, "publish-result"),
+        ] {
+            restart_post_create_refusal_into(&capture, 3, 5, stage, &error);
+            let text = std::fs::read_to_string(file.path()).unwrap();
+            let line = text.lines().last().unwrap();
+            assert!(line.len() < MAX_RECORD_BYTES);
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["phase"], "RestartPostCreateRefused");
+            assert_eq!(value["restartPostCreateStage"], label);
+            assert_eq!(value["error"], "stale-scope");
+            assert_eq!(value["generation"], 3);
+            assert_eq!(value["operationSeq"], 5);
+            assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "schemaVersion"
+                    | "source"
+                    | "pid"
+                    | "record"
+                    | "operationSeq"
+                    | "phase"
+                    | "droppedBefore"
+                    | "emittedBefore"
+                    | "suppressedBefore"
+                    | "overflow"
+                    | "generation"
+                    | "restartPostCreateStage"
+                    | "error"
+            )));
+        }
+        assert_eq!(error, ProtocolError::StaleScope);
+    }
+    #[test]
+    fn restart_post_create_facts_do_not_add_outcome_or_identity_authority() {
+        let value = serde_json::to_value(Facts {
+            generation: Some(1),
+            restart_post_create_stage: Some(RestartPostCreateStage::BindOwner),
+            error: Some(ProtocolError::StaleScope),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":1,"restartPostCreateStage":"bind-owner","error":"stale-scope"})
         );
     }
 }
