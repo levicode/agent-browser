@@ -248,6 +248,8 @@ struct Attribution {
     observation_only: bool,
     // None preserves a missing/malformed attachment flag; it is never EOF proof.
     observer_paused: Option<bool>,
+    // Only a newly admitted authorized application page attachment with the CDP pause receipt.
+    init_paused_by_attachment: bool,
     resumed: bool,
 }
 #[derive(Clone, Debug)]
@@ -3670,7 +3672,7 @@ impl ClientEnrollment {
         kind: &str,
         parent: Option<&str>,
     ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
-        self.register_with_custody(context, target, session, kind, parent, None, false)
+        self.register_with_custody(context, target, session, kind, parent, None, false, false)
     }
     fn register_with_custody(
         &self,
@@ -3681,6 +3683,7 @@ impl ClientEnrollment {
         parent: Option<&str>,
         custody: Option<&mut super::client_targets::RetainedInitialization>,
         opaque_parentless: bool,
+        paused_by_attachment: bool,
     ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
         if context != self.targets.context_id {
             return Ok(None);
@@ -3820,6 +3823,7 @@ impl ClientEnrollment {
             application: false,
             observation_only: false,
             observer_paused: None,
+            init_paused_by_attachment: kind == "page" && paused_by_attachment,
             resumed: false,
         };
         self.revoke_eval_authority();
@@ -4400,11 +4404,10 @@ impl ClientEnrollment {
                     self.frame_tree(&entry, tree, 0)?;
                 }
             }
-            // Runtime.enable creates the paused popup's main world before its first
-            // init registration. Chromium runs registrations immediately for paused
-            // new windows; creating the world inside that first registration can
-            // re-enter new-document injection and execute only script zero twice.
-            // Runtime events are already subscribed, and the target stays paused.
+            // Create the main world before registering scripts. For an authorized application page
+            // whose new attachment explicitly reports waitingForDebugger, the
+            // registration below also executes in that existing paused world.
+            // Runtime events are already subscribed; resume remains after all ACKs.
             ServiceWorkerAdmission::observe(
                 admission,
                 WorkerAdmissionStep::RuntimeEnable,
@@ -4412,11 +4415,20 @@ impl ClientEnrollment {
             )
             .await?;
             if page_target {
-                let revision = self
-                    .page
-                    .apply_to_new_session_initialization(&lease, &entry.session, op)
-                    .await
-                    .map_err(|failure| self.initialization_component_failure(failure))?;
+                let revision = if entry.kind == "page"
+                    && entry.init_paused_by_attachment
+                    && !entry.observation_only
+                    && !entry.resumed
+                {
+                    self.page
+                        .apply_to_paused_new_session_initialization(&lease, &entry.session, op)
+                        .await
+                } else {
+                    self.page
+                        .apply_to_new_session_initialization(&lease, &entry.session, op)
+                        .await
+                }
+                .map_err(|failure| self.initialization_component_failure(failure))?;
                 if revision != self.page.config_revision()? {
                     return Err(ProtocolError::StaleScope.into());
                 }
@@ -6456,6 +6468,7 @@ impl ClientEnrollment {
                     event.session_id.as_deref(),
                     custody,
                     info.get("parentId").is_none() && info.get("parentFrameId").is_none(),
+                    event.params.get("waitingForDebugger").and_then(Value::as_bool) == Some(true),
                 )
             },
         )? {
@@ -6535,6 +6548,7 @@ impl ClientEnrollment {
             application: false,
             observation_only: true,
             observer_paused: paused_by_attachment,
+            init_paused_by_attachment: false,
             resumed: false,
         };
         if let Some(debt) = self.client.debt_ledger() {
@@ -9627,6 +9641,7 @@ mod tests {
             application: true,
             observation_only: false,
             observer_paused: None,
+            init_paused_by_attachment: false,
             resumed: true,
         };
         let index = complete();
@@ -13243,6 +13258,7 @@ mod tests {
             application: true,
             observation_only: false,
             observer_paused: None,
+            init_paused_by_attachment: false,
             resumed: true,
         };
         for mismatch in ["target", "root", "parent", "kind"] {
@@ -13477,6 +13493,7 @@ mod tests {
             application: false,
             observation_only: true,
             observer_paused: None,
+            init_paused_by_attachment: false,
             resumed: true,
         };
         let diagnostic = capture_inventory_diagnostic(&[entry.clone()], &[], "private-context");
@@ -15275,6 +15292,7 @@ mod tests {
             application: true,
             observation_only: false,
             observer_paused: None,
+            init_paused_by_attachment: false,
             resumed: true,
         };
         owner.index.lock().unwrap().frames.insert(
@@ -15452,6 +15470,7 @@ mod tests {
             application: true,
             observation_only: false,
             observer_paused: None,
+            init_paused_by_attachment: false,
             resumed: false,
         };
         let lease = owner.lease(&entry).unwrap();
@@ -18332,6 +18351,15 @@ mod tests {
             .await
             .unwrap();
             assert!(!task.is_finished());
+            // Production configuration updates obtain sessions only from this
+            // complete inventory, after the same config_gate. An unconfigured
+            // popup cannot be swept into a future-only update ahead of init.
+            assert!(matches!(owner.targets.inventory(), Err(ProtocolError::ScopeUnavailable)));
+            // The same attached receipt cannot begin a second initialization.
+            assert!(owner.register_with_custody(
+                "owned-context", "popup", "popup-session", "page", None,
+                None, true, true,
+            ).unwrap().is_none());
             assert!(!log.lock().unwrap().iter().any(|request| matches!(
                 request["method"].as_str(),
                 Some("Page.addScriptToEvaluateOnNewDocument" | "Runtime.runIfWaitingForDebugger")
@@ -18357,6 +18385,13 @@ mod tests {
             } else {
                 result.unwrap();
                 assert_eq!(scripts.len(), 4);
+                assert!(scripts.iter().all(|request| request["params"]["runImmediately"] == true));
+                // A duplicate attachment after resume also performs no script
+                // registration or resume. The cloned resumed flag is not the
+                // one-shot proof: exact session registration rejects duplicates.
+                let before_duplicate = commands.len();
+                owner.attached(attach("owned-context", "popup", "popup-session", "page", None)).await.unwrap();
+                assert_eq!(log.lock().unwrap().len(), before_duplicate);
                 for (ordinal, request) in scripts.iter().enumerate() {
                     assert_eq!(
                         request["params"]["source"],
@@ -18379,6 +18414,35 @@ mod tests {
             }
             drop(lease);
             let _ = owner.close().await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn immediate_init_requires_exact_paused_attachment_receipt() {
+        for receipt in [None, Some(json!(false)), Some(json!("true")), Some(json!(true))] {
+            let (mut owner, _notices, log, _emit, server) = fixture("normal").await;
+            Arc::get_mut(&mut owner).unwrap().config.block_service_workers = true;
+            owner.enroll_existing("target", "initial", "page", &owner.operation()).await.unwrap();
+            let mut event = attach("owned-context", "popup", "popup-session", "page", None);
+            event.params.as_object_mut().unwrap().remove("waitingForDebugger");
+            if let Some(value) = &receipt {
+                event.params["waitingForDebugger"] = value.clone();
+            }
+            owner.attached(event).await.unwrap();
+            let commands = log.lock().unwrap().clone();
+            let scripts: Vec<_> = commands.iter()
+                .filter(|request| request["method"] == "Page.addScriptToEvaluateOnNewDocument")
+                .collect();
+            assert_eq!(scripts.len(), 2);
+            assert!(scripts[0]["params"].get("runImmediately").is_none());
+            if receipt == Some(json!(true)) {
+                assert_eq!(scripts[1]["params"]["runImmediately"], true);
+            } else {
+                assert!(scripts[1]["params"].get("runImmediately").is_none());
+            }
+            owner.close().await.unwrap();
+            owner.network.close().await.unwrap();
             server.abort();
         }
     }

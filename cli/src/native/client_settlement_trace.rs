@@ -1393,6 +1393,7 @@ pub(crate) enum QueryScopeReason {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum QueryReadStage {
     FrameEntry, FreshFields, Ax, Dom, CandidatePlan, Security, Metadata, QueryWorld,
+    CandidatePlanRoots, CandidatePlanDomBackend, CandidatePlanAttributes, CandidatePlanDuplicateDom, CandidatePlanAxRows, CandidatePlanAxDecode, CandidatePlanDuplicateAx, CandidatePlanAuthorIds, CandidatePlanMissingRecord, CandidatePlanAxChild, CandidatePlanDomObject, CandidatePlanFallback,
     QueryResolve, QueryMatch, CandidateConfirm, SecurityConfirm,
     MetadataConfirm, Projection, Cleanup, FrameFinal, LeaseFinal,
 }
@@ -3448,5 +3449,29 @@ mod query_read_schema_tests {
             (QueryScopeReason::EnrollmentTargetSetChanged,"enrollment-target-set-changed"),
         ];
         for (reason, text) in reasons { assert_eq!(serde_json::to_value(reason).unwrap(), text); }
+    }
+}
+
+#[cfg(test)]
+mod candidate_schema_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn candidate_schema_stages_are_closed_static_strings() {
+        for (stage, expected) in [
+            (QueryReadStage::CandidatePlanRoots, "candidate-plan-roots"),
+            (QueryReadStage::CandidatePlanDomBackend, "candidate-plan-dom-backend"),
+            (QueryReadStage::CandidatePlanAttributes, "candidate-plan-attributes"),
+            (QueryReadStage::CandidatePlanDuplicateDom, "candidate-plan-duplicate-dom"),
+            (QueryReadStage::CandidatePlanAxRows, "candidate-plan-ax-rows"),
+            (QueryReadStage::CandidatePlanAxDecode, "candidate-plan-ax-decode"),
+            (QueryReadStage::CandidatePlanDuplicateAx, "candidate-plan-duplicate-ax"),
+            (QueryReadStage::CandidatePlanAuthorIds, "candidate-plan-author-ids"),
+            (QueryReadStage::CandidatePlanMissingRecord, "candidate-plan-missing-record"),
+            (QueryReadStage::CandidatePlanAxChild, "candidate-plan-ax-child"),
+            (QueryReadStage::CandidatePlanDomObject, "candidate-plan-dom-object"),
+            (QueryReadStage::CandidatePlanFallback, "candidate-plan-fallback")
+        ] {
+            assert_eq!(serde_json::to_value(stage).unwrap(), expected);
+        }
     }
 }

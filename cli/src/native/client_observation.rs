@@ -3713,10 +3713,13 @@ async fn evaluate_query_diagnostic_inner(
     witness.stage(Stage::Dom);
     let dom = frame_dom(client, frame, lease).await?;
     witness.stage(Stage::CandidatePlan);
-    let candidate_plan = role_candidates::plan(&dom["root"], &ax_value, expression, options)?;
+    let candidate_plan = role_candidates::plan_diagnostic(&dom["root"], &ax_value, expression, options, Some(witness))?;
     let ids = match &candidate_plan {
         Some(plan) => plan.ids.clone(),
-        None => author_query_ids(&dom["root"])?,
+        None => author_query_ids(&dom["root"]).map_err(|error| {
+            witness.stage(Stage::CandidatePlanFallback);
+            error
+        })?,
     };
     let mut nodes = Vec::new();
     let metadata_options = ObservationOptions {

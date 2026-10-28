@@ -10,6 +10,16 @@ pub(super) struct QueryReadWitness {
     state: Mutex<(QueryReadStage, bool)>,
 }
 impl QueryReadWitness {
+    #[cfg(test)]
+    pub(super) fn schema_test(enabled: bool) -> Self {
+        Self { enabled, generation: 1, sequence: 2,
+            state: Mutex::new((QueryReadStage::CandidatePlan, false)) }
+    }
+    #[cfg(test)]
+    pub(super) fn schema_test_stage(&self) -> QueryReadStage {
+        self.state.lock().unwrap().0
+    }
+
     pub(super) fn new(lease: &OperationLease) -> Self {
         Self { enabled: trace::query_diagnostics_enabled(), generation: lease.generation,
             sequence: lease.sequence, state: Mutex::new((QueryReadStage::FrameEntry, false)) }

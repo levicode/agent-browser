@@ -724,6 +724,27 @@ impl ClientPageState {
         session: &str,
         op: &OperationLease,
     ) -> Result<u64, ObservedOperationFailure> {
+        self.apply_to_new_session_initialization_mode(page, session, op, false)
+            .await
+    }
+    /// Enrollment only: a new authorized application page attachment explicitly paused by CDP,
+    /// before its first resume. Ordinary init-script updates remain future-only.
+    pub(crate) async fn apply_to_paused_new_session_initialization(
+        &self,
+        page: &BrowserExecutionLease,
+        session: &str,
+        op: &OperationLease,
+    ) -> Result<u64, ObservedOperationFailure> {
+        self.apply_to_new_session_initialization_mode(page, session, op, true)
+            .await
+    }
+    async fn apply_to_new_session_initialization_mode(
+        &self,
+        page: &BrowserExecutionLease,
+        session: &str,
+        op: &OperationLease,
+        run_immediately: bool,
+    ) -> Result<u64, ObservedOperationFailure> {
         self.validate_initialization(page, op)?;
         // Serialize only configuration writes for this target. This lock never
         // blocks navigation, callback reads, or another target's enrollment.
@@ -749,12 +770,16 @@ impl ClientPageState {
         };
         for (index, source) in config.scripts.iter().enumerate().skip(installed) {
             self.state()?.uncertain_scripts.insert(session.into());
+            let mut registration = json!({"source":source.as_ref()});
+            if run_immediately {
+                registration["runImmediately"] = json!(true);
+            }
             let installed_script = command_initialization_component(
                 page,
                 op,
                 Some(session),
                 "Page.addScriptToEvaluateOnNewDocument",
-                json!({"source":source.as_ref()}),
+                registration,
             )
             .await?;
             if !installed_script
@@ -2624,6 +2649,32 @@ mod tests {
                 .count(),
             1
         );
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn immediate_init_is_explicit_and_installed_once_per_session() {
+        let (page, log, task) = mock("normal").await;
+        let (op, _sender) = operation();
+        let state = ClientPageState::new("scope".into(), "context".into());
+        state.ensure_service_worker_policy(&page, &op).unwrap();
+        // Existing-page/update route never opts into current-world execution.
+        state.apply_to_new_session_initialization(&page, "existing", &op).await.unwrap();
+        // Paused new attachment route opts in, but repeated application does
+        // not register or execute the already acknowledged script again.
+        state.apply_to_paused_new_session_initialization(&page, "paused", &op).await.unwrap();
+        state.apply_to_paused_new_session_initialization(&page, "paused", &op).await.unwrap();
+        state.apply_to_new_session_initialization(&page, "paused", &op).await.unwrap();
+        let events = log.lock().unwrap();
+        let scripts: Vec<_> = events.iter()
+            .filter(|event| event["method"] == "Page.addScriptToEvaluateOnNewDocument")
+            .collect();
+        assert_eq!(scripts.len(), 2);
+        assert_eq!(scripts[0]["sessionId"], "existing");
+        assert!(scripts[0]["params"].get("runImmediately").is_none());
+        assert_eq!(scripts[1]["sessionId"], "paused");
+        assert_eq!(scripts[1]["params"]["runImmediately"], true);
+        drop(events);
         task.abort();
     }
 
