@@ -75,11 +75,31 @@ impl RetainedInitialization {
         kind: String,
         root: Option<OwnedTarget>,
     ) -> Result<bool, ProtocolError> {
+        self.attach_with_ancestry(registry, context, target, session, kind, root, false)
+    }
+    pub(super) fn attach_with_ancestry(
+        &mut self,
+        registry: &Arc<ClientTargets>,
+        context: &str,
+        target: String,
+        session: String,
+        kind: String,
+        root: Option<OwnedTarget>,
+        rootless_auxiliary: bool,
+    ) -> Result<bool, ProtocolError> {
         if self.target.is_some() || !Arc::ptr_eq(&self.registry, registry) {
             return Err(ProtocolError::StaleScope);
         }
-        let attached =
-            registry.attach_inner(context, target, session, kind, true, root.as_ref(), true)?;
+        let attached = registry.attach_inner(
+            context,
+            target,
+            session,
+            kind,
+            true,
+            root.as_ref(),
+            true,
+            rootless_auxiliary,
+        )?;
         if let Some(target) = &attached {
             // The registry marked the exact fresh tenure under its insertion
             // lock. No await or fallible work separates insertion and custody.
@@ -1263,8 +1283,10 @@ impl ClientTargets {
         session_id: String,
         kind: String,
     ) -> Result<bool, ProtocolError> {
-        self.attach_inner(context_id, target_id, session_id, kind, false, None, false)
-            .map(|target| target.is_some())
+        self.attach_inner(
+            context_id, target_id, session_id, kind, false, None, false, false,
+        )
+        .map(|target| target.is_some())
     }
     pub(super) fn attached_enrolled(
         &self,
@@ -1274,8 +1296,28 @@ impl ClientTargets {
         kind: String,
         root: Option<&OwnedTarget>,
     ) -> Result<bool, ProtocolError> {
-        self.attach_inner(context, target, session, kind, false, root, true)
-            .map(|target| target.is_some())
+        self.attached_enrolled_with_ancestry(context, target, session, kind, root, false)
+    }
+    pub(super) fn attached_enrolled_with_ancestry(
+        &self,
+        context: &str,
+        target: String,
+        session: String,
+        kind: String,
+        root: Option<&OwnedTarget>,
+        rootless_auxiliary: bool,
+    ) -> Result<bool, ProtocolError> {
+        self.attach_inner(
+            context,
+            target,
+            session,
+            kind,
+            false,
+            root,
+            true,
+            rootless_auxiliary,
+        )
+        .map(|target| target.is_some())
     }
     fn attach_inner(
         &self,
@@ -1286,6 +1328,7 @@ impl ClientTargets {
         retained: bool,
         root: Option<&OwnedTarget>,
         enrolled: bool,
+        rootless_auxiliary: bool,
     ) -> Result<Option<OwnedTarget>, ProtocolError> {
         if context_id != self.context_id {
             return Ok(None);
@@ -1324,7 +1367,7 @@ impl ClientTargets {
                 }
             }
             let lineage = if enrolled {
-                AttachmentLineage::enrolled(&kind, root)?
+                AttachmentLineage::enrolled(&kind, root, rootless_auxiliary)?
             } else {
                 AttachmentLineage::Unknown
             };

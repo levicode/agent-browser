@@ -59,6 +59,17 @@ fn selected_entry(index: &Index, target: &OwnedTarget, root: &str) -> Result<boo
     {
         return Err(ProtocolError::StaleScope);
     }
+    if matches!(entry.kind.as_str(), "browser" | "tab" | "browser_ui") {
+        return if entry.root == entry.session
+            && entry.parent.is_none()
+            && entry.application
+            && entry.resumed
+        {
+            Ok(false)
+        } else {
+            Err(ProtocolError::ScopeUnavailable)
+        };
+    }
     if !matches!(entry.kind.as_str(), "page" | "iframe") {
         return if matches!(
             entry.kind.as_str(),
@@ -508,6 +519,26 @@ mod tests {
         }
     }
     #[test]
+    fn query_partition_auxiliary_requires_exact_self_root_no_parent_and_ready() {
+        for invalid in ["parent", "root", "application", "resumed"] {
+            let (mut index, registry) = fixture();
+            let entry = index.sessions.get_mut("popup-session").unwrap();
+            entry.kind = "browser_ui".into();
+            match invalid {
+                "parent" => entry.parent = Some("main-session".into()),
+                "root" => entry.root = "main-session".into(),
+                "application" => entry.application = false,
+                _ => entry.resumed = false,
+            }
+            let mut target = registry.owned_target("popup").unwrap();
+            target.kind = "browser_ui".into();
+            assert!(
+                selected_entry(&index, &target, "main-session").is_err(),
+                "{invalid}"
+            );
+        }
+    }
+    #[test]
     fn query_partition_never_uses_opener_as_iframe_ancestry() {
         let (mut index, registry) = fixture();
         // A page root cannot be converted to a child by merely supplying its opener.
@@ -701,6 +732,36 @@ mod retained_peer_tests {
                 .unwrap()
                 .publish_initialization(|| Ok(()))
                 .unwrap();
+            // Actual framed auto-attachment and initialization of the auxiliary
+            // kinds present in ordinary Chromium. They are not page renderers.
+            for kind in ["browser_ui", "tab", "browser"] {
+                let session = format!("aux-{kind}-session");
+                let target = format!("aux-{kind}-target");
+                emit.send(json!({"method":"Target.attachedToTarget","params":{
+                    "sessionId":session,"waitingForDebugger":true,"targetInfo":{
+                    "targetId":target,"type":kind,"browserContextId":"owned-context"}}}))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if owner
+                            .targets
+                            .owned_target(&target)
+                            .is_ok_and(|t| t.configured && t.resumed)
+                            && owner.index.lock().unwrap().pending_enrollment.is_empty()
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let index = owner.index.lock().unwrap();
+                let entry = &index.sessions[&session];
+                assert_eq!(entry.root, session);
+                assert!(entry.parent.is_none());
+            }
             let initial = owner.index.lock().unwrap().sessions["initial"].clone();
             let page = owner.lease(&initial).unwrap();
             let selected = owner.targets.owned_target("initial-target").unwrap();

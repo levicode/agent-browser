@@ -10,11 +10,21 @@ pub(super) enum AttachmentLineage {
     PageRoot,
     DocumentRoot(OwnedTarget),
     IndependentWorker,
+    // Explicitly enrolled rootless browser/tab/UI target. Not an independent
+    // worker: it must be ready and remains excluded by every selected barrier.
+    ReadyAuxiliary,
 }
 impl AttachmentLineage {
-    pub(super) fn enrolled(kind: &str, root: Option<&OwnedTarget>) -> Result<Self, ProtocolError> {
+    pub(super) fn enrolled(
+        kind: &str,
+        root: Option<&OwnedTarget>,
+        rootless_auxiliary: bool,
+    ) -> Result<Self, ProtocolError> {
         match (kind, root) {
             ("page", None) => Ok(Self::PageRoot),
+            ("browser" | "tab" | "browser_ui", None) if rootless_auxiliary => {
+                Ok(Self::ReadyAuxiliary)
+            }
             ("iframe" | "worker" | "shared_worker" | "service_worker", Some(root))
                 if matches!(&root.tenure.lineage, Self::PageRoot) =>
             {
@@ -55,7 +65,7 @@ impl ProtectedExclusion {
             return true;
         }
         match &tenure.lineage {
-            AttachmentLineage::Unknown => true,
+            AttachmentLineage::Unknown | AttachmentLineage::ReadyAuxiliary => true,
             AttachmentLineage::PageRoot => Arc::ptr_eq(&root.tenure, tenure),
             AttachmentLineage::DocumentRoot(document) => {
                 !Arc::ptr_eq(&root.tenure.owner, &document.tenure.owner)
@@ -85,7 +95,7 @@ impl Registry {
                 };
                 root.tenure.query_revision.store(next, Ordering::Release);
             }
-            AttachmentLineage::Unknown => {
+            AttachmentLineage::Unknown | AttachmentLineage::ReadyAuxiliary => {
                 let Some(next) = self.query_unknown_revision.checked_add(1) else {
                     self.lose_integrity();
                     return Err(ProtocolError::IdentifierExhausted);
@@ -110,7 +120,7 @@ impl Registry {
                 .targets
                 .get(&root.target_id)
                 .is_some_and(|current| current.same_initialization_attachment(root)),
-            AttachmentLineage::Unknown => true,
+            AttachmentLineage::Unknown | AttachmentLineage::ReadyAuxiliary => true,
             _ => false,
         }
     }
@@ -121,6 +131,9 @@ impl OwnedTarget {
             (AttachmentLineage::PageRoot, Some(root)) => self.same_initialization_attachment(root),
             (AttachmentLineage::DocumentRoot(original), Some(root)) => {
                 original.same_initialization_attachment(root)
+            }
+            (AttachmentLineage::ReadyAuxiliary, None) => {
+                matches!(self.kind.as_str(), "browser" | "tab" | "browser_ui")
             }
             (AttachmentLineage::IndependentWorker, None) => matches!(
                 self.kind.as_str(),
@@ -335,6 +348,119 @@ mod tests {
             |target, _| Ok(target.target_id == "main"),
             |snapshot| Ok(snapshot.clone()),
         )
+    }
+    #[tokio::test]
+    async fn selected_query_known_auxiliary_requires_ready_and_keeps_global_exclusion() {
+        for kind in ["browser", "tab", "browser_ui"] {
+            let (registry, main) = fixture().await;
+            let mut custody = RetainedInitialization::new(registry.clone());
+            custody
+                .attach_with_ancestry(
+                    &registry,
+                    "ctx",
+                    "aux".into(),
+                    "aux-session".into(),
+                    kind.into(),
+                    None,
+                    true,
+                )
+                .unwrap();
+            assert!(snapshot(&registry, &main, true).is_err());
+            assert!(registry
+                .operation_settlement_integrity_diagnostic(false)
+                .0
+                .is_ok());
+            assert!(registry.state.lock().unwrap().protected_read.is_none());
+            registry.configured("aux").unwrap();
+            registry
+                .resume_permit("aux")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            custody.finish(false).unwrap();
+            let (proof, guard) = snapshot(&registry, &main, true).unwrap();
+            assert_eq!(proof.targets.len(), 1);
+            let aux = registry.owned_target("aux").unwrap();
+            assert!(registry
+                .state
+                .lock()
+                .unwrap()
+                .live_resume_excluded(&aux.tenure));
+            assert!(registry.protected_read_barrier().is_err());
+            drop(guard);
+            assert!(registry.inventory().is_ok());
+        }
+    }
+    #[tokio::test]
+    async fn selected_query_auxiliary_plain_or_unverified_ancestry_never_upgrades() {
+        for (kind, enrolled) in [
+            ("browser_ui", false),
+            ("browser_ui", true),
+            ("webview", true),
+            ("background_page", true),
+            ("future_unknown", true),
+        ] {
+            let (registry, main) = fixture().await;
+            if enrolled {
+                registry
+                    .attached_enrolled_with_ancestry(
+                        "ctx",
+                        "aux".into(),
+                        "aux-session".into(),
+                        kind.into(),
+                        None,
+                        kind != "browser_ui",
+                    )
+                    .unwrap();
+            } else {
+                registry
+                    .attached("ctx", "aux".into(), "aux-session".into(), kind.into())
+                    .unwrap();
+            }
+            registry.configured("aux").unwrap();
+            registry
+                .resume_permit("aux")
+                .await
+                .unwrap()
+                .complete()
+                .unwrap();
+            assert!(
+                snapshot(&registry, &main, false).is_err(),
+                "{kind}/{enrolled}"
+            );
+            assert!(matches!(
+                &registry.owned_target("aux").unwrap().tenure.lineage,
+                AttachmentLineage::Unknown
+            ));
+        }
+    }
+    #[tokio::test]
+    async fn selected_query_transient_auxiliary_invalidates_old_proof_without_frame_event() {
+        let (registry, main) = fixture().await;
+        let (proof, _) = snapshot(&registry, &main, false).unwrap();
+        registry
+            .attached_enrolled_with_ancestry(
+                "ctx",
+                "aux".into(),
+                "aux-session".into(),
+                "browser_ui".into(),
+                None,
+                true,
+            )
+            .unwrap();
+        registry.detach("aux").unwrap();
+        assert!(registry
+            .with_selected_page_targets(
+                &main,
+                Some(&proof),
+                None,
+                false,
+                |target, _| Ok(target.target_id == "main"),
+                |_| Ok(())
+            )
+            .is_err());
+        assert!(snapshot(&registry, &main, false).is_ok());
     }
     #[tokio::test]
     async fn selected_query_retains_unrelated_initializer_without_ready_or_global_capture() {

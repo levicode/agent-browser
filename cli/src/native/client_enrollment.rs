@@ -3709,22 +3709,26 @@ impl ClientEnrollment {
         } else {
             None
         };
+        let rootless_auxiliary =
+            parent.is_none() && root == session && matches!(kind, "browser" | "tab" | "browser_ui");
         if let Some(custody) = custody {
-            custody.attach_with_root(
+            custody.attach_with_ancestry(
                 &self.targets,
                 context,
                 target.into(),
                 session.into(),
                 kind.into(),
                 root_ticket,
+                rootless_auxiliary,
             )?;
         } else {
-            self.targets.attached_enrolled(
+            self.targets.attached_enrolled_with_ancestry(
                 context,
                 target.into(),
                 session.into(),
                 kind.into(),
                 root_ticket.as_ref(),
+                rootless_auxiliary,
             )?;
         }
         let entry = Attribution {
