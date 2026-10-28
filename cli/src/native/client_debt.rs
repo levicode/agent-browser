@@ -19,6 +19,33 @@ pub(crate) struct OperationKey {
     pub generation: u64,
     pub operation_seq: u64,
 }
+/// Private evidence from the exact operation admission branch; never from
+/// owner, group, integrity, or generic command failures. No authority grant.
+pub(crate) struct ApplicationAdmissionStop {
+    journal: OperationJournalHandle,
+    deadline: Instant,
+    cancellation: tokio::sync::watch::Receiver<CancelSignal>,
+    error: ProtocolError,
+}
+#[derive(Default)]
+pub(crate) struct AdmissionObservation {
+    requested: bool,
+    stop: Option<ApplicationAdmissionStop>,
+}
+impl AdmissionObservation {
+    pub(crate) fn requested() -> Self { Self { requested: true, stop: None } }
+    pub(crate) fn take(&mut self) -> Option<ApplicationAdmissionStop> { self.stop.take() }
+}
+impl ApplicationAdmissionStop {
+    pub(crate) fn for_operation(self, operation: &OperationLease) -> Option<ProtocolError> {
+        (self.journal.key().generation == operation.generation
+            && self.journal.key().operation_seq == operation.sequence
+            && self.deadline == operation.deadline
+            && self.cancellation.same_channel(&operation.cancellation)
+            && current_operation().is_some_and(|journal| journal.same_operation(&self.journal)))
+            .then_some(self.error)
+    }
+}
 /// One native evaluate window, not an operation owner or a causal-parent claim.
 #[derive(Clone)]
 pub(crate) struct EvalWindowHandle {
@@ -594,19 +621,28 @@ impl OperationJournalHandle {
         CURRENT_OPERATION.scope(self.clone(), future).await
     }
     pub(crate) fn check_application_submission(&self) -> Result<(), ProtocolError> {
+        self.check_application_submission_observed(&mut AdmissionObservation::default())
+    }
+    fn check_application_submission_observed(&self, stop: &mut AdmissionObservation) -> Result<(), ProtocolError> {
         let state = self
             .journal
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state
-            .admission
-            .as_ref()
-            .is_some_and(|(deadline, cancellation)| {
-                Instant::now() >= *deadline || *cancellation.borrow() != CancelSignal::None
-            })
-        {
-            return Err(ProtocolError::Cancelled);
+        if let Some((deadline, cancellation)) = &state.admission {
+            let signal = *cancellation.borrow();
+            if Instant::now() >= *deadline || signal != CancelSignal::None {
+                if stop.requested {
+                    stop.stop = Some(ApplicationAdmissionStop {
+                        journal: self.clone(),
+                        deadline: *deadline,
+                        cancellation: cancellation.clone(),
+                        error: signal.error().unwrap_or(ProtocolError::DeadlineExceeded),
+                    });
+                }
+                // Preserve the legacy caller's exact original protocol result.
+                return Err(ProtocolError::Cancelled);
+            }
         }
         if state.integrity_lost || state.submission_revoked || state.local_producers_finished {
             Err(ProtocolError::Cancelled)
@@ -625,19 +661,28 @@ impl OperationJournalHandle {
         }
     }
     pub(crate) fn mark_mutation_maybe_submitted(&self) -> Result<(), ProtocolError> {
+        self.mark_mutation_maybe_submitted_observed(&mut AdmissionObservation::default())
+    }
+    fn mark_mutation_maybe_submitted_observed(&self, stop: &mut AdmissionObservation) -> Result<(), ProtocolError> {
         let mut state = self
             .journal
             .state
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        if state
-            .admission
-            .as_ref()
-            .is_some_and(|(deadline, cancellation)| {
-                Instant::now() >= *deadline || *cancellation.borrow() != CancelSignal::None
-            })
-        {
-            return Err(ProtocolError::Cancelled);
+        if let Some((deadline, cancellation)) = &state.admission {
+            let signal = *cancellation.borrow();
+            if Instant::now() >= *deadline || signal != CancelSignal::None {
+                if stop.requested {
+                    stop.stop = Some(ApplicationAdmissionStop {
+                        journal: self.clone(),
+                        deadline: *deadline,
+                        cancellation: cancellation.clone(),
+                        error: signal.error().unwrap_or(ProtocolError::DeadlineExceeded),
+                    });
+                }
+                // Preserve the legacy caller's exact original protocol result.
+                return Err(ProtocolError::Cancelled);
+            }
         }
         if state.integrity_lost || state.submission_revoked || state.local_producers_finished {
             return Err(ProtocolError::Cancelled);
@@ -2361,14 +2406,24 @@ impl OwnerDebtLedger {
         params: Option<&Value>,
         session: Option<&str>,
     ) -> Result<CommandReservation, ProtocolError> {
-        self.reserve_command_inner(journal, method, params, session, None, None)
+        self.reserve_command_observed(journal, method, params, session, &mut AdmissionObservation::default())
+    }
+    pub(crate) fn reserve_command_observed(
+        self: &Arc<Self>,
+        journal: Option<&OperationJournalHandle>,
+        method: &str,
+        params: Option<&Value>,
+        session: Option<&str>,
+        stop: &mut AdmissionObservation,
+    ) -> Result<CommandReservation, ProtocolError> {
+        self.reserve_command_inner(journal, method, params, session, None, None, stop)
     }
     pub(crate) fn reserve_owner_cleanup(
         self: &Arc<Self>,
         command: OwnerCleanupCommand,
     ) -> Result<CommandReservation, ProtocolError> {
         let (method, params) = command.envelope();
-        self.reserve_command_inner(None, method, params.as_ref(), None, Some(command), None)
+        self.reserve_command_inner(None, method, params.as_ref(), None, Some(command), None, &mut AdmissionObservation::default())
     }
     pub(super) fn reserve_scope_cleanup(
         self: &Arc<Self>,
@@ -2377,7 +2432,7 @@ impl OwnerDebtLedger {
         session: Option<&str>,
         deadline: Instant,
     ) -> Result<CommandReservation, ProtocolError> {
-        self.reserve_command_inner(None, method, Some(params), session, None, Some(deadline))
+        self.reserve_command_inner(None, method, Some(params), session, None, Some(deadline), &mut AdmissionObservation::default())
     }
     fn reserve_command_inner(
         self: &Arc<Self>,
@@ -2387,6 +2442,7 @@ impl OwnerDebtLedger {
         session: Option<&str>,
         owner_cleanup: Option<OwnerCleanupCommand>,
         teardown_deadline: Option<Instant>,
+        stop: &mut AdmissionObservation,
     ) -> Result<CommandReservation, ProtocolError> {
         if method.len() > 256 || session.is_some_and(|session| session.len() > 4096) {
             return Err(ProtocolError::CapacityExceeded);
@@ -2460,7 +2516,7 @@ impl OwnerDebtLedger {
         }
         if classification.category.application() {
             if let Some(journal) = journal {
-                journal.check_application_submission()?;
+                journal.check_application_submission_observed(stop)?;
             }
         }
         let release_object = if method == "Runtime.releaseObject" {
@@ -3452,7 +3508,10 @@ impl CommandReservation {
     }
     /// Called with websocket ownership immediately before the send future can
     /// accept bytes. Failed/maybe sends remain reader-owned debt, not rollback.
-    pub(crate) fn submit(mut self) -> Result<SubmittedCommand, ProtocolError> {
+    pub(crate) fn submit(self) -> Result<SubmittedCommand, ProtocolError> {
+        self.submit_observed(&mut AdmissionObservation::default())
+    }
+    pub(crate) fn submit_observed(mut self, stop: &mut AdmissionObservation) -> Result<SubmittedCommand, ProtocolError> {
         let mut state = self
             .ledger
             .state
@@ -3514,9 +3573,9 @@ impl CommandReservation {
         if command.category.application() {
             if let Some(journal) = &self.journal {
                 if command.mutation {
-                    journal.mark_mutation_maybe_submitted()?;
+                    journal.mark_mutation_maybe_submitted_observed(stop)?;
                 } else {
-                    journal.check_application_submission()?;
+                    journal.check_application_submission_observed(stop)?;
                 }
             }
         }
@@ -4906,6 +4965,56 @@ pub(crate) mod tests {
             }),
         )
         .await
+    }
+    #[tokio::test]
+    async fn admission_stop_receipt_is_exact_and_not_minted_from_revocation() {
+        let (_ledger, journal) = owner();
+        let (cancel, mut operation) = admission_operation(5_000);
+        operation.sequence = journal.key().operation_seq;
+        journal.bind_operation(&operation).unwrap();
+        let mut observed = AdmissionObservation::requested();
+        assert_eq!(journal.check_application_submission_observed(&mut observed), Ok(()));
+        assert!(observed.take().is_none());
+        journal.revoke_application_submission();
+        assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
+        assert!(observed.take().is_none(), "revocation is not an observed operation stop");
+        cancel.send_replace(CancelSignal::Requested);
+        assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
+        let receipt = observed.take().expect("actual bound cancellation must carry a receipt");
+        assert_eq!(journal.scope(async { receipt.for_operation(&operation) }).await, Some(ProtocolError::Cancelled));
+        assert!(observed.take().is_none());
+        for mismatch in ["sequence", "deadline", "channel", "owner"] {
+            assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
+            let receipt = observed.take().unwrap();
+            let (_other_cancel, other_channel) = tokio::sync::watch::channel(CancelSignal::Requested);
+            let other = OperationLease {
+                is_callback: false, generation: operation.generation,
+                sequence: operation.sequence + u64::from(mismatch == "sequence"),
+                deadline: operation.deadline + if mismatch == "deadline" { std::time::Duration::from_millis(1) } else { std::time::Duration::ZERO },
+                cancellation: if mismatch == "channel" { other_channel } else { operation.cancellation.clone() },
+            };
+            let (_other_ledger, other_journal) = owner();
+            let context = if mismatch == "owner" { &other_journal } else { &journal };
+            assert!(context.scope(async { receipt.for_operation(&other) }).await.is_none(), "{mismatch}");
+        }
+        assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
+        let receipt = observed.take().unwrap();
+        assert!(receipt.for_operation(&operation).is_none(), "no ambient task may borrow a journal receipt");
+        let mut ignored = AdmissionObservation::default();
+        assert_eq!(journal.check_application_submission_observed(&mut ignored), Err(ProtocolError::Cancelled));
+        assert!(ignored.take().is_none(), "legacy callers do not request receipts");
+    }
+    #[tokio::test]
+    async fn admission_stop_expired_original_deadline_keeps_legacy_error_and_typed_cause() {
+        let (_ledger, journal) = owner();
+        let (_cancel, mut operation) = admission_operation(0);
+        operation.sequence = journal.key().operation_seq;
+        journal.bind_operation(&operation).unwrap();
+        let mut observed = AdmissionObservation::requested();
+        assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
+        let receipt = observed.take().unwrap();
+        assert_eq!(journal.scope(async { receipt.for_operation(&operation) }).await, Some(ProtocolError::DeadlineExceeded));
+        assert_eq!(journal.check_application_submission(), Err(ProtocolError::Cancelled));
     }
     fn admission_operation(
         timeout_ms: u64,

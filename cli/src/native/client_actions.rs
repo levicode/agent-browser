@@ -445,17 +445,43 @@ impl ActionContext<'_> {
         let command = client_debt::command_scope(
             category,
             mutation,
-            self.page
-                .client
-                .send_command(method, Some(args), Some(session)),
+            async {
+                #[cfg(test)]
+                tests::replacement_boundary_hook(self, "command-before-admission");
+                self.page.client.send_action_command(method, Some(args), Some(session)).await
+            },
         );
         let mut cancel = self.operation.cancellation.clone();
         tokio::select! {
             value = command => {
+                #[cfg(test)]
+                if let Err(error) = &value {
+                    tests::command_error_boundary_hook(self, error.as_str());
+                }
+                #[cfg(test)]
+                if value.is_ok() { tests::replacement_boundary_hook(self, "command-success-observed"); }
                 // Transfer actual resource replies to their exact owning helper
                 // before a cancellation check can discard cleanup authority.
                 if !super::client_observation::produces_remote_objects(method) { self.check()?; }
-                value.map_err(|_| ProtocolError::BrowserFailure)
+                #[cfg(test)]
+                if self.page.identity_scope == "preparation-readonly-aux-held" {
+                    if let Err(error) = &value {
+                        let category = match error.as_str() {
+                            "Native CDP command admission refused" => "admission-refused",
+                            "Native CDP command admission revoked" => "admission-revoked",
+                            "Native CDP owner changed" | "Native CDP reservation owner changed" => "owner-changed",
+                            _ => "other-opaque",
+                        };
+                        eprintln!(
+                            "native-readonly-aux-command-error category={} object_producing={} deadline_elapsed={} cancellation_observed={}",
+                            category,
+                            super::client_observation::produces_remote_objects(method),
+                            Instant::now() >= self.operation.deadline,
+                            *self.operation.cancellation.borrow() != CancelSignal::None,
+                        );
+                    }
+                }
+                value.map_err(|failure| failure.into_protocol(self.operation))
             },
             _ = cancel.changed() => Err(ProtocolError::Cancelled),
             _ = tokio::time::sleep_until(self.operation.deadline.into()) => Err(ProtocolError::DeadlineExceeded),
@@ -1270,6 +1296,23 @@ impl ClientActions {
         }
         #[cfg(test)]
         tests::emit_preparation_mismatch(&ctx, &d, &result);
+        #[cfg(test)]
+        if ctx.page.identity_scope == "preparation-readonly-aux-held" {
+            if let Err(error) = &result {
+                eprintln!(
+                    "native-readonly-aux-action-error error={:?} enabled={} refusal={} stopped={} disqualified={} mutation_sent={} cleanup_failed={} deadline_elapsed={} cancellation_observed={}",
+                    error,
+                    d.readonly_preparation_enabled.load(Ordering::SeqCst),
+                    d.readonly_preparation_refusal.load(Ordering::SeqCst),
+                    d.readonly_preparation_stopped.load(Ordering::SeqCst),
+                    d.readonly_preparation_disqualified.load(Ordering::SeqCst),
+                    d.sent.load(Ordering::SeqCst),
+                    d.cleanup.load(Ordering::SeqCst),
+                    Instant::now() >= ctx.operation.deadline,
+                    *ctx.operation.cancellation.borrow() != CancelSignal::None,
+                );
+            }
+        }
         let result = finish_dispatch(&d, result).map_err(|mut failure| {
             if settled_prefix {
                 failure.effects = Effects::Completed;
@@ -5210,6 +5253,7 @@ mod tests {
     type BoundaryKey = (String, u64, u64, String);
     enum ReplacementHook {
         Run(Box<dyn FnOnce() + Send>),
+        CommandError(Box<dyn FnOnce(&str) + Send>),
         Preparation(Option<PreparationClassificationHook>),
     }
     fn replacement_hooks() -> &'static Mutex<HashMap<BoundaryKey, ReplacementHook>> {
@@ -5234,6 +5278,25 @@ mod tests {
                 .is_none());
             Self(binding)
         }
+    }
+    impl ReplacementBoundary {
+        fn install_command_error(
+            scope: &str,
+            generation: u64,
+            sequence: u64,
+            run: impl FnOnce(&str) + Send + 'static,
+        ) -> Self {
+            let binding = (scope.to_owned(), generation, sequence, "command-error-observed".to_owned());
+            assert!(replacement_hooks().lock().unwrap()
+                .insert(binding.clone(), ReplacementHook::CommandError(Box::new(run))).is_none());
+            Self(binding)
+        }
+    }
+    pub(super) fn command_error_boundary_hook(ctx: &ActionContext<'_>, error: &str) {
+        let binding = (ctx.page.identity_scope.clone(), ctx.operation.generation,
+            ctx.operation.sequence, "command-error-observed".to_owned());
+        let hook = replacement_hooks().lock().unwrap().remove(&binding);
+        if let Some(ReplacementHook::CommandError(run)) = hook { run(error); }
     }
     impl Drop for ReplacementBoundary {
         fn drop(&mut self) {
@@ -6168,6 +6231,10 @@ mod tests {
                             } else {
                                 json!({"result":{"value":{"checked":false,"radio":false}}})
                             }
+                        } else if mode == "preparation-readonly-command-success-object"
+                            && source == "function(){return 'owned-success-control';}"
+                        {
+                            json!({"result":{"objectId":"owned-success-object","value":true}})
                         } else if source == PREPARE_FILL {
                             json!({"result":{"value":{"complete":false}}})
                         } else {
@@ -6177,7 +6244,12 @@ mod tests {
                     "Runtime.evaluate" => json!({"result":{"value":true}}),
                     _ => json!({}),
                 };
-                let mut reply = if mode == "recording-first-start-error-ack"
+                let mut reply = if mode == "preparation-readonly-command-hard-error"
+                    && method == "Runtime.callFunctionOn"
+                    && source == "function(){return 'command-projection-control';}"
+                {
+                    json!({"id":request["id"],"error":{"code":-32000,"message":"synthetic command projection failure"}})
+                } else if mode == "recording-first-start-error-ack"
                     && method == "Page.getLayoutMetrics"
                     && layout_metrics_reads > 1
                 {
@@ -11335,6 +11407,149 @@ mod tests {
         );
     }
 
+    // Candidate contract; original characterization packet remains frozen separately.
+    // This controls a separate boundary defect; it does not identify the earlier
+    // unobserved full-suite failure and does not replace its regression.
+    async fn assert_object_command_projection_control(hard_error_first: bool) {
+        use super::super::client_session::ClientSession;
+        let mode = if hard_error_first {
+            "preparation-readonly-command-hard-error"
+        } else {
+            "preparation-readonly-command-admission-cancel"
+        };
+        let broker = Arc::new(ClientSession::new());
+        let mut f = fixture_scoped_with_action_broker(mode, mode, Some(broker.clone())).await;
+        let ledger = client_debt::OwnerDebtLedger::new(1, mode.into());
+        ledger.bind_context("context").unwrap();
+        f.page.client.install_debt_ledger(ledger.clone()).unwrap();
+        let transport_owner = f.page.client.clone();
+        f.page.client = f.page.client.owner_view(ledger.clone()).unwrap();
+        let (owner, state, _notices) = preparation_settlement_owner(&f, broker.clone()).await;
+        f.op = broker.admit(1, 1, 1_000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let journal = ledger.operation(client_debt::OperationKey {
+            generation: 1, operation_seq: 1,
+        }, "target".into(), "page".into()).unwrap();
+        journal.bind_operation(&f.op).unwrap();
+        f.log.lock().unwrap().clear();
+        f.replies.lock().unwrap().clear();
+        let gate_seen = Arc::new(AtomicBool::new(false));
+        let error_seen = Arc::new(AtomicBool::new(false));
+        let gate_flag = gate_seen.clone();
+        let gate_broker = broker.clone();
+        let gate_journal = journal.clone();
+        let gate_cancel = f.op.cancellation.clone();
+        let _before = ReplacementBoundary::install(mode, 1, 1, "command-before-admission", move || {
+            assert_eq!(*gate_cancel.borrow(), CancelSignal::None);
+            assert_eq!(gate_journal.check_application_submission(), Ok(()));
+            gate_flag.store(true, Ordering::SeqCst);
+            if !hard_error_first {
+                gate_broker.cancel(1, 1).unwrap();
+                assert_eq!(gate_journal.check_application_submission(), Err(ProtocolError::Cancelled));
+            }
+        });
+        let error_flag = error_seen.clone();
+        let error_broker = broker.clone();
+        let error_cancel = f.op.cancellation.clone();
+        let _error = ReplacementBoundary::install_command_error(mode, 1, 1, move |error| {
+            if hard_error_first {
+                // Real CDP ErrorAck has already become an Err in send_command;
+                // only NOW request cancellation. Never synthesize that error.
+                assert!(error.starts_with("CDP error (Runtime.callFunctionOn):"));
+                assert!(error.contains("synthetic command projection failure"));
+                assert_eq!(*error_cancel.borrow(), CancelSignal::None);
+                error_broker.cancel(1, 1).unwrap();
+            } else {
+                assert_eq!(error, "Native CDP command admission refused");
+                assert_eq!(*error_cancel.borrow(), CancelSignal::Requested);
+            }
+            error_flag.store(true, Ordering::SeqCst);
+        });
+        let ctx = ActionContext {
+            realm_authority: ActionRealmAuthority::Enrolled(&owner),
+            page_state: &state,
+            ..f.context()
+        };
+        let d = Dispatch::default();
+        let result = journal.scope(ctx.command(&d, false, "page", "Runtime.callFunctionOn",
+            json!({"objectId":"exact-node","functionDeclaration":"function(){return 'command-projection-control';}",
+                "returnByValue":true,"awaitPromise":true}))).await;
+        assert!(gate_seen.load(Ordering::SeqCst));
+        assert!(error_seen.load(Ordering::SeqCst));
+        assert_eq!(result, Err(if hard_error_first { ProtocolError::BrowserFailure } else { ProtocolError::Cancelled }));
+        assert_eq!(*f.op.cancellation.borrow(), CancelSignal::Requested);
+        let requests = f.log.lock().unwrap().clone();
+        let calls: Vec<_> = requests.iter().filter(|r| r["method"] == "Runtime.callFunctionOn"
+            && r["params"]["functionDeclaration"] == "function(){return 'command-projection-control';}").collect();
+        assert_eq!(calls.len(), usize::from(hard_error_first));
+        assert!(!d.sent.load(Ordering::SeqCst));
+        assert!(!journal.snapshot().mutation_dispatched);
+        assert!(!journal.snapshot().integrity_lost);
+        owner.close().await.unwrap();
+        transport_owner.close().await;
+        f.server.abort();
+    }
+    #[tokio::test]
+    async fn object_command_cancelled_admission_preserves_typed_cancellation() {
+        assert_object_command_projection_control(false).await;
+    }
+    #[tokio::test]
+    async fn object_command_real_hard_error_precedes_later_cancel() {
+        assert_object_command_projection_control(true).await;
+    }
+
+    #[tokio::test]
+    async fn object_command_success_reply_transfers_object_before_later_cancel() {
+        use super::super::client_session::ClientSession;
+        let mode = "preparation-readonly-command-success-object";
+        let broker = Arc::new(ClientSession::new());
+        let mut f = fixture_scoped_with_action_broker(mode, mode, Some(broker.clone())).await;
+        let ledger = client_debt::OwnerDebtLedger::new(1, mode.into());
+        ledger.bind_context("context").unwrap();
+        f.page.client.install_debt_ledger(ledger.clone()).unwrap();
+        let transport_owner = f.page.client.clone();
+        f.page.client = f.page.client.owner_view(ledger.clone()).unwrap();
+        let (owner, state, _notices) = preparation_settlement_owner(&f, broker.clone()).await;
+        f.op = broker.admit(1, 1, 1_000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let journal = ledger.operation(client_debt::OperationKey {
+            generation: 1, operation_seq: 1,
+        }, "target".into(), "page".into()).unwrap();
+        journal.bind_operation(&f.op).unwrap();
+        f.log.lock().unwrap().clear();
+        f.replies.lock().unwrap().clear();
+        let seen = Arc::new(AtomicBool::new(false));
+        let hook_seen = seen.clone();
+        let hook_broker = broker.clone();
+        let hook_cancel = f.op.cancellation.clone();
+        let _hook = ReplacementBoundary::install(mode, 1, 1, "command-success-observed", move || {
+            assert_eq!(*hook_cancel.borrow(), CancelSignal::None);
+            hook_broker.cancel(1, 1).unwrap();
+            hook_seen.store(true, Ordering::SeqCst);
+        });
+        let ctx = ActionContext { realm_authority: ActionRealmAuthority::Enrolled(&owner),
+            page_state: &state, ..f.context() };
+        let d = Dispatch::default();
+        journal.scope(async {
+            let reply = ctx.command(&d, false, "page", "Runtime.callFunctionOn",
+                json!({"objectId":"exact-node","functionDeclaration":"function(){return 'owned-success-control';}",
+                    "returnByValue":true,"awaitPromise":true})).await.unwrap();
+            assert!(seen.load(Ordering::SeqCst));
+            assert_eq!(*f.op.cancellation.borrow(), CancelSignal::Requested);
+            assert_eq!(reply["result"]["objectId"], "owned-success-object");
+            assert_eq!(journal.snapshot().object_debt, 1);
+            release_call_handles(&ctx, &d, "page", &reply, None).await.unwrap();
+            assert_eq!(journal.snapshot().object_debt, 0);
+            assert!(!journal.snapshot().integrity_lost);
+        }).await;
+        assert_eq!(f.log.lock().unwrap().iter().filter(|r| r["method"] == "Runtime.releaseObject"
+            && r["params"]["objectId"] == "owned-success-object").count(), 1);
+        assert!(!d.sent.load(Ordering::SeqCst));
+        owner.close().await.unwrap();
+        transport_owner.close().await;
+        f.server.abort();
+    }
+
     async fn assert_readonly_swipe_settlement(mode: &'static str) {
         use super::super::{
             client_protocol::ScopeState, client_session::ClientSession,
@@ -11560,10 +11775,17 @@ mod tests {
                 } else {
                     // The original deadline can be observed by pause's timer or
                     // the journal submission fence, which reports Cancelled.
-                    assert!(matches!(
-                        delivered.result,
-                        Err(ProtocolError::DeadlineExceeded | ProtocolError::Cancelled)
-                    ));
+                    assert!(
+                        matches!(
+                            delivered.result,
+                            Err(ProtocolError::DeadlineExceeded | ProtocolError::Cancelled)
+                        ),
+                        "readonly auxiliary settlement: delivered_error={:?}, before_deadline={}, object_debt={}, effects={:?}",
+                        delivered.result.as_ref().err(),
+                        before_deadline.load(Ordering::SeqCst),
+                        debt.object_debt,
+                        delivered.effects,
+                    );
                     assert!(!before_deadline.load(Ordering::SeqCst));
                     let auxiliary_releases: Vec<_> = requests
                         .iter()

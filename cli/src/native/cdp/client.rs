@@ -18,12 +18,27 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 
 use super::super::client_debt::{
-    current_operation, CommandReservation, CommandStatus, CommandStatusHandle, OwnerCleanupCommand,
+    current_operation, AdmissionObservation, ApplicationAdmissionStop, CommandReservation, CommandStatus, CommandStatusHandle, OwnerCleanupCommand,
     OwnerDebtLedger, ReservedDisposal, SubmittedCommand, WorkerStartupProof,
     WorkerStartupStatusProvenance,
 };
 use super::super::client_protocol::ProtocolError;
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
+
+/// Action-only error projection. Opaque errors are never inferred from a later
+/// cancellation, and successful object replies bypass this failure envelope.
+pub(crate) struct ActionCommandFailure {
+    #[cfg(test)]
+    message: String,
+    stop: Option<ApplicationAdmissionStop>,
+}
+impl ActionCommandFailure {
+    pub(crate) fn into_protocol(self, operation: &super::super::client_session::OperationLease) -> ProtocolError {
+        self.stop.and_then(|stop| stop.for_operation(operation)).unwrap_or(ProtocolError::BrowserFailure)
+    }
+    #[cfg(test)]
+    pub(crate) fn as_str(&self) -> &str { &self.message }
+}
 
 type TrackedResponses = Arc<std::sync::Mutex<HashMap<u64, SubmittedCommand>>>;
 type DebtOwner = Arc<std::sync::Mutex<Option<Arc<OwnerDebtLedger>>>>;
@@ -1447,6 +1462,15 @@ impl CdpClient {
         params: Option<&Value>,
         session: Option<&str>,
     ) -> Result<Option<CommandReservation>, String> {
+        self.reserve_tracked_command_observed(method, params, session, &mut AdmissionObservation::default())
+    }
+    fn reserve_tracked_command_observed(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        session: Option<&str>,
+        stop: &mut AdmissionObservation,
+    ) -> Result<Option<CommandReservation>, String> {
         let Some(ledger) = self.debt_ledger() else {
             return Ok(None);
         };
@@ -1458,7 +1482,7 @@ impl CdpClient {
         if self.owner.is_none() && journal.is_none() {
             return Err("Native CDP requires an owner-bound view".into());
         }
-        let reserved = ledger.reserve_command(journal.as_ref(), method, params, session);
+        let reserved = ledger.reserve_command_observed(journal.as_ref(), method, params, session, stop);
         #[cfg(test)]
         if let Err(error) = &reserved {
             self.activation_diagnostic(
@@ -1485,6 +1509,14 @@ impl CdpClient {
         id: u64,
         reservation: Option<CommandReservation>,
     ) -> Result<(), String> {
+        self.track_submission_observed(id, reservation, &mut AdmissionObservation::default())
+    }
+    fn track_submission_observed(
+        &self,
+        id: u64,
+        reservation: Option<CommandReservation>,
+        stop: &mut AdmissionObservation,
+    ) -> Result<(), String> {
         let current = self
             .transport
             .debt_owner
@@ -1501,7 +1533,7 @@ impl CdpClient {
             _ => return Err("Native CDP reservation owner changed".into()),
         }
         if let Some(reservation) = reservation {
-            let submitted = reservation.submit();
+            let submitted = reservation.submit_observed(stop);
             #[cfg(test)]
             if let Err(error) = &submitted {
                 self.activation_diagnostic(
@@ -1528,7 +1560,28 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        let reservation = self.reserve_tracked_command(method, params.as_ref(), session_id);
+        self.send_command_observed(method, params, session_id, &mut AdmissionObservation::default()).await
+    }
+    pub(crate) async fn send_action_command(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+    ) -> Result<Value, ActionCommandFailure> {
+        let mut stop = AdmissionObservation::requested();
+        self.send_command_observed(method, params, session_id, &mut stop)
+            .await
+            .map_err(|_message| ActionCommandFailure { #[cfg(test)] message: _message, stop: stop.take() })
+    }
+
+    async fn send_command_observed(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        stop: &mut AdmissionObservation,
+    ) -> Result<Value, String> {
+        let reservation = self.reserve_tracked_command_observed(method, params.as_ref(), session_id, stop);
         #[cfg(test)]
         self.activation_command_diagnostic(
             "cdp-reserve",
@@ -1536,7 +1589,7 @@ impl CdpClient {
             reservation.as_ref().map(|_| ()).map_err(String::as_str),
         );
         let result = self
-            .send_reserved_command(method, params, session_id, reservation?)
+            .send_reserved_command_observed(method, params, session_id, reservation?, stop)
             .await;
         #[cfg(test)]
         self.activation_command_diagnostic(
@@ -2097,6 +2150,16 @@ impl CdpClient {
         session_id: Option<&str>,
         reservation: Option<CommandReservation>,
     ) -> Result<Value, String> {
+        self.send_reserved_command_observed(method, params, session_id, reservation, &mut AdmissionObservation::default()).await
+    }
+    async fn send_reserved_command_observed(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        reservation: Option<CommandReservation>,
+        stop: &mut AdmissionObservation,
+    ) -> Result<Value, String> {
         if reservation
             .as_ref()
             .is_some_and(CommandReservation::is_owner_cleanup)
@@ -2113,7 +2176,7 @@ impl CdpClient {
             .and_then(CommandReservation::initialization_budget);
         within_initialization(
             budget,
-            self.send_reserved_command_bound(method, params, session_id, reservation, None),
+            self.send_reserved_command_bound_observed(method, params, session_id, reservation, None, stop),
         )
         .await
     }
@@ -2169,8 +2232,19 @@ impl CdpClient {
         reservation: Option<CommandReservation>,
         cleanup_owner: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
     ) -> Result<Value, String> {
+        self.send_reserved_command_bound_observed(method, params, session_id, reservation, cleanup_owner, &mut AdmissionObservation::default()).await
+    }
+    async fn send_reserved_command_bound_observed(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        reservation: Option<CommandReservation>,
+        cleanup_owner: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
+        stop: &mut AdmissionObservation,
+    ) -> Result<Value, String> {
         let response = self
-            .submit_reserved_command_bound(method, params, session_id, reservation, cleanup_owner)
+            .submit_reserved_command_bound_observed(method, params, session_id, reservation, cleanup_owner, stop)
             .await?;
         self.await_command_response(method, response, None).await
     }
@@ -2182,6 +2256,17 @@ impl CdpClient {
         session_id: Option<&str>,
         reservation: Option<CommandReservation>,
         owner_deadline: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
+    ) -> Result<CommandResponse, String> {
+        self.submit_reserved_command_bound_observed(method, params, session_id, reservation, owner_deadline, &mut AdmissionObservation::default()).await
+    }
+    async fn submit_reserved_command_bound_observed(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        reservation: Option<CommandReservation>,
+        owner_deadline: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
+        stop: &mut AdmissionObservation,
     ) -> Result<CommandResponse, String> {
         let id = self.next_command_id()?;
 
@@ -2215,7 +2300,7 @@ impl CdpClient {
                     return Err("Native cleanup deadline expired".into());
                 }
             }
-            self.track_submission(id, reservation)?;
+            self.track_submission_observed(id, reservation, stop)?;
             pending.insert(
                 id,
                 PendingResponse {
@@ -2799,6 +2884,58 @@ mod owner_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn action_typed_submit_refusal_after_writer_wait_keeps_exact_cause_and_zero_wire() {
+        use crate::native::client_debt::{command_scope, CommandCategory, OperationKey};
+        use crate::native::client_session::ClientSession;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                assert!(!message.is_text(), "refused submit must not send command bytes");
+                if message.is_close() { break; }
+            }
+        });
+        let client = CdpClient::connect(&endpoint).await.unwrap();
+        let ledger = OwnerDebtLedger::new(1, "typed-submit-owner".into());
+        client.install_debt_ledger(ledger.clone()).unwrap();
+        let view = client.owner_view(ledger.clone()).unwrap();
+        let broker = ClientSession::new();
+        let operation = broker.admit(1, 1, 1_000).unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let journal = ledger.operation(OperationKey { generation: 1, operation_seq: 1 },
+            "target".into(), "page".into()).unwrap();
+        journal.bind_operation(&operation).unwrap();
+        let writer = client.transport.ws_tx.lock().await;
+        let mut command = Box::pin(journal.scope(async {
+            let result = command_scope(CommandCategory::ApplicationObject, false,
+                view.send_action_command("Runtime.callFunctionOn",
+                    Some(json!({"objectId":"synthetic","returnByValue":true})), Some("page"))).await;
+            match result {
+                Err(error) => {
+                    assert_eq!(error.as_str(), "Native CDP command admission revoked");
+                    error.into_protocol(&operation)
+                }
+                Ok(_) => panic!("cancelled submit unexpectedly succeeded"),
+            }
+        }));
+        assert!(futures_util::poll!(command.as_mut()).is_pending());
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        broker.cancel(1, 1).unwrap();
+        drop(writer);
+        assert_eq!(command.await, ProtocolError::Cancelled);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(ledger.snapshot().object_debt, 0);
+        assert!(!journal.snapshot().mutation_dispatched);
+        assert!(!journal.snapshot().integrity_lost);
+        assert!(client.transport.pending.lock().await.is_empty());
+        assert!(client.transport.tracked_responses.lock().unwrap().is_empty());
+        client.close().await;
+        peer.await.unwrap();
+    }
+
     #[tokio::test]
     async fn dropped_waiter_keeps_reader_debt_and_late_handle_gets_one_original_session_release() {
         use super::super::super::client_debt::{OperationKey, OwnerDebtLedger};
