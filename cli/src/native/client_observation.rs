@@ -19,6 +19,8 @@ mod author_projection;
 mod frame_policy;
 #[path = "client_observation/fresh_query.rs"]
 mod fresh_query;
+#[path = "client_observation/query_diagnostic.rs"]
+mod query_diagnostic;
 #[path = "client_observation/role_candidates.rs"]
 mod role_candidates;
 pub(crate) use frame_policy::ObservationFramePolicy;
@@ -2902,19 +2904,38 @@ pub(crate) async fn query_fields(
     fields: &[ReadField],
     lease: &OperationLease,
 ) -> Result<Vec<Value>, ObservationError> {
+    let witness = query_diagnostic::QueryReadWitness::new(lease);
+    let result = query_fields_diagnostic_inner(client, frames, options, fields, lease, &witness).await;
+    witness.observe(&result);
+    result
+}
+
+async fn query_fields_diagnostic_inner(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    options: &QueryOptions,
+    fields: &[ReadField],
+    lease: &OperationLease,
+    witness: &query_diagnostic::QueryReadWitness,
+) -> Result<Vec<Value>, ObservationError> {
+    use super::client_settlement_trace::QueryReadStage as Stage;
     validate_read_fields(fields)?;
     validate_expression(&options.expression, 0)?;
     let (path, expression) = split_frame_expression(&options.expression)?;
     let frame = query_frame(client, frames, &path, options, lease, false).await?;
+    witness.stage(Stage::FreshFields);
     if let Some(values) =
         fresh_query::fields(client, frame, &expression, options, fields, lease).await?
     {
+        witness.stage(Stage::FrameFinal);
         validate_frame_ancestry(client, frames, frame, lease).await?;
         validate_frame(client, query_root(frames)?, lease).await?;
+        witness.stage(Stage::LeaseFinal);
         check(lease)?;
         return Ok(values);
     }
-    let evaluated = evaluate_query(client, frame, &expression, options, lease).await?;
+    let evaluated = evaluate_query_diagnostic_inner(client, frame, &expression, options, lease, witness).await?;
+    witness.stage(Stage::Projection);
     if evaluated.matches.len() > super::element::MAX_EXACT_REFERENCES {
         return Err(ObservationError::ResourceLimit);
     }
@@ -2923,8 +2944,10 @@ pub(crate) async fn query_fields(
         check(lease)?;
         values.push(project_fixture_fields(matched.node, fields)?);
     }
+    witness.stage(Stage::FrameFinal);
     validate_frame_ancestry(client, frames, frame, lease).await?;
     validate_frame(client, query_root(frames)?, lease).await?;
+    witness.stage(Stage::LeaseFinal);
     check(lease)?;
     Ok(values)
 }
@@ -3649,8 +3672,27 @@ async fn evaluate_query(
     options: &QueryOptions,
     lease: &OperationLease,
 ) -> Result<QueryEvaluation, ObservationError> {
+    // Only fixture.read-fields owns a receipt; nested/frame helper queries must
+    // not emit another first-failure record for the same operation.
+    let witness = query_diagnostic::QueryReadWitness::disabled(lease);
+    let result = evaluate_query_diagnostic_inner(client, frame, expression, options, lease, &witness).await;
+    witness.observe(&result);
+    result
+}
+
+async fn evaluate_query_diagnostic_inner(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    expression: &LocatorExpression,
+    options: &QueryOptions,
+    lease: &OperationLease,
+    witness: &query_diagnostic::QueryReadWitness,
+) -> Result<QueryEvaluation, ObservationError> {
+    use super::client_settlement_trace::QueryReadStage as Stage;
     let session = &frame.binding.session;
+    witness.stage(Stage::FrameEntry);
     validate_frame(client, frame, lease).await?;
+    witness.stage(Stage::Ax);
     let ax_value = command(
         client,
         session,
@@ -3668,7 +3710,9 @@ async fn evaluate_query(
         .collect();
     // DOM.getDocument includes shadow roots. Query candidates are real elements,
     // including AX-omitted nodes; shared projection applies authored public roles.
+    witness.stage(Stage::Dom);
     let dom = frame_dom(client, frame, lease).await?;
+    witness.stage(Stage::CandidatePlan);
     let candidate_plan = role_candidates::plan(&dom["root"], &ax_value, expression, options)?;
     let ids = match &candidate_plan {
         Some(plan) => plan.ids.clone(),
@@ -3680,6 +3724,7 @@ async fn evaluate_query(
         secure_field_selector: options.secure_field_selector.clone(),
         ..Default::default()
     };
+    witness.stage(Stage::Security);
     let security = match &candidate_plan {
         Some(plan) => {
             security_inventory_for_roots(
@@ -3699,13 +3744,16 @@ async fn evaluate_query(
         .map_err(|_| ObservationError::ResourceLimit)?;
     let result=async {
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
+    witness.stage(Stage::Metadata);
         for chunk in ax_nodes.chunks(64) {
             nodes.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&security).await?);
         }
         for (backend,node) in ids.iter().zip(&mut nodes){apply_security(node,*backend,&security);}
+    witness.stage(Stage::QueryWorld);
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing query realm")?;
         use futures_util::{stream,StreamExt};
+    witness.stage(Stage::QueryResolve);
         let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.iter().copied().map(|backend: i64| {
             let group=&group;
             async move {
@@ -3714,6 +3762,7 @@ async fn evaluate_query(
             }
         })).buffered(16).collect().await;
         let objects=collect_hint_results(objects)?;
+    witness.stage(Stage::QueryMatch);
         let (indices,redacted) = if objects.is_empty() { (Vec::<usize>::new(),Vec::<usize>::new()) } else {
         let mut arguments=vec![json!({"value":compile_selector_expression(expression)?}),json!({"value":query_match_metadata(&nodes)?}),json!({"value":nodes.iter().map(|n|&n.labels).collect::<Vec<_>>()}),json!({"value":nodes.iter().map(|n|&n.safe_public_name).collect::<Vec<_>>()}),json!({"value":options.secure_field_selector}),json!({"value":ids.iter().map(|id|security.ancestors.contains(id)).collect::<Vec<_>>()})];
         arguments.extend(objects.iter().map(|id|json!({"objectId":id})));
@@ -3728,15 +3777,18 @@ async fn evaluate_query(
         if let Some(expected) = &candidate_plan {
             // Reacquire the complete native inventories, not just issued handles:
             // additions and formerly excluded receivers changing role must reject.
+    witness.stage(Stage::CandidateConfirm);
             let current_ax = command(client,session,"Accessibility.getFullAXTree",json!({"frameId":frame.binding.frame}),lease).await?;
             let current_dom = frame_dom(client,frame,lease).await?;
             let current = role_candidates::plan(&current_dom["root"],&current_ax,expression,options)?;
             if current.as_ref() != Some(expected) { return Err(ObservationError::StaleReference); }
+    witness.stage(Stage::SecurityConfirm);
             let current_security = security_inventory_for_roots(client,frame,&metadata_options,lease,&current_dom,expected.roots.0.clone()).await?;
             if !role_candidates::same_security(&security,&current_security,&ids) { return Err(ObservationError::StaleReference); }
             // Public names can use live properties/computed styles not represented
             // by DOM attributes. Reuse the original projection rather than invent
             // accname rules, and require the same complete matching inputs.
+    witness.stage(Stage::MetadataConfirm);
             let mut confirmed = Vec::new();
             for chunk in ax_nodes.chunks(64) {
                 confirmed.extend(read_batch_with_refs(client,frame,&chunk.iter().collect::<Vec<_>>(),None,0,&metadata_options,lease,false,&current_security).await?);
@@ -3744,6 +3796,7 @@ async fn evaluate_query(
             for (backend,node) in ids.iter().zip(&mut confirmed) { apply_security(node,*backend,&current_security); }
             if role_candidates::matching_facts(&nodes) != role_candidates::matching_facts(&confirmed) { return Err(ObservationError::StaleReference); }
         }
+    witness.stage(Stage::Projection);
         for index in redacted { let node=nodes.get_mut(index).ok_or(ObservationError::BackendFailure)?;scrub_ancestor_content(node); }
         let projection_count = indices.len();
         let matches = indices.into_iter().enumerate().map(|(projection_index, i)| {
@@ -3758,9 +3811,13 @@ async fn evaluate_query(
         }).collect();
         Ok(QueryEvaluation { projection_count, matches })
     }.await;
+    witness.observe(&result);
+    witness.stage(Stage::Cleanup);
     let result = settle_object_group(client, session, &group, result, lease).await;
     let nodes = result?;
+    witness.stage(Stage::FrameFinal);
     validate_frame(client, frame, lease).await?;
+    witness.stage(Stage::LeaseFinal);
     check(lease)?;
     Ok(nodes)
 }

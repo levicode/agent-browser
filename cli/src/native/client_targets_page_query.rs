@@ -362,28 +362,34 @@ impl ClientTargets {
             .iter()
             .any(|target| target.same_attachment(selected))
         {
-            return Err(refuse(ProtocolError::StaleScope, Reason::TargetSetChanged));
+            return Err(refuse(ProtocolError::StaleScope, Reason::SelectedTargetMissing));
         }
         let revisions: Vec<_> = targets
             .iter()
             .map(|target| target.tenure.query_revision.load(Ordering::Acquire))
             .collect();
         if let Some(expected) = expected {
-            if dependency_revisions != expected.dependency_revisions
-                || dependencies.len() != expected.dependencies.len()
-                || dependencies
-                    .iter()
-                    .zip(&expected.dependencies)
-                    .any(|(a, b)| !a.same_attachment(b))
-                || revisions != expected.revisions
-                || state.query_unknown_revision != expected.unknown_revision
-                || targets.len() != expected.targets.len()
-                || targets
-                    .iter()
-                    .zip(&expected.targets)
-                    .any(|(a, b)| !a.same_attachment(b))
-            {
-                return Err(refuse(ProtocolError::StaleScope, Reason::TargetSetChanged));
+            // Same short-circuit comparisons, same snapshots and original refusal.
+            // Closed diagnostics distinguish the exact first mismatching dimension.
+            let changed = if dependency_revisions != expected.dependency_revisions {
+                Some(Reason::DependencyRevisionChanged)
+            } else if dependencies.len() != expected.dependencies.len() {
+                Some(Reason::DependencySetChanged)
+            } else if dependencies.iter().zip(&expected.dependencies)
+                .any(|(a, b)| !a.same_attachment(b)) {
+                Some(Reason::DependencyIdentityChanged)
+            } else if revisions != expected.revisions {
+                Some(Reason::TargetRevisionChanged)
+            } else if state.query_unknown_revision != expected.unknown_revision {
+                Some(Reason::UnknownRevisionChanged)
+            } else if targets.len() != expected.targets.len() {
+                Some(Reason::TargetCountChanged)
+            } else if targets.iter().zip(&expected.targets)
+                .any(|(a, b)| !a.same_attachment(b)) {
+                Some(Reason::TargetIdentityChanged)
+            } else { None };
+            if let Some(reason) = changed {
+                return Err(refuse(ProtocolError::StaleScope, reason));
             }
         }
         let snapshot = SelectedPageTargetSnapshot {

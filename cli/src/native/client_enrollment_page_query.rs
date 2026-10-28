@@ -501,7 +501,7 @@ impl PageQueryAuthority {
                             if !target.query_lineage_matches(root) {
                                 return Err(refuse(
                                     ProtocolError::StaleScope,
-                                    Reason::TargetSetChanged,
+                                    Reason::TargetLineageChanged,
                                 ));
                             }
                             Ok(relevant)
@@ -519,7 +519,7 @@ impl PageQueryAuthority {
                             {
                                 return Err(refuse(
                                     ProtocolError::StaleScope,
-                                    Reason::TargetSetChanged,
+                                    Reason::EnrollmentTargetSetChanged,
                                 ));
                             }
                             if *op.cancellation.borrow() != CancelSignal::None {
