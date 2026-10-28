@@ -775,6 +775,8 @@ struct CaptureSnapshot {
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum CaptureTestPoint {
     RestartWaiting,
+    RestartPageResumeWaiting,
+    BeforeInitializationResumeRelease,
     AfterInitialDrain,
     BeforeInfo,
     AfterInfoAck,
@@ -2759,6 +2761,15 @@ impl ClientEnrollment {
             {
                 return Ok(());
             }
+            #[cfg(test)]
+            if let Some(waiting) = self
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .remove(&CaptureTestPoint::RestartPageResumeWaiting)
+            {
+                waiting.entered.add_permits(1);
+            }
             bounded(op, async {
                 changed.await;
                 Ok(())
@@ -3890,7 +3901,15 @@ impl ClientEnrollment {
             .await;
         let error = match result {
             Ok(InitializationOutcome::Initialized) => {
-                return Ok(InitializationOutcome::Initialized)
+                #[cfg(test)]
+                if entry.kind == "page" {
+                    self.pause_initialization_at(
+                        CaptureTestPoint::BeforeInitializationResumeRelease,
+                        op,
+                    )
+                    .await?;
+                }
+                return Ok(InitializationOutcome::Initialized);
             }
             Ok(
                 InitializationOutcome::DetachedChild
@@ -7767,6 +7786,144 @@ mod tests {
             ),
             "actual gate failure borrowed later owner retirement: {failure:?}"
         );
+    }
+
+    async fn restart_waits_for_resume_release_case(mode: &str) {
+        let (owner, _notices, log, emit, server, _broker, connection) =
+            fixture_with_explicit_context_ownership("owner-retirement", true, true).await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        let release = CaptureTestGate::new();
+        owner.capture_test_gates.lock().unwrap().insert(
+            CaptureTestPoint::BeforeInitializationResumeRelease,
+            release.clone(),
+        );
+        emit.send(json!({"method":"Target.attachedToTarget","params":{
+            "sessionId":"popup-session","waitingForDebugger":true,"targetInfo":{
+                "targetId":"popup-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
+        release.wait_entered().await;
+        assert!(owner.index.lock().unwrap().sessions["popup-session"].resumed);
+        let pending = owner.targets.owned_target("popup-target").unwrap();
+        assert!(pending.configured && pending.resumed);
+        assert!(
+            !pending.capture_ready(),
+            "retained resume permit must still own publication"
+        );
+        let waiting = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::RestartPageResumeWaiting, waiting.clone());
+        let (cancel, cancellation) = watch::channel(CancelSignal::None);
+        let operation = OperationLease {
+            is_callback: false,
+            generation: owner.generation,
+            sequence: 17,
+            deadline: Instant::now() + Duration::from_secs(if mode == "deadline" { 1 } else { 5 }),
+            cancellation,
+        };
+        let task_owner = owner.clone();
+        let mut waiter = tokio::spawn(async move {
+            task_owner
+                .wait_restart_page_ready("popup-target", "popup-session", &operation)
+                .await
+        });
+        let early = tokio::select! {
+            result = &mut waiter => Some(result.unwrap()),
+            _ = waiting.wait_entered() => None,
+        };
+        let mut unrelated = None;
+        if early.is_none() && mode == "success" {
+            let gate = CaptureTestGate::new();
+            owner.capture_test_gates.lock().unwrap().insert(
+                CaptureTestPoint::BeforeInitializationResumeRelease,
+                gate.clone(),
+            );
+            emit.send(json!({"method":"Target.attachedToTarget","params":{
+                "sessionId":"unrelated-session","waitingForDebugger":true,"targetInfo":{
+                    "targetId":"unrelated-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
+            gate.wait_entered().await;
+            unrelated = Some(gate);
+        }
+        if mode == "cancel" {
+            cancel.send_replace(CancelSignal::Requested);
+        }
+        if mode == "success" || early.is_some() {
+            release.release.add_permits(1);
+        }
+        let was_early = early.is_some();
+        let result = match early {
+            Some(result) => result,
+            None => tokio::time::timeout(Duration::from_secs(3), waiter)
+                .await
+                .unwrap()
+                .unwrap(),
+        };
+        if mode != "success" && !was_early {
+            release.release.add_permits(1);
+        }
+        if let Some(unrelated) = unrelated {
+            assert!(
+                !owner
+                    .targets
+                    .owned_target("unrelated-target")
+                    .unwrap()
+                    .capture_ready(),
+                "selected readiness must not wait for unrelated initializer"
+            );
+            unrelated.release.add_permits(1);
+        }
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !owner.index.lock().unwrap().pending_enrollment.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let ready = owner.targets.owned_target("popup-target").unwrap();
+        let resumes = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request["sessionId"] == "popup-session"
+                    && request["method"] == "Runtime.runIfWaitingForDebugger"
+            })
+            .count();
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+        assert!(
+            !was_early,
+            "readiness returned before exact ResumePermit release: {result:?}"
+        );
+        assert_eq!(
+            result,
+            match mode {
+                "cancel" => Err(ProtocolError::Cancelled),
+                "deadline" => Err(ProtocolError::DeadlineExceeded),
+                _ => Ok(()),
+            }
+        );
+        assert!(ready.capture_ready());
+        assert_eq!(resumes, 1, "readiness wait must not replay resume");
+    }
+    #[tokio::test]
+    async fn restart_page_ready_waits_exact_resume_release_not_unrelated_initializers() {
+        restart_waits_for_resume_release_case("success").await;
+    }
+    #[tokio::test]
+    async fn restart_page_ready_resume_release_wait_honors_independent_cancel() {
+        restart_waits_for_resume_release_case("cancel").await;
+    }
+    #[tokio::test]
+    async fn restart_page_ready_resume_release_wait_keeps_original_deadline() {
+        restart_waits_for_resume_release_case("deadline").await;
     }
 
     #[tokio::test]
