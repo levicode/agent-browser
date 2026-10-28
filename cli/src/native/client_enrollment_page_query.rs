@@ -6,6 +6,23 @@ use crate::native::client_settlement_trace::{
 };
 use crate::native::client_targets::{SelectedPageTargetBarrier, SelectedPageTargetSnapshot};
 
+/// Private native control flow, never a wire error or permission grant.
+pub(crate) enum QueryBoundary<T> {
+    Ready(T),
+    Pending(QueryEventPrefix),
+}
+pub(crate) struct QueryEventPrefix {
+    watermark: BoundedEventWatermark,
+    received: u64,
+}
+impl<T> QueryBoundary<T> {
+    fn map<U>(self, map: impl FnOnce(T) -> U) -> QueryBoundary<U> {
+        match self {
+            Self::Ready(value) => QueryBoundary::Ready(map(value)),
+            Self::Pending(prefix) => QueryBoundary::Pending(prefix),
+        }
+    }
+}
 #[derive(Clone)]
 pub(crate) struct PageQueryAuthority {
     owner: Arc<ClientEnrollment>,
@@ -214,6 +231,147 @@ impl PageQueryAuthority {
             &BoundedEventWatermark,
         ) -> Result<T, ProtocolError>,
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        let watermark = match expected {
+            Some(proof) => proof.watermark.clone(),
+            None => self.owner.realm_watermark()?,
+        };
+        match self.with_partition_attempt(
+            page,
+            op,
+            expected,
+            held,
+            acquire_barrier,
+            stage,
+            &watermark,
+            &mut Some(publish),
+        )? {
+            QueryBoundary::Ready(value) => Ok(value),
+            QueryBoundary::Pending(_) => {
+                query_scope_refusal(op.generation, op.sequence, stage, Reason::WatermarkPending);
+                Err(ProtocolError::ScopeUnavailable)
+            }
+        }
+    }
+    async fn with_partition_async<T>(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        expected: Option<&PageAcquisitionProof>,
+        held: Option<&SelectedPageTargetBarrier>,
+        acquire_barrier: bool,
+        stage: Stage,
+        publish: impl FnOnce(
+            &[Attribution],
+            &SelectedPageTargetSnapshot,
+            &BoundedEventWatermark,
+        ) -> Result<T, ProtocolError>,
+    ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        let watermark = match expected {
+            Some(proof) => proof.watermark.clone(),
+            None => self.owner.realm_watermark()?,
+        };
+        let mut publish = Some(publish);
+        loop {
+            match self.with_partition_attempt(
+                page,
+                op,
+                expected,
+                held,
+                acquire_barrier,
+                stage,
+                &watermark,
+                &mut publish,
+            )? {
+                QueryBoundary::Ready(value) => return Ok(value),
+                QueryBoundary::Pending(prefix) => self.wait_event_prefix(page, op, &prefix).await?,
+            }
+        }
+    }
+    async fn wait_event_prefix(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        prefix: &QueryEventPrefix,
+    ) -> Result<(), ProtocolError> {
+        let owner = &self.owner;
+        let mut stop = owner.stop.subscribe();
+        bounded(op, async {
+            loop {
+                let changed = owner.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                owner.check_restart_operation(op)?;
+                page.permit.check()?;
+                if crate::native::client_observation::capture_superseded() {
+                    return Err(ProtocolError::StaleReference);
+                }
+                let applied = {
+                    let index = owner
+                        .index
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if let Some(error) = &index.failure {
+                        return Err(error.clone());
+                    }
+                    if *stop.borrow_and_update() != CancelSignal::None
+                        || owner.sealed.load(Ordering::Acquire)
+                        || !index.reconciled
+                        || index.borrowed_restart.is_some()
+                    {
+                        return Err(ProtocolError::ScopeUnavailable);
+                    }
+                    let subscription = owner
+                        .event_watermark
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if subscription
+                        .as_ref()
+                        .is_none_or(|current| !prefix.watermark.same_subscription(current))
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    prefix
+                        .watermark
+                        .with_received(|received| {
+                            if index.applied_watermark > received || received < prefix.received {
+                                return Err(ProtocolError::StaleScope);
+                            }
+                            Ok(index.applied_watermark >= prefix.received)
+                        })
+                        .map_err(|_| ProtocolError::ScopeUnavailable)??
+                };
+                if applied {
+                    return Ok(());
+                }
+                tokio::select! {
+                    _ = changed => {},
+                    _ = stop.changed() => {},
+                    _ = crate::native::client_observation::capture_retired() => {
+                        owner.check_restart_operation(op)?;
+                        return Err(ProtocolError::StaleReference);
+                    }
+                }
+            }
+        })
+        .await
+    }
+    fn with_partition_attempt<T>(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        expected: Option<&PageAcquisitionProof>,
+        held: Option<&SelectedPageTargetBarrier>,
+        acquire_barrier: bool,
+        stage: Stage,
+        watermark: &BoundedEventWatermark,
+        publish: &mut Option<
+            impl FnOnce(
+                &[Attribution],
+                &SelectedPageTargetSnapshot,
+                &BoundedEventWatermark,
+            ) -> Result<T, ProtocolError>,
+        >,
+    ) -> Result<QueryBoundary<(T, Option<SelectedPageTargetBarrier>)>, ProtocolError> {
         let refuse = |error, reason| {
             query_scope_refusal(op.generation, op.sequence, stage, reason);
             error
@@ -233,10 +391,6 @@ impl PageQueryAuthority {
         {
             return Err(refuse(ProtocolError::StaleScope, Reason::OwnerIdentity));
         }
-        let watermark = match expected {
-            Some(proof) => proof.watermark.clone(),
-            None => owner.realm_watermark()?,
-        };
         let index = owner
             .index
             .lock()
@@ -293,74 +447,86 @@ impl PageQueryAuthority {
         }
         watermark
             .with_received(|received| {
-                if index.applied_watermark != received {
-                    return Err(refuse(
-                        ProtocolError::ScopeUnavailable,
-                        Reason::WatermarkPending,
-                    ));
+                if index.applied_watermark > received {
+                    return Err(refuse(ProtocolError::StaleScope, Reason::WatermarkPending));
                 }
-                owner.targets.with_selected_page_targets_diagnostic(
-                    &self.selected,
-                    expected.map(|proof| &proof.targets),
-                    held,
-                    acquire_barrier,
-                    Some((op.generation, op.sequence, stage)),
-                    |target, registered| {
-                        let relevant = selected_entry(&index, target, &self.selected.session_id)?;
-                        let entry = index
-                            .sessions
-                            .get(&target.session_id)
-                            .ok_or(ProtocolError::StaleScope)?;
-                        let root_entry = index
-                            .sessions
-                            .get(&entry.root)
-                            .ok_or(ProtocolError::StaleScope)?;
-                        let root = if root_entry.kind == "page" {
-                            Some(
-                                registered
-                                    .get(&root_entry.target)
-                                    .filter(|root| root.session_id == root_entry.session)
-                                    .ok_or(ProtocolError::StaleScope)?,
-                            )
-                        } else {
-                            None
-                        };
-                        if !target.query_lineage_matches(root) {
-                            return Err(refuse(
-                                ProtocolError::StaleScope,
-                                Reason::TargetSetChanged,
-                            ));
-                        }
-                        Ok(relevant)
-                    },
-                    |targets| {
-                        // Every selected enrollment entry needs an exact target ticket.
-                        if targets.targets.len() != entries.len()
-                            || entries.iter().any(|entry| {
-                                !targets.targets.iter().any(|target| {
-                                    target.target_id == entry.target
-                                        && target.session_id == entry.session
-                                        && target.kind == entry.kind
+                if index.applied_watermark < received {
+                    return Ok(QueryBoundary::Pending(QueryEventPrefix {
+                        watermark: watermark.clone(),
+                        received,
+                    }));
+                }
+                owner
+                    .targets
+                    .with_selected_page_targets_diagnostic(
+                        &self.selected,
+                        expected.map(|proof| &proof.targets),
+                        held,
+                        acquire_barrier,
+                        Some((op.generation, op.sequence, stage)),
+                        |target, registered| {
+                            let relevant =
+                                selected_entry(&index, target, &self.selected.session_id)?;
+                            let entry = index
+                                .sessions
+                                .get(&target.session_id)
+                                .ok_or(ProtocolError::StaleScope)?;
+                            let root_entry = index
+                                .sessions
+                                .get(&entry.root)
+                                .ok_or(ProtocolError::StaleScope)?;
+                            let root = if root_entry.kind == "page" {
+                                Some(
+                                    registered
+                                        .get(&root_entry.target)
+                                        .filter(|root| root.session_id == root_entry.session)
+                                        .ok_or(ProtocolError::StaleScope)?,
+                                )
+                            } else {
+                                None
+                            };
+                            if !target.query_lineage_matches(root) {
+                                return Err(refuse(
+                                    ProtocolError::StaleScope,
+                                    Reason::TargetSetChanged,
+                                ));
+                            }
+                            Ok(relevant)
+                        },
+                        |targets| {
+                            // Every selected enrollment entry needs an exact target ticket.
+                            if targets.targets.len() != entries.len()
+                                || entries.iter().any(|entry| {
+                                    !targets.targets.iter().any(|target| {
+                                        target.target_id == entry.target
+                                            && target.session_id == entry.session
+                                            && target.kind == entry.kind
+                                    })
                                 })
-                            })
-                        {
-                            return Err(refuse(
-                                ProtocolError::StaleScope,
-                                Reason::TargetSetChanged,
-                            ));
-                        }
-                        if *op.cancellation.borrow() != CancelSignal::None {
-                            return Err(refuse(ProtocolError::Cancelled, Reason::OriginalBudget));
-                        }
-                        if Instant::now() >= op.deadline {
-                            return Err(refuse(
-                                ProtocolError::DeadlineExceeded,
-                                Reason::OriginalBudget,
-                            ));
-                        }
-                        publish(&entries, targets, &watermark)
-                    },
-                )
+                            {
+                                return Err(refuse(
+                                    ProtocolError::StaleScope,
+                                    Reason::TargetSetChanged,
+                                ));
+                            }
+                            if *op.cancellation.borrow() != CancelSignal::None {
+                                return Err(refuse(
+                                    ProtocolError::Cancelled,
+                                    Reason::OriginalBudget,
+                                ));
+                            }
+                            if Instant::now() >= op.deadline {
+                                return Err(refuse(
+                                    ProtocolError::DeadlineExceeded,
+                                    Reason::OriginalBudget,
+                                ));
+                            }
+                            publish.take().ok_or(ProtocolError::StaleScope)?(
+                                &entries, targets, watermark,
+                            )
+                        },
+                    )
+                    .map(QueryBoundary::Ready)
             })
             .map_err(|_| ProtocolError::ScopeUnavailable)?
     }
@@ -388,6 +554,31 @@ impl PageQueryAuthority {
         )
         .map(|(proof, _)| proof)
     }
+    pub(crate) async fn acquire_async(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<PageAcquisitionProof, ProtocolError> {
+        self.with_partition_async(
+            page,
+            op,
+            None,
+            None,
+            false,
+            Stage::Acquire,
+            |entries, targets, watermark| {
+                Ok(PageAcquisitionProof {
+                    authority: self.clone(),
+                    entries: entries.to_vec(),
+                    targets: targets.clone(),
+                    watermark: watermark.clone(),
+                    recheck_stage: Stage::Recheck,
+                })
+            },
+        )
+        .await
+        .map(|(proof, _)| proof)
+    }
 }
 impl PageAcquisitionProof {
     pub(crate) fn diagnostic_phase(&self, stage: Stage) -> Self {
@@ -402,58 +593,14 @@ impl PageAcquisitionProof {
         page: &BrowserExecutionLease,
         op: &OperationLease,
     ) -> Result<(), ProtocolError> {
-        let owner = &self.authority.owner;
-        let prefix = self
-            .watermark
-            .received()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        bounded(op, async {
-            loop {
-                let changed = owner.changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                owner.check_restart_operation(op)?;
-                page.permit.check()?;
-                let applied = {
-                    let index = owner
-                        .index
-                        .lock()
-                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                    if let Some(error) = &index.failure {
-                        return Err(error.clone());
-                    }
-                    if !index.reconciled
-                        || owner.sealed.load(Ordering::Acquire)
-                        || index.borrowed_restart.is_some()
-                    {
-                        return Err(ProtocolError::ScopeUnavailable);
-                    }
-                    let subscription = owner
-                        .event_watermark
-                        .lock()
-                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                    if subscription
-                        .as_ref()
-                        .is_none_or(|current| !self.watermark.same_subscription(current))
-                    {
-                        return Err(ProtocolError::StaleScope);
-                    }
-                    self.watermark
-                        .with_received(|received| {
-                            if index.applied_watermark > received || received < prefix {
-                                return Err(ProtocolError::StaleScope);
-                            }
-                            Ok(index.applied_watermark >= prefix)
-                        })
-                        .map_err(|_| ProtocolError::ScopeUnavailable)??
-                };
-                if applied {
-                    return Ok(());
-                }
-                changed.await;
-            }
-        })
-        .await
+        let prefix = QueryEventPrefix {
+            watermark: self.watermark.clone(),
+            received: self
+                .watermark
+                .received()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?,
+        };
+        self.authority.wait_event_prefix(page, op, &prefix).await
     }
     pub(crate) fn check_frame_boundary(
         &self,
@@ -492,6 +639,68 @@ impl PageAcquisitionProof {
             )
             .map(|_| ())
     }
+    pub(crate) async fn check_async(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.authority
+            .with_partition_async(
+                page,
+                op,
+                Some(self),
+                None,
+                false,
+                self.recheck_stage,
+                |_, _, _| Ok(()),
+            )
+            .await
+            .map(|_| ())
+    }
+    pub(crate) fn publication_attempt<T>(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        publish: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<QueryBoundary<T>, ProtocolError> {
+        self.authority
+            .with_partition_attempt(
+                page,
+                op,
+                Some(self),
+                None,
+                false,
+                Stage::Publication,
+                &self.watermark,
+                &mut Some(|_, _, _| publish()),
+            )
+            .map(|progress| progress.map(|(value, _)| value))
+    }
+    pub(crate) async fn wait_pending(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        prefix: &QueryEventPrefix,
+    ) -> Result<(), ProtocolError> {
+        self.authority.wait_event_prefix(page, op, prefix).await
+    }
+    pub(crate) async fn check_frame_boundary_async(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        entering: bool,
+    ) -> Result<(), ProtocolError> {
+        let stage = if self.recheck_stage == Stage::InitialFrames {
+            if entering {
+                Stage::InitialFramesEntry
+            } else {
+                Stage::InitialFramesExit
+            }
+        } else {
+            self.recheck_stage
+        };
+        self.diagnostic_phase(stage).check_async(page, op).await
+    }
     pub(crate) fn with_publication<T>(
         &self,
         page: &BrowserExecutionLease,
@@ -524,6 +733,28 @@ impl PageAcquisitionProof {
             Stage::BarrierAcquire,
             |_, _, _| Ok(()),
         )?;
+        Ok(SelectedPageReadBarrier {
+            proof: self.clone(),
+            guard: guard.ok_or(ProtocolError::ScopeUnavailable)?,
+        })
+    }
+    pub(crate) async fn begin_read_async(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<SelectedPageReadBarrier, ProtocolError> {
+        let (_, guard) = self
+            .authority
+            .with_partition_async(
+                page,
+                op,
+                Some(self),
+                None,
+                true,
+                Stage::BarrierAcquire,
+                |_, _, _| Ok(()),
+            )
+            .await?;
         Ok(SelectedPageReadBarrier {
             proof: self.clone(),
             guard: guard.ok_or(ProtocolError::ScopeUnavailable)?,
@@ -562,6 +793,33 @@ impl SelectedPageReadBarrier {
                 |_, _, _| publish(),
             )
             .map(|(value, _)| value)
+    }
+    pub(crate) async fn with_publication_async<T>(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        publish: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> Result<T, ProtocolError> {
+        self.proof
+            .authority
+            .with_partition_async(
+                page,
+                op,
+                Some(&self.proof),
+                Some(&self.guard),
+                false,
+                Stage::BarrierCheck,
+                |_, _, _| publish(),
+            )
+            .await
+            .map(|(value, _)| value)
+    }
+    pub(crate) async fn check_async(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        self.with_publication_async(page, op, || Ok(())).await
     }
 }
 
@@ -1456,6 +1714,344 @@ mod retained_peer_tests {
         }
     }
     #[tokio::test]
+    async fn protected_query_dispatch_catches_final_event_without_content_replay() {
+        for fail in [false, true] {
+            let (owner, _notices, log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-dispatch-final",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            owner
+                .client
+                .debt_ledger()
+                .unwrap()
+                .publish_initialization(|| Ok(()))
+                .unwrap();
+            // Actual framed auto-attachment and initialization of the auxiliary
+            // kinds present in ordinary Chromium. Opaque other is a mandatory
+            // dependency, never asserted to be non-rendering or disjoint.
+            for kind in ["browser_ui", "tab", "browser", "other"] {
+                let session = format!("aux-{kind}-session");
+                let target = format!("aux-{kind}-target");
+                emit.send(json!({"method":"Target.attachedToTarget","params":{
+                    "sessionId":session,"waitingForDebugger":true,"targetInfo":{
+                    "targetId":target,"type":kind,"browserContextId":"owned-context"}}}))
+                    .await
+                    .unwrap();
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    loop {
+                        if owner
+                            .targets
+                            .owned_target(&target)
+                            .is_ok_and(|t| t.configured && t.resumed)
+                            && owner.index.lock().unwrap().pending_enrollment.is_empty()
+                        {
+                            break;
+                        }
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let index = owner.index.lock().unwrap();
+                let entry = &index.sessions[&session];
+                assert_eq!(entry.root, session);
+                assert!(entry.parent.is_none());
+            }
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&initial).unwrap();
+            let selected = owner.targets.owned_target("initial-target").unwrap();
+            let authority = owner.page_query_authority(&page, &selected).unwrap();
+            let gate = CaptureTestGate::new();
+            owner
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .insert(CaptureTestPoint::BeforeAttachedProcessing, gate.clone());
+            let mut op = owner.operation();
+            op.sequence = 2;
+            let original_deadline = op.deadline;
+            emit.send(json!({"method":"Target.attachedToTarget","params":{
+                "sessionId":"popup-session","waitingForDebugger":true,"targetInfo":{
+                "targetId":"popup-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
+            gate.wait_entered().await;
+            let classification = authority.wait_classified(&page, &op);
+            tokio::pin!(classification);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut classification)
+                    .await
+                    .is_err()
+            );
+            gate.release.add_permits(1);
+            tokio::time::timeout(Duration::from_secs(2), &mut classification)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(op.deadline, original_deadline);
+            let held = tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Some(request) = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|request| {
+                            request["sessionId"] == "popup-session"
+                                && request["method"] == "Runtime.enable"
+                        })
+                        .cloned()
+                    {
+                        break request;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let debt = owner.client.debt_ledger().unwrap();
+            let outstanding = debt.snapshot().outstanding_commands;
+            let proof = authority.acquire(&page, &op).unwrap();
+            assert_eq!(proof.targets().len(), 1);
+            assert_eq!(
+                debt.check_admission(crate::native::client_debt::AdmissionClass::Reference),
+                Ok(())
+            );
+            let before = log.lock().unwrap().len();
+            let journal = debt
+                .operation(
+                    crate::native::client_debt::OperationKey {
+                        generation: op.generation,
+                        operation_seq: op.sequence,
+                    },
+                    page.target_id.clone(),
+                    page.page_session_id.clone(),
+                )
+                .unwrap();
+            journal.bind_operation(&op).unwrap();
+            use crate::native::client_blobs::{BlobScope, BlobStore};
+            use crate::native::client_observation_dispatch::{
+                DispatchContext, DispatchRequest, ObservationDispatch, QueryPurpose, QueryRequest,
+                ReadPolicy,
+            };
+            use crate::native::element::RefMap;
+            let blobs = Arc::new(BlobStore::new(Default::default()).unwrap());
+            let scope = BlobScope {
+                generation: op.generation,
+                identity_scope: page.identity_scope.clone(),
+            };
+            blobs.activate_scope(scope.clone()).unwrap();
+            let ui = owner.network.ui_gate_for_test();
+            assert!(owner.network.uses_ui_gate(&ui));
+            for scoped in [false, true] {
+                let refs = Arc::new(std::sync::Mutex::new(RefMap::new()));
+                let dispatch = ObservationDispatch::new(refs.clone());
+                let query_page = owner.lease(&initial).unwrap();
+                let world_gate = scoped.then(CaptureTestGate::new);
+                if let Some(gate) = &world_gate {
+                    owner
+                        .capture_test_gates
+                        .lock()
+                        .unwrap()
+                        .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+                }
+                let prepared = dispatch.prepare(DispatchContext {
+                query_authority: scoped.then(|| authority.clone()),
+                #[cfg(feature="acceptance-faults")]
+                faults: Arc::new(crate::native::client_test_faults::FaultController::default()),
+                attachment: selected.clone(), page: query_page, ui: ui.clone(), blobs: blobs.clone(), scope: scope.clone(),
+                policy: ReadPolicy { frame_policy: Default::default(), test_id_attribute: "data-testid".into(), secure_field_selector: "input[type=password]".into() },
+            }, DispatchRequest::Query(QueryRequest {
+                purpose: QueryPurpose::Protected,
+                options: serde_json::from_value(json!({"expression":{"kind":"selector","selector":"#selected"},"secureFieldSelector":"input[type=password]"})).unwrap(),
+            }), OperationLease { is_callback: op.is_callback, generation: op.generation, sequence: op.sequence, deadline: op.deadline, cancellation: op.cancellation.clone() }).unwrap();
+                let task = journal
+                    .scope(async { dispatch.start_prepared(prepared) })
+                    .await;
+                let mut result_receiver = task.result;
+                let mut content_before = 0;
+                if let Some(gate) = &world_gate {
+                    tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+                        .await
+                        .unwrap();
+                    let world = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .rev()
+                        .find(|request| request["method"] == "Page.createIsolatedWorld")
+                        .cloned()
+                        .unwrap();
+                    emit.send(json!({"id":world["id"],"sessionId":world["sessionId"],"result":{"executionContextId":7}})).await.unwrap();
+                    let blocked_ui = ui.enter(true, false, op.deadline, op.cancellation.clone());
+                    tokio::pin!(blocked_ui);
+                    assert!(matches!(
+                        futures_util::poll!(&mut blocked_ui),
+                        std::task::Poll::Pending
+                    ));
+                    assert!(
+                        owner.index.lock().unwrap().applied_watermark
+                            < owner.realm_watermark().unwrap().received().unwrap()
+                    );
+                    assert!(matches!(
+                        result_receiver.try_recv(),
+                        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+                    ));
+                    assert!(refs.lock().unwrap().ref_ids().is_empty());
+                    // Matcher has already run before the final frame event.
+                    content_before = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| {
+                            r["method"] == "Runtime.callFunctionOn"
+                                && r["params"]["functionDeclaration"]
+                                    .as_str()
+                                    .is_some_and(|d| d.starts_with("function(expression"))
+                        })
+                        .count();
+                    assert!(content_before > 0);
+                    gate.release.add_permits(1);
+                }
+                let received =
+                    tokio::time::timeout(Duration::from_secs(2), &mut result_receiver).await;
+                if received.is_err() {
+                    // Release the real held ACK and retain/join the task before failing.
+                    // This is a test observation bound, not a renewed operation budget.
+                    emit.send(json!({"id":held["id"],"sessionId":"popup-session","result":{}}))
+                        .await
+                        .unwrap();
+                    let completion = tokio::time::timeout(Duration::from_secs(3), task.join).await;
+                    let _ = owner.close().await;
+                    connection.close().await;
+                    server.abort();
+                    let _ = server.await;
+                    panic!("query waited for unrelated initializer; scoped={scoped}; cleanup={completion:?}");
+                }
+                let result = received.unwrap().unwrap();
+                task.join.await.unwrap().unwrap();
+                if !scoped {
+                    let failure =
+                        result.expect_err("strict global inventory must reject held popup");
+                    assert_eq!(failure.error, ProtocolError::ScopeUnavailable);
+                    assert!(!failure.cleanup_integrity_lost);
+                    assert!(refs.lock().unwrap().ref_ids().is_empty());
+                    assert!(owner.index.lock().unwrap().failure.is_none());
+                    assert!(!owner.index.lock().unwrap().pending_enrollment.is_empty());
+                    continue;
+                }
+                let result = result.unwrap();
+                let content_after = log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|r| {
+                        r["method"] == "Runtime.callFunctionOn"
+                            && r["params"]["functionDeclaration"]
+                                .as_str()
+                                .is_some_and(|d| d.starts_with("function(expression"))
+                    })
+                    .count();
+                assert_eq!(
+                    content_after, content_before,
+                    "content was replayed during event catchup"
+                );
+                assert_eq!(result["nodes"].as_array().unwrap().len(), 1);
+                assert_eq!(
+                    result["nodes"][0]["rect"],
+                    json!({"x":10.0,"y":20.0,"width":20.0,"height":20.0})
+                );
+                let id = result["nodes"][0]["ref"]["id"].as_str().unwrap();
+                assert_eq!(
+                    refs.lock()
+                        .unwrap()
+                        .get(id.trim_start_matches('@'))
+                        .unwrap()
+                        .backend_node_id,
+                    Some(7)
+                );
+                assert!(refs
+                    .lock()
+                    .unwrap()
+                    .get(id.trim_start_matches('@'))
+                    .unwrap()
+                    .matches_scope(&page.identity_scope, op.generation, "initial"));
+                assert_eq!(
+                    refs.lock()
+                        .unwrap()
+                        .get(id.trim_start_matches('@'))
+                        .unwrap()
+                        .exact_binding
+                        .as_ref()
+                        .unwrap()
+                        .session,
+                    "initial"
+                );
+                assert_eq!(op.deadline, original_deadline);
+            }
+            journal.finish_local_producers();
+            let commands = log.lock().unwrap()[before..].to_vec();
+            assert!(commands
+                .iter()
+                .any(|r| r["method"] == "Runtime.callFunctionOn"
+                    && r["params"]["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|d| d.starts_with("function(expression"))));
+            assert!(commands.iter().any(|r| r["method"] == "DOM.getBoxModel"));
+            assert!(commands.iter().all(|r| r["sessionId"] != "popup-session"));
+            assert!(commands
+                .iter()
+                .all(|r| r["sessionId"] != "aux-other-session"));
+            assert!(!owner.index.lock().unwrap().pending_enrollment.is_empty());
+            drop(journal);
+            assert!(owner.targets.inventory().is_err());
+            assert!(
+                !owner
+                    .targets
+                    .owned_target("popup-target")
+                    .unwrap()
+                    .configured
+            );
+            assert!(outstanding >= 1);
+            assert!(debt.snapshot().outstanding_commands >= outstanding);
+            // No pending command is declared settled by the page partition.
+            let response = if fail {
+                json!({"id":held["id"],"sessionId":"popup-session","error":{"code":-32000,"message":"controlled initializer error"}})
+            } else {
+                json!({"id":held["id"],"sessionId":"popup-session","result":{}})
+            };
+            emit.send(response).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if owner.index.lock().unwrap().pending_enrollment.is_empty() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let checked = proof.check(&page, &op);
+            let error = owner.index.lock().unwrap().failure.clone();
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+            if fail {
+                assert_eq!(checked, Err(ProtocolError::BrowserFailure));
+                assert_eq!(error, Some(ProtocolError::BrowserFailure));
+            } else {
+                assert_eq!(checked, Ok(()));
+                assert_eq!(error, None);
+            }
+        }
+    }
+    #[tokio::test]
     async fn query_classification_wait_keeps_original_cancel_and_deadline_without_owner_poison() {
         for cancel in [false, true] {
             let (owner, _notices, _log, emit, server, _broker, connection) =
@@ -1624,9 +2220,9 @@ mod retained_peer_tests {
 #[cfg(test)]
 mod query_world_event_counterexample {
     use super::*;
-    /// Characterizes current refusal, not an acceptance assertion that the
-    /// timing-sensitive refusal is desirable. The event comes from the peer
-    /// in response to production Page.createIsolatedWorld before its ACK.
+    /// Strict synchronous proof still refuses unapplied ingress; the production
+    /// async frame boundary now waits without replaying frame/content RPCs.
+    /// The peer emits the real world event before its correlated ACK.
     #[tokio::test]
     async fn selected_query_own_world_event_pending_application_refuses_then_recovers() {
         let (owner, _notices, log, emit, server, _broker, connection) =
@@ -1709,8 +2305,14 @@ mod query_world_event_counterexample {
         let watermark = owner.realm_watermark().unwrap();
         let unapplied =
             owner.index.lock().unwrap().applied_watermark < watermark.received().unwrap();
-        let refused = tokio::time::timeout(Duration::from_secs(2), &mut acquisition).await;
+        let refused = proof.check(&page, &op);
+        assert!(matches!(
+            futures_util::poll!(&mut acquisition),
+            std::task::Poll::Pending
+        ));
         gate.release.add_permits(1);
+        let acquisition_result =
+            tokio::time::timeout(Duration::from_secs(2), &mut acquisition).await;
         owner
             .drain_capture_watermark(&watermark, &op)
             .await
@@ -1728,7 +2330,8 @@ mod query_world_event_counterexample {
         server.abort();
         let _ = server.await;
         assert!(unapplied && world_sent);
-        assert!(matches!(refused, Ok(Err(ProtocolError::ScopeUnavailable))));
+        assert_eq!(refused, Err(ProtocolError::ScopeUnavailable));
+        assert!(matches!(acquisition_result, Ok(Ok(_))));
         assert_eq!(recovered, Ok(()));
         assert!(healthy);
         assert_eq!(op.deadline, deadline);
@@ -2213,6 +2816,243 @@ mod query_prefix_preparation_tests {
         assert_eq!(log.lock().unwrap().len(), before);
         drop(preparation);
         drop(held);
+        let _ = owner.close().await;
+        connection.close().await;
+        server.abort();
+        let _ = server.await;
+    }
+}
+
+#[cfg(test)]
+mod atomic_query_boundary_tests {
+    use super::*;
+    fn realm(id: i64) -> Value {
+        json!({"method":"Runtime.executionContextCreated","sessionId":"initial","params":{"context":{"id":id,"uniqueId":format!("boundary-{id}"),"name":"agent-browser-native-observation","auxData":{"frameId":"frame-initial","isDefault":false}}}})
+    }
+    async fn hold_event(
+        owner: &Arc<ClientEnrollment>,
+        emit: &tokio::sync::mpsc::Sender<Value>,
+        id: i64,
+    ) -> Arc<CaptureTestGate> {
+        let gate = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeEventApply, gate.clone());
+        emit.send(realm(id)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), gate.wait_entered())
+            .await
+            .unwrap();
+        gate
+    }
+    #[tokio::test]
+    async fn query_publication_pending_prefix_never_consumes_closure_or_refreshes_proof() {
+        for outcome in [
+            "success",
+            "cancel",
+            "deadline",
+            "metadata",
+            "unknown",
+            "subscription",
+            "stop",
+        ] {
+            let (owner, _notices, _log, emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-query",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&entry).unwrap();
+            let selected = owner.targets.owned_target("initial-target").unwrap();
+            let authority = owner.page_query_authority(&page, &selected).unwrap();
+            let (sender, cancellation) = watch::channel(CancelSignal::None);
+            let op = OperationLease {
+                is_callback: false,
+                generation: owner.generation,
+                sequence: 2,
+                deadline: Instant::now() + Duration::from_secs(2),
+                cancellation,
+            };
+            let proof = authority.acquire(&page, &op).unwrap();
+            let ui = owner.network.ui_gate_for_test();
+            let ui_permit = ui
+                .enter(true, false, op.deadline, op.cancellation.clone())
+                .await
+                .unwrap();
+            let barrier = proof.begin_read(&page, &op).unwrap();
+            let calls = std::sync::atomic::AtomicUsize::new(0);
+            // Two independently received prefixes; no new proof is acquired.
+            for id in [71, 72] {
+                let gate = hold_event(&owner, &emit, id).await;
+                let prefix = match proof
+                    .publication_attempt(&page, &op, || {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap()
+                {
+                    QueryBoundary::Pending(prefix) => prefix,
+                    QueryBoundary::Ready(()) => panic!("unapplied event published"),
+                };
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                let wait = proof.wait_pending(&page, &op, &prefix);
+                tokio::pin!(wait);
+                assert!(matches!(
+                    futures_util::poll!(&mut wait),
+                    std::task::Poll::Pending
+                ));
+                if id == 72 && outcome == "cancel" {
+                    sender.send_replace(CancelSignal::Requested);
+                }
+                if id == 72 && outcome == "subscription" {
+                    *owner.event_watermark.lock().unwrap() = None;
+                    owner.changed.notify_waiters();
+                }
+                if id == 72 && outcome == "stop" {
+                    owner.stop.send_replace(CancelSignal::SessionClosed);
+                }
+                if !(id == 72 && matches!(outcome, "cancel" | "deadline" | "subscription" | "stop"))
+                {
+                    gate.release.add_permits(1);
+                }
+                let result = wait.await;
+                if id == 72 && matches!(outcome, "cancel" | "deadline" | "subscription" | "stop") {
+                    gate.release.add_permits(1);
+                    match outcome {
+                        "cancel" => assert_eq!(result, Err(ProtocolError::Cancelled)),
+                        "deadline" => assert_eq!(result, Err(ProtocolError::DeadlineExceeded)),
+                        "subscription" => assert_eq!(result, Err(ProtocolError::StaleScope)),
+                        _ => assert!(result.is_err()),
+                    }
+                    break;
+                }
+                assert_eq!(result, Ok(()));
+            }
+            if outcome == "metadata" {
+                owner.targets.observe_query_target_info(
+                    "initial-target",
+                    "initial",
+                    Some("other"),
+                    true,
+                );
+                owner.targets.observe_query_target_info(
+                    "initial-target",
+                    "initial",
+                    Some("page"),
+                    true,
+                );
+            }
+            if outcome == "unknown" {
+                owner
+                    .targets
+                    .attached(
+                        &owner.targets.context_id,
+                        "unknown-target".into(),
+                        "unknown-session".into(),
+                        "mystery".into(),
+                    )
+                    .unwrap();
+            }
+            if matches!(outcome, "success" | "metadata" | "unknown") {
+                let checked = barrier.check_async(&page, &op).await;
+                if outcome != "success" {
+                    assert!(checked.is_err());
+                } else {
+                    checked.unwrap();
+                }
+                let result = proof.publication_attempt(&page, &op, || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
+                if outcome == "success" {
+                    assert!(matches!(result, Ok(QueryBoundary::Ready(()))));
+                } else {
+                    assert!(result.is_err());
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(outcome == "success")
+            );
+            // Original operation failure never turns a late event into a commit.
+            drop(barrier);
+            drop(ui_permit);
+            if outcome == "subscription" {
+                *owner.event_watermark.lock().unwrap() = Some(proof.watermark.clone());
+            }
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+        }
+    }
+    #[tokio::test]
+    async fn query_atomic_boundary_handles_new_prefix_without_consuming_publication() {
+        let (owner, _notices, _log, emit, server, _broker, connection) =
+            super::super::tests::fixture_with_explicit_context_ownership(
+                "owner-retirement-runtime-held-query",
+                true,
+                true,
+            )
+            .await;
+        owner
+            .enroll_existing("initial-target", "initial", "page", &owner.operation())
+            .await
+            .unwrap();
+        owner.start(&owner.operation()).await.unwrap();
+        let entry = owner.index.lock().unwrap().sessions["initial"].clone();
+        let page = owner.lease(&entry).unwrap();
+        let selected = owner.targets.owned_target("initial-target").unwrap();
+        let authority = owner.page_query_authority(&page, &selected).unwrap();
+        let mut op = owner.operation();
+        op.sequence = 2;
+        let proof = authority.acquire(&page, &op).unwrap();
+        let ui = owner.network.ui_gate_for_test();
+        let ui_permit = ui
+            .enter(true, false, op.deadline, op.cancellation.clone())
+            .await
+            .unwrap();
+        let barrier = proof.begin_read(&page, &op).unwrap();
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let first = hold_event(&owner, &emit, 81).await;
+        {
+            let publish = barrier.with_publication_async(&page, &op, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            });
+            tokio::pin!(publish);
+            assert!(matches!(
+                futures_util::poll!(&mut publish),
+                std::task::Poll::Pending
+            ));
+            first.release.add_permits(1);
+            // Do not poll the pending publisher until another actual event is held.
+            // Its first prefix becomes applied, but latest ingress is now larger.
+            let second = hold_event(&owner, &emit, 82).await;
+            assert!(matches!(
+                futures_util::poll!(&mut publish),
+                std::task::Poll::Pending
+            ));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+            second.release.add_permits(1);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), &mut publish)
+                    .await
+                    .unwrap(),
+                Ok(())
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+        drop(barrier);
+        drop(ui_permit);
         let _ = owner.close().await;
         connection.close().await;
         server.abort();

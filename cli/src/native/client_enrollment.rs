@@ -15,7 +15,9 @@ use super::client_protocol::ProtocolError;
 use super::client_session::{CancelSignal, OperationLease};
 use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
-pub(crate) use page_query::{PageAcquisitionProof, PageQueryAuthority, SelectedPageReadBarrier};
+pub(crate) use page_query::{
+    PageAcquisitionProof, PageQueryAuthority, QueryBoundary, SelectedPageReadBarrier,
+};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -8674,6 +8676,7 @@ mod tests {
             let mut detach_count = 0;
             let mut inventory_reads = 0;
             let mut query_world_emitted = false;
+            let mut query_frame_reads = 0usize;
             let mut realm_loader = "synthetic-loader".to_owned();
             let mut whitespace = HashMap::<String, bool>::new();
             let mut closed_targets = std::collections::HashSet::<String>::new();
@@ -8782,6 +8785,12 @@ mod tests {
                         if (mode=="first-request" || mode=="large-first-request" || mode=="hold-timezone" || (mode=="popup-held-dispose" && request["sessionId"]=="popup-session")) && method=="Fetch.enable" {
                             let body=if mode=="large-first-request" {"b".repeat(1536*1024)} else {String::new()};
                             socket.send(Message::Text(json!({"method":"Fetch.requestPaused","sessionId":request["sessionId"],"params":{"requestId":"first","request":{"url":"https://synthetic.test/first","method":"POST","headers":{},"postData":body}}}).to_string())).await.unwrap();
+                        }
+                        if mode=="owner-retirement-runtime-held-dispatch-final" && method=="Page.getFrameTree" && request["sessionId"]=="initial" { query_frame_reads += 1; }
+                        if mode=="owner-retirement-runtime-held-dispatch-final" && method=="Page.createIsolatedWorld" && query_frame_reads >= 7 && !query_world_emitted {
+                            query_world_emitted = true;
+                            socket.send(Message::Text(realm_created(7,"final-world-event").to_string())).await.unwrap();
+                            continue;
                         }
                         if mode=="owner-retirement-runtime-held-dispatch-world" && method=="Page.createIsolatedWorld" && !query_world_emitted {
                             query_world_emitted = true;

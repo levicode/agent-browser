@@ -53,6 +53,16 @@ enum ReadBarrier {
     Global(ProtectedTargetBarrier),
     Selected(super::client_enrollment::SelectedPageReadBarrier),
 }
+fn query_wait_reason(
+    error: super::client_protocol::ProtocolError,
+    fallback: ProtectedReadReason,
+) -> ProtectedReadReason {
+    match error {
+        super::client_protocol::ProtocolError::Cancelled => ProtectedReadReason::Cancelled,
+        super::client_protocol::ProtocolError::DeadlineExceeded => ProtectedReadReason::Deadline,
+        _ => fallback,
+    }
+}
 impl ReadBarrier {
     fn quarantine(&self) {
         match self {
@@ -168,6 +178,104 @@ impl<'a> ProtectedReadJournal<'a> {
         journal.check().map_err(failure)?;
         Ok(journal)
     }
+    pub(crate) async fn begin_query_async(
+        page: &'a BrowserExecutionLease,
+        operation: &'a OperationLease,
+        partition: Option<&super::client_enrollment::PageAcquisitionProof>,
+    ) -> Result<Self, ProtectedReadFailure> {
+        if partition.is_none() {
+            return Self::begin_query(page, operation, None);
+        }
+        let failure = |reason| ProtectedReadFailure {
+            reason,
+            identity_scope: page.identity_scope.clone(),
+            cleanup_integrity_lost: false,
+        };
+        let operation_journal = super::client_debt::OperationJournalHandle::current();
+        if let Some(journal) = &operation_journal {
+            if page.client.debt_ledger().is_none_or(|ledger| {
+                !journal.matches_protected_read(
+                    &ledger,
+                    &page.identity_scope,
+                    &page.target_id,
+                    &page.page_session_id,
+                    operation,
+                )
+            }) {
+                return Err(failure(ProtectedReadReason::StaleScope));
+            }
+        }
+        let barrier = match partition {
+            Some(partition) => {
+                ReadBarrier::Selected(partition.begin_read_async(page, operation).await.map_err(
+                    |error| {
+                        failure(query_wait_reason(
+                            error,
+                            ProtectedReadReason::IncompleteInventory,
+                        ))
+                    },
+                )?)
+            }
+            None => {
+                let barrier = page
+                    .targets
+                    .protected_read_barrier()
+                    .map_err(|_| failure(ProtectedReadReason::IncompleteInventory))?;
+                if barrier.stamp.identity_scope != page.identity_scope {
+                    return Err(failure(ProtectedReadReason::StaleScope));
+                }
+                ReadBarrier::Global(barrier)
+            }
+        };
+        let targets = match &barrier {
+            ReadBarrier::Global(barrier) => barrier.stamp.targets.as_slice(),
+            ReadBarrier::Selected(barrier) => barrier.targets(),
+        };
+        let mut sessions = Vec::new();
+        let mut main = false;
+        for target in targets {
+            if target.purpose != Some(TargetPurpose::Application) {
+                return Err(failure(ProtectedReadReason::IncompleteInventory));
+            }
+            if matches!(target.kind.as_str(), "page" | "iframe") {
+                main |=
+                    target.session_id == page.page_session_id && target.target_id == page.target_id;
+                sessions.push(target.session_id.clone());
+            }
+        }
+        if !main {
+            return Err(failure(ProtectedReadReason::IncompleteInventory));
+        }
+        sessions.sort();
+        sessions.dedup();
+        let record = page
+            .targets
+            .protected_read_residual
+            .reserve(
+                super::client_debt::OperationKey {
+                    generation: operation.generation,
+                    operation_seq: operation.sequence,
+                },
+                &page.page_session_id,
+                page.client.clone(),
+            )
+            .map_err(|_| failure(ProtectedReadReason::CleanupFailed))?;
+        let journal = Self {
+            page,
+            operation,
+            barrier,
+            sessions,
+            record,
+            cleanup_deadline: None,
+            operation_journal,
+            restored: false,
+            started: false,
+            stabilization_completed: false,
+            command_cleanup_lost: std::sync::atomic::AtomicBool::new(false),
+        };
+        journal.check_async().await.map_err(failure)?;
+        Ok(journal)
+    }
     fn records(&self) -> Result<MutexGuard<'_, Records>, ProtectedReadReason> {
         self.record
             .data
@@ -211,6 +319,29 @@ impl<'a> ProtectedReadJournal<'a> {
         self.barrier
             .check(self.page, self.operation)
             .map_err(|_| ProtectedReadReason::StaleScope)?;
+        if *self.operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtectedReadReason::Cancelled);
+        }
+        if Instant::now() >= self.operation.deadline {
+            return Err(ProtectedReadReason::Deadline);
+        }
+        if super::client_observation::capture_superseded() {
+            return Err(ProtectedReadReason::Superseded);
+        }
+        Ok(())
+    }
+    pub(crate) async fn check_async(&self) -> Result<(), ProtectedReadReason> {
+        self.page
+            .permit
+            .check()
+            .map_err(|_| ProtectedReadReason::StaleScope)?;
+        match &self.barrier {
+            ReadBarrier::Global(_) => return self.check(),
+            ReadBarrier::Selected(barrier) => barrier
+                .check_async(self.page, self.operation)
+                .await
+                .map_err(|error| query_wait_reason(error, ProtectedReadReason::StaleScope))?,
+        }
         if *self.operation.cancellation.borrow() != CancelSignal::None {
             return Err(ProtectedReadReason::Cancelled);
         }

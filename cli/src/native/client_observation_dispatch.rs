@@ -1127,6 +1127,129 @@ impl ObservationDispatch {
         }
     }
 
+    fn commit_staged_query_attempt(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+        capture: Option<&Arc<CaptureAdmission>>,
+        trace: Option<&TraceFence>,
+        retirement_fence: u64,
+        publication: &mut Publication,
+        kind: PublicationKind,
+        revision: u64,
+        staged: &mut Option<RefMap>,
+        blobs: &BlobStore,
+        blob_scope: &BlobScope,
+        handles: &[String],
+        query_partition: &super::client_enrollment::PageAcquisitionProof,
+    ) -> Result<super::client_enrollment::QueryBoundary<()>, ProtocolError> {
+        let authority = self
+            .captures
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check(page, operation)?;
+        if authority.retirement_fence != retirement_fence {
+            return Err(ProtocolError::StaleReference);
+        }
+        if let Some(capture) = capture {
+            if !capture.owner.matches(page, operation.generation)
+                || capture.sequence != operation.sequence
+                || !authority
+                    .latest
+                    .iter()
+                    .any(|current| Arc::ptr_eq(current, capture))
+            {
+                return Err(ProtocolError::StaleReference);
+            }
+        } else if matches!(kind, PublicationKind::Snapshot) {
+            return Err(ProtocolError::StaleReference);
+        }
+        if matches!(
+            kind,
+            PublicationKind::TraceViewport | PublicationKind::TraceSemantic
+        ) {
+            let trace = trace.ok_or(ProtocolError::StaleReference)?;
+            let current = authority
+                .latest
+                .iter()
+                .find(|entry| entry.owner.matches(page, operation.generation));
+            let unchanged = match (&trace.admission, current) {
+                (Some(sampled), Some(current)) => Arc::ptr_eq(sampled, current),
+                (None, None) => true,
+                _ => false,
+            };
+            if !trace.owner.matches(page, operation.generation) || !unchanged {
+                return Err(ProtocolError::StaleReference);
+            }
+        }
+        let mut refs = self
+            .refs
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check(page, operation)?;
+        let commit = || {
+            blobs
+                .bind_page_captures(blob_scope, handles, &authority.page_blob_tenure)
+                .map_err(blob_error)?;
+            publication.commit_refs(
+                kind,
+                revision,
+                &mut refs,
+                staged.take().ok_or(ProtocolError::StaleScope)?,
+            );
+            Ok(())
+        };
+        // Preserve captures -> refs before adding index -> watermark -> targets.
+        // Never enter captures while holding the registry: capture admission
+        // itself checks target tenure under its captures lock.
+        query_partition.publication_attempt(page, operation, commit)
+    }
+
+    async fn commit_staged_query(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+        capture: Option<&Arc<CaptureAdmission>>,
+        trace: Option<&TraceFence>,
+        retirement_fence: u64,
+        publication: &mut Publication,
+        kind: PublicationKind,
+        revision: u64,
+        staged: RefMap,
+        blobs: &BlobStore,
+        blob_scope: &BlobScope,
+        handles: &[String],
+        query_partition: &super::client_enrollment::PageAcquisitionProof,
+    ) -> Result<(), ProtocolError> {
+        let mut staged = Some(staged);
+        loop {
+            match self.commit_staged_query_attempt(
+                page,
+                operation,
+                capture,
+                trace,
+                retirement_fence,
+                publication,
+                kind,
+                revision,
+                &mut staged,
+                blobs,
+                blob_scope,
+                handles,
+                query_partition,
+            )? {
+                super::client_enrollment::QueryBoundary::Ready(()) => return Ok(()),
+                super::client_enrollment::QueryBoundary::Pending(prefix) => {
+                    // Attempt returned: captures/refs/index/watermark/targets
+                    // locks are all gone. Staged refs have not been consumed.
+                    query_partition
+                        .wait_pending(page, operation, &prefix)
+                        .await?;
+                }
+            }
+        }
+    }
+
     fn check_initial_trace_owner(
         &self,
         context: &DispatchContext,
@@ -1776,12 +1899,15 @@ impl ObservationDispatch {
         // No DOM, selector, geometry or semantic result is read here. The same
         // original proof is retained through all later protected checks.
         let query_partition = if matches!(&request, DispatchRequest::Query(_)) {
-            context
-                .query_authority
-                .as_ref()
-                .map(|authority| authority.acquire(&context.page, &operation))
-                .transpose()
-                .map_err(failure)?
+            match context.query_authority.as_ref() {
+                Some(authority) => Some(
+                    authority
+                        .acquire_async(&context.page, &operation)
+                        .await
+                        .map_err(failure)?,
+                ),
+                None => None,
+            }
         } else {
             None
         };
@@ -1970,11 +2096,12 @@ impl ObservationDispatch {
         screenshot_stage(screenshot, ScreenshotStage::ProtectedBarrier);
         let mut journal = if protected {
             Some(
-                ProtectedReadJournal::begin_query(
+                ProtectedReadJournal::begin_query_async(
                     &capture_context.page,
                     &operation,
                     query_partition.as_ref(),
                 )
+                .await
                 .map_err(|e| DispatchFailure {
                     error: protected_error(e.reason),
                     identity_scope: e.identity_scope,
@@ -2122,7 +2249,7 @@ impl ObservationDispatch {
                         // Finish the same proof as tree-only Observe before any
                         // optional-only animation, strict geometry or raw capture.
                         if let Some(semantic_journal) = journal.take() {
-                            semantic_journal.check().map_err(protected_error)?;
+                            semantic_journal.check_async().await.map_err(protected_error)?;
                             // Observe has not stabilized or installed masks yet.
                             // The existing no-effects Drop closes this read-only
                             // barrier without starting the raw cleanup clock.
@@ -2197,7 +2324,7 @@ impl ObservationDispatch {
         }
         if let Some(cause) = fallback_cause {
             if let Some(journal) = &journal {
-                journal.check().map_err(|e| failure(protected_error(e)))?;
+                journal.check_async().await.map_err(|e| failure(protected_error(e)))?;
             }
             // Release the old target barrier only after acknowledged restoration.
             // The UI owner and original operation budget remain unchanged.
@@ -2241,7 +2368,7 @@ impl ObservationDispatch {
         }
         screenshot_stage(screenshot, ScreenshotStage::FinalBarrier);
         if let Some(journal) = &journal {
-            journal.check().map_err(|e| failure(protected_error(e)))?;
+            journal.check_async().await.map_err(|e| failure(protected_error(e)))?;
         }
         screenshot_stage(screenshot, ScreenshotStage::FinalScope);
         check(&capture_context.page, &operation).map_err(failure)?;
@@ -2286,16 +2413,21 @@ impl ObservationDispatch {
         #[cfg(test)]
         witness.enter(ObserveFailureStage::Publication);
         screenshot_stage(screenshot, ScreenshotStage::Publication);
-        let publish = (|| {
+        let publish = (async {
             bounded_result(&value)?;
             check(&capture_context.page, &operation)?;
             if let Some(journal) = &journal {
-                journal.check().map_err(protected_error)?;
+                journal.check_async().await.map_err(protected_error)?;
             }
-            self.commit_staged(&capture_context.page, &operation, capture.as_ref(), trace.as_ref(), retirement_fence,
-                &mut publication, publication_kind, revision, staged, &context.blobs, &context.scope, &handles, query_partition.as_ref())?;
+            if let Some(partition) = query_partition.as_ref() {
+                self.commit_staged_query(&capture_context.page, &operation, capture.as_ref(), trace.as_ref(), retirement_fence,
+                    &mut publication, publication_kind, revision, staged, &context.blobs, &context.scope, &handles, partition).await?;
+            } else {
+                self.commit_staged(&capture_context.page, &operation, capture.as_ref(), trace.as_ref(), retirement_fence,
+                    &mut publication, publication_kind, revision, staged, &context.blobs, &context.scope, &handles, None)?;
+            }
             Ok::<(), ProtocolError>(())
-        })();
+        }).await;
         if let Err(error) = publish {
             if let Some(witness) = screenshot { witness.failure(&error); }
             let clean = release_handles(&context.blobs, &context.scope, &handles);
@@ -2844,7 +2976,7 @@ async fn prepare_query_worlds(
     warm_query_worlds(page, operation, &partition).await?;
     drop(permit);
     partition.wait_received_prefix(page, operation).await?;
-    partition.check(page, operation)
+    partition.check_async(page, operation).await
 }
 /// Only exact frame/world metadata, never DOM/geometry/selector projection.
 async fn warm_query_worlds(
@@ -2853,7 +2985,7 @@ async fn warm_query_worlds(
     partition: &super::client_enrollment::PageAcquisitionProof,
 ) -> Result<(), ProtocolError> {
     let partition = partition.diagnostic_phase(diagnostic::QueryScopeStage::WarmWorlds);
-    partition.check(page, operation)?;
+    partition.check_async(page, operation).await?;
     let mut trees = Vec::new();
     for target in partition.targets() {
         if !matches!(target.kind.as_str(), "page" | "iframe") {
@@ -2943,7 +3075,9 @@ async fn frame_inventory_attempt_impl(
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
     check(page, operation)?;
     let (revision, targets, inventory_before) = if let Some(partition) = partition {
-        partition.check_frame_boundary(page, operation, true)?;
+        partition
+            .check_frame_boundary_async(page, operation, true)
+            .await?;
         (0, partition.targets().to_vec(), None)
     } else {
         page.targets
@@ -3048,7 +3182,9 @@ async fn frame_inventory_attempt_impl(
         }
     }
     if let Some(partition) = partition {
-        partition.check_frame_boundary(page, operation, false)?;
+        partition
+            .check_frame_boundary_async(page, operation, false)
+            .await?;
     } else {
         let fence = page.targets.check_acquisition_revision(
             revision,
