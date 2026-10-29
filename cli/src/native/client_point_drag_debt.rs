@@ -5,6 +5,22 @@ use super::super::client_targets::OwnedTarget;
 
 /// Non-cloneable application capability. State retains the same tenure on cancellation.
 pub(crate) struct PointDragToken(pub(super) Arc<Mutex<PointDragDebt>>);
+/// Minted only after this transaction's full cleanup and atomic receiver seal.
+/// Fields stay private here; a command-status list alone cannot forge this proof.
+pub(crate) struct PointDragCleanupProof {
+    journal: OperationJournalHandle,
+    session: String,
+    rejected: Vec<CommandStatusHandle>,
+}
+impl PointDragCleanupProof {
+    #[cfg(test)]
+    pub(crate) fn for_test(journal: OperationJournalHandle, session: String, rejected: Vec<CommandStatusHandle>) -> Self {
+        Self { journal, session, rejected }
+    }
+    pub(crate) fn into_parts(self) -> (OperationJournalHandle, String, Vec<CommandStatusHandle>) {
+        (self.journal, self.session, self.rejected)
+    }
+}
 struct ObserverCleanup {
     session: String,
     method: &'static str,
@@ -14,6 +30,27 @@ struct ObserverCleanup {
     reply_validated: bool,
     terminal_failed: bool,
 }
+#[derive(Clone, Copy)]
+enum ProbeObservation { NoMove, NoDrag, Drag }
+impl ProbeObservation {
+    fn decode(value: &Value) -> Option<Self> {
+        if value.get("exceptionDetails").is_some() { return None; }
+        match value["result"]["value"].as_str()? {
+            "no-move" => Some(Self::NoMove), "no-drag" => Some(Self::NoDrag),
+            "drag" => Some(Self::Drag), _ => None,
+        }
+    }
+}
+struct RetainedProbe {
+    session: String,
+    object: String,
+    realm: Arc<super::super::client_enrollment::ExactRealmTicket>,
+    cycle: u64,
+    arm_status: Option<CommandStatusHandle>,
+    arm_value: Option<bool>,
+    finish_status: Option<CommandStatusHandle>,
+    finish_value: Option<ProbeObservation>,
+}
 #[derive(Clone)]
 struct PendingDragCommand {
     status: CommandStatusHandle,
@@ -21,9 +58,16 @@ struct PendingDragCommand {
     disabled: bool,
     may_start_drag: bool,
     observation_was_pending: bool,
+    observation_was_finishable: bool,
+    application_input: bool,
 }
 pub(super) struct PointDragDebt {
     key: OperationKey,
+    journal: OperationJournalHandle,
+    rejected_input: Vec<CommandStatusHandle>,
+    realms: Arc<super::super::client_enrollment::PointDragRealms>,
+    probe_cycle: u64,
+    probes: Vec<RetainedProbe>,
     attachment: OwnedTarget,
     targets: Arc<super::super::client_targets::ClientTargets>,
     session: String,
@@ -33,6 +77,7 @@ pub(super) struct PointDragDebt {
     sealed: bool,
     expected_positive: bool,
     observation_pending: bool,
+    observation_finishable: bool,
     enable_submitted: bool,
     disabled: bool,
     drop_acknowledged: bool,
@@ -50,6 +95,15 @@ fn lock(debt: &Arc<Mutex<PointDragDebt>>) -> Result<MutexGuard<'_, PointDragDebt
     debt.lock().map_err(|_| ProtocolError::CleanupFailed)
 }
 impl ClientPageState {
+    #[cfg(test)]
+    pub(crate) fn point_drag_rejected_statuses_for_test(&self, generation: u64, sequence: u64) -> Result<Vec<client_debt::CommandStatus>, ProtocolError> {
+        let debt = self.state()?.point_drag.clone().ok_or(ProtocolError::ScopeUnavailable)?;
+        let d = lock(&debt)?;
+        if d.key.generation != generation || d.key.operation_seq != sequence || d.journal.key() != d.key {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(d.rejected_input.iter().map(CommandStatusHandle::snapshot).collect())
+    }
     pub(super) fn point_drag_frozen(&self) -> Result<bool, ProtocolError> {
         let debt = self.state()?.point_drag.clone();
         match debt { Some(debt) => { let frozen = lock(&debt)?.frozen; Ok(frozen) }, None => Ok(false) }
@@ -58,6 +112,7 @@ impl ClientPageState {
         &self, page: &BrowserExecutionLease, op: &OperationLease,
         receipt: DragInterceptionReceipt,
         events: Arc<tokio::sync::Mutex<BoundedMethodEvents>>,
+        realms: Arc<super::super::client_enrollment::PointDragRealms>,
     ) -> Result<PointDragToken, ProtocolError> {
         self.validate(page, op)?;
         let journal = OperationJournalHandle::current().ok_or(ProtocolError::ScopeUnavailable)?;
@@ -71,8 +126,8 @@ impl ClientPageState {
         if state.point_drag.is_some() || state.input_cleanup.is_some() { return Err(ProtocolError::ScopeUnavailable); }
         bind_input_session(&mut state.input, &page.page_session_id)?;
         let debt = Arc::new(Mutex::new(PointDragDebt {
-            key, attachment, targets: page.targets.clone(), session: page.page_session_id.clone(), receipt, _events: events,
-            frozen: false, sealed: false, expected_positive: false, observation_pending: false, enable_submitted: false,
+            key, journal, rejected_input: Vec::new(), realms, probe_cycle: 0, probes: Vec::new(), attachment, targets: page.targets.clone(), session: page.page_session_id.clone(), receipt, _events: events,
+            frozen: false, sealed: false, expected_positive: false, observation_pending: false, observation_finishable: false, enable_submitted: false,
             disabled: false, drop_acknowledged: false, cancel_acknowledged: false, primary_failed: false, cleanup_failed: false, left_release_debt: false, pending: Vec::new(),
             cancel_status: None, disable_status: None, observers: Vec::new(), input_releases: None,
         }));
@@ -131,23 +186,60 @@ impl ClientPageState {
             return Err(ProtocolError::StaleScope);
         }
         if debt.observers.len() >= 128 || object_id.is_empty() || object_group.is_empty() { return Err(ProtocolError::CapacityExceeded); }
+        debt.probes.push(RetainedProbe { session: session.clone(), object: object_id.clone(), realm: realm.clone(), cycle: 0, arm_status: None, arm_value: None, finish_status: None, finish_value: None });
         debt.observers.push(ObserverCleanup { session: session.clone(), method: "Runtime.callFunctionOn", params: json!({"objectId":object_id,"functionDeclaration":"function(){return this.dispose()}","returnByValue":true,"awaitPromise":true}), status: None, reply_validated: false, terminal_failed: false, realm: Some(realm.clone()) });
         debt.observers.push(ObserverCleanup { session, method: "Runtime.releaseObjectGroup", params: json!({"objectGroup":object_group}), status: None, reply_validated: false, terminal_failed: false, realm: Some(realm) });
         Ok(())
     }
     pub(crate) async fn point_drag_observer_command(&self, page: &BrowserExecutionLease, op: &OperationLease, token: &PointDragToken, session: &str, method: &str, params: Value) -> Result<Value, ProtocolError> {
         self.check_point_drag(page, op, token)?;
-        if method != "Runtime.callFunctionOn" || !lock(&token.0)?.observers.iter().any(|o| o.session == session && o.params.get("objectId") == params.get("objectId") && params.get("objectId").is_some()) { return Err(ProtocolError::StaleScope); }
+        let arm = match params["functionDeclaration"].as_str() {
+            Some("function(){return this.arm()}") => true,
+            Some("function(){return this.finish()}") => false,
+            _ => return Err(ProtocolError::InvalidArguments),
+        };
+        let index = {
+            let d = lock(&token.0)?;
+            if method != "Runtime.callFunctionOn" { return Err(ProtocolError::InvalidArguments); }
+            d.probes.iter().position(|p| p.session == session && params["objectId"].as_str() == Some(p.object.as_str())).ok_or(ProtocolError::StaleScope)?
+        };
         let reservation = client_debt::command_scope(CommandCategory::ApplicationRead, false, async {
             page.client.reserve_tracked_command(method, Some(&params), Some(session))
         }).await.map_err(|_| ProtocolError::BrowserFailure)?.ok_or(ProtocolError::ScopeUnavailable)?;
         let status = reservation.status();
         {
-            let mut debt = lock(&token.0)?;
-            if debt.frozen || !debt.pending.is_empty() { return Err(ProtocolError::ScopeUnavailable); }
-            debt.pending.push(PendingDragCommand { status: status.clone(), dropped: false, disabled: false, may_start_drag: false, observation_was_pending: false });
+            let mut d = lock(&token.0)?;
+            if d.frozen || !d.pending.is_empty() { return Err(ProtocolError::ScopeUnavailable); }
+            if arm && index == 0 {
+                if d.observation_pending || d.expected_positive { return Err(ProtocolError::ScopeUnavailable); }
+                d.probe_cycle = d.probe_cycle.checked_add(1).ok_or(ProtocolError::CapacityExceeded)?;
+                let cycle = d.probe_cycle;
+                for probe in &mut d.probes {
+                    probe.cycle = cycle; probe.arm_status = None; probe.arm_value = None;
+                    probe.finish_status = None; probe.finish_value = None;
+                }
+            }
+            if d.probe_cycle == 0 || d.probes[index].cycle != d.probe_cycle { return Err(ProtocolError::ScopeUnavailable); }
+            let probe = &mut d.probes[index];
+            if arm {
+                if probe.arm_status.is_some() { return Err(ProtocolError::ScopeUnavailable); }
+                probe.arm_status = Some(status.clone());
+            } else {
+                if probe.arm_value != Some(true) || probe.finish_status.is_some() { return Err(ProtocolError::ScopeUnavailable); }
+                probe.finish_status = Some(status.clone());
+            }
+            d.pending.push(PendingDragCommand { status: status.clone(), dropped: false, disabled: false, may_start_drag: false, observation_was_pending: false, observation_was_finishable: false, application_input: false });
         }
-        let value = bounded(page, op, page.client.send_reserved_command(method, Some(params), Some(session), Some(reservation))).await?;
+        let value = bounded(page, op, async {
+            let value = page.client.send_reserved_command(method, Some(params), Some(session), Some(reservation)).await?;
+            // Store decoded evidence BEFORE bounded's postcheck can observe a
+            // simultaneous cancellation. Missing Value after submission is never replayable.
+            let mut d = lock(&token.0).map_err(|_| "point probe state unavailable".to_owned())?;
+            let probe = &mut d.probes[index];
+            if arm { probe.arm_value = if value.get("exceptionDetails").is_none() { value["result"]["value"].as_bool() } else { None }; }
+            else { probe.finish_value = ProbeObservation::decode(&value); }
+            Ok(value)
+        }).await?;
         status.wait_successful_ack(op.deadline).await?;
         lock(&token.0)?.pending.clear();
         Ok(value)
@@ -187,13 +279,15 @@ impl ClientPageState {
             let may_start_drag = held_left_move && debt.enable_submitted && !debt.disabled
                 && !debt.receipt.observed_on(&debt.session);
             let observation_was_pending = debt.observation_pending;
-            debt.pending.push(PendingDragCommand { status: status.clone(), dropped: drop, disabled: disable, may_start_drag, observation_was_pending });
-            if may_start_drag { debt.observation_pending = true; }
+            let observation_was_finishable = debt.observation_finishable;
+            debt.pending.push(PendingDragCommand { status: status.clone(), dropped: drop, disabled: disable, may_start_drag, observation_was_pending, observation_was_finishable, application_input: true });
+            if may_start_drag { debt.observation_pending = true; debt.observation_finishable = false; }
             if enable { debt.enable_submitted = true; debt.disabled = false; }
         }
         let value = bounded(page, op, page.client.send_reserved_command(method, Some(params), Some(&page.page_session_id), Some(reservation))).await?;
         status.wait_successful_ack(op.deadline).await?;
         let mut debt = lock(&token.0)?;
+        if debt.pending.iter().any(|p| p.may_start_drag) { debt.observation_finishable = true; }
         debt.pending.clear();
         if disable { debt.disabled = true; }
         if drop { debt.drop_acknowledged = true; }
@@ -231,7 +325,7 @@ impl ClientPageState {
                 let d = lock(debt)?; let o = &d.observers[index];
                 // A late successful Runtime envelope alone does not prove no
                 // JavaScript exception. Without its validated reply, retain debt.
-                if o.status.as_ref().is_some_and(|status| !status.is_error_ack()) && !o.reply_validated { return Err(ProtocolError::CleanupFailed); }
+                if o.status.as_ref().is_some_and(|status| !status.has_validated_error_reply()) && !o.reply_validated { return Err(ProtocolError::CleanupFailed); }
                 (o.session.clone(), o.method, o.params.clone(), o.status.clone())
             };
             let result = strict_cleanup_command(client, &session, method, params, previous, deadline, |status| {
@@ -266,13 +360,17 @@ impl ClientPageState {
                 // equivalent proof. An explicit error ACK is terminal failure,
                 // not successful movement, drop, disable, or cleanup.
                 let never_submitted = pending.status.snapshot() == client_debt::CommandStatus::Abandoned;
-                if pending.status.is_error_ack() || never_submitted {
+                if pending.status.has_validated_error_reply() || never_submitted {
                     let mut d = lock(&debt)?;
                     d.primary_failed = true;
                     // A generic error ACK does not establish non-injection. Only
                     // exact never-submitted proof can undo movement observation
                     // debt; error ACK is NOT a renderer-negative receipt.
-                    if never_submitted && pending.may_start_drag { d.observation_pending = pending.observation_was_pending; }
+                    if never_submitted && pending.may_start_drag {
+                        d.observation_pending = pending.observation_was_pending;
+                        d.observation_finishable = pending.observation_was_finishable;
+                    }
+                    if pending.application_input && pending.status.snapshot() == client_debt::CommandStatus::RetainedRejected { d.rejected_input.push(pending.status.clone()); }
                     continue;
                 }
                 return Err(error);
@@ -280,8 +378,12 @@ impl ClientPageState {
             let mut d = lock(&debt)?;
             d.drop_acknowledged |= pending.dropped;
             d.disabled |= pending.disabled;
+            if pending.may_start_drag { d.observation_finishable = true; }
         }
         lock(&debt)?.pending.clear();
+        // Observation failure must not prevent safe cancel/disable/release. Its
+        // unresolved bit stays set and prevents cleanupcomplete at the final fence.
+        let _ = self.settle_point_drag_observation(client, session, &debt, deadline).await;
         self.cancel_owned_point_drag(client, session, &debt, deadline).await?;
         let (enabled, disabled, disable_status) = {
             let d = lock(&debt)?;
@@ -302,6 +404,66 @@ impl ClientPageState {
         // no earlier unknown/foreign drag was cancelled and no command is replayed.
         self.cancel_owned_point_drag(client, session, &debt, deadline).await?;
         Ok(Some(debt))
+    }
+    async fn settle_point_drag_observation(&self, client: &CdpClient, session: &str, debt: &Arc<Mutex<PointDragDebt>>, deadline: Instant) -> Result<(), ProtocolError> {
+        let (realms, tickets, count, cycle) = {
+            let d = lock(debt)?;
+            if !d.observation_pending || d.receipt.observed_on(session) { return Ok(()); }
+            // Recovery reads are limited to an ACKed original movement. A
+            // rejected move without own evidence remains the negative control.
+            if !d.observation_finishable { return Err(ProtocolError::CleanupFailed); }
+            (d.realms.clone(), d.probes.iter().map(|p| p.realm.clone()).collect::<Vec<_>>(), d.probes.len(), d.probe_cycle)
+        };
+        if count == 0 || cycle == 0 { return Err(ProtocolError::CleanupFailed); }
+        realms.verify_cleanup(client, session, deadline, &tickets).await?;
+        let mut complete = true;
+        let mut positive = false;
+        for index in 0..count {
+            let (probe_session, object, arm_status, arm_value, previous, value, probe_cycle) = {
+                let d = lock(debt)?; let p = &d.probes[index];
+                (p.session.clone(), p.object.clone(), p.arm_status.clone(), p.arm_value, p.finish_status.clone(), p.finish_value, p.cycle)
+            };
+            if probe_cycle != cycle || arm_value != Some(true) { complete = false; continue; }
+            let Some(arm_status) = arm_status else { complete = false; continue; };
+            if arm_status.wait_successful_ack(deadline).await.is_err() { complete = false; continue; }
+            let observed = if let Some(value) = value {
+                let Some(previous) = previous.as_ref() else { complete = false; continue; };
+                if previous.wait_successful_ack(deadline).await.is_err() { complete = false; continue; }
+                Some(value)
+            } else {
+                // Only never-submitted finish can be invoked here. A reader ACK
+                // without the retained result is not a negative observation.
+                if previous.as_ref().is_some_and(|s| s.snapshot() != client_debt::CommandStatus::Abandoned) { complete = false; continue; }
+                if Instant::now() >= deadline { complete = false; continue; }
+                let params = json!({"objectId":object,"functionDeclaration":"function(){return this.finish()}","returnByValue":true,"awaitPromise":true});
+                let reservation = client_debt::command_scope(CommandCategory::CleanupObject, false, async {
+                    client.reserve_tracked_command("Runtime.callFunctionOn", Some(&params), Some(&probe_session))
+                }).await.map_err(|_| ProtocolError::CleanupFailed)?.ok_or(ProtocolError::CleanupFailed)?;
+                let status = reservation.status();
+                lock(debt)?.probes[index].finish_status = Some(status.clone());
+                let reply = tokio::time::timeout_at(deadline.into(), client.send_reserved_command("Runtime.callFunctionOn", Some(params), Some(&probe_session), Some(reservation))).await;
+                match reply {
+                    Ok(Ok(value)) => {
+                        let decoded = ProbeObservation::decode(&value);
+                        lock(debt)?.probes[index].finish_value = decoded;
+                        if decoded.is_none() || status.wait_successful_ack(deadline).await.is_err() {
+                            lock(debt)?.cleanup_failed = true;
+                            complete = false; continue;
+                        }
+                        decoded
+                    }
+                    _ => { lock(debt)?.cleanup_failed = true; complete = false; continue; }
+                }
+            };
+            match observed { Some(ProbeObservation::Drag) => positive = true, Some(_) => {}, None => complete = false }
+        }
+        // Positive native evidence remains a cleanup constraint even if a sibling
+        // loses its realm; it never alone authorizes cancellation of a foreign drag.
+        if positive { lock(debt)?.expected_positive = true; }
+        realms.verify_cleanup(client, session, deadline, &tickets).await?;
+        if !complete { return Err(ProtocolError::CleanupFailed); }
+        lock(debt)?.observation_pending = false;
+        Ok(())
     }
     async fn cancel_owned_point_drag(&self, client: &CdpClient, session: &str, debt: &Arc<Mutex<PointDragDebt>>, deadline: Instant) -> Result<(), ProtocolError> {
         let previous = {
@@ -379,6 +541,12 @@ impl ClientPageState {
             let _ = self.cancel_owned_point_drag(client, session, &debt, deadline).await;
             return Err(error);
         }
+        let proof = {
+            let d = lock(&debt)?;
+            PointDragCleanupProof { journal: d.journal.clone(), session: d.session.clone(), rejected: d.rejected_input.clone() }
+        };
+        let ledger = lock(&debt)?.journal.ledger();
+        ledger.retire_point_drag_rejections(proof)?;
         let mut state = self.state()?;
         state.input = clean;
         state.point_drag = None;
@@ -416,7 +584,7 @@ impl StrictCleanupFailure {
 }
 async fn strict_status(status: &CommandStatusHandle, deadline: Instant) -> Result<(), StrictCleanupFailure> {
     status.wait_successful_ack(deadline).await.map_err(|error| {
-        if status.is_error_ack() { StrictCleanupFailure::terminal() } else { StrictCleanupFailure::unknown(error) }
+        if status.has_validated_error_reply() { StrictCleanupFailure::terminal() } else { StrictCleanupFailure::unknown(error) }
     })
 }
 /// Persist a reservation before submission; re-entry waits for that exact command,
@@ -443,7 +611,7 @@ async fn strict_cleanup_command(
             return Err(StrictCleanupFailure::terminal());
         }
         Ok(Ok(_)) => {},
-        _ if status.is_error_ack() => return Err(StrictCleanupFailure::terminal()),
+        _ if status.has_validated_error_reply() => return Err(StrictCleanupFailure::terminal()),
         _ => return Err(StrictCleanupFailure::unknown(ProtocolError::CleanupFailed)),
     }
     strict_status(&status, deadline).await

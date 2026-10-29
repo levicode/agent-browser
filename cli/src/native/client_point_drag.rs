@@ -151,10 +151,10 @@ async fn setup_command(
     let ctx = runner.context;
     let mut cancelled = ctx.operation.cancellation.clone();
     let command = client_debt::command_scope(CommandCategory::ApplicationObject, false, async {
-        ctx.page.client.send_action_command(method, Some(params), Some(session)).await
+        ctx.page.client.send_point_drag_setup_command(method, params, session, ctx.operation).await
     });
     tokio::select! {
-        result = command => result.map_err(|error| error.into_protocol(ctx.operation)),
+        result = command => result,
         _ = cancelled.changed() => Err(ProtocolError::Cancelled),
         _ = tokio::time::sleep_until(ctx.operation.deadline.into()) => Err(ProtocolError::DeadlineExceeded),
     }
@@ -201,12 +201,12 @@ pub(super) async fn execute(
         #[cfg(test)]
         ActionRealmAuthority::UntrackedFixture => return Err(ProtocolError::ScopeUnavailable),
     };
-    let realms: super::super::client_enrollment::PointDragRealms = enrollment.capture_point_drag_realms(ctx.page, ctx.operation)?;
+    let realms = Arc::new(enrollment.capture_point_drag_realms(ctx.page, ctx.operation)?);
     let (events, receipt) = ctx.page.client
         .subscribe_drag_interception(&ctx.page.page_session_id, 1024 * 1024)
         .map_err(|_| ProtocolError::CapacityExceeded)?;
     let events = Arc::new(tokio::sync::Mutex::new(events));
-    let token = ctx.page_state.begin_point_drag(ctx.page, ctx.operation, receipt, events.clone())?;
+    let token = ctx.page_state.begin_point_drag(ctx.page, ctx.operation, receipt, events.clone(), realms.clone())?;
     let mut probes = Vec::new();
     for (index, binding) in realms.bindings().iter().enumerate() {
         let capture = enrollment.reserve_exact_realm(ctx.page, binding, ctx.operation)?;

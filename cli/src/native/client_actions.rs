@@ -5590,7 +5590,7 @@ mod tests {
                         direct_point_clicks::native_drag_event().to_string()
                     )).await.unwrap();
                 }
-                if mode == direct_point_clicks::CANCEL_MODE
+                if direct_point_clicks::cancels_first_held_move(mode)
                     && method == "Input.dispatchMouseEvent"
                     && request["params"]["type"] == "mouseMoved"
                     && request["params"]["x"].as_f64() == Some(30.0)
@@ -5598,6 +5598,30 @@ mod tests {
                     // Cancel only after the real first paced move is submitted,
                     // before its ACK can let the producer submit another move.
                     server_cancel.send_replace(CancelSignal::Requested);
+                }
+                if mode == direct_point_clicks::FINISH_LOST_CANCEL_MODE
+                    && direct_point_clicks::is_probe_finish(&request)
+                {
+                    // This is the real original finish submission. Withhold its
+                    // Value and cancel; cleanup must not send that finish again.
+                    server_cancel.send_replace(CancelSignal::Requested);
+                }
+                if mode == direct_point_clicks::CLEANUP_REALM_DESTROYED_MODE
+                    && direct_point_clicks::is_probe_finish(&request)
+                {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"method":"Runtime.executionContextDestroyed","sessionId":"page",
+                            "params":{"executionContextId":1}}).to_string()
+                    )).await.unwrap();
+                }
+                if mode == direct_point_clicks::CLEANUP_LATE_OWN_MODE
+                    && method == "Input.setInterceptDrags" && request["params"]["enabled"] == false
+                {
+                    // The owner event arrives after the passive negative result,
+                    // while disable is pending, before that exact ACK is sent.
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                        direct_point_clicks::native_drag_event().to_string()
+                    )).await.unwrap();
                 }
                 if method == "Page.getLayoutMetrics" {
                     layout_metrics_reads += 1;

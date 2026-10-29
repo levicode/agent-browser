@@ -25,7 +25,7 @@ use super::interaction::{char_to_key_info, key_text, named_key_info};
 mod navigation_retirement;
 #[path = "client_point_drag_debt.rs"]
 mod point_drag_debt;
-pub(crate) use point_drag_debt::PointDragToken;
+pub(crate) use point_drag_debt::{PointDragCleanupProof, PointDragToken};
 
 #[derive(Clone, Default)]
 struct Config {

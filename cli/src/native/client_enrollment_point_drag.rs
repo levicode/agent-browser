@@ -103,6 +103,75 @@ impl PointDragRealms {
     /// world constructor. Never selector/actionable-element authority.
     pub(crate) fn bindings(&self) -> &[ExactBinding] { &self.snapshot.bindings }
 
+    /// Retained cleanup observation only: no new operation, realm, or input grant.
+    /// The caller supplies the original cleanup deadline and every already-held
+    /// ticket; cancellation of the original action does not erase that custody.
+    pub(crate) async fn verify_cleanup(
+        &self, client: &CdpClient, session: &str, deadline: Instant,
+        exact_tickets: &[Arc<ExactRealmTicket>],
+    ) -> Result<(), ProtocolError> {
+        let check_identity = || -> Result<(), ProtocolError> {
+            self.owner.check()?;
+            if Instant::now() >= deadline
+                || !std::ptr::eq(self.owner.client.as_ref(), client)
+                || session != self.session
+                || self.owner.generation != self.operation.generation
+                || *client.remote_connection_closed().borrow()
+                || *self.owner.active_root.lock().map_err(|_| ProtocolError::ScopeUnavailable)? != self.session
+            { return Err(ProtocolError::CleanupFailed); }
+            let ledger = client.debt_ledger().ok_or(ProtocolError::ScopeUnavailable)?;
+            let journal = super::super::client_debt::OperationJournalHandle::current()
+                .ok_or(ProtocolError::ScopeUnavailable)?;
+            if !journal.matches_protected_read(&ledger, &self.owner.targets.identity_scope,
+                &self.target, &self.session, &self.operation) {
+                return Err(ProtocolError::StaleScope);
+            }
+            Ok(())
+        };
+        check_identity()?;
+        let watermark = self.owner.realm_watermark()?;
+        // Reconcile only the existing subscribed lifecycle stream. This loop
+        // never discovers frames or constructs an uncancelled application lease.
+        tokio::time::timeout_at(deadline.into(), async {
+            loop {
+                let changed = self.owner.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                check_identity()?;
+                {
+                    let index = self.owner.index.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    let received = watermark.received().map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    if capture_admission_ready(&index, received) { break; }
+                }
+                changed.await;
+            }
+            Ok::<(), ProtocolError>(())
+        }).await.map_err(|_| ProtocolError::CleanupFailed)??;
+        check_identity()?;
+        let index = self.owner.index.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.owner.realm_snapshot_healthy(&index, &watermark)?;
+        if !capture_admission_ready(&index, watermark.received().map_err(|_| ProtocolError::ScopeUnavailable)?)
+            || point_drag_snapshot(&index, &self.session, &self.target)? != self.snapshot
+            || exact_tickets.len() != self.snapshot.bindings.len()
+        { return Err(ProtocolError::StaleReference); }
+        for binding in &self.snapshot.bindings {
+            let mut matched = exact_tickets.iter().filter(|ticket| ticket.binding == *binding);
+            let ticket = matched.next().ok_or(ProtocolError::StaleReference)?;
+            if matched.next().is_some() || !Arc::ptr_eq(&ticket.owner, &self.owner)
+                || ticket.fact.destroyed.load(Ordering::SeqCst)
+                || index.realm_sessions.get(&ticket.fact.session) != Some(&ticket.fact.tenure)
+                || !index.realms.get(&(ticket.fact.session.clone(), ticket.fact.id))
+                    .is_some_and(|fact| Arc::ptr_eq(fact, &ticket.fact))
+            { return Err(ProtocolError::StaleReference); }
+        }
+        for captured in &self.attachments {
+            if !captured.same_attachment(&self.owner.targets.owned_target(&captured.target_id)?) {
+                return Err(ProtocolError::StaleScope);
+            }
+        }
+        Ok(())
+    }
+
     /// Invoke before installing observers and after their receipts, before any
     /// negative/no-drag decision. Each ExactRealmTicket must ALSO be verified:
     /// equal frame identities alone do not prove that an observer realm survived.

@@ -891,6 +891,15 @@ impl CommandStatusHandle {
     pub(crate) fn is_error_ack(&self) -> bool {
         self.0.load(Ordering::SeqCst) == CommandStatus::Acknowledged as u8
     }
+    /// Exact reader-validated error reply, including a rejected input/release
+    /// whose obligation remains retained. This proves terminal failure ONLY:
+    /// it does not settle debt, prove non-injection, or authorize replay.
+    /// RetainedRejected is minted only after envelope + exact-session validation
+    /// in settle_for_delivery; transport loss and pending submission do not mint it.
+    pub(crate) fn has_validated_error_reply(&self) -> bool {
+        let value = self.0.load(Ordering::SeqCst);
+        value == CommandStatus::Acknowledged as u8 || value == CommandStatus::RetainedRejected as u8
+    }
     /// The reader distinguishes a validated success envelope from an error ACK.
     /// This receipt retires only the exact callback command, never owner debt.
     pub(crate) async fn wait_successful_ack(&self, deadline: Instant) -> Result<(), ProtocolError> {
@@ -2417,6 +2426,41 @@ impl OwnerDebtLedger {
         stop: &mut AdmissionObservation,
     ) -> Result<CommandReservation, ProtocolError> {
         self.reserve_command_inner(journal, method, params, session, None, None, stop)
+    }
+    /// Consume the page transaction's private all-clean + sealed proof. This is
+    /// NOT a sweep and NOT a successful application ACK: retain its known error
+    /// and mutation classification while retiring only explicitly listed debt.
+    pub(crate) fn retire_point_drag_rejections(
+        self: &Arc<Self>, proof: super::client_page::PointDragCleanupProof,
+    ) -> Result<(), ProtocolError> {
+        let (journal, session, rejected) = proof.into_parts();
+        if !Arc::ptr_eq(self, &journal.ledger)
+            || current_operation().is_none_or(|current| !current.same_operation(&journal)) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut state = self.state.lock().map_err(|_| ProtocolError::CleanupFailed)?;
+        if state.integrity_lost || state.retired { return Err(ProtocolError::CleanupFailed); }
+        let mut ids = HashSet::new();
+        for status in &rejected {
+            let (id, command) = state.commands.iter().find(|(_, command)| Arc::ptr_eq(&command.status.0, &status.0)).ok_or(ProtocolError::CleanupFailed)?;
+            if !ids.insert(*id) || !command.submitted
+                || command.category != CommandCategory::ApplicationInput
+                || command.provenance.operation != Some(journal.key())
+                || command.provenance.target.as_deref() != Some(journal.journal.target.as_str())
+                || command.provenance.session.as_deref() != Some(session.as_str())
+                || command.status.snapshot() != CommandStatus::RetainedRejected {
+                return Err(ProtocolError::CleanupFailed);
+            }
+        }
+        // Prevalidation is complete before any mutation; a mixed/foreign list
+        // cannot partially clear valid obligations then fail on an invalid one.
+        for id in ids {
+            let command = remove_command(&mut state, id).expect("validated exact rejected command");
+            command.status.acknowledged(false);
+        }
+        drop(state);
+        self.changed.notify_waiters();
+        Ok(())
     }
     pub(crate) fn reserve_owner_cleanup(
         self: &Arc<Self>,
@@ -6303,6 +6347,108 @@ pub(crate) mod tests {
         cleanup.settle(&response(json!({"result":{"type":"boolean","value":true}})));
         assert_eq!(ledger.snapshot().object_debt, 0);
         assert!(journal.snapshot().mutation_dispatched);
+    }
+    #[tokio::test]
+    async fn validated_rejected_input_reply_is_terminal_failure_not_release_proof() {
+        let (ledger, journal) = owner();
+        let reservation = ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", None, Some("page")).unwrap();
+        let status = reservation.status();
+        assert!(!status.has_validated_error_reply());
+        let submitted = reservation.submit().unwrap();
+        assert!(!status.has_validated_error_reply());
+        submitted.settle(&serde_json::from_value(json!({"id":1,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}})).unwrap());
+        assert!(status.has_validated_error_reply());
+        assert!(!status.is_error_ack(), "existing ordinary error-ACK API is unchanged");
+        assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
+        assert!(!status.settled());
+        assert!(status.wait_successful_ack(Instant::now() + std::time::Duration::from_secs(1)).await.is_err());
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        assert!(journal.snapshot().mutation_dispatched);
+        // A distinct successful release ACK is not implicit authority to sweep
+        // the original exact retained command from the ledger.
+        let release = command_scope(CommandCategory::CleanupInput, false, async {
+            ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", Some(&json!({"type":"mouseReleased"})), Some("page"))
+        }).await.unwrap();
+        release.submit().unwrap().settle(&response(json!({})));
+        assert_eq!(ledger.snapshot().input_debt, 1);
+        assert!(status.has_validated_error_reply());
+    }
+    #[test]
+    fn validated_error_reply_requires_exact_reader_envelope_not_unknown_or_success() {
+        for reply in [
+            json!({"id":1,"sessionId":"foreign","error":{"code":-32000,"message":"synthetic"}}),
+            json!({"id":1,"sessionId":"page","error":{"message":"missing code"}}),
+            json!({"id":1,"sessionId":"page","result":{},"error":{"code":-32000,"message":"both"}}),
+            json!({"id":1,"sessionId":"page","result":{}}),
+        ] {
+            let (ledger, journal) = owner();
+            let reservation = ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", None, Some("page")).unwrap();
+            let status = reservation.status();
+            reservation.submit().unwrap().settle(&serde_json::from_value(reply).unwrap());
+            assert!(!status.has_validated_error_reply());
+        }
+        let status = CommandStatusHandle::new(false, Arc::new(tokio::sync::Notify::new()));
+        for state in [CommandStatus::Reserved, CommandStatus::Submitted, CommandStatus::Destroyed, CommandStatus::Abandoned, CommandStatus::IntegrityLost] {
+            status.set(state);
+            assert!(!status.has_validated_error_reply());
+        }
+        status.acknowledged(true);
+        assert!(!status.has_validated_error_reply());
+        status.acknowledged(false);
+        assert!(status.has_validated_error_reply());
+    }
+    #[tokio::test]
+    async fn point_drag_cleanup_proof_retires_only_its_exact_rejections_without_success_ack() {
+        let (ledger, journal) = owner();
+        let mut statuses = Vec::new();
+        for method in ["Input.setInterceptDrags", "Input.dispatchDragEvent"] {
+            let reservation = ledger.reserve_command(Some(&journal), method, None, Some("page")).unwrap();
+            statuses.push(reservation.status());
+            reservation.submit().unwrap().settle(&serde_json::from_value(json!({"id":1,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}})).unwrap());
+        }
+        assert_eq!(ledger.snapshot().input_debt, 2);
+        let proof = super::super::client_page::PointDragCleanupProof::for_test(journal.clone(), "page".into(), statuses.clone());
+        journal.scope(async { ledger.retire_point_drag_rejections(proof) }).await.unwrap();
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(journal.snapshot().mutation_dispatched);
+        for status in statuses {
+            assert!(status.is_error_ack());
+            assert!(status.has_validated_error_reply());
+            assert!(status.wait_successful_ack(Instant::now() + std::time::Duration::from_secs(1)).await.is_err());
+        }
+    }
+    #[tokio::test]
+    async fn point_drag_cleanup_proof_rejects_mixed_unknown_cleanup_and_wrong_scope_without_partial_retirement() {
+        let (ledger, journal) = owner();
+        let rejected = ledger.reserve_command(Some(&journal), "Input.dispatchDragEvent", None, Some("page")).unwrap();
+        let status = rejected.status();
+        rejected.submit().unwrap().settle(&serde_json::from_value(json!({"id":1,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}})).unwrap());
+        let unknown = ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", None, Some("page")).unwrap();
+        let unknown_status = unknown.status();
+        let _submitted = unknown.submit().unwrap();
+        let cleanup = command_scope(CommandCategory::CleanupInput, false, async {
+            ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", None, Some("page"))
+        }).await.unwrap();
+        let cleanup_status = cleanup.status();
+        cleanup.submit().unwrap().settle(&serde_json::from_value(json!({"id":3,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}})).unwrap());
+        let before = ledger.snapshot();
+        for (session, list) in [
+            ("page", vec![status.clone(), unknown_status]),
+            ("page", vec![status.clone(), cleanup_status]),
+            ("page", vec![status.clone(), status.clone()]),
+            ("foreign", vec![status.clone()]),
+        ] {
+            let proof = super::super::client_page::PointDragCleanupProof::for_test(journal.clone(), session.into(), list);
+            assert!(journal.scope(async { ledger.retire_point_drag_rejections(proof) }).await.is_err());
+            assert_eq!(ledger.snapshot(), before);
+            assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
+        }
+        let proof = super::super::client_page::PointDragCleanupProof::for_test(journal.clone(), "page".into(), vec![status.clone()]);
+        assert!(ledger.retire_point_drag_rejections(proof).is_err(), "no ambient original journal is not authority");
+        let (_, other_journal) = owner();
+        let proof = super::super::client_page::PointDragCleanupProof::for_test(journal.clone(), "page".into(), vec![status]);
+        assert!(other_journal.scope(async { ledger.retire_point_drag_rejections(proof) }).await.is_err());
+        assert_eq!(ledger.snapshot(), before);
     }
     #[test]
     fn rejected_object_release_is_retained_debt_not_cleanup_success() {

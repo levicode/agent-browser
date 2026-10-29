@@ -40,6 +40,23 @@ impl ActionCommandFailure {
     pub(crate) fn as_str(&self) -> &str { &self.message }
 }
 
+// Private typed evidence from the one reservation core. Legacy callers retain
+// their exact String projection; only point-drag setup observes local capacity.
+enum TrackedReservationFailure {
+    OwnerChanged,
+    OwnerRequired,
+    Ledger(ProtocolError),
+}
+impl TrackedReservationFailure {
+    fn legacy_message(&self) -> &'static str {
+        match self {
+            Self::OwnerChanged => "Native CDP owner changed",
+            Self::OwnerRequired => "Native CDP requires an owner-bound view",
+            Self::Ledger(_) => "Native CDP command admission refused",
+        }
+    }
+}
+
 type TrackedResponses = Arc<std::sync::Mutex<HashMap<u64, SubmittedCommand>>>;
 type DebtOwner = Arc<std::sync::Mutex<Option<Arc<OwnerDebtLedger>>>>;
 struct DisposalWork {
@@ -1545,16 +1562,26 @@ impl CdpClient {
         session: Option<&str>,
         stop: &mut AdmissionObservation,
     ) -> Result<Option<CommandReservation>, String> {
+        self.reserve_tracked_command_observed_typed(method, params, session, stop)
+            .map_err(|failure| failure.legacy_message().to_owned())
+    }
+    fn reserve_tracked_command_observed_typed(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        session: Option<&str>,
+        stop: &mut AdmissionObservation,
+    ) -> Result<Option<CommandReservation>, TrackedReservationFailure> {
         let Some(ledger) = self.debt_ledger() else {
             return Ok(None);
         };
         let journal = current_operation();
         self.check_cleanup_owner(&Some(ledger.clone()))
-            .map_err(|_| "Native CDP owner changed".to_string())?;
+            .map_err(|_| TrackedReservationFailure::OwnerChanged)?;
         // Legacy handles cease being ambient native-service authority when a
         // managed owner is installed. Operation journals remain exact-bound.
         if self.owner.is_none() && journal.is_none() {
-            return Err("Native CDP requires an owner-bound view".into());
+            return Err(TrackedReservationFailure::OwnerRequired);
         }
         let reserved = ledger.reserve_command_observed(journal.as_ref(), method, params, session, stop);
         #[cfg(test)]
@@ -1569,7 +1596,7 @@ impl CdpClient {
         }
         reserved
             .map(Some)
-            .map_err(|_| "Native CDP command admission refused".to_string())
+            .map_err(TrackedReservationFailure::Ledger)
     }
     fn next_command_id(&self) -> Result<u64, String> {
         #[allow(deprecated)]
@@ -1646,6 +1673,41 @@ impl CdpClient {
         self.send_command_observed(method, params, session_id, &mut stop)
             .await
             .map_err(|_message| ActionCommandFailure { #[cfg(test)] message: _message, stop: stop.take() })
+    }
+
+    /// Point-drag inert-realm setup only. Preserve an actual local capacity
+    /// refusal before send; opaque transport/remote failures remain BrowserFailure.
+    /// This uses the same owner/journal/ledger admission and writer recheck as
+    /// send_action_command, whose legacy error contract is deliberately unchanged.
+    pub(crate) async fn send_point_drag_setup_command(
+        &self,
+        method: &str,
+        params: Value,
+        session: &str,
+        operation: &super::super::client_session::OperationLease,
+    ) -> Result<Value, ProtocolError> {
+        if !matches!(method, "Page.createIsolatedWorld" | "Runtime.evaluate") {
+            return Err(ProtocolError::InvalidArguments);
+        }
+        let mut stop = AdmissionObservation::requested();
+        let reservation = match self.reserve_tracked_command_observed_typed(
+            method, Some(&params), Some(session), &mut stop,
+        ) {
+            Ok(reservation) => reservation,
+            Err(TrackedReservationFailure::Ledger(ProtocolError::CapacityExceeded)) => {
+                return Err(ProtocolError::CapacityExceeded);
+            }
+            Err(_failure) => return Err(ActionCommandFailure {
+                #[cfg(test)] message: _failure.legacy_message().to_owned(),
+                stop: stop.take(),
+            }.into_protocol(operation)),
+        };
+        self.send_reserved_command_observed(method, Some(params), Some(session), reservation, &mut stop)
+            .await
+            .map_err(|_message| ActionCommandFailure {
+                #[cfg(test)] message: _message,
+                stop: stop.take(),
+            }.into_protocol(operation))
     }
 
     async fn send_command_observed(
@@ -2996,6 +3058,87 @@ mod owner_lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn point_drag_setup_preserves_only_typed_local_capacity_and_exact_cancellation() {
+        use crate::native::client_debt::{command_scope, CommandCategory, OperationKey};
+        use crate::native::client_session::ClientSession;
+        for mode in ["capacity", "cancel", "writer-cancel", "remote-error", "unknown"] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut commands = 0;
+                while let Some(Ok(message)) = socket.next().await {
+                    if message.is_close() { break; }
+                    if !message.is_text() { continue; }
+                    commands += 1;
+                    assert!(matches!(mode, "remote-error" | "unknown"), "locally refused setup sent bytes: {mode}");
+                    let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], "Runtime.evaluate");
+                    assert_eq!(request["sessionId"], "page");
+                    if mode == "unknown" { socket.close(None).await.unwrap(); break; }
+                    socket.send(Message::Text(json!({"id":request["id"],"sessionId":"page",
+                        "error":{"code":-32000,"message":"capacity exceeded (remote text is not local evidence)"}}).to_string())).await.unwrap();
+                }
+                commands
+            });
+            let client = CdpClient::connect(&endpoint).await.unwrap();
+            let ledger = OwnerDebtLedger::new(1, "point-setup-owner".into());
+            client.install_debt_ledger(ledger.clone()).unwrap();
+            let view = client.owner_view(ledger.clone()).unwrap();
+            let broker = ClientSession::new();
+            let operation = broker.admit(1, 1, 1_000).unwrap();
+            assert!(broker.start(1, 1).unwrap());
+            let journal = ledger.operation(OperationKey { generation:1, operation_seq:1 }, "target".into(), "page".into()).unwrap();
+            journal.bind_operation(&operation).unwrap();
+            let params = json!({"expression":"({})","returnByValue":false});
+            let mut reserved = Vec::new();
+            if mode == "capacity" {
+                // Actual ledger reservations, not a manufactured error envelope.
+                command_scope(CommandCategory::ApplicationObject, false, async {
+                    for _ in 0..16 {
+                        reserved.push(ledger.reserve_command(Some(&journal), "Runtime.evaluate", Some(&params), Some("page")).unwrap());
+                    }
+                }).await;
+                assert_eq!(ledger.snapshot().object_debt, 32);
+                let generic = journal.scope(command_scope(CommandCategory::ApplicationObject, false,
+                    view.send_action_command("Runtime.evaluate", Some(params.clone()), Some("page")))).await;
+                assert_eq!(generic.err().unwrap().into_protocol(&operation), ProtocolError::BrowserFailure,
+                    "generic action behavior must remain unchanged");
+            }
+            if mode == "cancel" { broker.cancel(1, 1).unwrap(); }
+            let result = if mode == "writer-cancel" {
+                let writer = client.transport.ws_tx.lock().await;
+                let mut pending = Box::pin(journal.scope(command_scope(CommandCategory::ApplicationObject, false,
+                    view.send_point_drag_setup_command("Runtime.evaluate", params.clone(), "page", &operation))));
+                assert!(futures_util::poll!(pending.as_mut()).is_pending());
+                assert_eq!(ledger.snapshot().outstanding_commands, 1);
+                broker.cancel(1, 1).unwrap();
+                drop(writer);
+                pending.await
+            } else {
+                journal.scope(command_scope(CommandCategory::ApplicationObject, false,
+                    view.send_point_drag_setup_command("Runtime.evaluate", params.clone(), "page", &operation))).await
+            };
+            let expected = match mode {
+                "capacity" => ProtocolError::CapacityExceeded,
+                "cancel" | "writer-cancel" => ProtocolError::Cancelled,
+                _ => ProtocolError::BrowserFailure,
+            };
+            assert_eq!(result.unwrap_err(), expected, "{mode}");
+            assert!(!journal.snapshot().mutation_dispatched);
+            drop(reserved);
+            if matches!(mode, "capacity" | "cancel" | "writer-cancel") {
+                assert_eq!(ledger.snapshot().object_debt, 0);
+                assert_eq!(ledger.snapshot().outstanding_commands, 0);
+                assert!(client.transport.pending.lock().await.is_empty());
+            }
+            client.close().await;
+            assert_eq!(peer.await.unwrap(), usize::from(matches!(mode, "remote-error" | "unknown")));
+        }
+    }
+
     #[tokio::test]
     async fn action_typed_submit_refusal_after_writer_wait_keeps_exact_cause_and_zero_wire() {
         use crate::native::client_debt::{command_scope, CommandCategory, OperationKey};
