@@ -529,6 +529,44 @@ impl OperationJournalHandle {
     pub(crate) fn same_operation(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.ledger, &other.ledger) && Arc::ptr_eq(&self.journal, &other.journal)
     }
+    /// Local no-submission evidence only. Cancellation/deadline may already
+    /// have stopped this exact read; neither relaxes owner/journal integrity.
+    pub(crate) fn matches_readonly_resolve_owner(
+        &self,
+        ledger: &Arc<OwnerDebtLedger>,
+        session: &str,
+        operation: &OperationLease,
+    ) -> bool {
+        if !Arc::ptr_eq(&self.ledger, ledger)
+            || ledger.generation != operation.generation
+            || self.key()
+                != (OperationKey {
+                    generation: operation.generation,
+                    operation_seq: operation.sequence,
+                })
+            || self.journal.session != session
+            || !current_operation().is_some_and(|current| current.same_operation(self))
+        {
+            return false;
+        }
+        // Same ledger -> journal order as submission and protected-read checks.
+        self.ledger.state.lock().is_ok_and(|owner| {
+            !owner.retired
+                && !owner.integrity_lost
+                && owner.targets.get(session) == Some(&self.journal.target)
+                && self.journal.state.lock().is_ok_and(|state| {
+                    !state.integrity_lost
+                        && !state.local_producers_finished
+                        && state
+                            .admission
+                            .as_ref()
+                            .is_some_and(|(deadline, cancellation)| {
+                                *deadline == operation.deadline
+                                    && cancellation.same_channel(&operation.cancellation)
+                            })
+                })
+        })
+    }
     pub(crate) fn matches_protected_read(
         &self,
         ledger: &Arc<OwnerDebtLedger>,

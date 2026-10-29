@@ -2900,6 +2900,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             super::client_protocol::PAGE_IDENTITY_FENCE,
             "browser.observe/1",
             "browser.observe-frame-policy/1",
+            "browser.issuance-bound-references/1",
             "browser.trace-semantic/1",
             "browser.query/1",
             "browser.query-union/1",

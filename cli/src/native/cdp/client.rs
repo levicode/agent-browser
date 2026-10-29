@@ -2926,7 +2926,7 @@ impl CdpClient {
             .store(u64::from(enabled), Ordering::SeqCst);
     }
     #[cfg(test)]
-    fn activation_command_diagnostic(
+    pub(crate) fn activation_command_diagnostic(
         &self,
         stage: &'static str,
         method: &str,

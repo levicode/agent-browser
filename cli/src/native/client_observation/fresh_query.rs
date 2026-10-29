@@ -1,6 +1,11 @@
 //! Atomic, reference-free samples for DOM-derived queries. AX-derived fields
 //! keep the existing native AX path; a declined proof never becomes absence.
 use super::*;
+#[path = "fresh_query_resolve.rs"]
+mod resolve_custody;
+#[cfg(test)]
+#[path = "fresh_query_submission_tests.rs"]
+mod submission_tests;
 
 fn eligible(expression: &LocatorExpression, fields: &[ReadField]) -> bool {
     if fields.iter().any(|field| {
@@ -122,8 +127,8 @@ pub(super) async fn fields(
     // This stage cannot submit a group-producing command. A stopped world
     // request therefore has no group to hand off: retaining an empty release
     // would consume the bounded cleanup command pool until its ACK arrives.
-    // Once resolving starts below, every outcome keeps the existing accounted
-    // group cleanup, including cancelled/unknown late object creation.
+    // Once a resolve may have submitted below, its outcomes keep the existing
+    // accounted cleanup, including cancelled/unknown late object creation.
     let world = command(
         client,
         session,
@@ -139,20 +144,30 @@ pub(super) async fn fields(
     let group = client
         .readonly_group_instance(&format!("native-query-{}-fields", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
+    let resolve_owner = resolve_custody::ResolveOwner::capture(client, session, &group, lease);
+    let mut resolve_receipts = Vec::new();
+    let mut sample_started = false;
     let result = async {
         use futures_util::{stream, StreamExt};
-        let handles: Vec<Result<String, ObservationError>> = stream::iter(ids.iter().copied().map(|backend| {
+        // Collect (not try_collect) drains every creator future before any
+        // no-submission decision. No creator is spawned outside this lifetime.
+        let attempts: Vec<_> = stream::iter(ids.iter().copied().map(|backend| {
             let group = &group;
+            let owner = resolve_owner.as_ref();
             async move {
-                let resolved = command(client, session, "DOM.resolveNode", json!({"backendNodeId":backend,"executionContextId":context,"objectGroup":group}), lease).await?;
-                resolved["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference)
+                let (resolved, receipt) = resolve_custody::resolve(client, session, backend, context, group, lease, owner).await;
+                let handle = resolved.and_then(|value| value["object"]["objectId"].as_str().map(str::to_owned).ok_or(ObservationError::StaleReference));
+                (handle, receipt)
             }
         })).buffered(16).collect().await;
+        let (handles, receipts): (Vec<_>, Vec<_>) = attempts.into_iter().unzip();
+        resolve_receipts = receipts;
         let handles = collect_hint_results(handles)?;
         let first = handles.first().ok_or(ObservationError::BackendFailure)?;
         let function = format!("function(expression,fields,testId,secureSelector,authorRoots,domains,...roots) {{ const read={METADATA}; const matchQuery={MATCH_QUERY}; const security={SECURITY_INVENTORY}; const sample={FRESH_FIELDS}; return sample(expression,fields,testId,secureSelector,authorRoots,domains,read,matchQuery,security,...roots); }}");
         let mut arguments = vec![json!({"value":expression}), json!({"value":fields}), json!({"value":options.test_id_attribute}), json!({"value":options.secure_field_selector}), json!({"value":author}), json!({"value":domains})];
         arguments.extend(handles.iter().map(|object| json!({"objectId":object})));
+        sample_started = true;
         let result = command(client, session, "Runtime.callFunctionOn", json!({"objectId":first,"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}), lease).await?;
         if result.get("exceptionDetails").is_some() { return Err(ObservationError::BackendFailure); }
         let value = &result["result"]["value"];
@@ -177,7 +192,20 @@ pub(super) async fn fields(
         }
         Ok(Some(samples))
     }.await;
-    let result = settle_object_group(client, session, &group, result, lease).await?;
+    // This is a local, exact-bound history proof, never an absent-group/debt
+    // inference. Reserved, submitted, acknowledged, destroyed and unknown
+    // attempts keep the normal cleanup path, even when no handle was returned.
+    let never_submitted = result.is_err()
+        && !sample_started
+        && resolve_receipts.len() == ids.len()
+        && resolve_owner.as_ref().is_some_and(|owner| {
+            owner.proves_no_submission(client, session, &group, lease, &resolve_receipts)
+        });
+    let result = if never_submitted {
+        result.map_err(|error| settled_stop(error, lease))
+    } else {
+        settle_object_group(client, session, &group, result, lease).await
+    }?;
     // A new/retired author root invalidates the acquired policy rather than
     // turning an unseen closed domain into an empty result. Leaf churn does not.
     validate_frame(client, frame, lease).await?;
