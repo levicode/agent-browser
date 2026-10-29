@@ -445,15 +445,14 @@ impl ActionContext<'_> {
         } else {
             CommandCategory::ApplicationRead
         };
-        let command = client_debt::command_scope(
-            category,
-            mutation,
-            async {
-                #[cfg(test)]
-                tests::replacement_boundary_hook(self, "command-before-admission");
-                self.page.client.send_action_command(method, Some(args), Some(session)).await
-            },
-        );
+        let command = client_debt::command_scope(category, mutation, async {
+            #[cfg(test)]
+            tests::replacement_boundary_hook(self, "command-before-admission");
+            self.page
+                .client
+                .send_action_command(method, Some(args), Some(session))
+                .await
+        });
         let mut cancel = self.operation.cancellation.clone();
         tokio::select! {
             value = command => {
@@ -5268,17 +5267,34 @@ mod tests {
             sequence: u64,
             run: impl FnOnce(&str) + Send + 'static,
         ) -> Self {
-            let binding = (scope.to_owned(), generation, sequence, "command-error-observed".to_owned());
-            assert!(replacement_hooks().lock().unwrap()
-                .insert(binding.clone(), ReplacementHook::CommandError(Box::new(run))).is_none());
+            let binding = (
+                scope.to_owned(),
+                generation,
+                sequence,
+                "command-error-observed".to_owned(),
+            );
+            assert!(replacement_hooks()
+                .lock()
+                .unwrap()
+                .insert(
+                    binding.clone(),
+                    ReplacementHook::CommandError(Box::new(run))
+                )
+                .is_none());
             Self(binding)
         }
     }
     pub(super) fn command_error_boundary_hook(ctx: &ActionContext<'_>, error: &str) {
-        let binding = (ctx.page.identity_scope.clone(), ctx.operation.generation,
-            ctx.operation.sequence, "command-error-observed".to_owned());
+        let binding = (
+            ctx.page.identity_scope.clone(),
+            ctx.operation.generation,
+            ctx.operation.sequence,
+            "command-error-observed".to_owned(),
+        );
         let hook = replacement_hooks().lock().unwrap().remove(&binding);
-        if let Some(ReplacementHook::CommandError(run)) = hook { run(error); }
+        if let Some(ReplacementHook::CommandError(run)) = hook {
+            run(error);
+        }
     }
     impl Drop for ReplacementBoundary {
         fn drop(&mut self) {
@@ -5583,12 +5599,16 @@ mod tests {
                     assert_eq!(request["sessionId"], "page");
                     capacity_enrollment_started = true;
                 }
-                let point_probe_reply = capacity_probe_peer.reply(mode, &request)
+                let point_probe_reply = capacity_probe_peer
+                    .reply(mode, &request)
                     .or_else(|| point_probe_peer.reply(mode, &request));
                 if direct_point_clicks::intercept_event(mode, &request, false) {
-                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                        direct_point_clicks::native_drag_event().to_string()
-                    )).await.unwrap();
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            direct_point_clicks::native_drag_event().to_string(),
+                        ))
+                        .await
+                        .unwrap();
                 }
                 if direct_point_clicks::cancels_first_held_move(mode)
                     && method == "Input.dispatchMouseEvent"
@@ -5615,13 +5635,17 @@ mod tests {
                     )).await.unwrap();
                 }
                 if mode == direct_point_clicks::CLEANUP_LATE_OWN_MODE
-                    && method == "Input.setInterceptDrags" && request["params"]["enabled"] == false
+                    && method == "Input.setInterceptDrags"
+                    && request["params"]["enabled"] == false
                 {
                     // The owner event arrives after the passive negative result,
                     // while disable is pending, before that exact ACK is sent.
-                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                        direct_point_clicks::native_drag_event().to_string()
-                    )).await.unwrap();
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            direct_point_clicks::native_drag_event().to_string(),
+                        ))
+                        .await
+                        .unwrap();
                 }
                 if method == "Page.getLayoutMetrics" {
                     layout_metrics_reads += 1;
@@ -5882,7 +5906,8 @@ mod tests {
                 } else {
                     "Save"
                 };
-                if direct_point_clicks::is_swipe_mode(mode) && method == "Page.createIsolatedWorld" {
+                if direct_point_clicks::is_swipe_mode(mode) && method == "Page.createIsolatedWorld"
+                {
                     let context = direct_point_clicks::probe_context(mode, &request);
                     socket.send(tokio_tungstenite::tungstenite::Message::Text(
                         json!({"method":"Runtime.executionContextCreated","sessionId":"page",
@@ -5963,12 +5988,22 @@ mod tests {
                     "Page.getLayoutMetrics" if retirement_node_swipes::is_mode(mode) => {
                         json!({"cssVisualViewport":{"clientWidth":1280.,"clientHeight":720.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":1280.,"clientHeight":720.}})
                     }
-                    "Page.getFrameTree" if mode == direct_point_clicks::CAPACITY_MODE && capacity_enrollment_started => direct_point_clicks::capacity_frame_tree(),
-                    "Page.createIsolatedWorld" if mode == direct_point_clicks::CAPACITY_MODE => json!({"executionContextId":direct_point_clicks::probe_context(mode, &request)}),
+                    "Page.getFrameTree"
+                        if mode == direct_point_clicks::CAPACITY_MODE
+                            && capacity_enrollment_started =>
+                    {
+                        direct_point_clicks::capacity_frame_tree()
+                    }
+                    "Page.createIsolatedWorld" if mode == direct_point_clicks::CAPACITY_MODE => {
+                        json!({"executionContextId":direct_point_clicks::probe_context(mode, &request)})
+                    }
                     "Page.getFrameTree" => {
                         json!({"frameTree":{"frame":{"id":"main","loaderId":"doc","url":"about:blank"}}})
                     }
-                    "Target.getTargets" if mode.starts_with("preparation-") || direct_point_clicks::is_swipe_mode(mode) => {
+                    "Target.getTargets"
+                        if mode.starts_with("preparation-")
+                            || direct_point_clicks::is_swipe_mode(mode) =>
+                    {
                         json!({"targetInfos":[{"targetId":"target","browserContextId":"context","type":"page"}]})
                     }
                     "Page.createIsolatedWorld" => json!({"executionContextId":1}),
@@ -6282,7 +6317,9 @@ mod tests {
                 let mut reply = if direct_point_clicks::known_input_error(mode, &request) {
                     json!({"id":request["id"],"error":{"code":-32000,"message":"controlled terminal input ErrorAck"}})
                 } else if mode == direct_point_clicks::HTML5_REJECT_MODE
-                    && method == "Input.dispatchDragEvent" && request["params"]["type"] == "drop" {
+                    && method == "Input.dispatchDragEvent"
+                    && request["params"]["type"] == "drop"
+                {
                     json!({"id":request["id"],"error":{"code":-32000,"message":"controlled drop rejection"}})
                 } else if mode == "preparation-readonly-command-hard-error"
                     && method == "Runtime.callFunctionOn"
@@ -6420,9 +6457,12 @@ mod tests {
                     break;
                 }
                 if direct_point_clicks::intercept_event(mode, &request, true) {
-                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
-                        direct_point_clicks::native_drag_event().to_string()
-                    )).await.unwrap();
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            direct_point_clicks::native_drag_event().to_string(),
+                        ))
+                        .await
+                        .unwrap();
                 }
                 let mut observed_reply = json!({"request":request,"reply":reply});
                 if direct_point_clicks::is_pointer_mode(mode) {
@@ -9073,9 +9113,21 @@ mod tests {
         let f = fixture("normal").await;
         let actions = ClientActions::default();
         seed_recording(&actions, &f, 1, Some(&[0x1a, 0x45, 0xdf, 0xa3]), false).await;
-        actions.recording.lock().await.current.as_ref().unwrap().state.encoder_succeeded.store(false, Ordering::SeqCst);
+        actions
+            .recording
+            .lock()
+            .await
+            .current
+            .as_ref()
+            .unwrap()
+            .state
+            .encoder_succeeded
+            .store(false, Ordering::SeqCst);
         let result = collect_recording(&actions, &f).await.unwrap();
-        assert_eq!(result, json!({"identityScope":"scope","segments":[],"missingSegment":1}));
+        assert_eq!(
+            result,
+            json!({"identityScope":"scope","segments":[],"missingSegment":1})
+        );
         assert!(actions.recording.lock().await.finished.is_empty());
     }
     #[tokio::test]
@@ -11472,9 +11524,16 @@ mod tests {
         let (owner, state, _notices) = preparation_settlement_owner(&f, broker.clone()).await;
         f.op = broker.admit(1, 1, 1_000).unwrap();
         assert!(broker.start(1, 1).unwrap());
-        let journal = ledger.operation(client_debt::OperationKey {
-            generation: 1, operation_seq: 1,
-        }, "target".into(), "page".into()).unwrap();
+        let journal = ledger
+            .operation(
+                client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
         journal.bind_operation(&f.op).unwrap();
         f.log.lock().unwrap().clear();
         f.replies.lock().unwrap().clear();
@@ -11484,15 +11543,19 @@ mod tests {
         let gate_broker = broker.clone();
         let gate_journal = journal.clone();
         let gate_cancel = f.op.cancellation.clone();
-        let _before = ReplacementBoundary::install(mode, 1, 1, "command-before-admission", move || {
-            assert_eq!(*gate_cancel.borrow(), CancelSignal::None);
-            assert_eq!(gate_journal.check_application_submission(), Ok(()));
-            gate_flag.store(true, Ordering::SeqCst);
-            if !hard_error_first {
-                gate_broker.cancel(1, 1).unwrap();
-                assert_eq!(gate_journal.check_application_submission(), Err(ProtocolError::Cancelled));
-            }
-        });
+        let _before =
+            ReplacementBoundary::install(mode, 1, 1, "command-before-admission", move || {
+                assert_eq!(*gate_cancel.borrow(), CancelSignal::None);
+                assert_eq!(gate_journal.check_application_submission(), Ok(()));
+                gate_flag.store(true, Ordering::SeqCst);
+                if !hard_error_first {
+                    gate_broker.cancel(1, 1).unwrap();
+                    assert_eq!(
+                        gate_journal.check_application_submission(),
+                        Err(ProtocolError::Cancelled)
+                    );
+                }
+            });
         let error_flag = error_seen.clone();
         let error_broker = broker.clone();
         let error_cancel = f.op.cancellation.clone();
@@ -11521,11 +11584,24 @@ mod tests {
                 "returnByValue":true,"awaitPromise":true}))).await;
         assert!(gate_seen.load(Ordering::SeqCst));
         assert!(error_seen.load(Ordering::SeqCst));
-        assert_eq!(result, Err(if hard_error_first { ProtocolError::BrowserFailure } else { ProtocolError::Cancelled }));
+        assert_eq!(
+            result,
+            Err(if hard_error_first {
+                ProtocolError::BrowserFailure
+            } else {
+                ProtocolError::Cancelled
+            })
+        );
         assert_eq!(*f.op.cancellation.borrow(), CancelSignal::Requested);
         let requests = f.log.lock().unwrap().clone();
-        let calls: Vec<_> = requests.iter().filter(|r| r["method"] == "Runtime.callFunctionOn"
-            && r["params"]["functionDeclaration"] == "function(){return 'command-projection-control';}").collect();
+        let calls: Vec<_> = requests
+            .iter()
+            .filter(|r| {
+                r["method"] == "Runtime.callFunctionOn"
+                    && r["params"]["functionDeclaration"]
+                        == "function(){return 'command-projection-control';}"
+            })
+            .collect();
         assert_eq!(calls.len(), usize::from(hard_error_first));
         assert!(!d.sent.load(Ordering::SeqCst));
         assert!(!journal.snapshot().mutation_dispatched);
@@ -11557,9 +11633,16 @@ mod tests {
         let (owner, state, _notices) = preparation_settlement_owner(&f, broker.clone()).await;
         f.op = broker.admit(1, 1, 1_000).unwrap();
         assert!(broker.start(1, 1).unwrap());
-        let journal = ledger.operation(client_debt::OperationKey {
-            generation: 1, operation_seq: 1,
-        }, "target".into(), "page".into()).unwrap();
+        let journal = ledger
+            .operation(
+                client_debt::OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
         journal.bind_operation(&f.op).unwrap();
         f.log.lock().unwrap().clear();
         f.replies.lock().unwrap().clear();
@@ -11567,13 +11650,17 @@ mod tests {
         let hook_seen = seen.clone();
         let hook_broker = broker.clone();
         let hook_cancel = f.op.cancellation.clone();
-        let _hook = ReplacementBoundary::install(mode, 1, 1, "command-success-observed", move || {
-            assert_eq!(*hook_cancel.borrow(), CancelSignal::None);
-            hook_broker.cancel(1, 1).unwrap();
-            hook_seen.store(true, Ordering::SeqCst);
-        });
-        let ctx = ActionContext { realm_authority: ActionRealmAuthority::Enrolled(&owner),
-            page_state: &state, ..f.context() };
+        let _hook =
+            ReplacementBoundary::install(mode, 1, 1, "command-success-observed", move || {
+                assert_eq!(*hook_cancel.borrow(), CancelSignal::None);
+                hook_broker.cancel(1, 1).unwrap();
+                hook_seen.store(true, Ordering::SeqCst);
+            });
+        let ctx = ActionContext {
+            realm_authority: ActionRealmAuthority::Enrolled(&owner),
+            page_state: &state,
+            ..f.context()
+        };
         let d = Dispatch::default();
         journal.scope(async {
             let reply = ctx.command(&d, false, "page", "Runtime.callFunctionOn",
@@ -11587,8 +11674,16 @@ mod tests {
             assert_eq!(journal.snapshot().object_debt, 0);
             assert!(!journal.snapshot().integrity_lost);
         }).await;
-        assert_eq!(f.log.lock().unwrap().iter().filter(|r| r["method"] == "Runtime.releaseObject"
-            && r["params"]["objectId"] == "owned-success-object").count(), 1);
+        assert_eq!(
+            f.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|r| r["method"] == "Runtime.releaseObject"
+                    && r["params"]["objectId"] == "owned-success-object")
+                .count(),
+            1
+        );
         assert!(!d.sent.load(Ordering::SeqCst));
         owner.close().await.unwrap();
         transport_owner.close().await;

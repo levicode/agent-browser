@@ -3568,28 +3568,46 @@ mod tests {
     #[ignore = "hosted ffmpeg; actual failed encoder exit cannot certify terminal video"]
     async fn encoder_failure_joins_without_minting_successful_output_proof() {
         for invalid_frame in [false, true] {
-            let path = std::env::temp_dir().join(format!("native-negative-video-{}.webm", uuid::Uuid::new_v4()));
+            let path = std::env::temp_dir().join(format!(
+                "native-negative-video-{}.webm",
+                uuid::Uuid::new_v4()
+            ));
             let (sender, frames) = mpsc::channel(2);
             if invalid_frame {
-                sender.send(CapturedVideoFrame {
-                    sequence: 0, image_data: Arc::new(b"not an image".to_vec()),
-                    elapsed: Duration::ZERO, captured_at: tokio::time::Instant::now(),
-                    timestamp: cursor_timestamp(), device_width: 64.0, device_height: 64.0,
-                }).await.unwrap();
+                sender
+                    .send(CapturedVideoFrame {
+                        sequence: 0,
+                        image_data: Arc::new(b"not an image".to_vec()),
+                        elapsed: Duration::ZERO,
+                        captured_at: tokio::time::Instant::now(),
+                        timestamp: cursor_timestamp(),
+                        device_width: 64.0,
+                        device_height: 64.0,
+                    })
+                    .await
+                    .unwrap();
             }
             drop(sender);
             let joined = Arc::new(AtomicBool::new(false));
             let succeeded = Arc::new(AtomicBool::new(false));
             let output = encode_stream_with_options(
-                path.to_string_lossy().into_owned(), 30, false,
-                Arc::new(Mutex::new(RecordingCursorHistory::default())), frames,
-                CaptureOptions::default(), None, Some(joined.clone()), Some(succeeded.clone()),
-            ).await;
+                path.to_string_lossy().into_owned(),
+                30,
+                false,
+                Arc::new(Mutex::new(RecordingCursorHistory::default())),
+                frames,
+                CaptureOptions::default(),
+                None,
+                Some(joined.clone()),
+                Some(succeeded.clone()),
+            )
+            .await;
             assert!(output.is_err());
             assert!(joined.load(Ordering::SeqCst));
             assert!(!succeeded.load(Ordering::SeqCst));
-            if path.exists() { std::fs::remove_file(path).unwrap(); }
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
         }
     }
-
 }

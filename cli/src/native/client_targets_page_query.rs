@@ -191,6 +191,37 @@ impl Drop for SelectedPageTargetBarrier {
         self.registry.changed.notify_waiters();
     }
 }
+/// Pure comparison over the one already acquired inventory. All dimensions
+/// participate in revision-only classification, even after the first mismatch.
+struct SelectedTargetChanges([bool; 7]);
+impl SelectedTargetChanges {
+    fn first_reason(&self) -> Option<diagnostic::QueryScopeReason> {
+        use self::diagnostic::QueryScopeReason as Reason;
+        let reasons = [
+            Reason::DependencyRevisionChanged,
+            Reason::DependencySetChanged,
+            Reason::DependencyIdentityChanged,
+            Reason::TargetRevisionChanged,
+            Reason::UnknownRevisionChanged,
+            Reason::TargetCountChanged,
+            Reason::TargetIdentityChanged,
+        ];
+        self.0
+            .iter()
+            .zip(reasons)
+            .find_map(|(changed, reason)| changed.then_some(reason))
+    }
+    fn revision_only(&self) -> bool {
+        self.0 == [false, false, false, true, false, false, false]
+    }
+}
+
+/// A failed acquisition is never a snapshot or permission to publish.
+pub(crate) enum SelectedPageTargetCheck<T> {
+    Ready(T),
+    RevisionOnlyBeforePublication,
+}
+
 impl ClientTargets {
     /// Caller holds enrollment index and reader watermark, in that order.
     /// Classification is authoritative ancestry, never a diagnostic/opener hint.
@@ -223,6 +254,37 @@ impl ClientTargets {
         classify: impl Fn(&OwnedTarget, &HashMap<String, OwnedTarget>) -> Result<bool, ProtocolError>,
         publish: impl FnOnce(&SelectedPageTargetSnapshot) -> Result<T, ProtocolError>,
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        match self.with_selected_page_targets_checked(
+            selected,
+            expected,
+            held,
+            acquire_barrier,
+            diagnostic_context,
+            false,
+            classify,
+            |_| Ok(()),
+            publish,
+        )? {
+            SelectedPageTargetCheck::Ready(value) => Ok(value),
+            SelectedPageTargetCheck::RevisionOnlyBeforePublication => {
+                Err(ProtocolError::StaleScope)
+            }
+        }
+    }
+    #[allow(clippy::too_many_arguments)] // Same-snapshot classification, validation and publication boundaries.
+    pub(crate) fn with_selected_page_targets_checked<T>(
+        self: &Arc<Self>,
+        selected: &OwnedTarget,
+        expected: Option<&SelectedPageTargetSnapshot>,
+        held: Option<&SelectedPageTargetBarrier>,
+        acquire_barrier: bool,
+        diagnostic_context: Option<(u64, u64, diagnostic::QueryScopeStage)>,
+        allow_revision_only: bool,
+        classify: impl Fn(&OwnedTarget, &HashMap<String, OwnedTarget>) -> Result<bool, ProtocolError>,
+        validate: impl FnOnce(&SelectedPageTargetSnapshot) -> Result<(), ProtocolError>,
+        publish: impl FnOnce(&SelectedPageTargetSnapshot) -> Result<T, ProtocolError>,
+    ) -> Result<SelectedPageTargetCheck<(T, Option<SelectedPageTargetBarrier>)>, ProtocolError>
+    {
         use crate::native::client_settlement_trace::QueryScopeReason as Reason;
         let refuse = |error, reason| {
             if let Some((generation, sequence, stage)) = diagnostic_context {
@@ -362,33 +424,40 @@ impl ClientTargets {
             .iter()
             .any(|target| target.same_attachment(selected))
         {
-            return Err(refuse(ProtocolError::StaleScope, Reason::SelectedTargetMissing));
+            return Err(refuse(
+                ProtocolError::StaleScope,
+                Reason::SelectedTargetMissing,
+            ));
         }
         let revisions: Vec<_> = targets
             .iter()
             .map(|target| target.tenure.query_revision.load(Ordering::Acquire))
             .collect();
-        if let Some(expected) = expected {
-            // Same short-circuit comparisons, same snapshots and original refusal.
-            // Closed diagnostics distinguish the exact first mismatching dimension.
-            let changed = if dependency_revisions != expected.dependency_revisions {
-                Some(Reason::DependencyRevisionChanged)
-            } else if dependencies.len() != expected.dependencies.len() {
-                Some(Reason::DependencySetChanged)
-            } else if dependencies.iter().zip(&expected.dependencies)
-                .any(|(a, b)| !a.same_attachment(b)) {
-                Some(Reason::DependencyIdentityChanged)
-            } else if revisions != expected.revisions {
-                Some(Reason::TargetRevisionChanged)
-            } else if state.query_unknown_revision != expected.unknown_revision {
-                Some(Reason::UnknownRevisionChanged)
-            } else if targets.len() != expected.targets.len() {
-                Some(Reason::TargetCountChanged)
-            } else if targets.iter().zip(&expected.targets)
-                .any(|(a, b)| !a.same_attachment(b)) {
-                Some(Reason::TargetIdentityChanged)
-            } else { None };
-            if let Some(reason) = changed {
+        let changes = expected.map(|expected| {
+            SelectedTargetChanges([
+                dependency_revisions != expected.dependency_revisions,
+                dependencies.len() != expected.dependencies.len(),
+                dependencies
+                    .iter()
+                    .zip(&expected.dependencies)
+                    .any(|(a, b)| !a.same_attachment(b)),
+                revisions != expected.revisions,
+                state.query_unknown_revision != expected.unknown_revision,
+                targets.len() != expected.targets.len(),
+                targets
+                    .iter()
+                    .zip(&expected.targets)
+                    .any(|(a, b)| !a.same_attachment(b)),
+            ])
+        });
+        let revision_only = changes
+            .as_ref()
+            .is_some_and(SelectedTargetChanges::revision_only);
+        if let Some(reason) = changes
+            .as_ref()
+            .and_then(SelectedTargetChanges::first_reason)
+        {
+            if !(allow_revision_only && revision_only && held.is_none() && !acquire_barrier) {
                 return Err(refuse(ProtocolError::StaleScope, reason));
             }
         }
@@ -399,6 +468,21 @@ impl ClientTargets {
             dependency_revisions,
             unknown_revision: state.query_unknown_revision,
         };
+        // Validate enrollment membership and the original budget under the SAME
+        // registry/index/watermark locks, without invoking any publication callback.
+        validate(&snapshot)?;
+        if revision_only {
+            // Only the opt-in branch could reach here with a changed snapshot.
+            if let Some((generation, sequence, stage)) = diagnostic_context {
+                diagnostic::query_scope_refusal(
+                    generation,
+                    sequence,
+                    stage,
+                    Reason::TargetRevisionChanged,
+                );
+            }
+            return Ok(SelectedPageTargetCheck::RevisionOnlyBeforePublication);
+        }
         // Commit while index, watermark and registry fences are all retained.
         // The callback must not reenter target methods.
         let value = publish(&snapshot)?;
@@ -417,7 +501,7 @@ impl ClientTargets {
             None
         };
         drop(state);
-        Ok((value, guard))
+        Ok(SelectedPageTargetCheck::Ready((value, guard)))
     }
 }
 
@@ -473,6 +557,115 @@ mod tests {
             |target, _| Ok(target.target_id == "main"),
             |snapshot| Ok(snapshot.clone()),
         )
+    }
+    #[test]
+    fn revision_only_requires_all_seven_snapshot_dimensions() {
+        use self::diagnostic::QueryScopeReason as Reason;
+        let reasons = [
+            Reason::DependencyRevisionChanged,
+            Reason::DependencySetChanged,
+            Reason::DependencyIdentityChanged,
+            Reason::TargetRevisionChanged,
+            Reason::UnknownRevisionChanged,
+            Reason::TargetCountChanged,
+            Reason::TargetIdentityChanged,
+        ];
+        for mask in 0u8..128 {
+            let changes = SelectedTargetChanges(std::array::from_fn(|bit| mask & (1 << bit) != 0));
+            assert_eq!(changes.revision_only(), mask == 8, "mask {mask}");
+            let original_first = (0..7)
+                .find(|bit| mask & (1 << bit) != 0)
+                .map(|bit| reasons[bit]);
+            assert_eq!(changes.first_reason(), original_first, "mask {mask}");
+        }
+    }
+    #[tokio::test]
+    async fn revision_only_never_calls_publish_and_respects_late_validation() {
+        for validation in [
+            Ok(()),
+            Err(ProtocolError::Cancelled),
+            Err(ProtocolError::DeadlineExceeded),
+            Err(ProtocolError::StaleScope),
+            Err(ProtocolError::CleanupFailed),
+        ] {
+            for allow in [false, true] {
+                let (registry, main) = fixture().await;
+                let (proof, _) = snapshot(&registry, &main, false).unwrap();
+                registry
+                    .invalidate_inventory_for(diagnostic::InventoryRevisionEvent::Navigate, "main")
+                    .unwrap();
+                let validated = std::cell::Cell::new(false);
+                let published = std::cell::Cell::new(false);
+                let result = registry.with_selected_page_targets_checked(
+                    &main,
+                    Some(&proof),
+                    None,
+                    false,
+                    None,
+                    allow,
+                    |target, _| Ok(target.target_id == "main"),
+                    |_| {
+                        validated.set(true);
+                        validation.clone()
+                    },
+                    |_| {
+                        published.set(true);
+                        Ok(())
+                    },
+                );
+                assert!(!published.get());
+                assert_eq!(validated.get(), allow);
+                match (allow, &validation) {
+                    (true, Ok(())) => assert!(matches!(
+                        result,
+                        Ok(SelectedPageTargetCheck::RevisionOnlyBeforePublication)
+                    )),
+                    (true, Err(expected)) => {
+                        assert!(matches!(result, Err(error) if &error == expected))
+                    }
+                    (false, _) => assert!(matches!(result, Err(ProtocolError::StaleScope))),
+                }
+                // The refused acquisition never created a barrier.
+                assert!(registry.state.lock().unwrap().protected_read.is_none());
+            }
+        }
+    }
+    #[tokio::test]
+    async fn revision_plus_unknown_or_barrier_acquisition_is_not_retryable() {
+        for other in ["unknown", "acquire", "health", "creation", "selected"] {
+            let (registry, main) = fixture().await;
+            let (proof, _) = snapshot(&registry, &main, false).unwrap();
+            registry
+                .invalidate_inventory_for(diagnostic::InventoryRevisionEvent::Info, "main")
+                .unwrap();
+            match other {
+                "unknown" => registry.invalidate_inventory().unwrap(),
+                "health" => registry.state.lock().unwrap().integrity_lost = true,
+                "creation" => registry.state.lock().unwrap().reservations = 1,
+                "selected" => {
+                    registry.detach("main").unwrap();
+                }
+                _ => {}
+            }
+            let published = std::cell::Cell::new(false);
+            let result = registry.with_selected_page_targets_checked(
+                &main,
+                Some(&proof),
+                None,
+                other == "acquire",
+                None,
+                true,
+                |target, _| Ok(target.target_id == "main"),
+                |_| Ok(()),
+                |_| {
+                    published.set(true);
+                    Ok(())
+                },
+            );
+            assert!(result.is_err(), "{other}");
+            assert!(!published.get());
+            assert!(registry.state.lock().unwrap().protected_read.is_none());
+        }
     }
     #[tokio::test]
     async fn query_other_is_ready_exact_dependency_not_excluded_subtree() {

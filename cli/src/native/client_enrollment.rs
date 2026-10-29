@@ -5,7 +5,6 @@
 mod page_query;
 #[path = "client_enrollment_point_drag.rs"]
 mod point_drag;
-pub(crate) use point_drag::PointDragRealms;
 use super::cdp::client::{BoundedEventWatermark, BoundedMethodEvents, CdpClient};
 use super::cdp::types::CdpEvent;
 use super::client_app_events::{AppNavigationContext, AppNavigationKind};
@@ -21,6 +20,7 @@ use super::client_targets::{ClientTargets, OwnedTarget, TargetPurpose};
 pub(crate) use page_query::{
     PageAcquisitionProof, PageQueryAuthority, QueryBoundary, SelectedPageReadBarrier,
 };
+pub(crate) use point_drag::PointDragRealms;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6471,7 +6471,11 @@ impl ClientEnrollment {
                     event.session_id.as_deref(),
                     custody,
                     info.get("parentId").is_none() && info.get("parentFrameId").is_none(),
-                    event.params.get("waitingForDebugger").and_then(Value::as_bool) == Some(true),
+                    event
+                        .params
+                        .get("waitingForDebugger")
+                        .and_then(Value::as_bool)
+                        == Some(true),
                 )
             },
         )? {
@@ -10251,10 +10255,19 @@ mod tests {
     async fn exact_realm_destroy_requires_matching_unique_receipt_before_marking_destroyed() {
         let (owner, page, _notices, emit, server) = realm_test_owner().await;
         let op = owner.operation();
-        let capture = owner.reserve_exact_realm(&page, &realm_test_binding(), &op).unwrap();
+        let capture = owner
+            .reserve_exact_realm(&page, &realm_test_binding(), &op)
+            .unwrap();
         realm_emit(&owner, &emit, realm_created(7, "original-unique")).await;
         let ticket = capture.bind(7, &op).await.unwrap();
-        let entry = owner.index.lock().unwrap().sessions.get("initial").unwrap().clone();
+        let entry = owner
+            .index
+            .lock()
+            .unwrap()
+            .sessions
+            .get("initial")
+            .unwrap()
+            .clone();
         for params in [
             json!({"executionContextId":7}),
             json!({"executionContextId":7,"executionContextUniqueId":"foreign-unique"}),
@@ -10266,9 +10279,17 @@ mod tests {
             };
             // Exercise the unchanged production validator. Missing/mismatched
             // identity is a protocol failure, not successful realm destruction.
-            assert_eq!(owner.realm_event(&entry, &event), Err(ProtocolError::InvalidFrame));
+            assert_eq!(
+                owner.realm_event(&entry, &event),
+                Err(ProtocolError::InvalidFrame)
+            );
             assert_eq!(ticket.destroyed(), Ok(false));
-            assert!(owner.index.lock().unwrap().realms.contains_key(&("initial".into(), 7)));
+            assert!(owner
+                .index
+                .lock()
+                .unwrap()
+                .realms
+                .contains_key(&("initial".into(), 7)));
         }
         let event = CdpEvent {
             method: "Runtime.executionContextDestroyed".into(),
@@ -18392,12 +18413,24 @@ mod tests {
             // Production configuration updates obtain sessions only from this
             // complete inventory, after the same config_gate. An unconfigured
             // popup cannot be swept into a future-only update ahead of init.
-            assert!(matches!(owner.targets.inventory(), Err(ProtocolError::ScopeUnavailable)));
+            assert!(matches!(
+                owner.targets.inventory(),
+                Err(ProtocolError::ScopeUnavailable)
+            ));
             // The same attached receipt cannot begin a second initialization.
-            assert!(owner.register_with_custody(
-                "owned-context", "popup", "popup-session", "page", None,
-                None, true, true,
-            ).unwrap().is_none());
+            assert!(owner
+                .register_with_custody(
+                    "owned-context",
+                    "popup",
+                    "popup-session",
+                    "page",
+                    None,
+                    None,
+                    true,
+                    true,
+                )
+                .unwrap()
+                .is_none());
             assert!(!log.lock().unwrap().iter().any(|request| matches!(
                 request["method"].as_str(),
                 Some("Page.addScriptToEvaluateOnNewDocument" | "Runtime.runIfWaitingForDebugger")
@@ -18423,12 +18456,23 @@ mod tests {
             } else {
                 result.unwrap();
                 assert_eq!(scripts.len(), 4);
-                assert!(scripts.iter().all(|request| request["params"]["runImmediately"] == true));
+                assert!(scripts
+                    .iter()
+                    .all(|request| request["params"]["runImmediately"] == true));
                 // A duplicate attachment after resume also performs no script
                 // registration or resume. The cloned resumed flag is not the
                 // one-shot proof: exact session registration rejects duplicates.
                 let before_duplicate = commands.len();
-                owner.attached(attach("owned-context", "popup", "popup-session", "page", None)).await.unwrap();
+                owner
+                    .attached(attach(
+                        "owned-context",
+                        "popup",
+                        "popup-session",
+                        "page",
+                        None,
+                    ))
+                    .await
+                    .unwrap();
                 assert_eq!(log.lock().unwrap().len(), before_duplicate);
                 for (ordinal, request) in scripts.iter().enumerate() {
                     assert_eq!(
@@ -18458,18 +18502,34 @@ mod tests {
 
     #[tokio::test]
     async fn immediate_init_requires_exact_paused_attachment_receipt() {
-        for receipt in [None, Some(json!(false)), Some(json!("true")), Some(json!(true))] {
+        for receipt in [
+            None,
+            Some(json!(false)),
+            Some(json!("true")),
+            Some(json!(true)),
+        ] {
             let (mut owner, _notices, log, _emit, server) = fixture("normal").await;
-            Arc::get_mut(&mut owner).unwrap().config.block_service_workers = true;
-            owner.enroll_existing("target", "initial", "page", &owner.operation()).await.unwrap();
+            Arc::get_mut(&mut owner)
+                .unwrap()
+                .config
+                .block_service_workers = true;
+            owner
+                .enroll_existing("target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
             let mut event = attach("owned-context", "popup", "popup-session", "page", None);
-            event.params.as_object_mut().unwrap().remove("waitingForDebugger");
+            event
+                .params
+                .as_object_mut()
+                .unwrap()
+                .remove("waitingForDebugger");
             if let Some(value) = &receipt {
                 event.params["waitingForDebugger"] = value.clone();
             }
             owner.attached(event).await.unwrap();
             let commands = log.lock().unwrap().clone();
-            let scripts: Vec<_> = commands.iter()
+            let scripts: Vec<_> = commands
+                .iter()
                 .filter(|request| request["method"] == "Page.addScriptToEvaluateOnNewDocument")
                 .collect();
             assert_eq!(scripts.len(), 2);

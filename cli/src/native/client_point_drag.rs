@@ -106,8 +106,14 @@ mod tests {
     use super::*;
     #[test]
     fn sibling_realms_need_not_receive_the_mouse_move() {
-        assert_eq!(expects_drag(&[MoveObservation::NoMove, MoveObservation::Drag]), Some(true));
-        assert_eq!(expects_drag(&[MoveObservation::NoMove, MoveObservation::NoDrag]), Some(false));
+        assert_eq!(
+            expects_drag(&[MoveObservation::NoMove, MoveObservation::Drag]),
+            Some(true)
+        );
+        assert_eq!(
+            expects_drag(&[MoveObservation::NoMove, MoveObservation::NoDrag]),
+            Some(false)
+        );
     }
     #[test]
     fn degenerate_move_remains_pointer_only_but_missing_inventory_is_not_false() {
@@ -123,12 +129,12 @@ mod tests {
     }
 }
 
-use super::{ActionRealmAuthority, DirectPointRunner, Point};
 use super::super::cdp::client::BoundedCdpEvent;
 use super::super::client_debt::{self, CommandCategory};
 use super::super::client_enrollment::ExactRealmTicket;
 use super::super::client_page::PointDragToken;
 use super::super::client_protocol::ProtocolError;
+use super::{ActionRealmAuthority, DirectPointRunner, Point};
 use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -151,7 +157,10 @@ async fn setup_command(
     let ctx = runner.context;
     let mut cancelled = ctx.operation.cancellation.clone();
     let command = client_debt::command_scope(CommandCategory::ApplicationObject, false, async {
-        ctx.page.client.send_point_drag_setup_command(method, params, session, ctx.operation).await
+        ctx.page
+            .client
+            .send_point_drag_setup_command(method, params, session, ctx.operation)
+            .await
     });
     tokio::select! {
         result = command => result,
@@ -167,11 +176,18 @@ async fn probe_call(
     function: &str,
 ) -> Result<Value, ProtocolError> {
     let ctx = runner.context;
-    let value = ctx.page_state.point_drag_observer_command(
-        ctx.page, ctx.operation, token, &probe.session, "Runtime.callFunctionOn",
-        json!({"objectId":probe.object,"functionDeclaration":function,
+    let value = ctx
+        .page_state
+        .point_drag_observer_command(
+            ctx.page,
+            ctx.operation,
+            token,
+            &probe.session,
+            "Runtime.callFunctionOn",
+            json!({"objectId":probe.object,"functionDeclaration":function,
             "returnByValue":true,"awaitPromise":true}),
-    ).await?;
+        )
+        .await?;
     if value.get("exceptionDetails").is_some() {
         return Err(ProtocolError::BrowserFailure);
     }
@@ -179,20 +195,33 @@ async fn probe_call(
 }
 
 async fn drag_event(
-    runner: &DirectPointRunner<'_, '_>, token: &PointDragToken,
-    kind: &str, point: Point, event: &BoundedCdpEvent,
+    runner: &DirectPointRunner<'_, '_>,
+    token: &PointDragToken,
+    kind: &str,
+    point: Point,
+    event: &BoundedCdpEvent,
 ) -> Result<(), ProtocolError> {
     runner.check()?;
     runner.dispatch.mark();
     let ctx = runner.context;
-    ctx.page_state.point_drag_command(ctx.page, ctx.operation, token,
-        "Input.dispatchDragEvent", json!({"type":kind,"x":point.x,"y":point.y,
-            "data":event.params["data"]})).await?;
+    ctx.page_state
+        .point_drag_command(
+            ctx.page,
+            ctx.operation,
+            token,
+            "Input.dispatchDragEvent",
+            json!({"type":kind,"x":point.x,"y":point.y,
+            "data":event.params["data"]}),
+        )
+        .await?;
     runner.check()
 }
 
 pub(super) async fn execute(
-    runner: &DirectPointRunner<'_, '_>, from: Point, to: Point, pace: Option<Duration>,
+    runner: &DirectPointRunner<'_, '_>,
+    from: Point,
+    to: Point,
+    pace: Option<Duration>,
 ) -> Result<(), ProtocolError> {
     runner.check()?;
     let ctx = runner.context;
@@ -202,70 +231,156 @@ pub(super) async fn execute(
         ActionRealmAuthority::UntrackedFixture => return Err(ProtocolError::ScopeUnavailable),
     };
     let realms = Arc::new(enrollment.capture_point_drag_realms(ctx.page, ctx.operation)?);
-    let (events, receipt) = ctx.page.client
+    let (events, receipt) = ctx
+        .page
+        .client
         .subscribe_drag_interception(&ctx.page.page_session_id, 1024 * 1024)
         .map_err(|_| ProtocolError::CapacityExceeded)?;
     let events = Arc::new(tokio::sync::Mutex::new(events));
-    let token = ctx.page_state.begin_point_drag(ctx.page, ctx.operation, receipt, events.clone(), realms.clone())?;
+    let token = ctx.page_state.begin_point_drag(
+        ctx.page,
+        ctx.operation,
+        receipt,
+        events.clone(),
+        realms.clone(),
+    )?;
     let mut probes = Vec::new();
     for (index, binding) in realms.bindings().iter().enumerate() {
         let capture = enrollment.reserve_exact_realm(ctx.page, binding, ctx.operation)?;
-        let world = setup_command(runner, &binding.session, "Page.createIsolatedWorld",
-            json!({"frameId":binding.frame,"worldName":"agent-browser-native-observation"})).await?;
-        let context = world["executionContextId"].as_i64().ok_or(ProtocolError::BrowserFailure)?;
+        let world = setup_command(
+            runner,
+            &binding.session,
+            "Page.createIsolatedWorld",
+            json!({"frameId":binding.frame,"worldName":"agent-browser-native-observation"}),
+        )
+        .await?;
+        let context = world["executionContextId"]
+            .as_i64()
+            .ok_or(ProtocolError::BrowserFailure)?;
         let realm = Arc::new(capture.bind(context, ctx.operation).await?);
-        let group = format!("native-point-drag-{}-{}-{index}", ctx.operation.generation, ctx.operation.sequence);
-        let value = setup_command(runner, &binding.session, "Runtime.evaluate",
+        let group = format!(
+            "native-point-drag-{}-{}-{index}",
+            ctx.operation.generation, ctx.operation.sequence
+        );
+        let value = setup_command(
+            runner,
+            &binding.session,
+            "Runtime.evaluate",
             json!({"expression":format!("({CREATE_MOVE_PROBE})()"),"contextId":context,
-                "objectGroup":group,"returnByValue":false})).await?;
-        let object = value["result"]["objectId"].as_str().ok_or(ProtocolError::BrowserFailure)?.to_owned();
+                "objectGroup":group,"returnByValue":false}),
+        )
+        .await?;
+        let object = value["result"]["objectId"]
+            .as_str()
+            .ok_or(ProtocolError::BrowserFailure)?
+            .to_owned();
         // Adoption precedes cancellation/realm checks: cleanup authority may not
         // be discarded because the inert object's creation ACK arrived late.
-        ctx.page_state.record_point_drag_observer(ctx.page, ctx.operation, &token,
-            binding.session.clone(), object.clone(), group, realm.clone())?;
-        if value.get("exceptionDetails").is_some() { return Err(ProtocolError::BrowserFailure); }
+        ctx.page_state.record_point_drag_observer(
+            ctx.page,
+            ctx.operation,
+            &token,
+            binding.session.clone(),
+            object.clone(),
+            group,
+            realm.clone(),
+        )?;
+        if value.get("exceptionDetails").is_some() {
+            return Err(ProtocolError::BrowserFailure);
+        }
         realm.verify_resolution_owner(ctx.operation).await?;
-        probes.push(Probe { session: binding.session.clone(), object, realm });
+        probes.push(Probe {
+            session: binding.session.clone(),
+            object,
+            realm,
+        });
     }
     realms.verify(ctx.page, ctx.operation).await?;
     runner.event("mouseMoved", from, None, None).await?;
-    runner.event("mousePressed", from, Some("left"), Some(1)).await?;
-    let steps = pace.map(|value| (value.as_millis() / 16).max(2) as usize).unwrap_or(2);
+    runner
+        .event("mousePressed", from, Some("left"), Some(1))
+        .await?;
+    let steps = pace
+        .map(|value| (value.as_millis() / 16).max(2) as usize)
+        .unwrap_or(2);
     let start = Instant::now();
     let mut native_drag: Option<BoundedCdpEvent> = None;
     for step in 1..=steps {
         if let Some(pace) = pace {
             let due = start + pace.mul_f64(step as f64 / steps as f64);
-            if let Some(wait) = due.checked_duration_since(Instant::now()) { runner.pause(wait).await?; }
+            if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                runner.pause(wait).await?;
+            }
         }
         let fraction = step as f64 / steps as f64;
-        let point = Point { x:from.x + (to.x-from.x)*fraction, y:from.y+(to.y-from.y)*fraction }.validate()?;
+        let point = Point {
+            x: from.x + (to.x - from.x) * fraction,
+            y: from.y + (to.y - from.y) * fraction,
+        }
+        .validate()?;
         if let Some(event) = native_drag.as_ref() {
             drag_event(runner, &token, "dragOver", point, event).await?;
             continue;
         }
         for probe in &probes {
-            if probe_call(runner, &token, probe, "function(){return this.arm()}").await? != Value::Bool(true) {
+            if probe_call(runner, &token, probe, "function(){return this.arm()}").await?
+                != Value::Bool(true)
+            {
                 return Err(ProtocolError::BrowserFailure);
             }
         }
-        ctx.page_state.point_drag_command(ctx.page, ctx.operation, &token,
-            "Input.setInterceptDrags", json!({"enabled":true})).await?;
+        ctx.page_state
+            .point_drag_command(
+                ctx.page,
+                ctx.operation,
+                &token,
+                "Input.setInterceptDrags",
+                json!({"enabled":true}),
+            )
+            .await?;
         runner.event("mouseMoved", point, None, None).await?;
         let mut observations = Vec::new();
         for probe in &probes {
-            let value = probe_call(runner, &token, probe, "function(){return this.finish()}").await?;
-            observations.push(value.as_str().and_then(MoveObservation::decode).ok_or(ProtocolError::BrowserFailure)?);
+            let value =
+                probe_call(runner, &token, probe, "function(){return this.finish()}").await?;
+            observations.push(
+                value
+                    .as_str()
+                    .and_then(MoveObservation::decode)
+                    .ok_or(ProtocolError::BrowserFailure)?,
+            );
         }
         let expected = expects_drag(&observations).ok_or(ProtocolError::BrowserFailure)?;
-        if expected { ctx.page_state.point_drag_expected_positive(ctx.page, ctx.operation, &token)?; }
-        for probe in &probes { probe.realm.verify_resolution_owner(ctx.operation).await?; }
+        if expected {
+            ctx.page_state
+                .point_drag_expected_positive(ctx.page, ctx.operation, &token)?;
+        }
+        for probe in &probes {
+            probe.realm.verify_resolution_owner(ctx.operation).await?;
+        }
         realms.verify(ctx.page, ctx.operation).await?;
-        if !expected { ctx.page_state.point_drag_observed_negative(ctx.page, ctx.operation, &token)?; }
-        ctx.page_state.point_drag_command(ctx.page, ctx.operation, &token,
-            "Input.setInterceptDrags", json!({"enabled":false})).await?;
         if !expected {
-            if events.lock().await.watermark().received().map_err(|_| ProtocolError::BrowserFailure)? != 0 {
+            ctx.page_state
+                .point_drag_observed_negative(ctx.page, ctx.operation, &token)?;
+        }
+        ctx.page_state
+            .point_drag_command(
+                ctx.page,
+                ctx.operation,
+                &token,
+                "Input.setInterceptDrags",
+                json!({"enabled":false}),
+            )
+            .await?;
+        if !expected {
+            if events
+                .lock()
+                .await
+                .watermark()
+                .received()
+                .map_err(|_| ProtocolError::BrowserFailure)?
+                != 0
+            {
                 return Err(ProtocolError::BrowserFailure);
             }
             continue;
@@ -279,25 +394,43 @@ pub(super) async fn execute(
         };
         drop(event_guard);
         runner.check()?;
-        if event.sequence() != 1 || event.session_id.as_deref() != Some(ctx.page.page_session_id.as_str())
+        if event.sequence() != 1
+            || event.session_id.as_deref() != Some(ctx.page.page_session_id.as_str())
             || !event.params["data"]["items"].is_array()
-            || event.params["data"]["dragOperationsMask"].as_i64().is_none() {
+            || event.params["data"]["dragOperationsMask"]
+                .as_i64()
+                .is_none()
+        {
             return Err(ProtocolError::BrowserFailure);
         }
         drag_event(runner, &token, "dragEnter", point, &event).await?;
-        if step == steps { drag_event(runner, &token, "dragOver", point, &event).await?; }
+        if step == steps {
+            drag_event(runner, &token, "dragOver", point, &event).await?;
+        }
         // The event owns its bounded payload lease until the final command ACK.
         native_drag = Some(event);
     }
     if let Some(event) = native_drag.as_ref() {
-        if events.lock().await.watermark().received().map_err(|_| ProtocolError::BrowserFailure)? != 1 {
+        if events
+            .lock()
+            .await
+            .watermark()
+            .received()
+            .map_err(|_| ProtocolError::BrowserFailure)?
+            != 1
+        {
             return Err(ProtocolError::BrowserFailure);
         }
-        ctx.page_state.point_drag_logical_release(ctx.page, ctx.operation, &token)?;
+        ctx.page_state
+            .point_drag_logical_release(ctx.page, ctx.operation, &token)?;
         drag_event(runner, &token, "drop", to, event).await?;
     } else {
-        runner.event("mouseReleased", to, Some("left"), Some(1)).await?;
+        runner
+            .event("mouseReleased", to, Some("left"), Some(1))
+            .await?;
     }
-    ctx.page_state.finish_point_drag(ctx.page, ctx.operation, token).await?;
+    ctx.page_state
+        .finish_point_drag(ctx.page, ctx.operation, token)
+        .await?;
     runner.check()
 }

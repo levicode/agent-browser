@@ -143,7 +143,9 @@ pub(super) fn plan_diagnostic(
 ) -> Result<Option<Plan>, ObservationError> {
     use crate::native::client_settlement_trace::QueryReadStage as Stage;
     let failure = |stage, error| {
-        if let Some(witness) = witness { witness.stage(stage); }
+        if let Some(witness) = witness {
+            witness.stage(stage);
+        }
         error
     };
     let mut wanted = BTreeSet::new();
@@ -151,7 +153,9 @@ pub(super) fn plan_diagnostic(
     {
         return Ok(None);
     }
-    let Some(roots) = fresh_query::roots(root).map_err(|error| failure(Stage::CandidatePlanRoots, error))? else {
+    let Some(roots) =
+        fresh_query::roots(root).map_err(|error| failure(Stage::CandidatePlanRoots, error))?
+    else {
         return Ok(None);
     };
     let mut records = BTreeMap::new();
@@ -170,7 +174,12 @@ pub(super) fn plan_diagnostic(
         let id = node["backendNodeId"]
             .as_i64()
             .filter(|id| *id > 0)
-            .ok_or_else(|| failure(Stage::CandidatePlanDomBackend, ObservationError::BackendFailure))?;
+            .ok_or_else(|| {
+                failure(
+                    Stage::CandidatePlanDomBackend,
+                    ObservationError::BackendFailure,
+                )
+            })?;
         // METADATA projects author.tag from Element.localName, not nodeName.
         // Qualified names and XML/SVG case are meaningful; never strip a prefix
         // or lowercase a guessed substitute. An unavailable native fact declines
@@ -188,7 +197,8 @@ pub(super) fn plan_diagnostic(
         } else {
             String::new()
         };
-        let attributes = attributes(node).map_err(|error| failure(Stage::CandidatePlanAttributes, error))?;
+        let attributes =
+            attributes(node).map_err(|error| failure(Stage::CandidatePlanAttributes, error))?;
         // Ownership and slot redistribution require a composed dependency proof.
         // Keep the complete native path rather than infer their absence locally.
         if attributes.get("aria-owns").is_some()
@@ -211,7 +221,10 @@ pub(super) fn plan_diagnostic(
             children.entry(parent).or_default().push(id);
         }
         if records.insert(id, (node, parent, tag)).is_some() {
-            return Err(failure(Stage::CandidatePlanDuplicateDom, ObservationError::BackendFailure));
+            return Err(failure(
+                Stage::CandidatePlanDuplicateDom,
+                ObservationError::BackendFailure,
+            ));
         }
         attrs.insert(id, attributes);
         if matches!(node["nodeType"].as_i64(), Some(1 | 9 | 11)) {
@@ -245,18 +258,43 @@ pub(super) fn plan_diagnostic(
     let mut ax_rows = BTreeMap::new();
     let mut ax_backend = HashMap::new();
     for row in rows {
-        let parsed: AXNode =
-            serde_json::from_value(row.clone()).map_err(|_| failure(Stage::CandidatePlanAxDecode, ObservationError::BackendFailure))?;
+        let parsed: AXNode = serde_json::from_value(row.clone()).map_err(|_| {
+            failure(
+                Stage::CandidatePlanAxDecode,
+                ObservationError::BackendFailure,
+            )
+        })?;
         if let Some(id) = parsed.backend_d_o_m_node_id {
             ax_backend.insert(id, parsed.clone());
         }
-        if ax_rows.insert(parsed.node_id, row).is_some() {
-            return Err(failure(Stage::CandidatePlanDuplicateAx, ObservationError::BackendFailure));
+        match ax_rows.entry(parsed.node_id) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(row);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) => {
+                // A repeated serialization of the exact same raw row adds no
+                // facts. Compare every field, including unknown/frame/parent
+                // fields omitted by AXNode; retain the first occurrence.
+                // Raw response and row-count budgets were charged above.
+                if *entry.get() != row {
+                    return Err(failure(
+                        Stage::CandidatePlanDuplicateAx,
+                        ObservationError::BackendFailure,
+                    ));
+                }
+            }
         }
     }
     let mut ids = Vec::new();
-    for id in author_query_ids(root).map_err(|error| failure(Stage::CandidatePlanAuthorIds, error))? {
-        let (_, _, tag) = records.get(&id).ok_or_else(|| failure(Stage::CandidatePlanMissingRecord, ObservationError::BackendFailure))?;
+    for id in
+        author_query_ids(root).map_err(|error| failure(Stage::CandidatePlanAuthorIds, error))?
+    {
+        let (_, _, tag) = records.get(&id).ok_or_else(|| {
+            failure(
+                Stage::CandidatePlanMissingRecord,
+                ObservationError::BackendFailure,
+            )
+        })?;
         let empty = AXNode {
             node_id: String::new(),
             role: None,
@@ -359,7 +397,12 @@ pub(super) fn plan_diagnostic(
                             .as_str()
                             .map(str::to_owned)
                             .or_else(|| value.as_i64().map(|value| value.to_string()))
-                            .ok_or_else(|| failure(Stage::CandidatePlanAxChild, ObservationError::BackendFailure))?],
+                            .ok_or_else(|| {
+                                failure(
+                                    Stage::CandidatePlanAxChild,
+                                    ObservationError::BackendFailure,
+                                )
+                            })?],
                     )?;
                 }
             }
@@ -392,7 +435,12 @@ pub(super) fn plan_diagnostic(
         // and the already bounded graph owns descendant enumeration.
         let mut object: serde_json::Map<String, Value> = node
             .as_object()
-            .ok_or_else(|| failure(Stage::CandidatePlanDomObject, ObservationError::BackendFailure))?
+            .ok_or_else(|| {
+                failure(
+                    Stage::CandidatePlanDomObject,
+                    ObservationError::BackendFailure,
+                )
+            })?
             .iter()
             .filter(|(key, _)| {
                 !matches!(
@@ -499,7 +547,14 @@ mod tests {
         use crate::native::client_settlement_trace::QueryReadStage as Stage;
         let (dom, ax, options) = fixture();
         for enabled in [false, true] {
-            for malformed in ["none", "attributes", "duplicate-ax", "ax-rows", "ax-decode", "decline"] {
+            for malformed in [
+                "none",
+                "attributes",
+                "duplicate-ax",
+                "ax-rows",
+                "ax-decode",
+                "decline",
+            ] {
                 let mut d = dom.clone();
                 let mut a = ax.clone();
                 let expected = match malformed {
@@ -509,6 +564,7 @@ mod tests {
                     }
                     "duplicate-ax" => {
                         a["nodes"][1] = a["nodes"][0].clone();
+                        a["nodes"][1]["frameId"] = json!("different-frame");
                         Some(Stage::CandidatePlanDuplicateAx)
                     }
                     "ax-rows" => {
@@ -527,11 +583,18 @@ mod tests {
                 };
                 let original = plan(&d, &a, &options.expression, &options);
                 let witness = query_diagnostic::QueryReadWitness::schema_test(enabled);
-                let diagnostic = plan_diagnostic(&d, &a, &options.expression, &options, Some(&witness));
+                let diagnostic =
+                    plan_diagnostic(&d, &a, &options.expression, &options, Some(&witness));
                 assert_eq!(original, diagnostic, "{malformed}");
-                assert_eq!(witness.schema_test_stage(),
-                    if enabled { expected.unwrap_or(Stage::CandidatePlan) } else { Stage::CandidatePlan },
-                    "{malformed}");
+                assert_eq!(
+                    witness.schema_test_stage(),
+                    if enabled {
+                        expected.unwrap_or(Stage::CandidatePlan)
+                    } else {
+                        Stage::CandidatePlan
+                    },
+                    "{malformed}"
+                );
                 if expected.is_some() {
                     assert!(matches!(diagnostic, Err(ObservationError::BackendFailure)));
                 } else if malformed == "decline" {
@@ -543,6 +606,69 @@ mod tests {
         }
     }
 
+    #[test]
+    fn identical_raw_ax_duplicates_are_lossless_but_any_conflict_refuses() {
+        let (dom, ax, options) = fixture();
+        let expected = plan(&dom, &ax, &options.expression, &options).unwrap();
+        let mut duplicate = ax.clone();
+        duplicate["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, ax["nodes"][0].clone());
+        assert_eq!(
+            plan(&dom, &duplicate, &options.expression, &options).unwrap(),
+            expected
+        );
+        // First, middle and final positions all retain exactly the same facts.
+        duplicate["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(ax["nodes"][1].clone());
+        assert_eq!(
+            plan(&dom, &duplicate, &options.expression, &options).unwrap(),
+            expected
+        );
+        for (field, value) in [
+            ("frameId", json!("different-frame")),
+            ("parentId", json!("different-parent")),
+            ("childIds", json!(["different-child"])),
+            ("backendDOMNodeId", json!(987)),
+            ("ignored", json!(true)),
+            ("role", json!({"type":"role","value":"different-role"})),
+            ("unknownFutureField", json!({"nested":[1,2,3]})),
+            ("nodeId", json!(3)),
+        ] {
+            let mut conflict = ax.clone();
+            let mut row = ax["nodes"][0].clone();
+            row[field] = value;
+            conflict["nodes"].as_array_mut().unwrap().push(row);
+            let witness = query_diagnostic::QueryReadWitness::schema_test(true);
+            assert_eq!(
+                plan_diagnostic(
+                    &dom,
+                    &conflict,
+                    &options.expression,
+                    &options,
+                    Some(&witness)
+                ),
+                Err(ObservationError::BackendFailure),
+                "{field}"
+            );
+            assert_eq!(
+                witness.schema_test_stage(),
+                crate::native::client_settlement_trace::QueryReadStage::CandidatePlanDuplicateAx
+            );
+        }
+    }
+    #[test]
+    fn identical_duplicates_still_pay_the_original_raw_row_budget() {
+        let (dom, ax, options) = fixture();
+        let repeated = json!({"nodes":vec![ax["nodes"][0].clone();100_001]});
+        assert_eq!(
+            plan(&dom, &repeated, &options.expression, &options),
+            Err(ObservationError::ResourceLimit)
+        );
+    }
     fn plan_of(d: &Value, a: &Value, o: &QueryOptions) -> Plan {
         plan(d, a, &o.expression, o).unwrap().unwrap()
     }

@@ -2905,7 +2905,8 @@ pub(crate) async fn query_fields(
     lease: &OperationLease,
 ) -> Result<Vec<Value>, ObservationError> {
     let witness = query_diagnostic::QueryReadWitness::new(lease);
-    let result = query_fields_diagnostic_inner(client, frames, options, fields, lease, &witness).await;
+    let result =
+        query_fields_diagnostic_inner(client, frames, options, fields, lease, &witness).await;
     witness.observe(&result);
     result
 }
@@ -2934,7 +2935,9 @@ async fn query_fields_diagnostic_inner(
         check(lease)?;
         return Ok(values);
     }
-    let evaluated = evaluate_query_diagnostic_inner(client, frame, &expression, options, lease, witness).await?;
+    let evaluated =
+        evaluate_query_diagnostic_inner(client, frame, &expression, options, lease, witness)
+            .await?;
     witness.stage(Stage::Projection);
     if evaluated.matches.len() > super::element::MAX_EXACT_REFERENCES {
         return Err(ObservationError::ResourceLimit);
@@ -3675,7 +3678,8 @@ async fn evaluate_query(
     // Only fixture.read-fields owns a receipt; nested/frame helper queries must
     // not emit another first-failure record for the same operation.
     let witness = query_diagnostic::QueryReadWitness::disabled(lease);
-    let result = evaluate_query_diagnostic_inner(client, frame, expression, options, lease, &witness).await;
+    let result =
+        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, &witness).await;
     witness.observe(&result);
     result
 }
@@ -3713,7 +3717,13 @@ async fn evaluate_query_diagnostic_inner(
     witness.stage(Stage::Dom);
     let dom = frame_dom(client, frame, lease).await?;
     witness.stage(Stage::CandidatePlan);
-    let candidate_plan = role_candidates::plan_diagnostic(&dom["root"], &ax_value, expression, options, Some(witness))?;
+    let candidate_plan = role_candidates::plan_diagnostic(
+        &dom["root"],
+        &ax_value,
+        expression,
+        options,
+        Some(witness),
+    )?;
     let ids = match &candidate_plan {
         Some(plan) => plan.ids.clone(),
         None => author_query_ids(&dom["root"]).map_err(|error| {

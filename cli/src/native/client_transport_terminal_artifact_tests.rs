@@ -78,7 +78,10 @@ impl ClientExecutor for Executor {
         _args: serde_json::Map<String, Value>,
         lease: OperationLease,
     ) -> NativeOutcome {
-        assert!(matches!(command.as_str(), "fixture.fail" | "browser.perform" | "capture.screenshot" | "page.navigate"));
+        assert!(matches!(
+            command.as_str(),
+            "fixture.fail" | "browser.perform" | "capture.screenshot" | "page.navigate"
+        ));
         assert!(self.broker.start(lease.generation, lease.sequence).unwrap());
         self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         if self.failure_effects != Effects::Unknown {
@@ -171,7 +174,12 @@ async fn fixture_with_failure(
     assert_eq!(read(&mut client).await["type"], "ready");
     write(
         &mut client,
-        request("failure", 1, command, json!({"identityScope":"frozen-owner"})),
+        request(
+            "failure",
+            1,
+            command,
+            json!({"identityScope":"frozen-owner"}),
+        ),
     )
     .await;
     let failure = read(&mut client).await;
@@ -389,17 +397,34 @@ async fn terminal_action_capture_and_connection_failures_preserve_scoped_artifac
     for command in ["browser.perform", "capture.screenshot", "page.navigate"] {
         for effects in [Effects::Unknown, Effects::Completed, Effects::NotDispatched] {
             let (mut client, task, executor) = fixture_with_failure(None, command, effects).await;
-            write(&mut client, request("collect", 2, "recording.finalized.collect", identity())).await;
+            write(
+                &mut client,
+                request("collect", 2, "recording.finalized.collect", identity()),
+            )
+            .await;
             let manifest = read(&mut client).await;
             assert_eq!(manifest["ok"], true);
             assert_eq!(manifest["scopeState"], "quarantined");
             assert_eq!(manifest["data"]["identityScope"], "frozen-owner");
-            write(&mut client, request("denied", 3, "recording.stop", json!({"identityScope":"frozen-owner"}))).await;
+            write(
+                &mut client,
+                request(
+                    "denied",
+                    3,
+                    "recording.stop",
+                    json!({"identityScope":"frozen-owner"}),
+                ),
+            )
+            .await;
             let denied = read(&mut client).await;
             assert_eq!(denied["ok"], false);
             assert_eq!(denied["effects"], "not-dispatched");
             assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
-            write(&mut client, json!({"type":"close","id":"close","generation":1})).await;
+            write(
+                &mut client,
+                json!({"type":"close","id":"close","generation":1}),
+            )
+            .await;
             assert_eq!(read(&mut client).await["type"], "closed");
             assert!(task.await.unwrap());
             assert_eq!(executor.store.charged_for_test(), (0, 0));

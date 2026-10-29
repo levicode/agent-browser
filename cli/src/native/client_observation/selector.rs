@@ -54,7 +54,9 @@ pub(super) fn parse(selector: &str) -> Result<Vec<Part<'_>>, ParseError> {
     if !parts.is_empty()
         && parts.len() < 256
         && capture.is_none()
-        && parts.iter().all(|part| matches!(part.engine, "css" | "css:light"))
+        && parts
+            .iter()
+            .all(|part| matches!(part.engine, "css" | "css:light"))
         && selector[start..].trim_matches(js_whitespace).is_empty()
     {
         return Err(ParseError::TrailingSyntax);
@@ -279,12 +281,26 @@ mod tests {
         for selector in ["div >>", "css=div >> ", "div >> span >>"] {
             assert_eq!(parse(selector), Err(ParseError::TrailingSyntax));
         }
-        for selector in ["*css=ul >> li", "*css=ul >>", ">> div", "div >> >> span", "role=button >>", "text=x >>"] {
+        for selector in [
+            "*css=ul >> li",
+            "*css=ul >>",
+            ">> div",
+            "div >> >> span",
+            "role=button >>",
+            "text=x >>",
+        ] {
             assert_eq!(parse(selector), Err(ParseError::Invalid));
         }
         assert!(parse("css=[data-x='a >>']").is_ok());
-        let chain = |count| std::iter::repeat_n("div", count).collect::<Vec<_>>().join(" >> ");
-        assert_eq!(parse(&(chain(255) + " >>")), Err(ParseError::TrailingSyntax));
+        let chain = |count| {
+            std::iter::repeat_n("div", count)
+                .collect::<Vec<_>>()
+                .join(" >> ")
+        };
+        assert_eq!(
+            parse(&(chain(255) + " >>")),
+            Err(ParseError::TrailingSyntax)
+        );
         assert_eq!(parse(&(chain(256) + " >>")), Err(ParseError::Limit));
         assert_eq!(parse(&(chain(257) + " >>")), Err(ParseError::Limit));
         assert_eq!(parse(&chain(255)).unwrap().len(), 255);

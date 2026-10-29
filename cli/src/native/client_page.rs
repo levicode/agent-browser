@@ -470,7 +470,9 @@ impl ClientPageState {
         if self.identity_scope != page.identity_scope || self.context_id.is_empty() {
             return Err(ProtocolError::StaleScope);
         }
-        if self.point_drag_frozen()? { return Err(ProtocolError::ScopeUnavailable); }
+        if self.point_drag_frozen()? {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
         check(page, op)
     }
     fn validate_initialization(
@@ -1857,16 +1859,23 @@ impl ClientPageState {
         }
         let point_drag = self.state()?.point_drag.clone();
         if let Some(debt) = point_drag {
-            self.point_drag_command(page, op, &PointDragToken(debt), "Input.dispatchMouseEvent", params).await?;
+            self.point_drag_command(
+                page,
+                op,
+                &PointDragToken(debt),
+                "Input.dispatchMouseEvent",
+                params,
+            )
+            .await?;
         } else {
-        command(
-            page,
-            op,
-            Some(&page.page_session_id),
-            "Input.dispatchMouseEvent",
-            params,
-        )
-        .await?;
+            command(
+                page,
+                op,
+                Some(&page.page_session_id),
+                "Input.dispatchMouseEvent",
+                params,
+            )
+            .await?;
         }
         if let Some((x, y)) = point {
             let mut state = self.state()?;
@@ -2673,14 +2682,27 @@ mod tests {
         let state = ClientPageState::new("scope".into(), "context".into());
         state.ensure_service_worker_policy(&page, &op).unwrap();
         // Existing-page/update route never opts into current-world execution.
-        state.apply_to_new_session_initialization(&page, "existing", &op).await.unwrap();
+        state
+            .apply_to_new_session_initialization(&page, "existing", &op)
+            .await
+            .unwrap();
         // Paused new attachment route opts in, but repeated application does
         // not register or execute the already acknowledged script again.
-        state.apply_to_paused_new_session_initialization(&page, "paused", &op).await.unwrap();
-        state.apply_to_paused_new_session_initialization(&page, "paused", &op).await.unwrap();
-        state.apply_to_new_session_initialization(&page, "paused", &op).await.unwrap();
+        state
+            .apply_to_paused_new_session_initialization(&page, "paused", &op)
+            .await
+            .unwrap();
+        state
+            .apply_to_paused_new_session_initialization(&page, "paused", &op)
+            .await
+            .unwrap();
+        state
+            .apply_to_new_session_initialization(&page, "paused", &op)
+            .await
+            .unwrap();
         let events = log.lock().unwrap();
-        let scripts: Vec<_> = events.iter()
+        let scripts: Vec<_> = events
+            .iter()
             .filter(|event| event["method"] == "Page.addScriptToEvaluateOnNewDocument")
             .collect();
         assert_eq!(scripts.len(), 2);

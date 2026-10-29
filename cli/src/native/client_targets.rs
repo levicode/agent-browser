@@ -6,7 +6,9 @@ mod page_query;
 use super::client_protocol::ProtocolError;
 use super::client_settlement_trace as diagnostic;
 use page_query::{AttachmentLineage, ProtectedExclusion};
-pub(crate) use page_query::{SelectedPageTargetBarrier, SelectedPageTargetSnapshot};
+pub(crate) use page_query::{
+    SelectedPageTargetBarrier, SelectedPageTargetCheck, SelectedPageTargetSnapshot,
+};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};

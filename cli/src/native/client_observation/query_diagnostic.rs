@@ -12,8 +12,12 @@ pub(super) struct QueryReadWitness {
 impl QueryReadWitness {
     #[cfg(test)]
     pub(super) fn schema_test(enabled: bool) -> Self {
-        Self { enabled, generation: 1, sequence: 2,
-            state: Mutex::new((QueryReadStage::CandidatePlan, false)) }
+        Self {
+            enabled,
+            generation: 1,
+            sequence: 2,
+            state: Mutex::new((QueryReadStage::CandidatePlan, false)),
+        }
     }
     #[cfg(test)]
     pub(super) fn schema_test_stage(&self) -> QueryReadStage {
@@ -21,15 +25,25 @@ impl QueryReadWitness {
     }
 
     pub(super) fn new(lease: &OperationLease) -> Self {
-        Self { enabled: trace::query_diagnostics_enabled(), generation: lease.generation,
-            sequence: lease.sequence, state: Mutex::new((QueryReadStage::FrameEntry, false)) }
+        Self {
+            enabled: trace::query_diagnostics_enabled(),
+            generation: lease.generation,
+            sequence: lease.sequence,
+            state: Mutex::new((QueryReadStage::FrameEntry, false)),
+        }
     }
     pub(super) fn disabled(lease: &OperationLease) -> Self {
-        let mut witness = Self::new(lease); witness.enabled = false; witness
+        let mut witness = Self::new(lease);
+        witness.enabled = false;
+        witness
     }
     pub(super) fn stage(&self, stage: QueryReadStage) {
         if self.enabled {
-            if let Ok(mut state) = self.state.lock() { if !state.1 { state.0 = stage; } }
+            if let Ok(mut state) = self.state.lock() {
+                if !state.1 {
+                    state.0 = stage;
+                }
+            }
         }
     }
     /// Called only on the actual returned Result. The evaluate-query object group
@@ -38,11 +52,19 @@ impl QueryReadWitness {
     /// does not claim an unobserved deeper primary cause.
     /// Success never consumes the first-failure slot. Diagnostic loss is not success.
     pub(super) fn observe<T>(&self, result: &Result<T, ObservationError>) {
-        if !self.enabled { return; }
-        let Err(error) = result else { return; };
+        if !self.enabled {
+            return;
+        }
+        let Err(error) = result else {
+            return;
+        };
         let stage = {
-            let Ok(mut state) = self.state.lock() else { return; };
-            if state.1 { return; }
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            if state.1 {
+                return;
+            }
             state.1 = true;
             state.0
         };
@@ -71,8 +93,12 @@ fn classify(error: &ObservationError) -> ObservationReadError {
 mod tests {
     use super::*;
     fn witness() -> QueryReadWitness {
-        QueryReadWitness { enabled: true, generation: 1, sequence: 2,
-            state: Mutex::new((QueryReadStage::Ax, false)) }
+        QueryReadWitness {
+            enabled: true,
+            generation: 1,
+            sequence: 2,
+            state: Mutex::new((QueryReadStage::Ax, false)),
+        }
     }
     #[test]
     fn success_does_not_consume_first_failure_and_cleanup_cannot_replace_it() {
@@ -85,13 +111,19 @@ mod tests {
         assert!(matches!(original, Err(ObservationError::BackendFailure)));
         assert!(witness.state.lock().unwrap().1);
         witness.stage(QueryReadStage::Cleanup);
-        witness.observe(&Err::<(), _>(ObservationError::CleanupFailed { primary: None }));
+        witness.observe(&Err::<(), _>(ObservationError::CleanupFailed {
+            primary: None,
+        }));
         // Already consumed: no second receipt or replacement stage.
-        assert_eq!(*witness.state.lock().unwrap(), (QueryReadStage::Metadata, true));
+        assert_eq!(
+            *witness.state.lock().unwrap(),
+            (QueryReadStage::Metadata, true)
+        );
     }
     #[test]
     fn disabled_diagnostic_does_not_consume_error() {
-        let mut witness = witness(); witness.enabled = false;
+        let mut witness = witness();
+        witness.enabled = false;
         witness.observe(&Err::<(), _>(ObservationError::BackendFailure));
         assert!(!witness.state.lock().unwrap().1);
     }

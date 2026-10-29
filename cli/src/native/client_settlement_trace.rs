@@ -1392,10 +1392,35 @@ pub(crate) enum QueryScopeReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum QueryReadStage {
-    FrameEntry, FreshFields, Ax, Dom, CandidatePlan, Security, Metadata, QueryWorld,
-    CandidatePlanRoots, CandidatePlanDomBackend, CandidatePlanAttributes, CandidatePlanDuplicateDom, CandidatePlanAxRows, CandidatePlanAxDecode, CandidatePlanDuplicateAx, CandidatePlanAuthorIds, CandidatePlanMissingRecord, CandidatePlanAxChild, CandidatePlanDomObject, CandidatePlanFallback,
-    QueryResolve, QueryMatch, CandidateConfirm, SecurityConfirm,
-    MetadataConfirm, Projection, Cleanup, FrameFinal, LeaseFinal,
+    FrameEntry,
+    FreshFields,
+    Ax,
+    Dom,
+    CandidatePlan,
+    Security,
+    Metadata,
+    QueryWorld,
+    CandidatePlanRoots,
+    CandidatePlanDomBackend,
+    CandidatePlanAttributes,
+    CandidatePlanDuplicateDom,
+    CandidatePlanAxRows,
+    CandidatePlanAxDecode,
+    CandidatePlanDuplicateAx,
+    CandidatePlanAuthorIds,
+    CandidatePlanMissingRecord,
+    CandidatePlanAxChild,
+    CandidatePlanDomObject,
+    CandidatePlanFallback,
+    QueryResolve,
+    QueryMatch,
+    CandidateConfirm,
+    SecurityConfirm,
+    MetadataConfirm,
+    Projection,
+    Cleanup,
+    FrameFinal,
+    LeaseFinal,
 }
 pub(crate) fn query_diagnostics_enabled() -> bool {
     QUERY_SINK.get().and_then(Option::as_ref).is_some()
@@ -1407,10 +1432,17 @@ pub(crate) fn query_read_failure(
     error: ObservationReadError,
 ) {
     if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
-        record_capture(capture, sequence, Phase::QueryReadFailure, Facts {
-            generation: Some(generation), query_read_stage: Some(stage),
-            query_read_error: Some(error), ..Facts::default()
-        });
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryReadFailure,
+            Facts {
+                generation: Some(generation),
+                query_read_stage: Some(stage),
+                query_read_error: Some(error),
+                ..Facts::default()
+            },
+        );
     }
 }
 
@@ -3428,27 +3460,65 @@ mod query_read_schema_tests {
     #[test]
     fn query_read_receipt_is_closed_and_contains_no_scope_or_renderer_payload() {
         let value = serde_json::to_value(Facts {
-            generation: Some(1), query_read_stage: Some(QueryReadStage::Metadata),
-            query_read_error: Some(ObservationReadError::BackendFailure), ..Facts::default()
-        }).unwrap();
-        assert_eq!(value, serde_json::json!({"generation":1,"queryReadStage":"metadata","queryReadError":"backend-failure"}));
-        assert_eq!(serde_json::to_value(Phase::QueryReadFailure).unwrap(), "QueryReadFailure");
+            generation: Some(1),
+            query_read_stage: Some(QueryReadStage::Metadata),
+            query_read_error: Some(ObservationReadError::BackendFailure),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":1,"queryReadStage":"metadata","queryReadError":"backend-failure"})
+        );
+        assert_eq!(
+            serde_json::to_value(Phase::QueryReadFailure).unwrap(),
+            "QueryReadFailure"
+        );
     }
     #[test]
     fn split_target_differences_have_fixed_serialization() {
         let reasons = [
-            (QueryScopeReason::SelectedTargetMissing,"selected-target-missing"),
-            (QueryScopeReason::DependencyRevisionChanged,"dependency-revision-changed"),
-            (QueryScopeReason::DependencySetChanged,"dependency-set-changed"),
-            (QueryScopeReason::DependencyIdentityChanged,"dependency-identity-changed"),
-            (QueryScopeReason::TargetRevisionChanged,"target-revision-changed"),
-            (QueryScopeReason::UnknownRevisionChanged,"unknown-revision-changed"),
-            (QueryScopeReason::TargetCountChanged,"target-count-changed"),
-            (QueryScopeReason::TargetIdentityChanged,"target-identity-changed"),
-            (QueryScopeReason::TargetLineageChanged,"target-lineage-changed"),
-            (QueryScopeReason::EnrollmentTargetSetChanged,"enrollment-target-set-changed"),
+            (
+                QueryScopeReason::SelectedTargetMissing,
+                "selected-target-missing",
+            ),
+            (
+                QueryScopeReason::DependencyRevisionChanged,
+                "dependency-revision-changed",
+            ),
+            (
+                QueryScopeReason::DependencySetChanged,
+                "dependency-set-changed",
+            ),
+            (
+                QueryScopeReason::DependencyIdentityChanged,
+                "dependency-identity-changed",
+            ),
+            (
+                QueryScopeReason::TargetRevisionChanged,
+                "target-revision-changed",
+            ),
+            (
+                QueryScopeReason::UnknownRevisionChanged,
+                "unknown-revision-changed",
+            ),
+            (QueryScopeReason::TargetCountChanged, "target-count-changed"),
+            (
+                QueryScopeReason::TargetIdentityChanged,
+                "target-identity-changed",
+            ),
+            (
+                QueryScopeReason::TargetLineageChanged,
+                "target-lineage-changed",
+            ),
+            (
+                QueryScopeReason::EnrollmentTargetSetChanged,
+                "enrollment-target-set-changed",
+            ),
         ];
-        for (reason, text) in reasons { assert_eq!(serde_json::to_value(reason).unwrap(), text); }
+        for (reason, text) in reasons {
+            assert_eq!(serde_json::to_value(reason).unwrap(), text);
+        }
     }
 }
 
@@ -3459,17 +3529,50 @@ mod candidate_schema_diagnostic_tests {
     fn candidate_schema_stages_are_closed_static_strings() {
         for (stage, expected) in [
             (QueryReadStage::CandidatePlanRoots, "candidate-plan-roots"),
-            (QueryReadStage::CandidatePlanDomBackend, "candidate-plan-dom-backend"),
-            (QueryReadStage::CandidatePlanAttributes, "candidate-plan-attributes"),
-            (QueryReadStage::CandidatePlanDuplicateDom, "candidate-plan-duplicate-dom"),
-            (QueryReadStage::CandidatePlanAxRows, "candidate-plan-ax-rows"),
-            (QueryReadStage::CandidatePlanAxDecode, "candidate-plan-ax-decode"),
-            (QueryReadStage::CandidatePlanDuplicateAx, "candidate-plan-duplicate-ax"),
-            (QueryReadStage::CandidatePlanAuthorIds, "candidate-plan-author-ids"),
-            (QueryReadStage::CandidatePlanMissingRecord, "candidate-plan-missing-record"),
-            (QueryReadStage::CandidatePlanAxChild, "candidate-plan-ax-child"),
-            (QueryReadStage::CandidatePlanDomObject, "candidate-plan-dom-object"),
-            (QueryReadStage::CandidatePlanFallback, "candidate-plan-fallback")
+            (
+                QueryReadStage::CandidatePlanDomBackend,
+                "candidate-plan-dom-backend",
+            ),
+            (
+                QueryReadStage::CandidatePlanAttributes,
+                "candidate-plan-attributes",
+            ),
+            (
+                QueryReadStage::CandidatePlanDuplicateDom,
+                "candidate-plan-duplicate-dom",
+            ),
+            (
+                QueryReadStage::CandidatePlanAxRows,
+                "candidate-plan-ax-rows",
+            ),
+            (
+                QueryReadStage::CandidatePlanAxDecode,
+                "candidate-plan-ax-decode",
+            ),
+            (
+                QueryReadStage::CandidatePlanDuplicateAx,
+                "candidate-plan-duplicate-ax",
+            ),
+            (
+                QueryReadStage::CandidatePlanAuthorIds,
+                "candidate-plan-author-ids",
+            ),
+            (
+                QueryReadStage::CandidatePlanMissingRecord,
+                "candidate-plan-missing-record",
+            ),
+            (
+                QueryReadStage::CandidatePlanAxChild,
+                "candidate-plan-ax-child",
+            ),
+            (
+                QueryReadStage::CandidatePlanDomObject,
+                "candidate-plan-dom-object",
+            ),
+            (
+                QueryReadStage::CandidatePlanFallback,
+                "candidate-plan-fallback",
+            ),
         ] {
             assert_eq!(serde_json::to_value(stage).unwrap(), expected);
         }

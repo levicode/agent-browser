@@ -285,9 +285,22 @@ fn nth_without_capture_keeps_compiling_with_its_renderer_body() {
 
 #[test]
 fn trailing_chain_syntax_is_backend_failure_not_capture_invalid_locator() {
-    let expression = LocatorExpression::Selector { selector: "div >>".into() };
-    assert_eq!(validate_expression(&expression, 0), Err(ObservationError::BackendFailure));
-    assert!(matches!(compile_selector_expression(&expression), Err(ObservationError::BackendFailure)));
-    let capture = LocatorExpression::Selector { selector: "*css=ul >> li".into() };
-    assert_eq!(validate_expression(&capture, 0), Err(ObservationError::InvalidLocator));
+    let expression = LocatorExpression::Selector {
+        selector: "div >>".into(),
+    };
+    assert_eq!(
+        validate_expression(&expression, 0),
+        Err(ObservationError::BackendFailure)
+    );
+    assert!(matches!(
+        compile_selector_expression(&expression),
+        Err(ObservationError::BackendFailure)
+    ));
+    let capture = LocatorExpression::Selector {
+        selector: "*css=ul >> li".into(),
+    };
+    assert_eq!(
+        validate_expression(&capture, 0),
+        Err(ObservationError::InvalidLocator)
+    );
 }

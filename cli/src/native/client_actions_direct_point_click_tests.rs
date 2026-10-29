@@ -21,11 +21,45 @@ pub(super) const CLEANUP_LATE_OWN_MODE: &str = "direct-point-cleanup-late-own";
 pub(super) const WHEEL_MODE: &str = "direct-point-original-pointer-wheel";
 
 pub(super) fn is_pointer_mode(mode: &str) -> bool {
-    matches!(mode, POINTER_MODE | SWIPE_MODE | PACED_MODE | CANCEL_MODE | WHEEL_MODE | HTML5_EARLY_MODE | HTML5_LATE_MODE | HTML5_REJECT_MODE | CAPACITY_MODE | ENABLE_REJECT_MODE | MOVE_REJECT_MODE | MOVE_OWN_ERROR_MODE | FINISH_LOST_CANCEL_MODE | CLEANUP_FINISH_TIMEOUT_MODE | CLEANUP_REALM_DESTROYED_MODE | CLEANUP_LATE_OWN_MODE)
+    matches!(
+        mode,
+        POINTER_MODE
+            | SWIPE_MODE
+            | PACED_MODE
+            | CANCEL_MODE
+            | WHEEL_MODE
+            | HTML5_EARLY_MODE
+            | HTML5_LATE_MODE
+            | HTML5_REJECT_MODE
+            | CAPACITY_MODE
+            | ENABLE_REJECT_MODE
+            | MOVE_REJECT_MODE
+            | MOVE_OWN_ERROR_MODE
+            | FINISH_LOST_CANCEL_MODE
+            | CLEANUP_FINISH_TIMEOUT_MODE
+            | CLEANUP_REALM_DESTROYED_MODE
+            | CLEANUP_LATE_OWN_MODE
+    )
 }
 
 pub(super) fn is_swipe_mode(mode: &str) -> bool {
-    matches!(mode, SWIPE_MODE | PACED_MODE | CANCEL_MODE | HTML5_EARLY_MODE | HTML5_LATE_MODE | HTML5_REJECT_MODE | CAPACITY_MODE | ENABLE_REJECT_MODE | MOVE_REJECT_MODE | MOVE_OWN_ERROR_MODE | FINISH_LOST_CANCEL_MODE | CLEANUP_FINISH_TIMEOUT_MODE | CLEANUP_REALM_DESTROYED_MODE | CLEANUP_LATE_OWN_MODE)
+    matches!(
+        mode,
+        SWIPE_MODE
+            | PACED_MODE
+            | CANCEL_MODE
+            | HTML5_EARLY_MODE
+            | HTML5_LATE_MODE
+            | HTML5_REJECT_MODE
+            | CAPACITY_MODE
+            | ENABLE_REJECT_MODE
+            | MOVE_REJECT_MODE
+            | MOVE_OWN_ERROR_MODE
+            | FINISH_LOST_CANCEL_MODE
+            | CLEANUP_FINISH_TIMEOUT_MODE
+            | CLEANUP_REALM_DESTROYED_MODE
+            | CLEANUP_LATE_OWN_MODE
+    )
 }
 
 pub(super) fn is_probe_finish(request: &Value) -> bool {
@@ -36,19 +70,30 @@ pub(super) fn is_probe_finish(request: &Value) -> bool {
 }
 
 pub(super) fn cancels_first_held_move(mode: &str) -> bool {
-    matches!(mode, CANCEL_MODE | CLEANUP_FINISH_TIMEOUT_MODE | CLEANUP_REALM_DESTROYED_MODE | CLEANUP_LATE_OWN_MODE)
+    matches!(
+        mode,
+        CANCEL_MODE
+            | CLEANUP_FINISH_TIMEOUT_MODE
+            | CLEANUP_REALM_DESTROYED_MODE
+            | CLEANUP_LATE_OWN_MODE
+    )
 }
 
 pub(super) fn holds_pointer_reply(mode: &str, request: &Value) -> bool {
-    (matches!(mode, FINISH_LOST_CANCEL_MODE | CLEANUP_FINISH_TIMEOUT_MODE) && is_probe_finish(request))
+    (matches!(mode, FINISH_LOST_CANCEL_MODE | CLEANUP_FINISH_TIMEOUT_MODE)
+        && is_probe_finish(request))
         || ((mode == HTML5_EARLY_MODE || mode == HTML5_LATE_MODE)
-        && request["method"] == "Input.dispatchDragEvent" && request["params"]["type"] == "drop")
-        || (mode == CAPACITY_MODE && request["method"] == "Runtime.evaluate"
-            && request["params"]["objectGroup"].as_str().is_some_and(|g| g.starts_with("native-point-drag-")))
+            && request["method"] == "Input.dispatchDragEvent"
+            && request["params"]["type"] == "drop")
+        || (mode == CAPACITY_MODE
+            && request["method"] == "Runtime.evaluate"
+            && request["params"]["objectGroup"]
+                .as_str()
+                .is_some_and(|g| g.starts_with("native-point-drag-")))
         || (mode == PACED_MODE
-        && request["method"] == "Input.dispatchMouseEvent"
-        && request["params"]["type"] == "mouseMoved"
-        && request["params"]["x"].as_f64() == Some(50.0))
+            && request["method"] == "Input.dispatchMouseEvent"
+            && request["params"]["type"] == "mouseMoved"
+            && request["params"]["x"].as_f64() == Some(50.0))
         || (mode == CANCEL_MODE
             && request["method"] == "Input.dispatchMouseEvent"
             && request["params"]["type"] == "mouseReleased")
@@ -87,7 +132,13 @@ pub(super) async fn owned_pointer_fixture(
     install_pointer_ledger(f)
 }
 
-fn install_pointer_ledger(mut f: Fixture) -> (Fixture, Arc<client_debt::OwnerDebtLedger>, OperationJournalHandle) {
+fn install_pointer_ledger(
+    mut f: Fixture,
+) -> (
+    Fixture,
+    Arc<client_debt::OwnerDebtLedger>,
+    OperationJournalHandle,
+) {
     let ledger = client_debt::OwnerDebtLedger::new(1, "scope".into());
     f.page.client.install_debt_ledger(ledger.clone()).unwrap();
     f.page.client = f.page.client.owner_view(ledger.clone()).unwrap();
@@ -108,8 +159,12 @@ fn install_pointer_ledger(mut f: Fixture) -> (Fixture, Arc<client_debt::OwnerDeb
 
 // Unlike clicks, swipes require real enrollment and exact isolated-realm evidence.
 // This fixture does not pre-insert a target or replace its original operation.
-async fn owned_swipe_fixture(mode: &'static str) -> (
-    Fixture, Arc<client_debt::OwnerDebtLedger>, OperationJournalHandle,
+async fn owned_swipe_fixture(
+    mode: &'static str,
+) -> (
+    Fixture,
+    Arc<client_debt::OwnerDebtLedger>,
+    OperationJournalHandle,
     Arc<super::super::super::client_enrollment::ClientEnrollment>,
     tokio::sync::mpsc::Receiver<super::super::super::client_protocol::ServerMessage>,
 ) {
@@ -287,9 +342,12 @@ fn assert_pointer_trace(f: &Fixture, expected: &[PointerTraceEvent<'_>]) {
         })
         .collect();
     assert_eq!(actual.as_slice(), expected);
-    assert!(f.log.lock().unwrap().iter().all(|request| {
-        allowed_pointer_command(request)
-    }));
+    assert!(f
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|request| { allowed_pointer_command(request) }));
 }
 
 pub(super) fn assert_pointer_settled(
@@ -309,12 +367,27 @@ pub(super) fn assert_pointer_settled(
     assert!(!owner.integrity_lost);
     assert_eq!(f.state.mouse_state().unwrap().buttons, 0);
     let log = f.log.lock().unwrap().clone();
-    if log.iter().any(|r| r["params"]["objectId"] == "point-move-probe") {
-        let disposals: Vec<_> = log.iter().filter(|r| r["params"]["functionDeclaration"] == "function(){return this.dispose()}").collect();
-        let groups: Vec<_> = log.iter().filter(|r| r["method"] == "Runtime.releaseObjectGroup").collect();
+    if log
+        .iter()
+        .any(|r| r["params"]["objectId"] == "point-move-probe")
+    {
+        let disposals: Vec<_> = log
+            .iter()
+            .filter(|r| r["params"]["functionDeclaration"] == "function(){return this.dispose()}")
+            .collect();
+        let groups: Vec<_> = log
+            .iter()
+            .filter(|r| r["method"] == "Runtime.releaseObjectGroup")
+            .collect();
         assert_eq!(disposals.len(), 1);
         assert_eq!(groups.len(), 1);
-        assert_eq!(log.iter().rev().find(|r| r["method"] == "Input.setInterceptDrags").unwrap()["params"]["enabled"], false);
+        assert_eq!(
+            log.iter()
+                .rev()
+                .find(|r| r["method"] == "Input.setInterceptDrags")
+                .unwrap()["params"]["enabled"],
+            false
+        );
         for request in log.iter().filter(|r| r["method"] != "Browser.getVersion") {
             exact_pointer_ack(f, request);
         }
@@ -404,14 +477,23 @@ async fn direct_point_original_fractional_tap_and_swipe_round_to_css_pixels() {
         assert_eq!(result, Value::Null);
         assert_pointer_trace(&f, &expected);
         if !swipe {
-            assert!(f.log.lock().unwrap().iter().all(|request| request["method"] == "Input.dispatchMouseEvent"),
-                "fractional tap must remain independent of enrollment/realms");
+            assert!(
+                f.log
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|request| request["method"] == "Input.dispatchMouseEvent"),
+                "fractional tap must remain independent of enrollment/realms"
+            );
         }
         for request in mouse_inputs(&f) {
             exact_pointer_ack(&f, &request);
         }
         assert_pointer_settled(&f, &ledger, &journal);
-        if let Some(owner) = owner { owner.seal(); owner.drain().await.unwrap(); }
+        if let Some(owner) = owner {
+            owner.seal();
+            owner.drain().await.unwrap();
+        }
     }
 }
 
@@ -575,39 +657,77 @@ async fn direct_point_original_swipe_to_70_20_cancel_after_first_move_releases_o
     );
     assert_pointer_settled(&f, &ledger, &journal);
     let log = f.log.lock().unwrap().clone();
-    let finish = log.iter().position(is_probe_finish).expect("the retained passive observation must settle cancellation");
+    let finish = log
+        .iter()
+        .position(is_probe_finish)
+        .expect("the retained passive observation must settle cancellation");
     assert_eq!(log.iter().filter(|r| is_probe_finish(r)).count(), 1);
-    let disable = log.iter().position(|r| r["method"] == "Input.setInterceptDrags" && r["params"]["enabled"] == false).unwrap();
-    let released = log.iter().position(|r| r["params"]["type"] == "mouseReleased").unwrap();
-    let disposed = log.iter().position(|r| r["params"]["functionDeclaration"] == "function(){return this.dispose()}").unwrap();
-    assert!(finish < disable && disable < released && released < disposed, "existing passive receipt precedes destructive cleanup: {log:#?}");
-    assert_eq!(exact_pointer_ack(&f, &log[finish])["reply"]["result"]["result"]["value"], "no-drag");
+    let disable = log
+        .iter()
+        .position(|r| r["method"] == "Input.setInterceptDrags" && r["params"]["enabled"] == false)
+        .unwrap();
+    let released = log
+        .iter()
+        .position(|r| r["params"]["type"] == "mouseReleased")
+        .unwrap();
+    let disposed = log
+        .iter()
+        .position(|r| r["params"]["functionDeclaration"] == "function(){return this.dispose()}")
+        .unwrap();
+    assert!(
+        finish < disable && disable < released && released < disposed,
+        "existing passive receipt precedes destructive cleanup: {log:#?}"
+    );
+    assert_eq!(
+        exact_pointer_ack(&f, &log[finish])["reply"]["result"]["result"]["value"],
+        "no-drag"
+    );
     owner.seal();
     owner.drain().await.unwrap();
 }
 
 fn mouse_inputs(f: &Fixture) -> Vec<Value> {
-    f.inputs().into_iter().filter(|request| request["method"] == "Input.dispatchMouseEvent").collect()
+    f.inputs()
+        .into_iter()
+        .filter(|request| request["method"] == "Input.dispatchMouseEvent")
+        .collect()
 }
 
 fn allowed_pointer_command(request: &Value) -> bool {
     match request["method"].as_str().unwrap() {
         "Input.dispatchMouseEvent" => request["sessionId"] == "page",
         "Browser.getVersion" => request.get("sessionId").is_none(),
-        "Input.setInterceptDrags" => request["sessionId"] == "page" && request["params"]["enabled"].is_boolean(),
-        "Page.createIsolatedWorld" => request["sessionId"] == "page"
-            && request["params"]["frameId"] == "main"
-            && request["params"]["worldName"] == "agent-browser-native-observation",
-        "Runtime.evaluate" => request["sessionId"] == "page"
-            && request["params"]["expression"] == format!("({})()", super::super::point_drag::CREATE_MOVE_PROBE)
-            && request["params"]["contextId"] == 1
-            && request["params"]["objectGroup"] == "native-point-drag-1-1-0",
-        "Runtime.callFunctionOn" => request["sessionId"] == "page"
-            && request["params"]["objectId"] == "point-move-probe"
-            && matches!(request["params"]["functionDeclaration"].as_str(),
-                Some("function(){return this.arm()}" | "function(){return this.finish()}" | "function(){return this.dispose()}")),
-        "Runtime.releaseObjectGroup" => request["sessionId"] == "page"
-            && request["params"]["objectGroup"] == "native-point-drag-1-1-0",
+        "Input.setInterceptDrags" => {
+            request["sessionId"] == "page" && request["params"]["enabled"].is_boolean()
+        }
+        "Page.createIsolatedWorld" => {
+            request["sessionId"] == "page"
+                && request["params"]["frameId"] == "main"
+                && request["params"]["worldName"] == "agent-browser-native-observation"
+        }
+        "Runtime.evaluate" => {
+            request["sessionId"] == "page"
+                && request["params"]["expression"]
+                    == format!("({})()", super::super::point_drag::CREATE_MOVE_PROBE)
+                && request["params"]["contextId"] == 1
+                && request["params"]["objectGroup"] == "native-point-drag-1-1-0"
+        }
+        "Runtime.callFunctionOn" => {
+            request["sessionId"] == "page"
+                && request["params"]["objectId"] == "point-move-probe"
+                && matches!(
+                    request["params"]["functionDeclaration"].as_str(),
+                    Some(
+                        "function(){return this.arm()}"
+                            | "function(){return this.finish()}"
+                            | "function(){return this.dispose()}"
+                    )
+                )
+        }
+        "Runtime.releaseObjectGroup" => {
+            request["sessionId"] == "page"
+                && request["params"]["objectGroup"] == "native-point-drag-1-1-0"
+        }
         _ => false,
     }
 }
@@ -624,7 +744,9 @@ pub(super) struct PointProbePeer {
 }
 impl PointProbePeer {
     pub(super) fn reply(&mut self, mode: &str, request: &Value) -> Option<Value> {
-        if !is_swipe_mode(mode) || mode == CAPACITY_MODE { return None; }
+        if !is_swipe_mode(mode) || mode == CAPACITY_MODE {
+            return None;
+        }
         let method = request["method"].as_str().unwrap();
         let p = &request["params"];
         match method {
@@ -640,17 +762,21 @@ impl PointProbePeer {
                 match p["functionDeclaration"].as_str().unwrap() {
                     "function(){return this.arm()}" => {
                         assert!(!self.armed);
-                        self.armed = true; self.moved = false;
+                        self.armed = true;
+                        self.moved = false;
                         Some(json!({"result":{"value":true}}))
                     }
                     "function(){return this.finish()}" => {
                         assert!(self.armed && self.moved && self.intercept);
                         self.armed = false;
-                        Some(json!({"result":{"value":if html5_mode(mode) { "drag" } else { "no-drag" }}}))
+                        Some(
+                            json!({"result":{"value":if html5_mode(mode) { "drag" } else { "no-drag" }}}),
+                        )
                     }
                     "function(){return this.dispose()}" => {
                         assert!(!self.intercept, "disable must precede observer teardown");
-                        self.armed = false; self.disposed = true;
+                        self.armed = false;
+                        self.disposed = true;
                         Some(json!({"result":{"value":true}}))
                     }
                     _ => unreachable!(),
@@ -660,14 +786,20 @@ impl PointProbePeer {
                 assert!(allowed_pointer_command(request));
                 let enabled = p["enabled"].as_bool().unwrap();
                 // A known enable ErrorAck does not simulate an enabled browser.
-                if mode != ENABLE_REJECT_MODE || !enabled { self.intercept = enabled; }
-                if enabled { assert!(self.armed); }
+                if mode != ENABLE_REJECT_MODE || !enabled {
+                    self.intercept = enabled;
+                }
+                if enabled {
+                    assert!(self.armed);
+                }
                 Some(json!({}))
             }
             "Input.dispatchMouseEvent" if p["type"] == "mouseMoved" && p["buttons"] == 1 => {
                 assert!(self.armed && self.intercept);
                 // The peer rejects this command before any trusted move receipt.
-                if mode != MOVE_REJECT_MODE { self.moved = true; }
+                if mode != MOVE_REJECT_MODE {
+                    self.moved = true;
+                }
                 None
             }
             "Runtime.releaseObjectGroup" if p["objectGroup"] == "native-point-drag-1-1-0" => {
@@ -680,7 +812,10 @@ impl PointProbePeer {
 }
 
 pub(super) fn html5_mode(mode: &str) -> bool {
-    matches!(mode, HTML5_EARLY_MODE | HTML5_LATE_MODE | HTML5_REJECT_MODE | MOVE_OWN_ERROR_MODE)
+    matches!(
+        mode,
+        HTML5_EARLY_MODE | HTML5_LATE_MODE | HTML5_REJECT_MODE | MOVE_OWN_ERROR_MODE
+    )
 }
 pub(super) fn native_drag_data() -> Value {
     json!({"items":[{"mimeType":"text/plain","data":"native-fixture-payload"}],"dragOperationsMask":1})
@@ -689,7 +824,8 @@ pub(super) fn native_drag_event() -> Value {
     json!({"method":"Input.dragIntercepted","sessionId":"page","params":{"data":native_drag_data()}})
 }
 pub(super) fn intercept_event(mode: &str, request: &Value, after_ack: bool) -> bool {
-    html5_mode(mode) && (mode == HTML5_LATE_MODE) == after_ack
+    html5_mode(mode)
+        && (mode == HTML5_LATE_MODE) == after_ack
         && request["method"] == "Input.dispatchMouseEvent"
         && request["params"]["type"] == "mouseMoved"
         && request["params"]["buttons"] == 1
@@ -697,23 +833,66 @@ pub(super) fn intercept_event(mode: &str, request: &Value, after_ack: bool) -> b
 
 fn html5_protocol(f: &Fixture, failed: bool) {
     let mouse = mouse_inputs(f);
-    let business_mouse: Vec<_> = mouse.iter().filter(|r| r["params"]["type"] != "mouseReleased")
-        .map(|r| (r["params"]["type"].as_str().unwrap(), r["params"]["x"].as_f64().unwrap(), r["params"]["y"].as_f64().unwrap())).collect();
-    assert_eq!(business_mouse, [("mouseMoved",10.,20.),("mousePressed",10.,20.),("mouseMoved",60.,20.)]);
-    assert_eq!(mouse.iter().filter(|r| r["params"]["type"] == "mouseReleased").count(), usize::from(failed));
+    let business_mouse: Vec<_> = mouse
+        .iter()
+        .filter(|r| r["params"]["type"] != "mouseReleased")
+        .map(|r| {
+            (
+                r["params"]["type"].as_str().unwrap(),
+                r["params"]["x"].as_f64().unwrap(),
+                r["params"]["y"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        business_mouse,
+        [
+            ("mouseMoved", 10., 20.),
+            ("mousePressed", 10., 20.),
+            ("mouseMoved", 60., 20.)
+        ]
+    );
+    assert_eq!(
+        mouse
+            .iter()
+            .filter(|r| r["params"]["type"] == "mouseReleased")
+            .count(),
+        usize::from(failed)
+    );
     let inputs = f.inputs();
-    let drag: Vec<_> = inputs.iter().filter(|r| r["method"] == "Input.dispatchDragEvent").collect();
-    let types: Vec<_> = drag.iter().map(|r| r["params"]["type"].as_str().unwrap()).collect();
-    assert_eq!(types, if failed { vec!["dragEnter","dragOver","drop","dragCancel"] } else { vec!["dragEnter","dragOver","drop"] });
+    let drag: Vec<_> = inputs
+        .iter()
+        .filter(|r| r["method"] == "Input.dispatchDragEvent")
+        .collect();
+    let types: Vec<_> = drag
+        .iter()
+        .map(|r| r["params"]["type"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        types,
+        if failed {
+            vec!["dragEnter", "dragOver", "drop", "dragCancel"]
+        } else {
+            vec!["dragEnter", "dragOver", "drop"]
+        }
+    );
     for (index, request) in drag.iter().enumerate() {
         assert_eq!(request["sessionId"], "page");
         if index < 3 {
             assert_eq!(request["params"]["data"], native_drag_data());
-            assert_eq!(request["params"]["x"].as_f64(), Some(if index == 0 {60.} else {110.}));
+            assert_eq!(
+                request["params"]["x"].as_f64(),
+                Some(if index == 0 { 60. } else { 110. })
+            );
             assert_eq!(request["params"]["y"].as_f64(), Some(20.));
         }
     }
-    assert!(f.log.lock().unwrap().iter().all(|r| allowed_pointer_command(r) || r["method"] == "Input.dispatchDragEvent"));
+    assert!(f
+        .log
+        .lock()
+        .unwrap()
+        .iter()
+        .all(|r| allowed_pointer_command(r) || r["method"] == "Input.dispatchDragEvent"));
 }
 
 // Controlled transport positives, not a substitute for the unchanged real-browser board test.
@@ -729,16 +908,31 @@ async fn direct_point_html5_early_and_late_interception_wait_for_exact_drop_ack(
             result = &mut action => panic!("completed before exact drop ACK: {result:?}"),
             held = wait_for_held_pointer_request(&f, mode) => held,
         };
-        assert!(tokio::time::timeout(Duration::from_millis(5), &mut action).await.is_err());
-        assert!(!f.replies.lock().unwrap().iter().any(|r| r["request"]["id"] == drop_request["id"]));
+        assert!(tokio::time::timeout(Duration::from_millis(5), &mut action)
+            .await
+            .is_err());
+        assert!(!f
+            .replies
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r["request"]["id"] == drop_request["id"]));
         html5_protocol(&f, false);
-        f.page.client.send_command_no_params("Browser.getVersion", None).await.unwrap();
+        f.page
+            .client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
         assert_eq!(action.await.unwrap(), Value::Null);
         assert_eq!(f.op.deadline, original_deadline);
-        assert_eq!(exact_pointer_ack(&f, &drop_request)["heldUntilRequest"]["method"], "Browser.getVersion");
+        assert_eq!(
+            exact_pointer_ack(&f, &drop_request)["heldUntilRequest"]["method"],
+            "Browser.getVersion"
+        );
         html5_protocol(&f, false);
         assert_pointer_settled(&f, &ledger, &journal);
-        owner.seal(); owner.drain().await.unwrap();
+        owner.seal();
+        owner.drain().await.unwrap();
     }
 }
 
@@ -746,27 +940,56 @@ async fn direct_point_html5_early_and_late_interception_wait_for_exact_drop_ack(
 async fn direct_point_html5_rejected_drop_is_failure_and_cleans_own_drag_once() {
     let (f, ledger, journal, owner, _notices) = owned_swipe_fixture(HTML5_REJECT_MODE).await;
     let args = json!({"identityScope":"scope","point":{"x":10,"y":20},"action":{"kind":"swipeTo","target":{"x":110,"y":20}}});
-    let failure = execute_original_pointer(&f, Some(&owner), &journal, &args).await.unwrap_err();
+    let failure = execute_original_pointer(&f, Some(&owner), &journal, &args)
+        .await
+        .unwrap_err();
     assert_eq!(failure.error, ProtocolError::BrowserFailure);
     assert_eq!(failure.effects, Effects::Unknown);
-    assert!(!failure.cleanup_failed, "known application ErrorAck must not invent a cleanup failure");
+    assert!(
+        !failure.cleanup_failed,
+        "known application ErrorAck must not invent a cleanup failure"
+    );
     html5_protocol(&f, true);
     let log = f.log.lock().unwrap().clone();
     let drop_request = log.iter().find(|r| r["params"]["type"] == "drop").unwrap();
-    let reply = f.replies.lock().unwrap().iter().find(|r| r["request"]["id"] == drop_request["id"]).unwrap().clone();
+    let reply = f
+        .replies
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r["request"]["id"] == drop_request["id"])
+        .unwrap()
+        .clone();
     assert!(reply["reply"].get("error").is_some());
-    let kinds: Vec<_> = log.iter().filter_map(|r| r["params"]["type"].as_str()).collect();
+    let kinds: Vec<_> = log
+        .iter()
+        .filter_map(|r| r["params"]["type"].as_str())
+        .collect();
     let cancel = kinds.iter().position(|kind| *kind == "dragCancel").unwrap();
-    let release = kinds.iter().position(|kind| *kind == "mouseReleased").unwrap();
+    let release = kinds
+        .iter()
+        .position(|kind| *kind == "mouseReleased")
+        .unwrap();
     assert!(cancel < release);
     assert_eq!(f.state.mouse_state().unwrap().buttons, 0);
     // The original application error survives independently of acknowledged
     // observer disposal and input cleanup; it must not become CleanupFailed.
-    assert_eq!(log.iter().filter(|r| r["params"]["functionDeclaration"] == "function(){return this.dispose()}").count(), 1);
-    assert_eq!(log.iter().filter(|r| r["method"] == "Runtime.releaseObjectGroup").count(), 1);
+    assert_eq!(
+        log.iter()
+            .filter(|r| r["params"]["functionDeclaration"] == "function(){return this.dispose()}")
+            .count(),
+        1
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|r| r["method"] == "Runtime.releaseObjectGroup")
+            .count(),
+        1
+    );
     assert_eq!(ledger.snapshot().object_debt, 0);
     assert_eq!(journal.snapshot().input_debt, 0);
-    owner.seal(); owner.drain().await.unwrap();
+    owner.seal();
+    owner.drain().await.unwrap();
 }
 
 pub(super) fn capacity_frame_tree() -> Value {
@@ -776,8 +999,17 @@ pub(super) fn capacity_frame_tree() -> Value {
     json!({"frameTree":{"frame":{"id":"main","loaderId":"doc","url":"about:blank"},"childFrames":children}})
 }
 pub(super) fn probe_context(mode: &str, request: &Value) -> i64 {
-    if mode != CAPACITY_MODE || request["params"]["frameId"] == "main" { return 1; }
-    request["params"]["frameId"].as_str().unwrap().strip_prefix("capacity-").unwrap().parse::<i64>().unwrap() + 2
+    if mode != CAPACITY_MODE || request["params"]["frameId"] == "main" {
+        return 1;
+    }
+    request["params"]["frameId"]
+        .as_str()
+        .unwrap()
+        .strip_prefix("capacity-")
+        .unwrap()
+        .parse::<i64>()
+        .unwrap()
+        + 2
 }
 #[derive(Default)]
 pub(super) struct CapacityProbePeer {
@@ -785,27 +1017,57 @@ pub(super) struct CapacityProbePeer {
 }
 impl CapacityProbePeer {
     pub(super) fn reply(&mut self, mode: &str, request: &Value) -> Option<Value> {
-        if mode != CAPACITY_MODE { return None; }
+        if mode != CAPACITY_MODE {
+            return None;
+        }
         let p = &request["params"];
         match request["method"].as_str().unwrap() {
-            "Runtime.evaluate" if p["objectGroup"].as_str().is_some_and(|g| g.starts_with("native-point-drag-")) => {
+            "Runtime.evaluate"
+                if p["objectGroup"]
+                    .as_str()
+                    .is_some_and(|g| g.starts_with("native-point-drag-")) =>
+            {
                 assert_eq!(request["sessionId"], "page");
-                assert_eq!(p["expression"], format!("({})()", super::super::point_drag::CREATE_MOVE_PROBE));
+                assert_eq!(
+                    p["expression"],
+                    format!("({})()", super::super::point_drag::CREATE_MOVE_PROBE)
+                );
                 assert_eq!(p["returnByValue"], false);
                 let group = p["objectGroup"].as_str().unwrap().to_owned();
                 let object = format!("capacity-probe-{}", self.objects.len());
-                assert!(self.objects.insert(object.clone(), (group, false, false)).is_none());
+                assert!(self
+                    .objects
+                    .insert(object.clone(), (group, false, false))
+                    .is_none());
                 Some(json!({"result":{"type":"object","objectId":object}}))
             }
-            "Runtime.callFunctionOn" if p["objectId"].as_str().is_some_and(|id| id.starts_with("capacity-probe-")) => {
-                assert_eq!(p["functionDeclaration"], "function(){return this.dispose()}", "capacity rejection occurs before observer arm or press");
-                let (_, disposed, released) = self.objects.get_mut(p["objectId"].as_str().unwrap()).unwrap();
+            "Runtime.callFunctionOn"
+                if p["objectId"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with("capacity-probe-")) =>
+            {
+                assert_eq!(
+                    p["functionDeclaration"], "function(){return this.dispose()}",
+                    "capacity rejection occurs before observer arm or press"
+                );
+                let (_, disposed, released) = self
+                    .objects
+                    .get_mut(p["objectId"].as_str().unwrap())
+                    .unwrap();
                 assert!(!*disposed && !*released);
                 *disposed = true;
                 Some(json!({"result":{"value":true}}))
             }
-            "Runtime.releaseObjectGroup" if p["objectGroup"].as_str().is_some_and(|g| g.starts_with("native-point-drag-")) => {
-                let (_, disposed, released) = self.objects.values_mut().find(|(group, _, _)| p["objectGroup"].as_str() == Some(group.as_str())).unwrap();
+            "Runtime.releaseObjectGroup"
+                if p["objectGroup"]
+                    .as_str()
+                    .is_some_and(|g| g.starts_with("native-point-drag-")) =>
+            {
+                let (_, disposed, released) = self
+                    .objects
+                    .values_mut()
+                    .find(|(group, _, _)| p["objectGroup"].as_str() == Some(group.as_str()))
+                    .unwrap();
                 assert!(*disposed && !*released);
                 *released = true;
                 Some(json!({}))
@@ -819,8 +1081,12 @@ async fn unacknowledged_capacity_creation(f: &Fixture) -> Value {
     loop {
         let log = f.log.lock().unwrap().clone();
         let replies = f.replies.lock().unwrap().clone();
-        if let Some(request) = log.iter().find(|r| holds_pointer_reply(CAPACITY_MODE, r)
-            && !replies.iter().any(|reply| reply["request"]["id"] == r["id"])) {
+        if let Some(request) = log.iter().find(|r| {
+            holds_pointer_reply(CAPACITY_MODE, r)
+                && !replies
+                    .iter()
+                    .any(|reply| reply["request"]["id"] == r["id"])
+        }) {
             return request.clone();
         }
         tokio::time::sleep(Duration::from_millis(1)).await;
@@ -832,7 +1098,14 @@ async fn direct_point_existing_object_capacity_rejects_before_press_and_cleans_e
     let (f, ledger, journal, owner, _notices) = owned_swipe_fixture(CAPACITY_MODE).await;
     // The shared one-frame geometry setup must not shrink the action's actual
     // enrolled frame inventory. This reads the real enrollment capability.
-    assert_eq!(owner.capture_point_drag_realms(&f.page, &f.op).unwrap().bindings().len(), 33);
+    assert_eq!(
+        owner
+            .capture_point_drag_realms(&f.page, &f.op)
+            .unwrap()
+            .bindings()
+            .len(),
+        33
+    );
     let original_deadline = f.op.deadline;
     let args = json!({"identityScope":"scope","point":{"x":10,"y":20},"action":{"kind":"swipeTo","target":{"x":110,"y":20}}});
     let action = execute_original_pointer(&f, Some(&owner), &journal, &args);
@@ -844,13 +1117,23 @@ async fn direct_point_existing_object_capacity_rejects_before_press_and_cleans_e
             result = &mut action => break result.expect_err("33 enrolled realms must not evade the existing object capacity"),
             request = unacknowledged_capacity_creation(&f) => request,
         };
-        assert!(creations.iter().all(|id| id != &request["id"]), "one creation ACK per original request");
+        assert!(
+            creations.iter().all(|id| id != &request["id"]),
+            "one creation ACK per original request"
+        );
         creations.push(request["id"].clone());
         let count = ledger.snapshot().object_debt;
         peak = peak.max(count);
         assert!(count <= client_debt::MAX_OBJECT_DEBT);
-        assert!(mouse_inputs(&f).is_empty(), "probe setup must fail before source move or press");
-        f.page.client.send_command_no_params("Browser.getVersion", None).await.unwrap();
+        assert!(
+            mouse_inputs(&f).is_empty(),
+            "probe setup must fail before source move or press"
+        );
+        f.page
+            .client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
         exact_pointer_ack(&f, &request);
     };
     assert_eq!(failure.error, ProtocolError::CapacityExceeded,
@@ -860,16 +1143,30 @@ async fn direct_point_existing_object_capacity_rejects_before_press_and_cleans_e
     assert!(!failure.cleanup_failed);
     assert_eq!(f.op.deadline, original_deadline);
     assert_eq!(client_debt::MAX_OBJECT_DEBT, 32);
-    assert_eq!(peak, 32, "use the actual ledger capacity, not a new fixed frame cap");
+    assert_eq!(
+        peak, 32,
+        "use the actual ledger capacity, not a new fixed frame cap"
+    );
     assert!(!creations.is_empty() && creations.len() < 33);
     let log = f.log.lock().unwrap().clone();
     assert!(mouse_inputs(&f).is_empty());
-    assert!(!log.iter().any(|r| r["method"] == "Input.setInterceptDrags" || r["method"] == "Input.dispatchDragEvent"));
-    let disposed: Vec<_> = log.iter().filter(|r| r["params"]["functionDeclaration"] == "function(){return this.dispose()}").collect();
-    let released: Vec<_> = log.iter().filter(|r| r["method"] == "Runtime.releaseObjectGroup").collect();
+    assert!(!log
+        .iter()
+        .any(|r| r["method"] == "Input.setInterceptDrags"
+            || r["method"] == "Input.dispatchDragEvent"));
+    let disposed: Vec<_> = log
+        .iter()
+        .filter(|r| r["params"]["functionDeclaration"] == "function(){return this.dispose()}")
+        .collect();
+    let released: Vec<_> = log
+        .iter()
+        .filter(|r| r["method"] == "Runtime.releaseObjectGroup")
+        .collect();
     assert_eq!(disposed.len(), creations.len());
     assert_eq!(released.len(), creations.len());
-    for request in disposed.into_iter().chain(released) { exact_pointer_ack(&f, request); }
+    for request in disposed.into_iter().chain(released) {
+        exact_pointer_ack(&f, request);
+    }
     let state = ledger.snapshot();
     assert_eq!(state.object_debt, 0);
     assert_eq!(state.input_debt, 0);
@@ -878,14 +1175,18 @@ async fn direct_point_existing_object_capacity_rejects_before_press_and_cleans_e
     assert_eq!(journal.snapshot().object_debt, 0);
     assert_eq!(journal.snapshot().input_debt, 0);
     assert_eq!(f.state.mouse_state().unwrap().buttons, 0);
-    owner.seal(); owner.drain().await.unwrap();
+    owner.seal();
+    owner.drain().await.unwrap();
 }
 
 pub(super) fn known_input_error(mode: &str, request: &Value) -> bool {
-    (mode == ENABLE_REJECT_MODE && request["method"] == "Input.setInterceptDrags"
+    (mode == ENABLE_REJECT_MODE
+        && request["method"] == "Input.setInterceptDrags"
         && request["params"]["enabled"] == true)
-        || (matches!(mode, MOVE_REJECT_MODE | MOVE_OWN_ERROR_MODE) && request["method"] == "Input.dispatchMouseEvent"
-            && request["params"]["type"] == "mouseMoved" && request["params"]["buttons"] == 1)
+        || (matches!(mode, MOVE_REJECT_MODE | MOVE_OWN_ERROR_MODE)
+            && request["method"] == "Input.dispatchMouseEvent"
+            && request["params"]["type"] == "mouseMoved"
+            && request["params"]["buttons"] == 1)
 }
 
 async fn assert_known_input_error_preserves_observation_evidence(mode: &'static str) {
@@ -893,7 +1194,9 @@ async fn assert_known_input_error_preserves_observation_evidence(mode: &'static 
     let original_deadline = f.op.deadline;
     let args = json!({"identityScope":"scope","point":{"x":10,"y":20},
         "action":{"kind":"swipeTo","target":{"x":110,"y":20}}});
-    let failure = execute_original_pointer(&f, Some(&owner), &journal, &args).await.unwrap_err();
+    let failure = execute_original_pointer(&f, Some(&owner), &journal, &args)
+        .await
+        .unwrap_err();
     assert_eq!(failure.error, ProtocolError::BrowserFailure);
     assert_eq!(failure.effects, Effects::Unknown);
     // An ErrorAck is terminal, but is not a passive no-drag receipt. Only the
@@ -901,21 +1204,38 @@ async fn assert_known_input_error_preserves_observation_evidence(mode: &'static 
     assert_eq!(failure.cleanup_failed, mode == MOVE_REJECT_MODE);
     assert_eq!(f.op.deadline, original_deadline);
     let log = f.log.lock().unwrap().clone();
-    assert!(log.iter().all(|r| allowed_pointer_command(r) || (mode == MOVE_OWN_ERROR_MODE && r["method"] == "Input.dispatchDragEvent")));
-    let rejected: Vec<_> = log.iter().filter(|request| known_input_error(mode, request)).collect();
-    assert_eq!(rejected.len(), 1, "the failed application command is never replayed");
+    assert!(log.iter().all(|r| allowed_pointer_command(r)
+        || (mode == MOVE_OWN_ERROR_MODE && r["method"] == "Input.dispatchDragEvent")));
+    let rejected: Vec<_> = log
+        .iter()
+        .filter(|request| known_input_error(mode, request))
+        .collect();
+    assert_eq!(
+        rejected.len(),
+        1,
+        "the failed application command is never replayed"
+    );
     let replies = f.replies.lock().unwrap().clone();
-    let errors: Vec<_> = replies.iter().filter(|r| r["reply"].get("error").is_some()).collect();
+    let errors: Vec<_> = replies
+        .iter()
+        .filter(|r| r["reply"].get("error").is_some())
+        .collect();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["request"]["id"], rejected[0]["id"]);
     assert_eq!(errors[0]["reply"]["id"], rejected[0]["id"]);
     assert_eq!(errors[0]["reply"]["sessionId"], "page");
     assert_eq!(errors[0]["reply"]["error"]["code"], -32000);
-    for request in log.iter().filter(|request| request["id"] != rejected[0]["id"]) {
+    for request in log
+        .iter()
+        .filter(|request| request["id"] != rejected[0]["id"])
+    {
         exact_pointer_ack(&f, request);
     }
     let mouse = mouse_inputs(&f);
-    let held_moves: Vec<_> = mouse.iter().filter(|r| r["params"]["type"] == "mouseMoved" && r["params"]["buttons"] == 1).collect();
+    let held_moves: Vec<_> = mouse
+        .iter()
+        .filter(|r| r["params"]["type"] == "mouseMoved" && r["params"]["buttons"] == 1)
+        .collect();
     assert_eq!(held_moves.len(), usize::from(mode != ENABLE_REJECT_MODE));
     assert_eq!(mouse[0]["params"]["type"], "mouseMoved");
     assert_eq!(mouse[0]["params"]["x"].as_f64(), Some(10.));
@@ -925,34 +1245,76 @@ async fn assert_known_input_error_preserves_observation_evidence(mode: &'static 
         assert_eq!(held_moves[0]["params"]["x"].as_f64(), Some(60.));
         assert_eq!(held_moves[0]["params"]["y"].as_f64(), Some(20.));
     }
-    assert_eq!(mouse.iter().filter(|r| r["params"]["type"] == "mouseReleased").count(), 1);
+    assert_eq!(
+        mouse
+            .iter()
+            .filter(|r| r["params"]["type"] == "mouseReleased")
+            .count(),
+        1
+    );
     assert_eq!(mouse.len(), if mode != ENABLE_REJECT_MODE { 4 } else { 3 });
-    let drag: Vec<_> = log.iter().filter(|r| r["method"] == "Input.dispatchDragEvent").collect();
+    let drag: Vec<_> = log
+        .iter()
+        .filter(|r| r["method"] == "Input.dispatchDragEvent")
+        .collect();
     if mode == MOVE_OWN_ERROR_MODE {
         assert_eq!(drag.len(), 1);
         assert_eq!(drag[0]["params"]["type"], "dragCancel");
     } else {
-        assert!(drag.is_empty(), "no own receipt means no dragCancel authority");
+        assert!(
+            drag.is_empty(),
+            "no own receipt means no dragCancel authority"
+        );
     }
-    assert!(!log.iter().any(|r| r["params"]["functionDeclaration"] == "function(){return this.finish()}"));
-    let enables: Vec<_> = log.iter().enumerate().filter(|(_,r)| r["method"] == "Input.setInterceptDrags" && r["params"]["enabled"] == true).collect();
-    let disables: Vec<_> = log.iter().enumerate().filter(|(_,r)| r["method"] == "Input.setInterceptDrags" && r["params"]["enabled"] == false).collect();
-    let disposals: Vec<_> = log.iter().enumerate().filter(|(_,r)| r["params"]["functionDeclaration"] == "function(){return this.dispose()}").collect();
-    let releases: Vec<_> = log.iter().enumerate().filter(|(_,r)| r["method"] == "Runtime.releaseObjectGroup").collect();
+    assert!(!log
+        .iter()
+        .any(|r| r["params"]["functionDeclaration"] == "function(){return this.finish()}"));
+    let enables: Vec<_> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["method"] == "Input.setInterceptDrags" && r["params"]["enabled"] == true)
+        .collect();
+    let disables: Vec<_> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| {
+            r["method"] == "Input.setInterceptDrags" && r["params"]["enabled"] == false
+        })
+        .collect();
+    let disposals: Vec<_> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["params"]["functionDeclaration"] == "function(){return this.dispose()}")
+        .collect();
+    let releases: Vec<_> = log
+        .iter()
+        .enumerate()
+        .filter(|(_, r)| r["method"] == "Runtime.releaseObjectGroup")
+        .collect();
     assert_eq!(enables.len(), 1);
     assert_eq!(disables.len(), 1);
     assert_eq!(disposals.len(), 1);
     assert_eq!(releases.len(), 1);
-    let mouse_release = log.iter().position(|r| r["params"]["type"] == "mouseReleased").unwrap();
+    let mouse_release = log
+        .iter()
+        .position(|r| r["params"]["type"] == "mouseReleased")
+        .unwrap();
     assert!(enables[0].0 < disables[0].0 && disables[0].0 < mouse_release);
     assert!(mouse_release < disposals[0].0 && disposals[0].0 < releases[0].0);
     // No-own + no negative receipt deliberately remains unknown. A successful
     // physical release cannot retire that original rejected input obligation.
     let retained = u32::from(mode == MOVE_REJECT_MODE);
     if mode == MOVE_REJECT_MODE {
-        assert_eq!(f.state.point_drag_rejected_statuses_for_test(f.op.generation, f.op.sequence).unwrap(),
-            vec![client_debt::CommandStatus::RetainedRejected]);
-        assert!(f.state.point_drag_rejected_statuses_for_test(f.op.generation, f.op.sequence + 1).is_err());
+        assert_eq!(
+            f.state
+                .point_drag_rejected_statuses_for_test(f.op.generation, f.op.sequence)
+                .unwrap(),
+            vec![client_debt::CommandStatus::RetainedRejected]
+        );
+        assert!(f
+            .state
+            .point_drag_rejected_statuses_for_test(f.op.generation, f.op.sequence + 1)
+            .is_err());
     }
     let settled = journal.snapshot();
     assert!(settled.mutation_dispatched);
@@ -964,8 +1326,11 @@ async fn assert_known_input_error_preserves_observation_evidence(mode: &'static 
     assert_eq!(settled.object_debt, 0);
     assert_eq!(settled.outstanding_commands, retained);
     assert!(!settled.integrity_lost);
-    if !failure.cleanup_failed { assert_eq!(f.state.mouse_state().unwrap().buttons, 0); }
-    owner.seal(); owner.drain().await.unwrap();
+    if !failure.cleanup_failed {
+        assert_eq!(f.state.mouse_state().unwrap().buttons, 0);
+    }
+    owner.seal();
+    owner.drain().await.unwrap();
 }
 
 #[tokio::test]
@@ -982,7 +1347,6 @@ async fn direct_point_held_move_error_ack_with_own_receipt_cleans_without_replay
     assert_known_input_error_preserves_observation_evidence(MOVE_OWN_ERROR_MODE).await;
 }
 
-
 fn cleanup_receipt_diagnostic(f: &Fixture) -> Value {
     json!({"requests":f.log.lock().unwrap().clone(), "replies":f.replies.lock().unwrap().clone()})
 }
@@ -994,29 +1358,83 @@ async fn assert_uncertain_probe_cleanup(mode: &'static str) {
         "action":{"kind":"swipeTo","target":{"x":70,"y":20},"durationMs":48}});
     // The production cleanup owns its original two-second bound. This outer
     // test bound only detects a hang; it grants no fresh action/cleanup lease.
-    let failure = tokio::time::timeout(Duration::from_secs(4),
-        execute_original_pointer(&f, Some(&owner), &_journal, &args)).await
-        .expect("retained cleanup must not renew its budget").unwrap_err();
+    let failure = tokio::time::timeout(
+        Duration::from_secs(4),
+        execute_original_pointer(&f, Some(&owner), &_journal, &args),
+    )
+    .await
+    .expect("retained cleanup must not renew its budget")
+    .unwrap_err();
     let diagnostic = cleanup_receipt_diagnostic(&f);
     assert_eq!(failure.error, ProtocolError::Cancelled, "{diagnostic:#}");
     assert_eq!(failure.effects, Effects::Unknown, "{diagnostic:#}");
-    assert!(failure.cleanup_failed, "missing or stale passive evidence is not a negative receipt: {diagnostic:#}");
+    assert!(
+        failure.cleanup_failed,
+        "missing or stale passive evidence is not a negative receipt: {diagnostic:#}"
+    );
     assert_eq!(f.op.deadline, original_deadline);
     let log = f.log.lock().unwrap().clone();
     let finishes: Vec<_> = log.iter().filter(|r| is_probe_finish(r)).collect();
-    assert!(log.iter().all(allowed_pointer_command), "cleanup uses only the retained probe protocol: {diagnostic:#}");
-    assert_eq!(log.iter().filter(|r| r["method"] == "Page.createIsolatedWorld").count(), 1);
-    assert_eq!(log.iter().filter(|r| r["method"] == "Runtime.evaluate").count(), 1);
-    assert_eq!(finishes.len(), 1, "an already submitted finish is never replayed: {diagnostic:#}");
+    assert!(
+        log.iter().all(allowed_pointer_command),
+        "cleanup uses only the retained probe protocol: {diagnostic:#}"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|r| r["method"] == "Page.createIsolatedWorld")
+            .count(),
+        1
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|r| r["method"] == "Runtime.evaluate")
+            .count(),
+        1
+    );
+    assert_eq!(
+        finishes.len(),
+        1,
+        "an already submitted finish is never replayed: {diagnostic:#}"
+    );
     let mouse = mouse_inputs(&f);
-    let business: Vec<_> = mouse.iter().filter(|r| r["params"]["type"] != "mouseReleased")
-        .map(|r| (r["params"]["type"].as_str().unwrap(), r["params"]["x"].as_f64().unwrap(), r["params"]["y"].as_f64().unwrap())).collect();
-    assert_eq!(business, [("mouseMoved",10.,20.),("mousePressed",10.,20.),("mouseMoved",30.,20.)], "no business replay after cancellation: {diagnostic:#}");
-    assert!(!log.iter().any(|r| r["method"] == "Input.dispatchDragEvent"), "no own receipt grants dragCancel: {diagnostic:#}");
+    let business: Vec<_> = mouse
+        .iter()
+        .filter(|r| r["params"]["type"] != "mouseReleased")
+        .map(|r| {
+            (
+                r["params"]["type"].as_str().unwrap(),
+                r["params"]["x"].as_f64().unwrap(),
+                r["params"]["y"].as_f64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        business,
+        [
+            ("mouseMoved", 10., 20.),
+            ("mousePressed", 10., 20.),
+            ("mouseMoved", 30., 20.)
+        ],
+        "no business replay after cancellation: {diagnostic:#}"
+    );
+    assert!(
+        !log.iter().any(|r| r["method"] == "Input.dispatchDragEvent"),
+        "no own receipt grants dragCancel: {diagnostic:#}"
+    );
     if matches!(mode, FINISH_LOST_CANCEL_MODE | CLEANUP_FINISH_TIMEOUT_MODE) {
-        assert!(!f.replies.lock().unwrap().iter().any(|r| r["request"]["id"] == finishes[0]["id"]), "the finish result was actually withheld");
+        assert!(
+            !f.replies
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["request"]["id"] == finishes[0]["id"]),
+            "the finish result was actually withheld"
+        );
     } else {
-        assert_eq!(exact_pointer_ack(&f, finishes[0])["reply"]["result"]["result"]["value"], "no-drag");
+        assert_eq!(
+            exact_pointer_ack(&f, finishes[0])["reply"]["result"]["result"]["value"],
+            "no-drag"
+        );
     }
     owner.seal();
     owner.drain().await.unwrap();
@@ -1043,39 +1461,76 @@ async fn direct_point_cancelled_cleanup_late_own_event_is_cancelled_once() {
     let original_deadline = f.op.deadline;
     let args = json!({"identityScope":"scope", "point":{"x":10,"y":20},
         "action":{"kind":"swipeTo","target":{"x":70,"y":20},"durationMs":48}});
-    let failure = execute_original_pointer(&f, Some(&owner), &journal, &args).await.unwrap_err();
+    let failure = execute_original_pointer(&f, Some(&owner), &journal, &args)
+        .await
+        .unwrap_err();
     let diagnostic = cleanup_receipt_diagnostic(&f);
     assert_eq!(failure.error, ProtocolError::Cancelled, "{diagnostic:#}");
     assert_eq!(failure.effects, Effects::Unknown, "{diagnostic:#}");
-    assert!(!failure.cleanup_failed, "own receipt plus exact acknowledged cleanup can settle: {diagnostic:#}");
+    assert!(
+        !failure.cleanup_failed,
+        "own receipt plus exact acknowledged cleanup can settle: {diagnostic:#}"
+    );
     assert_eq!(f.op.deadline, original_deadline);
     let log = f.log.lock().unwrap().clone();
     let finish = log.iter().position(is_probe_finish).unwrap();
     assert_eq!(log.iter().filter(|r| is_probe_finish(r)).count(), 1);
-    let disable = log.iter().position(|r| r["method"] == "Input.setInterceptDrags" && r["params"]["enabled"] == false).unwrap();
-    let cancel = log.iter().position(|r| r["params"]["type"] == "dragCancel").unwrap();
-    let released = log.iter().position(|r| r["params"]["type"] == "mouseReleased").unwrap();
-    assert!(finish < disable && disable < cancel && cancel < released, "late receipt during disable is not ignored: {diagnostic:#}");
-    let drag: Vec<_> = log.iter().filter(|r| r["method"] == "Input.dispatchDragEvent").collect();
+    let disable = log
+        .iter()
+        .position(|r| r["method"] == "Input.setInterceptDrags" && r["params"]["enabled"] == false)
+        .unwrap();
+    let cancel = log
+        .iter()
+        .position(|r| r["params"]["type"] == "dragCancel")
+        .unwrap();
+    let released = log
+        .iter()
+        .position(|r| r["params"]["type"] == "mouseReleased")
+        .unwrap();
+    assert!(
+        finish < disable && disable < cancel && cancel < released,
+        "late receipt during disable is not ignored: {diagnostic:#}"
+    );
+    let drag: Vec<_> = log
+        .iter()
+        .filter(|r| r["method"] == "Input.dispatchDragEvent")
+        .collect();
     assert_eq!(drag.len(), 1);
     assert_eq!(drag[0]["params"]["type"], "dragCancel");
     let mouse = mouse_inputs(&f);
-    let actual: Vec<_> = mouse.iter().map(|r| {
-        assert_eq!(r["sessionId"], "page");
-        let p = &r["params"];
-        assert_eq!(p["modifiers"], 0);
-        (p["type"].as_str().unwrap(), p["x"].as_f64().unwrap(), p["y"].as_f64().unwrap(),
-            p["button"].as_str().unwrap(), p["buttons"].as_i64().unwrap(), p["clickCount"].as_i64())
-    }).collect();
-    assert_eq!(actual, [
-        ("mouseMoved",10.,20.,"none",0,None),
-        ("mousePressed",10.,20.,"left",1,Some(1)),
-        ("mouseMoved",30.,20.,"left",1,None),
-        ("mouseReleased",30.,20.,"left",0,Some(1)),
-    ]);
+    let actual: Vec<_> = mouse
+        .iter()
+        .map(|r| {
+            assert_eq!(r["sessionId"], "page");
+            let p = &r["params"];
+            assert_eq!(p["modifiers"], 0);
+            (
+                p["type"].as_str().unwrap(),
+                p["x"].as_f64().unwrap(),
+                p["y"].as_f64().unwrap(),
+                p["button"].as_str().unwrap(),
+                p["buttons"].as_i64().unwrap(),
+                p["clickCount"].as_i64(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        [
+            ("mouseMoved", 10., 20., "none", 0, None),
+            ("mousePressed", 10., 20., "left", 1, Some(1)),
+            ("mouseMoved", 30., 20., "left", 1, None),
+            ("mouseReleased", 30., 20., "left", 0, Some(1)),
+        ]
+    );
     assert!(log.iter().all(|r| allowed_pointer_command(r)
-        || (r["method"] == "Input.dispatchDragEvent" && r["sessionId"] == "page" && r["params"]["type"] == "dragCancel")));
-    for request in &log { exact_pointer_ack(&f, request); }
+        || (r["method"] == "Input.dispatchDragEvent"
+            && r["sessionId"] == "page"
+            && r["params"]["type"] == "dragCancel")));
+    for request in &log {
+        exact_pointer_ack(&f, request);
+    }
     assert_pointer_settled(&f, &ledger, &journal);
-    owner.seal(); owner.drain().await.unwrap();
+    owner.seal();
+    owner.drain().await.unwrap();
 }

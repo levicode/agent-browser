@@ -18,9 +18,9 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::Connector;
 
 use super::super::client_debt::{
-    current_operation, AdmissionObservation, ApplicationAdmissionStop, CommandReservation, CommandStatus, CommandStatusHandle, OwnerCleanupCommand,
-    OwnerDebtLedger, ReservedDisposal, SubmittedCommand, WorkerStartupProof,
-    WorkerStartupStatusProvenance,
+    current_operation, AdmissionObservation, ApplicationAdmissionStop, CommandReservation,
+    CommandStatus, CommandStatusHandle, OwnerCleanupCommand, OwnerDebtLedger, ReservedDisposal,
+    SubmittedCommand, WorkerStartupProof, WorkerStartupStatusProvenance,
 };
 use super::super::client_protocol::ProtocolError;
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
@@ -33,11 +33,18 @@ pub(crate) struct ActionCommandFailure {
     stop: Option<ApplicationAdmissionStop>,
 }
 impl ActionCommandFailure {
-    pub(crate) fn into_protocol(self, operation: &super::super::client_session::OperationLease) -> ProtocolError {
-        self.stop.and_then(|stop| stop.for_operation(operation)).unwrap_or(ProtocolError::BrowserFailure)
+    pub(crate) fn into_protocol(
+        self,
+        operation: &super::super::client_session::OperationLease,
+    ) -> ProtocolError {
+        self.stop
+            .and_then(|stop| stop.for_operation(operation))
+            .unwrap_or(ProtocolError::BrowserFailure)
     }
     #[cfg(test)]
-    pub(crate) fn as_str(&self) -> &str { &self.message }
+    pub(crate) fn as_str(&self) -> &str {
+        &self.message
+    }
 }
 
 // Private typed evidence from the one reservation core. Legacy callers retain
@@ -487,7 +494,9 @@ impl BoundedMethodEvents {
     /// Only after owned drag cancellation/disable has settled may cleanup drop
     /// that payload; duplicate/loss remains failure, never a clean drain.
     pub(crate) fn seal_for_cleanup(&mut self, expected_received: u64) -> Result<(), &'static str> {
-        if expected_received > 1 { return Err("invalid cleanup event count"); }
+        if expected_received > 1 {
+            return Err("invalid cleanup event count");
+        }
         self.seal_inner(expected_received, true)
     }
     fn seal_inner(&mut self, expected_received: u64, discard: bool) -> Result<(), &'static str> {
@@ -567,9 +576,11 @@ fn publish_bounded_checked(
             if !route.methods.contains(&event.method.as_str()) {
                 return true;
             }
-            if route.exact_session.as_deref().is_some_and(|session| {
-                event.session_id.as_deref() != Some(session)
-            }) {
+            if route
+                .exact_session
+                .as_deref()
+                .is_some_and(|session| event.session_id.as_deref() != Some(session))
+            {
                 return true;
             }
             // Record only receipt existence, before rejecting a payload or
@@ -1553,7 +1564,12 @@ impl CdpClient {
         params: Option<&Value>,
         session: Option<&str>,
     ) -> Result<Option<CommandReservation>, String> {
-        self.reserve_tracked_command_observed(method, params, session, &mut AdmissionObservation::default())
+        self.reserve_tracked_command_observed(
+            method,
+            params,
+            session,
+            &mut AdmissionObservation::default(),
+        )
     }
     fn reserve_tracked_command_observed(
         &self,
@@ -1583,7 +1599,8 @@ impl CdpClient {
         if self.owner.is_none() && journal.is_none() {
             return Err(TrackedReservationFailure::OwnerRequired);
         }
-        let reserved = ledger.reserve_command_observed(journal.as_ref(), method, params, session, stop);
+        let reserved =
+            ledger.reserve_command_observed(journal.as_ref(), method, params, session, stop);
         #[cfg(test)]
         if let Err(error) = &reserved {
             self.activation_diagnostic(
@@ -1661,7 +1678,13 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        self.send_command_observed(method, params, session_id, &mut AdmissionObservation::default()).await
+        self.send_command_observed(
+            method,
+            params,
+            session_id,
+            &mut AdmissionObservation::default(),
+        )
+        .await
     }
     pub(crate) async fn send_action_command(
         &self,
@@ -1672,7 +1695,11 @@ impl CdpClient {
         let mut stop = AdmissionObservation::requested();
         self.send_command_observed(method, params, session_id, &mut stop)
             .await
-            .map_err(|_message| ActionCommandFailure { #[cfg(test)] message: _message, stop: stop.take() })
+            .map_err(|_message| ActionCommandFailure {
+                #[cfg(test)]
+                message: _message,
+                stop: stop.take(),
+            })
     }
 
     /// Point-drag inert-realm setup only. Preserve an actual local capacity
@@ -1691,23 +1718,40 @@ impl CdpClient {
         }
         let mut stop = AdmissionObservation::requested();
         let reservation = match self.reserve_tracked_command_observed_typed(
-            method, Some(&params), Some(session), &mut stop,
+            method,
+            Some(&params),
+            Some(session),
+            &mut stop,
         ) {
             Ok(reservation) => reservation,
             Err(TrackedReservationFailure::Ledger(ProtocolError::CapacityExceeded)) => {
                 return Err(ProtocolError::CapacityExceeded);
             }
-            Err(_failure) => return Err(ActionCommandFailure {
-                #[cfg(test)] message: _failure.legacy_message().to_owned(),
-                stop: stop.take(),
-            }.into_protocol(operation)),
+            Err(_failure) => {
+                return Err(ActionCommandFailure {
+                    #[cfg(test)]
+                    message: _failure.legacy_message().to_owned(),
+                    stop: stop.take(),
+                }
+                .into_protocol(operation))
+            }
         };
-        self.send_reserved_command_observed(method, Some(params), Some(session), reservation, &mut stop)
-            .await
-            .map_err(|_message| ActionCommandFailure {
-                #[cfg(test)] message: _message,
+        self.send_reserved_command_observed(
+            method,
+            Some(params),
+            Some(session),
+            reservation,
+            &mut stop,
+        )
+        .await
+        .map_err(|_message| {
+            ActionCommandFailure {
+                #[cfg(test)]
+                message: _message,
                 stop: stop.take(),
-            }.into_protocol(operation))
+            }
+            .into_protocol(operation)
+        })
     }
 
     async fn send_command_observed(
@@ -1717,7 +1761,8 @@ impl CdpClient {
         session_id: Option<&str>,
         stop: &mut AdmissionObservation,
     ) -> Result<Value, String> {
-        let reservation = self.reserve_tracked_command_observed(method, params.as_ref(), session_id, stop);
+        let reservation =
+            self.reserve_tracked_command_observed(method, params.as_ref(), session_id, stop);
         #[cfg(test)]
         self.activation_command_diagnostic(
             "cdp-reserve",
@@ -2286,7 +2331,14 @@ impl CdpClient {
         session_id: Option<&str>,
         reservation: Option<CommandReservation>,
     ) -> Result<Value, String> {
-        self.send_reserved_command_observed(method, params, session_id, reservation, &mut AdmissionObservation::default()).await
+        self.send_reserved_command_observed(
+            method,
+            params,
+            session_id,
+            reservation,
+            &mut AdmissionObservation::default(),
+        )
+        .await
     }
     async fn send_reserved_command_observed(
         &self,
@@ -2312,7 +2364,14 @@ impl CdpClient {
             .and_then(CommandReservation::initialization_budget);
         within_initialization(
             budget,
-            self.send_reserved_command_bound_observed(method, params, session_id, reservation, None, stop),
+            self.send_reserved_command_bound_observed(
+                method,
+                params,
+                session_id,
+                reservation,
+                None,
+                stop,
+            ),
         )
         .await
     }
@@ -2368,7 +2427,15 @@ impl CdpClient {
         reservation: Option<CommandReservation>,
         cleanup_owner: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
     ) -> Result<Value, String> {
-        self.send_reserved_command_bound_observed(method, params, session_id, reservation, cleanup_owner, &mut AdmissionObservation::default()).await
+        self.send_reserved_command_bound_observed(
+            method,
+            params,
+            session_id,
+            reservation,
+            cleanup_owner,
+            &mut AdmissionObservation::default(),
+        )
+        .await
     }
     async fn send_reserved_command_bound_observed(
         &self,
@@ -2380,7 +2447,14 @@ impl CdpClient {
         stop: &mut AdmissionObservation,
     ) -> Result<Value, String> {
         let response = self
-            .submit_reserved_command_bound_observed(method, params, session_id, reservation, cleanup_owner, stop)
+            .submit_reserved_command_bound_observed(
+                method,
+                params,
+                session_id,
+                reservation,
+                cleanup_owner,
+                stop,
+            )
             .await?;
         self.await_command_response(method, response, None).await
     }
@@ -2393,7 +2467,15 @@ impl CdpClient {
         reservation: Option<CommandReservation>,
         owner_deadline: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
     ) -> Result<CommandResponse, String> {
-        self.submit_reserved_command_bound_observed(method, params, session_id, reservation, owner_deadline, &mut AdmissionObservation::default()).await
+        self.submit_reserved_command_bound_observed(
+            method,
+            params,
+            session_id,
+            reservation,
+            owner_deadline,
+            &mut AdmissionObservation::default(),
+        )
+        .await
     }
     async fn submit_reserved_command_bound_observed(
         &self,
@@ -2570,7 +2652,12 @@ impl CdpClient {
         max_in_flight_bytes: usize,
     ) -> Result<BoundedMethodEvents, &'static str> {
         self.subscribe_bounded_methods_scoped(
-            methods, capacity, max_event_bytes, max_in_flight_bytes, None, None,
+            methods,
+            capacity,
+            max_event_bytes,
+            max_in_flight_bytes,
+            None,
+            None,
         )
     }
 
@@ -2593,7 +2680,13 @@ impl CdpClient {
             Some(session.to_owned()),
             Some(observed.clone()),
         )?;
-        Ok((events, DragInterceptionReceipt { session: session.to_owned(), observed }))
+        Ok((
+            events,
+            DragInterceptionReceipt {
+                session: session.to_owned(),
+                observed,
+            },
+        ))
     }
 
     fn subscribe_bounded_methods_scoped(
@@ -3062,7 +3155,13 @@ mod tests {
     async fn point_drag_setup_preserves_only_typed_local_capacity_and_exact_cancellation() {
         use crate::native::client_debt::{command_scope, CommandCategory, OperationKey};
         use crate::native::client_session::ClientSession;
-        for mode in ["capacity", "cancel", "writer-cancel", "remote-error", "unknown"] {
+        for mode in [
+            "capacity",
+            "cancel",
+            "writer-cancel",
+            "remote-error",
+            "unknown",
+        ] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let endpoint = format!("ws://{}", listener.local_addr().unwrap());
             let peer = tokio::spawn(async move {
@@ -3070,14 +3169,24 @@ mod tests {
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
                 let mut commands = 0;
                 while let Some(Ok(message)) = socket.next().await {
-                    if message.is_close() { break; }
-                    if !message.is_text() { continue; }
+                    if message.is_close() {
+                        break;
+                    }
+                    if !message.is_text() {
+                        continue;
+                    }
                     commands += 1;
-                    assert!(matches!(mode, "remote-error" | "unknown"), "locally refused setup sent bytes: {mode}");
+                    assert!(
+                        matches!(mode, "remote-error" | "unknown"),
+                        "locally refused setup sent bytes: {mode}"
+                    );
                     let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
                     assert_eq!(request["method"], "Runtime.evaluate");
                     assert_eq!(request["sessionId"], "page");
-                    if mode == "unknown" { socket.close(None).await.unwrap(); break; }
+                    if mode == "unknown" {
+                        socket.close(None).await.unwrap();
+                        break;
+                    }
                     socket.send(Message::Text(json!({"id":request["id"],"sessionId":"page",
                         "error":{"code":-32000,"message":"capacity exceeded (remote text is not local evidence)"}}).to_string())).await.unwrap();
                 }
@@ -3090,7 +3199,16 @@ mod tests {
             let broker = ClientSession::new();
             let operation = broker.admit(1, 1, 1_000).unwrap();
             assert!(broker.start(1, 1).unwrap());
-            let journal = ledger.operation(OperationKey { generation:1, operation_seq:1 }, "target".into(), "page".into()).unwrap();
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
             journal.bind_operation(&operation).unwrap();
             let params = json!({"expression":"({})","returnByValue":false});
             let mut reserved = Vec::new();
@@ -3098,28 +3216,70 @@ mod tests {
                 // Actual ledger reservations, not a manufactured error envelope.
                 command_scope(CommandCategory::ApplicationObject, false, async {
                     for _ in 0..16 {
-                        reserved.push(ledger.reserve_command(Some(&journal), "Runtime.evaluate", Some(&params), Some("page")).unwrap());
+                        reserved.push(
+                            ledger
+                                .reserve_command(
+                                    Some(&journal),
+                                    "Runtime.evaluate",
+                                    Some(&params),
+                                    Some("page"),
+                                )
+                                .unwrap(),
+                        );
                     }
-                }).await;
+                })
+                .await;
                 assert_eq!(ledger.snapshot().object_debt, 32);
-                let generic = journal.scope(command_scope(CommandCategory::ApplicationObject, false,
-                    view.send_action_command("Runtime.evaluate", Some(params.clone()), Some("page")))).await;
-                assert_eq!(generic.err().unwrap().into_protocol(&operation), ProtocolError::BrowserFailure,
-                    "generic action behavior must remain unchanged");
+                let generic = journal
+                    .scope(command_scope(
+                        CommandCategory::ApplicationObject,
+                        false,
+                        view.send_action_command(
+                            "Runtime.evaluate",
+                            Some(params.clone()),
+                            Some("page"),
+                        ),
+                    ))
+                    .await;
+                assert_eq!(
+                    generic.err().unwrap().into_protocol(&operation),
+                    ProtocolError::BrowserFailure,
+                    "generic action behavior must remain unchanged"
+                );
             }
-            if mode == "cancel" { broker.cancel(1, 1).unwrap(); }
+            if mode == "cancel" {
+                broker.cancel(1, 1).unwrap();
+            }
             let result = if mode == "writer-cancel" {
                 let writer = client.transport.ws_tx.lock().await;
-                let mut pending = Box::pin(journal.scope(command_scope(CommandCategory::ApplicationObject, false,
-                    view.send_point_drag_setup_command("Runtime.evaluate", params.clone(), "page", &operation))));
+                let mut pending = Box::pin(journal.scope(command_scope(
+                    CommandCategory::ApplicationObject,
+                    false,
+                    view.send_point_drag_setup_command(
+                        "Runtime.evaluate",
+                        params.clone(),
+                        "page",
+                        &operation,
+                    ),
+                )));
                 assert!(futures_util::poll!(pending.as_mut()).is_pending());
                 assert_eq!(ledger.snapshot().outstanding_commands, 1);
                 broker.cancel(1, 1).unwrap();
                 drop(writer);
                 pending.await
             } else {
-                journal.scope(command_scope(CommandCategory::ApplicationObject, false,
-                    view.send_point_drag_setup_command("Runtime.evaluate", params.clone(), "page", &operation))).await
+                journal
+                    .scope(command_scope(
+                        CommandCategory::ApplicationObject,
+                        false,
+                        view.send_point_drag_setup_command(
+                            "Runtime.evaluate",
+                            params.clone(),
+                            "page",
+                            &operation,
+                        ),
+                    ))
+                    .await
             };
             let expected = match mode {
                 "capacity" => ProtocolError::CapacityExceeded,
@@ -3135,7 +3295,10 @@ mod tests {
                 assert!(client.transport.pending.lock().await.is_empty());
             }
             client.close().await;
-            assert_eq!(peer.await.unwrap(), usize::from(matches!(mode, "remote-error" | "unknown")));
+            assert_eq!(
+                peer.await.unwrap(),
+                usize::from(matches!(mode, "remote-error" | "unknown"))
+            );
         }
     }
 
@@ -3149,8 +3312,13 @@ mod tests {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             while let Some(Ok(message)) = socket.next().await {
-                assert!(!message.is_text(), "refused submit must not send command bytes");
-                if message.is_close() { break; }
+                assert!(
+                    !message.is_text(),
+                    "refused submit must not send command bytes"
+                );
+                if message.is_close() {
+                    break;
+                }
             }
         });
         let client = CdpClient::connect(&endpoint).await.unwrap();
@@ -3160,14 +3328,29 @@ mod tests {
         let broker = ClientSession::new();
         let operation = broker.admit(1, 1, 1_000).unwrap();
         assert!(broker.start(1, 1).unwrap());
-        let journal = ledger.operation(OperationKey { generation: 1, operation_seq: 1 },
-            "target".into(), "page".into()).unwrap();
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
         journal.bind_operation(&operation).unwrap();
         let writer = client.transport.ws_tx.lock().await;
         let mut command = Box::pin(journal.scope(async {
-            let result = command_scope(CommandCategory::ApplicationObject, false,
-                view.send_action_command("Runtime.callFunctionOn",
-                    Some(json!({"objectId":"synthetic","returnByValue":true})), Some("page"))).await;
+            let result = command_scope(
+                CommandCategory::ApplicationObject,
+                false,
+                view.send_action_command(
+                    "Runtime.callFunctionOn",
+                    Some(json!({"objectId":"synthetic","returnByValue":true})),
+                    Some("page"),
+                ),
+            )
+            .await;
             match result {
                 Err(error) => {
                     assert_eq!(error.as_str(), "Native CDP command admission revoked");
@@ -3186,7 +3369,12 @@ mod tests {
         assert!(!journal.snapshot().mutation_dispatched);
         assert!(!journal.snapshot().integrity_lost);
         assert!(client.transport.pending.lock().await.is_empty());
-        assert!(client.transport.tracked_responses.lock().unwrap().is_empty());
+        assert!(client
+            .transport
+            .tracked_responses
+            .lock()
+            .unwrap()
+            .is_empty());
         client.close().await;
         peer.await.unwrap();
     }
@@ -5757,7 +5945,11 @@ mod tests {
         };
         (routes, events)
     }
-    fn drag_fixture() -> (BoundedMethodTaps, BoundedMethodEvents, DragInterceptionReceipt) {
+    fn drag_fixture() -> (
+        BoundedMethodTaps,
+        BoundedMethodEvents,
+        DragInterceptionReceipt,
+    ) {
         let (routes, events) = bounded_fixture(1, 100);
         let observed = Arc::new(AtomicBool::new(false));
         {
@@ -5767,7 +5959,14 @@ mod tests {
             route.exact_session = Some("owned".into());
             route.drag_receipt = Some(observed.clone());
         }
-        (routes, events, DragInterceptionReceipt { session: "owned".into(), observed })
+        (
+            routes,
+            events,
+            DragInterceptionReceipt {
+                session: "owned".into(),
+                observed,
+            },
+        )
     }
     fn drag_event(session: &str) -> CdpEvent {
         CdpEvent {
@@ -5784,7 +5983,10 @@ mod tests {
         publish_bounded(&routes, &drag_event("owned"), 50);
         assert!(receipt.observed_on("owned"));
         assert!(!receipt.observed_on("foreign"));
-        assert_eq!(events.recv().await.unwrap().session_id.as_deref(), Some("owned"));
+        assert_eq!(
+            events.recv().await.unwrap().session_id.as_deref(),
+            Some("owned")
+        );
     }
     #[tokio::test]
     async fn exact_drag_oversize_retains_receipt_but_never_returns_data() {
@@ -5805,7 +6007,10 @@ mod tests {
     async fn exact_drag_closed_without_event_never_mints_receipt() {
         let (routes, mut events, receipt) = drag_fixture();
         routes.lock().unwrap().clear();
-        assert_eq!(events.recv().await.unwrap_err(), "control event stream closed");
+        assert_eq!(
+            events.recv().await.unwrap_err(),
+            "control event stream closed"
+        );
         assert!(!receipt.observed_on("owned"));
     }
     #[tokio::test]

@@ -1239,6 +1239,9 @@ impl ObservationDispatch {
                 query_partition,
             )? {
                 super::client_enrollment::QueryBoundary::Ready(()) => return Ok(()),
+                super::client_enrollment::QueryBoundary::RevisionOnlyBeforePublication => {
+                    return Err(ProtocolError::StaleScope)
+                }
                 super::client_enrollment::QueryBoundary::Pending(prefix) => {
                     // Attempt returned: captures/refs/index/watermark/targets
                     // locks are all gone. Staged refs have not been consumed.
@@ -1955,7 +1958,18 @@ impl ObservationDispatch {
         };
         if let Some(partition) = query_partition.as_ref() {
             tokio::select! {
-                result = prepare_query_worlds(&context.page, &operation, partition, &context.ui, protected) => result.map_err(failure)?,
+                result = prepare_query_worlds_mode(
+                    &context.page, &operation, partition, &context.ui, protected,
+                    fixture_query_acquisition(&request),
+                ) => {
+                    if let Err(error) = result {
+                        return Err(failure(finish_query_warm_failure(
+                            error, fixture_query_acquisition(&request),
+                            || check(&context.page, &operation),
+                            || self.check_publication_fence(retirement_fence),
+                        )));
+                    }
+                },
                 _ = observation::capture_retired() => {
                     check(&context.page, &operation).map_err(failure)?;
                     return Err(failure(ProtocolError::StaleReference));
@@ -2997,8 +3011,77 @@ pub(crate) async fn selected_query_frames_for_test(
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
     query_frames(page, operation, None, None, Some(partition)).await
 }
+fn fixture_query_acquisition(request: &DispatchRequest) -> bool {
+    matches!(request, DispatchRequest::Query(query) if query.purpose == QueryPurpose::Fixture)
+}
+#[derive(Debug)]
+enum QueryWarmFailure {
+    Protocol(ProtocolError),
+    RevisionOnlyBeforePublication,
+}
+impl From<ProtocolError> for QueryWarmFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self::Protocol(error)
+    }
+}
+impl QueryWarmFailure {
+    fn protocol(self, fixture_acquisition: bool) -> ProtocolError {
+        match self {
+            Self::Protocol(error) => error,
+            Self::RevisionOnlyBeforePublication if fixture_acquisition => {
+                ProtocolError::StaleReference
+            }
+            Self::RevisionOnlyBeforePublication => ProtocolError::StaleScope,
+        }
+    }
+}
+/// Classification has released inventory locks. Recheck existing owner and
+/// publication-retirement guards before mapping the typed refusal; this does
+/// not reacquire or repair the rejected snapshot and does not assign effects.
+fn finish_query_warm_failure(
+    error: QueryWarmFailure,
+    fixture_acquisition: bool,
+    check_owner: impl FnOnce() -> Result<(), ProtocolError>,
+    check_retirement: impl FnOnce() -> Result<(), ProtocolError>,
+) -> ProtocolError {
+    if matches!(&error, QueryWarmFailure::RevisionOnlyBeforePublication) {
+        if let Err(error) = check_owner() {
+            return error;
+        }
+        if let Err(error) = check_retirement() {
+            return error;
+        }
+    }
+    error.protocol(fixture_acquisition)
+}
+async fn check_warm_partition(
+    partition: &super::client_enrollment::PageAcquisitionProof,
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    fixture_acquisition: bool,
+) -> Result<(), QueryWarmFailure> {
+    if !fixture_acquisition {
+        partition.check_async(page, operation).await?;
+        return Ok(());
+    }
+    match partition
+        .check_fixture_acquisition_async(page, operation)
+        .await?
+    {
+        super::client_enrollment::QueryBoundary::Ready(()) => Ok(()),
+        super::client_enrollment::QueryBoundary::RevisionOnlyBeforePublication => {
+            Err(QueryWarmFailure::RevisionOnlyBeforePublication)
+        }
+        // The dedicated check consumes pending prefixes internally; never treat
+        // an unexpected unresolved prefix as permission to retry a changed scope.
+        super::client_enrollment::QueryBoundary::Pending(_) => {
+            Err(ProtocolError::StaleScope.into())
+        }
+    }
+}
 /// Metadata RPCs use the SAME UI admission as the final query. Drop that
 /// permit before awaiting event application; never retain publication/barriers.
+#[cfg(test)]
 async fn prepare_query_worlds(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
@@ -3006,6 +3089,18 @@ async fn prepare_query_worlds(
     ui: &Arc<UiGate>,
     protected: bool,
 ) -> Result<(), ProtocolError> {
+    prepare_query_worlds_mode(page, operation, partition, ui, protected, false)
+        .await
+        .map_err(|error| error.protocol(false))
+}
+async fn prepare_query_worlds_mode(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    partition: &super::client_enrollment::PageAcquisitionProof,
+    ui: &Arc<UiGate>,
+    protected: bool,
+    fixture_acquisition: bool,
+) -> Result<(), QueryWarmFailure> {
     let partition = partition.diagnostic_phase(diagnostic::QueryScopeStage::WarmWorlds);
     let permit = ui
         .enter(
@@ -3015,23 +3110,36 @@ async fn prepare_query_worlds(
             operation.cancellation.clone(),
         )
         .await?;
-    warm_query_worlds(page, operation, &partition).await?;
+    warm_query_worlds(
+        page,
+        operation,
+        &partition,
+        fixture_acquisition && !protected,
+    )
+    .await?;
     drop(permit);
     partition.wait_received_prefix(page, operation).await?;
-    partition.check_async(page, operation).await
+    check_warm_partition(
+        &partition,
+        page,
+        operation,
+        fixture_acquisition && !protected,
+    )
+    .await
 }
 /// Only exact frame/world metadata, never DOM/geometry/selector projection.
 async fn warm_query_worlds(
     page: &BrowserExecutionLease,
     operation: &OperationLease,
     partition: &super::client_enrollment::PageAcquisitionProof,
-) -> Result<(), ProtocolError> {
+    fixture_acquisition: bool,
+) -> Result<(), QueryWarmFailure> {
     let partition = partition.diagnostic_phase(diagnostic::QueryScopeStage::WarmWorlds);
-    partition.check_async(page, operation).await?;
+    check_warm_partition(&partition, page, operation, fixture_acquisition).await?;
     let mut trees = Vec::new();
     for target in partition.targets() {
         if !matches!(target.kind.as_str(), "page" | "iframe") {
-            return Err(ProtocolError::StaleScope);
+            return Err(ProtocolError::StaleScope.into());
         }
         let tree = command(
             page,
@@ -3045,7 +3153,7 @@ async fn warm_query_worlds(
     }
     let lineage = page_lineage(&trees, &page.page_session_id)?;
     if lineage.parents.len() > 256 || lineage.iframe_sessions.len() > 256 {
-        return Err(ProtocolError::InvalidArguments);
+        return Err(ProtocolError::InvalidArguments.into());
     }
     // Frame ancestry, never opener metadata, selects the exact CDP session.
     for frame in lineage.parents.keys() {
@@ -3064,7 +3172,7 @@ async fn warm_query_worlds(
                     resolved = true;
                     break;
                 }
-                None => return Err(ProtocolError::StaleScope),
+                None => return Err(ProtocolError::StaleScope.into()),
             }
         }
         if !resolved
@@ -3073,7 +3181,7 @@ async fn warm_query_worlds(
                 .iter()
                 .any(|target| target.session_id == session)
         {
-            return Err(ProtocolError::StaleScope);
+            return Err(ProtocolError::StaleScope.into());
         }
         command(
             page,
@@ -6551,3 +6659,150 @@ mod frame_inventory_tests;
 #[cfg(test)]
 #[path = "client_trace_initial_inventory_tests.rs"]
 mod trace_initial_inventory_tests;
+
+#[cfg(test)]
+mod fixture_acquisition_refusal_tests {
+    use super::*;
+    #[tokio::test]
+    async fn typed_refusal_preserves_owner_then_real_retirement_guard_priority() {
+        for error in [
+            ProtocolError::StaleScope,
+            ProtocolError::ScopeUnavailable,
+            ProtocolError::Cancelled,
+            ProtocolError::DeadlineExceeded,
+            ProtocolError::StaleReference,
+            ProtocolError::CleanupFailed,
+        ] {
+            let fence_called = std::cell::Cell::new(false);
+            assert_eq!(
+                finish_query_warm_failure(
+                    QueryWarmFailure::RevisionOnlyBeforePublication,
+                    true,
+                    || Err(error.clone()),
+                    || {
+                        fence_called.set(true);
+                        Err(ProtocolError::ScopeUnavailable)
+                    },
+                ),
+                error
+            );
+            assert!(!fence_called.get());
+        }
+        for retired in [false, true] {
+            let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+            let fence = dispatch.publication_fence().unwrap();
+            if retired {
+                dispatch.retire_interaction().await.unwrap();
+            }
+            let called = std::cell::Cell::new(false);
+            let result = finish_query_warm_failure(
+                QueryWarmFailure::RevisionOnlyBeforePublication,
+                true,
+                || Ok(()),
+                || {
+                    called.set(true);
+                    dispatch.check_publication_fence(fence)
+                },
+            );
+            assert!(called.get());
+            assert_eq!(result, ProtocolError::StaleReference);
+        }
+        let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+        let fence = dispatch.publication_fence().unwrap();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = dispatch.captures.lock().unwrap();
+            panic!("synthetic poisoned retirement guard");
+        }));
+        assert_eq!(
+            finish_query_warm_failure(
+                QueryWarmFailure::RevisionOnlyBeforePublication,
+                true,
+                || Ok(()),
+                || dispatch.check_publication_fence(fence),
+            ),
+            ProtocolError::ScopeUnavailable
+        );
+        assert_eq!(
+            finish_query_warm_failure(
+                QueryWarmFailure::Protocol(ProtocolError::CleanupFailed),
+                true,
+                || panic!("ordinary errors must not be reclassified"),
+                || panic!("ordinary errors must not be reclassified"),
+            ),
+            ProtocolError::CleanupFailed
+        );
+    }
+    #[test]
+    fn acquisition_refusal_never_overwrites_cleanup_uncertainty_or_effects() {
+        use super::super::client_protocol::Effects;
+        for dirty_dispatch in [false, true] {
+            for dirty_join in [false, true] {
+                let code = QueryWarmFailure::RevisionOnlyBeforePublication.protocol(true);
+                let failure = |error, cleanup_integrity_lost| DispatchFailure {
+                    error,
+                    identity_scope: "scope".into(),
+                    cleanup_integrity_lost,
+                };
+                let (outcome, dirty) = super::super::client_browser::settle_observation_dispatch(
+                    Ok(Err(failure(code.clone(), dirty_dispatch))),
+                    Ok(if dirty_join {
+                        Err(failure(ProtocolError::CleanupFailed, true))
+                    } else {
+                        Ok(())
+                    }),
+                );
+                assert_eq!(outcome.result, Err(code));
+                assert_eq!(dirty, dirty_dispatch || dirty_join);
+                assert_eq!(
+                    outcome.effects,
+                    if dirty {
+                        Effects::Unknown
+                    } else {
+                        Effects::NotDispatched
+                    }
+                );
+            }
+        }
+    }
+    #[test]
+    fn protected_query_cannot_opt_into_fixture_acquisition_refusal() {
+        for purpose in [QueryPurpose::Fixture, QueryPurpose::Protected] {
+            let request = DispatchRequest::Query(QueryRequest {
+                purpose,
+                options: serde_json::from_value(
+                    json!({"expression":{"kind":"selector","selector":"#synthetic"}}),
+                )
+                .unwrap(),
+            });
+            assert_eq!(
+                fixture_query_acquisition(&request),
+                purpose == QueryPurpose::Fixture
+            );
+        }
+    }
+    #[test]
+    fn only_explicit_fixture_typed_refusal_maps_to_stale_reference() {
+        assert_eq!(
+            QueryWarmFailure::RevisionOnlyBeforePublication.protocol(true),
+            ProtocolError::StaleReference
+        );
+        assert_eq!(
+            QueryWarmFailure::RevisionOnlyBeforePublication.protocol(false),
+            ProtocolError::StaleScope
+        );
+        for error in [
+            ProtocolError::StaleScope,
+            ProtocolError::ScopeUnavailable,
+            ProtocolError::Cancelled,
+            ProtocolError::DeadlineExceeded,
+            ProtocolError::CleanupFailed,
+        ] {
+            for fixture in [false, true] {
+                assert_eq!(
+                    QueryWarmFailure::Protocol(error.clone()).protocol(fixture),
+                    error
+                );
+            }
+        }
+    }
+}

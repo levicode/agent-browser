@@ -636,11 +636,20 @@ async fn recording_missing_second_file_returns_first_real_segment_without_anothe
     let result: Result<(), String> = async {
         let args = json!({"identityScope":"recording-wire"});
         let first = f.operation(2);
-        f.journal(0, &first).scope(actions.execute(f.context(0, &first), "recording.start", &args)).await.map_err(action_error)?;
+        f.journal(0, &first)
+            .scope(actions.execute(f.context(0, &first), "recording.start", &args))
+            .await
+            .map_err(action_error)?;
         let closing = f.operation(3);
-        f.journal(0, &closing).scope(actions.recording_page_closing("recording-wire", &f.blobs)).await.map_err(|e| format!("first close {e:?}"))?;
+        f.journal(0, &closing)
+            .scope(actions.recording_page_closing("recording-wire", &f.blobs))
+            .await
+            .map_err(|e| format!("first close {e:?}"))?;
         let second = f.operation(4);
-        f.journal(1, &second).scope(actions.recording_page_opened(f.context(1, &second))).await.map_err(action_error)?;
+        f.journal(1, &second)
+            .scope(actions.recording_page_opened(f.context(1, &second)))
+            .await
+            .map_err(action_error)?;
         // First-frame readiness acknowledges a pipe write, not FFmpeg opening
         // its output. Join the actual second producer before removing its file;
         // do not sleep, seed finished bytes, or manufacture encoder success.
@@ -652,19 +661,29 @@ async fn recording_missing_second_file_returns_first_real_segment_without_anothe
             tokio::time::timeout_at(
                 tokio::time::Instant::from_std(f.deadline),
                 recording::stop_recording_task(&mut owned.state),
-            ).await.map_err(|_| "second encoder join exceeded the original fixture deadline")?
-                .map_err(|e| format!("second actual stop: {e}"))?;
+            )
+            .await
+            .map_err(|_| "second encoder join exceeded the original fixture deadline")?
+            .map_err(|e| format!("second actual stop: {e}"))?;
             if !owned.state.encoder_complete.load(Ordering::SeqCst)
                 || !owned.state.encoder_succeeded.load(Ordering::SeqCst)
-                || owned.state.capture_task.is_some() || owned.bytes.is_some() || owned.read_job.is_some()
+                || owned.state.capture_task.is_some()
+                || owned.bytes.is_some()
+                || owned.read_job.is_some()
             {
-                return Err("second producer was not independently joined before the read fault".into());
+                return Err(
+                    "second producer was not independently joined before the read fault".into(),
+                );
             }
             owned.state.output_path.clone()
         };
-        let metadata = std::fs::metadata(&missing_path).map_err(|e| format!("second actual encoder output: {e}"))?;
-        if !metadata.is_file() || metadata.len() == 0 { return Err("second encoder produced no owned file".into()); }
-        std::fs::remove_file(&missing_path).map_err(|e| format!("inject second-file read failure: {e}"))?;
+        let metadata = std::fs::metadata(&missing_path)
+            .map_err(|e| format!("second actual encoder output: {e}"))?;
+        if !metadata.is_file() || metadata.len() == 0 {
+            return Err("second encoder produced no owned file".into());
+        }
+        std::fs::remove_file(&missing_path)
+            .map_err(|e| format!("inject second-file read failure: {e}"))?;
         let stop = f.operation(5);
         let stop_journal = f.journal(1, &stop);
         let public_stop_calls = std::sync::atomic::AtomicUsize::new(0);
@@ -673,12 +692,20 @@ async fn recording_missing_second_file_returns_first_real_segment_without_anothe
             stop_journal.scope(actions.execute(f.context(1, &stop), "recording.stop", &args))
         };
         let output = public_stop().await.map_err(action_error)?;
-        let segments = output["segments"].as_array().ok_or("missing safe segments")?;
-        if output["missingSegment"] != 2 || output.as_object().map(|o| o.len()) != Some(3) || segments.len() != 1 {
+        let segments = output["segments"]
+            .as_array()
+            .ok_or("missing safe segments")?;
+        if output["missingSegment"] != 2
+            || output.as_object().map(|o| o.len()) != Some(3)
+            || segments.len() != 1
+        {
             return Err(format!("missing-file receipt lost safe output: {output}"));
         }
         for session in ["capture1", "capture2"] {
-            if f.count("Page.startScreencast", session) != 1 || f.count("Page.stopScreencast", session) != 1 || f.count("Target.detachFromTarget", session) != 1 {
+            if f.count("Page.startScreencast", session) != 1
+                || f.count("Page.stopScreencast", session) != 1
+                || f.count("Target.detachFromTarget", session) != 1
+            {
                 return Err("partial file read repeated capture or stop".into());
             }
         }
@@ -691,7 +718,8 @@ async fn recording_missing_second_file_returns_first_real_segment_without_anothe
             return Err("partial transfer retried the public recording.stop".into());
         }
         Ok(())
-    }.await;
+    }
+    .await;
     let cleanup = actions.cleanup().await;
     f.close().await;
     assert_eq!(cleanup, Ok(()));
@@ -706,50 +734,107 @@ async fn recording_freeze_preserves_finished_segment_without_stopping_active_sec
     let result: Result<(), String> = async {
         let args = json!({"identityScope":"recording-wire"});
         let first = f.operation(2);
-        f.journal(0, &first).scope(actions.execute(f.context(0, &first), "recording.start", &args)).await.map_err(action_error)?;
+        f.journal(0, &first)
+            .scope(actions.execute(f.context(0, &first), "recording.start", &args))
+            .await
+            .map_err(action_error)?;
         let closing = f.operation(3);
-        f.journal(0, &closing).scope(actions.recording_page_closing("recording-wire", &f.blobs)).await.map_err(|e| format!("first close {e:?}"))?;
+        f.journal(0, &closing)
+            .scope(actions.recording_page_closing("recording-wire", &f.blobs))
+            .await
+            .map_err(|e| format!("first close {e:?}"))?;
         let second = f.operation(4);
-        f.journal(1, &second).scope(actions.recording_page_opened(f.context(1, &second))).await.map_err(action_error)?;
+        f.journal(1, &second)
+            .scope(actions.recording_page_opened(f.context(1, &second)))
+            .await
+            .map_err(action_error)?;
         let before = f.requests.lock().unwrap().len();
-        let key = client_debt::OperationKey { generation: 1, operation_seq: 5 };
-        let mut batch = actions.freeze_finalized_recording("recording-wire", key, &f.blobs).ok_or("safe previous segment not frozen")?;
-        if f.requests.lock().unwrap().len() != before || f.count("Page.stopScreencast", "capture2") != 0 {
+        let key = client_debt::OperationKey {
+            generation: 1,
+            operation_seq: 5,
+        };
+        let mut batch = actions
+            .freeze_finalized_recording("recording-wire", key, &f.blobs)
+            .ok_or("safe previous segment not frozen")?;
+        if f.requests.lock().unwrap().len() != before
+            || f.count("Page.stopScreencast", "capture2") != 0
+        {
             return Err("read-only freeze stopped or mutated the active recorder".into());
         }
         {
             let ledger = actions.recording.lock().await;
-            if ledger.current.is_none() || !ledger.abandoned || ledger.armed || ledger.finished.len() != 1 || ledger.finished[0].reservation.is_some() || ledger.finished[0].bytes.is_some() {
+            if ledger.current.is_none()
+                || !ledger.abandoned
+                || ledger.armed
+                || ledger.finished.len() != 1
+                || ledger.finished[0].reservation.is_some()
+                || ledger.finished[0].bytes.is_some()
+            {
                 return Err("freeze lost retained producer/cleanup ownership".into());
             }
         }
         let identity = json!({"identityScope":"recording-wire","failedOperationSeq":5});
-        let manifest = batch.command(1, "recording.finalized.collect", identity.as_object().unwrap().clone()).map_err(|e|format!("collect {e:?}"))?;
-        if manifest["segments"].as_array().map(Vec::len) != Some(1) || manifest["segments"][0]["ordinal"] != 1 {
+        let manifest = batch
+            .command(
+                1,
+                "recording.finalized.collect",
+                identity.as_object().unwrap().clone(),
+            )
+            .map_err(|e| format!("collect {e:?}"))?;
+        if manifest["segments"].as_array().map(Vec::len) != Some(1)
+            || manifest["segments"][0]["ordinal"] != 1
+        {
             return Err("active or missing segment entered the frozen manifest".into());
         }
         let mut read = identity;
-        read["token"] = manifest["token"].clone(); read["handle"] = manifest["segments"][0]["handle"].clone();
-        read["offset"] = json!(0); read["maxBytes"] = json!(262144);
+        read["token"] = manifest["token"].clone();
+        read["handle"] = manifest["segments"][0]["handle"].clone();
+        read["offset"] = json!(0);
+        read["maxBytes"] = json!(262144);
         let mut bytes = Vec::new();
         loop {
             read["offset"] = json!(bytes.len());
-            let chunk = batch.command(1, "recording.finalized.read", read.as_object().unwrap().clone()).map_err(|e|format!("read {e:?}"))?;
-            bytes.extend(base64::engine::general_purpose::STANDARD.decode(chunk["base64"].as_str().ok_or("missing chunk")?).map_err(|_|"base64")?);
-            if chunk["eof"] == true { break; }
+            let chunk = batch
+                .command(
+                    1,
+                    "recording.finalized.read",
+                    read.as_object().unwrap().clone(),
+                )
+                .map_err(|e| format!("read {e:?}"))?;
+            bytes.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(chunk["base64"].as_str().ok_or("missing chunk")?)
+                    .map_err(|_| "base64")?,
+            );
+            if chunk["eof"] == true {
+                break;
+            }
         }
-        let directory = OwnedDirectory::create().map_err(|_|"probe directory")?;
+        let directory = OwnedDirectory::create().map_err(|_| "probe directory")?;
         let video = directory.path.join("safe.webm");
-        std::fs::write(&video, &bytes).map_err(|_|"probe file")?;
-        let decoded = tokio::process::Command::new("ffmpeg").args(["-v", "error", "-i"]).arg(&video).args(["-frames:v", "1", "-f", "null", "-"]).output().await.map_err(|_|"ffmpeg required")?;
-        directory.close().map_err(|_|"probe cleanup")?;
-        if !decoded.status.success() { return Err("frozen real segment did not decode".into()); }
-        if f.requests.lock().unwrap().len() != before { return Err("frozen transfer issued browser commands".into()); }
+        std::fs::write(&video, &bytes).map_err(|_| "probe file")?;
+        let decoded = tokio::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-i"])
+            .arg(&video)
+            .args(["-frames:v", "1", "-f", "null", "-"])
+            .output()
+            .await
+            .map_err(|_| "ffmpeg required")?;
+        directory.close().map_err(|_| "probe cleanup")?;
+        if !decoded.status.success() {
+            return Err("frozen real segment did not decode".into());
+        }
+        if f.requests.lock().unwrap().len() != before {
+            return Err("frozen transfer issued browser commands".into());
+        }
         drop(batch);
         Ok(())
-    }.await;
+    }
+    .await;
     let cleanup = actions.cleanup().await;
-    if result.is_ok() { assert_eq!(f.count("Page.stopScreencast", "capture2"), 1); }
+    if result.is_ok() {
+        assert_eq!(f.count("Page.stopScreencast", "capture2"), 1);
+    }
     f.close().await;
     assert_eq!(cleanup, Ok(()));
     result.unwrap();

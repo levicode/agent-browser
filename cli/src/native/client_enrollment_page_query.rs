@@ -4,12 +4,15 @@ use super::*;
 use crate::native::client_settlement_trace::{
     query_scope_refusal, QueryScopeReason as Reason, QueryScopeStage as Stage,
 };
-use crate::native::client_targets::{SelectedPageTargetBarrier, SelectedPageTargetSnapshot};
+use crate::native::client_targets::{
+    SelectedPageTargetBarrier, SelectedPageTargetCheck, SelectedPageTargetSnapshot,
+};
 
 /// Private native control flow, never a wire error or permission grant.
 pub(crate) enum QueryBoundary<T> {
     Ready(T),
     Pending(QueryEventPrefix),
+    RevisionOnlyBeforePublication,
 }
 pub(crate) struct QueryEventPrefix {
     watermark: BoundedEventWatermark,
@@ -20,6 +23,7 @@ impl<T> QueryBoundary<T> {
         match self {
             Self::Ready(value) => QueryBoundary::Ready(map(value)),
             Self::Pending(prefix) => QueryBoundary::Pending(prefix),
+            Self::RevisionOnlyBeforePublication => QueryBoundary::RevisionOnlyBeforePublication,
         }
     }
 }
@@ -246,6 +250,7 @@ impl PageQueryAuthority {
             &mut Some(publish),
         )? {
             QueryBoundary::Ready(value) => Ok(value),
+            QueryBoundary::RevisionOnlyBeforePublication => Err(ProtocolError::StaleScope),
             QueryBoundary::Pending(_) => {
                 query_scope_refusal(op.generation, op.sequence, stage, Reason::WatermarkPending);
                 Err(ProtocolError::ScopeUnavailable)
@@ -283,6 +288,9 @@ impl PageQueryAuthority {
                 &mut publish,
             )? {
                 QueryBoundary::Ready(value) => return Ok(value),
+                QueryBoundary::RevisionOnlyBeforePublication => {
+                    return Err(ProtocolError::StaleScope)
+                }
                 QueryBoundary::Pending(prefix) => self.wait_event_prefix(page, op, &prefix).await?,
             }
         }
@@ -364,6 +372,37 @@ impl PageQueryAuthority {
         acquire_barrier: bool,
         stage: Stage,
         watermark: &BoundedEventWatermark,
+        publish: &mut Option<
+            impl FnOnce(
+                &[Attribution],
+                &SelectedPageTargetSnapshot,
+                &BoundedEventWatermark,
+            ) -> Result<T, ProtocolError>,
+        >,
+    ) -> Result<QueryBoundary<(T, Option<SelectedPageTargetBarrier>)>, ProtocolError> {
+        self.with_partition_attempt_mode(
+            page,
+            op,
+            expected,
+            held,
+            acquire_barrier,
+            stage,
+            watermark,
+            false,
+            publish,
+        )
+    }
+    #[allow(clippy::too_many_arguments)] // Same-snapshot classification, validation and publication boundaries.
+    fn with_partition_attempt_mode<T>(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        expected: Option<&PageAcquisitionProof>,
+        held: Option<&SelectedPageTargetBarrier>,
+        acquire_barrier: bool,
+        stage: Stage,
+        watermark: &BoundedEventWatermark,
+        allow_revision_only: bool,
         publish: &mut Option<
             impl FnOnce(
                 &[Attribution],
@@ -471,12 +510,17 @@ impl PageQueryAuthority {
                 }
                 owner
                     .targets
-                    .with_selected_page_targets_diagnostic(
+                    .with_selected_page_targets_checked(
                         &self.selected,
                         expected.map(|proof| &proof.targets),
                         held,
                         acquire_barrier,
                         Some((op.generation, op.sequence, stage)),
+                        allow_revision_only
+                            && stage == Stage::WarmWorlds
+                            && expected.is_some()
+                            && held.is_none()
+                            && !acquire_barrier,
                         |target, registered| {
                             let relevant =
                                 selected_entry(&index, target, &self.selected.session_id)?;
@@ -534,12 +578,20 @@ impl PageQueryAuthority {
                                     Reason::OriginalBudget,
                                 ));
                             }
+                            Ok(())
+                        },
+                        |targets| {
                             publish.take().ok_or(ProtocolError::StaleScope)?(
                                 &entries, targets, watermark,
                             )
                         },
                     )
-                    .map(QueryBoundary::Ready)
+                    .map(|result| match result {
+                        SelectedPageTargetCheck::Ready(value) => QueryBoundary::Ready(value),
+                        SelectedPageTargetCheck::RevisionOnlyBeforePublication => {
+                            QueryBoundary::RevisionOnlyBeforePublication
+                        }
+                    })
             })
             .map_err(|_| ProtocolError::ScopeUnavailable)?
     }
@@ -685,6 +737,40 @@ impl PageAcquisitionProof {
             )
             .await
             .map(|_| ())
+    }
+    /// Fixture-query acquisition only. A revision-only refusal drops the old
+    /// proof; it never accepts changed facts or grants a protected-read barrier.
+    pub(crate) async fn check_fixture_acquisition_async(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+    ) -> Result<QueryBoundary<()>, ProtocolError> {
+        loop {
+            let result = self.authority.with_partition_attempt_mode(
+                page,
+                op,
+                Some(self),
+                None,
+                false,
+                Stage::WarmWorlds,
+                &self.watermark,
+                true,
+                &mut Some(
+                    |_: &[Attribution],
+                     _: &SelectedPageTargetSnapshot,
+                     _: &BoundedEventWatermark| Ok(()),
+                ),
+            )?;
+            match result {
+                QueryBoundary::Ready(_) => return Ok(QueryBoundary::Ready(())),
+                QueryBoundary::RevisionOnlyBeforePublication => {
+                    return Ok(QueryBoundary::RevisionOnlyBeforePublication)
+                }
+                QueryBoundary::Pending(prefix) => {
+                    self.authority.wait_event_prefix(page, op, &prefix).await?
+                }
+            }
+        }
     }
     pub(crate) fn publication_attempt<T>(
         &self,
@@ -2974,6 +3060,9 @@ mod atomic_query_boundary_tests {
                 {
                     QueryBoundary::Pending(prefix) => prefix,
                     QueryBoundary::Ready(()) => panic!("unapplied event published"),
+                    QueryBoundary::RevisionOnlyBeforePublication => {
+                        panic!("publication cannot admit acquisition refusal")
+                    }
                 };
                 assert_eq!(calls.load(Ordering::SeqCst), 0);
                 let wait = proof.wait_pending(&page, &op, &prefix);
@@ -3243,6 +3332,132 @@ mod atomic_query_boundary_tests {
             assert_ne!(next, staged_id);
             drop(barrier);
             drop(ui_permit);
+            let _ = owner.close().await;
+            connection.close().await;
+            server.abort();
+            let _ = server.await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod fixture_revision_acquisition_tests {
+    use super::*;
+    /// CI-only existing framed-peer fixture. No new browser input, scope or retry.
+    #[tokio::test]
+    async fn fixture_revision_refusal_checks_enrollment_owner_and_original_budget() {
+        for outcome in [
+            "revision",
+            "enrollment",
+            "cancel",
+            "deadline",
+            "generation",
+            "retired",
+            "failure",
+        ] {
+            let (owner, _notices, log, _emit, server, _broker, connection) =
+                super::super::tests::fixture_with_explicit_context_ownership(
+                    "owner-retirement-runtime-held-query",
+                    true,
+                    true,
+                )
+                .await;
+            owner
+                .enroll_existing("initial-target", "initial", "page", &owner.operation())
+                .await
+                .unwrap();
+            owner.start(&owner.operation()).await.unwrap();
+            owner
+                .client
+                .debt_ledger()
+                .unwrap()
+                .publish_initialization(|| Ok(()))
+                .unwrap();
+            let initial = owner.index.lock().unwrap().sessions["initial"].clone();
+            let page = owner.lease(&initial).unwrap();
+            let selected = owner.targets.owned_target("initial-target").unwrap();
+            let authority = owner.page_query_authority(&page, &selected).unwrap();
+            let (sender, cancellation) = watch::channel(CancelSignal::None);
+            let mut op = OperationLease {
+                is_callback: false,
+                generation: owner.generation,
+                sequence: 2,
+                deadline: Instant::now() + Duration::from_secs(2),
+                cancellation,
+            };
+            let mut proof = authority.acquire_async(&page, &op).await.unwrap();
+            owner
+                .targets
+                .invalidate_inventory_for(
+                    crate::native::client_settlement_trace::InventoryRevisionEvent::Navigate,
+                    "initial-target",
+                )
+                .unwrap();
+            match outcome {
+                "enrollment" => {
+                    // Force the late enrollment-target correspondence check,
+                    // not the earlier expected attribution vector comparison.
+                    let mut unmatched = initial.clone();
+                    unmatched.session = "zz-unmatched-session".into();
+                    unmatched.target = "zz-unmatched-target".into();
+                    owner
+                        .index
+                        .lock()
+                        .unwrap()
+                        .sessions
+                        .insert(unmatched.session.clone(), unmatched.clone());
+                    proof.entries.push(unmatched);
+                    proof.entries.sort_by(|a, b| a.session.cmp(&b.session));
+                }
+                "cancel" => {
+                    sender.send_replace(CancelSignal::Requested);
+                }
+                "deadline" => op.deadline = Instant::now() - Duration::from_millis(1),
+                "generation" => op.generation += 1,
+                "retired" => {
+                    owner
+                        .index
+                        .lock()
+                        .unwrap()
+                        .retired_page_sessions
+                        .insert("initial".into());
+                }
+                "failure" => {
+                    owner.index.lock().unwrap().failure = Some(ProtocolError::CleanupFailed)
+                }
+                _ => {}
+            }
+            let deadline = op.deadline;
+            let requests = log.lock().unwrap().len();
+            let result = proof.check_fixture_acquisition_async(&page, &op).await;
+            assert_eq!(op.deadline, deadline, "{outcome}");
+            assert_eq!(
+                log.lock().unwrap().len(),
+                requests,
+                "classification adds no RPC"
+            );
+            match outcome {
+                "revision" => {
+                    assert!(matches!(
+                        result,
+                        Ok(QueryBoundary::RevisionOnlyBeforePublication)
+                    ));
+                    // Protected/final publication still refuses exactly the same old proof.
+                    assert!(proof.check_async(&page, &op).await.is_err());
+                    let published = std::cell::Cell::new(false);
+                    assert!(proof
+                        .with_publication(&page, &op, || {
+                            published.set(true);
+                            Ok(())
+                        })
+                        .is_err());
+                    assert!(!published.get());
+                }
+                "cancel" => assert!(matches!(result, Err(ProtocolError::Cancelled))),
+                "deadline" => assert!(matches!(result, Err(ProtocolError::DeadlineExceeded))),
+                "failure" => assert!(matches!(result, Err(ProtocolError::CleanupFailed))),
+                _ => assert!(result.is_err(), "{outcome}"),
+            }
             let _ = owner.close().await;
             connection.close().await;
             server.abort();

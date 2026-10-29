@@ -33,8 +33,15 @@ pub(crate) struct AdmissionObservation {
     stop: Option<ApplicationAdmissionStop>,
 }
 impl AdmissionObservation {
-    pub(crate) fn requested() -> Self { Self { requested: true, stop: None } }
-    pub(crate) fn take(&mut self) -> Option<ApplicationAdmissionStop> { self.stop.take() }
+    pub(crate) fn requested() -> Self {
+        Self {
+            requested: true,
+            stop: None,
+        }
+    }
+    pub(crate) fn take(&mut self) -> Option<ApplicationAdmissionStop> {
+        self.stop.take()
+    }
 }
 impl ApplicationAdmissionStop {
     pub(crate) fn for_operation(self, operation: &OperationLease) -> Option<ProtocolError> {
@@ -43,7 +50,7 @@ impl ApplicationAdmissionStop {
             && self.deadline == operation.deadline
             && self.cancellation.same_channel(&operation.cancellation)
             && current_operation().is_some_and(|journal| journal.same_operation(&self.journal)))
-            .then_some(self.error)
+        .then_some(self.error)
     }
 }
 /// One native evaluate window, not an operation owner or a causal-parent claim.
@@ -623,7 +630,10 @@ impl OperationJournalHandle {
     pub(crate) fn check_application_submission(&self) -> Result<(), ProtocolError> {
         self.check_application_submission_observed(&mut AdmissionObservation::default())
     }
-    fn check_application_submission_observed(&self, stop: &mut AdmissionObservation) -> Result<(), ProtocolError> {
+    fn check_application_submission_observed(
+        &self,
+        stop: &mut AdmissionObservation,
+    ) -> Result<(), ProtocolError> {
         let state = self
             .journal
             .state
@@ -663,7 +673,10 @@ impl OperationJournalHandle {
     pub(crate) fn mark_mutation_maybe_submitted(&self) -> Result<(), ProtocolError> {
         self.mark_mutation_maybe_submitted_observed(&mut AdmissionObservation::default())
     }
-    fn mark_mutation_maybe_submitted_observed(&self, stop: &mut AdmissionObservation) -> Result<(), ProtocolError> {
+    fn mark_mutation_maybe_submitted_observed(
+        &self,
+        stop: &mut AdmissionObservation,
+    ) -> Result<(), ProtocolError> {
         let mut state = self
             .journal
             .state
@@ -2415,7 +2428,13 @@ impl OwnerDebtLedger {
         params: Option<&Value>,
         session: Option<&str>,
     ) -> Result<CommandReservation, ProtocolError> {
-        self.reserve_command_observed(journal, method, params, session, &mut AdmissionObservation::default())
+        self.reserve_command_observed(
+            journal,
+            method,
+            params,
+            session,
+            &mut AdmissionObservation::default(),
+        )
     }
     pub(crate) fn reserve_command_observed(
         self: &Arc<Self>,
@@ -2431,24 +2450,37 @@ impl OwnerDebtLedger {
     /// NOT a sweep and NOT a successful application ACK: retain its known error
     /// and mutation classification while retiring only explicitly listed debt.
     pub(crate) fn retire_point_drag_rejections(
-        self: &Arc<Self>, proof: super::client_page::PointDragCleanupProof,
+        self: &Arc<Self>,
+        proof: super::client_page::PointDragCleanupProof,
     ) -> Result<(), ProtocolError> {
         let (journal, session, rejected) = proof.into_parts();
         if !Arc::ptr_eq(self, &journal.ledger)
-            || current_operation().is_none_or(|current| !current.same_operation(&journal)) {
+            || current_operation().is_none_or(|current| !current.same_operation(&journal))
+        {
             return Err(ProtocolError::StaleScope);
         }
-        let mut state = self.state.lock().map_err(|_| ProtocolError::CleanupFailed)?;
-        if state.integrity_lost || state.retired { return Err(ProtocolError::CleanupFailed); }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        if state.integrity_lost || state.retired {
+            return Err(ProtocolError::CleanupFailed);
+        }
         let mut ids = HashSet::new();
         for status in &rejected {
-            let (id, command) = state.commands.iter().find(|(_, command)| Arc::ptr_eq(&command.status.0, &status.0)).ok_or(ProtocolError::CleanupFailed)?;
-            if !ids.insert(*id) || !command.submitted
+            let (id, command) = state
+                .commands
+                .iter()
+                .find(|(_, command)| Arc::ptr_eq(&command.status.0, &status.0))
+                .ok_or(ProtocolError::CleanupFailed)?;
+            if !ids.insert(*id)
+                || !command.submitted
                 || command.category != CommandCategory::ApplicationInput
                 || command.provenance.operation != Some(journal.key())
                 || command.provenance.target.as_deref() != Some(journal.journal.target.as_str())
                 || command.provenance.session.as_deref() != Some(session.as_str())
-                || command.status.snapshot() != CommandStatus::RetainedRejected {
+                || command.status.snapshot() != CommandStatus::RetainedRejected
+            {
                 return Err(ProtocolError::CleanupFailed);
             }
         }
@@ -2467,7 +2499,15 @@ impl OwnerDebtLedger {
         command: OwnerCleanupCommand,
     ) -> Result<CommandReservation, ProtocolError> {
         let (method, params) = command.envelope();
-        self.reserve_command_inner(None, method, params.as_ref(), None, Some(command), None, &mut AdmissionObservation::default())
+        self.reserve_command_inner(
+            None,
+            method,
+            params.as_ref(),
+            None,
+            Some(command),
+            None,
+            &mut AdmissionObservation::default(),
+        )
     }
     pub(super) fn reserve_scope_cleanup(
         self: &Arc<Self>,
@@ -2476,7 +2516,15 @@ impl OwnerDebtLedger {
         session: Option<&str>,
         deadline: Instant,
     ) -> Result<CommandReservation, ProtocolError> {
-        self.reserve_command_inner(None, method, Some(params), session, None, Some(deadline), &mut AdmissionObservation::default())
+        self.reserve_command_inner(
+            None,
+            method,
+            Some(params),
+            session,
+            None,
+            Some(deadline),
+            &mut AdmissionObservation::default(),
+        )
     }
     fn reserve_command_inner(
         self: &Arc<Self>,
@@ -3555,7 +3603,10 @@ impl CommandReservation {
     pub(crate) fn submit(self) -> Result<SubmittedCommand, ProtocolError> {
         self.submit_observed(&mut AdmissionObservation::default())
     }
-    pub(crate) fn submit_observed(mut self, stop: &mut AdmissionObservation) -> Result<SubmittedCommand, ProtocolError> {
+    pub(crate) fn submit_observed(
+        mut self,
+        stop: &mut AdmissionObservation,
+    ) -> Result<SubmittedCommand, ProtocolError> {
         let mut state = self
             .ledger
             .state
@@ -5017,36 +5068,91 @@ pub(crate) mod tests {
         operation.sequence = journal.key().operation_seq;
         journal.bind_operation(&operation).unwrap();
         let mut observed = AdmissionObservation::requested();
-        assert_eq!(journal.check_application_submission_observed(&mut observed), Ok(()));
+        assert_eq!(
+            journal.check_application_submission_observed(&mut observed),
+            Ok(())
+        );
         assert!(observed.take().is_none());
         journal.revoke_application_submission();
-        assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
-        assert!(observed.take().is_none(), "revocation is not an observed operation stop");
+        assert_eq!(
+            journal.check_application_submission_observed(&mut observed),
+            Err(ProtocolError::Cancelled)
+        );
+        assert!(
+            observed.take().is_none(),
+            "revocation is not an observed operation stop"
+        );
         cancel.send_replace(CancelSignal::Requested);
-        assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
-        let receipt = observed.take().expect("actual bound cancellation must carry a receipt");
-        assert_eq!(journal.scope(async { receipt.for_operation(&operation) }).await, Some(ProtocolError::Cancelled));
+        assert_eq!(
+            journal.check_application_submission_observed(&mut observed),
+            Err(ProtocolError::Cancelled)
+        );
+        let receipt = observed
+            .take()
+            .expect("actual bound cancellation must carry a receipt");
+        assert_eq!(
+            journal
+                .scope(async { receipt.for_operation(&operation) })
+                .await,
+            Some(ProtocolError::Cancelled)
+        );
         assert!(observed.take().is_none());
         for mismatch in ["sequence", "deadline", "channel", "owner"] {
-            assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
+            assert_eq!(
+                journal.check_application_submission_observed(&mut observed),
+                Err(ProtocolError::Cancelled)
+            );
             let receipt = observed.take().unwrap();
-            let (_other_cancel, other_channel) = tokio::sync::watch::channel(CancelSignal::Requested);
+            let (_other_cancel, other_channel) =
+                tokio::sync::watch::channel(CancelSignal::Requested);
             let other = OperationLease {
-                is_callback: false, generation: operation.generation,
+                is_callback: false,
+                generation: operation.generation,
                 sequence: operation.sequence + u64::from(mismatch == "sequence"),
-                deadline: operation.deadline + if mismatch == "deadline" { std::time::Duration::from_millis(1) } else { std::time::Duration::ZERO },
-                cancellation: if mismatch == "channel" { other_channel } else { operation.cancellation.clone() },
+                deadline: operation.deadline
+                    + if mismatch == "deadline" {
+                        std::time::Duration::from_millis(1)
+                    } else {
+                        std::time::Duration::ZERO
+                    },
+                cancellation: if mismatch == "channel" {
+                    other_channel
+                } else {
+                    operation.cancellation.clone()
+                },
             };
             let (_other_ledger, other_journal) = owner();
-            let context = if mismatch == "owner" { &other_journal } else { &journal };
-            assert!(context.scope(async { receipt.for_operation(&other) }).await.is_none(), "{mismatch}");
+            let context = if mismatch == "owner" {
+                &other_journal
+            } else {
+                &journal
+            };
+            assert!(
+                context
+                    .scope(async { receipt.for_operation(&other) })
+                    .await
+                    .is_none(),
+                "{mismatch}"
+            );
         }
-        assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
+        assert_eq!(
+            journal.check_application_submission_observed(&mut observed),
+            Err(ProtocolError::Cancelled)
+        );
         let receipt = observed.take().unwrap();
-        assert!(receipt.for_operation(&operation).is_none(), "no ambient task may borrow a journal receipt");
+        assert!(
+            receipt.for_operation(&operation).is_none(),
+            "no ambient task may borrow a journal receipt"
+        );
         let mut ignored = AdmissionObservation::default();
-        assert_eq!(journal.check_application_submission_observed(&mut ignored), Err(ProtocolError::Cancelled));
-        assert!(ignored.take().is_none(), "legacy callers do not request receipts");
+        assert_eq!(
+            journal.check_application_submission_observed(&mut ignored),
+            Err(ProtocolError::Cancelled)
+        );
+        assert!(
+            ignored.take().is_none(),
+            "legacy callers do not request receipts"
+        );
     }
     #[tokio::test]
     async fn admission_stop_expired_original_deadline_keeps_legacy_error_and_typed_cause() {
@@ -5055,10 +5161,21 @@ pub(crate) mod tests {
         operation.sequence = journal.key().operation_seq;
         journal.bind_operation(&operation).unwrap();
         let mut observed = AdmissionObservation::requested();
-        assert_eq!(journal.check_application_submission_observed(&mut observed), Err(ProtocolError::Cancelled));
+        assert_eq!(
+            journal.check_application_submission_observed(&mut observed),
+            Err(ProtocolError::Cancelled)
+        );
         let receipt = observed.take().unwrap();
-        assert_eq!(journal.scope(async { receipt.for_operation(&operation) }).await, Some(ProtocolError::DeadlineExceeded));
-        assert_eq!(journal.check_application_submission(), Err(ProtocolError::Cancelled));
+        assert_eq!(
+            journal
+                .scope(async { receipt.for_operation(&operation) })
+                .await,
+            Some(ProtocolError::DeadlineExceeded)
+        );
+        assert_eq!(
+            journal.check_application_submission(),
+            Err(ProtocolError::Cancelled)
+        );
     }
     fn admission_operation(
         timeout_ms: u64,
@@ -6351,24 +6468,49 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn validated_rejected_input_reply_is_terminal_failure_not_release_proof() {
         let (ledger, journal) = owner();
-        let reservation = ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", None, Some("page")).unwrap();
+        let reservation = ledger
+            .reserve_command(
+                Some(&journal),
+                "Input.dispatchMouseEvent",
+                None,
+                Some("page"),
+            )
+            .unwrap();
         let status = reservation.status();
         assert!(!status.has_validated_error_reply());
         let submitted = reservation.submit().unwrap();
         assert!(!status.has_validated_error_reply());
-        submitted.settle(&serde_json::from_value(json!({"id":1,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}})).unwrap());
+        submitted.settle(
+            &serde_json::from_value(
+                json!({"id":1,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}}),
+            )
+            .unwrap(),
+        );
         assert!(status.has_validated_error_reply());
-        assert!(!status.is_error_ack(), "existing ordinary error-ACK API is unchanged");
+        assert!(
+            !status.is_error_ack(),
+            "existing ordinary error-ACK API is unchanged"
+        );
         assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
         assert!(!status.settled());
-        assert!(status.wait_successful_ack(Instant::now() + std::time::Duration::from_secs(1)).await.is_err());
+        assert!(status
+            .wait_successful_ack(Instant::now() + std::time::Duration::from_secs(1))
+            .await
+            .is_err());
         assert_eq!(ledger.snapshot().input_debt, 1);
         assert!(journal.snapshot().mutation_dispatched);
         // A distinct successful release ACK is not implicit authority to sweep
         // the original exact retained command from the ledger.
         let release = command_scope(CommandCategory::CleanupInput, false, async {
-            ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", Some(&json!({"type":"mouseReleased"})), Some("page"))
-        }).await.unwrap();
+            ledger.reserve_command(
+                Some(&journal),
+                "Input.dispatchMouseEvent",
+                Some(&json!({"type":"mouseReleased"})),
+                Some("page"),
+            )
+        })
+        .await
+        .unwrap();
         release.submit().unwrap().settle(&response(json!({})));
         assert_eq!(ledger.snapshot().input_debt, 1);
         assert!(status.has_validated_error_reply());
@@ -6382,13 +6524,29 @@ pub(crate) mod tests {
             json!({"id":1,"sessionId":"page","result":{}}),
         ] {
             let (ledger, journal) = owner();
-            let reservation = ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", None, Some("page")).unwrap();
+            let reservation = ledger
+                .reserve_command(
+                    Some(&journal),
+                    "Input.dispatchMouseEvent",
+                    None,
+                    Some("page"),
+                )
+                .unwrap();
             let status = reservation.status();
-            reservation.submit().unwrap().settle(&serde_json::from_value(reply).unwrap());
+            reservation
+                .submit()
+                .unwrap()
+                .settle(&serde_json::from_value(reply).unwrap());
             assert!(!status.has_validated_error_reply());
         }
         let status = CommandStatusHandle::new(false, Arc::new(tokio::sync::Notify::new()));
-        for state in [CommandStatus::Reserved, CommandStatus::Submitted, CommandStatus::Destroyed, CommandStatus::Abandoned, CommandStatus::IntegrityLost] {
+        for state in [
+            CommandStatus::Reserved,
+            CommandStatus::Submitted,
+            CommandStatus::Destroyed,
+            CommandStatus::Abandoned,
+            CommandStatus::IntegrityLost,
+        ] {
             status.set(state);
             assert!(!status.has_validated_error_reply());
         }
@@ -6402,35 +6560,79 @@ pub(crate) mod tests {
         let (ledger, journal) = owner();
         let mut statuses = Vec::new();
         for method in ["Input.setInterceptDrags", "Input.dispatchDragEvent"] {
-            let reservation = ledger.reserve_command(Some(&journal), method, None, Some("page")).unwrap();
+            let reservation = ledger
+                .reserve_command(Some(&journal), method, None, Some("page"))
+                .unwrap();
             statuses.push(reservation.status());
             reservation.submit().unwrap().settle(&serde_json::from_value(json!({"id":1,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}})).unwrap());
         }
         assert_eq!(ledger.snapshot().input_debt, 2);
-        let proof = super::super::client_page::PointDragCleanupProof::for_test(journal.clone(), "page".into(), statuses.clone());
-        journal.scope(async { ledger.retire_point_drag_rejections(proof) }).await.unwrap();
+        let proof = super::super::client_page::PointDragCleanupProof::for_test(
+            journal.clone(),
+            "page".into(),
+            statuses.clone(),
+        );
+        journal
+            .scope(async { ledger.retire_point_drag_rejections(proof) })
+            .await
+            .unwrap();
         assert_eq!(ledger.snapshot().input_debt, 0);
         assert!(journal.snapshot().mutation_dispatched);
         for status in statuses {
             assert!(status.is_error_ack());
             assert!(status.has_validated_error_reply());
-            assert!(status.wait_successful_ack(Instant::now() + std::time::Duration::from_secs(1)).await.is_err());
+            assert!(status
+                .wait_successful_ack(Instant::now() + std::time::Duration::from_secs(1))
+                .await
+                .is_err());
         }
     }
     #[tokio::test]
-    async fn point_drag_cleanup_proof_rejects_mixed_unknown_cleanup_and_wrong_scope_without_partial_retirement() {
+    async fn point_drag_cleanup_proof_rejects_mixed_unknown_cleanup_and_wrong_scope_without_partial_retirement(
+    ) {
         let (ledger, journal) = owner();
-        let rejected = ledger.reserve_command(Some(&journal), "Input.dispatchDragEvent", None, Some("page")).unwrap();
+        let rejected = ledger
+            .reserve_command(
+                Some(&journal),
+                "Input.dispatchDragEvent",
+                None,
+                Some("page"),
+            )
+            .unwrap();
         let status = rejected.status();
-        rejected.submit().unwrap().settle(&serde_json::from_value(json!({"id":1,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}})).unwrap());
-        let unknown = ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", None, Some("page")).unwrap();
+        rejected.submit().unwrap().settle(
+            &serde_json::from_value(
+                json!({"id":1,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}}),
+            )
+            .unwrap(),
+        );
+        let unknown = ledger
+            .reserve_command(
+                Some(&journal),
+                "Input.dispatchMouseEvent",
+                None,
+                Some("page"),
+            )
+            .unwrap();
         let unknown_status = unknown.status();
         let _submitted = unknown.submit().unwrap();
         let cleanup = command_scope(CommandCategory::CleanupInput, false, async {
-            ledger.reserve_command(Some(&journal), "Input.dispatchMouseEvent", None, Some("page"))
-        }).await.unwrap();
+            ledger.reserve_command(
+                Some(&journal),
+                "Input.dispatchMouseEvent",
+                None,
+                Some("page"),
+            )
+        })
+        .await
+        .unwrap();
         let cleanup_status = cleanup.status();
-        cleanup.submit().unwrap().settle(&serde_json::from_value(json!({"id":3,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}})).unwrap());
+        cleanup.submit().unwrap().settle(
+            &serde_json::from_value(
+                json!({"id":3,"sessionId":"page","error":{"code":-32000,"message":"synthetic"}}),
+            )
+            .unwrap(),
+        );
         let before = ledger.snapshot();
         for (session, list) in [
             ("page", vec![status.clone(), unknown_status]),
@@ -6438,16 +6640,37 @@ pub(crate) mod tests {
             ("page", vec![status.clone(), status.clone()]),
             ("foreign", vec![status.clone()]),
         ] {
-            let proof = super::super::client_page::PointDragCleanupProof::for_test(journal.clone(), session.into(), list);
-            assert!(journal.scope(async { ledger.retire_point_drag_rejections(proof) }).await.is_err());
+            let proof = super::super::client_page::PointDragCleanupProof::for_test(
+                journal.clone(),
+                session.into(),
+                list,
+            );
+            assert!(journal
+                .scope(async { ledger.retire_point_drag_rejections(proof) })
+                .await
+                .is_err());
             assert_eq!(ledger.snapshot(), before);
             assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
         }
-        let proof = super::super::client_page::PointDragCleanupProof::for_test(journal.clone(), "page".into(), vec![status.clone()]);
-        assert!(ledger.retire_point_drag_rejections(proof).is_err(), "no ambient original journal is not authority");
+        let proof = super::super::client_page::PointDragCleanupProof::for_test(
+            journal.clone(),
+            "page".into(),
+            vec![status.clone()],
+        );
+        assert!(
+            ledger.retire_point_drag_rejections(proof).is_err(),
+            "no ambient original journal is not authority"
+        );
         let (_, other_journal) = owner();
-        let proof = super::super::client_page::PointDragCleanupProof::for_test(journal.clone(), "page".into(), vec![status]);
-        assert!(other_journal.scope(async { ledger.retire_point_drag_rejections(proof) }).await.is_err());
+        let proof = super::super::client_page::PointDragCleanupProof::for_test(
+            journal.clone(),
+            "page".into(),
+            vec![status],
+        );
+        assert!(other_journal
+            .scope(async { ledger.retire_point_drag_rejections(proof) })
+            .await
+            .is_err());
         assert_eq!(ledger.snapshot(), before);
     }
     #[test]
