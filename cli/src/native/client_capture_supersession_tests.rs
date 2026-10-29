@@ -240,14 +240,24 @@ async fn admitted_b_rejects_actual_a_commit_without_retiring_committed_authoriti
         "scope",
         1,
         "session",
-        &revision.to_string()
+        &crate::native::element::LocatedIssuance {
+            identity_scope: "scope".into(),
+            generation: 1,
+            revision
+        }
+        .wire_revision()
     ));
     assert!(current.matches_viewport_reference(
         "scope",
         1,
         "session",
         &viewport,
-        &revision.to_string()
+        &crate::native::element::LocatedIssuance {
+            identity_scope: "scope".into(),
+            generation: 1,
+            revision
+        }
+        .wire_revision()
     ));
     assert!(current.get(&burned).is_none());
     let next = current.try_allocate_ref().unwrap();
@@ -909,7 +919,12 @@ async fn first_trace_is_page_only_stable_and_failed_issuance_is_burned() {
         1,
         "session",
         &viewport.id,
-        &revision.to_string()
+        &crate::native::element::LocatedIssuance {
+            identity_scope: "scope".into(),
+            generation: 1,
+            revision
+        }
+        .wire_revision()
     ));
     server.abort();
 }
@@ -1330,10 +1345,17 @@ async fn capture_dispatch_case(case: CaptureDispatchCase) {
         let current = refs.lock().unwrap();
         assert_eq!(current.ref_ids(), prior_ids);
         assert!(current.get(&observed).unwrap().is_current_observed(7));
-        assert!(current
-            .get(&located)
-            .unwrap()
-            .matches_reference("scope", 1, "session", "5"));
+        assert!(current.get(&located).unwrap().matches_reference(
+            "scope",
+            1,
+            "session",
+            &crate::native::element::LocatedIssuance {
+                identity_scope: "scope".into(),
+                generation: 1,
+                revision: 5,
+            }
+            .wire_revision()
+        ));
         if !pressure {
             // No viewport existed before capture. Asking a disposable clone for
             // one now must create a new issuance, not recover a leaked staging ID.

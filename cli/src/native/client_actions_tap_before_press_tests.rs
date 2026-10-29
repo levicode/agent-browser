@@ -26,7 +26,7 @@ async fn exercise(mode: &'static str) -> (Result<Value, ActionFailure>, Vec<Valu
     f.replies.lock().unwrap().clear();
     let result = journal.scope(ClientActions::default().execute(
         ActionContext { realm_authority: ActionRealmAuthority::Enrolled(&owner), page_state: &state, ..f.context() },
-        "browser.perform", &json!({"identityScope":mode,"ref":{"id":"@e1","revision":"1"},"action":{"kind":"tap"}}),
+        "browser.perform", &json!({"identityScope":mode,"ref":{"id":"@e1","revision":test_reference_revision(mode, 1, 1)},"action":{"kind":"tap"}}),
     )).await;
     let effects = result
         .as_ref()

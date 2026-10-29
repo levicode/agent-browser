@@ -701,7 +701,7 @@ fn reference<'a>(
     ) {
         return Err(ProtocolError::StaleReference);
     }
-    if entry.kind == element::NativeReferenceKind::ReadOnlyCssPseudo {
+    if entry.kind != element::NativeReferenceKind::Dom {
         return Err(ProtocolError::NotActionable);
     }
     let binding = entry
@@ -5467,6 +5467,15 @@ mod tests {
             release_received,
         });
     }
+    fn test_reference_revision(scope: &str, generation: u64, revision: u64) -> String {
+        element::LocatedIssuance {
+            identity_scope: scope.into(),
+            generation,
+            revision,
+        }
+        .wire_revision()
+    }
+
     struct Fixture {
         gate: Arc<ExecutionGate>,
         page: BrowserExecutionLease,
@@ -6766,7 +6775,7 @@ mod tests {
                     f.context(),
                     "browser.perform",
                     &json!({
-                        "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                        "identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},
                         "action":{"kind":"dragTo","target":target}
                     }),
                 )
@@ -6845,7 +6854,7 @@ mod tests {
                 f.context(),
                 "browser.perform",
                 &json!({
-                    "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                    "identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},
                     "action":{"kind":"dragTo","target":query.nodes[0].reference}
                 }),
             ))
@@ -6925,7 +6934,7 @@ mod tests {
                 f.context(),
                 "browser.perform",
                 &json!({
-                    "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                    "identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},
                     "action":{"kind":"dragTo","target":query.nodes[0].reference}
                 }),
             )
@@ -6954,8 +6963,8 @@ mod tests {
                 f.context(),
                 "browser.perform",
                 &json!({
-                    "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
-                    "action":{"kind":"dragTo","target":{"id":format!("@{id}"),"revision":"1"}}
+                    "identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},
+                    "action":{"kind":"dragTo","target":{"id":format!("@{id}"),"revision":test_reference_revision("scope", 1, 1)}}
                 }),
             )
             .await
@@ -7004,8 +7013,8 @@ mod tests {
                     f.context(),
                     "browser.perform",
                     &json!({
-                        "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
-                        "action":{"kind":"dragTo","target":{"id":format!("@{id}"),"revision":"1"}}
+                        "identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},
+                        "action":{"kind":"dragTo","target":{"id":format!("@{id}"),"revision":test_reference_revision("scope", 1, 1)}}
                     }),
                 )
                 .await;
@@ -7310,7 +7319,7 @@ mod tests {
             1
         );
         let before = logged_query_matches(&f);
-        ClientActions::default().execute(f.context(), "browser.perform", &json!({"identityScope":"scope","ref":{"id":"@e1","revision":"1"},"action":{"kind":"tap"}})).await.unwrap();
+        ClientActions::default().execute(f.context(), "browser.perform", &json!({"identityScope":"scope","ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},"action":{"kind":"tap"}})).await.unwrap();
         assert_eq!(
             logged_query_matches(&f),
             before,
@@ -7407,7 +7416,7 @@ mod tests {
 
         let reference = NodeReference {
             id: "@e1".into(),
-            revision: "1".into(),
+            revision: test_reference_revision("scope", 1, 1),
         };
         let mut fill = observed_fill_request("scope", &reference, "late");
         let parsed = decode::<Perform>(&fill).unwrap();
@@ -7616,20 +7625,23 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            let mut forged = reference.clone();
-            forged.revision = "9".into();
-            let mut context = f.context();
-            context.revision = 9;
-            let failure = ClientActions::default()
-                .execute(
-                    context,
-                    "browser.perform",
-                    &json!({"identityScope":"scope","ref":forged,"action":{"kind":"tap"}}),
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(failure.error, ProtocolError::StaleReference);
-            assert_eq!(failure.effects, Effects::NotDispatched);
+            let current_wire_revision = test_reference_revision("scope", 1, 9);
+            for forged_revision in ["9", current_wire_revision.as_str()] {
+                let mut forged = reference.clone();
+                forged.revision = forged_revision.into();
+                let mut context = f.context();
+                context.revision = 9;
+                let failure = ClientActions::default()
+                    .execute(
+                        context,
+                        "browser.perform",
+                        &json!({"identityScope":"scope","ref":forged,"action":{"kind":"tap"}}),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(failure.error, ProtocolError::StaleReference);
+                assert_eq!(failure.effects, Effects::NotDispatched);
+            }
             let options = serde_json::from_value(json!({"ref":reference.id})).unwrap();
             let fresh = super::super::client_observation::read(
                 &f.page.client,
@@ -7692,7 +7704,7 @@ mod tests {
         ] {
             let f = fixture(mode).await;
             let failure = ClientActions::default().execute(f.context(), "browser.perform", &json!({
-                "identityScope":"scope", "ref":{"id":"@e1","revision":"1"}, "action":{"kind":"check"}
+                "identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)}, "action":{"kind":"check"}
             })).await.unwrap_err();
             assert_eq!(failure.error, expected, "{mode}");
             assert_eq!(failure.effects, Effects::NotDispatched, "{mode}");
@@ -7720,7 +7732,7 @@ mod tests {
         binding.loader = "retired-document".into();
         let id = f.refs.bind_exact(42, "checkbox", "", binding);
         let failure = ClientActions::default().execute(f.context(), "browser.perform", &json!({
-            "identityScope":"scope", "ref":{"id":format!("@{id}"),"revision":"1"}, "action":{"kind":"check"}
+            "identityScope":"scope", "ref":{"id":format!("@{id}"),"revision":test_reference_revision("scope", 1, 1)}, "action":{"kind":"check"}
         })).await.unwrap_err();
         assert_eq!(failure.error, ProtocolError::StaleReference);
         assert_eq!(failure.effects, Effects::NotDispatched);
@@ -8019,7 +8031,7 @@ mod tests {
         let mut f = fixture("strict-query-one").await;
         let first = NodeReference {
             id: "@e1".into(),
-            revision: "1".into(),
+            revision: test_reference_revision("scope", 1, 1),
         };
         let binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
         f.refs.begin_observation("scope", 1, 2);
@@ -8055,7 +8067,8 @@ mod tests {
             .any(|request| request["method"] == "Input.insertText"
                 && request["params"]["text"] == "late"));
         f.log.lock().unwrap().clear();
-        for revision in ["2", "01", "999"] {
+        let current_wire_revision = test_reference_revision("scope", 1, 2);
+        for revision in ["2", "01", "999", current_wire_revision.as_str()] {
             let failure = actions
                 .execute(
                     f.context(),
@@ -8097,7 +8110,7 @@ mod tests {
         let mut f = fixture("strict-query-one").await;
         let first = NodeReference {
             id: "@e1".into(),
-            revision: "1".into(),
+            revision: test_reference_revision("scope", 1, 1),
         };
         let binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
         let located = f
@@ -8116,7 +8129,7 @@ mod tests {
             .unwrap();
         let located = NodeReference {
             id: format!("@{located}"),
-            revision: "1".into(),
+            revision: test_reference_revision("scope", 1, 1),
         };
         f.refs.retire_semantic_authority();
         f.log.lock().unwrap().clear();
@@ -8154,7 +8167,8 @@ mod tests {
             .any(|request| request["method"] == "Input.insertText"
                 && request["params"]["text"] == "readmitted"));
         f.log.lock().unwrap().clear();
-        for revision in ["0", "2", "01", "999"] {
+        let current_wire_revision = test_reference_revision("scope", 1, 2);
+        for revision in ["0", "2", "01", "999", current_wire_revision.as_str()] {
             let mut context = f.context();
             context.revision = 2;
             context.observed_revision = 2;
@@ -8204,8 +8218,9 @@ mod tests {
             &first
         );
         let actions = ClientActions::default();
-        let args = json!({"identityScope":"scope","ref":{"id":format!("@{}",first.id),"revision":"1"},"action":{"kind":"swipe","direction":"down"}});
-        for revision in ["0", "2", "01"] {
+        let args = json!({"identityScope":"scope","ref":{"id":format!("@{}",first.id),"revision":first.issuance.wire_revision()},"action":{"kind":"swipe","direction":"down"}});
+        let current_wire_revision = test_reference_revision("scope", 1, 2);
+        for revision in ["0", "2", "01", current_wire_revision.as_str()] {
             let mut forged = args.clone();
             forged["ref"]["revision"] = json!(revision);
             assert_eq!(
@@ -8277,7 +8292,7 @@ mod tests {
             } else {
                 json!({"kind":kind})
             };
-            let error=actions.execute(f.context(),"browser.perform",&json!({"identityScope":scope,"ref":{"id":format!("@{viewport}"),"revision":"1"},"action":action})).await.unwrap_err();
+            let error=actions.execute(f.context(),"browser.perform",&json!({"identityScope":scope,"ref":{"id":format!("@{viewport}"),"revision":test_reference_revision("scope", 1, 1)},"action":action})).await.unwrap_err();
             assert_eq!(error.effects, Effects::NotDispatched);
         }
         assert!(f.inputs().is_empty());
@@ -8917,7 +8932,7 @@ mod tests {
         let f = fixture("focus-cancel").await;
         f._cancel.send_replace(CancelSignal::Requested);
         let actions = ClientActions::default();
-        let error=actions.execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":{"id":"@e1","revision":"1"},"action":{"kind":"fill","value":"synthetic-secret-value","sensitive":true}})).await.unwrap_err();
+        let error=actions.execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},"action":{"kind":"fill","value":"synthetic-secret-value","sensitive":true}})).await.unwrap_err();
         assert!(!format!("{error:?}").contains("synthetic-secret-value"));
         assert_eq!(error.error, ProtocolError::Cancelled);
     }
@@ -10134,7 +10149,7 @@ mod tests {
             let d = Dispatch::default();
             let reference = NodeReference {
                 id: "@e1".into(),
-                revision: "1".into(),
+                revision: test_reference_revision("scope", 1, 1),
             };
             let error = match action_target(&f.context(), &d, &reference).await {
                 Ok(_) => panic!("{mode}: retired target must not escape"),
@@ -10247,7 +10262,7 @@ mod tests {
     async fn obscured_action_exposes_only_closed_interception_reason() {
         let mut f = fixture("intercepted").await;
         f.op.deadline = Instant::now() + Duration::from_millis(80);
-        let error = ClientActions::default().execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":{"id":"@e1","revision":"1"},"action":{"kind":"tap"}})).await.unwrap_err();
+        let error = ClientActions::default().execute(f.context(),"browser.perform",&json!({"identityScope":"scope","ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},"action":{"kind":"tap"}})).await.unwrap_err();
         assert_eq!(error.error, ProtocolError::NotActionable);
         assert_eq!(error.reason, Some(ActionReason::InterceptedPointer));
         assert!(f.inputs().is_empty());
@@ -10363,7 +10378,7 @@ mod tests {
                 &d,
                 "browser.perform",
                 &json!({
-                    "identityScope":"release-debt", "ref":{"id":"@e1","revision":"1"},
+                    "identityScope":"release-debt", "ref":{"id":"@e1","revision":test_reference_revision("release-debt", 1, 1)},
                     "action":{"kind":"tap"}
                 }),
             )
@@ -10503,7 +10518,7 @@ mod tests {
                     .execute(
                         ctx,
                         "browser.perform",
-                        &json!({"identityScope":mode,"ref":{"id":"@e1","revision":"1"},
+                        &json!({"identityScope":mode,"ref":{"id":"@e1","revision":test_reference_revision(mode, 1, 1)},
                             "action":{"kind":"tap"}}),
                     )
                     .await
@@ -10838,7 +10853,7 @@ mod tests {
                     .execute(
                         ctx,
                         "browser.perform",
-                        &json!({"identityScope":mode,"ref":{"id":"@e1","revision":"1"},
+                        &json!({"identityScope":mode,"ref":{"id":"@e1","revision":test_reference_revision(mode, 1, 1)},
                             "action":{"kind":"tap"}}),
                     )
                     .await;
@@ -11241,7 +11256,7 @@ mod tests {
             page_state: &state,
             ..f.context()
         }, &d, "browser.perform", &json!({
-            "identityScope":"callback-tap", "ref":{"id":"@e1","revision":"1"}, "action":{"kind":"tap"}
+            "identityScope":"callback-tap", "ref":{"id":"@e1","revision":test_reference_revision("callback-tap", 1, 1)}, "action":{"kind":"tap"}
         })).await;
         let inputs = f.inputs();
         let closed = owner.close().await;
@@ -11492,7 +11507,7 @@ mod tests {
     async fn preparation_semantic_refusal_still_retries_into_an_ordinary_successful_tap() {
         let f = fixture("preparation-retry-success").await;
         ClientActions::default().execute(f.context(), "browser.perform", &json!({
-            "identityScope":"scope", "ref":{"id":"@e1","revision":"1"}, "action":{"kind":"tap"}
+            "identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)}, "action":{"kind":"tap"}
         })).await.unwrap();
         let requests = f.log.lock().unwrap();
         assert_eq!(
@@ -11753,7 +11768,7 @@ mod tests {
                                 ..action_fixture.context()
                             },
                             "browser.perform",
-                            &json!({"identityScope":mode,"ref":{"id":"@e1","revision":"1"},
+                            &json!({"identityScope":mode,"ref":{"id":"@e1","revision":test_reference_revision(mode, 1, 1)},
                                 "action":{"kind":"swipe","direction":"down"}}),
                         )
                         .await;
@@ -12023,7 +12038,7 @@ mod tests {
             ClientActions::default().execute(
                 f.context(),
                 "browser.perform",
-                &json!({"identityScope":"scope", "ref":{"id":"@e1","revision":"1"}, "action":{"kind":"swipe","direction":"down"}}),
+                &json!({"identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)}, "action":{"kind":"swipe","direction":"down"}}),
             ),
         )
         .await
@@ -12062,6 +12077,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_owner_action_rejects_old_client_or_generation_with_colliding_id() {
+        let f = fixture("normal").await;
+        let current = NodeReference {
+            id: "@e1".into(),
+            revision: f.refs.get("e1").unwrap().issued_wire_revision().unwrap(),
+        };
+        assert!(reference(&f.context(), &current).is_ok());
+        for (issuer, generation) in [("old-client", 1), ("scope", 0)] {
+            let mut stale = current.clone();
+            stale.revision = test_reference_revision(issuer, generation, 1);
+            for (source, action) in [
+                (stale.clone(), json!({"kind":"tap"})),
+                (stale.clone(), json!({"kind":"dragTo","target":current})),
+                (current.clone(), json!({"kind":"dragTo","target":stale})),
+            ] {
+                let failure = ClientActions::default()
+                    .execute(
+                        f.context(),
+                        "browser.perform",
+                        &json!({
+                            // Current request owner cannot authorize the old source or destination.
+                            "identityScope":"scope", "ref":source, "action":action,
+                        }),
+                    )
+                    .await
+                    .unwrap_err();
+                assert_eq!(failure.error, ProtocolError::StaleReference);
+                assert_eq!(failure.effects, Effects::NotDispatched);
+                assert!(f.log.lock().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn disposable_trace_wire_refs_never_gain_action_authority() {
+        let f = fixture("normal").await;
+        let binding = f.refs.get("e1").unwrap().exact_binding.clone().unwrap();
+        let mut trace = f.refs.clone();
+        trace.retire_interaction_references();
+        trace.begin_observation("scope", 1, 2);
+        let id = trace
+            .try_bind_exact(99, "button", "trace", binding)
+            .unwrap();
+        let temporary = NodeReference {
+            id: format!("@{id}"),
+            revision: trace.get(&id).unwrap().issued_wire_revision().unwrap(),
+        };
+        let viewport = trace
+            .try_viewport_ref("scope", 1, "page", 2)
+            .unwrap()
+            .clone();
+        for (reference, action) in [
+            (temporary, json!({"kind":"tap"})),
+            (
+                NodeReference {
+                    id: format!("@{}", viewport.id),
+                    revision: viewport.issuance.wire_revision(),
+                },
+                json!({"kind":"swipe","direction":"down"}),
+            ),
+        ] {
+            let failure = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &json!({
+                        "identityScope":"scope", "ref":reference, "action":action,
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.error, ProtocolError::StaleReference);
+            assert_eq!(failure.effects, Effects::NotDispatched);
+            assert!(f.log.lock().unwrap().is_empty());
+        }
+        assert!(f.refs.get(&id).is_none());
+        assert!(!f.refs.is_viewport_ref(&viewport.id));
+        assert_ne!(f.refs.try_allocate_ref().unwrap(), id);
+    }
+
+    #[tokio::test]
+    async fn pixel_root_actions_refuse_before_resolution_even_with_valid_issuance() {
+        let mut f = fixture("normal").await;
+        let id = f
+            .refs
+            .try_bind_readonly_pixel_root(
+                99,
+                ExactBinding {
+                    page_session: "page".into(),
+                    session: "page".into(),
+                    frame: "main".into(),
+                    loader: "doc".into(),
+                    actionable: true,
+                },
+            )
+            .unwrap();
+        let reference = NodeReference {
+            id: format!("@{id}"),
+            revision: f.refs.get(&id).unwrap().issued_wire_revision().unwrap(),
+        };
+        assert_eq!(
+            f.refs.get(&id).unwrap().kind,
+            element::NativeReferenceKind::ReadOnlyPixelRoot
+        );
+        for action in [
+            json!({"kind":"tap"}),
+            json!({"kind":"press","key":"Enter"}),
+            json!({"kind":"swipe","direction":"down"}),
+            json!({"kind":"dragTo","target":reference}),
+        ] {
+            let error = ClientActions::default()
+                .execute(
+                    f.context(),
+                    "browser.perform",
+                    &json!({
+                        "identityScope":"scope", "ref":reference, "action":action,
+                    }),
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(error.error, ProtocolError::NotActionable);
+            assert_eq!(error.effects, Effects::NotDispatched);
+            assert!(f.log.lock().unwrap().is_empty());
+        }
+        // A caller cannot override native kind through extra wire metadata.
+        let error = ClientActions::default().execute(f.context(), "browser.perform", &json!({
+            "identityScope":"scope", "ref":{"id":reference.id,"revision":reference.revision,"kind":"Dom"},
+            "action":{"kind":"tap"},
+        })).await.unwrap_err();
+        assert_eq!(error.error, ProtocolError::InvalidArguments);
+        assert_eq!(error.effects, Effects::NotDispatched);
+        assert!(f.log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn readonly_pseudo_action_never_resolves_or_retargets_origin() {
         let mut f = fixture("normal").await;
         let id = f
@@ -12081,7 +12231,7 @@ mod tests {
         // Both verbs refuse this exact readonly binding before focus or input.
         for action in [json!({"kind":"tap"}), json!({"kind":"press","key":"Enter"})] {
             let error = ClientActions::default().execute(f.context(), "browser.perform", &json!({
-                "identityScope":"scope","ref":{"id":format!("@{id}"),"revision":"1"},"action":action
+                "identityScope":"scope","ref":{"id":format!("@{id}"),"revision":test_reference_revision("scope", 1, 1)},"action":action
             })).await.unwrap_err();
             assert_eq!(error.error, ProtocolError::NotActionable);
             assert_eq!(error.effects, Effects::NotDispatched);
@@ -12557,11 +12707,11 @@ mod tests {
                 ("#check", json!({"kind":"check"})),
                 ("#button", json!({"kind":"doubleTap"})),
             ] {
-                actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":"1"},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
+                actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids[selector],"revision":test_reference_revision(&page.identity_scope, operation.generation, 1)},"action":action})).await.map_err(|error|format!("action failed: {:?}",error.error))?;
             }
             let value = evaluate_on(&browser.client,&session,"[document.querySelector('#text').value,document.querySelector('#pick').value,document.querySelector('#check').checked,document.querySelector('#button').dataset.clicked]").await?;
             assert_eq!(value,json!(["native synthetic","b",true,"2"]));
-            actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":"1"},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
+            actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":document_ref,"revision":test_reference_revision(&page.identity_scope, operation.generation, 1)},"action":{"kind":"scrollIntoView"}})).await.map_err(|error|format!("document action failed: {:?}",error.error))?;
             // Exercise old observed handles against actual retained/reinserted
             // DOM objects, not a selector or a current-ref substitution.
             use super::super::client_observation::{enumerate_frames, observe, read, ObservationOptions, SemanticNode};
@@ -12606,7 +12756,7 @@ mod tests {
             assert_eq!(stale.error,ProtocolError::StaleReference);assert_eq!(stale.effects,Effects::NotDispatched);
             assert_eq!(evaluate_on(&browser.client,&session,"document.querySelector('#text').value").await?,json!("reinserted"));
             evaluate_on(&browser.client,&session,"document.querySelector('#button').remove(); true").await?;
-            assert!(actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":"1"},"action":{"kind":"tap"}})).await.is_err());
+            assert!(actions.execute(ActionContext { observation_frames: &[], observation_after: None, observed_revision: 0, realm_authority: ActionRealmAuthority::UntrackedFixture, page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry},"browser.perform",&json!({"identityScope":page.identity_scope,"ref":{"id":ids["#button"],"revision":test_reference_revision(&page.identity_scope, operation.generation, 1)},"action":{"kind":"tap"}})).await.is_err());
             actions.cleanup().await.map_err(|_|"cleanup failed")?;
             Ok::<(),String>(())
         }.await;
@@ -12649,7 +12799,7 @@ mod tests {
             let state=ClientPageState::new(page.identity_scope.clone(),"fixture".into());let blobs=BlobStore::new(BlobLimits::default()).unwrap();
             blobs.activate_scope(BlobScope{generation:1,identity_scope:page.identity_scope.clone()}).unwrap();
             let sessions=HashMap::new();let actions=ClientActions::default();
-            let args=json!({"identityScope":page.identity_scope,"ref":{"id":id,"revision":"1"},"action":{"kind":"tap"}});
+            let args=json!({"identityScope":page.identity_scope,"ref":{"id":id,"revision":test_reference_revision(&page.identity_scope, operation.generation, 1)},"action":{"kind":"tap"}});
             actions.execute(ActionContext{ observation_frames: &[], observation_after: None, observed_revision: 0,realm_authority: ActionRealmAuthority::UntrackedFixture,page:&page,operation:&operation,page_state:&state,refs:&refs,revision:1,iframe_sessions:&sessions,blobs:&blobs,geometry:&geometry},"browser.perform",&args).await.map_err(|e|format!("Nested action failed: {:?}",e.error))?;
             assert_eq!(evaluate_on(&page.client,&session,"document.querySelector('#outer').contentDocument.querySelector('#inner').contentDocument.querySelector('button').dataset.clicks").await?,json!("1"));
             evaluate_on(&page.client,&session,"const cover=document.createElement('div');cover.style.cssText='position:fixed;inset:0;z-index:999;background:red';document.body.append(cover);true").await?;

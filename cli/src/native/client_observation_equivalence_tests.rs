@@ -978,7 +978,7 @@ async fn chromium_query_churn_bounds_durable_metadata_without_evicting_authority
         assert_eq!(read(&browser.client,&inventory,&mut refs,"churn",1,&pinned_read,&op).await.unwrap_err(),ObservationError::StaleReference);
         let old_read:ReadOptions=serde_json::from_value(json!({"ref":old.clone()})).unwrap();
         let live=read(&browser.client,&inventory,&mut refs,"churn",1,&old_read,&op).await?;
-        assert_eq!(live["ref"]["id"],old);assert_eq!(live["ref"]["revision"],"1");
+        assert_eq!(live["ref"]["id"],old);assert_eq!(live["ref"]["revision"],first.nodes[0].reference.revision);
         assert_eq!(live["name"],"Current");
         assert_eq!((refs.ref_ids(),refs.retained_identity_counts()),before,"Temporary live resolution must not mint or replace authority");
         evaluate_on(&browser.client,session,"document.querySelector('#current').onclick=()=>document.querySelector('#current').textContent='Clicked';true").await?;

@@ -8,7 +8,7 @@ async fn upload(mode: &'static str) -> (Fixture, Result<Value, ActionFailure>) {
             f.context(),
             "browser.perform",
             &json!({
-                "identityScope":"scope", "ref":{"id":"@e1","revision":"1"},
+                "identityScope":"scope", "ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},
                 "action":{"kind":"setInputFiles", "files":[]}
             }),
         )
@@ -153,8 +153,8 @@ async fn upload_control_release_failure_preserves_dispatched_effects() {
 #[tokio::test]
 async fn upload_label_mapping_cannot_bypass_opaque_scope_or_revision_guards() {
     for request in [
-        json!({"identityScope":"other","ref":{"id":"@e1","revision":"1"},"action":{"kind":"setInputFiles","files":[]}}),
-        json!({"identityScope":"scope","ref":{"id":"@missing","revision":"1"},"action":{"kind":"setInputFiles","files":[]}}),
+        json!({"identityScope":"other","ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},"action":{"kind":"setInputFiles","files":[]}}),
+        json!({"identityScope":"scope","ref":{"id":"@missing","revision":test_reference_revision("scope", 1, 1)},"action":{"kind":"setInputFiles","files":[]}}),
         json!({"identityScope":"scope","ref":{"id":"@e1","revision":"0"},"action":{"kind":"setInputFiles","files":[]}}),
     ] {
         let f = fixture("upload-label").await;

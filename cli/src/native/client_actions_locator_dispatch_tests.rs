@@ -148,7 +148,7 @@ async fn locator_long_press_witnesses_original_900_ms_hold() {
             f.context(),
             "browser.perform",
             &json!({
-                "identityScope": "scope", "ref": { "id": "@e1", "revision": "1" },
+                "identityScope": "scope", "ref": { "id": "@e1", "revision": test_reference_revision("scope", 1, 1) },
                 "action": { "kind": "longPress", "durationMs": 900 }
             }),
         )
@@ -193,7 +193,7 @@ async fn locator_clear_uses_exact_empty_value_then_fallback_delete() {
             f.context(),
             "browser.perform",
             &json!({
-                "identityScope": "scope", "ref": { "id": "@e1", "revision": "1" },
+                "identityScope": "scope", "ref": { "id": "@e1", "revision": test_reference_revision("scope", 1, 1) },
                 "action": { "kind": "clear" }
             }),
         )
@@ -255,7 +255,7 @@ async fn locator_select_option_positive_index_two_executes_native_selection() {
             f.context(),
             "browser.perform",
             &json!({
-                "identityScope": "scope", "ref": { "id": "@e1", "revision": "1" },
+                "identityScope": "scope", "ref": { "id": "@e1", "revision": test_reference_revision("scope", 1, 1) },
                 "action": { "kind": "selectOption", "value": { "index": 2 } }
             }),
         )

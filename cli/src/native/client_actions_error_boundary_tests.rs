@@ -170,7 +170,7 @@ async fn exercise(mode: &'static str, sensitive: bool, succeeds: bool, raced: bo
                 ..f.context()
             },
             "browser.perform",
-            &json!({"identityScope":mode,"ref":{"id":"@e1","revision":"1"},
+            &json!({"identityScope":mode,"ref":{"id":"@e1","revision":test_reference_revision(mode, 1, 1)},
             "action":{"kind":"fill","value":value,"sensitive":sensitive}}),
         ))
         .await;

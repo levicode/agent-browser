@@ -1695,7 +1695,7 @@ fn project_node_with_refs(
         && !author
             .as_ref()
             .is_some_and(|facts| matches!(facts.node_type, 3 | 9));
-    let (id, issued_revision) = if let Some(refs) = refs {
+    let (id, wire_revision) = if let Some(refs) = refs {
         let id = if data["__nativeReadonlyPseudo"] == true {
             refs.try_bind_readonly_pseudo(backend, role.as_deref().unwrap_or(""), binding)
         } else {
@@ -1704,18 +1704,18 @@ fn project_node_with_refs(
         .map_err(reference_allocation_error)?;
         let issued = refs
             .get(&id)
-            .and_then(RefEntry::issued_revision)
+            .and_then(RefEntry::issued_wire_revision)
             .ok_or(ObservationError::StaleReference)?;
         (format!("@{id}"), issued)
     } else {
         // Internal candidates never carry public reference authority.
-        (String::new(), revision)
+        (String::new(), revision.to_string())
     };
     let mut node = SemanticNode {
         author,
         reference: NodeReference {
             id,
-            revision: issued_revision.to_string(),
+            revision: wire_revision,
         },
         role,
         name: ax_string(&ax.name).filter(|name| !name.is_empty()),
@@ -2723,7 +2723,7 @@ pub async fn observe(
     )?;
     let viewport_ref = NodeReference {
         id: format!("@{}", viewport.id),
-        revision: viewport.issuance.revision.to_string(),
+        revision: viewport.issuance.wire_revision(),
     };
     // Acquiring metadata does not publish authority for hidden/compacted-away
     // candidates. Preserve located authority and exactly the emitted observed
@@ -3070,7 +3070,9 @@ pub async fn read(
     check(lease)?;
     node.reference = NodeReference {
         id: format!("@{id}"),
-        revision: issued_revision.to_string(),
+        revision: entry
+            .issued_wire_revision()
+            .ok_or(ObservationError::StaleReference)?,
     };
     let result = project_read_fields(node, options.fields.as_deref())?;
     Ok(result)
@@ -3323,7 +3325,7 @@ pub async fn query(
             .map_err(reference_allocation_error)?;
         node.reference = NodeReference {
             id: format!("@{id}"),
-            revision: revision.to_string(),
+            revision: issuance.wire_revision(),
         };
         nodes.push(node);
     }
@@ -7720,7 +7722,15 @@ mod tests {
                             "{tag}/{native_role:?}/{authored}/{bounded}"
                         );
                         assert_eq!(node.reference.id, "@e1");
-                        assert_eq!(node.reference.revision, "1");
+                        assert_eq!(
+                            node.reference.revision,
+                            LocatedIssuance {
+                                identity_scope: "scope".into(),
+                                generation: 1,
+                                revision: 1,
+                            }
+                            .wire_revision()
+                        );
                         assert_eq!(refs.get("e1").unwrap().backend_node_id, Some(42));
                         data["__nativeReadonlyPseudo"] = json!(true);
                         let pseudo =
@@ -10681,6 +10691,12 @@ mod tests {
 
     #[test]
     fn revision_wire_preserves_full_native_integer_precision() {
+        let reference_revision = LocatedIssuance {
+            identity_scope: "scope".into(),
+            generation: 1,
+            revision: u64::MAX,
+        }
+        .wire_revision();
         let observation = Observation {
             semantic_frame_proof: SemanticFrameProof::default(),
             identity_scope: "scope".into(),
@@ -10688,12 +10704,13 @@ mod tests {
             roots: vec![],
             viewport_ref: NodeReference {
                 id: "@e1".into(),
-                revision: u64::MAX.to_string(),
+                revision: reference_revision.clone(),
             },
             truncated: false,
         };
         let encoded = serde_json::to_value(&observation).unwrap();
         assert_eq!(encoded["revision"], u64::MAX.to_string());
+        assert_eq!(encoded["viewportRef"]["revision"], reference_revision);
         assert!(encoded.get("hiddenFrameProof").is_none());
         assert_eq!(
             serde_json::from_value::<Observation>(encoded.clone())

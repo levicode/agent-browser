@@ -2249,7 +2249,7 @@ impl ObservationDispatch {
                     let value = if request.purpose == ScreenshotPurpose::Trace {
                         let viewport_ref = staged.try_viewport_ref(&identity, operation.generation,
                             &capture_context.page.page_session_id, revision).map_err(|_| ProtocolError::IdentifierExhausted)?;
-                        let viewport_ref = observation::NodeReference { id: format!("@{}", viewport_ref.id), revision: viewport_ref.issuance.revision.to_string() };
+                        let viewport_ref = observation::NodeReference { id: format!("@{}", viewport_ref.id), revision: viewport_ref.issuance.wire_revision() };
                         json!({"identityScope":identity,"viewportRef":viewport_ref,
                             "viewport":viewport(&capture_context.page, &operation).await?,
                             "location":main_frame(&frozen)?.url})
@@ -2683,7 +2683,7 @@ async fn fresh_fallback<'a>(
         let viewport_ref = {
             let viewport = refs.try_viewport_ref(&context.page.identity_scope, operation.generation,
                 &context.page.page_session_id, revision).map_err(|_| ProtocolError::IdentifierExhausted)?;
-            observation::NodeReference { id: format!("@{}", viewport.id), revision: viewport.issuance.revision.to_string() }
+            observation::NodeReference { id: format!("@{}", viewport.id), revision: viewport.issuance.wire_revision() }
         };
         let viewport = viewport(&context.page, operation).await?;
         let pixels = client_capture::capture_under_journal(context, &CaptureRequest { secure_field_selector: selector.to_owned() }, &pixel_lease(operation), &mut journal, geometry).await.map_err(FallbackFailure::Capture)?;
@@ -3610,15 +3610,14 @@ async fn minimal_document(
         .filter(|id| *id > 0)
         .ok_or(ProtocolError::BrowserFailure)?;
     let reference = refs
-        .try_bind_exact(backend, "document", "", main.binding.clone())
+        .try_bind_readonly_pixel_root(backend, main.binding.clone())
         .map_err(|_| ProtocolError::IdentifierExhausted)?;
     Ok(observation::NodeReference {
         id: format!("@{reference}"),
         revision: refs
             .get(&reference)
-            .and_then(|entry| entry.issued_revision())
-            .ok_or(ProtocolError::StaleReference)?
-            .to_string(),
+            .and_then(|entry| entry.issued_wire_revision())
+            .ok_or(ProtocolError::StaleReference)?,
     })
 }
 async fn viewport(
@@ -5632,7 +5631,7 @@ mod tests {
                     1,
                     "session",
                     &format!("@{}", viewport.id),
-                    &viewport.issuance.revision.to_string()
+                    &viewport.issuance.wire_revision()
                 ));
                 if !integrity_lost_expected && !authority_revoked {
                     // Retained data is usable only while the original scope and
@@ -5661,7 +5660,7 @@ mod tests {
                             "scope",
                             1,
                             "session",
-                            &entry.issued_revision().unwrap().to_string()
+                            &entry.issued_wire_revision().unwrap()
                         ));
                         super::super::element::validate_exact_binding_typed(
                             &client,
@@ -5746,6 +5745,19 @@ mod tests {
                 .backend_node_id,
             Some(1)
         );
+        {
+            let committed = refs.lock().unwrap();
+            let pixel_root = committed.get(root_id.trim_start_matches('@')).unwrap();
+            assert_eq!(
+                pixel_root.kind,
+                crate::native::element::NativeReferenceKind::ReadOnlyPixelRoot
+            );
+            assert!(!pixel_root.exact_binding.as_ref().unwrap().actionable);
+            assert_eq!(
+                pixel_root.issued_wire_revision().as_deref(),
+                root["ref"]["revision"].as_str()
+            );
+        }
         blobs
             .release(&scope, output["pixels"]["handle"].as_str().unwrap())
             .unwrap();

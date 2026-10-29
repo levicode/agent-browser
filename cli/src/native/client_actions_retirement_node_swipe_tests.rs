@@ -157,7 +157,7 @@ async fn phase(
     let deadline = f.op.deadline;
     // This is the fixture's existing independent5s component lease, never an
     // altered7ms adapter operation or a7ms end-to-end success claim.
-    let args = json!({"identityScope":"scope","ref":{"id":"@e1","revision":"1"},"action":action});
+    let args = json!({"identityScope":"scope","ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},"action":action});
     let actions = ClientActions::default();
     let producer = journal.scope(actions.execute(f.context(), "browser.perform", &args));
     tokio::pin!(producer);
@@ -441,7 +441,7 @@ async fn node400x300_iframe_uses_original_centre_targeting() {
 async fn node400x300_explicit_hover_keeps_centre_mode_then_swipe_reuses_it() {
     let (f, ledger, journal) = setup(POINTER).await;
     journal.scope(ClientActions::default().execute(f.context(),"browser.perform",
-        &json!({"identityScope":"scope","ref":{"id":"@e1","revision":"1"},"action":{"kind":"hover"}}))).await.unwrap();
+        &json!({"identityScope":"scope","ref":{"id":"@e1","revision":test_reference_revision("scope", 1, 1)},"action":{"kind":"hover"}}))).await.unwrap();
     assert_eq!(
         f.state.known_pointer_position(&f.page, &f.op).unwrap(),
         Some((200., 150.))

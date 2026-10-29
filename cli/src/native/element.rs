@@ -25,6 +25,7 @@ pub struct ExactBinding {
 pub enum NativeReferenceKind {
     Dom,
     ReadOnlyCssPseudo,
+    ReadOnlyPixelRoot,
 }
 
 /// Immutable full live-query source, distinct from its acquisition backend.
@@ -58,6 +59,21 @@ pub struct LocatedIssuance {
     pub identity_scope: String,
     pub generation: u64,
     pub revision: u64,
+}
+
+impl LocatedIssuance {
+    /// Opaque wire identity, derived only from immutable native issuance.
+    /// The UTF-8 byte length makes scopes containing separators unambiguous.
+    /// Incoming revisions are never parsed or normalized into authority.
+    pub fn wire_revision(&self) -> String {
+        format!(
+            "nr1:{}:{}:{}:{}",
+            self.identity_scope.len(),
+            self.identity_scope,
+            self.generation,
+            self.revision
+        )
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +111,10 @@ impl RefEntry {
         self.issuance().map(|issuance| issuance.revision)
     }
 
+    pub fn issued_wire_revision(&self) -> Option<String> {
+        self.issuance().map(LocatedIssuance::wire_revision)
+    }
+
     pub fn is_current_observed(&self, snapshot_revision: u64) -> bool {
         matches!(self.lifetime, RefLifetime::Observed)
             && snapshot_revision != 0
@@ -123,8 +143,8 @@ impl RefEntry {
     ) -> bool {
         self.matches_scope(identity_scope, generation, page_session)
             && self
-                .issued_revision()
-                .is_some_and(|revision| supplied_revision == revision.to_string())
+                .issued_wire_revision()
+                .is_some_and(|revision| supplied_revision == revision)
     }
 }
 
@@ -493,6 +513,24 @@ impl RefMap {
             binding,
             None,
             NativeReferenceKind::ReadOnlyCssPseudo,
+        )
+    }
+
+    /// Pixel fallback has document identity but no semantic element authority.
+    /// Only the separate viewport capability may perform root swipes.
+    pub(crate) fn try_bind_readonly_pixel_root(
+        &mut self,
+        backend: i64,
+        mut binding: ExactBinding,
+    ) -> Result<String, RefAllocationError> {
+        binding.actionable = false;
+        self.try_bind_exact_kind(
+            backend,
+            "document",
+            "",
+            binding,
+            None,
+            NativeReferenceKind::ReadOnlyPixelRoot,
         )
     }
 
@@ -898,7 +936,7 @@ impl RefMap {
                 && viewport.issuance.generation == generation
                 && viewport.page_session == page_session
                 && viewport.issuance.revision != 0
-                && revision == viewport.issuance.revision.to_string()
+                && revision == viewport.issuance.wire_revision()
         })
     }
 
@@ -1106,7 +1144,7 @@ pub async fn resolve_element_center(
             .get(&ref_id)
             .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
 
-        if entry.kind == NativeReferenceKind::ReadOnlyCssPseudo {
+        if entry.kind != NativeReferenceKind::Dom {
             return Err("Native reference is read-only and not actionable".into());
         }
         if let Some(binding) = &entry.exact_binding {
@@ -2664,6 +2702,173 @@ mod tests {
     }
 
     #[test]
+    fn pixel_root_identity_never_aliases_dom_or_css_pseudo_authority() {
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 7, 1);
+        let dom = refs.bind_exact(42, "document", "", strict_binding("doc"));
+        let pixel = refs
+            .try_bind_readonly_pixel_root(42, strict_binding("doc"))
+            .unwrap();
+        assert_ne!(dom, pixel);
+        let entry = refs.get(&pixel).unwrap();
+        assert_eq!(entry.kind, NativeReferenceKind::ReadOnlyPixelRoot);
+        assert!(!entry.exact_binding.as_ref().unwrap().actionable);
+        assert!(entry.matches_reference("scope", 7, "page", "nr1:5:scope:7:1"));
+        let pseudo = refs
+            .try_bind_readonly_pseudo(42, "text", strict_binding("doc"))
+            .unwrap();
+        assert_ne!(pseudo, pixel);
+        assert_ne!(pseudo, dom);
+        refs.begin_observation("scope", 7, 2);
+        let fresh = refs.bind_exact(42, "document", "", strict_binding("doc"));
+        assert_ne!(fresh, pixel);
+        assert_eq!(refs.get(&fresh).unwrap().kind, NativeReferenceKind::Dom);
+        assert!(refs.get(&pixel).is_none());
+    }
+
+    #[test]
+    fn wire_revision_is_exact_versioned_utf8_issuance_not_a_numeric_counter() {
+        let issuance = LocatedIssuance {
+            identity_scope: "域:scope".into(),
+            generation: 7,
+            revision: 3,
+        };
+        assert_eq!(issuance.wire_revision(), "nr1:9:域:scope:7:3");
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 7, 1);
+        let id = refs.bind_exact(42, "button", "", strict_binding("doc"));
+        let entry = refs.get(&id).unwrap();
+        assert_eq!(entry.issued_revision(), Some(1));
+        assert_eq!(
+            entry.issued_wire_revision().as_deref(),
+            Some("nr1:5:scope:7:1")
+        );
+        assert!(entry.matches_reference("scope", 7, "page", "nr1:5:scope:7:1"));
+        for supplied in [
+            "1",
+            "",
+            " nr1:5:scope:7:1",
+            "nr1:5:scope:7:1 ",
+            "nr1:05:scope:7:1",
+            "nr1:5:scope:07:1",
+            "nr1:5:scope:7:01",
+            "nr2:5:scope:7:1",
+            "nr1:5:other:7:1",
+            "nr1:5:scope:8:1",
+            "nr1:5:scope:7:2",
+        ] {
+            assert!(
+                !entry.matches_reference("scope", 7, "page", supplied),
+                "{supplied}"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_client_colliding_ids_and_counters_cannot_rebind_old_wire_references() {
+        for (old_scope, new_scope, old_generation, new_generation) in [
+            ("client-a", "client-b", 7, 7),
+            ("client-a", "client-a", 7, 8),
+        ] {
+            let mut old = RefMap::new();
+            let mut current = RefMap::new();
+            old.begin_observation(old_scope, old_generation, 1);
+            current.begin_observation(new_scope, new_generation, 1);
+            let old_id = old.bind_exact(42, "button", "", strict_binding("doc"));
+            let current_id = current.bind_exact(42, "button", "", strict_binding("doc"));
+            assert_eq!(old_id, current_id);
+            let stale = old.get(&old_id).unwrap().issued_wire_revision().unwrap();
+            let entry = current.get(&current_id).unwrap();
+            assert!(entry.matches_reference(
+                new_scope,
+                new_generation,
+                "page",
+                &entry.issued_wire_revision().unwrap()
+            ));
+            // The caller has already adopted the CURRENT scope and owner. Only
+            // the reference carries the old client/recovery issuance.
+            assert!(!entry.matches_reference(new_scope, new_generation, "page", &stale));
+            let old_located = old
+                .try_bind_located(
+                    43,
+                    "button",
+                    strict_binding("doc"),
+                    LocatedIssuance {
+                        identity_scope: old_scope.into(),
+                        generation: old_generation,
+                        revision: 1,
+                    },
+                    None,
+                )
+                .unwrap();
+            let current_located = current
+                .try_bind_located(
+                    43,
+                    "button",
+                    strict_binding("doc"),
+                    LocatedIssuance {
+                        identity_scope: new_scope.into(),
+                        generation: new_generation,
+                        revision: 1,
+                    },
+                    None,
+                )
+                .unwrap();
+            assert_eq!(old_located, current_located);
+            let stale = old
+                .get(&old_located)
+                .unwrap()
+                .issued_wire_revision()
+                .unwrap();
+            let entry = current.get(&current_located).unwrap();
+            assert!(entry.matches_reference(
+                new_scope,
+                new_generation,
+                "page",
+                &entry.issued_wire_revision().unwrap()
+            ));
+            assert!(!entry.matches_reference(new_scope, new_generation, "page", &stale));
+            let old_viewport = old
+                .try_viewport_ref(old_scope, old_generation, "page", 1)
+                .unwrap()
+                .clone();
+            let viewport = current
+                .try_viewport_ref(new_scope, new_generation, "page", 1)
+                .unwrap()
+                .clone();
+            assert_eq!(old_viewport.id, viewport.id);
+            assert!(current.matches_viewport_reference(
+                new_scope,
+                new_generation,
+                "page",
+                &viewport.id,
+                &viewport.issuance.wire_revision()
+            ));
+            assert!(!current.matches_viewport_reference(
+                new_scope,
+                new_generation,
+                "page",
+                &old_viewport.id,
+                &old_viewport.issuance.wire_revision()
+            ));
+            current.invalidate_all_documents();
+            assert_eq!(
+                current
+                    .try_viewport_ref(new_scope, new_generation, "page", 99)
+                    .unwrap(),
+                &viewport
+            );
+            assert!(current.matches_viewport_reference(
+                new_scope,
+                new_generation,
+                "page",
+                &viewport.id,
+                &viewport.issuance.wire_revision()
+            ));
+        }
+    }
+
+    #[test]
     fn located_sources_have_fresh_issuance_and_survive_only_normal_observation() {
         let mut refs = RefMap::new();
         let observed = refs.bind_exact(42, "button", "", strict_binding("doc"));
@@ -2709,12 +2914,13 @@ mod tests {
         assert!(refs
             .get(&first)
             .unwrap()
-            .matches_reference("scope", 7, "page", "3"));
+            .matches_reference("scope", 7, "page", "nr1:5:scope:7:3"));
         for (scope, generation, page, revision) in [
-            ("other", 7, "page", "3"),
-            ("scope", 8, "page", "3"),
-            ("scope", 7, "foreign", "3"),
+            ("other", 7, "page", "nr1:5:scope:7:3"),
+            ("scope", 8, "page", "nr1:5:scope:7:3"),
+            ("scope", 7, "foreign", "nr1:5:scope:7:3"),
             ("scope", 7, "page", "10"),
+            ("scope", 7, "page", "nr1:5:scope:7:10"),
             ("scope", 7, "page", "03"),
         ] {
             assert!(!refs
@@ -2770,8 +2976,8 @@ mod tests {
         let current = staged.get(&observed).unwrap();
         assert!(current.is_current_observed(2));
         assert!(!current.is_current_observed(1));
-        assert!(current.matches_reference("scope", 7, "page", "1"));
-        for revision in ["0", "2", "01", "999"] {
+        assert!(current.matches_reference("scope", 7, "page", "nr1:5:scope:7:1"));
+        for revision in ["0", "2", "01", "999", "nr1:5:scope:7:2"] {
             assert!(!current.matches_reference("scope", 7, "page", revision));
         }
         assert!(staged.get(&located).is_none());
@@ -3345,13 +3551,14 @@ mod tests {
             staged.try_viewport_ref("scope", 7, "page", 4).unwrap(),
             &first
         );
-        assert!(refs.matches_viewport_reference("scope", 7, "page", &first.id, "2"));
+        assert!(refs.matches_viewport_reference("scope", 7, "page", &first.id, "nr1:5:scope:7:2"));
         for (scope, generation, page, revision) in [
             ("scope", 7, "page", "3"),
+            ("scope", 7, "page", "nr1:5:scope:7:3"),
             ("scope", 7, "page", "02"),
-            ("other", 7, "page", "2"),
-            ("scope", 8, "page", "2"),
-            ("scope", 7, "other", "2"),
+            ("other", 7, "page", "nr1:5:scope:7:2"),
+            ("scope", 8, "page", "nr1:5:scope:7:2"),
+            ("scope", 7, "other", "nr1:5:scope:7:2"),
         ] {
             assert!(!refs.matches_viewport_reference(scope, generation, page, &first.id, revision));
         }
@@ -3380,8 +3587,8 @@ mod tests {
         assert_eq!(entry.issued_revision(), Some(1));
         assert!(entry.is_current_observed(2));
         assert!(!entry.is_current_observed(1));
-        assert!(entry.matches_reference("scope", 7, "page", "1"));
-        for revision in ["0", "2", "01", "999"] {
+        assert!(entry.matches_reference("scope", 7, "page", "nr1:5:scope:7:1"));
+        for revision in ["0", "2", "01", "999", "nr1:5:scope:7:2"] {
             assert!(!entry.matches_reference("scope", 7, "page", revision));
         }
         for (scope, generation, page) in [
@@ -3389,7 +3596,7 @@ mod tests {
             ("scope", 8, "page"),
             ("scope", 7, "other"),
         ] {
-            assert!(!entry.matches_reference(scope, generation, page, "1"));
+            assert!(!entry.matches_reference(scope, generation, page, "nr1:5:scope:7:1"));
         }
         refs = staged;
         let baseline = refs.clone();
@@ -3537,10 +3744,12 @@ mod tests {
     fn abandoned_observed_records_cannot_resurrect_and_unissued_refs_have_no_authority() {
         let mut refs = RefMap::new();
         let legacy = refs.bind_exact(42, "textbox", "", strict_binding("doc"));
-        assert!(!refs
-            .get(&legacy)
-            .unwrap()
-            .matches_reference("scope", 7, "page", "1"));
+        assert!(!refs.get(&legacy).unwrap().matches_reference(
+            "scope",
+            7,
+            "page",
+            "nr1:5:scope:7:1"
+        ));
         let abandoned = {
             let mut staged = refs.clone();
             staged.begin_observation("scope", 7, 1);

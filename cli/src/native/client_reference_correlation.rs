@@ -35,7 +35,7 @@ fn canonical_ref(reference: &NodeReference) -> Result<String, ProtocolError> {
         .strip_prefix("@e")
         .filter(|id| canonical_positive(id))
         .ok_or(ProtocolError::InvalidArguments)?;
-    if !canonical_positive(&reference.revision) {
+    if reference.revision.is_empty() {
         return Err(ProtocolError::InvalidArguments);
     }
     Ok(format!("e{id}"))
@@ -228,7 +228,12 @@ mod tests {
     fn node(id: &str, revision: u64) -> NodeReference {
         NodeReference {
             id: format!("@{id}"),
-            revision: revision.to_string(),
+            revision: LocatedIssuance {
+                identity_scope: "scope".into(),
+                generation: 7,
+                revision,
+            }
+            .wire_revision(),
         }
     }
     fn located(refs: &mut RefMap, backend: i64) -> NodeReference {
@@ -359,6 +364,14 @@ mod tests {
         );
         for (located, observed, error) in [
             (
+                vec![NodeReference {
+                    id: acquired.id.clone(),
+                    revision: String::new(),
+                }],
+                vec![observed.clone()],
+                ProtocolError::InvalidArguments,
+            ),
+            (
                 vec![acquired.clone(), acquired.clone()],
                 vec![observed.clone()],
                 ProtocolError::InvalidArguments,
@@ -384,7 +397,17 @@ mod tests {
                     revision: "02".into(),
                 }],
                 vec![observed.clone()],
-                ProtocolError::InvalidArguments,
+                ProtocolError::StaleReference,
+            ),
+            (
+                vec![node(acquired.id.trim_start_matches('@'), 3)],
+                vec![observed.clone()],
+                ProtocolError::StaleReference,
+            ),
+            (
+                vec![acquired.clone()],
+                vec![node(observed.id.trim_start_matches('@'), 4)],
+                ProtocolError::StaleReference,
             ),
             (
                 vec![NodeReference {
@@ -425,6 +448,64 @@ mod tests {
             Err(ProtocolError::StaleReference)
         ));
     }
+    #[test]
+    fn pixel_root_cannot_be_forged_into_semantic_correlation() {
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 7, 5);
+        let acquired = located(&mut refs, 42);
+        let pixel = refs.try_bind_readonly_pixel_root(42, binding()).unwrap();
+        let pixel = node(&pixel, 5);
+        assert!(matches!(
+            build(
+                &CorrelateRequest {
+                    located: vec![acquired],
+                    observed: vec![pixel],
+                },
+                &refs
+            ),
+            Err(ProtocolError::InvalidArguments)
+        ));
+    }
+
+    #[test]
+    fn colliding_current_owner_refs_refuse_old_client_issuance_in_correlation() {
+        let mut refs = RefMap::new();
+        refs.begin_observation("scope", 7, 5);
+        let acquired = located(&mut refs, 42);
+        let observed = node(&refs.bind_exact(42, "button", "", binding()), 5);
+        let current = CorrelateRequest {
+            located: vec![acquired.clone()],
+            observed: vec![observed.clone()],
+        };
+        assert_eq!(
+            build(&current, &refs).unwrap().matches,
+            vec![Some(observed.clone())]
+        );
+        for (scope, generation) in [("old-client", 7), ("scope", 6)] {
+            for stale_observed in [false, true] {
+                let mut request = CorrelateRequest {
+                    located: vec![acquired.clone()],
+                    observed: vec![observed.clone()],
+                };
+                let reference = if stale_observed {
+                    &mut request.observed[0]
+                } else {
+                    &mut request.located[0]
+                };
+                reference.revision = LocatedIssuance {
+                    identity_scope: scope.into(),
+                    generation,
+                    revision: if stale_observed { 5 } else { 2 },
+                }
+                .wire_revision();
+                assert!(matches!(
+                    build(&request, &refs),
+                    Err(ProtocolError::StaleReference)
+                ));
+            }
+        }
+    }
+
     #[test]
     fn wrong_scope_document_and_viewport_cannot_correlate() {
         let mut refs = RefMap::new();

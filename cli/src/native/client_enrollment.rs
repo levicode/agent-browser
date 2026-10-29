@@ -10465,7 +10465,7 @@ mod tests {
             let failure=ClientActions::default().execute(ActionContext { observation_after: None, observed_revision: 0, observation_frames: &observation_frames,
                 realm_authority:ActionRealmAuthority::Enrolled(&owner),page:&page,operation:&op,
                 page_state:&owner.page,refs:&refs,revision:1,iframe_sessions:&frames,blobs:&blobs,geometry:&geometry,
-            },"browser.perform",&json!({"identityScope":"owned-scope","ref":{"id":format!("@{id}"),"revision":"1"},"action":{"kind":"check"}})).await.unwrap_err();
+            },"browser.perform",&json!({"identityScope":"owned-scope","ref":{"id":format!("@{id}"),"revision":refs.get(&id).unwrap().issued_wire_revision().unwrap()},"action":{"kind":"check"}})).await.unwrap_err();
             assert_eq!(failure.error, ProtocolError::StaleReference);
             assert_eq!(failure.effects, Effects::NotDispatched);
             assert_eq!(failure.cleanup_failed, failed_release);
