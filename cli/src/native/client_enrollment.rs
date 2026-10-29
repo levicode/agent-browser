@@ -10259,19 +10259,22 @@ mod tests {
             json!({"executionContextId":7}),
             json!({"executionContextId":7,"executionContextUniqueId":"foreign-unique"}),
         ] {
-            let event: CdpEvent = serde_json::from_value(json!({
-                "method":"Runtime.executionContextDestroyed", "sessionId":"initial", "params":params,
-            })).unwrap();
+            let event = CdpEvent {
+                method: "Runtime.executionContextDestroyed".into(),
+                session_id: Some("initial".into()),
+                params,
+            };
             // Exercise the unchanged production validator. Missing/mismatched
             // identity is a protocol failure, not successful realm destruction.
             assert_eq!(owner.realm_event(&entry, &event), Err(ProtocolError::InvalidFrame));
             assert_eq!(ticket.destroyed(), Ok(false));
             assert!(owner.index.lock().unwrap().realms.contains_key(&("initial".into(), 7)));
         }
-        let event: CdpEvent = serde_json::from_value(json!({
-            "method":"Runtime.executionContextDestroyed", "sessionId":"initial",
-            "params":{"executionContextId":7,"executionContextUniqueId":"original-unique"},
-        })).unwrap();
+        let event = CdpEvent {
+            method: "Runtime.executionContextDestroyed".into(),
+            session_id: Some("initial".into()),
+            params: json!({"executionContextId":7,"executionContextUniqueId":"original-unique"}),
+        };
         assert_eq!(owner.realm_event(&entry, &event), Ok(()));
         assert_eq!(ticket.destroyed(), Ok(true));
         drop(ticket);
