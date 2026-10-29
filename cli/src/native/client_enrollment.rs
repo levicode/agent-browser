@@ -1855,8 +1855,8 @@ impl ClientEnrollment {
                 Some(_) => EvalWatermark::Ahead,
                 None => EvalWatermark::Unknown,
             },
-            revision: revision.filter(|value| *value <= (1u64 << 53) - 1),
-            epoch: (index.application_epoch <= (1u64 << 53) - 1).then_some(index.application_epoch),
+            revision: revision.filter(|value| *value < (1u64 << 53)),
+            epoch: (index.application_epoch < (1u64 << 53)).then_some(index.application_epoch),
         }
     }
     /// Drain only the events already received at this command's entry. This
@@ -2032,7 +2032,7 @@ impl ClientEnrollment {
             // fences observation before publishing received, with no lock spanning it.
             let revision = ledger.capture_eval_revision(&page.page_session_id, &page.target_id)?;
             if let Some(facts) = &mut refusal_diagnostic {
-                facts.revision = (revision <= (1u64 << 53) - 1).then_some(revision);
+                facts.revision = (revision < (1u64 << 53)).then_some(revision);
             }
             self.realm_snapshot_healthy(&index, &watermark)
                 .inspect_err(|_| {
