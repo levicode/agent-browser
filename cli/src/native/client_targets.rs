@@ -51,6 +51,16 @@ pub(super) struct RetainedInitialization {
     target: Option<OwnedTarget>,
     root: Option<OwnedTarget>,
 }
+struct AttachmentRegistrationContext<'a> {
+    retained: bool,
+    root: Option<&'a OwnedTarget>,
+    enrolled: bool,
+    verified_self_root: bool,
+}
+pub(super) struct AttachmentAncestry {
+    pub(super) root: Option<OwnedTarget>,
+    pub(super) verified_self_root: bool,
+}
 impl RetainedInitialization {
     pub(super) fn new(registry: Arc<ClientTargets>) -> Self {
         Self {
@@ -78,7 +88,17 @@ impl RetainedInitialization {
         kind: String,
         root: Option<OwnedTarget>,
     ) -> Result<bool, ProtocolError> {
-        self.attach_with_ancestry(registry, context, target, session, kind, root, false)
+        self.attach_with_ancestry(
+            registry,
+            context,
+            target,
+            session,
+            kind,
+            AttachmentAncestry {
+                root,
+                verified_self_root: false,
+            },
+        )
     }
     pub(super) fn attach_with_ancestry(
         &mut self,
@@ -87,9 +107,12 @@ impl RetainedInitialization {
         target: String,
         session: String,
         kind: String,
-        root: Option<OwnedTarget>,
-        verified_self_root: bool,
+        ancestry: AttachmentAncestry,
     ) -> Result<bool, ProtocolError> {
+        let AttachmentAncestry {
+            root,
+            verified_self_root,
+        } = ancestry;
         if self.target.is_some() || !Arc::ptr_eq(&self.registry, registry) {
             return Err(ProtocolError::StaleScope);
         }
@@ -98,10 +121,12 @@ impl RetainedInitialization {
             target,
             session,
             kind,
-            true,
-            root.as_ref(),
-            true,
-            verified_self_root,
+            AttachmentRegistrationContext {
+                retained: true,
+                root: root.as_ref(),
+                enrolled: true,
+                verified_self_root,
+            },
         )?;
         if let Some(target) = &attached {
             // The registry marked the exact fresh tenure under its insertion
@@ -1287,7 +1312,16 @@ impl ClientTargets {
         kind: String,
     ) -> Result<bool, ProtocolError> {
         self.attach_inner(
-            context_id, target_id, session_id, kind, false, None, false, false,
+            context_id,
+            target_id,
+            session_id,
+            kind,
+            AttachmentRegistrationContext {
+                retained: false,
+                root: None,
+                enrolled: false,
+                verified_self_root: false,
+            },
         )
         .map(|target| target.is_some())
     }
@@ -1315,10 +1349,12 @@ impl ClientTargets {
             target,
             session,
             kind,
-            false,
-            root,
-            true,
-            verified_self_root,
+            AttachmentRegistrationContext {
+                retained: false,
+                root,
+                enrolled: true,
+                verified_self_root,
+            },
         )
         .map(|target| target.is_some())
     }
@@ -1328,11 +1364,14 @@ impl ClientTargets {
         target_id: String,
         session_id: String,
         kind: String,
-        retained: bool,
-        root: Option<&OwnedTarget>,
-        enrolled: bool,
-        verified_self_root: bool,
+        context: AttachmentRegistrationContext<'_>,
     ) -> Result<Option<OwnedTarget>, ProtocolError> {
+        let AttachmentRegistrationContext {
+            retained,
+            root,
+            enrolled,
+            verified_self_root,
+        } = context;
         if context_id != self.context_id {
             return Ok(None);
         }

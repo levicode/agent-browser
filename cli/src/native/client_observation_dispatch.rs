@@ -461,6 +461,23 @@ pub struct DispatchTask {
     pub join: tokio::task::JoinHandle<Result<(), DispatchFailure>>,
     pub result: oneshot::Receiver<Result<Value, DispatchFailure>>,
 }
+// One borrowed publication transaction; field order follows the call boundary.
+struct QueryPublication<'a, S> {
+    page: &'a BrowserExecutionLease,
+    operation: &'a OperationLease,
+    capture: Option<&'a Arc<CaptureAdmission>>,
+    trace: Option<&'a TraceFence>,
+    retirement_fence: u64,
+    publication: &'a mut Publication,
+    kind: PublicationKind,
+    revision: u64,
+    staged: S,
+    blobs: &'a BlobStore,
+    blob_scope: &'a BlobScope,
+    handles: &'a [String],
+    query_partition: &'a super::client_enrollment::PageAcquisitionProof,
+}
+
 struct Publication {
     revision: u64,
     published_revision: u64,
@@ -1129,20 +1146,23 @@ impl ObservationDispatch {
 
     fn commit_staged_query_attempt(
         &self,
-        page: &BrowserExecutionLease,
-        operation: &OperationLease,
-        capture: Option<&Arc<CaptureAdmission>>,
-        trace: Option<&TraceFence>,
-        retirement_fence: u64,
-        publication: &mut Publication,
-        kind: PublicationKind,
-        revision: u64,
-        staged: &mut Option<RefMap>,
-        blobs: &BlobStore,
-        blob_scope: &BlobScope,
-        handles: &[String],
-        query_partition: &super::client_enrollment::PageAcquisitionProof,
+        context: QueryPublication<'_, &mut Option<RefMap>>,
     ) -> Result<super::client_enrollment::QueryBoundary<()>, ProtocolError> {
+        let QueryPublication {
+            page,
+            operation,
+            capture,
+            trace,
+            retirement_fence,
+            publication,
+            kind,
+            revision,
+            staged,
+            blobs,
+            blob_scope,
+            handles,
+            query_partition,
+        } = context;
         let authority = self
             .captures
             .lock()
@@ -1207,23 +1227,26 @@ impl ObservationDispatch {
 
     async fn commit_staged_query(
         &self,
-        page: &BrowserExecutionLease,
-        operation: &OperationLease,
-        capture: Option<&Arc<CaptureAdmission>>,
-        trace: Option<&TraceFence>,
-        retirement_fence: u64,
-        publication: &mut Publication,
-        kind: PublicationKind,
-        revision: u64,
-        staged: RefMap,
-        blobs: &BlobStore,
-        blob_scope: &BlobScope,
-        handles: &[String],
-        query_partition: &super::client_enrollment::PageAcquisitionProof,
+        context: QueryPublication<'_, RefMap>,
     ) -> Result<(), ProtocolError> {
+        let QueryPublication {
+            page,
+            operation,
+            capture,
+            trace,
+            retirement_fence,
+            publication,
+            kind,
+            revision,
+            staged,
+            blobs,
+            blob_scope,
+            handles,
+            query_partition,
+        } = context;
         let mut staged = Some(staged);
         loop {
-            match self.commit_staged_query_attempt(
+            match self.commit_staged_query_attempt(QueryPublication {
                 page,
                 operation,
                 capture,
@@ -1232,12 +1255,12 @@ impl ObservationDispatch {
                 publication,
                 kind,
                 revision,
-                &mut staged,
+                staged: &mut staged,
                 blobs,
                 blob_scope,
                 handles,
                 query_partition,
-            )? {
+            })? {
                 super::client_enrollment::QueryBoundary::Ready(()) => return Ok(()),
                 super::client_enrollment::QueryBoundary::RevisionOnlyBeforePublication => {
                     return Err(ProtocolError::StaleScope)
@@ -1266,21 +1289,21 @@ impl ObservationDispatch {
         let fence = self.publication_fence()?;
         let mut publication = self.publication.lock().await;
         let revision = publication.stage_revision(PublicationKind::AdditiveQuery)?;
-        self.commit_staged_query(
+        self.commit_staged_query(QueryPublication {
             page,
             operation,
-            None,
-            None,
-            fence,
-            &mut publication,
-            PublicationKind::AdditiveQuery,
+            capture: None,
+            trace: None,
+            retirement_fence: fence,
+            publication: &mut publication,
+            kind: PublicationKind::AdditiveQuery,
             revision,
             staged,
             blobs,
-            scope,
-            &[],
-            partition,
-        )
+            blob_scope: scope,
+            handles: &[],
+            query_partition: partition,
+        })
         .await?;
         Ok(publication.published_revision)
     }
@@ -2201,7 +2224,7 @@ impl ObservationDispatch {
                     screenshot_stage(screenshot, ScreenshotStage::SemanticMetadata);
                     let mut tree = observation::observe(&capture_context.page.client, &frozen, &mut staged, &identity, revision, &options, &semantic).await.map_err(map_observation)?;
                     screenshot_stage(screenshot, ScreenshotStage::SemanticFrameGeometry);
-                    geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.semantic_frame_proof, &context.policy.frame_policy, &identity, revision, &operation).await.map_err(map_geometry)?);
+                    geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, super::client_geometry::SemanticCaptureContext { proof: &tree.semantic_frame_proof, policy: &context.policy.frame_policy, identity_scope: &identity, revision }, &operation).await.map_err(map_geometry)?);
                     let proof = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                     screenshot_stage(screenshot, ScreenshotStage::SemanticNodeGeometry);
                     observation::project_geometry(&capture_context.page.client, &frozen, &staged, proof, &mut tree.roots, &operation).await.map_err(map_geometry)?;
@@ -2274,7 +2297,7 @@ impl ObservationDispatch {
                             witness.enter(ObserveFailureStage::Geometry);
                             if geometry.is_none() {
                                 screenshot_stage(screenshot, ScreenshotStage::SemanticFrameGeometry);
-                                geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, &tree.semantic_frame_proof, &context.policy.frame_policy, &identity, revision, &operation).await.map_err(map_geometry)?);
+                                geometry = Some(GeometrySnapshot::capture_semantic(&capture_context.page.client, &capture_context.page.page_session_id, &frozen, super::client_geometry::SemanticCaptureContext { proof: &tree.semantic_frame_proof, policy: &context.policy.frame_policy, identity_scope: &identity, revision }, &operation).await.map_err(map_geometry)?);
                             }
                             let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                             screenshot_stage(screenshot, ScreenshotStage::SemanticNodeGeometry);
@@ -2476,8 +2499,8 @@ impl ObservationDispatch {
                 journal.check_async().await.map_err(protected_error)?;
             }
             if let Some(partition) = query_partition.as_ref() {
-                self.commit_staged_query(&capture_context.page, &operation, capture.as_ref(), trace.as_ref(), retirement_fence,
-                    &mut publication, publication_kind, revision, staged, &context.blobs, &context.scope, &handles, partition).await?;
+                self.commit_staged_query(QueryPublication { page: &capture_context.page, operation: &operation, capture: capture.as_ref(), trace: trace.as_ref(), retirement_fence,
+                    publication: &mut publication, kind: publication_kind, revision, staged, blobs: &context.blobs, blob_scope: &context.scope, handles: &handles, query_partition: partition }).await?;
             } else {
                 self.commit_staged(&capture_context.page, &operation, capture.as_ref(), trace.as_ref(), retirement_fence,
                     &mut publication, publication_kind, revision, staged, &context.blobs, &context.scope, &handles, None)?;
@@ -5750,7 +5773,7 @@ mod tests {
         let before = dispatch.publication_fence().unwrap();
         let tenure = dispatch.captures.lock().unwrap().page_blob_tenure.clone();
         blobs
-            .bind_page_captures(&scope, &[old.handle.clone()], &tenure)
+            .bind_page_captures(&scope, std::slice::from_ref(&old.handle), &tenure)
             .unwrap();
         dispatch
             .retire_page_publication(&blobs, &scope)
@@ -5772,7 +5795,7 @@ mod tests {
         let current = dispatch.captures.lock().unwrap().page_blob_tenure.clone();
         assert!(!Arc::ptr_eq(&tenure, &current));
         blobs
-            .bind_page_captures(&scope, &[fresh.handle.clone()], &current)
+            .bind_page_captures(&scope, std::slice::from_ref(&fresh.handle), &current)
             .unwrap();
         blobs.revoke_page_captures(&scope, &tenure).unwrap();
         assert_eq!(

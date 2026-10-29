@@ -39,7 +39,7 @@ async fn peer(mode: Mode) -> (super::super::super::browser::BrowserManager, Peer
             tokio::select! {
                 Some(()) = released.recv(), if pending.is_some() => {
                     let response = pending.take().unwrap();
-                    if socket.send(Message::Text(response.to_string().into())).await.is_err() { break; }
+                    if socket.send(Message::Text(response.to_string())).await.is_err() { break; }
                 }
                 next = socket.next() => {
                     let Some(Ok(Message::Text(text))) = next else { break; };
@@ -76,7 +76,7 @@ async fn peer(mode: Mode) -> (super::super::super::browser::BrowserManager, Peer
                         || (mode == Mode::HoldBeforeIdentity && method == "Target.getTargetInfo" && info_reads == 1)
                         || (mode == Mode::HoldAfterAttach && method == "Target.getBrowserContexts" && context_reads == 3);
                     if hold { pending = Some(response); let _ = held_tx.send(()); }
-                    else if socket.send(Message::Text(response.to_string().into())).await.is_err() { break; }
+                    else if socket.send(Message::Text(response.to_string())).await.is_err() { break; }
                 }
             }
         }

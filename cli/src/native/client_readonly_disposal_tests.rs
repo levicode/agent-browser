@@ -466,7 +466,7 @@ async fn strict_snapshot_semantic_bounds_debt_never_discharges_strict_polygon_ob
         .scope(GeometrySnapshot::capture(
             &peer.client,
             "page",
-            &[frame.clone()],
+            std::slice::from_ref(&frame),
             &peer.operation,
         ))
         .await
@@ -537,10 +537,12 @@ async fn semantic_snapshot_rejects_strict_polygon_before_any_new_cdp_work() {
             &peer.client,
             "page",
             &frames,
-            &proof,
-            &ObservationFramePolicy::default(),
-            "readonly-disposal",
-            1,
+            super::client_geometry::SemanticCaptureContext {
+                proof: &proof,
+                policy: &ObservationFramePolicy::default(),
+                identity_scope: "readonly-disposal",
+                revision: 1,
+            },
             &peer.operation,
         ))
         .await

@@ -1531,10 +1531,10 @@ mod tests {
         let old_tenure = Arc::new(());
         let new_tenure = Arc::new(());
         store
-            .bind_page_captures(&scope, &[old.handle.clone()], &old_tenure)
+            .bind_page_captures(&scope, std::slice::from_ref(&old.handle), &old_tenure)
             .unwrap();
         store
-            .bind_page_captures(&scope, &[fresh.handle.clone()], &new_tenure)
+            .bind_page_captures(&scope, std::slice::from_ref(&fresh.handle), &new_tenure)
             .unwrap();
         store.revoke_page_captures(&scope, &Arc::new(())).unwrap();
         assert_eq!(

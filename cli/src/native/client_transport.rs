@@ -601,8 +601,7 @@ impl ClientEventSink {
                 token: lease.token.clone(),
                 timeout_ms: u64::try_from(left.as_millis())
                     .unwrap_or(MAX_TIMEOUT_MS)
-                    .min(MAX_TIMEOUT_MS)
-                    .max(1),
+                    .clamp(1, MAX_TIMEOUT_MS),
             }),
         )
     }

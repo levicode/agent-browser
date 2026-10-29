@@ -264,16 +264,17 @@ async fn optional_mask_retirement(case: Case) {
             .unwrap()
             .unwrap();
         // A complete semantic read has finished before the independent mask read.
-        let log = commands.lock().unwrap();
-        assert!(log
-            .iter()
-            .any(|r| r["method"] == "Runtime.releaseObjectGroup"
-                && r["params"]["objectGroup"] == "native-metadata-1"));
-        assert!(
-            refs.lock().unwrap().ref_ids().is_empty(),
-            "staging is not publication"
-        );
-        drop(log);
+        {
+            let log = commands.lock().unwrap();
+            assert!(log
+                .iter()
+                .any(|r| r["method"] == "Runtime.releaseObjectGroup"
+                    && r["params"]["objectGroup"] == "native-metadata-1"));
+            assert!(
+                refs.lock().unwrap().ref_ids().is_empty(),
+                "staging is not publication"
+            );
+        }
         if case == Case::SupersededBeforeCutoff {
             let (newer, _cancel_newer) = operation(2);
             let admitted = dispatch.prepare(owner.context(), observe(), newer).unwrap();

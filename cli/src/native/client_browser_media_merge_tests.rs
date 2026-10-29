@@ -28,13 +28,15 @@ impl Fixture {
         let (seen, media) = tokio::sync::mpsc::unbounded_channel();
         let (replies, incoming) = tokio::sync::mpsc::unbounded_channel();
         let (endpoint, log, peer) = peer_with_media_replies(
-            false,
-            None,
-            false,
-            None,
-            None,
-            Some(incoming),
-            false,
+            PeerControl {
+                ack_before_attach: false,
+                old_input: None,
+                hold_old_input: false,
+                cleanup_ack: None,
+                title_seen: None,
+                input_replies: Some(incoming),
+                hold_point: false,
+            },
             Some(seen),
         )
         .await;
@@ -211,8 +213,9 @@ impl Fixture {
                     }
                     _ => panic!("unexpected queued-media interruption frame: {frame}"),
                 }
-                if result.is_some() && (!explicit_cancel || cancel_ack) {
-                    return result.unwrap();
+                match result {
+                    Some(result) if !explicit_cancel || cancel_ack => return result,
+                    _ => {}
                 }
             }
             panic!("bounded media result/control pair missing")

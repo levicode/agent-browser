@@ -25,7 +25,7 @@ enum Race {
     HeldReleaseAfterReacquisition,
     Protected,
     InvalidLoader,
-    HeldReleaseWithoutRace,
+    HeldReleaseWithoutMutation,
     Deadline,
     Superseded,
     ReleaseError,
@@ -90,7 +90,7 @@ impl Fixture {
                 race,
                 Race::HeldRelease
                     | Race::HeldReleaseAfterReacquisition
-                    | Race::HeldReleaseWithoutRace
+                    | Race::HeldReleaseWithoutMutation
                     | Race::ReleaseError
                     | Race::ReleaseWrongSession
             );
@@ -146,7 +146,7 @@ impl Fixture {
                             let invalidate = match race {
                                 Race::Continuous => true,
                                 Race::Protected => completed == 1,
-                                Race::InvalidLoader | Race::HeldReleaseWithoutRace => false,
+                                Race::InvalidLoader | Race::HeldReleaseWithoutMutation => false,
                                 _ => completed == 0,
                             };
                             if invalidate {
@@ -230,7 +230,7 @@ impl Fixture {
                         assert!(instance > 0 && instance < u64::MAX);
                         assert_eq!(instance.to_string(), suffix);
                         releases += 1;
-                        if matches!(race, Race::HeldRelease | Race::HeldReleaseWithoutRace)
+                        if matches!(race, Race::HeldRelease | Race::HeldReleaseWithoutMutation)
                             || (race == Race::HeldReleaseAfterReacquisition && releases == 2)
                         {
                             continue;

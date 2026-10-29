@@ -101,34 +101,6 @@ pub(super) fn expects_drag(observations: &[MoveObservation]) -> Option<bool> {
     Some(observations.contains(&MoveObservation::Drag))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn sibling_realms_need_not_receive_the_mouse_move() {
-        assert_eq!(
-            expects_drag(&[MoveObservation::NoMove, MoveObservation::Drag]),
-            Some(true)
-        );
-        assert_eq!(
-            expects_drag(&[MoveObservation::NoMove, MoveObservation::NoDrag]),
-            Some(false)
-        );
-    }
-    #[test]
-    fn degenerate_move_remains_pointer_only_but_missing_inventory_is_not_false() {
-        assert_eq!(expects_drag(&[MoveObservation::NoMove]), Some(false));
-        assert_eq!(expects_drag(&[]), None);
-    }
-    #[test]
-    fn malformed_probe_result_does_not_become_no_drag() {
-        for value in ["", "false", "destroyed", "cancelled", "unknown"] {
-            assert_eq!(MoveObservation::decode(value), None);
-        }
-        assert_eq!(MoveObservation::decode("drag"), Some(MoveObservation::Drag));
-    }
-}
-
 use super::super::cdp::client::BoundedCdpEvent;
 use super::super::client_debt::{self, CommandCategory};
 use super::super::client_enrollment::ExactRealmTicket;
@@ -433,4 +405,32 @@ pub(super) async fn execute(
         .finish_point_drag(ctx.page, ctx.operation, token)
         .await?;
     runner.check()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sibling_realms_need_not_receive_the_mouse_move() {
+        assert_eq!(
+            expects_drag(&[MoveObservation::NoMove, MoveObservation::Drag]),
+            Some(true)
+        );
+        assert_eq!(
+            expects_drag(&[MoveObservation::NoMove, MoveObservation::NoDrag]),
+            Some(false)
+        );
+    }
+    #[test]
+    fn degenerate_move_remains_pointer_only_but_missing_inventory_is_not_false() {
+        assert_eq!(expects_drag(&[MoveObservation::NoMove]), Some(false));
+        assert_eq!(expects_drag(&[]), None);
+    }
+    #[test]
+    fn malformed_probe_result_does_not_become_no_drag() {
+        for value in ["", "false", "destroyed", "cancelled", "unknown"] {
+            assert_eq!(MoveObservation::decode(value), None);
+        }
+        assert_eq!(MoveObservation::decode("drag"), Some(MoveObservation::Drag));
+    }
 }

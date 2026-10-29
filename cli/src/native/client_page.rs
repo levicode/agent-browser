@@ -243,12 +243,11 @@ fn check_initialization(
         }
         admitted?;
     }
-    if let Err(observed) = ObservedOperationFailure::check_cancelled(op) {
+    ObservedOperationFailure::check_cancelled(op).inspect_err(|_| {
         #[cfg(test)]
         page.client
             .activation_diagnostic("guard-check", None, "cancelled", None, None);
-        return Err(observed);
-    }
+    })?;
     if Instant::now() >= op.deadline {
         #[cfg(test)]
         page.client

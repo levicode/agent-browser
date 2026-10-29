@@ -53,7 +53,7 @@ fn attributes(node: &Value) -> Result<Value, ObservationError> {
         if values.len() % 2 != 0 {
             return Err(ObservationError::BackendFailure);
         }
-        for pair in values.chunks_exact(2) {
+        for pair in values.as_chunks::<2>().0 {
             let key = pair[0].as_str().ok_or(ObservationError::BackendFailure)?;
             if !pair[1].is_string() || result.insert(key.into(), pair[1].clone()).is_some() {
                 return Err(ObservationError::BackendFailure);

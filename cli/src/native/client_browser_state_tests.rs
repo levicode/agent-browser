@@ -297,56 +297,61 @@ impl FramedFixture {
                             | "page.title" => name,
                             _ => "other-fixture-command",
                         };
-                        let health = match frame["scopeState"].as_str() {
-                            Some(value @ ("usable" | "quarantined" | "closed")) => value,
-                            _ => "missing-or-unknown",
-                        };
-                        let effects = match frame["effects"].as_str() {
-                            Some(value @ ("not-dispatched" | "completed" | "unknown")) => value,
-                            _ => "missing-or-unknown",
-                        };
-                        let code = match frame["error"]["code"].as_str() {
-                            Some(
-                                value @ ("invalid-frame"
-                                | "unsupported-protocol"
-                                | "unsupported-capability"
-                                | "stale-generation"
-                                | "scope-unavailable"
-                                | "sequence-reused"
-                                | "invalid-sequence"
-                                | "invalid-timeout"
-                                | "capacity-exceeded"
-                                | "operation-missing"
-                                | "decision-missing"
-                                | "decision-expired"
-                                | "decision-kind-mismatch"
-                                | "registry-missing"
-                                | "registry-in-use"
-                                | "identifier-exhausted"
-                                | "unsupported-command"
-                                | "deadline-exceeded"
-                                | "cancelled"
-                                | "invalid-arguments"
-                                | "browser-failure"
-                                | "stale-scope"
-                                | "cleanup-failed"
-                                | "stale-reference"
-                                | "policy-denied"
-                                | "not-actionable"
-                                | "locator-not-found"
-                                | "content-length-mismatch"
-                                | "redirect-body-unavailable"
-                                | "intercepted-pointer"
-                                | "checked-state-unchanged"
-                                | "checked-control-replaced"
-                                | "fill-unsupported-target"
-                                | "no-editable-focus"
-                                | "tap-target-replaced-before-press"
-                                | "frame-not-found"
-                                | "frame-ambiguous"),
-                            ) => value,
-                            _ => "missing-or-unknown",
-                        };
+                        let health = frame["scopeState"]
+                            .as_str()
+                            .filter(|value| matches!(*value, "usable" | "quarantined" | "closed"))
+                            .unwrap_or("missing-or-unknown");
+                        let effects = frame["effects"]
+                            .as_str()
+                            .filter(|value| {
+                                matches!(*value, "not-dispatched" | "completed" | "unknown")
+                            })
+                            .unwrap_or("missing-or-unknown");
+                        let code = frame["error"]["code"]
+                            .as_str()
+                            .filter(|value| {
+                                matches!(
+                                    *value,
+                                    "invalid-frame"
+                                        | "unsupported-protocol"
+                                        | "unsupported-capability"
+                                        | "stale-generation"
+                                        | "scope-unavailable"
+                                        | "sequence-reused"
+                                        | "invalid-sequence"
+                                        | "invalid-timeout"
+                                        | "capacity-exceeded"
+                                        | "operation-missing"
+                                        | "decision-missing"
+                                        | "decision-expired"
+                                        | "decision-kind-mismatch"
+                                        | "registry-missing"
+                                        | "registry-in-use"
+                                        | "identifier-exhausted"
+                                        | "unsupported-command"
+                                        | "deadline-exceeded"
+                                        | "cancelled"
+                                        | "invalid-arguments"
+                                        | "browser-failure"
+                                        | "stale-scope"
+                                        | "cleanup-failed"
+                                        | "stale-reference"
+                                        | "policy-denied"
+                                        | "not-actionable"
+                                        | "locator-not-found"
+                                        | "content-length-mismatch"
+                                        | "redirect-body-unavailable"
+                                        | "intercepted-pointer"
+                                        | "checked-state-unchanged"
+                                        | "checked-control-replaced"
+                                        | "fill-unsupported-target"
+                                        | "no-editable-focus"
+                                        | "tap-target-replaced-before-press"
+                                        | "frame-not-found"
+                                        | "frame-ambiguous"
+                                )
+                            })
+                            .unwrap_or("missing-or-unknown");
                         return Err(format!(
                             "fixture operation correlation or health failed: {}",
                             json!({

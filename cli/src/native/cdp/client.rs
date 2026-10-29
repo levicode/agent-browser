@@ -2958,7 +2958,7 @@ impl CdpClient {
         error: Option<&ProtocolError>,
         matches: Option<[bool; 4]>,
     ) {
-        let Ok(sequence) = self.transport.activation_diagnostic_sequence.fetch_update(
+        let Ok(sequence) = self.transport.activation_diagnostic_sequence.try_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
             |value| {

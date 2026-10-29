@@ -51,7 +51,7 @@ pub struct ProtectedReadJournal<'a> {
 }
 enum ReadBarrier {
     Global(ProtectedTargetBarrier),
-    Selected(super::client_enrollment::SelectedPageReadBarrier),
+    Selected(Box<super::client_enrollment::SelectedPageReadBarrier>),
 }
 fn query_wait_reason(
     error: super::client_protocol::ProtocolError,
@@ -113,11 +113,11 @@ impl<'a> ProtectedReadJournal<'a> {
             }
         }
         let barrier = match partition {
-            Some(partition) => ReadBarrier::Selected(
+            Some(partition) => ReadBarrier::Selected(Box::new(
                 partition
                     .begin_read(page, operation)
                     .map_err(|_| failure(ProtectedReadReason::IncompleteInventory))?,
-            ),
+            )),
             None => {
                 let barrier = page
                     .targets
@@ -206,16 +206,17 @@ impl<'a> ProtectedReadJournal<'a> {
             }
         }
         let barrier = match partition {
-            Some(partition) => {
-                ReadBarrier::Selected(partition.begin_read_async(page, operation).await.map_err(
-                    |error| {
+            Some(partition) => ReadBarrier::Selected(Box::new(
+                partition
+                    .begin_read_async(page, operation)
+                    .await
+                    .map_err(|error| {
                         failure(query_wait_reason(
                             error,
                             ProtectedReadReason::IncompleteInventory,
                         ))
-                    },
-                )?)
-            }
+                    })?,
+            )),
             None => {
                 let barrier = page
                     .targets

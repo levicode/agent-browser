@@ -454,7 +454,7 @@ mod tests {
             assert!(!released.pinned);
             assert_eq!(released.target_id, "TARGET1");
             assert_eq!(pinned_owner("TARGET1", "b"), None);
-            assert_eq!(load("a").unwrap().unwrap().pinned, false);
+            assert!(!load("a").unwrap().unwrap().pinned);
             assert_eq!(release_pin("a"), Ok(None));
             assert_eq!(release_pin("missing"), Ok(None));
         });

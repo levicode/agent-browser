@@ -6,11 +6,16 @@
 // here; retain warnings everywhere else rather than editing those modules.
 #![allow(unused_imports)]
 
+#[path = "../../src/native/client_capture_metadata.rs"]
+mod client_capture;
 #[path = "../../src/native/client_protocol.rs"]
 pub mod client_protocol;
+#[path = "../../src/native/client_operation_lease.rs"]
+mod client_session;
 #[path = "../../src/native/client_settlement_trace.rs"]
 mod client_settlement_trace;
 mod native {
+    pub(crate) use crate::client_capture;
     pub use crate::client_protocol;
     pub(crate) use crate::client_settlement_trace;
 }

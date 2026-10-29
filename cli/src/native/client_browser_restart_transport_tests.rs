@@ -156,19 +156,21 @@ async fn peer_with_input_replies(
     hold_point: bool,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
     peer_with_media_replies(
-        ack_before_attach,
-        old_input,
-        hold_old_input,
-        cleanup_ack,
-        title_seen,
-        input_replies,
-        hold_point,
+        PeerControl {
+            ack_before_attach,
+            old_input,
+            hold_old_input,
+            cleanup_ack,
+            title_seen,
+            input_replies,
+            hold_point,
+        },
         None,
     )
     .await
 }
 
-async fn peer_with_media_replies(
+struct PeerControl {
     ack_before_attach: bool,
     old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     hold_old_input: bool,
@@ -179,9 +181,13 @@ async fn peer_with_media_replies(
     title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     input_replies: Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
     hold_point: bool,
+}
+
+async fn peer_with_media_replies(
+    control: PeerControl,
     media_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
-    peer_with_media_and_startup_replies(
+    let PeerControl {
         ack_before_attach,
         old_input,
         hold_old_input,
@@ -189,28 +195,30 @@ async fn peer_with_media_replies(
         title_seen,
         input_replies,
         hold_point,
+    } = control;
+    peer_with_media_and_startup_replies(
+        PeerControl {
+            ack_before_attach,
+            old_input,
+            hold_old_input,
+            cleanup_ack,
+            title_seen,
+            input_replies,
+            hold_point,
+        },
         media_seen,
         None,
     )
     .await
 }
 async fn peer_with_startup_acquisition(
-    ack_before_attach: bool,
-    old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
-    hold_old_input: bool,
-    cleanup_ack: Option<(
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
-    )>,
-    title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
-    input_replies: Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
-    hold_point: bool,
+    control: PeerControl,
     startup_ack: Option<(
         tokio::sync::oneshot::Sender<Value>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
-    peer_with_media_and_startup_replies(
+    let PeerControl {
         ack_before_attach,
         old_input,
         hold_old_input,
@@ -218,28 +226,39 @@ async fn peer_with_startup_acquisition(
         title_seen,
         input_replies,
         hold_point,
+    } = control;
+    peer_with_media_and_startup_replies(
+        PeerControl {
+            ack_before_attach,
+            old_input,
+            hold_old_input,
+            cleanup_ack,
+            title_seen,
+            input_replies,
+            hold_point,
+        },
         None,
         startup_ack,
     )
     .await
 }
 async fn peer_with_media_and_startup_replies(
-    ack_before_attach: bool,
-    old_input: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
-    hold_old_input: bool,
-    mut cleanup_ack: Option<(
-        tokio::sync::oneshot::Sender<()>,
-        tokio::sync::oneshot::Receiver<()>,
-    )>,
-    title_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
-    mut input_replies: Option<tokio::sync::mpsc::UnboundedReceiver<Value>>,
-    hold_point: bool,
+    control: PeerControl,
     media_seen: Option<tokio::sync::mpsc::UnboundedSender<Value>>,
     mut startup_ack: Option<(
         tokio::sync::oneshot::Sender<Value>,
         tokio::sync::oneshot::Receiver<()>,
     )>,
 ) -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
+    let PeerControl {
+        ack_before_attach,
+        old_input,
+        hold_old_input,
+        mut cleanup_ack,
+        title_seen,
+        mut input_replies,
+        hold_point,
+    } = control;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let log = Arc::new(Mutex::new(Vec::new()));
@@ -893,13 +912,15 @@ async fn retired_startup_joins_late_target_before_next_attempt_identity() {
     let (reached, acquisition) = tokio::sync::oneshot::channel();
     let (release, released) = tokio::sync::oneshot::channel();
     let (old_endpoint, old_log, old_peer) = peer_with_startup_acquisition(
-        true,
-        None,
-        false,
-        None,
-        None,
-        None,
-        false,
+        PeerControl {
+            ack_before_attach: true,
+            old_input: None,
+            hold_old_input: false,
+            cleanup_ack: None,
+            title_seen: None,
+            input_replies: None,
+            hold_point: false,
+        },
         Some((reached, released)),
     )
     .await;

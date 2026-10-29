@@ -44,6 +44,12 @@ pub(crate) struct SelectedPageReadBarrier {
     proof: PageAcquisitionProof,
     guard: SelectedPageTargetBarrier,
 }
+struct PartitionContext<'a> {
+    page: &'a BrowserExecutionLease,
+    op: &'a OperationLease,
+    expected: Option<&'a PageAcquisitionProof>,
+    held: Option<&'a SelectedPageTargetBarrier>,
+}
 impl ClientEnrollment {
     pub(crate) fn page_query_authority(
         self: &Arc<Self>,
@@ -223,10 +229,7 @@ impl PageQueryAuthority {
     }
     fn with_partition<T>(
         &self,
-        page: &BrowserExecutionLease,
-        op: &OperationLease,
-        expected: Option<&PageAcquisitionProof>,
-        held: Option<&SelectedPageTargetBarrier>,
+        context: PartitionContext<'_>,
         acquire_barrier: bool,
         stage: Stage,
         publish: impl FnOnce(
@@ -235,15 +238,23 @@ impl PageQueryAuthority {
             &BoundedEventWatermark,
         ) -> Result<T, ProtocolError>,
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        let PartitionContext {
+            page,
+            op,
+            expected,
+            held,
+        } = context;
         let watermark = match expected {
             Some(proof) => proof.watermark.clone(),
             None => self.owner.realm_watermark()?,
         };
         match self.with_partition_attempt(
-            page,
-            op,
-            expected,
-            held,
+            PartitionContext {
+                page,
+                op,
+                expected,
+                held,
+            },
             acquire_barrier,
             stage,
             &watermark,
@@ -259,10 +270,7 @@ impl PageQueryAuthority {
     }
     async fn with_partition_async<T>(
         &self,
-        page: &BrowserExecutionLease,
-        op: &OperationLease,
-        expected: Option<&PageAcquisitionProof>,
-        held: Option<&SelectedPageTargetBarrier>,
+        context: PartitionContext<'_>,
         acquire_barrier: bool,
         stage: Stage,
         publish: impl FnOnce(
@@ -271,6 +279,12 @@ impl PageQueryAuthority {
             &BoundedEventWatermark,
         ) -> Result<T, ProtocolError>,
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        let PartitionContext {
+            page,
+            op,
+            expected,
+            held,
+        } = context;
         let watermark = match expected {
             Some(proof) => proof.watermark.clone(),
             None => self.owner.realm_watermark()?,
@@ -278,10 +292,12 @@ impl PageQueryAuthority {
         let mut publish = Some(publish);
         loop {
             match self.with_partition_attempt(
-                page,
-                op,
-                expected,
-                held,
+                PartitionContext {
+                    page,
+                    op,
+                    expected,
+                    held,
+                },
                 acquire_barrier,
                 stage,
                 &watermark,
@@ -365,10 +381,7 @@ impl PageQueryAuthority {
     }
     fn with_partition_attempt<T>(
         &self,
-        page: &BrowserExecutionLease,
-        op: &OperationLease,
-        expected: Option<&PageAcquisitionProof>,
-        held: Option<&SelectedPageTargetBarrier>,
+        context: PartitionContext<'_>,
         acquire_barrier: bool,
         stage: Stage,
         watermark: &BoundedEventWatermark,
@@ -380,6 +393,12 @@ impl PageQueryAuthority {
             ) -> Result<T, ProtocolError>,
         >,
     ) -> Result<QueryBoundary<(T, Option<SelectedPageTargetBarrier>)>, ProtocolError> {
+        let PartitionContext {
+            page,
+            op,
+            expected,
+            held,
+        } = context;
         self.with_partition_attempt_mode(
             page,
             op,
@@ -601,10 +620,12 @@ impl PageQueryAuthority {
         op: &OperationLease,
     ) -> Result<PageAcquisitionProof, ProtocolError> {
         self.with_partition(
-            page,
-            op,
-            None,
-            None,
+            PartitionContext {
+                page,
+                op,
+                expected: None,
+                held: None,
+            },
             false,
             Stage::Acquire,
             |entries, targets, watermark| {
@@ -625,10 +646,12 @@ impl PageQueryAuthority {
         op: &OperationLease,
     ) -> Result<PageAcquisitionProof, ProtocolError> {
         self.with_partition_async(
-            page,
-            op,
-            None,
-            None,
+            PartitionContext {
+                page,
+                op,
+                expected: None,
+                held: None,
+            },
             false,
             Stage::Acquire,
             |entries, targets, watermark| {
@@ -710,10 +733,12 @@ impl PageAcquisitionProof {
     ) -> Result<(), ProtocolError> {
         self.authority
             .with_partition(
-                page,
-                op,
-                Some(self),
-                None,
+                PartitionContext {
+                    page,
+                    op,
+                    expected: Some(self),
+                    held: None,
+                },
                 false,
                 self.recheck_stage,
                 |_, _, _| Ok(()),
@@ -727,10 +752,12 @@ impl PageAcquisitionProof {
     ) -> Result<(), ProtocolError> {
         self.authority
             .with_partition_async(
-                page,
-                op,
-                Some(self),
-                None,
+                PartitionContext {
+                    page,
+                    op,
+                    expected: Some(self),
+                    held: None,
+                },
                 false,
                 self.recheck_stage,
                 |_, _, _| Ok(()),
@@ -780,10 +807,12 @@ impl PageAcquisitionProof {
     ) -> Result<QueryBoundary<T>, ProtocolError> {
         self.authority
             .with_partition_attempt(
-                page,
-                op,
-                Some(self),
-                None,
+                PartitionContext {
+                    page,
+                    op,
+                    expected: Some(self),
+                    held: None,
+                },
                 false,
                 Stage::Publication,
                 &self.watermark,
@@ -828,10 +857,12 @@ impl PageAcquisitionProof {
     ) -> Result<T, ProtocolError> {
         self.authority
             .with_partition(
-                page,
-                op,
-                Some(self),
-                None,
+                PartitionContext {
+                    page,
+                    op,
+                    expected: Some(self),
+                    held: None,
+                },
                 false,
                 Stage::Publication,
                 |_, _, _| publish(),
@@ -844,10 +875,12 @@ impl PageAcquisitionProof {
         op: &OperationLease,
     ) -> Result<SelectedPageReadBarrier, ProtocolError> {
         let (_, guard) = self.authority.with_partition(
-            page,
-            op,
-            Some(self),
-            None,
+            PartitionContext {
+                page,
+                op,
+                expected: Some(self),
+                held: None,
+            },
             true,
             Stage::BarrierAcquire,
             |_, _, _| Ok(()),
@@ -865,10 +898,12 @@ impl PageAcquisitionProof {
         let (_, guard) = self
             .authority
             .with_partition_async(
-                page,
-                op,
-                Some(self),
-                None,
+                PartitionContext {
+                    page,
+                    op,
+                    expected: Some(self),
+                    held: None,
+                },
                 true,
                 Stage::BarrierAcquire,
                 |_, _, _| Ok(()),
@@ -903,10 +938,12 @@ impl SelectedPageReadBarrier {
         self.proof
             .authority
             .with_partition(
-                page,
-                op,
-                Some(&self.proof),
-                Some(&self.guard),
+                PartitionContext {
+                    page,
+                    op,
+                    expected: Some(&self.proof),
+                    held: Some(&self.guard),
+                },
                 false,
                 Stage::BarrierCheck,
                 |_, _, _| publish(),
@@ -922,10 +959,12 @@ impl SelectedPageReadBarrier {
         self.proof
             .authority
             .with_partition_async(
-                page,
-                op,
-                Some(&self.proof),
-                Some(&self.guard),
+                PartitionContext {
+                    page,
+                    op,
+                    expected: Some(&self.proof),
+                    held: Some(&self.guard),
+                },
                 false,
                 Stage::BarrierCheck,
                 |_, _, _| publish(),
@@ -2973,7 +3012,7 @@ mod query_prefix_preparation_tests {
             std::task::Poll::Pending
         ));
         assert_eq!(log.lock().unwrap().len(), before);
-        drop(preparation);
+        // The pinned future remains owned by this scope; its Pin reference needs no drop.
         drop(held);
         let _ = owner.close().await;
         connection.close().await;

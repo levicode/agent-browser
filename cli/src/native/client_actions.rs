@@ -1251,15 +1251,15 @@ impl ClientActions {
         // Recheck after mandatory input cleanup and immediately before result
         // classification. A cancellation/retirement during cleanup cannot turn
         // an earlier recording receipt into reusable public scope authority.
-        if result == Err(ProtocolError::BrowserFailure) && !d.cleanup.load(Ordering::SeqCst) {
-            if d.recording_start_refusal
+        if result == Err(ProtocolError::BrowserFailure)
+            && !d.cleanup.load(Ordering::SeqCst)
+            && d.recording_start_refusal
                 .lock()
                 .ok()
                 .and_then(|mut proof| proof.take())
                 .is_some_and(|proof| proof.check(&ctx))
-            {
-                d.acknowledged_postcondition.store(true, Ordering::SeqCst);
-            }
+        {
+            d.acknowledged_postcondition.store(true, Ordering::SeqCst);
         }
         // New no-input reasons are usable only while the exact operation is
         // still current after cleanup; a late refusal cannot authorize fallback.
@@ -3508,7 +3508,11 @@ struct RecordingStartAuthority {
 }
 impl RecordingStartAuthority {
     fn capture(ctx: &ActionContext<'_>) -> Option<Self> {
-        let ActionRealmAuthority::Enrolled(owner) = ctx.realm_authority else {
+        #[cfg(not(test))]
+        let ActionRealmAuthority::Enrolled(owner) = ctx.realm_authority;
+        #[cfg(test)]
+        let ActionRealmAuthority::Enrolled(owner) = ctx.realm_authority
+        else {
             return None;
         };
         let journal = OperationJournalHandle::current()?;
@@ -3532,7 +3536,11 @@ impl RecordingStartAuthority {
         })
     }
     fn check(&self, ctx: &ActionContext<'_>) -> bool {
-        let ActionRealmAuthority::Enrolled(owner) = ctx.realm_authority else {
+        #[cfg(not(test))]
+        let ActionRealmAuthority::Enrolled(owner) = ctx.realm_authority;
+        #[cfg(test)]
+        let ActionRealmAuthority::Enrolled(owner) = ctx.realm_authority
+        else {
             return false;
         };
         let Some(current) = OperationJournalHandle::current() else {

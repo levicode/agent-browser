@@ -222,6 +222,11 @@ pub(crate) enum SelectedPageTargetCheck<T> {
     RevisionOnlyBeforePublication,
 }
 
+pub(crate) struct SelectedPagePartitionContext<'a> {
+    expected: Option<&'a SelectedPageTargetSnapshot>,
+    held: Option<&'a SelectedPageTargetBarrier>,
+    acquire_barrier: bool,
+}
 impl ClientTargets {
     /// Caller holds enrollment index and reader watermark, in that order.
     /// Classification is authoritative ancestry, never a diagnostic/opener hint.
@@ -236,9 +241,11 @@ impl ClientTargets {
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
         self.with_selected_page_targets_diagnostic(
             selected,
-            expected,
-            held,
-            acquire_barrier,
+            SelectedPagePartitionContext {
+                expected,
+                held,
+                acquire_barrier,
+            },
             None,
             classify,
             publish,
@@ -247,13 +254,16 @@ impl ClientTargets {
     pub(crate) fn with_selected_page_targets_diagnostic<T>(
         self: &Arc<Self>,
         selected: &OwnedTarget,
-        expected: Option<&SelectedPageTargetSnapshot>,
-        held: Option<&SelectedPageTargetBarrier>,
-        acquire_barrier: bool,
+        partition: SelectedPagePartitionContext<'_>,
         diagnostic_context: Option<(u64, u64, diagnostic::QueryScopeStage)>,
         classify: impl Fn(&OwnedTarget, &HashMap<String, OwnedTarget>) -> Result<bool, ProtocolError>,
         publish: impl FnOnce(&SelectedPageTargetSnapshot) -> Result<T, ProtocolError>,
     ) -> Result<(T, Option<SelectedPageTargetBarrier>), ProtocolError> {
+        let SelectedPagePartitionContext {
+            expected,
+            held,
+            acquire_barrier,
+        } = partition;
         match self.with_selected_page_targets_checked(
             selected,
             expected,
@@ -678,8 +688,10 @@ mod tests {
                 "opaque".into(),
                 "opaque-session".into(),
                 "other".into(),
-                None,
-                true,
+                crate::native::client_targets::AttachmentAncestry {
+                    root: None,
+                    verified_self_root: true,
+                },
             )
             .unwrap();
         assert!(snapshot(&registry, &main, true).is_err());
@@ -837,8 +849,10 @@ mod tests {
                     "aux".into(),
                     "aux-session".into(),
                     kind.into(),
-                    None,
-                    true,
+                    crate::native::client_targets::AttachmentAncestry {
+                        root: None,
+                        verified_self_root: true,
+                    },
                 )
                 .unwrap();
             assert!(snapshot(&registry, &main, true).is_err());

@@ -1110,6 +1110,12 @@ impl LedgerState {
             && self.recording_targets.is_empty()
     }
 }
+struct CommandAdmissionContext<'a> {
+    journal: Option<&'a OperationJournalHandle>,
+    method: &'a str,
+    params: Option<&'a Value>,
+    session: Option<&'a str>,
+}
 pub(crate) struct OwnerDebtLedger {
     generation: u64,
     identity_scope: String,
@@ -2444,7 +2450,17 @@ impl OwnerDebtLedger {
         session: Option<&str>,
         stop: &mut AdmissionObservation,
     ) -> Result<CommandReservation, ProtocolError> {
-        self.reserve_command_inner(journal, method, params, session, None, None, stop)
+        self.reserve_command_inner(
+            CommandAdmissionContext {
+                journal,
+                method,
+                params,
+                session,
+            },
+            None,
+            None,
+            stop,
+        )
     }
     /// Consume the page transaction's private all-clean + sealed proof. This is
     /// NOT a sweep and NOT a successful application ACK: retain its known error
@@ -2500,10 +2516,12 @@ impl OwnerDebtLedger {
     ) -> Result<CommandReservation, ProtocolError> {
         let (method, params) = command.envelope();
         self.reserve_command_inner(
-            None,
-            method,
-            params.as_ref(),
-            None,
+            CommandAdmissionContext {
+                journal: None,
+                method,
+                params: params.as_ref(),
+                session: None,
+            },
             Some(command),
             None,
             &mut AdmissionObservation::default(),
@@ -2517,10 +2535,12 @@ impl OwnerDebtLedger {
         deadline: Instant,
     ) -> Result<CommandReservation, ProtocolError> {
         self.reserve_command_inner(
-            None,
-            method,
-            Some(params),
-            session,
+            CommandAdmissionContext {
+                journal: None,
+                method,
+                params: Some(params),
+                session,
+            },
             None,
             Some(deadline),
             &mut AdmissionObservation::default(),
@@ -2528,14 +2548,17 @@ impl OwnerDebtLedger {
     }
     fn reserve_command_inner(
         self: &Arc<Self>,
-        journal: Option<&OperationJournalHandle>,
-        method: &str,
-        params: Option<&Value>,
-        session: Option<&str>,
+        context: CommandAdmissionContext<'_>,
         owner_cleanup: Option<OwnerCleanupCommand>,
         teardown_deadline: Option<Instant>,
         stop: &mut AdmissionObservation,
     ) -> Result<CommandReservation, ProtocolError> {
+        let CommandAdmissionContext {
+            journal,
+            method,
+            params,
+            session,
+        } = context;
         if method.len() > 256 || session.is_some_and(|session| session.len() > 4096) {
             return Err(ProtocolError::CapacityExceeded);
         }

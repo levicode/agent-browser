@@ -1025,6 +1025,12 @@ fn hidden_proof_error(error: ObservationError) -> GeometryError {
         | ObservationError::ResourceLimit => GeometryError::IncompleteInventory,
     }
 }
+pub(crate) struct SemanticCaptureContext<'a> {
+    pub(crate) proof: &'a SemanticFrameProof,
+    pub(crate) policy: &'a ObservationFramePolicy,
+    pub(crate) identity_scope: &'a str,
+    pub(crate) revision: u64,
+}
 impl GeometrySnapshot {
     pub async fn capture(
         client: &CdpClient,
@@ -1041,12 +1047,15 @@ impl GeometrySnapshot {
         client: &CdpClient,
         page_session: &str,
         frames: &[ObservationFrame],
-        proof: &SemanticFrameProof,
-        policy: &ObservationFramePolicy,
-        identity_scope: &str,
-        revision: u64,
+        context: SemanticCaptureContext<'_>,
         operation: &OperationLease,
     ) -> Result<Self, GeometryError> {
+        let SemanticCaptureContext {
+            proof,
+            policy,
+            identity_scope,
+            revision,
+        } = context;
         proof
             .validate_context(frames, policy, identity_scope, revision, operation)
             .map_err(hidden_proof_error)?;
@@ -2463,10 +2472,12 @@ mod tests {
                 &client,
                 "page",
                 &full,
-                &semantic_proof,
-                &ObservationFramePolicy::default(),
-                "fixture",
-                1,
+                SemanticCaptureContext {
+                    proof: &semantic_proof,
+                    policy: &ObservationFramePolicy::default(),
+                    identity_scope: "fixture",
+                    revision: 1,
+                },
                 &operation,
             )
             .await

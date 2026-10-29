@@ -17,35 +17,9 @@ const MAX_OPERATIONS: usize = 64;
 const MAX_DECISIONS: usize = 256;
 const MAX_REGISTRIES: usize = 256;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CancelSignal {
-    None,
-    Requested,
-    DeadlineExceeded,
-    SessionClosed,
-    /// Private enrollment producer stop; no public/wire representation.
-    OwnerRetirement,
-}
-
-impl CancelSignal {
-    pub(crate) fn error(self) -> Option<ProtocolError> {
-        match self {
-            Self::None => None,
-            Self::Requested | Self::SessionClosed | Self::OwnerRetirement => {
-                Some(ProtocolError::Cancelled)
-            }
-            Self::DeadlineExceeded => Some(ProtocolError::DeadlineExceeded),
-        }
-    }
-}
-
-pub struct OperationLease {
-    pub is_callback: bool,
-    pub generation: u64,
-    pub sequence: u64,
-    pub deadline: Instant,
-    pub cancellation: watch::Receiver<CancelSignal>,
-}
+#[path = "client_operation_lease.rs"]
+mod operation_lease;
+pub use operation_lease::{CancelSignal, OperationLease};
 
 /// A stop observed at the exact operation-channel guard/select that returned it.
 /// This carries no owner/registry authority; only enrollment may classify its

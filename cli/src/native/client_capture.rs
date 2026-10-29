@@ -8,9 +8,11 @@ use super::client_protected_read::{ProtectedReadJournal, ProtectedReadReason};
 use super::client_session::{CancelSignal, OperationLease};
 use base64::Engine;
 use futures_util::StreamExt;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+#[cfg(test)]
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::Cursor;
 
 const MAX_PIXELS: u64 = 16_777_216;
@@ -19,37 +21,11 @@ const MAX_PIXELS: u64 = 16_777_216;
 pub(super) const MAX_PNG_BYTES: usize = 32 * 1024 * 1024;
 const MAX_DOM_NODES: usize = 100_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum CaptureReason {
-    Cancelled,
-    Superseded,
-    Deadline,
-    StaleScope,
-    IncompleteFrames,
-    UnsafeGeometry,
-    UninspectableContent,
-    MaskingUnproven,
-    BrowserFailure,
-    BoundsExceeded,
-    CleanupFailed,
-}
-/// Internal provenance, not a public error category. In particular, a failed
-/// initial coverage probe is not a failed source-mask or post-capture proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum CapturePhase {
-    Admission,
-    IndependentCoverage,
-    SourceProtection,
-    RawCapture,
-    PostCaptureValidation,
-}
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct CaptureAttemptFailure {
-    pub phase: CapturePhase,
-    pub reason: CaptureReason,
-}
+#[path = "client_capture_metadata.rs"]
+mod metadata;
+pub use metadata::CaptureReason;
+pub(crate) use metadata::{CaptureAttemptFailure, CapturePhase};
+
 impl CapturePhase {
     fn failure(self, reason: CaptureReason, operation: &OperationLease) -> CaptureAttemptFailure {
         let failure = CaptureAttemptFailure {

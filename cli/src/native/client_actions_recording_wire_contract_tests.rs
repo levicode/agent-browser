@@ -493,17 +493,19 @@ async fn recording_page_opened_remeasures_second_viewport_and_stops_each_capture
             {
                 return Err("capture was replayed or stopped twice".into());
             }
-            let requests = f.requests.lock().unwrap();
-            let start = requests
-                .iter()
-                .find(|request| {
-                    request["method"] == "Page.startScreencast" && request["sessionId"] == session
-                })
-                .ok_or("missing capture start")?;
-            if start["params"]["maxWidth"] != size.0 || start["params"]["maxHeight"] != size.1 {
-                return Err("pageOpened retained old viewport size".into());
+            {
+                let requests = f.requests.lock().unwrap();
+                let start = requests
+                    .iter()
+                    .find(|request| {
+                        request["method"] == "Page.startScreencast"
+                            && request["sessionId"] == session
+                    })
+                    .ok_or("missing capture start")?;
+                if start["params"]["maxWidth"] != size.0 || start["params"]["maxHeight"] != size.1 {
+                    return Err("pageOpened retained old viewport size".into());
+                }
             }
-            drop(requests);
             decoded_segment(&f, &segments[index], size).await?;
         }
         let request_count = f.requests.lock().unwrap().len();

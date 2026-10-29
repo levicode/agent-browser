@@ -1027,6 +1027,13 @@ pub struct ClientEnrollment {
     #[cfg(test)]
     retire_after_initialization_gate_error: AtomicBool,
 }
+struct EnrollmentAttachmentContext<'a> {
+    context: &'a str,
+    target: &'a str,
+    session: &'a str,
+    kind: &'a str,
+    parent: Option<&'a str>,
+}
 impl ClientEnrollment {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -3675,19 +3682,33 @@ impl ClientEnrollment {
         kind: &str,
         parent: Option<&str>,
     ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
-        self.register_with_custody(context, target, session, kind, parent, None, false, false)
+        self.register_with_custody(
+            EnrollmentAttachmentContext {
+                context,
+                target,
+                session,
+                kind,
+                parent,
+            },
+            None,
+            false,
+            false,
+        )
     }
     fn register_with_custody(
         &self,
-        context: &str,
-        target: &str,
-        session: &str,
-        kind: &str,
-        parent: Option<&str>,
+        attachment: EnrollmentAttachmentContext<'_>,
         custody: Option<&mut super::client_targets::RetainedInitialization>,
         opaque_parentless: bool,
         paused_by_attachment: bool,
     ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
+        let EnrollmentAttachmentContext {
+            context,
+            target,
+            session,
+            kind,
+            parent,
+        } = attachment;
         if context != self.targets.context_id {
             return Ok(None);
         }
@@ -3799,8 +3820,10 @@ impl ClientEnrollment {
                 target.into(),
                 session.into(),
                 kind.into(),
-                root_ticket,
-                verified_self_root,
+                crate::native::client_targets::AttachmentAncestry {
+                    root: root_ticket,
+                    verified_self_root,
+                },
             )?;
         } else {
             self.targets.attached_enrolled_with_ancestry(
@@ -6464,11 +6487,13 @@ impl ClientEnrollment {
             WorkerAdmissionStep::Register,
             || {
                 self.register_with_custody(
-                    context,
-                    target,
-                    &session,
-                    kind,
-                    event.session_id.as_deref(),
+                    EnrollmentAttachmentContext {
+                        context,
+                        target,
+                        session: &session,
+                        kind,
+                        parent: event.session_id.as_deref(),
+                    },
                     custody,
                     info.get("parentId").is_none() && info.get("parentFrameId").is_none(),
                     event
@@ -17345,15 +17370,16 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let received = watermark.received().ok();
-                    let index = owner.index.lock().unwrap();
-                    if index.failure.is_some()
-                        || received.is_some_and(|received| {
-                            received > before && index.applied_watermark >= received
-                        })
                     {
-                        break;
+                        let index = owner.index.lock().unwrap();
+                        if index.failure.is_some()
+                            || received.is_some_and(|received| {
+                                received > before && index.applied_watermark >= received
+                            })
+                        {
+                            break;
+                        }
                     }
-                    drop(index);
                     tokio::task::yield_now().await;
                 }
             })
@@ -17698,13 +17724,12 @@ mod tests {
             }
             emit.send(event).await.unwrap();
             queued.wait_entered().await;
-            assert!(owner
+            assert!(!owner
                 .index
                 .lock()
                 .unwrap()
                 .pending_enrollment
-                .get("child")
-                .is_none());
+                .contains_key("child"));
             let before = owner.realm_watermark().unwrap().received().unwrap();
             emit.send(json!({"method":"Target.detachedFromTarget","sessionId":"initial","params":{"sessionId":"child","targetId":"iframe-target"}})).await.unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -18420,11 +18445,13 @@ mod tests {
             // The same attached receipt cannot begin a second initialization.
             assert!(owner
                 .register_with_custody(
-                    "owned-context",
-                    "popup",
-                    "popup-session",
-                    "page",
-                    None,
+                    EnrollmentAttachmentContext {
+                        context: "owned-context",
+                        target: "popup",
+                        session: "popup-session",
+                        kind: "page",
+                        parent: None
+                    },
                     None,
                     true,
                     true,

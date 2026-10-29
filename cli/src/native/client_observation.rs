@@ -3726,9 +3726,8 @@ async fn evaluate_query_diagnostic_inner(
     )?;
     let ids = match &candidate_plan {
         Some(plan) => plan.ids.clone(),
-        None => author_query_ids(&dom["root"]).map_err(|error| {
+        None => author_query_ids(&dom["root"]).inspect_err(|_| {
             witness.stage(Stage::CandidatePlanFallback);
-            error
         })?,
     };
     let mut nodes = Vec::new();
@@ -5893,9 +5892,11 @@ mod tests {
                     node.name.is_none(),
                     "{role}/{bounded}: ARIA selection stays anonymous"
                 );
-                assert!(query_match_metadata(&[node.clone()]).unwrap()[0]
-                    .get("name")
-                    .is_none());
+                assert!(
+                    query_match_metadata(std::slice::from_ref(&node)).unwrap()[0]
+                        .get("name")
+                        .is_none()
+                );
                 let fields = project_read_fields(node.clone(), Some(&[ReadField::Name])).unwrap();
                 assert_eq!(fields["name"], "Public content");
                 let reference = node.reference.clone();
@@ -5924,7 +5925,7 @@ mod tests {
                     project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false)
                         .unwrap();
                 assert_eq!(
-                    query_match_metadata(&[node.clone()]).unwrap()[0]["name"],
+                    query_match_metadata(std::slice::from_ref(&node)).unwrap()[0]["name"],
                     "Save"
                 );
                 assert_eq!(
@@ -5939,11 +5940,11 @@ mod tests {
             let after =
                 project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false).unwrap();
             assert_eq!(
-                query_match_metadata(&[before.clone()]).unwrap(),
-                query_match_metadata(&[after.clone()]).unwrap()
+                query_match_metadata(std::slice::from_ref(&before)).unwrap(),
+                query_match_metadata(std::slice::from_ref(&after)).unwrap()
             );
             assert_ne!(
-                role_candidates::matching_facts(&[before.clone()]),
+                role_candidates::matching_facts(std::slice::from_ref(&before)),
                 role_candidates::matching_facts(&[after])
             );
             let mut unavailable = before.clone();
@@ -5995,7 +5996,7 @@ mod tests {
             project_node(&frame(), 42, &native, &mut observed_refs(), 1, &data, false).unwrap();
         assert_eq!(node.public_content_name, Some(None));
         assert_eq!(
-            query_match_metadata(&[node.clone()]).unwrap()[0]["name"],
+            query_match_metadata(std::slice::from_ref(&node)).unwrap()[0]["name"],
             "Save"
         );
         assert!(project_read_fields(node, Some(&[ReadField::Name]))

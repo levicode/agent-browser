@@ -18,8 +18,7 @@ pub(super) async fn rendezvous(
         .saturating_duration_since(std::time::Instant::now());
     let timeout = u64::try_from(left.as_millis())
         .unwrap_or(super::super::client_protocol::MAX_TIMEOUT_MS)
-        .min(super::super::client_protocol::MAX_TIMEOUT_MS)
-        .max(1);
+        .clamp(1, super::super::client_protocol::MAX_TIMEOUT_MS);
     let mut lease = broker.decision(
         operation.generation,
         DecisionOwner::Operation(operation.sequence),
