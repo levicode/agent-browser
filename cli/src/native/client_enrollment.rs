@@ -255,7 +255,7 @@ struct Attribution {
     init_paused_by_attachment: bool,
     resumed: bool,
 }
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct FrameOwner {
     loader: Option<String>,
     name: Option<String>,
@@ -287,6 +287,8 @@ struct Index {
     application_epoch: u64,
     applied_watermark: u64,
     pending_enrollment: HashMap<String, Option<QueuedIframe>>,
+    // Same bounded existing tasks; receipts survive removal in a captured cohort.
+    pending_eval_initialization: HashMap<String, super::client_targets::PopupInitializationReceipt>,
     // Bounded by the same pending-enrollment MAX_TASKS admission. Never a
     // target ownership grant; retains metadata invalidation before registration.
     pending_query_attribution: HashMap<String, PendingQueryAttribution>,
@@ -298,6 +300,30 @@ struct Index {
     retired_observer_targets: HashSet<String>,
 }
 
+/// Durable entry evidence, retained across the existing UI admission wait.
+/// It is not an eval grant and owns no initializer or background task.
+pub(crate) struct EvalIngressPreparation {
+    config_gate: Arc<tokio::sync::Mutex<()>>,
+    ledger: Arc<super::client_debt::OwnerDebtLedger>,
+    watermark: BoundedEventWatermark,
+    received: u64,
+    epoch: u64,
+    config_revision: u64,
+    generation: u64,
+    operation: u64,
+    deadline: Instant,
+    cancellation: watch::Receiver<CancelSignal>,
+    root: OwnedTarget,
+    root_entry: Attribution,
+    root_frame: (String, FrameOwner),
+    fence: super::client_debt::EvalPreparationFence,
+    cohort: Vec<EvalPopupPreparationMember>,
+}
+struct EvalPopupPreparationMember {
+    target: String,
+    session: String,
+    receipt: super::client_targets::PopupInitializationReceipt,
+}
 const MAX_REALM_HOLDS: usize = 64;
 #[derive(Debug)]
 struct RealmFact {
@@ -807,6 +833,9 @@ enum CaptureTestPoint {
     EvalAdmissionReceipt,
     EvalPreparationWaiting,
     AfterPopupResumeAckBeforeComplete,
+    AfterPopupCustodyFinishBeforeReceipt,
+    BeforeEvalPreparationRecheck,
+    EvalPreparedUiPending,
     BeforeAttachedProcessing,
     BeforeWorkerReadyCommit,
     BeforeWorkerRetirementWait,
@@ -1911,6 +1940,248 @@ impl ClientEnrollment {
             receipts.push((op.generation, op.sequence, facts));
         }
     }
+    fn eval_root_frame(
+        index: &Index,
+        session: &str,
+    ) -> Result<(String, FrameOwner), ProtocolError> {
+        let mut frames = index
+            .frames
+            .iter()
+            .filter(|(_, frame)| frame.session == session && frame.parent.is_none());
+        let (id, frame) = frames.next().ok_or(ProtocolError::InvalidFrame)?;
+        if frames.next().is_some() || frame.loader.is_none() {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        Ok((id.clone(), frame.clone()))
+    }
+    fn freeze_eval_preparation(
+        &self,
+        index: &Index,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+        watermark: &BoundedEventWatermark,
+        entry_snapshot: (u64, super::client_debt::EvalPreparationSnapshot),
+    ) -> Result<EvalIngressPreparation, ProtocolError> {
+        let (received, snapshot) = entry_snapshot;
+        // Narrow first version: no received-but-unregistered owner can become
+        // a discovered member after entry. Unknown provenance refuses.
+        if index.pending_enrollment.is_empty()
+            || index.applied_watermark < received
+            || index.pending_enrollment.len() > MAX_TASKS
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let root_entry = index
+            .sessions
+            .get(&page.page_session_id)
+            .ok_or(ProtocolError::StaleScope)?;
+        if root_entry.target != page.target_id
+            || root_entry.kind != "page"
+            || !root_entry.application
+            || root_entry.observation_only
+            || !root_entry.resumed
+            || root_entry.root != root_entry.session
+            || *self
+                .active_root
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                != root_entry.session
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let root = self.targets.owned_target(&page.target_id)?;
+        if root.session_id != page.page_session_id || !root.capture_ready() {
+            return Err(ProtocolError::StaleScope);
+        }
+        let root_frame = Self::eval_root_frame(index, &root_entry.session)?;
+        let mut cohort = Vec::with_capacity(index.pending_enrollment.len());
+        for session in index.pending_enrollment.keys() {
+            let entry = index
+                .sessions
+                .get(session)
+                .ok_or(ProtocolError::ScopeUnavailable)?;
+            if !entry.application
+                || entry.observation_only
+                || !entry.init_paused_by_attachment
+                || entry.kind != "page"
+                || entry.root != entry.session
+                || session == &root_entry.session
+            {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            Self::eval_root_frame(index, session)?;
+            let receipt = index
+                .pending_eval_initialization
+                .get(session)
+                .ok_or(ProtocolError::ScopeUnavailable)?;
+            receipt.capture_for_eval(
+                &self.targets,
+                ledger,
+                watermark,
+                received,
+                &entry.target,
+                session,
+            )?;
+            cohort.push(EvalPopupPreparationMember {
+                target: entry.target.clone(),
+                session: session.clone(),
+                receipt: receipt.clone(),
+            });
+        }
+        Ok(EvalIngressPreparation {
+            config_gate: self.config_gate.clone(),
+            ledger: ledger.clone(),
+            watermark: watermark.clone(),
+            received,
+            epoch: index.application_epoch,
+            config_revision: self.page.config_revision()?,
+            generation: op.generation,
+            operation: op.sequence,
+            deadline: op.deadline,
+            cancellation: op.cancellation.clone(),
+            root,
+            root_entry: root_entry.clone(),
+            root_frame,
+            fence: snapshot.freeze(received)?,
+            cohort,
+        })
+    }
+    fn check_eval_preparation_locked(
+        &self,
+        index: &Index,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        preparation: &EvalIngressPreparation,
+    ) -> Result<bool, ProtocolError> {
+        if let Some(error) = &index.failure {
+            return Err(error.clone());
+        }
+        // The caller already holds index: never call check_restart_operation,
+        // which would re-lock it. Preserve its live generation/budget checks.
+        if op.generation != self.generation {
+            return Err(ProtocolError::StaleGeneration);
+        }
+        if *op.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if Instant::now() >= op.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(ProtocolError::StaleScope);
+        }
+        page.permit.check()?;
+        if !Arc::ptr_eq(&preparation.config_gate, &self.config_gate)
+            || !Arc::ptr_eq(&page.client, &self.client)
+            || !Arc::ptr_eq(&page.targets, &self.targets)
+            || self
+                .client
+                .debt_ledger()
+                .is_none_or(|ledger| !Arc::ptr_eq(&ledger, &preparation.ledger))
+            || op.is_callback
+            || preparation.generation != op.generation
+            || preparation.operation != op.sequence
+            || preparation.deadline != op.deadline
+            || !preparation.cancellation.same_channel(&op.cancellation)
+            || page.identity_scope != self.targets.identity_scope
+            || page.target_id != preparation.root.target_id
+            || page.page_session_id != preparation.root.session_id
+            || !index.reconciled
+            || index.application_epoch != preparation.epoch
+            || self.page.config_revision()? != preparation.config_revision
+            || !preparation
+                .watermark
+                .same_subscription(&self.realm_watermark()?)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.targets.require_eval_owner(&preparation.ledger)?;
+        preparation.ledger.check_eval_preparation(
+            &page.page_session_id,
+            &page.target_id,
+            &preparation.fence,
+        )?;
+        preparation
+            .watermark
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if index.sessions.get(&page.page_session_id) != Some(&preparation.root_entry)
+            || *self
+                .active_root
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                != preparation.root_entry.session
+            || Self::eval_root_frame(index, &page.page_session_id)? != preparation.root_frame
+            || !preparation
+                .root
+                .same_attachment(&self.targets.owned_target(&page.target_id)?)
+            || index.pending_enrollment.keys().any(|session| {
+                !preparation
+                    .cohort
+                    .iter()
+                    .any(|member| &member.session == session)
+            })
+            || index.pending_eval_initialization.keys().any(|session| {
+                !preparation
+                    .cohort
+                    .iter()
+                    .any(|member| &member.session == session)
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut complete = true;
+        for member in &preparation.cohort {
+            member.receipt.capture_for_eval(
+                &self.targets,
+                &preparation.ledger,
+                &preparation.watermark,
+                preparation.received,
+                &member.target,
+                &member.session,
+            )?;
+            let positive = member.receipt.completed(&self.targets)?;
+            if index.pending_enrollment.contains_key(&member.session) {
+                if index
+                    .pending_eval_initialization
+                    .get(&member.session)
+                    .is_none_or(|receipt| !receipt.same_receipt(&member.receipt))
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                complete = false;
+            } else if !positive {
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            complete &= positive;
+        }
+        Ok(complete && index.applied_watermark >= preparation.received)
+    }
+    /// Existing capture remains mandatory. The last ledger-locked step binds
+    /// the original preparation fence to that same stamp/window, not a new one.
+    pub(crate) fn capture_prepared_eval_authority(
+        &self,
+        page: &BrowserExecutionLease,
+        op: &OperationLease,
+        preparation: Option<&EvalIngressPreparation>,
+    ) -> Result<super::client_debt::EvalAuthorityStamp, ProtocolError> {
+        let Some(preparation) = preparation else {
+            return self.capture_eval_authority(page, op);
+        };
+        let mut stamp = self.capture_eval_authority(page, op)?;
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if !self.check_eval_preparation_locked(&index, page, op, preparation)? {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        preparation
+            .ledger
+            .bind_eval_preparation(&mut stamp, &preparation.fence)?;
+        Ok(stamp)
+    }
     /// Drain only the events already received at this command's entry. This
     /// yields before the caller owns a UI/configuration/input guard and grants
     /// no evaluation authority: capture_eval_authority still runs at dispatch.
@@ -1918,7 +2189,7 @@ impl ClientEnrollment {
         &self,
         page: &BrowserExecutionLease,
         op: &OperationLease,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<Option<EvalIngressPreparation>, ProtocolError> {
         #[cfg(test)]
         if let Some(entered) = self
             .capture_test_gates
@@ -1956,7 +2227,7 @@ impl ClientEnrollment {
                 .unwrap()
                 .contains_key(&CaptureTestPoint::EvalAdmissionReceipt);
         let mut refusal_diagnostic = None;
-        let (received, epoch, revision, entry_diagnostic) = {
+        let (received, epoch, revision, preparation, entry_diagnostic) = {
             let index = self
                 .index
                 .lock()
@@ -1967,9 +2238,20 @@ impl ClientEnrollment {
             if !index.reconciled {
                 return Err(ProtocolError::StaleScope);
             }
-            // Preserve index -> ledger ordering and observe the ledger before
-            // reading the watermark, just like the final authority capture.
-            let revision = ledger.observe_eval_revision(&page.page_session_id, &page.target_id)?;
+            // Preserve ledger observation before the fixed received frontier.
+            let (revision, snapshot) = if index.pending_enrollment.is_empty() {
+                (
+                    ledger.observe_eval_revision(&page.page_session_id, &page.target_id)?,
+                    None,
+                )
+            } else {
+                let (revision, snapshot) = ledger.observe_eval_preparation(
+                    &page.page_session_id,
+                    &page.target_id,
+                    &watermark,
+                )?;
+                (revision, Some(snapshot))
+            };
             let received = watermark
                 .received()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
@@ -1983,7 +2265,25 @@ impl ClientEnrollment {
                     Some(revision),
                 )
             });
-            (received, index.application_epoch, revision, diagnostic)
+            let preparation = snapshot
+                .map(|snapshot| {
+                    self.freeze_eval_preparation(
+                        &index,
+                        page,
+                        op,
+                        &ledger,
+                        &watermark,
+                        (received, snapshot),
+                    )
+                })
+                .transpose()?;
+            (
+                received,
+                index.application_epoch,
+                revision,
+                preparation,
+                diagnostic,
+            )
         };
         if let Some(facts) = entry_diagnostic {
             #[cfg(test)]
@@ -2010,59 +2310,68 @@ impl ClientEnrollment {
                         if let Some(error) = &index.failure {
                             return Err(error.clone());
                         }
-                        if !index.reconciled
-                            || index.application_epoch != epoch
-                            || ledger
-                                .observe_eval_revision(&page.page_session_id, &page.target_id)?
-                                != revision
-                        {
-                            refusal_diagnostic =
-                                diagnostics.then(|| {
+                        if let Some(preparation) = &preparation {
+                            if self.check_eval_preparation_locked(&index, page, op, preparation)? {
+                                return Ok(());
+                            }
+                            #[cfg(test)]
+                            if let Some(member) = preparation.cohort.iter().find(|member| {
+                                index.pending_enrollment.contains_key(&member.session)
+                            }) {
+                                // The fixed cohort and all guards are already captured;
+                                // changed was armed before inspection. No wait is created by this hook.
+                                self.observe_eval_preparation_wait_for_test(
+                                    op,
+                                    &member.target,
+                                    &member.session,
+                                );
+                            }
+                        } else {
+                            if !index.reconciled
+                                || index.application_epoch != epoch
+                                || ledger
+                                    .observe_eval_revision(&page.page_session_id, &page.target_id)?
+                                    != revision
+                            {
+                                refusal_diagnostic = diagnostics.then(|| {
                                     self.eval_diagnostic_snapshot(&index, page,
-                            super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
-                            super::client_settlement_trace::EvalAdmissionReason::EntryFence,
-                            Some(received), None)
+                                super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
+                                super::client_settlement_trace::EvalAdmissionReason::EntryFence,
+                                Some(received), None)
                                 });
-                            return Err(ProtocolError::StaleScope);
+                                return Err(ProtocolError::StaleScope);
+                            }
+                            watermark
+                                .received()
+                                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                            if index.applied_watermark >= received {
+                                return Ok(());
+                            }
                         }
-                        // Detect a lost/overflowed subscription, but never replace
-                        // the fixed received target with this later high-water mark.
-                        watermark
-                            .received()
-                            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                        if index.applied_watermark >= received {
-                            return Ok(());
-                        }
+                    }
+                    #[cfg(test)]
+                    if preparation.is_some() {
+                        self.pause_capture_at(CaptureTestPoint::BeforeEvalPreparationRecheck, op)
+                            .await?;
                     }
                     changed.await;
                 }
             })
             .await;
-        #[cfg(test)]
         if result.is_err() {
-            self.record_eval_admission_for_test(
-                op,
-                refusal_diagnostic.unwrap_or_else(|| {
-                    super::client_settlement_trace::EvalAdmissionFacts::unknown(
-                        super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
-                        super::client_settlement_trace::EvalAdmissionReason::OtherGuard,
-                    )
-                }),
-            );
+            let facts = refusal_diagnostic.unwrap_or_else(|| {
+                super::client_settlement_trace::EvalAdmissionFacts::unknown(
+                    super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
+                    super::client_settlement_trace::EvalAdmissionReason::OtherGuard,
+                )
+            });
+            #[cfg(test)]
+            self.record_eval_admission_for_test(op, facts);
+            if diagnostics {
+                super::client_settlement_trace::eval_admission(op.generation, op.sequence, facts);
+            }
         }
-        if diagnostics && result.is_err() {
-            super::client_settlement_trace::eval_admission(
-                op.generation,
-                op.sequence,
-                refusal_diagnostic.unwrap_or_else(|| {
-                    super::client_settlement_trace::EvalAdmissionFacts::unknown(
-                        super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
-                        super::client_settlement_trace::EvalAdmissionReason::OtherGuard,
-                    )
-                }),
-            );
-        }
-        result
+        result.map(|()| preparation)
     }
     pub(crate) fn capture_eval_authority(
         &self,
@@ -2189,6 +2498,7 @@ impl ClientEnrollment {
                 })?;
             Ok(super::client_debt::EvalAuthorityStamp {
                 revision,
+                preparation: None,
                 target: entry.target.clone(),
                 session: entry.session.clone(),
                 frame: frame.clone(),
@@ -4742,10 +5052,41 @@ impl ClientEnrollment {
                 WorkerAdmissionStep::Configured,
                 || self.targets.configured(&entry.target),
             )?;
+            let popup_receipt = {
+                let index = self
+                    .index
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                if entry.kind == "page"
+                    && entry.init_paused_by_attachment
+                    && !entry.observation_only
+                    && entry.root == entry.session
+                    && *self
+                        .active_root
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?
+                        != entry.session
+                {
+                    index
+                        .pending_eval_initialization
+                        .get(&entry.session)
+                        .cloned()
+                } else {
+                    None
+                }
+            };
             let permit = ServiceWorkerAdmission::observe(
                 admission,
                 WorkerAdmissionStep::ResumePermit,
-                self.bounded_initialization(op, self.targets.resume_permit(&entry.target)),
+                self.bounded_initialization(op, async {
+                    if let Some(receipt) = &popup_receipt {
+                        self.targets
+                            .popup_resume_permit(&entry.target, receipt)
+                            .await
+                    } else {
+                        self.targets.resume_permit(&entry.target).await
+                    }
+                }),
             )
             .await?;
             *pending_resume = Some(permit);
@@ -5521,6 +5862,13 @@ impl ClientEnrollment {
                     256 * 1024 * 1024,
                 )
                 .map_err(|_| ProtocolError::CapacityExceeded)?;
+            if let Some(ledger) = self.client.debt_ledger() {
+                ledger.bind_eval_preparation_stream(
+                    self.generation,
+                    &self.targets.identity_scope,
+                    &events.watermark(),
+                )?;
+            }
             *self
                 .event_watermark
                 .lock()
@@ -5601,14 +5949,36 @@ impl ClientEnrollment {
                         let owner = self.clone();
                         // Stage custody before spawn. Registration occurs only
                         // while this retained future owns the non-cloneable guard.
-                        let mut custody = super::client_targets::RetainedInitialization::new(owner.targets.clone());
+                        let mut custody = if pending.is_some() {
+                            if let Some(ledger) = owner.client.debt_ledger() {
+                                match super::client_targets::RetainedInitialization::from_received_event(
+                                    owner.targets.clone(), ledger, owner.generation, events.watermark(), &event,
+                                ) {
+                                    Ok(custody) => custody,
+                                    Err(error) => break Err(error),
+                                }
+                            } else { super::client_targets::RetainedInitialization::new(owner.targets.clone()) }
+                        } else { super::client_targets::RetainedInitialization::new(owner.targets.clone()) };
+                        if let (Some(session), Some(receipt)) = (&pending, custody.popup_receipt()) {
+                            self.index.lock().map_err(|_| ProtocolError::ScopeUnavailable)?.pending_eval_initialization.insert(session.clone(), receipt);
+                        }
                         tasks.spawn(async move {
                             let result = match owner.attached_observed_with_custody((*event).clone(), Some(&mut custody)).await {
                                 Err(InitFailure::OwnedStop(stop)) if stop.authorizes(&owner) => custody.stop_retired(&stop).map(|()| InitializationOutcome::StoppedByOwner),
                                 Err(error) => Err(error.into_protocol()),
                                 Ok(outcome) => {
                                     let detached = matches!(&outcome, InitializationOutcome::DetachedChild | InitializationOutcome::DetachedQueuedChild | InitializationOutcome::FailedRetired(_));
-                                    custody.finish(detached).map(|()| outcome)
+                                    match custody.finish(detached) {
+                                        Err(error) => Err(error),
+                                        Ok(()) => {
+                                            if matches!(&outcome, InitializationOutcome::Initialized) && !detached {
+                                                #[cfg(test)]
+                                                owner.pause_capture_at(CaptureTestPoint::AfterPopupCustodyFinishBeforeReceipt, &owner.operation()).await?;
+                                                custody.publish_initialized();
+                                            }
+                                            Ok(outcome)
+                                        }
+                                    }
                                 },
                             };
                             if let Err(error)=&result { owner.poison(error.clone()); }
@@ -5619,6 +5989,7 @@ impl ClientEnrollment {
                                 {
                                     let mut index=owner.index.lock().map_err(|_|ProtocolError::ScopeUnavailable)?;
                                     index.pending_enrollment.remove(&session);
+                                    index.pending_eval_initialization.remove(&session);
                                     index.pending_query_attribution.remove(&session);
                                 }
                                 owner.changed.notify_waiters();
@@ -8931,6 +9302,8 @@ mod tests {
     include!("client_restart_readiness_tests.rs");
     include!("client_viewport_replacement_tests.rs");
     include!("client_eval_network_watermark_tests.rs");
+    include!("client_popup_preparation_tests.rs");
+    include!("client_popup_interposition_test_helpers.rs");
     fn coordinator(
         client: Arc<CdpClient>,
         context: &str,

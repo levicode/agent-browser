@@ -4284,17 +4284,22 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         if command != "page.navigate" && command != "page.activate" && command != "session.environment" && !command.starts_with("context.") && !page_active.load(std::sync::atomic::Ordering::SeqCst) {
                             return Err(ProtocolError::ScopeUnavailable);
                         }
-                        if command == "page.evaluate" && !lease.is_callback {
-                            enrollment.wait_eval_ingress(&page, &lease).await?;
-                        }
-                        let _ui = ui
-                            .enter(
-                                false,
-                                lease.is_callback,
-                                lease.deadline,
-                                lease.cancellation.clone(),
-                            )
-                            .await?;
+                        let eval_preparation = if command == "page.evaluate" && !lease.is_callback {
+                            enrollment.wait_eval_ingress(&page, &lease).await?
+                        } else { None };
+                        let ui_wait = ui.enter(
+                            false,
+                            lease.is_callback,
+                            lease.deadline,
+                            lease.cancellation.clone(),
+                        );
+                        #[cfg(test)]
+                        let ui_wait = enrollment.observe_eval_ui_wait_for_test(
+                            &lease,
+                            eval_preparation.is_some(),
+                            ui_wait,
+                        );
+                        let _ui = ui_wait.await?;
                         page.permit.check()?;
                         if !broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
                         // A scope callback is authorized by its exact live native
@@ -4433,7 +4438,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             Some(if let Some(permit) = eval_child {
                                 super::client_debt::EvalCommandGrant::Child(permit)
                             } else {
-                                let stamp = enrollment.capture_eval_authority(&page, &lease)?;
+                                let stamp = enrollment.capture_prepared_eval_authority(&page, &lease, eval_preparation.as_ref())?;
                                 let window = dispatch_tasks.prepare_eval_window(&journal, &lease, stamp)?;
                                 if let Err(error) = broker.bind_eval_root(&lease, &window) {
                                     debt.abandon_eval_preparation(&window);

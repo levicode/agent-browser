@@ -184,6 +184,8 @@ pub(crate) struct Facts {
     pub query_read_stage: Option<QueryReadStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_read_error: Option<ObservationReadError>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readMs")]
+    pub query_read_ms: Option<[u16; 13]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_scope_reason: Option<QueryScopeReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1400,6 +1402,17 @@ pub(crate) enum QueryScopeReason {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum QueryReadStage {
+    ReadAdmission,
+    ReadUi,
+    ReadFramesBefore,
+    FreshInventory,
+    FreshWorld,
+    FreshResolve,
+    FreshSample,
+    FreshCleanup,
+    FreshRootsFinal,
+    ReadFramesAfter,
+    ReadPublish,
     FrameEntry,
     FreshFields,
     Ax,
@@ -1537,6 +1550,7 @@ pub(crate) fn query_read_failure(
     sequence: u64,
     stage: QueryReadStage,
     error: ObservationReadError,
+    timing: Option<[u16; 13]>,
 ) {
     if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
         record_capture(
@@ -1547,6 +1561,30 @@ pub(crate) fn query_read_failure(
                 generation: Some(generation),
                 query_read_stage: Some(stage),
                 query_read_error: Some(error),
+                query_read_ms: timing,
+                ..Facts::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn query_read_protocol_failure(
+    generation: u64,
+    sequence: u64,
+    stage: QueryReadStage,
+    error: ProtocolError,
+    timing: Option<[u16; 13]>,
+) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryReadFailure,
+            Facts {
+                generation: Some(generation),
+                query_read_stage: Some(stage),
+                error: Some(error),
+                query_read_ms: timing,
                 ..Facts::default()
             },
         );
@@ -3581,6 +3619,31 @@ mod query_read_schema_tests {
             serde_json::to_value(Phase::QueryReadFailure).unwrap(),
             "QueryReadFailure"
         );
+    }
+    #[test]
+    fn timed_field_failure_fits_unchanged_record_bound() {
+        let record = Record {
+            schema_version: 2,
+            source: Source::Native,
+            pid: u32::MAX,
+            record: SAFE_INTEGER,
+            operation_seq: SAFE_INTEGER,
+            phase: Phase::QueryReadFailure,
+            dropped_before: SAFE_INTEGER,
+            emitted_before: SAFE_INTEGER,
+            suppressed_before: SAFE_INTEGER,
+            overflow: true,
+            facts: Facts {
+                generation: Some(SAFE_INTEGER),
+                query_read_stage: Some(QueryReadStage::ReadFramesBefore),
+                query_read_error: Some(ObservationReadError::UnsupportedCapability),
+                query_read_ms: Some([u16::MAX; 13]),
+                ..Facts::default()
+            },
+        };
+        assert!(serde_json::to_vec(&record).unwrap().len() + 1 <= MAX_RECORD_BYTES);
+        assert_eq!(QUERY_MAX_RECORDS, 128);
+        assert_eq!(QUERY_MAX_BYTES, 64 * 1024);
     }
     #[test]
     fn split_target_differences_have_fixed_serialization() {

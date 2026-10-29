@@ -1225,6 +1225,17 @@ impl ClientPageState {
                 if a.width > i32::MAX as u32 || a.height > i32::MAX as u32 {
                     return invalid();
                 }
+                // Viewport is retained declarative configuration too. Advance
+                // the same checked revision before any browser mutation attempt
+                // so change-and-restore cannot revive an older preparation.
+                {
+                    let mut state = self.state()?;
+                    state.config.revision = state
+                        .config
+                        .revision
+                        .checked_add(1)
+                        .ok_or(ProtocolError::IdentifierExhausted)?;
+                }
                 command(page,op,session,"Emulation.setDeviceMetricsOverride",json!({"width":a.width,"height":a.height,"deviceScaleFactor":0,"mobile":false,"screenWidth":a.width,"screenHeight":a.height})).await?;
                 self.state()?.requested_viewport = Some((a.width, a.height));
                 Ok(Value::Null)
@@ -2485,6 +2496,7 @@ fn project_cookies(response: &Value) -> Result<Vec<Value>, ProtocolError> {
 
 #[cfg(test)]
 mod tests {
+    include!("client_page_viewport_revision_tests.rs");
     #[tokio::test]
     async fn fixed_page_reads_and_public_evaluate_have_distinct_real_dispatch_journals() {
         for (name, args, mutating) in [
@@ -2859,6 +2871,21 @@ mod tests {
                 }
                 if mode == "hold-evaluate" && method == "Runtime.evaluate" {
                     continue;
+                }
+                if method == "Emulation.setDeviceMetricsOverride" {
+                    if mode == "hold-viewport" {
+                        continue;
+                    }
+                    if mode == "reject-viewport" {
+                        ws.send(Message::Text(
+                            json!({"id":request["id"],"sessionId":request["sessionId"],
+                            "error":{"code":-32000,"message":"controlled viewport refusal"}})
+                            .to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                        continue;
+                    }
                 }
                 if mode == "exception-handle-hold" && method == "Runtime.releaseObject" {
                     continue;

@@ -2164,6 +2164,7 @@ mod tests {
                 &journal,
                 &operation,
                 EvalAuthorityStamp {
+                    preparation: None,
                     revision: 0,
                     target: "target".into(),
                     session: "session".into(),

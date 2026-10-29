@@ -20,7 +20,7 @@ mod frame_policy;
 #[path = "client_observation/fresh_query.rs"]
 mod fresh_query;
 #[path = "client_observation/query_diagnostic.rs"]
-mod query_diagnostic;
+pub(crate) mod query_diagnostic;
 #[path = "client_observation/role_candidates.rs"]
 mod role_candidates;
 pub(crate) use frame_policy::ObservationFramePolicy;
@@ -2903,10 +2903,12 @@ pub(crate) async fn query_fields(
     options: &QueryOptions,
     fields: &[ReadField],
     lease: &OperationLease,
+    witness: Option<&query_diagnostic::QueryReadWitness>,
 ) -> Result<Vec<Value>, ObservationError> {
-    let witness = query_diagnostic::QueryReadWitness::new(lease);
+    let local = query_diagnostic::QueryReadWitness::new(lease);
+    let witness = witness.unwrap_or(&local);
     let result =
-        query_fields_diagnostic_inner(client, frames, options, fields, lease, &witness).await;
+        query_fields_diagnostic_inner(client, frames, options, fields, lease, witness).await;
     witness.observe(&result);
     result
 }
@@ -2926,7 +2928,7 @@ async fn query_fields_diagnostic_inner(
     let frame = query_frame(client, frames, &path, options, lease, false).await?;
     witness.stage(Stage::FreshFields);
     if let Some(values) =
-        fresh_query::fields(client, frame, &expression, options, fields, lease).await?
+        fresh_query::fields(client, frame, &expression, options, fields, lease, witness).await?
     {
         witness.stage(Stage::FrameFinal);
         validate_frame_ancestry(client, frames, frame, lease).await?;
@@ -8756,6 +8758,7 @@ mod tests {
                         },
                         &[ReadField::Value],
                         &operation,
+                        &query_diagnostic::QueryReadWitness::disabled(&operation),
                     ))
                     .await
             });
@@ -8849,6 +8852,7 @@ mod tests {
                 },
                 &[ReadField::Value],
                 &operation,
+                &query_diagnostic::QueryReadWitness::disabled(&operation),
             ))
             .await;
         let snapshot = ledger.snapshot();
@@ -8989,6 +8993,7 @@ mod tests {
                     },
                     &[ReadField::Value],
                     &operation,
+                    &query_diagnostic::QueryReadWitness::disabled(&operation),
                 ))
                 .await
         });
@@ -9218,6 +9223,7 @@ mod tests {
                 &options,
                 &[ReadField::Text],
                 &operation,
+                None,
             )
             .await;
             match mode {

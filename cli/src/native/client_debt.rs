@@ -83,6 +83,7 @@ impl EvalWindowHandle {
         let ledger = self.ledger.upgrade()?;
         let state = ledger.state.lock().ok()?;
         let window = state.eval_window.as_ref()?;
+        check_preparation_fence(&state, window.stamp.preparation.as_ref()).ok()?;
         if ledger.identity_scope != scope
             || state.retired
             || state.integrity_lost
@@ -121,6 +122,7 @@ impl EvalWindowHandle {
 #[derive(Clone)]
 pub(crate) struct EvalAuthorityStamp {
     pub(crate) revision: u64,
+    pub(super) preparation: Option<EvalPreparationFence>,
     pub(crate) target: String,
     pub(crate) session: String,
     pub(crate) frame: String,
@@ -128,13 +130,48 @@ pub(crate) struct EvalAuthorityStamp {
 }
 impl EvalAuthorityStamp {
     fn footprint(&self) -> usize {
-        512 + self.target.len() + self.session.len() + self.frame.len() + self.loader.len()
+        512 + self.target.len()
+            + self.session.len()
+            + self.frame.len()
+            + self.loader.len()
+            + self.preparation.as_ref().map_or(0, |_| 64)
     }
     fn valid(&self) -> bool {
         [&self.target, &self.session, &self.frame]
             .iter()
             .all(|value| !value.is_empty() && value.len() <= 4096)
             && self.loader.len() <= 4096
+    }
+}
+/// Preparation evidence only: no window, command or lifecycle authority.
+pub(super) struct EvalPreparationSnapshot {
+    owner: std::sync::Weak<OwnerDebtLedger>,
+    foreign_revision: u64,
+    maximum_origin: u64,
+}
+#[derive(Clone)]
+pub(super) struct EvalPreparationFence {
+    owner: std::sync::Weak<OwnerDebtLedger>,
+    foreign_revision: u64,
+    received: u64,
+}
+impl EvalPreparationSnapshot {
+    pub(super) fn freeze(self, received: u64) -> Result<EvalPreparationFence, ProtocolError> {
+        if self.maximum_origin > received {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(EvalPreparationFence {
+            owner: self.owner,
+            foreign_revision: self.foreign_revision,
+            received,
+        })
+    }
+}
+impl EvalPreparationFence {
+    fn belongs_to(&self, owner: &OwnerDebtLedger) -> bool {
+        self.owner
+            .upgrade()
+            .is_some_and(|current| std::ptr::eq(current.as_ref(), owner))
     }
 }
 #[derive(Clone)]
@@ -1082,6 +1119,9 @@ struct LedgerState {
     next_reservation: u64,
     eval_epoch: u64,
     eval_revision: u64,
+    // These restrict preparation only. Raw revision/revocation is unchanged.
+    eval_foreign_revision: u64,
+    eval_maximum_initializer_origin: u64,
     // Reader observation has begun, but existing bounded publication has not returned.
     // This is only an eval admission fence, not a second received/applied watermark.
     eval_publication_pending: bool,
@@ -1158,6 +1198,7 @@ pub(crate) struct OwnerDebtLedger {
     generation: u64,
     identity_scope: String,
     state: Mutex<LedgerState>,
+    eval_preparation_stream: std::sync::OnceLock<super::cdp::client::BoundedEventWatermark>,
     changed: Arc<tokio::sync::Notify>,
     pub(crate) cleanup_diagnostics: Arc<super::client_settlement_trace::CleanupDiagnostics>,
 }
@@ -1182,6 +1223,116 @@ impl Drop for DebtChange<'_> {
     }
 }
 impl OwnerDebtLedger {
+    pub(super) fn bind_eval_preparation_stream(
+        &self,
+        generation: u64,
+        scope: &str,
+        stream: &super::cdp::client::BoundedEventWatermark,
+    ) -> Result<(), ProtocolError> {
+        if !self.matches_owner(generation, scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if self.eval_preparation_stream.get().is_none() {
+            let _ = self.eval_preparation_stream.set(stream.clone());
+        }
+        if self.matches_eval_preparation_stream(stream) {
+            Ok(())
+        } else {
+            Err(ProtocolError::StaleScope)
+        }
+    }
+    pub(super) fn matches_eval_preparation_stream(
+        &self,
+        stream: &super::cdp::client::BoundedEventWatermark,
+    ) -> bool {
+        self.eval_preparation_stream
+            .get()
+            .is_some_and(|bound| bound.same_subscription(stream))
+    }
+    pub(super) fn observe_eval_preparation(
+        self: &Arc<Self>,
+        session: &str,
+        target: &str,
+        stream: &super::cdp::client::BoundedEventWatermark,
+    ) -> Result<(u64, EvalPreparationSnapshot), ProtocolError> {
+        if !self.matches_eval_preparation_stream(stream) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check_eval_authority(&state, Some((session, target)), None)?;
+        Ok((
+            state.eval_revision,
+            EvalPreparationSnapshot {
+                owner: Arc::downgrade(self),
+                foreign_revision: state.eval_foreign_revision,
+                maximum_origin: state.eval_maximum_initializer_origin,
+            },
+        ))
+    }
+    pub(super) fn check_eval_preparation(
+        &self,
+        session: &str,
+        target: &str,
+        fence: &EvalPreparationFence,
+    ) -> Result<u64, ProtocolError> {
+        if !fence.belongs_to(self) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check_eval_authority(&state, Some((session, target)), None)?;
+        check_preparation_fence(&state, Some(fence))?;
+        Ok(state.eval_revision)
+    }
+    /// Last pre-grant check, under the same ledger lock as install/submit.
+    pub(super) fn bind_eval_preparation(
+        &self,
+        stamp: &mut EvalAuthorityStamp,
+        fence: &EvalPreparationFence,
+    ) -> Result<(), ProtocolError> {
+        if !fence.belongs_to(self) || stamp.preparation.is_some() {
+            return Err(ProtocolError::StaleScope);
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        check_eval_authority(
+            &state,
+            Some((&stamp.session, &stamp.target)),
+            Some(stamp.revision),
+        )?;
+        check_preparation_fence(&state, Some(fence))?;
+        stamp.preparation = Some(fence.clone());
+        Ok(())
+    }
+    /// Exactly two audited target transitions call this. The mutation takes
+    /// only targets after this ledger, and reports success after exact checks.
+    pub(super) fn with_eval_popup_progress<T>(
+        &self,
+        receipt: Option<&super::client_targets::PopupInitializationReceipt>,
+        mutation: impl FnOnce() -> (T, bool),
+    ) -> T {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        revoke_eval_revision(&mut state);
+        let (result, successful) = mutation();
+        match receipt
+            .filter(|_| successful)
+            .and_then(|receipt| receipt.known_origin_for(self))
+        {
+            Some(origin) => {
+                state.eval_maximum_initializer_origin =
+                    state.eval_maximum_initializer_origin.max(origin);
+            }
+            None => invalidate_eval_preparation(&mut state),
+        }
+        result
+    }
     #[cfg(test)]
     pub(crate) fn eval_authority_revision(&self) -> Result<u64, ProtocolError> {
         let state = self
@@ -1468,6 +1619,14 @@ impl OwnerDebtLedger {
             Some((&stamp.session, &stamp.target)),
             Some(stamp.revision),
         )?;
+        if stamp
+            .preparation
+            .as_ref()
+            .is_some_and(|fence| !fence.belongs_to(self))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        check_preparation_fence(&state, stamp.preparation.as_ref())?;
         if state.eval_window.is_some()
             || state
                 .commands
@@ -1564,6 +1723,7 @@ impl OwnerDebtLedger {
             Some(window.stamp.revision),
         )
         .ok()?;
+        check_preparation_fence(&state, window.stamp.preparation.as_ref()).ok()?;
         if self.identity_scope != scope
             || window.revoked
             || !window.root_submitted
@@ -2040,6 +2200,7 @@ impl OwnerDebtLedger {
             cleanup_diagnostics: super::client_settlement_trace::CleanupDiagnostics::new(
                 generation,
             ),
+            eval_preparation_stream: std::sync::OnceLock::new(),
             state: Mutex::new(LedgerState {
                 integrity_lost: invalid,
                 eof_integrity_cause: if invalid {
@@ -3152,6 +3313,16 @@ impl OwnerDebtLedger {
         if state.retired {
             return false;
         }
+        // Main-world creation is not a legacy raw-revision event. Restrict
+        // prepared windows only, including a create-only realm replacement.
+        if event.method == "Runtime.executionContextCreated"
+            && event
+                .session_id
+                .as_deref()
+                .is_some_and(|session| owned_eval_session(&state, session))
+        {
+            invalidate_eval_preparation(&mut state);
+        }
         let affects_eval = eval_lifecycle_event(&state, event);
         if affects_eval {
             if publication {
@@ -3301,14 +3472,15 @@ fn check_metadata_add(state: &LedgerState, extra: usize) -> Result<(), ProtocolE
 }
 // Only the six existing lifecycle revocation methods. Attribution comes from
 // this owner's existing session/target maps, never a callback or adapter claim.
+fn owned_eval_session(state: &LedgerState, session: &str) -> bool {
+    state.targets.contains_key(session)
+        && !matches!(
+            state.lifecycle_sessions.get(session),
+            Some(LifecycleSessionPurpose::Observer | LifecycleSessionPurpose::Recording)
+        )
+}
 fn eval_lifecycle_event(state: &LedgerState, event: &CdpEvent) -> bool {
-    let owned = |session: &str| {
-        state.targets.contains_key(session)
-            && !matches!(
-                state.lifecycle_sessions.get(session),
-                Some(LifecycleSessionPurpose::Observer | LifecycleSessionPurpose::Recording)
-            )
-    };
+    let owned = |session: &str| owned_eval_session(state, session);
     match event.method.as_str() {
         "Target.detachedFromTarget" => event.params["sessionId"].as_str().is_some_and(owned),
         "Target.targetDestroyed" => event.params["targetId"].as_str().is_some_and(|target| {
@@ -3345,7 +3517,29 @@ fn check_eval_authority(
     }
     Ok(())
 }
+fn check_preparation_fence(
+    state: &LedgerState,
+    fence: Option<&EvalPreparationFence>,
+) -> Result<(), ProtocolError> {
+    if fence.is_some_and(|fence| {
+        state.eval_foreign_revision != fence.foreign_revision
+            || state.eval_maximum_initializer_origin > fence.received
+    }) {
+        return Err(ProtocolError::ScopeUnavailable);
+    }
+    Ok(())
+}
+fn invalidate_eval_preparation(state: &mut LedgerState) {
+    match state.eval_foreign_revision.checked_add(1) {
+        Some(revision) => state.eval_foreign_revision = revision,
+        None => state.contaminate_integrity(),
+    }
+}
 fn invalidate_eval(state: &mut LedgerState) {
+    revoke_eval_revision(state);
+    invalidate_eval_preparation(state);
+}
+fn revoke_eval_revision(state: &mut LedgerState) {
     if let Some(window) = &mut state.eval_window {
         window.revoked = true;
     }
@@ -3367,6 +3561,7 @@ fn eval_window_mut<'a>(
         Some((&window.stamp.session, &window.stamp.target)),
         Some(window.stamp.revision),
     )?;
+    check_preparation_fence(state, window.stamp.preparation.as_ref())?;
     if window.epoch != handle.epoch || window.root.key != handle.root || window.revoked {
         return Err(ProtocolError::ScopeUnavailable);
     }
@@ -3389,6 +3584,7 @@ fn check_eval_child(
         Some((&window.stamp.session, &window.stamp.target)),
         Some(window.stamp.revision),
     )?;
+    check_preparation_fence(state, window.stamp.preparation.as_ref())?;
     if window.epoch != handle.epoch
         || window.root.key != handle.root
         || window.revoked
@@ -4507,6 +4703,7 @@ pub(crate) mod tests {
         op.sequence = 1;
         journal.bind_operation(&op).unwrap();
         let stamp = EvalAuthorityStamp {
+            preparation: None,
             revision: ledger.eval_authority_revision().unwrap(),
             target: "target".into(),
             session: "page".into(),
@@ -4615,6 +4812,7 @@ pub(crate) mod tests {
             op.sequence = 1;
             journal.bind_operation(&op).unwrap();
             let stamp = EvalAuthorityStamp {
+                preparation: None,
                 revision: ledger.capture_eval_revision("page", "target").unwrap(),
                 session: "page".into(),
                 target: "target".into(),
@@ -4853,6 +5051,7 @@ pub(crate) mod tests {
                 &journal,
                 &op,
                 EvalAuthorityStamp {
+                    preparation: None,
                     revision: 0,
                     target: "target".into(),
                     session: "page".into(),
@@ -7012,3 +7211,7 @@ mod recording_start_status_tests {
         assert!(status.is_error_ack());
     }
 }
+
+#[cfg(test)]
+#[path = "client_eval_preparation_tests.rs"]
+mod eval_preparation_tests;

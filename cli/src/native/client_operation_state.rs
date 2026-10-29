@@ -1057,6 +1057,7 @@ mod tests {
     }
     fn eval_stamp(ledger: &OwnerDebtLedger) -> EvalAuthorityStamp {
         EvalAuthorityStamp {
+            preparation: None,
             revision: ledger.eval_authority_revision().unwrap(),
             target: "page".into(),
             session: "session".into(),

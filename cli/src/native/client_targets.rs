@@ -10,7 +10,7 @@ pub(crate) use page_query::{
     SelectedPageTargetBarrier, SelectedPageTargetCheck, SelectedPageTargetSnapshot,
 };
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Notify;
 
@@ -50,6 +50,7 @@ pub(super) struct RetainedInitialization {
     registry: Arc<ClientTargets>,
     target: Option<OwnedTarget>,
     root: Option<OwnedTarget>,
+    popup_progress: Option<PopupInitializationReceipt>,
 }
 struct AttachmentRegistrationContext<'a> {
     retained: bool,
@@ -61,12 +62,206 @@ pub(super) struct AttachmentAncestry {
     pub(super) root: Option<OwnedTarget>,
     pub(super) verified_self_root: bool,
 }
+/// Read-only evidence from the existing retained initializer, never a second
+/// producer. Origin is immutable; only custody can bind its actual tenure once.
+#[derive(Clone)]
+pub(super) struct PopupInitializationReceipt(Arc<PopupInitializationProgress>);
+struct PopupInitializationProgress {
+    registry: std::sync::Weak<ClientTargets>,
+    ledger: std::sync::Weak<super::client_debt::OwnerDebtLedger>,
+    generation: u64,
+    stream: super::cdp::client::BoundedEventWatermark,
+    origin: u64,
+    target: std::sync::OnceLock<OwnedTarget>,
+    // 0 unissued, 1 issued, 2 completed, 3 released. No transition repeats.
+    stage: AtomicU8,
+    // 0 retained, 1 positive after finish, 2 not successful.
+    terminal: AtomicU8,
+}
+impl PopupInitializationReceipt {
+    fn matches_target(&self, registry: &ClientTargets, target: &OwnedTarget) -> bool {
+        self.0
+            .registry
+            .upgrade()
+            .is_some_and(|owner| std::ptr::eq(owner.as_ref(), registry))
+            && self
+                .0
+                .target
+                .get()
+                .is_some_and(|bound| bound.same_initialization_attachment(target))
+    }
+    pub(super) fn known_origin_for(
+        &self,
+        ledger: &super::client_debt::OwnerDebtLedger,
+    ) -> Option<u64> {
+        let owner = self.0.ledger.upgrade()?;
+        let registry = self.0.registry.upgrade()?;
+        (std::ptr::eq(owner.as_ref(), ledger)
+            && ledger.matches_owner(self.0.generation, &registry.identity_scope)
+            && ledger.matches_eval_preparation_stream(&self.0.stream)
+            && registry.require_eval_owner(&owner).is_ok()
+            && self.0.origin > 0
+            && self.0.origin < u64::MAX
+            && (2..=3).contains(&self.0.stage.load(Ordering::Acquire))
+            && self.0.terminal.load(Ordering::Acquire) == 0)
+            .then_some(self.0.origin)
+    }
+    pub(super) fn capture_for_eval(
+        &self,
+        registry: &Arc<ClientTargets>,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+        stream: &super::cdp::client::BoundedEventWatermark,
+        received: u64,
+        target: &str,
+        session: &str,
+    ) -> Result<OwnedTarget, ProtocolError> {
+        if !self.0.stream.same_subscription(stream)
+            || !ledger.matches_eval_preparation_stream(stream)
+            || self
+                .0
+                .ledger
+                .upgrade()
+                .is_none_or(|owner| !Arc::ptr_eq(&owner, ledger))
+            || !ledger.matches_owner(self.0.generation, &registry.identity_scope)
+            || self.0.origin == 0
+            || self.0.origin > received
+            || self.0.origin == u64::MAX
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        registry.require_eval_owner(ledger)?;
+        let current = self.current(registry)?;
+        if current.target_id != target || current.session_id != session {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(current)
+    }
+    fn current(&self, registry: &Arc<ClientTargets>) -> Result<OwnedTarget, ProtocolError> {
+        let bound = self.0.target.get().ok_or(ProtocolError::ScopeUnavailable)?;
+        let state = registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let current = state
+            .targets
+            .get(&bound.target_id)
+            .ok_or(ProtocolError::StaleScope)?;
+        let stage = self.0.stage.load(Ordering::Acquire);
+        let terminal = self.0.terminal.load(Ordering::Acquire);
+        if state.sealed
+            || state.integrity_lost
+            || !self.matches_target(registry, current)
+            || current.kind != "page"
+            || current.purpose != Some(TargetPurpose::Application)
+            || !current.configured
+            || terminal == 2
+            || !(1..=3).contains(&stage)
+            || (stage < 3
+                && (!current.resume_pending
+                    || !current
+                        .tenure
+                        .retained_initialization
+                        .load(Ordering::Acquire)))
+            || (stage == 3 && !current.capture_ready())
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        Ok(current.clone())
+    }
+    pub(super) fn same_receipt(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+    pub(super) fn completed(&self, registry: &Arc<ClientTargets>) -> Result<bool, ProtocolError> {
+        let current = self.current(registry)?;
+        let positive = self.0.terminal.load(Ordering::Acquire) == 1;
+        if positive
+            && (self.0.stage.load(Ordering::Acquire) != 3
+                || current
+                    .tenure
+                    .retained_initialization
+                    .load(Ordering::Acquire))
+        {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        Ok(positive)
+    }
+    fn unsuccessful(&self) {
+        let _ = self
+            .0
+            .terminal
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire);
+    }
+}
 impl RetainedInitialization {
     pub(super) fn new(registry: Arc<ClientTargets>) -> Self {
         Self {
             registry,
             target: None,
             root: None,
+            popup_progress: None,
+        }
+    }
+    pub(super) fn from_received_event(
+        registry: Arc<ClientTargets>,
+        ledger: Arc<super::client_debt::OwnerDebtLedger>,
+        generation: u64,
+        stream: super::cdp::client::BoundedEventWatermark,
+        event: &super::cdp::client::BoundedCdpEvent,
+    ) -> Result<Self, ProtocolError> {
+        if !ledger.matches_owner(generation, &registry.identity_scope)
+            || !ledger.matches_eval_preparation_stream(&stream)
+            || event.sequence() == 0
+            || event.sequence() == u64::MAX
+            || stream
+                .received()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?
+                < event.sequence()
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let progress = PopupInitializationReceipt(Arc::new(PopupInitializationProgress {
+            registry: Arc::downgrade(&registry),
+            ledger: Arc::downgrade(&ledger),
+            generation,
+            stream,
+            origin: event.sequence(),
+            target: std::sync::OnceLock::new(),
+            stage: AtomicU8::new(0),
+            terminal: AtomicU8::new(0),
+        }));
+        Ok(Self {
+            registry,
+            target: None,
+            root: None,
+            popup_progress: Some(progress),
+        })
+    }
+    pub(super) fn popup_receipt(&self) -> Option<PopupInitializationReceipt> {
+        self.popup_progress.clone()
+    }
+    /// Called only after finish(false) returned for Initialized. The positive
+    /// receipt cannot precede the real ResumePermit Drop or custody finish.
+    pub(super) fn publish_initialized(&self) {
+        let Some(receipt) = &self.popup_progress else {
+            return;
+        };
+        // Failure to certify a receipt must not turn an already-successful
+        // initializer into a new error (for example detach just after finish).
+        let positive = self.target.is_none()
+            && receipt.0.stage.load(Ordering::Acquire) == 3
+            && receipt.current(&self.registry).is_ok_and(|current| {
+                !current
+                    .tenure
+                    .retained_initialization
+                    .load(Ordering::Acquire)
+            });
+        if positive {
+            let _ = receipt
+                .0
+                .terminal
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire);
+        } else {
+            receipt.unsuccessful();
         }
     }
     pub(super) fn attach(
@@ -138,6 +333,13 @@ impl RetainedInitialization {
             {
                 self.target = Some(target.clone());
                 self.root = root;
+                if let Some(receipt) = &self.popup_progress {
+                    receipt
+                        .0
+                        .target
+                        .set(target.clone())
+                        .map_err(|_| ProtocolError::StaleScope)?;
+                }
             }
         }
         Ok(attached.is_some())
@@ -208,6 +410,9 @@ impl RetainedInitialization {
 }
 impl Drop for RetainedInitialization {
     fn drop(&mut self) {
+        if let Some(receipt) = &self.popup_progress {
+            receipt.unsuccessful();
+        }
         if let Some(target) = self.target.take() {
             // Publish loss BEFORE removing custody, including panic/abort.
             self.registry.seal();
@@ -538,6 +743,7 @@ pub struct ResumePermit {
     tenure: Arc<AttachmentTenure>,
     worker_startup: bool,
     completed: bool,
+    popup_progress: Option<PopupInitializationReceipt>,
 }
 impl ProtectedTargetBarrier {
     /// Quarantine exactly the registry captured by this transaction.
@@ -708,13 +914,36 @@ impl ResumePermit {
     }
     pub(super) fn complete_retained(&mut self) -> Result<(), ProtocolError> {
         let registry = self.registry.clone();
-        let observed = registry.eval_invalidation(|revoke| {
-            revoke();
-            let mut state = registry
-                .state
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?;
-            self.complete_locked(&mut state, || Ok(()))
+        let receipt = self.popup_progress.clone();
+        let observed = registry.eval_popup_invalidation(receipt.as_ref(), || {
+            let Ok(mut state) = registry.state.lock() else {
+                return (Err(ProtocolError::ScopeUnavailable), false);
+            };
+            let eligible = !state.sealed
+                && !state.integrity_lost
+                && state.resuming > 0
+                && receipt.as_ref().is_some_and(|receipt| {
+                    state.targets.get(&self.target_id).is_some_and(|target| {
+                        receipt.matches_target(&registry, target)
+                            && target.kind == "page"
+                            && target.purpose == Some(TargetPurpose::Application)
+                            && target
+                                .tenure
+                                .retained_initialization
+                                .load(Ordering::Acquire)
+                    })
+                });
+            let result = self.complete_locked(&mut state, || Ok(()));
+            let known = eligible
+                && result.is_ok()
+                && receipt.as_ref().is_some_and(|receipt| {
+                    receipt
+                        .0
+                        .stage
+                        .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                });
+            (result, known)
         })?;
         if let Some(value) = observed {
             diagnostic::target_lifecycle(value.generation, 0, value, None);
@@ -728,13 +957,32 @@ impl ResumePermit {
 impl Drop for ResumePermit {
     fn drop(&mut self) {
         let registry = self.registry.clone();
-        registry.eval_invalidation(|revoke| {
-            revoke();
+        let receipt = self.popup_progress.clone();
+        registry.eval_popup_invalidation(receipt.as_ref(), || {
+            let mut known = false;
             if let Ok(mut state) = self.registry.state.lock() {
+                let eligible =
+                    self.completed && !state.sealed && !state.integrity_lost && state.resuming > 0;
                 if let Some(target) = state.targets.get_mut(&self.target_id) {
                     if target.session_id == self.session_id
                         && Arc::ptr_eq(&target.tenure, &self.tenure)
                     {
+                        known = eligible
+                            && target.resume_pending
+                            && target.resumed
+                            && target.configured
+                            && target
+                                .tenure
+                                .retained_initialization
+                                .load(Ordering::Acquire)
+                            && receipt.as_ref().is_some_and(|receipt| {
+                                receipt.matches_target(&registry, target)
+                                    && receipt
+                                        .0
+                                        .stage
+                                        .compare_exchange(2, 3, Ordering::AcqRel, Ordering::Acquire)
+                                        .is_ok()
+                            });
                         target.resume_pending = false;
                     }
                 }
@@ -744,6 +992,7 @@ impl Drop for ResumePermit {
                 }
             }
             self.registry.changed.notify_waiters();
+            ((), known)
         })
     }
 }
@@ -873,6 +1122,17 @@ impl ClientTargets {
             mutation(&mut || {})
         }
     }
+    fn eval_popup_invalidation<T>(
+        &self,
+        receipt: Option<&PopupInitializationReceipt>,
+        mutation: impl FnOnce() -> (T, bool),
+    ) -> T {
+        if let Some(owner) = self.eval_owner.get().and_then(std::sync::Weak::upgrade) {
+            owner.with_eval_popup_progress(receipt, mutation)
+        } else {
+            mutation().0
+        }
+    }
     /// Lifecycle owner calls this only after bounded event routing and recursive
     /// target attachment barriers are installed and initial inventory reconciled.
     pub fn acknowledge_enrollment(&self) -> Result<(), ProtocolError> {
@@ -963,7 +1223,7 @@ impl ClientTargets {
         self: &Arc<Self>,
         target_id: &str,
     ) -> Result<ResumePermit, ProtocolError> {
-        self.resume_permit_inner(target_id, None).await
+        self.resume_permit_inner(target_id, None, None).await
     }
 
     /// A service worker can exist before its renderer is ready. Security
@@ -974,13 +1234,23 @@ impl ClientTargets {
         target_id: &str,
         session_id: &str,
     ) -> Result<ResumePermit, ProtocolError> {
-        self.resume_permit_inner(target_id, Some(session_id)).await
+        self.resume_permit_inner(target_id, Some(session_id), None)
+            .await
     }
 
+    pub(super) async fn popup_resume_permit(
+        self: &Arc<Self>,
+        target_id: &str,
+        receipt: &PopupInitializationReceipt,
+    ) -> Result<ResumePermit, ProtocolError> {
+        self.resume_permit_inner(target_id, None, Some(receipt))
+            .await
+    }
     async fn resume_permit_inner(
         self: &Arc<Self>,
         target_id: &str,
         worker_session: Option<&str>,
+        popup: Option<&PopupInitializationReceipt>,
     ) -> Result<ResumePermit, ProtocolError> {
         let mut expected_tenure = None;
         loop {
@@ -1025,6 +1295,24 @@ impl ClientTargets {
                         .resuming
                         .checked_add(1)
                         .ok_or(ProtocolError::CapacityExceeded)?;
+                    if let Some(receipt) = popup {
+                        if !receipt.matches_target(self, target)
+                            || target.kind != "page"
+                            || target.purpose != Some(TargetPurpose::Application)
+                            || !target
+                                .tenure
+                                .retained_initialization
+                                .load(Ordering::Acquire)
+                            || receipt.0.terminal.load(Ordering::Acquire) != 0
+                            || receipt
+                                .0
+                                .stage
+                                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                                .is_err()
+                        {
+                            return Err(ProtocolError::StaleScope);
+                        }
+                    }
                     state
                         .targets
                         .get_mut(target_id)
@@ -1038,6 +1326,7 @@ impl ClientTargets {
                         tenure,
                         worker_startup: worker_session.is_some(),
                         completed: false,
+                        popup_progress: popup.cloned(),
                     });
                 }
             }

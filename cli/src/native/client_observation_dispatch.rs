@@ -1865,6 +1865,14 @@ impl ObservationDispatch {
         let witness = ObserveFailureWitness::new(
             matches!(&request, DispatchRequest::Observe(request) if !request.options.pixels && !request.options.pixel_fallback),
         );
+        let field_witness = matches!(&request, DispatchRequest::ReadFields(_))
+            .then(|| observation::query_diagnostic::QueryReadWitness::field_dispatch(&operation));
+        let field_stage = |stage| {
+            if let Some(witness) = &field_witness {
+                witness.stage(stage);
+            }
+        };
+        use super::client_settlement_trace::QueryReadStage as FieldStage;
         let observation_cleanup = AtomicBool::new(false);
         let map_observation = |error| {
             let detail = screenshot.map(|_| observation_read_failure(&error));
@@ -1883,6 +1891,9 @@ impl ObservationDispatch {
             error
         };
         let failure = |error: ProtocolError| {
+            if let Some(witness) = &field_witness {
+                witness.observe_protocol(&error);
+            }
             if let Some(witness) = screenshot {
                 witness.failure(&error);
             }
@@ -1999,6 +2010,7 @@ impl ObservationDispatch {
                 }
             }
         }
+        field_stage(FieldStage::ReadUi);
         screenshot_stage(screenshot, ScreenshotStage::UiAdmission);
         let _ui = tokio::select! {
             result = context.ui.enter(protected, operation.is_callback,
@@ -2026,6 +2038,7 @@ impl ObservationDispatch {
                 read.check_admission(&operation, &identity, &ledger)
             };
             check_authority().map_err(failure)?;
+            field_stage(FieldStage::ReadFramesBefore);
             let frames =
                 verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
                     .await
@@ -2036,15 +2049,18 @@ impl ObservationDispatch {
                 &read.options,
                 &read.fields,
                 &operation,
+                field_witness.as_ref(),
             )
             .await
             .map_err(map_observation)
             .map_err(failure)?;
+            field_stage(FieldStage::ReadFramesAfter);
             let current =
                 verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
                     .await
                     .map_err(failure)?;
             same_frames(&frames, &current).map_err(failure)?;
+            field_stage(FieldStage::ReadPublish);
             check_authority().map_err(failure)?;
             let value = json!({"identityScope":identity,"values":values});
             bounded_result(&value).map_err(failure)?;

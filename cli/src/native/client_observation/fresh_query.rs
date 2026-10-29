@@ -112,12 +112,15 @@ pub(super) async fn fields(
     options: &QueryOptions,
     fields: &[ReadField],
     lease: &OperationLease,
+    witness: &query_diagnostic::QueryReadWitness,
 ) -> Result<Option<Vec<Value>>, ObservationError> {
+    use super::super::client_settlement_trace::QueryReadStage as Stage;
     // Arbitrary CSS can match browser implementation nodes. Its policy keeps
     // the complete native inventory path, never this UA-eliding proof.
     if !eligible(expression, fields) || options.secure_field_selector != default_secure_selector() {
         return Ok(None);
     }
+    witness.stage(Stage::FreshInventory);
     validate_frame(client, frame, lease).await?;
     let dom = frame_dom(client, frame, lease).await?;
     let Some((ids, author, domains)) = roots(&dom["root"])? else {
@@ -129,6 +132,7 @@ pub(super) async fn fields(
     // would consume the bounded cleanup command pool until its ACK arrives.
     // Once a resolve may have submitted below, its outcomes keep the existing
     // accounted cleanup, including cancelled/unknown late object creation.
+    witness.stage(Stage::FreshWorld);
     let world = command(
         client,
         session,
@@ -144,6 +148,7 @@ pub(super) async fn fields(
     let group = client
         .readonly_group_instance(&format!("native-query-{}-fields", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
+    witness.stage(Stage::FreshResolve);
     let resolve_owner = resolve_custody::ResolveOwner::capture(client, session, &group, lease);
     let mut resolve_receipts = Vec::new();
     let mut sample_started = false;
@@ -167,6 +172,7 @@ pub(super) async fn fields(
         let function = format!("function(expression,fields,testId,secureSelector,authorRoots,domains,...roots) {{ const read={METADATA}; const matchQuery={MATCH_QUERY}; const security={SECURITY_INVENTORY}; const sample={FRESH_FIELDS}; return sample(expression,fields,testId,secureSelector,authorRoots,domains,read,matchQuery,security,...roots); }}");
         let mut arguments = vec![json!({"value":expression}), json!({"value":fields}), json!({"value":options.test_id_attribute}), json!({"value":options.secure_field_selector}), json!({"value":author}), json!({"value":domains})];
         arguments.extend(handles.iter().map(|object| json!({"objectId":object})));
+        witness.stage(Stage::FreshSample);
         sample_started = true;
         let result = command(client, session, "Runtime.callFunctionOn", json!({"objectId":first,"functionDeclaration":function,"arguments":arguments,"returnByValue":true,"objectGroup":group}), lease).await?;
         if result.get("exceptionDetails").is_some() { return Err(ObservationError::BackendFailure); }
@@ -192,6 +198,9 @@ pub(super) async fn fields(
         }
         Ok(Some(samples))
     }.await;
+    // Freeze an actual sample/resolve failure before cleanup can replace it.
+    witness.observe(&result);
+    witness.stage(Stage::FreshCleanup);
     // This is a local, exact-bound history proof, never an absent-group/debt
     // inference. Reserved, submitted, acknowledged, destroyed and unknown
     // attempts keep the normal cleanup path, even when no handle was returned.
@@ -208,6 +217,7 @@ pub(super) async fn fields(
     }?;
     // A new/retired author root invalidates the acquired policy rather than
     // turning an unseen closed domain into an empty result. Leaf churn does not.
+    witness.stage(Stage::FreshRootsFinal);
     validate_frame(client, frame, lease).await?;
     let current = frame_dom(client, frame, lease).await?;
     if roots(&current["root"])? != Some((ids, author, domains)) {

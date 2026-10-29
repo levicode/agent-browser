@@ -895,6 +895,8 @@ async fn cancelled_pre_swap_replacement_preserves_old_terminal_cleanup_proof() {
     }
 }
 
+#[path = "client_browser_popup_interposition_tests.rs"]
+mod popup_interposition_tests;
 #[path = "client_browser_response_entry_tests.rs"]
 mod response_entry_tests;
 
