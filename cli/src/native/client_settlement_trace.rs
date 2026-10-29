@@ -3641,7 +3641,7 @@ mod query_read_schema_tests {
                 ..Facts::default()
             },
         };
-        assert!(serde_json::to_vec(&record).unwrap().len() + 1 <= MAX_RECORD_BYTES);
+        assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
         assert_eq!(QUERY_MAX_RECORDS, 128);
         assert_eq!(QUERY_MAX_BYTES, 64 * 1024);
     }

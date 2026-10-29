@@ -144,6 +144,7 @@ async fn boundary_case(stop: Stop) {
                 },
                 &[ReadField::Value],
                 &operation,
+                &query_diagnostic::QueryReadWitness::disabled(&operation),
             ))
             .await
     });
