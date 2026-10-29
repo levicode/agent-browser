@@ -5532,6 +5532,7 @@ mod tests {
             let mut held_direct_press: Option<Value> = None;
             let mut point_probe_peer = direct_point_clicks::PointProbePeer::default();
             let mut capacity_probe_peer = direct_point_clicks::CapacityProbePeer::default();
+            let mut capacity_enrollment_started = false;
             let mut held_original_pointer_reply: Option<(Value, Value)> = None;
             let mut held_drag_releases: Vec<Value> = Vec::new();
             let mut retirement_node_scrolled = false;
@@ -5575,6 +5576,13 @@ mod tests {
                 }
                 captured.lock().unwrap().push(observed.clone());
                 let method = request["method"].as_str().unwrap();
+                // Shared fixture geometry precedes enrollment and has one frame.
+                // Expand this synthetic document only at real page enrollment;
+                // its next getFrameTree must still enroll all 33 capacity frames.
+                if mode == direct_point_clicks::CAPACITY_MODE && method == "Page.enable" {
+                    assert_eq!(request["sessionId"], "page");
+                    capacity_enrollment_started = true;
+                }
                 let point_probe_reply = capacity_probe_peer.reply(mode, &request)
                     .or_else(|| point_probe_peer.reply(mode, &request));
                 if direct_point_clicks::intercept_event(mode, &request, false) {
@@ -5931,7 +5939,7 @@ mod tests {
                     "Page.getLayoutMetrics" if retirement_node_swipes::is_mode(mode) => {
                         json!({"cssVisualViewport":{"clientWidth":1280.,"clientHeight":720.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":1280.,"clientHeight":720.}})
                     }
-                    "Page.getFrameTree" if mode == direct_point_clicks::CAPACITY_MODE => direct_point_clicks::capacity_frame_tree(),
+                    "Page.getFrameTree" if mode == direct_point_clicks::CAPACITY_MODE && capacity_enrollment_started => direct_point_clicks::capacity_frame_tree(),
                     "Page.createIsolatedWorld" if mode == direct_point_clicks::CAPACITY_MODE => json!({"executionContextId":direct_point_clicks::probe_context(mode, &request)}),
                     "Page.getFrameTree" => {
                         json!({"frameTree":{"frame":{"id":"main","loaderId":"doc","url":"about:blank"}}})

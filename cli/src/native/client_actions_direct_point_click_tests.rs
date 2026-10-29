@@ -99,6 +99,8 @@ async fn owned_swipe_fixture(mode: &'static str) -> (
 ) {
     assert!(is_swipe_mode(mode));
     let (mut f, ledger, journal) = install_pointer_ledger(fixture(mode).await);
+    // Real enrollment binds session tenure only inside its already owned context.
+    ledger.bind_context(&f.page.targets.context_id).unwrap();
     let broker = Arc::new(super::super::super::client_session::ClientSession::new());
     let (owner, state, notices) = preparation_settlement_owner(&f, broker).await;
     f.state = state;
@@ -804,6 +806,9 @@ async fn unacknowledged_capacity_creation(f: &Fixture) -> Value {
 #[tokio::test]
 async fn direct_point_existing_object_capacity_rejects_before_press_and_cleans_every_observer() {
     let (f, ledger, journal, owner, _notices) = owned_swipe_fixture(CAPACITY_MODE).await;
+    // The shared one-frame geometry setup must not shrink the action's actual
+    // enrolled frame inventory. This reads the real enrollment capability.
+    assert_eq!(owner.capture_point_drag_realms(&f.page, &f.op).unwrap().bindings().len(), 33);
     let original_deadline = f.op.deadline;
     let args = json!({"identityScope":"scope","point":{"x":10,"y":20},"action":{"kind":"swipeTo","target":{"x":110,"y":20}}});
     let action = execute_original_pointer(&f, Some(&owner), &journal, &args);
