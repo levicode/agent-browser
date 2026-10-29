@@ -537,7 +537,7 @@ async fn semantic_snapshot_rejects_strict_polygon_before_any_new_cdp_work() {
             &peer.client,
             "page",
             &frames,
-            super::client_geometry::SemanticCaptureContext {
+            crate::native::client_geometry::SemanticCaptureContext {
                 proof: &proof,
                 policy: &ObservationFramePolicy::default(),
                 identity_scope: "readonly-disposal",

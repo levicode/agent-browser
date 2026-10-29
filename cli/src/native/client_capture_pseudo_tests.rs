@@ -1,5 +1,6 @@
 //! Native snapshot provenance and real generated-paint capture regressions.
 use super::*;
+use serde::Serialize;
 #[test]
 fn capture_pseudo_origins_are_native_bound_and_not_element_receivers() {
     let strings = vec![

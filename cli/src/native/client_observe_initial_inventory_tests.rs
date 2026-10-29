@@ -191,7 +191,7 @@ async fn observe_initial_second_success_retains_its_own_group_without_waiting() 
 
 #[tokio::test]
 async fn observe_initial_first_success_keeps_original_accounted_group_contract() {
-    let fixture = Fixture::new_mode(Race::HeldReleaseWithoutRace, true).await;
+    let fixture = Fixture::new_mode(Race::HeldReleaseWithoutMutation, true).await;
     let (fixture, capture, fence) = prepare(fixture);
     let cleanup = AtomicBool::new(false);
     let frames = acquire(&fixture, &capture, fence, &cleanup, None)
