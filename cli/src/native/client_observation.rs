@@ -8859,22 +8859,23 @@ mod tests {
         );
         assert!(!snapshot.integrity_lost);
         assert!(!journal.snapshot().mutation_dispatched);
-        let methods = log.lock().unwrap();
-        assert_eq!(
-            methods
-                .iter()
-                .filter(|r| r["method"] == "DOM.resolveNode")
-                .count(),
-            1
-        );
-        assert_eq!(
-            methods
-                .iter()
-                .filter(|r| r["method"] == "Runtime.callFunctionOn")
-                .count(),
-            1
-        );
-        drop(methods);
+        {
+            let methods = log.lock().unwrap();
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|r| r["method"] == "DOM.resolveNode")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|r| r["method"] == "Runtime.callFunctionOn")
+                    .count(),
+                1
+            );
+        }
         if !acknowledge_empty_releases && prefix_releases == 32 {
             // Exact baseline causal witness, before the desired invariant fails.
             assert_eq!(prefix_debt, 32);
