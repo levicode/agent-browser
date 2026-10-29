@@ -8669,8 +8669,21 @@ mod tests {
                     }
                     message = socket.next() => {
                         let Some(Ok(message)) = message else { break; };
-                        let Ok(text) = message.to_text() else { continue; };
-                        let request: Value = serde_json::from_str(text).unwrap();
+                        // CDP payloads are Text only. A WebSocket Close is
+                        // transport framing, not an empty JSON response.
+                        let text = match message {
+                            tokio_tungstenite::tungstenite::Message::Text(text) => text,
+                            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                                socket.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.unwrap();
+                                continue;
+                            }
+                            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+                            tokio_tungstenite::tungstenite::Message::Binary(_)
+                            | tokio_tungstenite::tungstenite::Message::Frame(_) => panic!("unexpected non-text CDP fixture frame"),
+                        };
+                        // Malformed Text remains a hard fixture failure.
+                        let request: Value = serde_json::from_str(&text).unwrap();
                         assert_eq!(request["sessionId"], "renderer");
                         seen.lock().unwrap().push(request.clone());
                         let result = match request["method"].as_str().unwrap() {
@@ -8909,8 +8922,21 @@ mod tests {
                     }
                     message = socket.next() => {
                         let Some(Ok(message)) = message else { break; };
-                        let Ok(text) = message.to_text() else { continue; };
-                        let request: Value = serde_json::from_str(text).unwrap();
+                        // CDP payloads are Text only. A WebSocket Close is
+                        // transport framing, not an empty JSON response.
+                        let text = match message {
+                            tokio_tungstenite::tungstenite::Message::Text(text) => text,
+                            tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                            tokio_tungstenite::tungstenite::Message::Ping(payload) => {
+                                socket.send(tokio_tungstenite::tungstenite::Message::Pong(payload)).await.unwrap();
+                                continue;
+                            }
+                            tokio_tungstenite::tungstenite::Message::Pong(_) => continue,
+                            tokio_tungstenite::tungstenite::Message::Binary(_)
+                            | tokio_tungstenite::tungstenite::Message::Frame(_) => panic!("unexpected non-text CDP fixture frame"),
+                        };
+                        // Malformed Text remains a hard fixture failure.
+                        let request: Value = serde_json::from_str(&text).unwrap();
                         assert_eq!(request["sessionId"], "renderer");
                         seen.lock().unwrap().push(request.clone());
                         let result = match request["method"].as_str().unwrap() {
