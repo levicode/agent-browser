@@ -38,6 +38,44 @@ async fn send_preparation_popup(
             "targetId":target,"type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await.unwrap();
 }
 
+// These finite owner-retirement fixtures inject one event at a time and do
+// not emit automatic lifecycle events. Observe that exact subscription prefix,
+// not capture admission: the caller deliberately retains a pending initializer.
+async fn popup_preparation_emit_applied(
+    owner: &Arc<ClientEnrollment>,
+    emit: &tokio::sync::mpsc::Sender<Value>,
+    event: Value,
+) {
+    let watermark = owner.realm_watermark().unwrap();
+    let frontier = watermark.received().unwrap().checked_add(1).unwrap();
+    emit.send(event).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let changed = owner.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            owner.check().unwrap();
+            assert!(watermark.same_subscription(&owner.realm_watermark().unwrap()));
+            let received = watermark.received().unwrap();
+            assert!(received <= frontier, "unexpected extra fixture event");
+            {
+                let index = owner.index.lock().unwrap();
+                assert!(index.failure.is_none());
+                if received == frontier && index.applied_watermark >= frontier {
+                    assert!(
+                        !index.pending_enrollment.is_empty(),
+                        "event application must not wait away the retained initializer"
+                    );
+                    return;
+                }
+            }
+            changed.await;
+        }
+    })
+    .await
+    .expect("injected popup-control event was not received and applied");
+}
+
 async fn popup_preparation_negative_case(mode: &str) {
     let (owner, page, _notices, log, emit, server, connection) =
         popup_preparation_owner("owner-retirement").await;
@@ -90,7 +128,7 @@ async fn popup_preparation_negative_case(mode: &str) {
                 cancel.send_replace(CancelSignal::Requested);
             }
             "created" => {
-                realm_emit(&owner, &emit, json!({"method":"Runtime.executionContextCreated","sessionId":"initial",
+                popup_preparation_emit_applied(&owner, &emit, json!({"method":"Runtime.executionContextCreated","sessionId":"initial",
                     "params":{"context":{"id":901,"uniqueId":"main-replacement","name":"","auxData":{"frameId":"frame-initial","isDefault":true}}}})).await;
             }
             "navigation-aba" => {
@@ -101,7 +139,7 @@ async fn popup_preparation_negative_case(mode: &str) {
                     .observe_eval_revision("initial", "initial-target")
                     .unwrap();
                 for loader in ["replacement-loader", "synthetic-loader"] {
-                    realm_emit(&owner, &emit, json!({"method":"Page.frameNavigated","sessionId":"initial",
+                    popup_preparation_emit_applied(&owner, &emit, json!({"method":"Page.frameNavigated","sessionId":"initial",
                         "params":{"frame":{"id":"frame-initial","loaderId":loader,"url":"about:blank"}}})).await;
                 }
                 assert_eq!(
@@ -121,7 +159,7 @@ async fn popup_preparation_negative_case(mode: &str) {
             "later-cohort" => {
                 let recheck = recheck.as_ref().unwrap();
                 recheck.wait_entered().await;
-                realm_emit(&owner, &emit, json!({"method":"Target.attachedToTarget","params":{
+                popup_preparation_emit_applied(&owner, &emit, json!({"method":"Target.attachedToTarget","params":{
                     "sessionId":"later-popup-session","waitingForDebugger":true,"targetInfo":{
                         "targetId":"later-popup-target","type":"page","browserContextId":"owned-context","openerId":"initial-target"}}})).await;
                 tokio::time::timeout(Duration::from_secs(2), async {
@@ -330,7 +368,7 @@ async fn popup_finish_then_detach_before_receipt_does_not_manufacture_initialize
         .unwrap()
         .capture_ready());
     let receipt = owner.index.lock().unwrap().pending_eval_initialization["popup-session"].clone();
-    realm_emit(
+    popup_preparation_emit_applied(
         &owner,
         &emit,
         json!({"method":"Target.detachedFromTarget","params":{

@@ -63,22 +63,23 @@ async fn viewport_changes_restore_values_but_never_restore_configuration_revisio
         state.script_registration_ack_ordinals("page").unwrap(),
         vec![0]
     );
-    let requests = log.lock().unwrap();
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request["method"] == "Page.addScriptToEvaluateOnNewDocument")
-            .count(),
-        1
-    );
-    assert_eq!(
-        requests
-            .iter()
-            .filter(|request| request["method"] == "Emulation.setDeviceMetricsOverride")
-            .count(),
-        3
-    );
-    drop(requests);
+    {
+        let requests = log.lock().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "Page.addScriptToEvaluateOnNewDocument")
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "Emulation.setDeviceMetricsOverride")
+                .count(),
+            3
+        );
+    }
     server.abort();
     let _ = server.await;
 }
