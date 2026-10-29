@@ -10248,6 +10248,38 @@ mod tests {
         server2.abort();
     }
     #[tokio::test]
+    async fn exact_realm_destroy_requires_matching_unique_receipt_before_marking_destroyed() {
+        let (owner, page, _notices, emit, server) = realm_test_owner().await;
+        let op = owner.operation();
+        let capture = owner.reserve_exact_realm(&page, &realm_test_binding(), &op).unwrap();
+        realm_emit(&owner, &emit, realm_created(7, "original-unique")).await;
+        let ticket = capture.bind(7, &op).await.unwrap();
+        let entry = owner.index.lock().unwrap().sessions.get("initial").unwrap().clone();
+        for params in [
+            json!({"executionContextId":7}),
+            json!({"executionContextId":7,"executionContextUniqueId":"foreign-unique"}),
+        ] {
+            let event: CdpEvent = serde_json::from_value(json!({
+                "method":"Runtime.executionContextDestroyed", "sessionId":"initial", "params":params,
+            })).unwrap();
+            // Exercise the unchanged production validator. Missing/mismatched
+            // identity is a protocol failure, not successful realm destruction.
+            assert_eq!(owner.realm_event(&entry, &event), Err(ProtocolError::InvalidFrame));
+            assert_eq!(ticket.destroyed(), Ok(false));
+            assert!(owner.index.lock().unwrap().realms.contains_key(&("initial".into(), 7)));
+        }
+        let event: CdpEvent = serde_json::from_value(json!({
+            "method":"Runtime.executionContextDestroyed", "sessionId":"initial",
+            "params":{"executionContextId":7,"executionContextUniqueId":"original-unique"},
+        })).unwrap();
+        assert_eq!(owner.realm_event(&entry, &event), Ok(()));
+        assert_eq!(ticket.destroyed(), Ok(true));
+        drop(ticket);
+        drop(page);
+        owner.close().await.unwrap();
+        server.abort();
+    }
+    #[tokio::test]
     async fn exact_realm_destroy_before_bind_survives_numeric_id_reuse_and_needs_new_document() {
         let (owner, page, _notices, emit, server) = realm_test_owner().await;
         let op = owner.operation();

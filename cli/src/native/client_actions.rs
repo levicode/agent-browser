@@ -5611,7 +5611,7 @@ mod tests {
                 {
                     socket.send(tokio_tungstenite::tungstenite::Message::Text(
                         json!({"method":"Runtime.executionContextDestroyed","sessionId":"page",
-                            "params":{"executionContextId":1}}).to_string()
+                            "params":{"executionContextId":1,"executionContextUniqueId":"point-swipe-realm-1"}}).to_string()
                     )).await.unwrap();
                 }
                 if mode == direct_point_clicks::CLEANUP_LATE_OWN_MODE
