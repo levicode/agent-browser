@@ -8644,6 +8644,442 @@ mod tests {
         }
     }
 
+    // Real managed fresh-fields commands, not the selector fallback or an injected
+    // cleanup-dirty flag. The peer withholds only exact release acknowledgements.
+    async fn fresh_fields_after_stopped_worlds(acknowledge_empty_releases: bool) {
+        use super::super::client_debt::{AdmissionClass, OperationKey, OwnerDebtLedger};
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen = log.clone();
+        let (world_tx, mut worlds) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (late_tx, mut late_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let mut world_count = 0;
+            loop {
+                tokio::select! {
+                    Some(reply) = late_rx.recv() => {
+                        socket.send(tokio_tungstenite::tungstenite::Message::Text(reply.to_string())).await.unwrap();
+                    }
+                    message = socket.next() => {
+                        let Some(Ok(message)) = message else { break; };
+                        let Ok(text) = message.to_text() else { continue; };
+                        let request: Value = serde_json::from_str(text).unwrap();
+                        assert_eq!(request["sessionId"], "renderer");
+                        seen.lock().unwrap().push(request.clone());
+                        let result = match request["method"].as_str().unwrap() {
+                            "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}}),
+                            "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":99,"children":[]}}),
+                            "Page.createIsolatedWorld" => {
+                                world_count += 1;
+                                if world_count <= 32 {
+                                    world_tx.send(request).unwrap();
+                                    continue;
+                                }
+                                json!({"executionContextId":1})
+                            }
+                            "DOM.resolveNode" => json!({"object":{"objectId":"owned-document","subtype":"node"}}),
+                            "Runtime.callFunctionOn" => {
+                                assert_eq!(request["params"]["returnByValue"], true);
+                                json!({"result":{"value":{"values":[]}}})
+                            }
+                            "Runtime.releaseObjectGroup" => {
+                                // Prefixes never submitted a group-producing command.
+                                // The final real group is also held to prove handoff != ACK.
+                                if !acknowledge_empty_releases || world_count > 32 { continue; }
+                                json!({})
+                            }
+                            other => panic!("unexpected fresh-fields command: {other}"),
+                        };
+                        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"sessionId":"renderer","result":result}).to_string()
+                        )).await.unwrap();
+                    }
+                }
+            }
+        });
+        let transport = CdpClient::connect(&endpoint).await.unwrap();
+        let ledger = OwnerDebtLedger::new(1, "stopped-world-owner".into());
+        transport.install_debt_ledger(ledger.clone()).unwrap();
+        let client = transport.owner_view(ledger.clone()).unwrap();
+        let expression: LocatorExpression = serde_json::from_value(json!({"kind":"query","query":{"kind":"testId","value":{"kind":"string","value":"city","exact":true}}})).unwrap();
+        for sequence in 1..=32 {
+            let (mut operation, cancellation) = lease();
+            operation.sequence = sequence;
+            // One real deadline and 31 explicit cancellations, all after the
+            // exact world request is on the wire and before any resolve reply.
+            if sequence == 1 {
+                operation.deadline = std::time::Instant::now() + Duration::from_millis(200);
+            }
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: sequence,
+                    },
+                    "target".into(),
+                    "renderer".into(),
+                )
+                .unwrap();
+            journal.bind_operation(&operation).unwrap();
+            ledger.check_admission(AdmissionClass::Reference).unwrap();
+            let (read_client, query) = (client.clone(), expression.clone());
+            let read = tokio::spawn(async move {
+                journal
+                    .scope(fresh_query::fields(
+                        &read_client,
+                        &frame(),
+                        &query,
+                        &QueryOptions {
+                            expression: query.clone(),
+                            test_id_attribute: default_test_id(),
+                            secure_field_selector: default_secure_selector(),
+                        },
+                        &[ReadField::Value],
+                        &operation,
+                    ))
+                    .await
+            });
+            let world = tokio::time::timeout(Duration::from_secs(1), worlds.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if sequence != 1 {
+                cancellation.send_replace(CancelSignal::Requested);
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), read)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                result,
+                Err(if sequence == 1 {
+                    ObservationError::DeadlineExceeded
+                } else {
+                    ObservationError::Cancelled
+                })
+            );
+            late_tx.send(json!({"id":world["id"],"sessionId":"renderer","result":{"executionContextId":1}})).unwrap();
+            // Wait for the real late world response and transport writes, never
+            // reset the ledger or count queue custody as a release receipt.
+            tokio::time::timeout(Duration::from_secs(1), async {
+                loop {
+                    let releases = log
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|r| r["method"] == "Runtime.releaseObjectGroup")
+                        .count() as u32;
+                    let expected = if acknowledge_empty_releases {
+                        0
+                    } else {
+                        releases
+                    };
+                    if ledger.snapshot().outstanding_commands == expected {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            let snapshot = ledger.snapshot();
+            assert_eq!((snapshot.input_debt, snapshot.object_debt), (0, 0));
+            assert!(!snapshot.integrity_lost);
+            assert!(!log
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|r| r["method"] == "DOM.resolveNode"));
+        }
+        let prefix_releases = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r["method"] == "Runtime.releaseObjectGroup")
+            .count();
+        let prefix_debt = ledger.snapshot().outstanding_commands;
+        if !acknowledge_empty_releases {
+            assert_eq!(prefix_debt as usize, prefix_releases);
+        } else {
+            assert_eq!(prefix_debt, 0);
+        }
+        ledger.check_admission(AdmissionClass::Reference).unwrap();
+        let (mut operation, _cancellation) = lease();
+        operation.sequence = 33;
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 33,
+                },
+                "target".into(),
+                "renderer".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&operation).unwrap();
+        let result = journal
+            .scope(fresh_query::fields(
+                &client,
+                &frame(),
+                &expression,
+                &QueryOptions {
+                    expression: expression.clone(),
+                    test_id_attribute: default_test_id(),
+                    secure_field_selector: default_secure_selector(),
+                },
+                &[ReadField::Value],
+                &operation,
+            ))
+            .await;
+        let snapshot = ledger.snapshot();
+        assert_eq!(snapshot.input_debt, 0);
+        assert_eq!(
+            snapshot.object_debt, 1,
+            "real group remains owned until matching ACK"
+        );
+        assert!(!snapshot.integrity_lost);
+        assert!(!journal.snapshot().mutation_dispatched);
+        let methods = log.lock().unwrap();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|r| r["method"] == "DOM.resolveNode")
+                .count(),
+            1
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|r| r["method"] == "Runtime.callFunctionOn")
+                .count(),
+            1
+        );
+        drop(methods);
+        if !acknowledge_empty_releases && prefix_releases == 32 {
+            // Exact baseline causal witness, before the desired invariant fails.
+            assert_eq!(prefix_debt, 32);
+            assert_eq!(
+                result,
+                Err(ObservationError::CleanupFailed { primary: None })
+            );
+            eprintln!("READONLY_CAPACITY_BASELINE_WITNESS cleanup_commands=32 object_debt=1 input_debt=0 resolve_count=1 sample_count=1");
+        }
+        server.abort();
+        let _ = server.await;
+        assert_eq!(result, Ok(Some(Vec::new())), "stopped before DOM.resolveNode: empty cleanup must not exhaust later real-group disposal capacity");
+    }
+
+    #[tokio::test]
+    async fn stopped_worlds_without_release_ack_do_not_poison_later_fresh_fields() {
+        fresh_fields_after_stopped_worlds(false).await;
+    }
+
+    #[tokio::test]
+    async fn stopped_worlds_with_exact_release_ack_leave_fresh_fields_usable() {
+        fresh_fields_after_stopped_worlds(true).await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_fresh_fields_resolve_retains_group_until_late_disposal_ack() {
+        use super::super::client_debt::{AdmissionClass, OperationKey, OwnerDebtLedger};
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, Mutex};
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let log = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let seen = log.clone();
+        let (held_tx, mut held_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            loop {
+                tokio::select! {
+                    Some(reply) = reply_rx.recv() => {
+                        socket.send(tokio_tungstenite::tungstenite::Message::Text(reply.to_string())).await.unwrap();
+                    }
+                    message = socket.next() => {
+                        let Some(Ok(message)) = message else { break; };
+                        let Ok(text) = message.to_text() else { continue; };
+                        let request: Value = serde_json::from_str(text).unwrap();
+                        assert_eq!(request["sessionId"], "renderer");
+                        seen.lock().unwrap().push(request.clone());
+                        let result = match request["method"].as_str().unwrap() {
+                            "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}}),
+                            "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":99,"children":[]}}),
+                            "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                            "DOM.resolveNode" | "Runtime.releaseObjectGroup" => {
+                                held_tx.send(request).unwrap();
+                                continue;
+                            }
+                            other => panic!("unexpected stopped-resolve command: {other}"),
+                        };
+                        socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"sessionId":"renderer","result":result}).to_string()
+                        )).await.unwrap();
+                    }
+                }
+            }
+        });
+        let transport = CdpClient::connect(&endpoint).await.unwrap();
+        let ledger = OwnerDebtLedger::new(1, "stopped-resolve-owner".into());
+        transport.install_debt_ledger(ledger.clone()).unwrap();
+        let client = transport.owner_view(ledger.clone()).unwrap();
+        let (operation, cancellation) = lease();
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "renderer".into(),
+            )
+            .unwrap();
+        journal.bind_operation(&operation).unwrap();
+        ledger.check_admission(AdmissionClass::Reference).unwrap();
+        let read_journal = journal.clone();
+        let read = tokio::spawn(async move {
+            let query: LocatorExpression = serde_json::from_value(json!({"kind":"query","query":{"kind":"testId","value":{"kind":"string","value":"city","exact":true}}})).unwrap();
+            read_journal
+                .scope(fresh_query::fields(
+                    &client,
+                    &frame(),
+                    &query,
+                    &QueryOptions {
+                        expression: query.clone(),
+                        test_id_attribute: default_test_id(),
+                        secure_field_selector: default_secure_selector(),
+                    },
+                    &[ReadField::Value],
+                    &operation,
+                ))
+                .await
+        });
+        let resolve = tokio::time::timeout(Duration::from_secs(1), held_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolve["method"], "DOM.resolveNode");
+        assert_eq!(resolve["sessionId"], "renderer");
+        let group = resolve["params"]["objectGroup"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(group.starts_with("native-query-1-fields"));
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        cancellation.send_replace(CancelSignal::Requested);
+        let result = tokio::time::timeout(Duration::from_secs(1), read)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(result, Err(ObservationError::Cancelled));
+        let first_release = tokio::time::timeout(Duration::from_secs(1), held_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first_release["method"], "Runtime.releaseObjectGroup");
+        assert_eq!(first_release["sessionId"], "renderer");
+        assert_eq!(first_release["params"]["objectGroup"], group);
+        assert_eq!(ledger.snapshot().outstanding_commands, 2);
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(!journal.snapshot().mutation_dispatched);
+        assert!(!ledger.snapshot().integrity_lost);
+
+        // The read is already cancelled, but the actual submitted creation can
+        // still return an object. Its receiver disappearing does not erase debt.
+        reply_tx
+            .send(json!({"id":resolve["id"],"sessionId":"renderer",
+            "result":{"object":{"objectId":"late-owned-document","subtype":"node"}}}))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ledger.snapshot().outstanding_commands != 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert!(
+            held_rx.try_recv().is_err(),
+            "the first release is still in flight"
+        );
+        // This release was submitted while creation was pending. Even a matching
+        // ACK is not proof that the late-created handle was disposed: the ledger
+        // must issue one new exact release after creation has settled.
+        reply_tx
+            .send(json!({"id":first_release["id"],"sessionId":"renderer","result":{}}))
+            .unwrap();
+        let final_release = tokio::time::timeout(Duration::from_secs(1), held_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_release["method"], "Runtime.releaseObjectGroup");
+        assert_eq!(final_release["sessionId"], "renderer");
+        assert_eq!(final_release["params"]["objectGroup"], group);
+        assert_ne!(final_release["id"], first_release["id"]);
+        assert_eq!(
+            ledger.snapshot().object_debt,
+            1,
+            "first release ACK cannot clear late creation"
+        );
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        reply_tx
+            .send(json!({"id":final_release["id"],"sessionId":"renderer","result":{}}))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ledger.snapshot().outstanding_commands != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ledger.snapshot().object_debt, 0);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(!journal.snapshot().mutation_dispatched);
+        assert!(
+            held_rx.try_recv().is_err(),
+            "disposal is once-only after the late creation"
+        );
+        {
+            let methods = log.lock().unwrap();
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|r| r["method"] == "DOM.resolveNode")
+                    .count(),
+                1
+            );
+            assert_eq!(
+                methods
+                    .iter()
+                    .filter(|r| r["method"] == "Runtime.releaseObjectGroup")
+                    .count(),
+                2
+            );
+            assert!(!methods
+                .iter()
+                .any(|r| r["method"] == "Runtime.callFunctionOn"
+                    || r["method"].as_str().unwrap().starts_with("Input.")));
+        }
+        transport.close().await;
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[tokio::test]
     async fn fixture_fields_keep_frame_cancellation_and_cleanup_guards_without_publication() {
         use futures_util::{SinkExt, StreamExt};

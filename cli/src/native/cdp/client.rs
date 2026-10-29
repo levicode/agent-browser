@@ -3604,6 +3604,170 @@ mod tests {
         }
     }
 
+    /// Empty-group release ACK debt consumes a different bounded pool from
+    /// object debt. This is a transport characterization, not permission for a
+    /// query caller to acquire a group without guaranteed disposal custody.
+    #[tokio::test]
+    async fn readonly_empty_group_acks_exhaust_cleanup_before_reference_admission() {
+        use crate::native::client_debt::{
+            command_scope, native_object_group, AdmissionClass, CommandCategory, OperationKey,
+        };
+        let (transport, mut requests, replies, peer) = service_worker_test_peer().await;
+        let ledger = OwnerDebtLedger::new(1, "readonly-empty-groups".into());
+        let journal = ledger
+            .operation(
+                OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        transport.install_debt_ledger(ledger.clone()).unwrap();
+        let client = transport.owner_view(ledger.clone()).unwrap();
+        let mut empty_releases = Vec::new();
+        for index in 0..32 {
+            let group = client
+                .readonly_group_instance("native-query-1-fields")
+                .unwrap();
+            journal
+                .scope(async { client.handoff_readonly_group_release("page", &group) })
+                .await
+                .unwrap();
+            // Observe the real write before proceeding: queue/byte permits are
+            // no longer the limiting resource, but no release ACK is supplied.
+            let release = service_worker_request(&mut requests).await;
+            assert_eq!(release["method"], "Runtime.releaseObjectGroup");
+            assert_eq!(release["sessionId"], "page");
+            assert_eq!(release["params"]["objectGroup"], group);
+            assert!(empty_releases
+                .iter()
+                .all(|old: &Value| old["params"]["objectGroup"] != group));
+            empty_releases.push(release);
+            let snapshot = ledger.snapshot();
+            assert_eq!(snapshot.input_debt, 0);
+            assert_eq!(snapshot.object_debt, 0);
+            assert_eq!(snapshot.outstanding_commands, index + 1);
+            assert!(!snapshot.integrity_lost);
+        }
+        assert_eq!(ledger.check_admission(AdmissionClass::Reference), Ok(()));
+        let group = client
+            .readonly_group_instance("native-query-1-fields")
+            .unwrap();
+        let (read_client, read_journal, read_group) =
+            (client.clone(), journal.clone(), group.clone());
+        let read = tokio::spawn(async move {
+            read_journal
+                .scope(native_object_group(
+                    &read_group,
+                    command_scope(
+                        CommandCategory::ApplicationObject,
+                        false,
+                        read_client.send_command(
+                            "DOM.resolveNode",
+                            Some(json!({"backendNodeId":7,"objectGroup":read_group})),
+                            Some("page"),
+                        ),
+                    ),
+                ))
+                .await
+        });
+        let request = service_worker_request(&mut requests).await;
+        assert_eq!(request["method"], "DOM.resolveNode");
+        assert_eq!(request["sessionId"], "page");
+        assert_eq!(request["params"]["objectGroup"], group);
+        replies
+            .send(json!({"id":request["id"],"sessionId":"page",
+            "result":{"object":{"objectId":"owned-after-empty-releases","subtype":"node"}}}))
+            .unwrap();
+        read.await.unwrap().unwrap();
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert_eq!(ledger.snapshot().outstanding_commands, 32);
+        // Typed refusal proves the bounded ledger pool, rather than queue
+        // congestion or an owner mismatch, caused the failed handoff.
+        let params = json!({"objectGroup":group});
+        let refusal = journal
+            .scope(async {
+                client.reserve_tracked_command_observed_typed(
+                    "Runtime.releaseObjectGroup",
+                    Some(&params),
+                    Some("page"),
+                    &mut AdmissionObservation::default(),
+                )
+            })
+            .await;
+        assert!(matches!(
+            refusal,
+            Err(TrackedReservationFailure::Ledger(
+                ProtocolError::CapacityExceeded
+            ))
+        ));
+        assert!(journal
+            .scope(async { client.handoff_readonly_group_release("page", &group) })
+            .await
+            .is_err());
+        assert_eq!(
+            ledger.snapshot().object_debt,
+            1,
+            "refusal retains the acquired group"
+        );
+        assert_eq!(ledger.snapshot().outstanding_commands, 32);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(
+            requests.try_recv().is_err(),
+            "refused release must not be written"
+        );
+
+        // One matching empty-group ACK frees precisely one command slot; it
+        // cannot discharge the unrelated acquired group's debt.
+        replies
+            .send(service_worker_response(&empty_releases[0], false))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ledger.snapshot().outstanding_commands != 31 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        journal
+            .scope(async { client.handoff_readonly_group_release("page", &group) })
+            .await
+            .unwrap();
+        let release = service_worker_request(&mut requests).await;
+        assert_eq!(release["method"], "Runtime.releaseObjectGroup");
+        assert_eq!(release["sessionId"], "page");
+        assert_eq!(release["params"]["objectGroup"], group);
+        assert_eq!(ledger.snapshot().object_debt, 1, "handoff is not an ACK");
+        replies
+            .send(service_worker_response(&release, false))
+            .unwrap();
+        for release in &empty_releases[1..] {
+            replies
+                .send(service_worker_response(release, false))
+                .unwrap();
+        }
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ledger.snapshot().outstanding_commands != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(ledger.snapshot().object_debt, 0);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+        assert!(
+            requests.try_recv().is_err(),
+            "no input or extra cleanup was dispatched"
+        );
+        transport.close().await;
+        peer.await.unwrap();
+    }
+
     #[tokio::test]
     async fn readonly_disposal_capacity_refusal_keeps_exact_acquired_group_custody() {
         use crate::native::client_debt::{
