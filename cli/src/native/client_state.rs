@@ -1848,3 +1848,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "client_state_close_receipt_tests.rs"]
+mod close_receipt_tests;

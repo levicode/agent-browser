@@ -8623,6 +8623,7 @@ mod tests {
     include!("client_restart_readiness_tests.rs");
     include!("client_viewport_replacement_tests.rs");
     include!("client_eval_network_watermark_tests.rs");
+    include!("client_capture_tenure_retained_tests.rs");
     fn coordinator(
         client: Arc<CdpClient>,
         context: &str,
