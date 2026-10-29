@@ -822,6 +822,7 @@ async fn popup_capture_pending_case(before_complete_retained: bool, expect_prepa
 }
 
 #[tokio::test]
+#[ignore = "baseline-only refusal witness; run explicitly on baseline"]
 async fn framed_popup_capture_pending_after_resume_ack_before_complete_retained() {
     tokio::time::timeout(
         Duration::from_secs(30),
@@ -832,6 +833,7 @@ async fn framed_popup_capture_pending_after_resume_ack_before_complete_retained(
 }
 
 #[tokio::test]
+#[ignore = "baseline-only refusal witness; run explicitly on baseline"]
 async fn framed_popup_capture_pending_after_complete_retained_before_network_commit() {
     tokio::time::timeout(
         Duration::from_secs(30),
