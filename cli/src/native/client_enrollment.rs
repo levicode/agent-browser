@@ -3,6 +3,9 @@
 //! The authoritative identity/purpose registry remains ClientTargets.
 #[path = "client_enrollment_page_query.rs"]
 mod page_query;
+#[path = "client_enrollment_point_drag.rs"]
+mod point_drag;
+pub(crate) use point_drag::PointDragRealms;
 use super::cdp::client::{BoundedEventWatermark, BoundedMethodEvents, CdpClient};
 use super::cdp::types::CdpEvent;
 use super::client_app_events::{AppNavigationContext, AppNavigationKind};

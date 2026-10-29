@@ -15,6 +15,9 @@ use super::client_settlement_trace::{
 };
 use super::element::{self, ExactBinding, RefMap};
 use super::recording::{self, CaptureOptions, RecordingOptions, RecordingState};
+#[path = "client_point_drag.rs"]
+mod point_drag;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -1382,6 +1385,7 @@ impl ClientActions {
 /// The caller has admitted the exact page and owns both guards. There is no
 /// DOM-reference or renderer geometry authority in this direct-input context.
 pub(crate) struct DirectPointContext<'a> {
+    pub realm_authority: ActionRealmAuthority<'a>,
     pub page: &'a BrowserExecutionLease,
     pub operation: &'a OperationLease,
     pub page_state: &'a ClientPageState,
@@ -1484,29 +1488,7 @@ impl DirectPointRunner<'_, '_> {
         to: Point,
         pace: Option<Duration>,
     ) -> Result<(), ProtocolError> {
-        self.event("mouseMoved", from, None, None).await?;
-        self.event("mousePressed", from, Some("left"), Some(1))
-            .await?;
-        let steps = pace
-            .map(|pace| (pace.as_millis() / 16).max(2) as usize)
-            .unwrap_or(2);
-        let start = Instant::now();
-        for step in 1..=steps {
-            if let Some(pace) = pace {
-                let due = start + pace.mul_f64(step as f64 / steps as f64);
-                if let Some(wait) = due.checked_duration_since(Instant::now()) {
-                    self.pause(wait).await?;
-                }
-            }
-            let fraction = step as f64 / steps as f64;
-            let point = Point {
-                x: from.x + (to.x - from.x) * fraction,
-                y: from.y + (to.y - from.y) * fraction,
-            }
-            .validate()?;
-            self.event("mouseMoved", point, None, None).await?;
-        }
-        self.event("mouseReleased", to, Some("left"), Some(1)).await
+        point_drag::execute(self, from, to, pace).await
     }
 }
 impl ClientActions {
@@ -5466,7 +5448,7 @@ mod tests {
         page: BrowserExecutionLease,
         op: OperationLease,
         _cancel: tokio::sync::watch::Sender<CancelSignal>,
-        state: ClientPageState,
+        state: Arc<ClientPageState>,
         refs: RefMap,
         blobs: BlobStore,
         frames: HashMap<String, String>,
@@ -5548,6 +5530,8 @@ mod tests {
             let mut held_focus_release: Option<Value> = None;
             let mut held_debt_release: Option<Value> = None;
             let mut held_direct_press: Option<Value> = None;
+            let mut point_probe_peer = direct_point_clicks::PointProbePeer::default();
+            let mut capacity_probe_peer = direct_point_clicks::CapacityProbePeer::default();
             let mut held_original_pointer_reply: Option<(Value, Value)> = None;
             let mut held_drag_releases: Vec<Value> = Vec::new();
             let mut retirement_node_scrolled = false;
@@ -5591,6 +5575,13 @@ mod tests {
                 }
                 captured.lock().unwrap().push(observed.clone());
                 let method = request["method"].as_str().unwrap();
+                let point_probe_reply = capacity_probe_peer.reply(mode, &request)
+                    .or_else(|| point_probe_peer.reply(mode, &request));
+                if direct_point_clicks::intercept_event(mode, &request, false) {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                        direct_point_clicks::native_drag_event().to_string()
+                    )).await.unwrap();
+                }
                 if mode == direct_point_clicks::CANCEL_MODE
                     && method == "Input.dispatchMouseEvent"
                     && request["params"]["type"] == "mouseMoved"
@@ -5859,7 +5850,17 @@ mod tests {
                 } else {
                     "Save"
                 };
+                if direct_point_clicks::is_swipe_mode(mode) && method == "Page.createIsolatedWorld" {
+                    let context = direct_point_clicks::probe_context(mode, &request);
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"method":"Runtime.executionContextCreated","sessionId":"page",
+                            "params":{"context":{"id":context,"uniqueId":format!("point-swipe-realm-{context}"),
+                            "name":"agent-browser-native-observation",
+                            "auxData":{"frameId":request["params"]["frameId"],"isDefault":false}}}}).to_string()
+                    )).await.unwrap();
+                }
                 let result = match method {
+                    _ if point_probe_reply.is_some() => point_probe_reply.unwrap(),
                     "Runtime.callFunctionOn"
                         if mode.starts_with("preparation-tap-before-press-")
                             && source == TAP_RECEIVER_AFTER_HOVER =>
@@ -5930,10 +5931,12 @@ mod tests {
                     "Page.getLayoutMetrics" if retirement_node_swipes::is_mode(mode) => {
                         json!({"cssVisualViewport":{"clientWidth":1280.,"clientHeight":720.,"offsetX":0.,"offsetY":0.,"scale":1.},"cssLayoutViewport":{"clientWidth":1280.,"clientHeight":720.}})
                     }
+                    "Page.getFrameTree" if mode == direct_point_clicks::CAPACITY_MODE => direct_point_clicks::capacity_frame_tree(),
+                    "Page.createIsolatedWorld" if mode == direct_point_clicks::CAPACITY_MODE => json!({"executionContextId":direct_point_clicks::probe_context(mode, &request)}),
                     "Page.getFrameTree" => {
                         json!({"frameTree":{"frame":{"id":"main","loaderId":"doc","url":"about:blank"}}})
                     }
-                    "Target.getTargets" if mode.starts_with("preparation-") => {
+                    "Target.getTargets" if mode.starts_with("preparation-") || direct_point_clicks::is_swipe_mode(mode) => {
                         json!({"targetInfos":[{"targetId":"target","browserContextId":"context","type":"page"}]})
                     }
                     "Page.createIsolatedWorld" => json!({"executionContextId":1}),
@@ -6244,7 +6247,12 @@ mod tests {
                     "Runtime.evaluate" => json!({"result":{"value":true}}),
                     _ => json!({}),
                 };
-                let mut reply = if mode == "preparation-readonly-command-hard-error"
+                let mut reply = if direct_point_clicks::known_input_error(mode, &request) {
+                    json!({"id":request["id"],"error":{"code":-32000,"message":"controlled terminal input ErrorAck"}})
+                } else if mode == direct_point_clicks::HTML5_REJECT_MODE
+                    && method == "Input.dispatchDragEvent" && request["params"]["type"] == "drop" {
+                    json!({"id":request["id"],"error":{"code":-32000,"message":"controlled drop rejection"}})
+                } else if mode == "preparation-readonly-command-hard-error"
                     && method == "Runtime.callFunctionOn"
                     && source == "function(){return 'command-projection-control';}"
                 {
@@ -6379,6 +6387,11 @@ mod tests {
                 {
                     break;
                 }
+                if direct_point_clicks::intercept_event(mode, &request, true) {
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(
+                        direct_point_clicks::native_drag_event().to_string()
+                    )).await.unwrap();
+                }
                 let mut observed_reply = json!({"request":request,"reply":reply});
                 if direct_point_clicks::is_pointer_mode(mode) {
                     observed_reply["directPointPeerAckStartNanos"] =
@@ -6456,7 +6469,7 @@ mod tests {
             page,
             op,
             _cancel: cancel,
-            state: ClientPageState::new(scope.into(), "context".into()),
+            state: Arc::new(ClientPageState::new(scope.into(), "context".into())),
             refs,
             blobs,
             frames: HashMap::new(),
@@ -6507,7 +6520,7 @@ mod tests {
                 .await
                 .unwrap();
             let input = tokio::sync::Mutex::new(());
-            let result=ClientActions::default().execute_direct_point(DirectPointContext{page:&f.page,operation:&f.op,page_state:&f.state,journal:&journal,ui,input:input.lock().await},&json!({"identityScope":"scope","point":{"x":8,"y":9},"action":{"kind":"doubleTap"}})).await;
+            let result=ClientActions::default().execute_direct_point(DirectPointContext{realm_authority:ActionRealmAuthority::UntrackedFixture,page:&f.page,operation:&f.op,page_state:&f.state,journal:&journal,ui,input:input.lock().await},&json!({"identityScope":"scope","point":{"x":8,"y":9},"action":{"kind":"doubleTap"}})).await;
             if cancelled {
                 assert!(result.is_err());
                 assert_eq!(ledger.snapshot().input_debt, 1);

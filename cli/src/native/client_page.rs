@@ -23,6 +23,9 @@ use super::interaction::{char_to_key_info, key_text, named_key_info};
 
 #[path = "client_navigation_retirement.rs"]
 mod navigation_retirement;
+#[path = "client_point_drag_debt.rs"]
+mod point_drag_debt;
+pub(crate) use point_drag_debt::PointDragToken;
 
 #[derive(Clone, Default)]
 struct Config {
@@ -92,6 +95,7 @@ struct State {
     uncertain_scripts: BTreeSet<String>,
     configuration_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
     input: InputState,
+    point_drag: Option<Arc<Mutex<point_drag_debt::PointDragDebt>>>,
     input_cleanup: Option<(Vec<CommandStatusHandle>, InputState)>,
     origins: BTreeSet<String>,
     requested_viewport: Option<(u32, u32)>,
@@ -466,6 +470,7 @@ impl ClientPageState {
         if self.identity_scope != page.identity_scope || self.context_id.is_empty() {
             return Err(ProtocolError::StaleScope);
         }
+        if self.point_drag_frozen()? { return Err(ProtocolError::ScopeUnavailable); }
         check(page, op)
     }
     fn validate_initialization(
@@ -655,6 +660,7 @@ impl ClientPageState {
         if !state.input.keys.is_empty()
             || state.input.mouse.buttons != 0
             || state.input_cleanup.is_some()
+            || state.point_drag.is_some()
         {
             return Err(ProtocolError::CleanupFailed);
         }
@@ -1849,6 +1855,10 @@ impl ClientPageState {
                 params.as_object_mut().unwrap().remove(field);
             }
         }
+        let point_drag = self.state()?.point_drag.clone();
+        if let Some(debt) = point_drag {
+            self.point_drag_command(page, op, &PointDragToken(debt), "Input.dispatchMouseEvent", params).await?;
+        } else {
         command(
             page,
             op,
@@ -1857,6 +1867,7 @@ impl ClientPageState {
             params,
         )
         .await?;
+        }
         if let Some((x, y)) = point {
             let mut state = self.state()?;
             if state.input.session.as_deref() == Some(page.page_session_id.as_str())
@@ -1930,6 +1941,9 @@ impl ClientPageState {
         }
         if Instant::now() >= deadline {
             return Err(ProtocolError::CleanupFailed);
+        }
+        if self.state()?.point_drag.is_some() {
+            return self.cleanup_point_drag(client, session, deadline).await;
         }
         let mut input = self.state()?.input.clone();
         if input.session.as_deref().is_some_and(|old| old != session) {

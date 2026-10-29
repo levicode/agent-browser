@@ -3821,6 +3821,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     // No RefMap, verified_frames, GeometrySnapshot or fabricated
                     // viewport reaches this branch. Guards outlive input cleanup.
                     actions.execute_direct_point(super::client_actions::DirectPointContext {
+                        realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment),
                         page: &page, operation: &lease, page_state: &page_state, journal: &journal,
                         ui: ui_permit, input: input_permit,
                     }, &args).await

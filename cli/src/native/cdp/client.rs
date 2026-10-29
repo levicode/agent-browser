@@ -336,6 +336,8 @@ type MethodTaps =
 /// paused request. The consumer must quarantine its owned scope on overflow.
 type BoundedMethodTaps = Arc<std::sync::Mutex<HashMap<u64, BoundedMethodRoute>>>;
 struct BoundedMethodRoute {
+    exact_session: Option<String>,
+    drag_receipt: Option<Arc<AtomicBool>>,
     methods: &'static [&'static str],
     sender: mpsc::Sender<BoundedCdpEvent>,
     received: Arc<AtomicU64>,
@@ -436,6 +438,19 @@ impl BoundedEventWatermark {
         Ok(publish(self.received.load(Ordering::SeqCst)))
     }
 }
+/// A payload-free receipt that this exact session emitted dragIntercepted.
+/// This is observation only: the caller must retain its operation/input lease
+/// and match the original session before using it for owned-drag cleanup.
+/// False is never proof that no drag exists, especially after stream failure.
+pub(crate) struct DragInterceptionReceipt {
+    session: String,
+    observed: Arc<AtomicBool>,
+}
+impl DragInterceptionReceipt {
+    pub(crate) fn observed_on(&self, session: &str) -> bool {
+        self.session == session && self.observed.load(Ordering::SeqCst)
+    }
+}
 pub struct BoundedMethodEvents {
     receiver: mpsc::Receiver<BoundedCdpEvent>,
     failed: Arc<AtomicBool>,
@@ -444,6 +459,39 @@ pub struct BoundedMethodEvents {
     received: Arc<AtomicU64>,
 }
 impl BoundedMethodEvents {
+    /// Close an exact transaction's observation tenure only after its required
+    /// events have been consumed and all associated commands have settled.
+    /// Validation and route removal share the reader's route lock, so a final
+    /// duplicate/overflow cannot race a successful completion receipt.
+    pub(crate) fn seal(&mut self, expected_received: u64) -> Result<(), &'static str> {
+        self.seal_inner(expected_received, false)
+    }
+    /// Failed gestures may not have consumed their one intercepted payload.
+    /// Only after owned drag cancellation/disable has settled may cleanup drop
+    /// that payload; duplicate/loss remains failure, never a clean drain.
+    pub(crate) fn seal_for_cleanup(&mut self, expected_received: u64) -> Result<(), &'static str> {
+        if expected_received > 1 { return Err("invalid cleanup event count"); }
+        self.seal_inner(expected_received, true)
+    }
+    fn seal_inner(&mut self, expected_received: u64, discard: bool) -> Result<(), &'static str> {
+        let mut routes = self.routes.lock().map_err(|_| "control stream poisoned")?;
+        let route = routes.get(&self.id).ok_or("control stream closed")?;
+        if self.failed.load(Ordering::SeqCst)
+            || !Arc::ptr_eq(&route.received, &self.received)
+            || self.received.load(Ordering::SeqCst) != expected_received
+            || (!discard && !self.receiver.is_empty())
+            || (discard && route.drag_receipt.is_none())
+        {
+            return Err("control event seal mismatch");
+        }
+        routes.remove(&self.id);
+        self.receiver.close();
+        if discard {
+            while self.receiver.try_recv().is_ok() {}
+        }
+        Ok(())
+    }
+
     pub fn watermark(&self) -> BoundedEventWatermark {
         BoundedEventWatermark {
             routes: Arc::downgrade(&self.routes),
@@ -486,12 +534,38 @@ impl Drop for BoundedMethodEvents {
             .remove(&self.id);
     }
 }
+#[cfg(test)]
 fn publish_bounded(taps: &BoundedMethodTaps, event: &CdpEvent, bytes: usize) {
+    publish_bounded_checked(taps, event, bytes, true);
+}
+fn publish_bounded_checked(
+    taps: &BoundedMethodTaps,
+    event: &CdpEvent,
+    bytes: usize,
+    valid_envelope: bool,
+) {
     taps.lock()
         .unwrap_or_else(|e| e.into_inner())
         .retain(|_, route| {
             if !route.methods.contains(&event.method.as_str()) {
                 return true;
+            }
+            if route.exact_session.as_deref().is_some_and(|session| {
+                event.session_id.as_deref() != Some(session)
+            }) {
+                return true;
+            }
+            // Record only receipt existence, before rejecting a payload or
+            // overflowing the queue. Losing DragData must still fail closed,
+            // but must not erase evidence needed to cancel our own drag.
+            if let Some(receipt) = &route.drag_receipt {
+                // Legacy routes retain their existing delivery semantics, but
+                // malformed envelopes cannot mint drag cancellation evidence.
+                if !valid_envelope {
+                    route.failed.store(true, Ordering::SeqCst);
+                    return false;
+                }
+                receipt.store(true, Ordering::SeqCst);
             }
             if bytes > route.max_event_bytes {
                 route.failed.store(true, Ordering::SeqCst);
@@ -1088,7 +1162,7 @@ impl CdpClient {
                             None => false,
                         }
                     });
-                    publish_bounded(&bounded_taps_clone, &event, msg.len());
+                    publish_bounded_checked(&bounded_taps_clone, &event, msg.len(), valid_envelope);
                     if let Some(publication) = eval_publication {
                         publication.complete();
                     }
@@ -2433,6 +2507,42 @@ impl CdpClient {
         max_event_bytes: usize,
         max_in_flight_bytes: usize,
     ) -> Result<BoundedMethodEvents, &'static str> {
+        self.subscribe_bounded_methods_scoped(
+            methods, capacity, max_event_bytes, max_in_flight_bytes, None, None,
+        )
+    }
+
+    /// One operation's exact-session drag lane; unrelated sessions neither
+    /// consume its byte budget nor grant it drag cancellation authority.
+    pub(crate) fn subscribe_drag_interception(
+        &self,
+        session: &str,
+        max_event_bytes: usize,
+    ) -> Result<(BoundedMethodEvents, DragInterceptionReceipt), &'static str> {
+        if session.is_empty() {
+            return Err("empty drag session");
+        }
+        let observed = Arc::new(AtomicBool::new(false));
+        let events = self.subscribe_bounded_methods_scoped(
+            &["Input.dragIntercepted"],
+            1,
+            max_event_bytes,
+            max_event_bytes,
+            Some(session.to_owned()),
+            Some(observed.clone()),
+        )?;
+        Ok((events, DragInterceptionReceipt { session: session.to_owned(), observed }))
+    }
+
+    fn subscribe_bounded_methods_scoped(
+        &self,
+        methods: &'static [&'static str],
+        capacity: usize,
+        max_event_bytes: usize,
+        max_in_flight_bytes: usize,
+        exact_session: Option<String>,
+        drag_receipt: Option<Arc<AtomicBool>>,
+    ) -> Result<BoundedMethodEvents, &'static str> {
         if methods.is_empty()
             || capacity == 0
             || capacity > 256
@@ -2459,6 +2569,8 @@ impl CdpClient {
             .insert(
                 id,
                 BoundedMethodRoute {
+                    exact_session,
+                    drag_receipt,
                     methods,
                     sender,
                     received: received.clone(),
@@ -5480,6 +5592,8 @@ mod tests {
         routes.lock().unwrap().insert(
             1,
             BoundedMethodRoute {
+                exact_session: None,
+                drag_receipt: None,
                 methods: &["Fetch.requestPaused"],
                 sender,
                 received: received.clone(),
@@ -5499,6 +5613,100 @@ mod tests {
             id: 1,
         };
         (routes, events)
+    }
+    fn drag_fixture() -> (BoundedMethodTaps, BoundedMethodEvents, DragInterceptionReceipt) {
+        let (routes, events) = bounded_fixture(1, 100);
+        let observed = Arc::new(AtomicBool::new(false));
+        {
+            let mut routes = routes.lock().unwrap();
+            let route = routes.get_mut(&1).unwrap();
+            route.methods = &["Input.dragIntercepted"];
+            route.exact_session = Some("owned".into());
+            route.drag_receipt = Some(observed.clone());
+        }
+        (routes, events, DragInterceptionReceipt { session: "owned".into(), observed })
+    }
+    fn drag_event(session: &str) -> CdpEvent {
+        CdpEvent {
+            method: "Input.dragIntercepted".into(),
+            params: json!({"data":{"items":[],"dragOperationsMask":1}}),
+            session_id: Some(session.into()),
+        }
+    }
+    #[tokio::test]
+    async fn exact_drag_foreign_payload_cannot_charge_or_mint_receipt() {
+        let (routes, mut events, receipt) = drag_fixture();
+        publish_bounded(&routes, &drag_event("foreign"), 1000);
+        assert!(!receipt.observed_on("owned"));
+        publish_bounded(&routes, &drag_event("owned"), 50);
+        assert!(receipt.observed_on("owned"));
+        assert!(!receipt.observed_on("foreign"));
+        assert_eq!(events.recv().await.unwrap().session_id.as_deref(), Some("owned"));
+    }
+    #[tokio::test]
+    async fn exact_drag_oversize_retains_receipt_but_never_returns_data() {
+        let (routes, mut events, receipt) = drag_fixture();
+        publish_bounded(&routes, &drag_event("owned"), 101);
+        assert!(receipt.observed_on("owned"));
+        assert_eq!(events.recv().await.unwrap_err(), "control event overflow");
+    }
+    #[tokio::test]
+    async fn exact_drag_duplicate_overflow_retains_receipt_and_fails_closed() {
+        let (routes, mut events, receipt) = drag_fixture();
+        publish_bounded(&routes, &drag_event("owned"), 40);
+        publish_bounded(&routes, &drag_event("owned"), 40);
+        assert!(receipt.observed_on("owned"));
+        assert_eq!(events.recv().await.unwrap_err(), "control event overflow");
+    }
+    #[tokio::test]
+    async fn exact_drag_closed_without_event_never_mints_receipt() {
+        let (routes, mut events, receipt) = drag_fixture();
+        routes.lock().unwrap().clear();
+        assert_eq!(events.recv().await.unwrap_err(), "control event stream closed");
+        assert!(!receipt.observed_on("owned"));
+    }
+    #[tokio::test]
+    async fn exact_drag_invalid_envelope_never_mints_cleanup_authority() {
+        let (routes, mut events, receipt) = drag_fixture();
+        let mut malformed = drag_event("owned");
+        malformed.params = json!([]);
+        publish_bounded_checked(&routes, &malformed, 50, false);
+        assert!(!receipt.observed_on("owned"));
+        assert_eq!(events.recv().await.unwrap_err(), "control event overflow");
+    }
+    #[tokio::test]
+    async fn exact_drag_route_outlives_helper_through_retained_receiver() {
+        let (routes, events, receipt) = drag_fixture();
+        let helper = Arc::new(tokio::sync::Mutex::new(events));
+        let retained = helper.clone();
+        drop(helper);
+        publish_bounded(&routes, &drag_event("owned"), 40);
+        assert!(receipt.observed_on("owned"));
+        let mut events = retained.lock().await;
+        events.recv().await.unwrap();
+        events.seal(1).unwrap();
+        assert!(routes.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn exact_drag_final_seal_rejects_duplicate_after_first_receive() {
+        let (routes, mut events, _) = drag_fixture();
+        publish_bounded(&routes, &drag_event("owned"), 40);
+        events.recv().await.unwrap();
+        publish_bounded(&routes, &drag_event("owned"), 40);
+        assert!(events.seal(1).is_err());
+    }
+    #[tokio::test]
+    async fn exact_drag_cleanup_seal_accepts_only_one_healthy_owned_payload() {
+        let (routes, mut events, receipt) = drag_fixture();
+        publish_bounded(&routes, &drag_event("owned"), 40);
+        assert!(receipt.observed_on("owned"));
+        assert!(events.seal(1).is_err());
+        events.seal_for_cleanup(1).unwrap();
+        assert!(events.receiver.is_empty());
+        let (routes, mut events, _) = drag_fixture();
+        publish_bounded(&routes, &drag_event("owned"), 40);
+        publish_bounded(&routes, &drag_event("owned"), 40);
+        assert!(events.seal_for_cleanup(1).is_err());
     }
     fn paused_event() -> CdpEvent {
         CdpEvent {
