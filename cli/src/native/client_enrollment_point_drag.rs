@@ -143,7 +143,7 @@ mod tests {
         for (session, target, kind, root) in [("main", "page", "page", "main"), ("child", "oopif", "iframe", "main"), ("foreign", "popup", "page", "foreign")] {
             index.sessions.insert(session.into(), Attribution {
                 target: target.into(), session: session.into(), parent: None, root: root.into(), kind: kind.into(),
-                application: true, observation_only: false, observer_paused: None, resumed: true,
+                application: true, observation_only: false, observer_paused: None, init_paused_by_attachment: false, resumed: true,
             });
             index.frames.insert(target.into(), FrameOwner { loader: Some("loader".into()), name: None, session: session.into(), parent: None });
         }
