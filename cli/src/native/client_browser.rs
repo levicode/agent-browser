@@ -6277,6 +6277,7 @@ mod tests {
             "page-identity-fence",
             "observe",
             "observe-frame-policy",
+            "issuance-bound-references",
             "trace-semantic",
             "query",
             "query-union",
