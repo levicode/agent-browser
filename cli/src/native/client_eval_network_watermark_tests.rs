@@ -167,3 +167,91 @@ impl ClientEnrollment {
             .unwrap();
     }
 }
+
+// Two distinct real initializer positions can expose the hosted F4 counts.
+// Neither is the rejected post-ResumePermit-drop/pre-custody-completion tail.
+pub(crate) struct PopupCaptureSchedule {
+    initializer: Arc<CaptureTestGate>,
+    recorder: Arc<CaptureTestGate>,
+    preparation: Arc<CaptureTestGate>,
+}
+impl PopupCaptureSchedule {
+    pub(crate) async fn preparation_waiting(&self) -> Value {
+        self.preparation.wait_entered().await;
+        self.preparation
+            .preparation_receipt
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap()
+    }
+    pub(crate) async fn initializer_held(&self) {
+        self.initializer.wait_entered().await;
+    }
+    pub(crate) fn release(&self) {
+        self.initializer.release();
+    }
+    pub(crate) fn receipts(&self) -> Value {
+        Value::Array(
+            self.recorder
+                .eval_receipts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(generation, sequence, facts)| {
+                    json!({"generation":generation,"operationSeq":sequence,"facts":facts})
+                })
+                .collect(),
+        )
+    }
+}
+impl ClientEnrollment {
+    pub(crate) fn popup_capture_schedule_for_test(
+        &self,
+        before_complete_retained: bool,
+    ) -> PopupCaptureSchedule {
+        let initializer = CaptureTestGate::new();
+        let recorder = CaptureTestGate::new();
+        let preparation = CaptureTestGate::new();
+        let point = if before_complete_retained {
+            CaptureTestPoint::AfterPopupResumeAckBeforeComplete
+        } else {
+            CaptureTestPoint::BeforeNetworkCommitBoundary
+        };
+        let mut gates = self.capture_test_gates.lock().unwrap();
+        assert!(gates.insert(point, initializer.clone()).is_none());
+        assert!(gates
+            .insert(CaptureTestPoint::EvalAdmissionReceipt, recorder.clone())
+            .is_none());
+        assert!(gates
+            .insert(
+                CaptureTestPoint::EvalPreparationWaiting,
+                preparation.clone()
+            )
+            .is_none());
+        PopupCaptureSchedule {
+            initializer,
+            recorder,
+            preparation,
+        }
+    }
+    pub(crate) async fn popup_initializer_finished_for_test(&self) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = self.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                {
+                    let index = self.index.lock().unwrap();
+                    assert!(index.failure.is_none());
+                    if index.pending_enrollment.is_empty() {
+                        return;
+                    }
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("real popup initializer did not release custody");
+    }
+}

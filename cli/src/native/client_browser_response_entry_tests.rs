@@ -67,6 +67,12 @@ async fn response_peer() -> (
                     let request: Value = serde_json::from_str(&text).unwrap();
                     log.lock().unwrap().push(request.clone());
                     let result = match request["method"].as_str().unwrap() {
+                        "Target.getTargetInfo" if request["params"]["targetId"] == "capture-popup"
+                            || request["sessionId"] == "capture-popup-session" => {
+                            let mut info = target("capture-popup", "page");
+                            info["openerId"] = "page-1".into();
+                            Some(json!({"targetInfo":info}))
+                        }
                         "Runtime.evaluate" if request["params"]["expression"] == expression() => {
                             assert_eq!(request["sessionId"], "session-1");
                             assert_eq!(request["params"]["awaitPromise"], true);
@@ -582,4 +588,277 @@ async fn response_entry_rejects_realm_change_during_ingress_wait() {
 #[tokio::test]
 async fn response_entry_rejects_exact_session_detach_during_ingress_wait() {
     response_entry_case(EntryCase::Detached).await;
+}
+
+// Baseline-only controls: real retained initialization, native command admission,
+// and framed result/cleanup. The finite peer ACKs CDP; it does not run JavaScript.
+async fn popup_capture_pending_case(before_complete_retained: bool, expect_preparation: bool) {
+    let (endpoint, emit, log, peer, backend) = response_peer().await;
+    let broker = Arc::new(ClientSession::new());
+    let browser = Arc::new(ClientBrowser::new(broker.clone()));
+    let mut fixture = framed(
+        browser.clone(),
+        broker.clone(),
+        Arc::new(RestartFlush::default()),
+    );
+    fixture.ready().await.unwrap();
+    let opened = fixture
+        .command(
+            "scope.open",
+            fixture_scope_open("connect", Some(&endpoint)),
+            5,
+        )
+        .await
+        .unwrap();
+    let scope = opened["identityScope"].as_str().unwrap().to_owned();
+    fixture.scope = Some(scope.clone());
+    fixture
+        .command("scope.configure", fixture_configuration(&scope, None), 5)
+        .await
+        .unwrap();
+    fixture
+        .command("network.routes.replace", fixture_routes(&scope), 5)
+        .await
+        .unwrap();
+    fixture.registry = 1;
+    fixture
+        .command(
+            "page.navigate",
+            json!({"identityScope":scope,"url":"https://synthetic.test/","waitUntil":"load"}),
+            5,
+        )
+        .await
+        .unwrap();
+    let enrollment = browser
+        .owner
+        .lock()
+        .await
+        .as_ref()
+        .unwrap()
+        .runtime
+        .as_ref()
+        .unwrap()
+        .enrollment
+        .clone();
+    let schedule = enrollment.popup_capture_schedule_for_test(before_complete_retained);
+    let mut event = attach("capture-popup", "capture-popup-session", "page");
+    event["params"]["targetInfo"]["openerId"] = "page-1".into();
+    emit.send(event).await.unwrap();
+    schedule.initializer_held().await;
+    let held = enrollment.response_entry_state_for_test();
+    let page = browser.page_lease(false).await.unwrap();
+    let ledger = page.client.debt_ledger().unwrap();
+    let debt = ledger.snapshot();
+    let revision = ledger
+        .observe_eval_revision(&page.page_session_id, &page.target_id)
+        .unwrap();
+    drop(page);
+    fixture.sequence += 1;
+    let sequence = fixture.sequence;
+    let mut args = evaluation();
+    args["identityScope"] = scope.clone().into();
+    fixture
+        .write(
+            json!({"type":"request","id":"popup-capture-evaluate","generation":1,
+        "operationSeq":sequence,"timeoutMs":2000,"command":"page.evaluate","args":args}),
+        )
+        .await
+        .unwrap();
+    // No early-read timeout or sleep establishes causality: the initializer
+    // remains held until the actual terminal native framed result is received.
+    let (evaluated, preparation) = if expect_preparation {
+        // Keep the framed read alive if the wait notification wins. Dropping a
+        // partially polled framed read would not be a valid protocol control.
+        let mut read = tokio::spawn(async move {
+            let evaluated = read_entry_frame(&mut fixture).await;
+            (fixture, evaluated)
+        });
+        let (returned, evaluated, preparation) = tokio::select! {
+            result = &mut read => {
+                let (fixture, evaluated) = result.unwrap();
+                (fixture, evaluated, None)
+            }
+            receipt = schedule.preparation_waiting() => {
+                assert_eq!(receipt["generation"], 1);
+                assert_eq!(receipt["operationSeq"], sequence);
+                assert_eq!(receipt["target"], "capture-popup");
+                assert_eq!(receipt["session"], "capture-popup-session");
+                assert_eq!(enrollment.response_entry_state_for_test(), held);
+                assert_eq!(log.lock().unwrap().iter().filter(|request| {
+                    request["method"] == "Runtime.evaluate"
+                        && request["params"]["expression"] == expression()
+                }).count(), 0);
+                schedule.release();
+                let (fixture, evaluated) = read.await.unwrap();
+                (fixture, evaluated, Some(receipt))
+            }
+        };
+        fixture = returned;
+        (evaluated, preparation)
+    } else {
+        (read_entry_frame(&mut fixture).await, None)
+    };
+    let receipts = schedule.receipts();
+    let still_held = enrollment.response_entry_state_for_test();
+    let expression_dispatches = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request["method"] == "Runtime.evaluate"
+                && request["params"]["expression"] == expression()
+        })
+        .count();
+    let resume_commands = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request["method"] == "Runtime.runIfWaitingForDebugger"
+                && request["sessionId"] == "capture-popup-session"
+        })
+        .count();
+    schedule.release();
+    enrollment.popup_initializer_finished_for_test().await;
+    let finished = enrollment.response_entry_state_for_test();
+    let page = browser.page_lease(false).await.unwrap();
+    let after_revision = ledger
+        .observe_eval_revision(&page.page_session_id, &page.target_id)
+        .unwrap();
+    drop(page);
+    let scope_end = fixture
+        .command("scope.end", json!({"identityScope":scope}), 5)
+        .await;
+    let cleanup = tokio::time::timeout(Duration::from_secs(15), fixture.finish()).await;
+    drop(emit);
+    let peer_join = tokio::time::timeout(Duration::from_secs(2), peer).await;
+    let backend_join = tokio::time::timeout(Duration::from_secs(2), backend).await;
+    assert!(scope_end.is_ok(), "scope_end={scope_end:?}");
+    assert!(matches!(cleanup, Ok(Ok(()))), "cleanup={cleanup:?}");
+    assert!(matches!(peer_join, Ok(Ok(()))), "peer={peer_join:?}");
+    assert!(
+        matches!(backend_join, Ok(Ok(()))),
+        "backend={backend_join:?}"
+    );
+    assert_eq!(held["pending"], 1);
+    assert_eq!(held["unresumed"], 1);
+    assert_eq!(held["failure"], false);
+    assert_eq!(held["received"], held["applied"]);
+    if preparation.is_none() {
+        assert_eq!(still_held, held);
+    }
+    assert_eq!(debt.outstanding_commands, 0);
+    assert_eq!(debt.input_debt, 0);
+    assert!(!debt.integrity_lost);
+    assert_eq!(resume_commands, 1);
+    assert_eq!(evaluated["id"], "popup-capture-evaluate");
+    if preparation.is_none() {
+        assert_eq!(evaluated["ok"], false);
+        assert_eq!(evaluated["error"]["code"], "scope-unavailable");
+        assert_eq!(evaluated["effects"], "not-dispatched");
+        assert_eq!(evaluated["scopeState"], "usable");
+        assert_eq!(expression_dispatches, 0);
+        assert_eq!(receipts.as_array().unwrap().len(), 2);
+        for receipt in receipts.as_array().unwrap() {
+            assert_eq!(receipt["generation"], 1);
+            assert_eq!(receipt["operationSeq"], sequence);
+            assert_eq!(receipt["facts"]["p"], json!([1, 0, 1, 0, 1, 1, 0, 1]));
+            assert_eq!(receipt["facts"]["t"], json!([1, 1, 0]));
+            assert_eq!(receipt["facts"]["h"], json!([0, 0, 1]));
+            assert_eq!(receipt["facts"]["v"], revision);
+            assert_eq!(receipt["facts"]["e"], held["epoch"]);
+        }
+        assert_eq!(receipts[0]["facts"]["s"], "entry");
+        assert_eq!(receipts[0]["facts"]["c"], "entry");
+        assert_eq!(receipts[0]["facts"]["w"], "equal");
+        assert_eq!(receipts[1]["facts"]["s"], "capture");
+        assert_eq!(receipts[1]["facts"]["c"], "pending");
+    } else {
+        assert_eq!(evaluated["ok"], true);
+        assert_eq!(evaluated["effects"], "completed");
+        assert_eq!(evaluated["data"], json!({"value":{"ok":true,"value":null}}));
+        assert_eq!(expression_dispatches, 1);
+    }
+    assert_eq!(finished["pending"], 0);
+    assert_eq!(finished["unresumed"], 0);
+    assert_eq!(finished["failure"], false);
+    assert_eq!(finished["epoch"], held["epoch"]);
+    assert!(
+        after_revision > revision,
+        "real permit completion/drop revokes"
+    );
+    let boundary = if before_complete_retained {
+        "ack-before-complete-retained"
+    } else {
+        "complete-retained-before-network-commit"
+    };
+    let final_expression_dispatches = log
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| {
+            request["method"] == "Runtime.evaluate"
+                && request["params"]["expression"] == expression()
+        })
+        .count();
+    assert_eq!(final_expression_dispatches, expression_dispatches);
+    if preparation.is_none() {
+        eprintln!(
+            "POPUP_CAPTURE_BASELINE_WITNESS boundary={boundary} error=scope-unavailable effects=not-dispatched application_evaluate_dispatches={expression_dispatches} cleanup=joined receipts={receipts}"
+        );
+    }
+    if expect_preparation {
+        // Common C0 contract: baseline is RED only after its exact witness and
+        // real cleanup; a candidate must have actually waited, then dispatch once.
+        assert!(
+            preparation.is_some(),
+            "baseline capture/pending refusal, not a matched preparation wait"
+        );
+        assert_eq!(expression_dispatches, 1);
+        eprintln!(
+            "POPUP_PREPARATION_C0_WITNESS boundary={boundary} application_evaluate_dispatches={expression_dispatches} cleanup=joined preparation={preparation:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn framed_popup_capture_pending_after_resume_ack_before_complete_retained() {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        popup_capture_pending_case(true, false),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn framed_popup_capture_pending_after_complete_retained_before_network_commit() {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        popup_capture_pending_case(false, false),
+    )
+    .await
+    .unwrap();
+}
+
+// Identical test bodies can be applied to baseline and candidate. The release
+// protocol is explicit: terminal baseline receipt OR matched candidate wait.
+#[tokio::test]
+async fn framed_popup_preparation_c0_after_resume_ack_before_complete_retained() {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        popup_capture_pending_case(true, true),
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn framed_popup_preparation_c0_after_complete_retained_before_network_commit() {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        popup_capture_pending_case(false, true),
+    )
+    .await
+    .unwrap();
 }

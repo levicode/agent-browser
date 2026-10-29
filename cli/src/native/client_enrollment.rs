@@ -804,6 +804,9 @@ enum CaptureTestPoint {
     BeforeVerifyReturn,
     BeforeEventApply,
     EvalEntry,
+    EvalAdmissionReceipt,
+    EvalPreparationWaiting,
+    AfterPopupResumeAckBeforeComplete,
     BeforeAttachedProcessing,
     BeforeWorkerReadyCommit,
     BeforeWorkerRetirementWait,
@@ -820,6 +823,8 @@ enum CaptureTestPoint {
 #[cfg(test)]
 struct CaptureTestGate {
     observed: AtomicBool,
+    eval_receipts: Mutex<Vec<(u64, u64, super::client_settlement_trace::EvalAdmissionFacts)>>,
+    preparation_receipt: Mutex<Option<Value>>,
     entered: tokio::sync::Semaphore,
     release: tokio::sync::Semaphore,
     passed: tokio::sync::Semaphore,
@@ -829,6 +834,8 @@ impl CaptureTestGate {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             observed: AtomicBool::new(false),
+            eval_receipts: Mutex::new(Vec::new()),
+            preparation_receipt: Mutex::new(None),
             entered: tokio::sync::Semaphore::new(0),
             release: tokio::sync::Semaphore::new(0),
             passed: tokio::sync::Semaphore::new(0),
@@ -1859,6 +1866,51 @@ impl ClientEnrollment {
             epoch: (index.application_epoch < (1u64 << 53)).then_some(index.application_epoch),
         }
     }
+    // Candidate-only callers notify after registering an actual matched wait.
+    // Installing this test observer neither schedules nor authorizes that wait.
+    #[cfg(test)]
+    pub(crate) fn observe_eval_preparation_wait_for_test(
+        &self,
+        op: &OperationLease,
+        target: &str,
+        session: &str,
+    ) {
+        let recorder = self
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .remove(&CaptureTestPoint::EvalPreparationWaiting);
+        if let Some(recorder) = recorder {
+            *recorder.preparation_receipt.lock().unwrap() = Some(json!({
+                "generation":op.generation,"operationSeq":op.sequence,
+                "target":target,"session":session
+            }));
+            recorder.entered.add_permits(1);
+        }
+    }
+    // Per-owner test receipts copy actual diagnostic decisions. They never
+    // fabricate an index/ledger fact or enter the production diagnostic sink.
+    #[cfg(test)]
+    fn record_eval_admission_for_test(
+        &self,
+        op: &OperationLease,
+        facts: super::client_settlement_trace::EvalAdmissionFacts,
+    ) {
+        let recorder = self
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .get(&CaptureTestPoint::EvalAdmissionReceipt)
+            .cloned();
+        if let Some(recorder) = recorder {
+            let mut receipts = recorder.eval_receipts.lock().unwrap();
+            assert!(
+                receipts.len() < 2,
+                "unexpected extra eval admission receipt"
+            );
+            receipts.push((op.generation, op.sequence, facts));
+        }
+    }
     /// Drain only the events already received at this command's entry. This
     /// yields before the caller owns a UI/configuration/input guard and grants
     /// no evaluation authority: capture_eval_authority still runs at dispatch.
@@ -1896,6 +1948,13 @@ impl ClientEnrollment {
             return Err(ProtocolError::StaleScope);
         }
         let diagnostics = super::client_settlement_trace::query_diagnostics_enabled();
+        #[cfg(test)]
+        let diagnostics = diagnostics
+            || self
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .contains_key(&CaptureTestPoint::EvalAdmissionReceipt);
         let mut refusal_diagnostic = None;
         let (received, epoch, revision, entry_diagnostic) = {
             let index = self
@@ -1927,6 +1986,8 @@ impl ClientEnrollment {
             (received, index.application_epoch, revision, diagnostic)
         };
         if let Some(facts) = entry_diagnostic {
+            #[cfg(test)]
+            self.record_eval_admission_for_test(op, facts);
             super::client_settlement_trace::eval_admission(op.generation, op.sequence, facts);
         }
         let result =
@@ -1977,6 +2038,18 @@ impl ClientEnrollment {
                 }
             })
             .await;
+        #[cfg(test)]
+        if result.is_err() {
+            self.record_eval_admission_for_test(
+                op,
+                refusal_diagnostic.unwrap_or_else(|| {
+                    super::client_settlement_trace::EvalAdmissionFacts::unknown(
+                        super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
+                        super::client_settlement_trace::EvalAdmissionReason::OtherGuard,
+                    )
+                }),
+            );
+        }
         if diagnostics && result.is_err() {
             super::client_settlement_trace::eval_admission(
                 op.generation,
@@ -1997,6 +2070,13 @@ impl ClientEnrollment {
         op: &OperationLease,
     ) -> Result<super::client_debt::EvalAuthorityStamp, ProtocolError> {
         let diagnostics = super::client_settlement_trace::query_diagnostics_enabled();
+        #[cfg(test)]
+        let diagnostics = diagnostics
+            || self
+                .capture_test_gates
+                .lock()
+                .unwrap()
+                .contains_key(&CaptureTestPoint::EvalAdmissionReceipt);
         let mut refusal_diagnostic = None;
         let result = (|| {
             self.check_restart_operation(op)?;
@@ -2115,6 +2195,18 @@ impl ClientEnrollment {
                 loader,
             })
         })();
+        #[cfg(test)]
+        if result.is_err() {
+            self.record_eval_admission_for_test(
+                op,
+                refusal_diagnostic.unwrap_or_else(|| {
+                    super::client_settlement_trace::EvalAdmissionFacts::unknown(
+                        super::client_settlement_trace::EvalAdmissionStage::CaptureRefused,
+                        super::client_settlement_trace::EvalAdmissionReason::OtherGuard,
+                    )
+                }),
+            );
+        }
         if diagnostics && result.is_err() {
             super::client_settlement_trace::eval_admission(
                 op.generation,
@@ -4668,6 +4760,16 @@ impl ClientEnrollment {
                 ),
             )
             .await?;
+            #[cfg(test)]
+            if entry.kind == "page" {
+                // The actual CDP command future returned its ACK. This is
+                // before complete_retained, index.resumed and ResumePermit Drop.
+                self.pause_component_boundary(
+                    CaptureTestPoint::AfterPopupResumeAckBeforeComplete,
+                    op,
+                )
+                .await?;
+            }
             lease.permit.check()?;
             pending_resume
                 .as_mut()
