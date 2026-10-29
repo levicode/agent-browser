@@ -119,12 +119,27 @@ pub(super) async fn fields(
         return Ok(None);
     };
     let session = &frame.binding.session;
+    // This stage cannot submit a group-producing command. A stopped world
+    // request therefore has no group to hand off: retaining an empty release
+    // would consume the bounded cleanup command pool until its ACK arrives.
+    // Once resolving starts below, every outcome keeps the existing accounted
+    // group cleanup, including cancelled/unknown late object creation.
+    let world = command(
+        client,
+        session,
+        "Page.createIsolatedWorld",
+        json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),
+        lease,
+    )
+    .await
+    .map_err(|error| settled_stop(error, lease))?;
+    let context = world["executionContextId"]
+        .as_i64()
+        .ok_or(ObservationError::BackendFailure)?;
     let group = client
         .readonly_group_instance(&format!("native-query-{}-fields", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
     let result = async {
-        let world = command(client, session, "Page.createIsolatedWorld", json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}), lease).await?;
-        let context = world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?;
         use futures_util::{stream, StreamExt};
         let handles: Vec<Result<String, ObservationError>> = stream::iter(ids.iter().copied().map(|backend| {
             let group = &group;
