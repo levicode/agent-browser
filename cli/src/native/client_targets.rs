@@ -817,6 +817,38 @@ impl ClientTargets {
             .set(Arc::downgrade(ledger))
             .map_err(|_| ProtocolError::ScopeUnavailable)
     }
+    /// Best-effort diagnostic snapshot only. Never waits or changes registry state.
+    pub(crate) fn eval_diagnostic_targets<'a>(
+        &self,
+        pending: impl Iterator<Item = (&'a str, &'a str)>,
+        root_target: &str,
+        root_session: &str,
+    ) -> Option<([u16; 3], bool)> {
+        let state = self.state.try_lock().ok()?;
+        let mut counts = [0u16; 3];
+        for (target, session) in pending {
+            if let Some(target) = state
+                .targets
+                .get(target)
+                .filter(|target| target.session_id == session)
+            {
+                counts[0] = counts[0].checked_add(u16::from(target.resume_pending))?;
+                counts[1] = counts[1].checked_add(u16::from(
+                    target
+                        .tenure
+                        .retained_initialization
+                        .load(Ordering::Acquire),
+                ))?;
+            } else {
+                counts[2] = counts[2].checked_add(1)?;
+            }
+        }
+        let root_ready = state
+            .targets
+            .get(root_target)
+            .is_some_and(|target| target.session_id == root_session && target.capture_ready());
+        Some((counts, root_ready))
+    }
     pub(crate) fn require_eval_owner(
         &self,
         ledger: &Arc<super::client_debt::OwnerDebtLedger>,
@@ -4797,5 +4829,25 @@ mod atomic_revision_diagnostic_tests {
             assert_eq!(registry.check_revision(0), Ok(()));
         }
         assert!(registry.state.lock().unwrap().revision_history.is_none());
+    }
+}
+
+#[cfg(test)]
+mod eval_diagnostic_target_tests {
+    use super::*;
+    #[test]
+    fn eval_diagnostic_target_lock_contention_is_unknown_and_never_mutates() {
+        let targets = ClientTargets::new("synthetic-context".into(), "synthetic-owner".into());
+        let guard = targets.state.lock().unwrap();
+        assert!(targets
+            .eval_diagnostic_targets(std::iter::empty(), "missing", "missing")
+            .is_none());
+        assert!(guard.targets.is_empty());
+        assert!(!guard.integrity_lost);
+        drop(guard);
+        assert_eq!(
+            targets.eval_diagnostic_targets(std::iter::empty(), "missing", "missing"),
+            Some(([0; 3], false))
+        );
     }
 }

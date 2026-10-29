@@ -35,6 +35,7 @@ pub(crate) enum SettlementPhase {
     ReadonlyPrepareFailure,
     QueryScopeRefusal,
     QueryReadFailure,
+    EvalAdmission,
     UploadPreflightRefusal,
     TerminalCleanupCheckpoint,
     ServiceWorkerAdmission,
@@ -175,6 +176,8 @@ pub(crate) enum MessageKind {
 #[derive(Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval: Option<EvalAdmissionFacts>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_scope_stage: Option<QueryScopeStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,6 +350,11 @@ pub(crate) struct Facts {
 
 impl Facts {
     fn clamp(&mut self, overflow: &mut bool) {
+        if let Some(eval) = &mut self.eval {
+            for value in [&mut eval.revision, &mut eval.epoch].into_iter().flatten() {
+                *value = bounded(*value, overflow);
+            }
+        }
         for value in [
             &mut self.generation,
             &mut self.capture_budget_ms,
@@ -1421,6 +1429,105 @@ pub(crate) enum QueryReadStage {
     Cleanup,
     FrameFinal,
     LeaseFinal,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum EvalAdmissionStage {
+    Entry,
+    #[serde(rename = "wait")]
+    WaitRefused,
+    #[serde(rename = "capture")]
+    CaptureRefused,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum EvalAdmissionReason {
+    #[serde(rename = "entry")]
+    Frontier,
+    #[serde(rename = "fence")]
+    EntryFence,
+    #[serde(rename = "pending")]
+    PendingEnrollment,
+    Unresumed,
+    #[serde(rename = "retire")]
+    RetirementPending,
+    #[serde(rename = "health")]
+    RealmHealth,
+    #[serde(rename = "guard")]
+    OtherGuard,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum EvalWatermark {
+    Equal,
+    Behind,
+    Ahead,
+    #[serde(rename = "unk")]
+    Unknown,
+}
+/// Closed diagnostic counts only, never an admission or completion receipt.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EvalAdmissionFacts {
+    #[serde(rename = "s")]
+    pub stage: EvalAdmissionStage,
+    #[serde(rename = "c")]
+    pub reason: EvalAdmissionReason,
+    // realm_pending, realm_tickets, bits: reconciled=1, sealed=2, index_failure=4.
+    #[serde(rename = "h")]
+    pub health: Option<(u16, u16, u8)>,
+    // total, unregistered, application, observer, unresumed, frame, realm, page.
+    #[serde(rename = "p")]
+    pub pending: Option<[u16; 8]>,
+    // resume_pending, retained_initialization, missing exact target/session.
+    #[serde(rename = "t")]
+    pub targets: Option<[u16; 3]>,
+    // selected frame known, loader known, live realm known, target capture_ready.
+    #[serde(rename = "r")]
+    pub root: Option<[bool; 4]>,
+    #[serde(rename = "w")]
+    pub watermark: EvalWatermark,
+    #[serde(rename = "v")]
+    pub revision: Option<u64>,
+    #[serde(rename = "e")]
+    pub epoch: Option<u64>,
+}
+impl EvalAdmissionFacts {
+    pub(crate) fn unknown(stage: EvalAdmissionStage, reason: EvalAdmissionReason) -> Self {
+        Self {
+            stage,
+            reason,
+            health: None,
+            pending: None,
+            targets: None,
+            root: None,
+            watermark: EvalWatermark::Unknown,
+            revision: None,
+            epoch: None,
+        }
+    }
+}
+pub(crate) fn eval_admission(generation: u64, sequence: u64, facts: EvalAdmissionFacts) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_eval_admission(capture, generation, sequence, facts);
+    }
+}
+fn record_eval_admission(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    facts: EvalAdmissionFacts,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::EvalAdmission,
+        Facts {
+            generation: Some(generation),
+            eval: Some(facts),
+            ..Facts::default()
+        },
+    );
 }
 pub(crate) fn query_diagnostics_enabled() -> bool {
     QUERY_SINK.get().and_then(Option::as_ref).is_some()
@@ -3576,5 +3683,100 @@ mod candidate_schema_diagnostic_tests {
         ] {
             assert_eq!(serde_json::to_value(stage).unwrap(), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod eval_admission_schema_tests {
+    use super::*;
+    fn maximum() -> EvalAdmissionFacts {
+        EvalAdmissionFacts {
+            stage: EvalAdmissionStage::CaptureRefused,
+            reason: EvalAdmissionReason::Unresumed,
+            health: Some((u16::MAX, u16::MAX, 7)),
+            pending: Some([u16::MAX; 8]),
+            targets: Some([u16::MAX; 3]),
+            root: Some([false; 4]),
+            watermark: EvalWatermark::Behind,
+            revision: Some(SAFE_INTEGER),
+            epoch: Some(SAFE_INTEGER),
+        }
+    }
+    #[test]
+    fn eval_admission_closed_schema_and_worst_case_record_fit_existing_limit() {
+        let record = Record {
+            schema_version: 2,
+            source: Source::Native,
+            pid: u32::MAX,
+            record: SAFE_INTEGER,
+            operation_seq: SAFE_INTEGER,
+            phase: Phase::EvalAdmission,
+            dropped_before: SAFE_INTEGER,
+            emitted_before: SAFE_INTEGER,
+            suppressed_before: SAFE_INTEGER,
+            overflow: false,
+            facts: Facts {
+                generation: Some(SAFE_INTEGER),
+                eval: Some(maximum()),
+                ..Facts::default()
+            },
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert!(bytes.len() < MAX_RECORD_BYTES, "{}", bytes.len());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["phase"], "EvalAdmission");
+        let eval = value["eval"].as_object().unwrap();
+        let mut keys = eval.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["c", "e", "h", "p", "r", "s", "t", "v", "w"]);
+        assert_eq!(eval["s"], "capture");
+        assert_eq!(eval["c"], "unresumed");
+        assert_eq!(eval["p"].as_array().unwrap().len(), 8);
+        assert_eq!(eval["t"].as_array().unwrap().len(), 3);
+        assert_eq!(eval["r"].as_array().unwrap().len(), 4);
+        assert!(!String::from_utf8(bytes).unwrap().contains("identityScope"));
+    }
+    #[test]
+    fn eval_admission_unknown_is_not_zero_or_success_and_numbers_clamp() {
+        let unknown = EvalAdmissionFacts::unknown(
+            EvalAdmissionStage::WaitRefused,
+            EvalAdmissionReason::OtherGuard,
+        );
+        let value = serde_json::to_value(unknown).unwrap();
+        for key in ["h", "p", "t", "r", "v", "e"] {
+            assert!(value[key].is_null());
+        }
+        assert_eq!(value["w"], "unk");
+        let mut facts = Facts {
+            eval: Some(EvalAdmissionFacts {
+                revision: Some(u64::MAX),
+                epoch: Some(u64::MAX),
+                ..maximum()
+            }),
+            ..Facts::default()
+        };
+        let mut overflow = false;
+        facts.clamp(&mut overflow);
+        assert!(overflow);
+        let value = serde_json::to_value(facts).unwrap();
+        assert_eq!(value["eval"]["v"], SAFE_INTEGER);
+        assert_eq!(value["eval"]["e"], SAFE_INTEGER);
+    }
+    #[test]
+    fn eval_admission_reuses_query_cap_and_explicit_loss_without_new_sink() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = query_capture(Some(file.path())).unwrap();
+        for _ in 0..QUERY_MAX_RECORDS + 4 {
+            record_eval_admission(&capture, 1, 2, maximum());
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(text.lines().count(), QUERY_MAX_RECORDS);
+        assert_eq!(text.matches("CaptureLimitReached").count(), 1);
+        assert!(text.lines().all(|line| line.len() < MAX_RECORD_BYTES));
+        assert!(query_capture(None).is_none());
+        let absent = file.path().with_extension("not-created");
+        assert!(!absent.exists());
+        assert!(query_capture(Some(&absent)).is_none());
+        assert!(!absent.exists());
     }
 }

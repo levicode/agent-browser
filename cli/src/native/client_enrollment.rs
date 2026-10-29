@@ -1775,6 +1775,90 @@ impl ClientEnrollment {
             ledger.invalidate_eval_authority();
         }
     }
+    /// Called only for an enabled diagnostic sink with the already-held index.
+    /// Supplemental registry lookup is try-lock only; failure remains explicit.
+    fn eval_diagnostic_snapshot(
+        &self,
+        index: &Index,
+        page: &BrowserExecutionLease,
+        stage: super::client_settlement_trace::EvalAdmissionStage,
+        reason: super::client_settlement_trace::EvalAdmissionReason,
+        received: Option<u64>,
+        revision: Option<u64>,
+    ) -> super::client_settlement_trace::EvalAdmissionFacts {
+        use super::client_settlement_trace::{EvalAdmissionFacts, EvalWatermark};
+        let live_realm = |session: &str| {
+            index
+                .realms
+                .values()
+                .any(|realm| realm.session == session && !realm.destroyed.load(Ordering::Acquire))
+        };
+        let mut counts = [0usize; 8];
+        for session in index.pending_enrollment.keys() {
+            counts[0] += 1;
+            if let Some(entry) = index.sessions.get(session) {
+                counts[2] += usize::from(entry.application);
+                counts[3] += usize::from(entry.observation_only);
+                counts[4] += usize::from(!entry.resumed);
+                counts[5] +=
+                    usize::from(index.frames.values().any(|frame| frame.session == *session));
+                counts[6] += usize::from(live_realm(session));
+                counts[7] += usize::from(entry.kind == "page");
+            } else {
+                counts[1] += 1;
+            }
+        }
+        let pending = counts
+            .into_iter()
+            .map(u16::try_from)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()
+            .and_then(|counts| counts.try_into().ok());
+        let target = self.targets.eval_diagnostic_targets(
+            index
+                .pending_enrollment
+                .keys()
+                .filter_map(|session| index.sessions.get(session))
+                .map(|entry| (entry.target.as_str(), entry.session.as_str())),
+            &page.target_id,
+            &page.page_session_id,
+        );
+        let frame = index
+            .frames
+            .values()
+            .find(|frame| frame.session == page.page_session_id && frame.parent.is_none());
+        EvalAdmissionFacts {
+            stage,
+            reason,
+            health: u16::try_from(index.realm_pending.len())
+                .ok()
+                .zip(u16::try_from(index.realm_tickets).ok())
+                .map(|(pending, tickets)| {
+                    let bits = u8::from(index.reconciled)
+                        | (u8::from(self.sealed.load(Ordering::SeqCst)) << 1)
+                        | (u8::from(index.failure.is_some()) << 2);
+                    (pending, tickets, bits)
+                }),
+            pending,
+            targets: target.map(|(counts, _)| counts),
+            root: target.map(|(_, ready)| {
+                [
+                    frame.is_some(),
+                    frame.is_some_and(|frame| frame.loader.is_some()),
+                    live_realm(&page.page_session_id),
+                    ready,
+                ]
+            }),
+            watermark: match received {
+                Some(received) if index.applied_watermark == received => EvalWatermark::Equal,
+                Some(received) if index.applied_watermark < received => EvalWatermark::Behind,
+                Some(_) => EvalWatermark::Ahead,
+                None => EvalWatermark::Unknown,
+            },
+            revision: revision.filter(|value| *value <= (1u64 << 53) - 1),
+            epoch: (index.application_epoch <= (1u64 << 53) - 1).then_some(index.application_epoch),
+        }
+    }
     /// Drain only the events already received at this command's entry. This
     /// yields before the caller owns a UI/configuration/input guard and grants
     /// no evaluation authority: capture_eval_authority still runs at dispatch.
@@ -1811,7 +1895,9 @@ impl ClientEnrollment {
         if attachment.session_id != page.page_session_id || !attachment.capture_ready() {
             return Err(ProtocolError::StaleScope);
         }
-        let (received, epoch, revision) = {
+        let diagnostics = super::client_settlement_trace::query_diagnostics_enabled();
+        let mut refusal_diagnostic = None;
+        let (received, epoch, revision, entry_diagnostic) = {
             let index = self
                 .index
                 .lock()
@@ -1828,132 +1914,220 @@ impl ClientEnrollment {
             let received = watermark
                 .received()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
-            (received, index.application_epoch, revision)
+            let diagnostic = diagnostics.then(|| {
+                self.eval_diagnostic_snapshot(
+                    &index,
+                    page,
+                    super::client_settlement_trace::EvalAdmissionStage::Entry,
+                    super::client_settlement_trace::EvalAdmissionReason::Frontier,
+                    Some(received),
+                    Some(revision),
+                )
+            });
+            (received, index.application_epoch, revision, diagnostic)
         };
-        bounded(op, async {
-            loop {
-                let changed = self.changed.notified();
-                tokio::pin!(changed);
-                changed.as_mut().enable();
-                self.check_restart_operation(op)?;
-                page.permit.check()?;
-                self.targets.require_eval_owner(&ledger)?;
-                if !attachment.same_attachment(&self.targets.owned_target(&page.target_id)?) {
-                    return Err(ProtocolError::StaleScope);
-                }
-                {
-                    let index = self
-                        .index
-                        .lock()
-                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                    if let Some(error) = &index.failure {
-                        return Err(error.clone());
-                    }
-                    if !index.reconciled
-                        || index.application_epoch != epoch
-                        || ledger.observe_eval_revision(&page.page_session_id, &page.target_id)?
-                            != revision
-                    {
+        if let Some(facts) = entry_diagnostic {
+            super::client_settlement_trace::eval_admission(op.generation, op.sequence, facts);
+        }
+        let result =
+            bounded(op, async {
+                loop {
+                    let changed = self.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    self.check_restart_operation(op)?;
+                    page.permit.check()?;
+                    self.targets.require_eval_owner(&ledger)?;
+                    if !attachment.same_attachment(&self.targets.owned_target(&page.target_id)?) {
                         return Err(ProtocolError::StaleScope);
                     }
-                    // Detect a lost/overflowed subscription, but never replace
-                    // the fixed received target with this later high-water mark.
-                    watermark
-                        .received()
-                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
-                    if index.applied_watermark >= received {
-                        return Ok(());
+                    {
+                        let index = self
+                            .index
+                            .lock()
+                            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                        if let Some(error) = &index.failure {
+                            return Err(error.clone());
+                        }
+                        if !index.reconciled
+                            || index.application_epoch != epoch
+                            || ledger
+                                .observe_eval_revision(&page.page_session_id, &page.target_id)?
+                                != revision
+                        {
+                            refusal_diagnostic =
+                                diagnostics.then(|| {
+                                    self.eval_diagnostic_snapshot(&index, page,
+                            super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
+                            super::client_settlement_trace::EvalAdmissionReason::EntryFence,
+                            Some(received), None)
+                                });
+                            return Err(ProtocolError::StaleScope);
+                        }
+                        // Detect a lost/overflowed subscription, but never replace
+                        // the fixed received target with this later high-water mark.
+                        watermark
+                            .received()
+                            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                        if index.applied_watermark >= received {
+                            return Ok(());
+                        }
                     }
+                    changed.await;
                 }
-                changed.await;
-            }
-        })
-        .await
+            })
+            .await;
+        if diagnostics && result.is_err() {
+            super::client_settlement_trace::eval_admission(
+                op.generation,
+                op.sequence,
+                refusal_diagnostic.unwrap_or_else(|| {
+                    super::client_settlement_trace::EvalAdmissionFacts::unknown(
+                        super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
+                        super::client_settlement_trace::EvalAdmissionReason::OtherGuard,
+                    )
+                }),
+            );
+        }
+        result
     }
     pub(crate) fn capture_eval_authority(
         &self,
         page: &BrowserExecutionLease,
         op: &OperationLease,
     ) -> Result<super::client_debt::EvalAuthorityStamp, ProtocolError> {
-        self.check_restart_operation(op)?;
-        if op.is_callback
-            || !Arc::ptr_eq(&page.client, &self.client)
-            || !Arc::ptr_eq(&page.targets, &self.targets)
-            || page.identity_scope != self.targets.identity_scope
-        {
-            return Err(ProtocolError::StaleScope);
-        }
-        page.permit.check()?;
-        let ledger = self
-            .client
-            .debt_ledger()
-            .ok_or(ProtocolError::ScopeUnavailable)?;
-        self.targets.require_eval_owner(&ledger)?;
-        let watermark = self.realm_watermark()?;
-        let index = self
-            .index
-            .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
-        // Observe the ledger before reading the index/watermark: the reader
-        // fences observation before publishing received, with no lock spanning it.
-        let revision = ledger.capture_eval_revision(&page.page_session_id, &page.target_id)?;
-        self.realm_snapshot_healthy(&index, &watermark)?;
-        if !index.pending_enrollment.is_empty()
-            || index
-                .sessions
-                .values()
-                .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
-            || !restart_retirements_settled(
-                &index,
-                watermark
-                    .received()
-                    .map_err(|_| ProtocolError::ScopeUnavailable)?,
-            )
-        {
-            return Err(ProtocolError::ScopeUnavailable);
-        }
-        let entry = index
-            .sessions
-            .get(&page.page_session_id)
-            .ok_or(ProtocolError::StaleScope)?;
-        if !entry.application
-            || entry.observation_only
-            || !entry.resumed
-            || entry.target != page.target_id
-            || entry.kind != "page"
-            || entry.root != entry.session
-            || *self
-                .active_root
+        let diagnostics = super::client_settlement_trace::query_diagnostics_enabled();
+        let mut refusal_diagnostic = None;
+        let result = (|| {
+            self.check_restart_operation(op)?;
+            if op.is_callback
+                || !Arc::ptr_eq(&page.client, &self.client)
+                || !Arc::ptr_eq(&page.targets, &self.targets)
+                || page.identity_scope != self.targets.identity_scope
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            page.permit.check()?;
+            let ledger = self
+                .client
+                .debt_ledger()
+                .ok_or(ProtocolError::ScopeUnavailable)?;
+            self.targets.require_eval_owner(&ledger)?;
+            let watermark = self.realm_watermark()?;
+            let index = self
+                .index
                 .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?
-                != entry.session
-        {
-            return Err(ProtocolError::StaleScope);
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            refusal_diagnostic = diagnostics.then(|| {
+                self.eval_diagnostic_snapshot(
+                    &index,
+                    page,
+                    super::client_settlement_trace::EvalAdmissionStage::CaptureRefused,
+                    super::client_settlement_trace::EvalAdmissionReason::OtherGuard,
+                    None,
+                    None,
+                )
+            });
+            // Observe the ledger before reading the index/watermark: the reader
+            // fences observation before publishing received, with no lock spanning it.
+            let revision = ledger.capture_eval_revision(&page.page_session_id, &page.target_id)?;
+            if let Some(facts) = &mut refusal_diagnostic {
+                facts.revision = (revision <= (1u64 << 53) - 1).then_some(revision);
+            }
+            self.realm_snapshot_healthy(&index, &watermark)
+                .inspect_err(|_| {
+                    if let Some(facts) = &mut refusal_diagnostic {
+                        facts.reason =
+                            super::client_settlement_trace::EvalAdmissionReason::RealmHealth;
+                    }
+                })?;
+            if !index.pending_enrollment.is_empty()
+                || index
+                    .sessions
+                    .values()
+                    .any(|entry| (entry.application || entry.observation_only) && !entry.resumed)
+                || !restart_retirements_settled(
+                    &index,
+                    watermark
+                        .received()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?,
+                )
+            {
+                if let Some(facts) = &mut refusal_diagnostic {
+                    facts.reason = if !index.pending_enrollment.is_empty() {
+                        super::client_settlement_trace::EvalAdmissionReason::PendingEnrollment
+                    } else if index.sessions.values().any(|entry| {
+                        (entry.application || entry.observation_only) && !entry.resumed
+                    }) {
+                        super::client_settlement_trace::EvalAdmissionReason::Unresumed
+                    } else {
+                        super::client_settlement_trace::EvalAdmissionReason::RetirementPending
+                    };
+                }
+                return Err(ProtocolError::ScopeUnavailable);
+            }
+            let entry = index
+                .sessions
+                .get(&page.page_session_id)
+                .ok_or(ProtocolError::StaleScope)?;
+            if !entry.application
+                || entry.observation_only
+                || !entry.resumed
+                || entry.target != page.target_id
+                || entry.kind != "page"
+                || entry.root != entry.session
+                || *self
+                    .active_root
+                    .lock()
+                    .map_err(|_| ProtocolError::ScopeUnavailable)?
+                    != entry.session
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            let mut frames = index
+                .frames
+                .iter()
+                .filter(|(_, frame)| frame.session == entry.session && frame.parent.is_none());
+            let (frame, owner) = frames.next().ok_or(ProtocolError::InvalidFrame)?;
+            if frames.next().is_some() {
+                return Err(ProtocolError::InvalidFrame);
+            }
+            let loader = owner.loader.clone().ok_or(ProtocolError::InvalidFrame)?;
+            let attachment = self.targets.owned_target(&page.target_id)?;
+            if attachment.session_id != page.page_session_id
+                || !attachment.capture_ready()
+                || ledger.capture_eval_revision(&page.page_session_id, &page.target_id)? != revision
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            self.realm_snapshot_healthy(&index, &watermark)
+                .inspect_err(|_| {
+                    if let Some(facts) = &mut refusal_diagnostic {
+                        facts.reason =
+                            super::client_settlement_trace::EvalAdmissionReason::RealmHealth;
+                    }
+                })?;
+            Ok(super::client_debt::EvalAuthorityStamp {
+                revision,
+                target: entry.target.clone(),
+                session: entry.session.clone(),
+                frame: frame.clone(),
+                loader,
+            })
+        })();
+        if diagnostics && result.is_err() {
+            super::client_settlement_trace::eval_admission(
+                op.generation,
+                op.sequence,
+                refusal_diagnostic.unwrap_or_else(|| {
+                    super::client_settlement_trace::EvalAdmissionFacts::unknown(
+                        super::client_settlement_trace::EvalAdmissionStage::CaptureRefused,
+                        super::client_settlement_trace::EvalAdmissionReason::OtherGuard,
+                    )
+                }),
+            );
         }
-        let mut frames = index
-            .frames
-            .iter()
-            .filter(|(_, frame)| frame.session == entry.session && frame.parent.is_none());
-        let (frame, owner) = frames.next().ok_or(ProtocolError::InvalidFrame)?;
-        if frames.next().is_some() {
-            return Err(ProtocolError::InvalidFrame);
-        }
-        let loader = owner.loader.clone().ok_or(ProtocolError::InvalidFrame)?;
-        let attachment = self.targets.owned_target(&page.target_id)?;
-        if attachment.session_id != page.page_session_id
-            || !attachment.capture_ready()
-            || ledger.capture_eval_revision(&page.page_session_id, &page.target_id)? != revision
-        {
-            return Err(ProtocolError::StaleScope);
-        }
-        self.realm_snapshot_healthy(&index, &watermark)?;
-        Ok(super::client_debt::EvalAuthorityStamp {
-            revision,
-            target: entry.target.clone(),
-            session: entry.session.clone(),
-            frame: frame.clone(),
-            loader,
-        })
+        result
     }
     fn bump_application_epoch(&self) -> Result<(), ProtocolError> {
         let mut index = self
