@@ -7,7 +7,7 @@ mod resolve_custody;
 #[path = "fresh_query_submission_tests.rs"]
 mod submission_tests;
 
-fn eligible(expression: &LocatorExpression, fields: &[ReadField]) -> bool {
+pub(super) fn eligible(expression: &LocatorExpression, fields: &[ReadField]) -> bool {
     if fields.iter().any(|field| {
         matches!(
             field,
@@ -114,16 +114,44 @@ pub(super) async fn fields(
     lease: &OperationLease,
     witness: &query_diagnostic::QueryReadWitness,
 ) -> Result<Option<Vec<Value>>, ObservationError> {
+    match fields_impl(
+        client, frame, expression, options, fields, lease, witness, None,
+    )
+    .await?
+    {
+        single_root_fields::Sample::Values(values) => Ok(Some(values)),
+        single_root_fields::Sample::NotEligible | single_root_fields::Sample::RequiresAx => {
+            Ok(None)
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn fields_impl(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    expression: &LocatorExpression,
+    options: &QueryOptions,
+    fields: &[ReadField],
+    lease: &OperationLease,
+    witness: &query_diagnostic::QueryReadWitness,
+    receipt: Option<&single_root_fields::RootRealm<'_>>,
+) -> Result<single_root_fields::Sample, ObservationError> {
     use super::super::client_settlement_trace::QueryReadStage as Stage;
     // Arbitrary CSS can match browser implementation nodes. Its policy keeps
     // the complete native inventory path, never this UA-eliding proof.
     if !eligible(expression, fields) || options.secure_field_selector != default_secure_selector() {
-        return Ok(None);
+        return Ok(single_root_fields::Sample::NotEligible);
     }
     witness.stage(Stage::FreshInventory);
-    let dom = validated_frame_dom(client, frame, lease).await?;
+    let dom = if let Some(receipt) = receipt {
+        receipt.check(client, frame, lease)?;
+        root_document_dom(client, frame, lease).await?
+    } else {
+        validated_frame_dom(client, frame, lease).await?
+    };
     let Some((ids, author, domains)) = roots(&dom["root"])? else {
-        return Ok(None);
+        return Ok(single_root_fields::Sample::NotEligible);
     };
     let session = &frame.binding.session;
     // This stage cannot submit a group-producing command. A stopped world
@@ -132,18 +160,22 @@ pub(super) async fn fields(
     // Once a resolve may have submitted below, its outcomes keep the existing
     // accounted cleanup, including cancelled/unknown late object creation.
     witness.stage(Stage::FreshWorld);
-    let world = command(
-        client,
-        session,
-        "Page.createIsolatedWorld",
-        json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),
-        lease,
-    )
-    .await
-    .map_err(|error| settled_stop(error, lease))?;
-    let context = world["executionContextId"]
-        .as_i64()
-        .ok_or(ObservationError::BackendFailure)?;
+    let context = if let Some(receipt) = receipt {
+        receipt.context(client, frame, lease)?
+    } else {
+        let world = command(
+            client,
+            session,
+            "Page.createIsolatedWorld",
+            json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),
+            lease,
+        )
+        .await
+        .map_err(|error| settled_stop(error, lease))?;
+        world["executionContextId"]
+            .as_i64()
+            .ok_or(ObservationError::BackendFailure)?
+    };
     let group = client
         .readonly_group_instance(&format!("native-query-{}-fields", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
@@ -183,7 +215,7 @@ pub(super) async fn fields(
             Some(_) => return Err(ObservationError::BackendFailure),
             None => {}
         }
-        if value["requiresAx"] == true { return Ok(None); }
+        if value["requiresAx"] == true { return Ok(single_root_fields::Sample::RequiresAx); }
         let rows = value["values"].as_array().ok_or(ObservationError::BackendFailure)?;
         if rows.len() > super::super::element::MAX_EXACT_REFERENCES { return Err(ObservationError::ResourceLimit); }
         let empty_ax = AXNode { node_id:String::new(), role:None, name:None, value:None, description:None, properties:None, child_ids:None, backend_d_o_m_node_id:None, ignored:None };
@@ -195,7 +227,7 @@ pub(super) async fn fields(
             let node = project_node_with_refs(frame, 0, &empty_ax, None, 0, row, false)?;
             samples.push(project_fixture_fields(node, fields)?);
         }
-        Ok(Some(samples))
+        Ok(single_root_fields::Sample::Values(samples))
     }.await;
     // Freeze an actual sample/resolve failure before cleanup can replace it.
     witness.observe(&result);
@@ -217,7 +249,12 @@ pub(super) async fn fields(
     // A new/retired author root invalidates the acquired policy rather than
     // turning an unseen closed domain into an empty result. Leaf churn does not.
     witness.stage(Stage::FreshRootsFinal);
-    let current = validated_frame_dom(client, frame, lease).await?;
+    let current = if let Some(receipt) = receipt {
+        receipt.check(client, frame, lease)?;
+        root_document_dom(client, frame, lease).await?
+    } else {
+        validated_frame_dom(client, frame, lease).await?
+    };
     if roots(&current["root"])? != Some((ids, author, domains)) {
         return Err(ObservationError::StaleReference);
     }

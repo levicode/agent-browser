@@ -2916,6 +2916,29 @@ impl ClientTargets {
             diagnostic::target_observation_lost(operation.0, operation.1);
         }
     }
+    /// Capture diagnostic identity before an await. This carries no authority,
+    /// never waits for the registry, and cannot be rebound to a later attachment.
+    pub(crate) fn diagnostic_attachment_for_session(
+        &self,
+        target_id: &str,
+        session_id: &str,
+        operation: (u64, u64),
+    ) -> Option<diagnostic::DiagnosticAttachment> {
+        if !diagnostic::inventory_enabled() {
+            return None;
+        }
+        let observed = self.state.try_lock().ok().and_then(|state| {
+            state
+                .targets
+                .get(target_id)
+                .filter(|target| target.session_id == session_id)
+                .and_then(|target| target.diagnostic_snapshot())
+        });
+        if observed.is_none() {
+            diagnostic::target_observation_lost(operation.0, operation.1);
+        }
+        observed
+    }
     pub(crate) fn diagnostic_step(
         &self,
         target_id: &str,

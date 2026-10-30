@@ -7,11 +7,42 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
-// Exact single-frame S11 application script. Readonly release is independent.
+// Exact single-root transaction script. Readonly release is independent.
 // The last entry has no later CDP command to reject admission. The expected
 // scope-unavailable must come from the final FieldReadRequest authority check,
 // not the outer retained owner's separate dirty-success/cleanup-failed fallback.
-const APPLICATION: [&str; 19] = [
+const APPLICATION: [&str; 10] = [
+    "Page.getFrameTree", // initial singleton inventory
+    "Page.createIsolatedWorld",
+    "Page.getFrameTree", // post-world confirmation
+    "DOM.getDocument",
+    "DOM.describeNode",
+    "DOM.resolveNode",
+    "Runtime.callFunctionOn",
+    "DOM.getDocument",   // fresh current Document, not retained backend
+    "DOM.describeNode",  // complete final policy roots
+    "Page.getFrameTree", // complete final topology and publication fence
+];
+// A RequiresAx sample must finish fresh roots and a complete legacy frame
+// inventory before entering AX, never recursively run another fresh sample.
+const REQUIRES_AX_APPLICATION: [&str; 15] = [
+    "Page.getFrameTree",
+    "Page.createIsolatedWorld",
+    "Page.getFrameTree",
+    "DOM.getDocument",
+    "DOM.describeNode",
+    "DOM.resolveNode",
+    "Runtime.callFunctionOn",
+    "DOM.getDocument",
+    "DOM.describeNode",
+    "Page.getFrameTree", // complete final lineage
+    "Page.getFrameTree", // final enumeration
+    "Page.createIsolatedWorld",
+    "Page.getFrameTree", // final enumeration confirmation
+    "Page.getFrameTree", // AX entry frame validation
+    "Accessibility.getFullAXTree",
+];
+const LEGACY_APPLICATION: [&str; 19] = [
     "Page.getFrameTree", // initial lineage
     "Page.getFrameTree", // initial enumeration
     "Page.createIsolatedWorld",
@@ -32,10 +63,32 @@ const APPLICATION: [&str; 19] = [
     "Page.createIsolatedWorld",
     "Page.getFrameTree", // final enumeration validation
 ];
+const FINAL_EXTRA_WORKER_APPLICATION: [&str; 13] = [
+    "Page.getFrameTree",
+    "Page.createIsolatedWorld",
+    "Page.getFrameTree",
+    "DOM.getDocument",
+    "DOM.describeNode",
+    "DOM.resolveNode",
+    "Runtime.callFunctionOn",
+    "DOM.getDocument",
+    "DOM.describeNode",
+    "Page.getFrameTree",
+    "Page.getFrameTree",
+    "Page.createIsolatedWorld",
+    "Page.getFrameTree",
+];
+const SAMPLE_INDEX: usize = 6;
+const FINAL_DOCUMENT_INDEX: usize = 7;
+const FINAL_DESCRIPTION_INDEX: usize = 8;
+const FINAL_TOPOLOGY_INDEX: usize = 9;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Valid,
+    RequiresAxBackendError,
+    InitialExtraWorker,
+    FinalExtraWorker,
     ForeignInitialFrame,
     ForeignInitialDescription,
     ForeignFinalDescription,
@@ -45,19 +98,51 @@ enum Mode {
     HeldCleanup,
     HeldInitialDescription,
     HeldFinalDescription,
+    FinalChild,
+    FinalFrame,
+    FinalLoader,
+    FinalUrl,
+    FinalDocument,
+    FinalClosedRoot,
+    FinalLeafChurn,
 }
 impl Mode {
+    fn script(self) -> &'static [&'static str] {
+        match self {
+            Self::RequiresAxBackendError => &REQUIRES_AX_APPLICATION,
+            Self::InitialExtraWorker => &LEGACY_APPLICATION,
+            Self::FinalExtraWorker => &FINAL_EXTRA_WORKER_APPLICATION,
+            _ => &APPLICATION,
+        }
+    }
+    fn sample_index(self) -> usize {
+        if self == Self::InitialExtraWorker {
+            9
+        } else {
+            SAMPLE_INDEX
+        }
+    }
     fn boundary(self) -> Option<usize> {
         match self {
-            Self::ForeignInitialFrame => Some(3),
+            Self::ForeignInitialFrame => Some(2),
             Self::ForeignInitialDescription
             | Self::OpaqueInitialDescription
-            | Self::HeldInitialDescription => Some(6),
+            | Self::HeldInitialDescription => Some(4),
             Self::ForeignFinalDescription
             | Self::OpaqueFinalDescription
-            | Self::HeldFinalDescription => Some(12),
-            Self::ForeignPublicationFrame => Some(18),
-            Self::Valid | Self::HeldCleanup => None,
+            | Self::HeldFinalDescription => Some(FINAL_DESCRIPTION_INDEX),
+            Self::FinalDocument | Self::FinalClosedRoot => Some(FINAL_DESCRIPTION_INDEX),
+            Self::ForeignPublicationFrame
+            | Self::FinalChild
+            | Self::FinalFrame
+            | Self::FinalLoader
+            | Self::FinalUrl => Some(FINAL_TOPOLOGY_INDEX),
+            Self::Valid
+            | Self::HeldCleanup
+            | Self::FinalLeafChurn
+            | Self::RequiresAxBackendError
+            | Self::InitialExtraWorker
+            | Self::FinalExtraWorker => None,
         }
     }
     fn foreign(self) -> bool {
@@ -102,7 +187,7 @@ struct PeerReport {
     application_count: usize,
     release_seen: bool,
     held_response_pending: bool,
-    final_tree_response_pending: bool,
+    final_document_response_pending: bool,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Disarm {
@@ -163,7 +248,12 @@ async fn send_reply(
 fn frame_tree() -> Value {
     json!({"frameTree":{"frame":{"id":"frame-host-session","loaderId":"activation-loader","url":"about:blank"}}})
 }
-fn application_reply(request: &Value, group: &mut Option<String>) -> Value {
+fn application_reply(
+    request: &Value,
+    group: &mut Option<String>,
+    mode: Mode,
+    ordinal: usize,
+) -> Value {
     assert_eq!(request["sessionId"], "host-session");
     match request["method"].as_str().unwrap() {
         "Page.getFrameTree" => {
@@ -177,14 +267,25 @@ fn application_reply(request: &Value, group: &mut Option<String>) -> Value {
             );
             json!({"executionContextId":1})
         }
+        "Accessibility.getFullAXTree" => {
+            assert_eq!(mode, Mode::RequiresAxBackendError);
+            assert_eq!(ordinal, REQUIRES_AX_APPLICATION.len() - 1);
+            assert_eq!(request["params"], json!({"frameId":"frame-host-session"}));
+            json!({})
+        }
         "DOM.getDocument" => {
             assert_eq!(request["params"], json!({"depth":0,"pierce":true}));
             json!({"root":{"nodeType":9,"backendNodeId":1}})
         }
         "DOM.describeNode" => {
+            let backend = if mode == Mode::FinalDocument && ordinal == FINAL_DESCRIPTION_INDEX {
+                101
+            } else {
+                1
+            };
             assert_eq!(
                 request["params"],
-                json!({"backendNodeId":1,"depth":-1,"pierce":true})
+                json!({"backendNodeId":backend,"depth":-1,"pierce":true})
             );
             json!({"node":{"nodeId":0,"nodeType":9,"backendNodeId":1,"children":[{"nodeId":0,"nodeType":1,"backendNodeId":2,"nodeName":"INPUT","attributes":["data-testid","city"],"children":[]}]}})
         }
@@ -209,7 +310,7 @@ fn application_reply(request: &Value, group: &mut Option<String>) -> Value {
             assert_eq!(
                 request["params"]["arguments"],
                 json!([
-                    {"value":canonical_expression()}, {"value":["value"]},
+                    {"value":canonical_expression()}, {"value":if mode == Mode::RequiresAxBackendError { vec!["states"] } else { vec!["value"] }},
                     {"value":"data-testid"}, {"value":FIXTURE_SECURE_SELECTOR},
                     {"value":[true]}, {"value":[0]}, {"objectId":"field-root"}
                 ])
@@ -243,7 +344,7 @@ async fn peer(mode: Mode) -> Peer {
         let mut group = None;
         let mut release_seen = false;
         let mut held_response = None;
-        let mut final_tree_response = None;
+        let mut final_document_response = None;
         let exit = loop {
             tokio::select! {
                 _ = &mut disconnected => break PeerExit::TestDisconnect,
@@ -261,7 +362,7 @@ async fn peer(mode: Mode) -> Peer {
                         }
                         Control::Disarm(done) => {
                             assert!(held_response.is_none());
-                            assert!(final_tree_response.is_none());
+                            assert!(final_document_response.is_none());
                             armed = false;
                             done.send(()).unwrap();
                         }
@@ -298,17 +399,53 @@ async fn peer(mode: Mode) -> Peer {
                                 held_send.send(()).unwrap();
                             } else {
                                 send_reply(&mut socket, response).await;
-                                if let Some(response) = final_tree_response.take() {
+                                if let Some(response) = final_document_response.take() {
                                     send_reply(&mut socket, response).await;
                                 }
                             }
                             continue;
                         }
-                        assert_eq!(Some(&method), APPLICATION.get(ordinal), "application order changed at {ordinal}");
+                        assert_eq!(Some(&method), mode.script().get(ordinal), "application order changed at {ordinal}");
                         let current = ordinal;
                         ordinal += 1;
                         recorded.lock().unwrap().push(request.clone());
-                        let mut response = reply(&request, application_reply(&request, &mut group));
+                        let mut response = reply(&request, application_reply(&request, &mut group, mode, current));
+                        if mode == Mode::RequiresAxBackendError {
+                            if current == SAMPLE_INDEX {
+                                response["result"]["result"]["value"] = json!({"requiresAx":true});
+                            } else if current == REQUIRES_AX_APPLICATION.len() - 1 {
+                                response.as_object_mut().unwrap().remove("result");
+                                response["error"] = json!({"code":-32000,"message":"explicit AX control failure"});
+                            }
+                        }
+                        if current == FINAL_DOCUMENT_INDEX && mode == Mode::FinalDocument {
+                            response["result"]["root"]["backendNodeId"] = json!(101);
+                        }
+                        if current == FINAL_DESCRIPTION_INDEX {
+                            match mode {
+                                Mode::FinalDocument => response["result"]["node"]["backendNodeId"] = json!(101),
+                                Mode::FinalClosedRoot => response["result"]["node"]["children"][0]["shadowRoots"] =
+                                    json!([{"nodeType":11,"backendNodeId":3,"shadowRootType":"closed","children":[]}]),
+                                Mode::FinalLeafChurn => response["result"]["node"]["children"][0]["backendNodeId"] = json!(99),
+                                _ => {}
+                            }
+                        }
+                        if current == FINAL_TOPOLOGY_INDEX {
+                            match mode {
+                                Mode::FinalChild => response["result"]["frameTree"]["childFrames"] = json!([
+                                    {"frame":{"id":"same-session-child","parentId":"frame-host-session","loaderId":"child-loader","url":"about:blank"}}
+                                ]),
+                                Mode::FinalFrame => response["result"]["frameTree"]["frame"]["id"] = json!("replacement-frame"),
+                                Mode::FinalLoader => response["result"]["frameTree"]["frame"]["loaderId"] = json!("replacement-loader"),
+                                Mode::FinalUrl => response["result"]["frameTree"]["frame"]["url"] = json!("https://changed.invalid/"),
+                                _ => {}
+                            }
+                        }
+                        if mode == Mode::FinalExtraWorker && current == FINAL_DESCRIPTION_INDEX {
+                            assert!(held_response.replace(response).is_none());
+                            held_send.send(()).unwrap();
+                            continue;
+                        }
                         if mode.boundary() == Some(current) {
                             if mode.foreign() {
                                 // Keep the exact command id and payload; change only session.
@@ -323,11 +460,11 @@ async fn peer(mode: Mode) -> Peer {
                             }
                         }
                         // Only the test peer imposes this rendezvous. It accepts
-                        // either release-first or final-tree-first wire order.
+                        // either release-first or final-document-first wire order.
                         // Poison controls then measure exactly one read debt,
                         // not an unrelated racing release/group obligation.
-                        if current == 10 && mode != Mode::HeldCleanup && !release_seen {
-                            assert!(final_tree_response.replace(response).is_none());
+                        if current == mode.sample_index() + 1 && mode != Mode::HeldCleanup && !release_seen {
+                            assert!(final_document_response.replace(response).is_none());
                         } else {
                             send_reply(&mut socket, response).await;
                         }
@@ -336,7 +473,7 @@ async fn peer(mode: Mode) -> Peer {
                     // Setup may perform these reads; terminal cleanup may not
                     // silently resume the completed field application script.
                     if ordinal != 0 {
-                        assert!(!APPLICATION.contains(&method), "late application read after Disarm: {method}");
+                        assert!(!mode.script().contains(&method), "late application read after Disarm: {method}");
                     }
                     let session = request["sessionId"].as_str().unwrap_or("");
                     let result = match method {
@@ -381,7 +518,7 @@ async fn peer(mode: Mode) -> Peer {
             application_count: ordinal,
             release_seen,
             held_response_pending: held_response.is_some(),
-            final_tree_response_pending: final_tree_response.is_some(),
+            final_document_response_pending: final_document_response.is_some(),
         }
     });
     Peer {
@@ -477,11 +614,14 @@ async fn setup(mode: Mode) -> (Peer, Arc<ClientBrowser>, FramedFixture, String) 
     (peer, browser, fixture, scope)
 }
 async fn request(fixture: &mut FramedFixture, scope: &str, timeout_ms: u64) {
+    request_fields(fixture, scope, timeout_ms, "value").await;
+}
+async fn request_fields(fixture: &mut FramedFixture, scope: &str, timeout_ms: u64, field: &str) {
     fixture.sequence += 1;
     fixture
         .write(json!({"type":"request","id":"public-fields","generation":1,
         "operationSeq":fixture.sequence,"timeoutMs":timeout_ms,"command":"fixture.read-fields",
-        "args":{"identityScope":scope,"expression":expression(),"fields":["value"],
+        "args":{"identityScope":scope,"expression":expression(),"fields":[field],
         "testIdAttribute":"data-testid","secureFieldSelector":FIXTURE_SECURE_SELECTOR}}))
         .await
         .unwrap();
@@ -523,15 +663,15 @@ async fn result(fixture: &mut FramedFixture, cancellation: bool) -> Value {
 }
 fn assert_script(peer: &Peer, mode: Mode) {
     let application = peer.application.lock().unwrap();
-    let expected_count = mode.boundary().map_or(APPLICATION.len(), |at| at + 1);
+    let expected_count = mode.boundary().map_or(mode.script().len(), |at| at + 1);
     assert_eq!(application.len(), expected_count, "{mode:?}");
-    for (request, method) in application.iter().zip(APPLICATION) {
+    for (request, method) in application.iter().zip(mode.script().iter().copied()) {
         assert_eq!(request["method"], method);
         assert_eq!(request["sessionId"], "host-session");
     }
     assert_eq!(
         peer.releases.lock().unwrap().len(),
-        usize::from(expected_count > 9)
+        usize::from(expected_count > mode.sample_index())
     );
 }
 fn assert_rejected(value: &Value, browser: &ClientBrowser) {
@@ -556,7 +696,7 @@ async fn finish(peer: Peer, fixture: FramedFixture, poisoned: bool) {
     let mode = peer.mode;
     assert_eq!(poisoned, mode.foreign());
     assert_script(&peer, mode);
-    let expected_count = mode.boundary().map_or(APPLICATION.len(), |at| at + 1);
+    let expected_count = mode.boundary().map_or(mode.script().len(), |at| at + 1);
     let application = peer.application.clone();
     let releases = peer.releases.clone();
     let completed_application = application.lock().unwrap().clone();
@@ -592,14 +732,14 @@ async fn finish(peer: Peer, fixture: FramedFixture, poisoned: bool) {
     assert_eq!(*application.lock().unwrap(), completed_application);
     assert_eq!(*releases.lock().unwrap(), completed_releases);
     assert_eq!(report.application_count, expected_count);
-    assert_eq!(report.release_seen, expected_count > 9);
+    assert_eq!(report.release_seen, expected_count > mode.sample_index());
     assert!(
         !report.held_response_pending,
         "teardown lost a required held ACK"
     );
     assert!(
-        !report.final_tree_response_pending,
-        "teardown lost a final-tree rendezvous"
+        !report.final_document_response_pending,
+        "teardown lost a final-document rendezvous"
     );
     match disarm {
         Disarm::Acknowledged => {
@@ -815,5 +955,200 @@ async fn public_read_fields_original_stop_survives_held_inventory_ack() {
             assert_script(&peer, mode);
             finish(peer, fixture, false).await;
         }
+    }
+}
+
+#[tokio::test]
+async fn public_read_fields_final_topology_and_policy_changes_never_publish_sample() {
+    for mode in [
+        Mode::FinalChild,
+        Mode::FinalFrame,
+        Mode::FinalLoader,
+        Mode::FinalUrl,
+        Mode::FinalDocument,
+        Mode::FinalClosedRoot,
+    ] {
+        let (peer, browser, mut fixture, scope) = setup(mode).await;
+        let ledger = browser
+            .page_lease(false)
+            .await
+            .unwrap()
+            .client
+            .debt_ledger()
+            .unwrap();
+        request(&mut fixture, &scope, 5_000).await;
+        let value = result(&mut fixture, false).await;
+        assert_rejected(&value, &browser);
+        assert_eq!(value["effects"], "not-dispatched");
+        assert_eq!(value["scopeState"], "usable");
+        debt_settled(&ledger).await;
+        assert_eq!(
+            value["error"]["code"],
+            if matches!(mode, Mode::FinalDocument | Mode::FinalClosedRoot) {
+                "stale-reference"
+            } else {
+                "stale-scope"
+            }
+        );
+        // The fixture supplied a nonempty sample exactly once; refusal must
+        // come from the fresh final proof, never a replay on another document.
+        assert_eq!(
+            peer.application
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Runtime.callFunctionOn")
+                .count(),
+            1
+        );
+        assert_script(&peer, mode);
+        finish(peer, fixture, false).await;
+    }
+}
+
+#[tokio::test]
+async fn public_read_fields_leaf_churn_preserves_root_policy_and_sample() {
+    let mode = Mode::FinalLeafChurn;
+    let (peer, browser, mut fixture, scope) = setup(mode).await;
+    let ledger = browser
+        .page_lease(false)
+        .await
+        .unwrap()
+        .client
+        .debt_ledger()
+        .unwrap();
+    request(&mut fixture, &scope, 5_000).await;
+    let value = result(&mut fixture, false).await;
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["effects"], "completed");
+    assert_eq!(value["scopeState"], "usable");
+    assert_eq!(
+        value["data"],
+        json!({"identityScope":scope,"values":[{"value":"London","states":{"secure":false}}]})
+    );
+    assert!(browser.refs.lock().unwrap().entries_sorted().is_empty());
+    debt_settled(&ledger).await;
+    assert_script(&peer, mode);
+    finish(peer, fixture, false).await;
+}
+
+#[tokio::test]
+async fn public_read_fields_requires_ax_validates_final_frames_before_ax_without_resampling() {
+    let mode = Mode::RequiresAxBackendError;
+    let (peer, browser, mut fixture, scope) = setup(mode).await;
+    let ledger = browser
+        .page_lease(false)
+        .await
+        .unwrap()
+        .client
+        .debt_ledger()
+        .unwrap();
+    request_fields(&mut fixture, &scope, 5_000, "states").await;
+    let value = result(&mut fixture, false).await;
+    assert_rejected(&value, &browser);
+    assert_eq!(value["error"]["code"], "browser-failure");
+    assert_eq!(value["effects"], "not-dispatched");
+    assert_eq!(value["scopeState"], "usable");
+    debt_settled(&ledger).await;
+    assert_eq!(
+        peer.application
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "Runtime.callFunctionOn")
+            .count(),
+        1
+    );
+    assert_script(&peer, mode);
+    finish(peer, fixture, false).await;
+}
+
+// This fixture constructs a ready unrelated registry member using the same
+// lifecycle APIs as target-registry unit tests, never an OwnedTarget literal or
+// a forged private tenure. It is detached before normal host-page shutdown.
+async fn add_ready_worker(browser: &ClientBrowser) {
+    let page = browser.page_lease(false).await.unwrap();
+    assert!(page
+        .targets
+        .attached(
+            "host-context",
+            "extra-worker".into(),
+            "worker-session".into(),
+            "worker".into()
+        )
+        .unwrap());
+    page.targets.configured("extra-worker").unwrap();
+    page.targets
+        .resume_permit("extra-worker")
+        .await
+        .unwrap()
+        .complete()
+        .unwrap();
+    let (_, targets) = page.targets.inventory().unwrap();
+    assert_eq!(targets.len(), 2);
+    let worker = targets
+        .iter()
+        .find(|target| target.target_id == "extra-worker")
+        .unwrap();
+    assert_eq!(worker.session_id, "worker-session");
+    assert_eq!(worker.kind, "worker");
+    assert_eq!(
+        worker.purpose,
+        Some(crate::native::client_targets::TargetPurpose::Application)
+    );
+    assert!(worker.capture_ready());
+}
+
+#[tokio::test]
+async fn public_read_fields_extra_ready_worker_uses_full_inventory_without_resampling() {
+    for mode in [Mode::InitialExtraWorker, Mode::FinalExtraWorker] {
+        let (mut peer, browser, mut fixture, scope) = setup(mode).await;
+        let ledger = browser
+            .page_lease(false)
+            .await
+            .unwrap()
+            .client
+            .debt_ledger()
+            .unwrap();
+        if mode == Mode::InitialExtraWorker {
+            add_ready_worker(&browser).await;
+        }
+        request(&mut fixture, &scope, 5_000).await;
+        if mode == Mode::FinalExtraWorker {
+            tokio::time::timeout(Duration::from_secs(2), peer.held.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            add_ready_worker(&browser).await;
+            control(&peer, Control::ReleaseHeld).await;
+        }
+        let value = result(&mut fixture, false).await;
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["effects"], "completed");
+        assert_eq!(value["scopeState"], "usable");
+        assert_eq!(
+            value["data"],
+            json!({"identityScope":scope,"values":[{"value":"London","states":{"secure":false}}]})
+        );
+        assert!(browser.refs.lock().unwrap().entries_sorted().is_empty());
+        debt_settled(&ledger).await;
+        assert_eq!(
+            peer.application
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Runtime.callFunctionOn")
+                .count(),
+            1
+        );
+        assert_script(&peer, mode);
+        browser
+            .page_lease(false)
+            .await
+            .unwrap()
+            .targets
+            .detach("extra-worker")
+            .unwrap();
+        finish(peer, fixture, false).await;
     }
 }

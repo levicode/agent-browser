@@ -5338,6 +5338,23 @@ impl ClientEnrollment {
             )
             .await?;
             *pending_resume = Some(permit);
+            let resume_diagnostic = self.targets.diagnostic_attachment_for_session(
+                &entry.target,
+                &entry.session,
+                (op.generation, op.sequence),
+            );
+            let observe_resume = |stage| {
+                if let Some(mut target) = resume_diagnostic {
+                    target.stage = stage;
+                    super::client_settlement_trace::target_lifecycle(
+                        op.generation,
+                        op.sequence,
+                        target,
+                        None,
+                    );
+                }
+            };
+            observe_resume(super::client_settlement_trace::DiagnosticTargetStage::ResumeEnter);
             ServiceWorkerAdmission::observe(
                 admission,
                 WorkerAdmissionStep::ResumeDebugger,
@@ -5349,6 +5366,7 @@ impl ClientEnrollment {
                 ),
             )
             .await?;
+            observe_resume(super::client_settlement_trace::DiagnosticTargetStage::ResumeAck);
             #[cfg(test)]
             if entry.kind == "page" {
                 // The actual CDP command future returned its ACK. This is

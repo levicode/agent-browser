@@ -26,6 +26,11 @@ mod fresh_query;
 pub(crate) mod query_diagnostic;
 #[path = "client_observation/role_candidates.rs"]
 mod role_candidates;
+#[path = "client_observation/single_root_fields.rs"]
+pub(crate) mod single_root_fields;
+#[cfg(test)]
+#[path = "client_observation/single_root_fields_tests.rs"]
+mod single_root_fields_tests;
 pub(crate) use frame_policy::ObservationFramePolicy;
 #[path = "client_observation/semantic_frame_proof.rs"]
 mod semantic_frame_proof;
@@ -2979,9 +2984,33 @@ async fn query_fields_diagnostic_inner(
         check(lease)?;
         return Ok(values);
     }
+    query_fields_ax(
+        client,
+        frames,
+        frame,
+        &expression,
+        options,
+        fields,
+        lease,
+        witness,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn query_fields_ax(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    frame: &ObservationFrame,
+    expression: &LocatorExpression,
+    options: &QueryOptions,
+    fields: &[ReadField],
+    lease: &OperationLease,
+    witness: &query_diagnostic::QueryReadWitness,
+) -> Result<Vec<Value>, ObservationError> {
+    use super::client_settlement_trace::QueryReadStage as Stage;
     let evaluated =
-        evaluate_query_diagnostic_inner(client, frame, &expression, options, lease, witness)
-            .await?;
+        evaluate_query_diagnostic_inner(client, frame, expression, options, lease, witness).await?;
     witness.stage(Stage::Projection);
     if evaluated.matches.len() > super::element::MAX_EXACT_REFERENCES {
         return Err(ObservationError::ResourceLimit);
@@ -4413,40 +4442,49 @@ async fn validated_frame_dom(
     .await?;
     validate_frame_tree(&tree, frame, false)?;
     if tree["frameTree"]["frame"]["id"].as_str() == Some(frame.binding.frame.as_str()) {
-        // getDocument resets earlier frontend bindings, including Observe's.
-        // Bind only its Document here: a deep tracked read subscribes the
-        // renderer to needless mutation events for every acquired descendant.
-        // The full policy tree is still fetched fresh, without frontend IDs.
-        let document = command(
-            client,
-            &frame.binding.session,
-            "DOM.getDocument",
-            json!({"depth":0,"pierce":true}),
-            lease,
-        )
-        .await?;
-        let backend = document_backend(&document["root"])?;
-        let described = command(
-            client,
-            &frame.binding.session,
-            "DOM.describeNode",
-            json!({"backendNodeId":backend,"depth":-1,"pierce":true}),
-            lease,
-        )
-        .await?;
-        let root = &described["node"];
-        if document_backend(root)? != backend {
-            return Err(ObservationError::StaleReference);
-        }
-        // A depth -1 Document description includes its children array even
-        // when empty. Never substitute the shallow seed for missing deep data.
-        if !root["children"].is_array() {
-            return Err(ObservationError::BackendFailure);
-        }
-        return Ok(json!({"root":root}));
+        return root_document_dom(client, frame, lease).await;
     }
     // A same-session child keeps its original stateless contentDocument path.
     frame_dom_from_tree(client, frame, lease, &tree).await
+}
+
+// Only a private, phase-fenced root transaction may omit the tree lookup.
+async fn root_document_dom(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    lease: &OperationLease,
+) -> Result<Value, ObservationError> {
+    // getDocument resets earlier frontend bindings, including Observe's.
+    // Bind only its Document here: a deep tracked read subscribes the
+    // renderer to needless mutation events for every acquired descendant.
+    // The full policy tree is still fetched fresh, without frontend IDs.
+    let document = command(
+        client,
+        &frame.binding.session,
+        "DOM.getDocument",
+        json!({"depth":0,"pierce":true}),
+        lease,
+    )
+    .await?;
+    let backend = document_backend(&document["root"])?;
+    let described = command(
+        client,
+        &frame.binding.session,
+        "DOM.describeNode",
+        json!({"backendNodeId":backend,"depth":-1,"pierce":true}),
+        lease,
+    )
+    .await?;
+    let root = &described["node"];
+    if document_backend(root)? != backend {
+        return Err(ObservationError::StaleReference);
+    }
+    // A depth -1 Document description includes its children array even
+    // when empty. Never substitute the shallow seed for missing deep data.
+    if !root["children"].is_array() {
+        return Err(ObservationError::BackendFailure);
+    }
+    Ok(json!({"root":root}))
 }
 
 fn document_backend(node: &Value) -> Result<i64, ObservationError> {

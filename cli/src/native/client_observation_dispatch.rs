@@ -2032,34 +2032,131 @@ impl ObservationDispatch {
             };
             check_authority().map_err(failure)?;
             field_stage(FieldStage::ReadFramesBefore);
-            let frames = observation::query_diagnostic::field_command_scope(
-                field_witness.as_ref(),
-                verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup)),
+            let single = if observation::single_root_fields::eligible(
+                &read.options,
+                &read.fields,
+                &operation,
             )
-            .await
-            .map_err(failure)?;
-            let values = observation::query_diagnostic::field_command_scope(
-                field_witness.as_ref(),
-                observation::query_fields(
-                    &context.page.client,
-                    &frames,
-                    &read.options,
-                    &read.fields,
-                    &operation,
-                    field_witness.as_ref(),
-                ),
-            )
-            .await
             .map_err(map_observation)
-            .map_err(failure)?;
-            field_stage(FieldStage::ReadFramesAfter);
-            let current = observation::query_diagnostic::field_command_scope(
-                field_witness.as_ref(),
-                verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup)),
-            )
-            .await
-            .map_err(failure)?;
-            same_frames(&frames, &current).map_err(failure)?;
+            .map_err(failure)?
+            {
+                observation::query_diagnostic::field_command_scope(
+                    field_witness.as_ref(),
+                    single_root_fields_before(&context.page, &operation),
+                )
+                .await
+                .map_err(failure)?
+            } else {
+                None
+            };
+            check_authority().map_err(failure)?;
+            let legacy = || async {
+                field_stage(FieldStage::ReadFramesBefore);
+                let frames = observation::query_diagnostic::field_command_scope(
+                    field_witness.as_ref(),
+                    verified_frames_with_cleanup(
+                        &context.page,
+                        &operation,
+                        Some(&observation_cleanup),
+                    ),
+                )
+                .await
+                .map_err(failure)?;
+                let values = observation::query_diagnostic::field_command_scope(
+                    field_witness.as_ref(),
+                    observation::query_fields(
+                        &context.page.client,
+                        &frames,
+                        &read.options,
+                        &read.fields,
+                        &operation,
+                        field_witness.as_ref(),
+                    ),
+                )
+                .await
+                .map_err(map_observation)
+                .map_err(failure)?;
+                field_stage(FieldStage::ReadFramesAfter);
+                let current = observation::query_diagnostic::field_command_scope(
+                    field_witness.as_ref(),
+                    verified_frames_with_cleanup(
+                        &context.page,
+                        &operation,
+                        Some(&observation_cleanup),
+                    ),
+                )
+                .await
+                .map_err(failure)?;
+                same_frames(&frames, &current).map_err(failure)?;
+                Ok::<_, DispatchFailure>(values)
+            };
+            let values = if let Some((frame, realm)) = single {
+                let sample = observation::query_diagnostic::field_command_scope(
+                    field_witness.as_ref(),
+                    realm.fields(&read.options, &read.fields, field_witness.as_ref()),
+                )
+                .await
+                .map_err(map_observation)
+                .map_err(failure)?;
+                match sample {
+                    observation::single_root_fields::Sample::NotEligible => legacy().await?,
+                    observation::single_root_fields::Sample::Values(values) => {
+                        field_stage(FieldStage::ReadFramesAfter);
+                        observation::query_diagnostic::field_command_scope(
+                            field_witness.as_ref(),
+                            single_root_fields_after(
+                                &context.page,
+                                &operation,
+                                &frame,
+                                false,
+                                &observation_cleanup,
+                            ),
+                        )
+                        .await
+                        .map_err(failure)?;
+                        values
+                    }
+                    observation::single_root_fields::Sample::RequiresAx => {
+                        field_stage(FieldStage::ReadFramesAfter);
+                        observation::query_diagnostic::field_command_scope(
+                            field_witness.as_ref(),
+                            single_root_fields_after(
+                                &context.page,
+                                &operation,
+                                &frame,
+                                true,
+                                &observation_cleanup,
+                            ),
+                        )
+                        .await
+                        .map_err(failure)?;
+                        check_authority().map_err(failure)?;
+                        let values = observation::query_diagnostic::field_command_scope(
+                            field_witness.as_ref(),
+                            realm.ax_fields(&read.options, &read.fields, field_witness.as_ref()),
+                        )
+                        .await
+                        .map_err(map_observation)
+                        .map_err(failure)?;
+                        field_stage(FieldStage::ReadFramesAfter);
+                        observation::query_diagnostic::field_command_scope(
+                            field_witness.as_ref(),
+                            single_root_fields_after(
+                                &context.page,
+                                &operation,
+                                &frame,
+                                true,
+                                &observation_cleanup,
+                            ),
+                        )
+                        .await
+                        .map_err(failure)?;
+                        values
+                    }
+                }
+            } else {
+                legacy().await?
+            };
             field_stage(FieldStage::ReadPublish);
             check_authority().map_err(failure)?;
             let value = json!({"identityScope":identity,"values":values});
@@ -3279,6 +3376,115 @@ async fn query_frames(
         .await
         .map(|inventory| inventory.frames)
         .map_err(|error| error.record(screenshot))
+}
+// Private ReadFields phase proofs. No generic inventory semantics change.
+async fn single_root_fields_before<'a>(
+    page: &'a BrowserExecutionLease,
+    operation: &'a OperationLease,
+) -> Result<
+    Option<(
+        ObservationFrame,
+        observation::single_root_fields::RootRealm<'a>,
+    )>,
+    ProtocolError,
+> {
+    check(page, operation)?;
+    let (revision, targets, before) = page.targets.inventory_with_diagnostic(false)?;
+    let main = targets
+        .iter()
+        .find(|target| {
+            target.target_id == page.target_id
+                && target.session_id == page.page_session_id
+                && target.kind == "page"
+                && target.purpose == Some(TargetPurpose::Application)
+        })
+        .ok_or(ProtocolError::StaleScope)?;
+    if !main.configured || !main.resumed {
+        return Err(ProtocolError::ScopeUnavailable);
+    }
+    if targets.len() != 1 {
+        return Ok(None);
+    }
+    let tree = command(
+        page,
+        operation,
+        &page.page_session_id,
+        "Page.getFrameTree",
+        json!({}),
+    )
+    .await?;
+    let Some(frame) = observation::single_root_fields::root_frame(&tree, &page.page_session_id)
+        .map_err(observation_error)?
+    else {
+        return Ok(None);
+    };
+    let realm =
+        observation::single_root_fields::RootRealm::acquire(&page.client, &frame, operation)
+            .await
+            .map_err(observation_error)?;
+    page.targets
+        .check_acquisition_revision(
+            revision,
+            before.as_ref(),
+            main,
+            diagnostic::FrameInventoryPass::Initial,
+            false,
+        )
+        .result?;
+    check(page, operation)?;
+    Ok(Some((frame, realm)))
+}
+async fn single_root_fields_after(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    frame: &ObservationFrame,
+    full_final: bool,
+    cleanup: &AtomicBool,
+) -> Result<(), ProtocolError> {
+    check(page, operation)?;
+    // A separate final fence preserves legacy semantics for unrelated target
+    // churn; the initial revision is deliberately not an operation-wide lock.
+    let (revision, targets, before) = page.targets.inventory_with_diagnostic(false)?;
+    let main = targets
+        .iter()
+        .find(|target| {
+            target.target_id == page.target_id
+                && target.session_id == page.page_session_id
+                && target.kind == "page"
+                && target.purpose == Some(TargetPurpose::Application)
+        })
+        .ok_or(ProtocolError::StaleScope)?;
+    if !main.configured || !main.resumed {
+        return Err(ProtocolError::ScopeUnavailable);
+    }
+    if full_final || targets.len() != 1 {
+        // Eligibility decline is not a failed-proof retry: same samples, lease,
+        // custody and initial root; the original full final proof decides.
+        let current = verified_frames_with_cleanup(page, operation, Some(cleanup)).await?;
+        return same_frames(std::slice::from_ref(frame), &current);
+    }
+    let tree = command(
+        page,
+        operation,
+        &page.page_session_id,
+        "Page.getFrameTree",
+        json!({}),
+    )
+    .await?;
+    let current = observation::single_root_fields::root_frame(&tree, &page.page_session_id)
+        .map_err(observation_error)?
+        .ok_or(ProtocolError::StaleScope)?;
+    page.targets
+        .check_acquisition_revision(
+            revision,
+            before.as_ref(),
+            main,
+            diagnostic::FrameInventoryPass::Initial,
+            false,
+        )
+        .result?;
+    same_frames(std::slice::from_ref(frame), std::slice::from_ref(&current))?;
+    check(page, operation)
 }
 async fn frame_inventory_attempt_impl(
     page: &BrowserExecutionLease,

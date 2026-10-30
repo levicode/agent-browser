@@ -721,7 +721,7 @@ impl ClientPageState {
         session: &str,
         op: &OperationLease,
     ) -> Result<u64, ProtocolError> {
-        self.apply_to_new_session_initialization(page, session, op)
+        self.apply_to_new_session_initialization_mode(page, session, op, false, false)
             .await
             .map_err(ObservedOperationFailure::into_protocol)
     }
@@ -731,7 +731,7 @@ impl ClientPageState {
         session: &str,
         op: &OperationLease,
     ) -> Result<u64, ObservedOperationFailure> {
-        self.apply_to_new_session_initialization_mode(page, session, op, false)
+        self.apply_to_new_session_initialization_mode(page, session, op, false, true)
             .await
     }
     /// Enrollment only: a new authorized application page attachment explicitly paused by CDP,
@@ -742,7 +742,7 @@ impl ClientPageState {
         session: &str,
         op: &OperationLease,
     ) -> Result<u64, ObservedOperationFailure> {
-        self.apply_to_new_session_initialization_mode(page, session, op, true)
+        self.apply_to_new_session_initialization_mode(page, session, op, true, true)
             .await
     }
     async fn apply_to_new_session_initialization_mode(
@@ -751,6 +751,7 @@ impl ClientPageState {
         session: &str,
         op: &OperationLease,
         run_immediately: bool,
+        capture_startup: bool,
     ) -> Result<u64, ObservedOperationFailure> {
         self.validate_initialization(page, op)?;
         // Serialize only configuration writes for this target. This lock never
@@ -775,12 +776,40 @@ impl ClientPageState {
                 *s.installed_scripts.get(session).unwrap_or(&0),
             )
         };
+        // Retain the exact diagnostic attachment once, never look it up after
+        // an ACK where a new tenure might otherwise inherit this observation.
+        let diagnostic = if capture_startup {
+            page.targets.diagnostic_attachment_for_session(
+                &page.target_id,
+                session,
+                (op.generation, op.sequence),
+            )
+        } else {
+            None
+        };
+        let observe_script = |stage| {
+            if let Some(mut target) = diagnostic {
+                target.stage = stage;
+                super::client_settlement_trace::target_lifecycle(
+                    op.generation,
+                    op.sequence,
+                    target,
+                    None,
+                );
+            }
+        };
         for (index, source) in config.scripts.iter().enumerate().skip(installed) {
             self.state()?.uncertain_scripts.insert(session.into());
             let mut registration = json!({"source":source.as_ref()});
             if run_immediately {
                 registration["runImmediately"] = json!(true);
             }
+            // Enter is not a wire-send receipt. No script text or identifier is captured.
+            observe_script(if run_immediately {
+                super::client_settlement_trace::DiagnosticTargetStage::InitImmediateEnter
+            } else {
+                super::client_settlement_trace::DiagnosticTargetStage::InitFutureEnter
+            });
             let installed_script = command_initialization_component(
                 page,
                 op,
@@ -796,6 +825,7 @@ impl ClientPageState {
             {
                 return Err(ProtocolError::BrowserFailure.into());
             }
+            observe_script(super::client_settlement_trace::DiagnosticTargetStage::InitScriptAck);
             {
                 let mut state = self.state()?;
                 state

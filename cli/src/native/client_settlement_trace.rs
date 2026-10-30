@@ -712,6 +712,11 @@ diagnostic_enum!(DiagnosticTargetStage {
     ConfigureStarted,
     ConfigureAck,
     ConfigureFailed,
+    InitImmediateEnter,
+    InitFutureEnter,
+    InitScriptAck,
+    ResumeEnter,
+    ResumeAck,
     Resumed,
     Detached,
     RestartRetiring,
@@ -4435,6 +4440,52 @@ mod query_command_schema_tests {
                 expected.insert("cmdSummary");
             }
             assert_eq!(keys, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod popup_startup_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn startup_stages_are_closed_and_fit_existing_record_limit() {
+        for (stage, encoded) in [
+            (
+                DiagnosticTargetStage::InitImmediateEnter,
+                "init-immediate-enter",
+            ),
+            (DiagnosticTargetStage::InitFutureEnter, "init-future-enter"),
+            (DiagnosticTargetStage::InitScriptAck, "init-script-ack"),
+            (DiagnosticTargetStage::ResumeEnter, "resume-enter"),
+            (DiagnosticTargetStage::ResumeAck, "resume-ack"),
+        ] {
+            assert_eq!(serde_json::to_value(stage).unwrap(), encoded);
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: SAFE_INTEGER,
+                phase: Phase::TargetLifecycle,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: true,
+                facts: Facts {
+                    generation: Some(SAFE_INTEGER),
+                    attachment_ordinal: Some(TARGET_ORDINAL_LIMIT),
+                    target_stage: Some(stage),
+                    target_purpose: Some(DiagnosticTargetPurpose::StateBootstrap),
+                    target_classification: Some(
+                        DiagnosticTargetClassification::ReservationRemainder,
+                    ),
+                    target_configured: Some(false),
+                    target_resumed: Some(false),
+                    ..Facts::default()
+                },
+            };
+            assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
         }
     }
 }
