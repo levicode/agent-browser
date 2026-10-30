@@ -833,6 +833,8 @@ enum CaptureTestPoint {
     EvalAdmissionReceipt,
     EvalPreparationWaiting,
     BeforePopupConfigured,
+    BeforePopupConfigurationProof,
+    AfterPopupConfigurationProof,
     AfterPopupConfiguredBeforeResumePermit,
     AfterPopupResumeAckBeforeComplete,
     AfterPopupCustodyFinishBeforeReceipt,
@@ -2022,6 +2024,10 @@ impl ClientEnrollment {
         }
         let root_frame = Self::eval_root_frame(index, &root_entry.session)
             .map_err(|error| Failure::new(error, Refused::RootFrame))?;
+        let config_revision = self
+            .page
+            .config_revision()
+            .map_err(|error| Failure::new(error, Refused::Configuration))?;
         let mut cohort = Vec::with_capacity(index.pending_enrollment.len());
         for session in index.pending_enrollment.keys() {
             let entry = index.sessions.get(session).ok_or_else(|| {
@@ -2051,7 +2057,7 @@ impl ClientEnrollment {
                 &self.targets,
                 ledger,
                 watermark,
-                received,
+                (received, config_revision),
                 &entry.target,
                 session,
             )?;
@@ -2067,10 +2073,7 @@ impl ClientEnrollment {
             watermark: watermark.clone(),
             received,
             epoch: index.application_epoch,
-            config_revision: self
-                .page
-                .config_revision()
-                .map_err(|error| Failure::new(error, Refused::Configuration))?,
+            config_revision,
             generation: op.generation,
             operation: op.sequence,
             deadline: op.deadline,
@@ -2174,11 +2177,14 @@ impl ClientEnrollment {
                 &self.targets,
                 &preparation.ledger,
                 &preparation.watermark,
-                preparation.received,
+                (preparation.received, preparation.config_revision),
                 &member.target,
                 &member.session,
             )?;
-            let positive = member.receipt.preparation_completed(&self.targets)?;
+            let positive = member.receipt.preparation_completed(
+                &self.targets,
+                (preparation.received, preparation.config_revision),
+            )?;
             if index.pending_enrollment.contains_key(&member.session) {
                 if index
                     .pending_eval_initialization
@@ -4898,6 +4904,65 @@ impl ClientEnrollment {
         })
         .await
     }
+    /// Mint producer evidence only for this already-registered retained popup.
+    /// The caller still owns initialize_inner's configuration gate. Nothing is
+    /// rebound and no event, application epoch, or foreign fence is reset here.
+    fn mark_popup_configuration_applied(
+        &self,
+        entry: &Attribution,
+        op: &OperationLease,
+        revision: u64,
+    ) -> Result<(), ObservedOperationFailure> {
+        if entry.kind != "page"
+            || !entry.init_paused_by_attachment
+            || entry.observation_only
+            || entry.root != entry.session
+        {
+            return Ok(());
+        }
+        let index = self
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if *self
+            .active_root
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            == entry.session
+        {
+            return Ok(());
+        }
+        let Some(receipt) = index.pending_eval_initialization.get(&entry.session) else {
+            return Ok(());
+        };
+        if index.sessions.get(&entry.session) != Some(entry)
+            || !index.pending_enrollment.contains_key(&entry.session)
+        {
+            return Err(ProtocolError::StaleScope.into());
+        }
+        receipt.mark_configuration_applied(
+            &self.targets,
+            op,
+            revision,
+            &entry.target,
+            &entry.session,
+        )
+    }
+    // Consume only the stop captured at the proof guard. Never consult the
+    // current channel when classifying a returned hard error or earlier stop.
+    fn popup_configuration_failure(&self, failure: ObservedOperationFailure) -> InitFailure {
+        match failure {
+            ObservedOperationFailure::Stopped(observation) => {
+                let (operation, signal) = observation.into_parts();
+                if signal == CancelSignal::DeadlineExceeded {
+                    InitFailure::Operation(ProtocolError::DeadlineExceeded)
+                } else {
+                    self.initialization_cancel(&operation, signal)
+                }
+            }
+            failure => self.initialization_component_failure(failure),
+        }
+    }
     async fn initialize_inner(
         &self,
         mut entry: Attribution,
@@ -5177,10 +5242,28 @@ impl ClientEnrollment {
                 if revision != self.page.config_revision()? {
                     return Err(ProtocolError::StaleScope.into());
                 }
+                observe_popup_setup(
+                    super::client_settlement_trace::PopupSetupCheckpoint::ScriptsAcknowledged,
+                );
+                #[cfg(test)]
+                if entry.kind == "page" {
+                    self.pause_component_boundary(
+                        CaptureTestPoint::BeforePopupConfigurationProof,
+                        op,
+                    )
+                    .await?;
+                }
+                self.mark_popup_configuration_applied(&entry, op, revision)
+                    .map_err(|failure| self.popup_configuration_failure(failure))?;
+                #[cfg(test)]
+                if entry.kind == "page" {
+                    self.pause_component_boundary(
+                        CaptureTestPoint::AfterPopupConfigurationProof,
+                        op,
+                    )
+                    .await?;
+                }
             }
-            observe_popup_setup(
-                super::client_settlement_trace::PopupSetupCheckpoint::ScriptsAcknowledged,
-            );
             // Autoattach is recursive. Install it while this target is paused.
             ServiceWorkerAdmission::observe(
                 admission,
@@ -9469,6 +9552,7 @@ mod tests {
     include!("client_eval_network_watermark_tests.rs");
     include!("client_popup_preparation_tests.rs");
     include!("client_popup_interposition_test_helpers.rs");
+    include!("client_popup_configuration_proof_stop_tests.rs");
 
     // Reconstruction: test-only schedules use real configured/permit boundaries.
     impl ClientEnrollment {
@@ -9484,9 +9568,23 @@ mod tests {
             let point = if configured {
                 CaptureTestPoint::AfterPopupConfiguredBeforeResumePermit
             } else {
-                CaptureTestPoint::BeforePopupConfigured
+                // This negative still proves no authority without producer proof,
+                // now immediately before proof mint rather than after recursive ACK.
+                CaptureTestPoint::BeforePopupConfigurationProof
             };
             assert!(gates.insert(point, initializer).is_none());
+            schedule
+        }
+
+        pub(crate) fn popup_configuration_proof_schedule_for_test(&self) -> PopupCaptureSchedule {
+            let schedule = self.popup_capture_schedule_for_test(true);
+            let mut gates = self.capture_test_gates.lock().unwrap();
+            let initializer = gates
+                .remove(&CaptureTestPoint::AfterPopupResumeAckBeforeComplete)
+                .unwrap();
+            assert!(gates
+                .insert(CaptureTestPoint::AfterPopupConfigurationProof, initializer)
+                .is_none());
             schedule
         }
 

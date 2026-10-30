@@ -312,6 +312,28 @@ pub(crate) fn produces_remote_objects(method: &str) -> bool {
         "DOM.resolveNode" | "Runtime.evaluate" | "Runtime.callFunctionOn" | "Runtime.getProperties"
     )
 }
+// Preserve the pre-existing non-object lease recheck. Object replies may carry
+// cleanup obligations, so success must reach its owner without a post-hoc stop.
+// The two typed errors below come only from the exact admission-stop envelope;
+// for object-producing methods an opaque browser failure is never reclassified
+// by consulting the current clock. Non-object methods keep their original check.
+fn nonretained_read_result(
+    method: &str,
+    result: Result<Value, super::client_protocol::ProtocolError>,
+    lease: &OperationLease,
+) -> Result<Value, ObservationError> {
+    if !produces_remote_objects(method) {
+        check(lease)?;
+    }
+    result.map_err(|error| match error {
+        super::client_protocol::ProtocolError::Cancelled => ObservationError::Cancelled,
+        super::client_protocol::ProtocolError::DeadlineExceeded => {
+            ObservationError::DeadlineExceeded
+        }
+        _ => ObservationError::BackendFailure,
+    })
+}
+
 /// Supersession never interrupts a started command. Only the original caller
 /// cancellation/deadline starts bounded late settlement. Resource replies must
 /// reach their caller before a supersession check:
@@ -330,9 +352,8 @@ pub(crate) async fn retained_read_command(
         // behavior. The retained late-reply path belongs only to Observe.
         let mut cancellation = lease.cancellation.clone();
         return tokio::select! {
-            result = client.send_command(method, Some(args), Some(session)) => {
-                if !produces_remote_objects(method) { check(lease)?; }
-                result.map_err(|_| ObservationError::BackendFailure)
+            result = client.send_observation_read_command(method, Some(args), Some(session), lease) => {
+                nonretained_read_result(method, result, lease)
             }
             _ = cancellation.changed() => Err(observed_stop(*cancellation.borrow()).unwrap_or(ObservationError::Cancelled)),
             _ = tokio::time::sleep_until(lease.deadline.into()) => Err(observed_stop(*cancellation.borrow()).unwrap_or(ObservationError::DeadlineExceeded)),
@@ -5664,6 +5685,84 @@ mod tests {
             ] {
                 assert_eq!(settled_stop(error.clone(), &lease), error);
             }
+        }
+    }
+
+    #[test]
+    fn nonretained_object_projection_keeps_late_success_and_opaque_failure() {
+        use super::super::client_protocol::ProtocolError;
+        for signal in [CancelSignal::Requested, CancelSignal::DeadlineExceeded] {
+            let (_sender, cancellation) = tokio::sync::watch::channel(signal);
+            let lease = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now(),
+                cancellation,
+            };
+            for method in [
+                "DOM.resolveNode",
+                "Runtime.evaluate",
+                "Runtime.callFunctionOn",
+                "Runtime.getProperties",
+            ] {
+                let reply = json!({"result":{"objectId":"late-owned-handle"}});
+                assert_eq!(
+                    nonretained_read_result(method, Ok(reply.clone()), &lease).unwrap(),
+                    reply
+                );
+                assert_eq!(
+                    nonretained_read_result(method, Err(ProtocolError::BrowserFailure), &lease)
+                        .unwrap_err(),
+                    ObservationError::BackendFailure
+                );
+                assert_eq!(
+                    nonretained_read_result(method, Err(ProtocolError::StaleScope), &lease)
+                        .unwrap_err(),
+                    ObservationError::BackendFailure
+                );
+            }
+            assert_eq!(
+                nonretained_read_result("Page.getFrameTree", Ok(json!({})), &lease).unwrap_err(),
+                observed_stop(signal).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn nonretained_typed_stop_projection_does_not_consult_later_signal() {
+        use super::super::client_protocol::ProtocolError;
+        for signal in [
+            CancelSignal::None,
+            CancelSignal::Requested,
+            CancelSignal::DeadlineExceeded,
+        ] {
+            let (_sender, cancellation) = tokio::sync::watch::channel(signal);
+            let lease = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now(),
+                cancellation,
+            };
+            assert_eq!(
+                nonretained_read_result(
+                    "Runtime.callFunctionOn",
+                    Err(ProtocolError::Cancelled),
+                    &lease
+                )
+                .unwrap_err(),
+                ObservationError::Cancelled
+            );
+            assert_eq!(
+                nonretained_read_result(
+                    "Runtime.callFunctionOn",
+                    Err(ProtocolError::DeadlineExceeded),
+                    &lease
+                )
+                .unwrap_err(),
+                ObservationError::DeadlineExceeded
+            );
         }
     }
 

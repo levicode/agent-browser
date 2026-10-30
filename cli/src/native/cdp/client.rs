@@ -25,7 +25,7 @@ use super::super::client_debt::{
 use super::super::client_protocol::ProtocolError;
 use super::types::{CdpCommand, CdpError, CdpEvent, CdpMessage};
 
-/// Action-only error projection. Opaque errors are never inferred from a later
+/// Exact application-admission error projection. Opaque errors are never inferred from a later
 /// cancellation, and successful object replies bypass this failure envelope.
 pub(crate) struct ActionCommandFailure {
     #[cfg(test)]
@@ -752,9 +752,18 @@ type WorkerStartupNoReceiptGate = (
     oneshot::Receiver<()>,
 );
 
+// Linux shares the already-owned duplicate with its one reader; other targets
+// keep the original socket ownership and perform no ACK-mode syscall.
+#[cfg(target_os = "linux")]
+type OwnedCdpSocket = Arc<socket2::Socket>;
+#[cfg(not(target_os = "linux"))]
+type OwnedCdpSocket = socket2::Socket;
+
 struct CdpTransport {
     ws_tx: WsTx,
-    socket: socket2::Socket,
+    socket: OwnedCdpSocket,
+    #[cfg(all(test, target_os = "linux"))]
+    reader_quickack_requests: Arc<AtomicUsize>,
     closed: Arc<AtomicBool>,
     close_complete: AtomicBool,
     remote_closed: watch::Receiver<bool>,
@@ -888,6 +897,8 @@ impl CdpClient {
         let socket = socket2::SockRef::from(tcp_stream)
             .try_clone()
             .map_err(|error| format!("Failed to duplicate CDP socket: {}", error))?;
+        #[cfg(target_os = "linux")]
+        let socket = Arc::new(socket);
 
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx = Arc::new(Mutex::new(ws_tx));
@@ -984,8 +995,30 @@ impl CdpClient {
 
         let owner_disposal_tx = disposal_tx.clone();
         let owner_disposal_budget = disposal_budget.clone();
+        #[cfg(target_os = "linux")]
+        let reader_socket = Arc::downgrade(&socket);
+        #[cfg(all(test, target_os = "linux"))]
+        let reader_quickack_requests = Arc::new(AtomicUsize::new(0));
+        #[cfg(all(test, target_os = "linux"))]
+        let quickack_requests = reader_quickack_requests.clone();
         let reader_handle = tokio::spawn(async move {
-            while let Some(msg) = ws_rx.next().await {
+            while let Some(msg) = {
+                // QUICKACK is transient. Request it before waiting for each
+                // next WS frame, including a response split into small TCP
+                // writes. It is only a best-effort ACK pacing hint: a refusal
+                // must not change CDP errors, closure, or reader ordering.
+                #[cfg(target_os = "linux")]
+                {
+                    // Do not retain the duplicate across the await or after
+                    // its original transport owner is dropped without close.
+                    if let Some(socket) = reader_socket.upgrade() {
+                        let _ = request_tcp_quickack(&socket);
+                    }
+                }
+                #[cfg(all(test, target_os = "linux"))]
+                quickack_requests.fetch_add(1, Ordering::SeqCst);
+                ws_rx.next().await
+            } {
                 // Accept both Text and Binary frames — remote CDP proxies
                 // (e.g. Browserless) may send responses as Binary frames.
                 let msg = match msg {
@@ -1278,6 +1311,8 @@ impl CdpClient {
             transport: Arc::new(CdpTransport {
                 ws_tx,
                 socket,
+                #[cfg(all(test, target_os = "linux"))]
+                reader_quickack_requests,
                 closed,
                 close_complete: AtomicBool::new(false),
                 remote_closed,
@@ -1703,6 +1738,23 @@ impl CdpClient {
                 message: _message,
                 stop: stop.take(),
             })
+    }
+
+    /// Non-retained observation reads use the same exact admission evidence as
+    /// actions, without changing command category, submission, or reply custody.
+    /// Only the stop captured by the actual same-operation admission refusal is
+    /// typed. Remote/protocol/transport errors remain BrowserFailure; successful
+    /// object replies are returned intact even if the lease stops afterwards.
+    pub(crate) async fn send_observation_read_command(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        operation: &super::super::client_session::OperationLease,
+    ) -> Result<Value, ProtocolError> {
+        self.send_action_command(method, params, session_id)
+            .await
+            .map_err(|failure| failure.into_protocol(operation))
     }
 
     /// Point-drag inert-realm setup only. Preserve an actual local capacity
@@ -3134,6 +3186,14 @@ impl InspectProxyHandle {
     }
 }
 
+/// Linux-only, per-connection receive ACK hint. No timeout, protocol, or
+/// application admission semantics depend on this optional socket option.
+/// The kernel may leave quickack mode after subsequent protocol processing.
+#[cfg(target_os = "linux")]
+fn request_tcp_quickack(socket: &socket2::Socket) -> std::io::Result<()> {
+    socket.set_tcp_quickack(true)
+}
+
 /// Enable TCP SO_KEEPALIVE on the underlying socket of a WebSocket connection.
 /// This is best-effort: failures are silently ignored since the WebSocket-level
 /// Ping keepalive provides the primary connection liveness mechanism.
@@ -3319,6 +3379,305 @@ mod tests {
                 peer.await.unwrap(),
                 usize::from(matches!(mode, "remote-error" | "unknown"))
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_read_submit_stop_keeps_exact_cause_and_zero_wire() {
+        use crate::native::client_debt::{command_scope, CommandCategory, OperationKey};
+        use crate::native::client_session::{CancelSignal, OperationLease};
+        for signal in [
+            CancelSignal::None,
+            CancelSignal::Requested,
+            CancelSignal::DeadlineExceeded,
+        ] {
+            let (transport, mut requests, _replies, peer) =
+                tokio::time::timeout(Duration::from_secs(1), service_worker_test_peer())
+                    .await
+                    .unwrap();
+            let ledger = OwnerDebtLedger::new(1, "read-stop-owner".into());
+            transport.install_debt_ledger(ledger.clone()).unwrap();
+            let view = transport.owner_view(ledger.clone()).unwrap();
+            let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now()
+                    + Duration::from_secs(if signal == CancelSignal::None { 1 } else { 5 }),
+                cancellation,
+            };
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            journal.bind_operation(&operation).unwrap();
+            let writer = transport.transport.ws_tx.lock().await;
+            let mut pending = Box::pin(journal.scope(command_scope(
+                CommandCategory::ApplicationObject,
+                false,
+                view.send_observation_read_command(
+                    "Runtime.callFunctionOn",
+                    Some(json!({"objectId":"synthetic","returnByValue":true})),
+                    Some("page"),
+                    &operation,
+                ),
+            )));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            assert_eq!(ledger.snapshot().outstanding_commands, 1);
+            if signal == CancelSignal::None {
+                // Reach the bound operation's actual deadline while its request
+                // is reserved behind the writer, not an arbitrary scheduling nap.
+                tokio::time::sleep_until(operation.deadline.into()).await;
+            } else {
+                cancel.send_replace(signal);
+            }
+            drop(writer);
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), pending)
+                    .await
+                    .unwrap()
+                    .unwrap_err(),
+                signal.error().unwrap_or(ProtocolError::DeadlineExceeded)
+            );
+            let debt = ledger.snapshot();
+            assert_eq!(debt.outstanding_commands, 0);
+            assert_eq!(debt.object_debt, 0);
+            assert!(!debt.integrity_lost);
+            assert!(transport.transport.pending.lock().await.is_empty());
+            assert!(transport
+                .transport
+                .tracked_responses
+                .lock()
+                .unwrap()
+                .is_empty());
+            tokio::time::timeout(Duration::from_secs(1), transport.close())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                requests.try_recv().is_err(),
+                "locally stopped read sent command bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_read_stop_evidence_rejects_foreign_operation_bindings() {
+        use crate::native::client_debt::{command_scope, CommandCategory, OperationKey};
+        use crate::native::client_session::{CancelSignal, OperationLease};
+        for mismatch in [
+            "none",
+            "generation",
+            "sequence",
+            "deadline",
+            "channel",
+            "journal",
+        ] {
+            let (transport, mut requests, _replies, peer) =
+                tokio::time::timeout(Duration::from_secs(1), service_worker_test_peer())
+                    .await
+                    .unwrap();
+            let ledger = OwnerDebtLedger::new(1, "read-stop-owner".into());
+            transport.install_debt_ledger(ledger.clone()).unwrap();
+            let view = transport.owner_view(ledger.clone()).unwrap();
+            let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+                cancellation,
+            };
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            journal.bind_operation(&operation).unwrap();
+            cancel.send_replace(CancelSignal::Requested);
+            let (_other_cancel, other_cancellation) =
+                tokio::sync::watch::channel(CancelSignal::Requested);
+            let mut candidate = OperationLease {
+                is_callback: false,
+                generation: operation.generation,
+                sequence: operation.sequence,
+                deadline: operation.deadline,
+                cancellation: operation.cancellation.clone(),
+            };
+            match mismatch {
+                "generation" => candidate.generation += 1,
+                "sequence" => candidate.sequence += 1,
+                "deadline" => candidate.deadline += Duration::from_millis(1),
+                "channel" => candidate.cancellation = other_cancellation,
+                _ => {}
+            }
+            let result = journal
+                .scope(async {
+                    let failure = command_scope(
+                        CommandCategory::ApplicationObject,
+                        false,
+                        view.send_action_command(
+                            "Runtime.callFunctionOn",
+                            Some(json!({"objectId":"synthetic","returnByValue":true})),
+                            Some("page"),
+                        ),
+                    )
+                    .await
+                    .unwrap_err();
+                    if mismatch == "journal" {
+                        let foreign =
+                            OwnerDebtLedger::new(1, "same-numbers-different-owner".into());
+                        let foreign_journal = foreign
+                            .operation(
+                                OperationKey {
+                                    generation: 1,
+                                    operation_seq: 1,
+                                },
+                                "target".into(),
+                                "page".into(),
+                            )
+                            .unwrap();
+                        foreign_journal
+                            .scope(async { failure.into_protocol(&candidate) })
+                            .await
+                    } else {
+                        failure.into_protocol(&candidate)
+                    }
+                })
+                .await;
+            assert_eq!(
+                result,
+                if mismatch == "none" {
+                    ProtocolError::Cancelled
+                } else {
+                    ProtocolError::BrowserFailure
+                },
+                "{mismatch}"
+            );
+            assert_eq!(ledger.snapshot().outstanding_commands, 0);
+            assert_eq!(ledger.snapshot().object_debt, 0);
+            tokio::time::timeout(Duration::from_secs(1), transport.close())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), peer)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                requests.try_recv().is_err(),
+                "foreign/refused operation sent bytes"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_read_later_stop_does_not_relabel_remote_error_transport_or_success() {
+        use crate::native::client_debt::{command_scope, CommandCategory, OperationKey};
+        use crate::native::client_session::{CancelSignal, OperationLease};
+        for mode in ["remote-error", "transport", "late-object-success"] {
+            let (transport, mut requests, replies, peer) =
+                tokio::time::timeout(Duration::from_secs(1), service_worker_test_peer())
+                    .await
+                    .unwrap();
+            let mut peer = Some(peer);
+            let ledger = OwnerDebtLedger::new(1, "read-result-owner".into());
+            transport.install_debt_ledger(ledger.clone()).unwrap();
+            let view = transport.owner_view(ledger.clone()).unwrap();
+            let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now() + Duration::from_secs(5),
+                cancellation,
+            };
+            let journal = ledger
+                .operation(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 1,
+                    },
+                    "target".into(),
+                    "page".into(),
+                )
+                .unwrap();
+            journal.bind_operation(&operation).unwrap();
+            let command = tokio::spawn(async move {
+                journal
+                    .scope(command_scope(
+                        CommandCategory::ApplicationObject,
+                        false,
+                        view.send_observation_read_command(
+                            "Runtime.callFunctionOn",
+                            Some(json!({"objectId":"synthetic","returnByValue":false})),
+                            Some("page"),
+                            &operation,
+                        ),
+                    ))
+                    .await
+            });
+            let request = service_worker_request(&mut requests).await;
+            assert_eq!(request["method"], "Runtime.callFunctionOn");
+            cancel.send_replace(CancelSignal::DeadlineExceeded);
+            if mode == "transport" {
+                let peer = peer.take().unwrap();
+                peer.abort();
+                assert!(tokio::time::timeout(Duration::from_secs(1), peer)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled());
+            } else if mode == "remote-error" {
+                replies.send(json!({"id":request["id"],"sessionId":"page","error":{"code":-32000,"message":"deadline exceeded is only remote text"}})).unwrap();
+            } else {
+                replies.send(json!({"id":request["id"],"sessionId":"page","result":{"result":{"objectId":"late-object"}}})).unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(1), command)
+                .await
+                .unwrap()
+                .unwrap();
+            if mode == "late-object-success" {
+                assert_eq!(
+                    result.unwrap(),
+                    json!({"result":{"objectId":"late-object"}})
+                );
+                assert!(
+                    ledger.snapshot().object_debt > 0,
+                    "success must retain its real object obligation"
+                );
+            } else {
+                assert_eq!(result.unwrap_err(), ProtocolError::BrowserFailure, "{mode}");
+                if mode == "transport" {
+                    assert!(
+                        ledger.snapshot().outstanding_commands > 0,
+                        "unknown transmission cannot become clean"
+                    );
+                }
+            }
+            tokio::time::timeout(Duration::from_secs(1), transport.close())
+                .await
+                .unwrap();
+            if let Some(peer) = peer {
+                tokio::time::timeout(Duration::from_secs(1), peer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
         }
     }
 
@@ -7044,19 +7403,49 @@ mod tests {
                 .with_single_cert(vec![certificate.clone()], key)
                 .unwrap(),
         );
-
         let listener = StdTcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (frames_tx, frames_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (stream, _) = listener.accept().unwrap();
+            let accept_deadline = std::time::Instant::now() + Duration::from_secs(2);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < accept_deadline,
+                            "TLS accept timed out"
+                        );
+                        std::thread::yield_now();
+                    }
+                    Err(error) => panic!("TLS accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
             let connection = rustls::ServerConnection::new(server_config).unwrap();
             let tls = rustls::StreamOwned::new(connection, stream);
             let mut ws = tokio_tungstenite::tungstenite::accept(tls).unwrap();
+            // No WS data is sent until the direct underlying-socket assertion.
+            frames_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            ws.send(Message::Text(
+                json!({"method":"Page.loadEventFired","params":{"timestamp":0}}).to_string(),
+            ))
+            .unwrap();
+            let request: Value =
+                serde_json::from_str(ws.read().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(request["method"], "Browser.getVersion");
+            ws.send(Message::Text(
+                json!({"id":request["id"],"result":{"product":"fixture"}}).to_string(),
+            ))
+            .unwrap();
             assert!(matches!(ws.read().unwrap(), Message::Close(_)));
-
             let mut byte = [0u8; 1];
             let count = ws
                 .get_mut()
@@ -7065,7 +7454,6 @@ mod tests {
                 .expect("server TCP read should succeed");
             assert_eq!(count, 0);
         });
-
         let mut roots = rustls::RootCertStore::empty();
         roots.add(certificate).unwrap();
         let client_config = Arc::new(
@@ -7081,17 +7469,76 @@ mod tests {
             max_frame_size: None,
             ..Default::default()
         };
-        let client =
-            CdpClient::connect_request(request, config, Some(Connector::Rustls(client_config)))
-                .await
-                .unwrap();
+        let client = tokio::time::timeout(
+            Duration::from_secs(2),
+            CdpClient::connect_request(request, config, Some(Connector::Rustls(client_config))),
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(
             client.transport.socket.tcp_nodelay().unwrap(),
             "TLS CDP must disable Nagle on the actual underlying TCP socket"
         );
-
-        client.close().await;
-        server.join().unwrap();
+        #[cfg(target_os = "linux")]
+        let socket = Arc::downgrade(&client.transport.socket);
+        #[cfg(target_os = "linux")]
+        assert!(
+            request_tcp_quickack(&client.transport.socket).is_ok(),
+            "TLS underlying TCP socket must accept the optional Linux ACK hint"
+        );
+        frames_tx.send(()).unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.send_command("Browser.getVersion", None, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply["product"], "fixture");
+        #[cfg(target_os = "linux")]
+        tokio::time::timeout(Duration::from_secs(2), async {
+            // Initial wait, post-event wait, and post-response wait all rearm.
+            // No assertion claims the kernel keeps this transient mode enabled.
+            while client
+                .transport
+                .reader_quickack_requests
+                .load(Ordering::SeqCst)
+                < 3
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("TLS reader did not rearm before its next frame wait");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            Arc::strong_count(&client.transport.socket),
+            1,
+            "TLS reader must drop its temporary socket ownership before awaiting"
+        );
+        tokio::time::timeout(Duration::from_secs(2), client.close())
+            .await
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            Arc::strong_count(&client.transport.socket),
+            1,
+            "closed TLS reader must release its shared socket ownership"
+        );
+        drop(client);
+        #[cfg(target_os = "linux")]
+        assert!(
+            socket.upgrade().is_none(),
+            "TLS socket retained after owner drop"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::task::spawn_blocking(move || server.join().unwrap()),
+        )
+        .await
+        .unwrap()
+        .unwrap();
     }
 
     #[test]
@@ -7127,42 +7574,120 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (path_tx, path_rx) = oneshot::channel();
-
+        let (frames_tx, frames_rx) = oneshot::channel();
         let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut path_tx = Some(path_tx);
-            // The upstream callback trait requires its unboxed HTTP error response.
-            #[allow(clippy::result_large_err)]
-            let _ = tokio_tungstenite::accept_hdr_async(
-                stream,
-                move |
-                    request: &tokio_tungstenite::tungstenite::handshake::server::Request,
-                    response: tokio_tungstenite::tungstenite::handshake::server::Response,
-                | {
-                    if let Some(tx) = path_tx.take() {
-                        let path = request
-                            .uri()
-                            .path_and_query()
-                            .map(|value| value.as_str().to_string())
-                            .unwrap_or_default();
-                        let _ = tx.send(path);
-                    }
-                    Ok(response)
-                },
-            )
+            tokio::time::timeout(Duration::from_secs(2), async {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut path_tx = Some(path_tx);
+                // The upstream callback trait requires its unboxed HTTP error response.
+                #[allow(clippy::result_large_err)]
+                let mut ws = tokio_tungstenite::accept_hdr_async(
+                    stream,
+                    move |
+                        request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                        response: tokio_tungstenite::tungstenite::handshake::server::Response,
+                    | {
+                        if let Some(tx) = path_tx.take() {
+                            let path = request.uri().path_and_query()
+                                .map(|value| value.as_str().to_string()).unwrap_or_default();
+                            let _ = tx.send(path);
+                        }
+                        Ok(response)
+                    },
+                ).await.unwrap();
+                frames_rx.await.unwrap();
+                ws.send(Message::Text(
+                    json!({"method":"Page.loadEventFired","params":{"timestamp":0}}).to_string(),
+                ))
+                .await
+                .unwrap();
+                let request: Value =
+                    serde_json::from_str(ws.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], "Browser.getVersion");
+                ws.send(Message::Text(
+                    json!({"id":request["id"],"result":{"product":"fixture"}}).to_string(),
+                ))
+                .await
+                .unwrap();
+                assert!(matches!(
+                    ws.next().await.unwrap().unwrap(),
+                    Message::Close(_)
+                ));
+            })
             .await
-            .unwrap();
+            .expect("plain peer did not complete its bounded protocol");
         });
-
         let url = format!("ws://127.0.0.1:{}?token=a%2Fb&scope=browser%20test", port);
-        let client = CdpClient::connect(&url).await.unwrap();
+        let client = tokio::time::timeout(Duration::from_secs(2), CdpClient::connect(&url))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
             client.transport.socket.tcp_nodelay().unwrap(),
             "plain CDP must disable Nagle on the actual connected TCP socket"
         );
-
-        assert_eq!(path_rx.await.unwrap(), "/?token=a%2Fb&scope=browser%20test");
-        server.await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), path_rx)
+                .await
+                .unwrap()
+                .unwrap(),
+            "/?token=a%2Fb&scope=browser%20test"
+        );
+        #[cfg(target_os = "linux")]
+        let socket = Arc::downgrade(&client.transport.socket);
+        #[cfg(target_os = "linux")]
+        assert!(
+            request_tcp_quickack(&client.transport.socket).is_ok(),
+            "plain connected TCP socket must accept the optional Linux ACK hint"
+        );
+        frames_tx.send(()).unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.send_command("Browser.getVersion", None, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(reply["product"], "fixture");
+        #[cfg(target_os = "linux")]
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while client
+                .transport
+                .reader_quickack_requests
+                .load(Ordering::SeqCst)
+                < 3
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("plain reader did not rearm before its next frame wait");
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            Arc::strong_count(&client.transport.socket),
+            1,
+            "plain reader must drop its temporary socket ownership before awaiting"
+        );
+        tokio::time::timeout(Duration::from_secs(2), client.close())
+            .await
+            .unwrap();
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            Arc::strong_count(&client.transport.socket),
+            1,
+            "closed plain reader must release its shared socket ownership"
+        );
+        drop(client);
+        #[cfg(target_os = "linux")]
+        assert!(
+            socket.upgrade().is_none(),
+            "plain socket retained after owner drop"
+        );
+        tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
     /// Events on a privately subscribed session reach only that receiver;
     /// everything else still reaches broadcast subscribers.

@@ -97,7 +97,12 @@ async fn popup_stage_zero(case: StageZeroCase) {
     assert_eq!(held["received"], held["applied"]);
     {
         let commands = log.lock().unwrap();
-        assert_eq!(popup_commands(&commands, "Target.setAutoAttach"), 1);
+        // Pre-proof negative is before recursive attachment; existing configured
+        // stage-zero controls retain the original post-recursive-ACK schedule.
+        assert_eq!(
+            popup_commands(&commands, "Target.setAutoAttach"),
+            usize::from(case != StageZeroCase::Unconfigured)
+        );
         assert_eq!(
             popup_commands(&commands, "Page.addScriptToEvaluateOnNewDocument"),
             1
@@ -367,3 +372,6 @@ async fn framed_popup_configured_stage_zero_rejects_created_only() {
 async fn framed_popup_configured_stage_zero_rejects_navigation_aba() {
     stage_zero_case(StageZeroCase::NavigationAba).await;
 }
+
+#[path = "client_popup_configuration_proof_tests.rs"]
+mod configuration_proof_tests;

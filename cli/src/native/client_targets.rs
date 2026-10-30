@@ -79,6 +79,17 @@ struct PopupInitializationProgress {
     terminal: AtomicU8,
     // Opt-in observation only; never read by admission/completion predicates.
     setup_diagnostic: PopupSetupProgress,
+    // Authoritative producer proof, independent of opt-in diagnostic checkpoints.
+    configuration_applied: std::sync::OnceLock<PopupConfigurationApplied>,
+}
+struct PopupConfigurationApplied {
+    revision: u64,
+    received: u64,
+}
+impl PopupConfigurationApplied {
+    fn matches(&self, (received, revision): (u64, u64)) -> bool {
+        self.revision == revision && self.received <= received
+    }
 }
 /// Diagnostic-only monotonic checkpoint. A skipped/duplicate transition loses
 /// detail permanently rather than inventing an ACK or silently repairing order.
@@ -140,6 +151,69 @@ impl PopupPreparationFailure {
     }
 }
 impl PopupInitializationReceipt {
+    /// Only the existing initializer calls this after all page configuration
+    /// ACKs and its revision check, while retaining the original config gate.
+    /// This certifies neither recursive attachment nor resume/capture readiness.
+    pub(super) fn mark_configuration_applied(
+        &self,
+        registry: &Arc<ClientTargets>,
+        op: &super::client_session::OperationLease,
+        revision: u64,
+        target: &str,
+        session: &str,
+    ) -> Result<(), super::client_session::ObservedOperationFailure> {
+        if op.is_callback || op.generation != self.0.generation {
+            return Err(ProtocolError::StaleScope.into());
+        }
+        // Preserve the signal observed by this exact guard. A later owner stop
+        // must not turn an ordinary failure into lifecycle retirement authority.
+        super::client_session::ObservedOperationFailure::check_cancelled(op)?;
+        if std::time::Instant::now() >= op.deadline {
+            return Err(ProtocolError::DeadlineExceeded.into());
+        }
+        let ledger = self.0.ledger.upgrade().ok_or(ProtocolError::StaleScope)?;
+        if !ledger.matches_owner(self.0.generation, &registry.identity_scope)
+            || !ledger.matches_eval_preparation_stream(&self.0.stream)
+        {
+            return Err(ProtocolError::StaleScope.into());
+        }
+        registry.require_eval_owner(&ledger)?;
+        let received = self
+            .0
+            .stream
+            .received()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if self.0.origin == 0 || self.0.origin == u64::MAX || self.0.origin > received {
+            return Err(ProtocolError::StaleScope.into());
+        }
+        let state = registry
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let current = state.targets.get(target).ok_or(ProtocolError::StaleScope)?;
+        if state.sealed
+            || state.integrity_lost
+            || !self.matches_target(registry, current)
+            || current.session_id != session
+            || current.kind != "page"
+            || current.purpose != Some(TargetPurpose::Application)
+            || current.configured
+            || current.resumed
+            || current.resume_pending
+            || self.0.stage.load(Ordering::Acquire) != 0
+            || self.0.terminal.load(Ordering::Acquire) != 0
+            || !current
+                .tenure
+                .retained_initialization
+                .load(Ordering::Acquire)
+        {
+            return Err(ProtocolError::ScopeUnavailable.into());
+        }
+        self.0
+            .configuration_applied
+            .set(PopupConfigurationApplied { revision, received })
+            .map_err(|_| ProtocolError::StaleScope.into())
+    }
     /// Only the initializer's already-retained exact receipt is observed. A
     /// stale/wrong receipt cannot alter another cohort or grant any authority.
     pub(super) fn observe_setup_checkpoint(
@@ -219,17 +293,17 @@ impl PopupInitializationReceipt {
         Ok(current)
     }
     /// Private preparation is a retained wait, not an evaluation grant. Only the
-    /// already-configured gap before the real resume permit may additionally wait.
+    /// post-configuration-ACK gap before the real resume permit may additionally wait.
     pub(super) fn capture_for_preparation(
         &self,
         registry: &Arc<ClientTargets>,
         ledger: &Arc<super::client_debt::OwnerDebtLedger>,
         stream: &super::cdp::client::BoundedEventWatermark,
-        received: u64,
+        boundary: (u64, u64),
         target: &str,
         session: &str,
     ) -> Result<OwnedTarget, ProtocolError> {
-        self.capture_for_preparation_observed(registry, ledger, stream, received, target, session)
+        self.capture_for_preparation_observed(registry, ledger, stream, boundary, target, session)
             .map_err(|failure| failure.error)
     }
     pub(super) fn capture_for_preparation_observed(
@@ -237,10 +311,11 @@ impl PopupInitializationReceipt {
         registry: &Arc<ClientTargets>,
         ledger: &Arc<super::client_debt::OwnerDebtLedger>,
         stream: &super::cdp::client::BoundedEventWatermark,
-        received: u64,
+        boundary: (u64, u64),
         target: &str,
         session: &str,
     ) -> Result<OwnedTarget, PopupPreparationFailure> {
+        let (received, _) = boundary;
         use diagnostic::EvalPreparationRefusal as Refused;
         if !self.0.stream.same_subscription(stream)
             || !ledger.matches_eval_preparation_stream(stream)
@@ -265,7 +340,7 @@ impl PopupInitializationReceipt {
         registry
             .require_eval_owner(ledger)
             .map_err(|error| PopupPreparationFailure::new(error, Refused::ReceiptOwner))?;
-        let current = self.current_observed(registry, true)?;
+        let current = self.current_observed(registry, Some(boundary))?;
         if current.target_id != target || current.session_id != session {
             return Err(PopupPreparationFailure::new(
                 ProtocolError::StaleScope,
@@ -275,12 +350,12 @@ impl PopupInitializationReceipt {
         Ok(current)
     }
     fn current(&self, registry: &Arc<ClientTargets>) -> Result<OwnedTarget, ProtocolError> {
-        self.current_for(registry, false)
+        self.current_for(registry, None)
     }
     fn current_for(
         &self,
         registry: &Arc<ClientTargets>,
-        preparation: bool,
+        preparation: Option<(u64, u64)>,
     ) -> Result<OwnedTarget, ProtocolError> {
         self.current_observed(registry, preparation)
             .map_err(|failure| failure.error)
@@ -288,7 +363,7 @@ impl PopupInitializationReceipt {
     fn current_observed(
         &self,
         registry: &Arc<ClientTargets>,
-        preparation: bool,
+        preparation: Option<(u64, u64)>,
     ) -> Result<OwnedTarget, PopupPreparationFailure> {
         use diagnostic::EvalPreparationRefusal as Refused;
         let fail = |error, reason| PopupPreparationFailure::new(error, reason);
@@ -307,10 +382,10 @@ impl PopupInitializationReceipt {
             .ok_or_else(|| fail(ProtocolError::StaleScope, Refused::ReceiptTarget))?;
         let stage = self.0.stage.load(Ordering::Acquire);
         let terminal = self.0.terminal.load(Ordering::Acquire);
-        // This exact custody already completed configuration, but has not issued
-        // a resume permit. Nothing here marks it resumed or capture-ready. The
-        // strict current()/completed() callers never enable this exception.
-        let awaiting_permit = preparation
+        // Only retained stage-zero custody can wait. Configured custody retains
+        // its original path; unconfigured custody additionally needs the exact
+        // successful configuration producer proof below. Neither grants capture.
+        let awaiting_permit = preparation.is_some()
             && stage == 0
             && terminal == 0
             && !current.resumed
@@ -319,13 +394,23 @@ impl PopupInitializationReceipt {
                 .tenure
                 .retained_initialization
                 .load(Ordering::Acquire);
+        // The fixed entry boundary must include the proof's receive frontier;
+        // enrollment additionally requires applied >= received before freezing.
+        // Later Runtime/foreign events still invalidate the original fence.
+        let awaiting_configuration = awaiting_permit
+            && preparation.is_some_and(|(received, revision)| {
+                self.0
+                    .configuration_applied
+                    .get()
+                    .is_some_and(|proof| proof.matches((received, revision)))
+            });
         let reason = if state.sealed || state.integrity_lost {
             Some(Refused::RegistryHealth)
         } else if !self.matches_target(registry, current) {
             Some(Refused::ReceiptBinding)
         } else if current.kind != "page" || current.purpose != Some(TargetPurpose::Application) {
             Some(Refused::ReceiptTarget)
-        } else if !current.configured {
+        } else if !current.configured && !awaiting_configuration {
             // Sample once in the actual first-failed branch, before returning.
             Some(self.0.setup_diagnostic.unconfigured_refusal(stage))
         } else if terminal == 2 {
@@ -371,9 +456,10 @@ impl PopupInitializationReceipt {
     pub(super) fn preparation_completed(
         &self,
         registry: &Arc<ClientTargets>,
+        boundary: (u64, u64),
     ) -> Result<bool, ProtocolError> {
         if self.0.stage.load(Ordering::Acquire) == 0 {
-            self.current_for(registry, true)?;
+            self.current_for(registry, Some(boundary))?;
             return Ok(false);
         }
         self.completed(registry)
@@ -422,6 +508,7 @@ impl RetainedInitialization {
             stage: AtomicU8::new(0),
             terminal: AtomicU8::new(0),
             setup_diagnostic: PopupSetupProgress::default(),
+            configuration_applied: std::sync::OnceLock::new(),
         }));
         Ok(Self {
             registry,
@@ -5338,3 +5425,7 @@ mod eval_diagnostic_target_tests {
 #[cfg(test)]
 #[path = "client_popup_setup_diagnostic_tests.rs"]
 mod popup_setup_diagnostic_tests;
+
+#[cfg(test)]
+#[path = "client_popup_configuration_proof_unit_tests.rs"]
+mod popup_configuration_proof_unit_tests;
