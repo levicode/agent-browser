@@ -2363,6 +2363,16 @@ impl ObservationDispatch {
                         screenshot_stage(screenshot, ScreenshotStage::FinalScope);
                         bounded_result(&value)?;
                         check(&capture_context.page, &operation)?;
+                        // A provisional CDP payload is not semantic completion
+                        // if its reader already rejected the reply's identity.
+                        // Check before optional work can fail independently; a
+                        // later optional failure must not revoke a sound tree.
+                        // Legal retained cleanup is not a reason to wait here.
+                        if capture_context.page.client.debt_ledger()
+                            .is_some_and(|ledger| ledger.snapshot().integrity_lost)
+                        {
+                            return Err(ProtocolError::ScopeUnavailable);
+                        }
                         // The tree is immutable, but its staged refs remain
                         // private until the on-time result actually publishes.
                         completed_optional = Some(self.optional_observe_pixels(

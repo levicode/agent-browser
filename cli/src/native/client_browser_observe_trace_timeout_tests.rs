@@ -22,7 +22,23 @@ enum Case {
     OptionalMalformedHeld,
     SemanticCorruption,
     OptionalRestoreFailure,
+    SemanticFinalViewportHeld,
+    SemanticFinalViewportForeignHeld,
 }
+
+// verify_document_root -> semantic viewport -> geometry tree/viewport ->
+// complete semantic frame inventory -> final semantic viewport. Readonly group
+// release may interleave, but its actual ACK is separately fenced by the test.
+const SEMANTIC_COMPLETION_SUFFIX: [&str; 8] = [
+    "Page.getLayoutMetrics",
+    "Page.getFrameTree",
+    "Page.getLayoutMetrics",
+    "Page.getFrameTree",
+    "Page.getFrameTree",
+    "Page.createIsolatedWorld",
+    "Page.getFrameTree",
+    "Page.getLayoutMetrics",
+];
 
 struct Peer {
     endpoint: String,
@@ -30,6 +46,7 @@ struct Peer {
     early_restore: Arc<AtomicBool>,
     terminal_sent: Arc<AtomicBool>,
     restoration_acked: Arc<AtomicBool>,
+    semantic_boundary: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
     protected_png: String,
     release: mpsc::UnboundedSender<()>,
@@ -55,6 +72,8 @@ async fn peer(case: Case) -> Peer {
     let terminal = terminal_sent.clone();
     let restoration_acked = Arc::new(AtomicBool::new(false));
     let restored = restoration_acked.clone();
+    let semantic_boundary = Arc::new(AtomicBool::new(false));
+    let semantic_reached = semantic_boundary.clone();
     let protected_png = png([0, 0, 0, 255]);
     let protected = protected_png.clone();
     // Synthetic marker only; no real private pixels exist in this test.
@@ -75,6 +94,8 @@ async fn peer(case: Case) -> Peer {
         let mut held: Option<Value> = None;
         let mut readonly_held_once = false;
         let mut release_job = None;
+        let mut semantic_suffix = None;
+        let mut semantic_marker_seen = false;
         loop {
             tokio::select! {
                 // Test peer teardown only. EOF is not a synthetic capture ACK
@@ -89,7 +110,9 @@ async fn peer(case: Case) -> Peer {
                     let result = if raw {
                         if case == Case::OptionalMalformedHeld { json!({"data":42}) } else { json!({"data":data}) }
                     } else { observation_reply(&request).expect("known held readonly command") };
-                    let session = if raw && case == Case::OptionalWrongSessionHeld { json!("wrong-session") } else { request["sessionId"].clone() };
+                    let session = if (raw && case == Case::OptionalWrongSessionHeld)
+                        || (request["method"] == "Page.getLayoutMetrics" && case == Case::SemanticFinalViewportForeignHeld)
+                    { json!("wrong-session") } else { request["sessionId"].clone() };
                     if socket.send(Message::Text(json!({"id":request["id"],"sessionId":session,"result":result}).to_string())).await.is_err() { break; }
                 }
                 message = socket.next() => {
@@ -98,6 +121,42 @@ async fn peer(case: Case) -> Peer {
                     recorded.lock().unwrap().push(request.clone());
                     let method = request["method"].as_str().unwrap();
                     let session = request["sessionId"].as_str().unwrap_or("");
+                    if matches!(case, Case::SemanticFinalViewportHeld | Case::SemanticFinalViewportForeignHeld) {
+                        // The unique document-root verification follows real
+                        // semantic metadata. Match its complete finite suffix,
+                        // not an unbounded count of viewport requests.
+                        if !semantic_marker_seen && method == "DOM.getDocument"
+                            && request["params"] == json!({"depth":0,"pierce":false})
+                        {
+                            assert!(recorded.lock().unwrap().iter().any(|prior| {
+                                prior["method"] == "Runtime.callFunctionOn"
+                                    && prior["params"]["functionDeclaration"].as_str()
+                                        .is_some_and(|source| source.contains("const read="))
+                            }));
+                            semantic_marker_seen = true;
+                            semantic_suffix = Some(0usize);
+                        } else if let Some(index) = semantic_suffix {
+                            if method == "Runtime.releaseObjectGroup" {
+                                assert!(request["params"]["objectGroup"].as_str()
+                                    .is_some_and(|group| group.starts_with("native-")));
+                            } else {
+                                assert_eq!(method, SEMANTIC_COMPLETION_SUFFIX[index], "semantic suffix {index}");
+                                assert_eq!(request["sessionId"], "host-session");
+                                if method == "Page.createIsolatedWorld" {
+                                    assert_eq!(request["params"], json!({"frameId":frame,"worldName":"agent-browser-native-observation"}));
+                                } else {
+                                    assert_eq!(request["params"], json!({}));
+                                }
+                                if index + 1 == SEMANTIC_COMPLETION_SUFFIX.len() {
+                                    assert!(held.replace(request.clone()).is_none());
+                                    semantic_suffix = None;
+                                    semantic_reached.store(true, Ordering::Release);
+                                    continue;
+                                }
+                                semantic_suffix = Some(index + 1);
+                            }
+                        }
+                    }
                     let rejected = case == Case::OptionalRestoreFailure && method == "Animation.setPlaybackRate"
                         && request["params"]["playbackRate"].as_f64() == Some(1.0);
                     let result = match method {
@@ -182,7 +241,7 @@ async fn peer(case: Case) -> Peer {
                             assert_eq!(captures, 1, "no retry/warmup permitted");
                             assert!(source_holder);
                             assert_eq!(request["params"], json!({"format":"png","fromSurface":true}));
-                            if !matches!(case, Case::Immediate | Case::OptionalRestoreFailure) {
+                            if !matches!(case, Case::Immediate | Case::OptionalRestoreFailure | Case::SemanticFinalViewportHeld) {
                                 assert!(held.is_none());
                                 held=Some(request.clone());
                                 let release=release_tx.clone();
@@ -236,6 +295,7 @@ async fn peer(case: Case) -> Peer {
         early_restore,
         terminal_sent,
         restoration_acked,
+        semantic_boundary,
         task,
         protected_png,
         release: peer_release,
@@ -1651,4 +1711,128 @@ async fn query_semantic_bounds_returns_before_exact_readonly_release_ack() {
 #[tokio::test]
 async fn trace_semantic_bounds_returns_before_exact_readonly_release_ack_without_action_refs() {
     readonly_semantic_bounds_command("browser.trace").await;
+}
+
+async fn semantic_completion_ack(foreign_session: bool) {
+    let case = if foreign_session {
+        Case::SemanticFinalViewportForeignHeld
+    } else {
+        Case::SemanticFinalViewportHeld
+    };
+    let (peer, browser, mut fixture, scope) = optional_fixture(case).await;
+    let client = browser.page_lease(false).await.unwrap().client;
+    let ledger = client.debt_ledger().unwrap();
+    let refs_before = browser.refs.lock().unwrap().ref_ids();
+    assert!(refs_before.is_empty());
+    optional_request(&mut fixture, &scope, "semantic-completion-ack", true, 1000).await;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while !peer.semantic_boundary.load(Ordering::Acquire) {
+            tokio::task::yield_now().await;
+        }
+        // The producer is waiting on the exact final viewport. Drain only
+        // actual earlier readonly release ACKs, never infer cleanup from time.
+        loop {
+            let state = ledger.snapshot();
+            assert!(!state.integrity_lost);
+            if state.outstanding_commands == 1 && state.object_debt == 0 {
+                assert_eq!(state.input_debt, 0);
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("final semantic viewport or prior exact cleanup ACKs not reached");
+    assert!(browser.refs.lock().unwrap().ref_ids().is_empty());
+    assert!(!peer.log.lock().unwrap().iter().any(|request| matches!(
+        request["method"].as_str(),
+        Some("Animation.enable" | "Page.captureScreenshot")
+    )));
+    peer.release.send(()).unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        optional_result(&mut fixture, "semantic-completion-ack"),
+    )
+    .await
+    .expect("public Observe result did not settle");
+    if foreign_session {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !ledger.snapshot().integrity_lost {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("foreign semantic ACK did not reach the real ledger");
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["error"]["code"], "scope-unavailable");
+        assert_eq!(result["effects"], "unknown");
+        assert_eq!(result["scopeState"], "quarantined");
+        assert!(result.get("data").is_none());
+        assert!(result.get("retention").is_none());
+        assert_eq!(browser.refs.lock().unwrap().ref_ids(), refs_before);
+        let state = ledger.snapshot();
+        assert!(state.integrity_lost);
+        assert_eq!(state.outstanding_commands, 1);
+        assert_eq!(state.object_debt, 0);
+        assert_eq!(state.input_debt, 0);
+        assert!(!peer.log.lock().unwrap().iter().any(|request| matches!(
+            request["method"].as_str(),
+            Some("Animation.enable" | "Page.captureScreenshot")
+        )));
+        // This debt is a rejected semantic ACK, not a raw/mask residual. Do
+        // not reuse optional_finish_failed's unrelated protection assertion.
+        let cleanup = tokio::time::timeout(Duration::from_secs(10), fixture.finish())
+            .await
+            .expect("poisoned semantic owner shutdown stalled");
+        assert!(
+            cleanup.is_err(),
+            "foreign command debt is not clean shutdown"
+        );
+        // Unlike a raw/mask residual, this failure may still reach the real
+        // manager.close and end the borrowed socket. A closed test sender is
+        // not settlement proof: either case must join the actual peer cleanly.
+        let disconnect_requested = peer.disconnect.send(()).is_ok();
+        tokio::time::timeout(Duration::from_secs(2), peer.task)
+            .await
+            .expect("poisoned semantic peer did not join")
+            .expect("poisoned semantic peer panicked");
+        eprintln!("semantic-poison teardown disconnect_requested={disconnect_requested}");
+    } else {
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["effects"], "completed");
+        assert_eq!(result["scopeState"], "usable");
+        assert_eq!(result["data"]["root"]["role"], "document");
+        assert!(result["data"]["pixels"]["handle"].is_string());
+        assert!(!browser.refs.lock().unwrap().ref_ids().is_empty());
+        assert!(!ledger.snapshot().integrity_lost);
+        assert_eq!(
+            peer.log
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Page.captureScreenshot")
+                .count(),
+            1
+        );
+        fixture
+            .command(
+                "blob.release",
+                json!({"identityScope":scope,
+            "handle":result["data"]["pixels"]["handle"]}),
+                1,
+            )
+            .await
+            .unwrap();
+        optional_finish(peer, fixture).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn semantic_final_foreign_viewport_ack_never_publishes_optional_tree() {
+    semantic_completion_ack(true).await;
+}
+
+#[tokio::test]
+async fn semantic_final_matching_viewport_ack_preserves_optional_pixels() {
+    semantic_completion_ack(false).await;
 }

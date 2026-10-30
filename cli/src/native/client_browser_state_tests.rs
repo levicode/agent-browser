@@ -753,3 +753,6 @@ mod recording_start_receipt_tests;
 
 #[path = "client_browser_terminal_recording_tests.rs"]
 mod terminal_recording_tests;
+
+#[path = "client_browser_read_fields_tests.rs"]
+mod read_fields_tests;

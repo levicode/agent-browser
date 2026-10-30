@@ -280,6 +280,12 @@ async fn run_case_with_integrity(
             "inventory cannot create object handles"
         );
         assert_eq!(snapshot.input_debt, 0);
+        for class in [AdmissionClass::Reference, AdmissionClass::FixedRead] {
+            assert_eq!(
+                ledger.check_admission(class),
+                Err(crate::native::client_protocol::ProtocolError::ScopeUnavailable)
+            );
+        }
     } else {
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -706,7 +712,16 @@ async fn stateless_root_describe_errors_stay_opaque_and_foreign_ack_keeps_debt()
         }
         let (result, requests) =
             run_case_with_integrity(Read::Validated, frame(false), steps, foreign_session).await;
-        assert_eq!(result, Err(ObservationError::BackendFailure));
+        if foreign_session {
+            // Legacy LocalFailure delivery preserves the provisional payload.
+            // run_case_with_integrity has already required poisoned authority,
+            // exactly one unsettled command, and no object/input debt. This is
+            // NOT public success: the paired framed ReadFields controls reject
+            // both inventory descriptions and the last dispatcher frame ACK.
+            assert_eq!(result, Ok(dom(99)));
+        } else {
+            assert_eq!(result, Err(ObservationError::BackendFailure));
+        }
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[2]["method"], "DOM.describeNode");
         assert_eq!(requests[2]["sessionId"], "renderer");
