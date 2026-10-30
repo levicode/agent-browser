@@ -873,7 +873,9 @@ impl CdpClient {
         let (ws_stream, _) = tokio_tungstenite::connect_async_tls_with_config(
             request,
             Some(ws_config),
-            false,
+            // CDP uses latency-sensitive request/reply messages; do not hold
+            // small writes for TCP packet coalescing. Snapshot order is unchanged.
+            true,
             connector,
         )
         .await
@@ -7015,6 +7017,10 @@ mod tests {
             CdpClient::connect_request(request, config, Some(Connector::Rustls(client_config)))
                 .await
                 .unwrap();
+        assert!(
+            client.transport.socket.tcp_nodelay().unwrap(),
+            "TLS CDP must disable Nagle on the actual underlying TCP socket"
+        );
 
         client.close().await;
         server.join().unwrap();
@@ -7081,7 +7087,11 @@ mod tests {
         });
 
         let url = format!("ws://127.0.0.1:{}?token=a%2Fb&scope=browser%20test", port);
-        let _client = CdpClient::connect(&url).await.unwrap();
+        let client = CdpClient::connect(&url).await.unwrap();
+        assert!(
+            client.transport.socket.tcp_nodelay().unwrap(),
+            "plain CDP must disable Nagle on the actual connected TCP socket"
+        );
 
         assert_eq!(path_rx.await.unwrap(), "/?token=a%2Fb&scope=browser%20test");
         server.await.unwrap();
