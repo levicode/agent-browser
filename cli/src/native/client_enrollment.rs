@@ -832,6 +832,8 @@ enum CaptureTestPoint {
     EvalEntry,
     EvalAdmissionReceipt,
     EvalPreparationWaiting,
+    BeforePopupConfigured,
+    AfterPopupConfiguredBeforeResumePermit,
     AfterPopupResumeAckBeforeComplete,
     AfterPopupCustodyFinishBeforeReceipt,
     BeforeEvalPreparationRecheck,
@@ -1962,45 +1964,69 @@ impl ClientEnrollment {
         ledger: &Arc<super::client_debt::OwnerDebtLedger>,
         watermark: &BoundedEventWatermark,
         entry_snapshot: (u64, super::client_debt::EvalPreparationSnapshot),
-    ) -> Result<EvalIngressPreparation, ProtocolError> {
+    ) -> Result<EvalIngressPreparation, super::client_targets::PopupPreparationFailure> {
+        use super::client_settlement_trace::EvalPreparationRefusal as Refused;
+        use super::client_targets::PopupPreparationFailure as Failure;
         let (received, snapshot) = entry_snapshot;
-        // Narrow first version: no received-but-unregistered owner can become
-        // a discovered member after entry. Unknown provenance refuses.
-        if index.pending_enrollment.is_empty()
-            || index.applied_watermark < received
-            || index.pending_enrollment.len() > MAX_TASKS
-        {
-            return Err(ProtocolError::ScopeUnavailable);
+        // Freeze only the already-registered cohort. The configured stage-zero
+        // wait does not forgive a received-but-unapplied attachment or any other
+        // missing frontier proof. Record the predicate at its actual check.
+        if index.pending_enrollment.is_empty() {
+            return Err(Failure::new(
+                ProtocolError::ScopeUnavailable,
+                Refused::EmptyCohort,
+            ));
+        }
+        if index.applied_watermark < received {
+            return Err(Failure::new(
+                ProtocolError::ScopeUnavailable,
+                Refused::Frontier,
+            ));
+        }
+        if index.pending_enrollment.len() > MAX_TASKS {
+            return Err(Failure::new(
+                ProtocolError::ScopeUnavailable,
+                Refused::CohortCapacity,
+            ));
         }
         let root_entry = index
             .sessions
             .get(&page.page_session_id)
-            .ok_or(ProtocolError::StaleScope)?;
+            .ok_or_else(|| Failure::new(ProtocolError::StaleScope, Refused::RootEntry))?;
         if root_entry.target != page.target_id
             || root_entry.kind != "page"
             || !root_entry.application
             || root_entry.observation_only
             || !root_entry.resumed
             || root_entry.root != root_entry.session
-            || *self
-                .active_root
-                .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?
-                != root_entry.session
         {
-            return Err(ProtocolError::StaleScope);
+            return Err(Failure::new(
+                ProtocolError::StaleScope,
+                Refused::RootIdentity,
+            ));
         }
-        let root = self.targets.owned_target(&page.target_id)?;
+        if *self
+            .active_root
+            .lock()
+            .map_err(|_| Failure::new(ProtocolError::ScopeUnavailable, Refused::RootActive))?
+            != root_entry.session
+        {
+            return Err(Failure::new(ProtocolError::StaleScope, Refused::RootActive));
+        }
+        let root = self
+            .targets
+            .owned_target(&page.target_id)
+            .map_err(|error| Failure::new(error, Refused::RootTarget))?;
         if root.session_id != page.page_session_id || !root.capture_ready() {
-            return Err(ProtocolError::StaleScope);
+            return Err(Failure::new(ProtocolError::StaleScope, Refused::RootTarget));
         }
-        let root_frame = Self::eval_root_frame(index, &root_entry.session)?;
+        let root_frame = Self::eval_root_frame(index, &root_entry.session)
+            .map_err(|error| Failure::new(error, Refused::RootFrame))?;
         let mut cohort = Vec::with_capacity(index.pending_enrollment.len());
         for session in index.pending_enrollment.keys() {
-            let entry = index
-                .sessions
-                .get(session)
-                .ok_or(ProtocolError::ScopeUnavailable)?;
+            let entry = index.sessions.get(session).ok_or_else(|| {
+                Failure::new(ProtocolError::ScopeUnavailable, Refused::MemberEntry)
+            })?;
             if !entry.application
                 || entry.observation_only
                 || !entry.init_paused_by_attachment
@@ -2008,14 +2034,20 @@ impl ClientEnrollment {
                 || entry.root != entry.session
                 || session == &root_entry.session
             {
-                return Err(ProtocolError::ScopeUnavailable);
+                return Err(Failure::new(
+                    ProtocolError::ScopeUnavailable,
+                    Refused::MemberKind,
+                ));
             }
-            Self::eval_root_frame(index, session)?;
+            Self::eval_root_frame(index, session)
+                .map_err(|error| Failure::new(error, Refused::MemberFrame))?;
             let receipt = index
                 .pending_eval_initialization
                 .get(session)
-                .ok_or(ProtocolError::ScopeUnavailable)?;
-            receipt.capture_for_eval(
+                .ok_or_else(|| {
+                    Failure::new(ProtocolError::ScopeUnavailable, Refused::ReceiptMissing)
+                })?;
+            receipt.capture_for_preparation_observed(
                 &self.targets,
                 ledger,
                 watermark,
@@ -2035,7 +2067,10 @@ impl ClientEnrollment {
             watermark: watermark.clone(),
             received,
             epoch: index.application_epoch,
-            config_revision: self.page.config_revision()?,
+            config_revision: self
+                .page
+                .config_revision()
+                .map_err(|error| Failure::new(error, Refused::Configuration))?,
             generation: op.generation,
             operation: op.sequence,
             deadline: op.deadline,
@@ -2043,7 +2078,9 @@ impl ClientEnrollment {
             root,
             root_entry: root_entry.clone(),
             root_frame,
-            fence: snapshot.freeze(received)?,
+            fence: snapshot
+                .freeze(received)
+                .map_err(|error| Failure::new(error, Refused::Fence))?,
             cohort,
         })
     }
@@ -2133,7 +2170,7 @@ impl ClientEnrollment {
         }
         let mut complete = true;
         for member in &preparation.cohort {
-            member.receipt.capture_for_eval(
+            member.receipt.capture_for_preparation(
                 &self.targets,
                 &preparation.ledger,
                 &preparation.watermark,
@@ -2141,7 +2178,7 @@ impl ClientEnrollment {
                 &member.target,
                 &member.session,
             )?;
-            let positive = member.receipt.completed(&self.targets)?;
+            let positive = member.receipt.preparation_completed(&self.targets)?;
             if index.pending_enrollment.contains_key(&member.session) {
                 if index
                     .pending_eval_initialization
@@ -2177,6 +2214,19 @@ impl ClientEnrollment {
         if !self.check_eval_preparation_locked(&index, page, op, preparation)? {
             return Err(ProtocolError::ScopeUnavailable);
         }
+        // The relaxed stage-zero path is wait-only. Final authority still uses
+        // the original strict receipt check after positive completion, before
+        // binding this unchanged fence to the ordinary authority stamp.
+        for member in &preparation.cohort {
+            member.receipt.capture_for_eval(
+                &self.targets,
+                &preparation.ledger,
+                &preparation.watermark,
+                preparation.received,
+                &member.target,
+                &member.session,
+            )?;
+        }
         preparation
             .ledger
             .bind_eval_preparation(&mut stamp, &preparation.fence)?;
@@ -2199,25 +2249,6 @@ impl ClientEnrollment {
         {
             entered.entered.add_permits(1);
         }
-        self.check_restart_operation(op)?;
-        if op.is_callback
-            || !Arc::ptr_eq(&page.client, &self.client)
-            || !Arc::ptr_eq(&page.targets, &self.targets)
-            || page.identity_scope != self.targets.identity_scope
-        {
-            return Err(ProtocolError::StaleScope);
-        }
-        page.permit.check()?;
-        let ledger = self
-            .client
-            .debt_ledger()
-            .ok_or(ProtocolError::ScopeUnavailable)?;
-        self.targets.require_eval_owner(&ledger)?;
-        let watermark = self.realm_watermark()?;
-        let attachment = self.targets.owned_target(&page.target_id)?;
-        if attachment.session_id != page.page_session_id || !attachment.capture_ready() {
-            return Err(ProtocolError::StaleScope);
-        }
         let diagnostics = super::client_settlement_trace::query_diagnostics_enabled();
         #[cfg(test)]
         let diagnostics = diagnostics
@@ -2226,36 +2257,87 @@ impl ClientEnrollment {
                 .lock()
                 .unwrap()
                 .contains_key(&CaptureTestPoint::EvalAdmissionReceipt);
-        let mut refusal_diagnostic = None;
-        let (received, epoch, revision, preparation, entry_diagnostic) = {
+        // Capture supplementary facts before fallible admission. The typed
+        // reason is returned by the exact failing branch, never a later sample.
+        let mut entry_diagnostic = None;
+        let entry = (|| {
+            use super::client_settlement_trace::EvalPreparationRefusal as Refused;
+            use super::client_targets::PopupPreparationFailure as Failure;
+            self.check_restart_operation(op)
+                .map_err(|error| Failure::new(error, Refused::EntryOperation))?;
+            if op.is_callback
+                || !Arc::ptr_eq(&page.client, &self.client)
+                || !Arc::ptr_eq(&page.targets, &self.targets)
+                || page.identity_scope != self.targets.identity_scope
+            {
+                return Err(Failure::new(
+                    ProtocolError::StaleScope,
+                    Refused::EntryIdentity,
+                ));
+            }
+            page.permit
+                .check()
+                .map_err(|error| Failure::new(error, Refused::EntryPermit))?;
+            let ledger = self.client.debt_ledger().ok_or_else(|| {
+                Failure::new(ProtocolError::ScopeUnavailable, Refused::EntryLedger)
+            })?;
+            self.targets
+                .require_eval_owner(&ledger)
+                .map_err(|error| Failure::new(error, Refused::EntryOwner))?;
+            let watermark = self
+                .realm_watermark()
+                .map_err(|error| Failure::new(error, Refused::EntryStream))?;
+            let attachment = self
+                .targets
+                .owned_target(&page.target_id)
+                .map_err(|error| Failure::new(error, Refused::EntryTarget))?;
+            if attachment.session_id != page.page_session_id || !attachment.capture_ready() {
+                return Err(Failure::new(
+                    ProtocolError::StaleScope,
+                    Refused::EntryTarget,
+                ));
+            }
             let index = self
                 .index
                 .lock()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                .map_err(|_| Failure::new(ProtocolError::ScopeUnavailable, Refused::IndexHealth))?;
+            entry_diagnostic = diagnostics.then(|| {
+                self.eval_diagnostic_snapshot(
+                    &index,
+                    page,
+                    super::client_settlement_trace::EvalAdmissionStage::Entry,
+                    super::client_settlement_trace::EvalAdmissionReason::Frontier,
+                    None,
+                    None,
+                )
+            });
             if let Some(error) = &index.failure {
-                return Err(error.clone());
+                return Err(Failure::new(error.clone(), Refused::IndexFailure));
             }
             if !index.reconciled {
-                return Err(ProtocolError::StaleScope);
+                return Err(Failure::new(
+                    ProtocolError::StaleScope,
+                    Refused::IndexHealth,
+                ));
             }
-            // Preserve ledger observation before the fixed received frontier.
+            // Keep ledger observation before the original fixed received frontier.
             let (revision, snapshot) = if index.pending_enrollment.is_empty() {
                 (
-                    ledger.observe_eval_revision(&page.page_session_id, &page.target_id)?,
+                    ledger
+                        .observe_eval_revision(&page.page_session_id, &page.target_id)
+                        .map_err(|error| Failure::new(error, Refused::LedgerSnapshot))?,
                     None,
                 )
             } else {
-                let (revision, snapshot) = ledger.observe_eval_preparation(
-                    &page.page_session_id,
-                    &page.target_id,
-                    &watermark,
-                )?;
+                let (revision, snapshot) = ledger
+                    .observe_eval_preparation(&page.page_session_id, &page.target_id, &watermark)
+                    .map_err(|error| Failure::new(error, Refused::LedgerSnapshot))?;
                 (revision, Some(snapshot))
             };
             let received = watermark
                 .received()
-                .map_err(|_| ProtocolError::ScopeUnavailable)?;
-            let diagnostic = diagnostics.then(|| {
+                .map_err(|_| Failure::new(ProtocolError::ScopeUnavailable, Refused::EntryStream))?;
+            entry_diagnostic = diagnostics.then(|| {
                 self.eval_diagnostic_snapshot(
                     &index,
                     page,
@@ -2277,14 +2359,40 @@ impl ClientEnrollment {
                     )
                 })
                 .transpose()?;
-            (
+            Ok((
+                ledger,
+                watermark,
+                attachment,
                 received,
                 index.application_epoch,
                 revision,
                 preparation,
-                diagnostic,
-            )
+            ))
+        })();
+        let (ledger, watermark, attachment, received, epoch, revision, preparation) = match entry {
+            Ok(value) => value,
+            Err(failure) => {
+                let mut facts = entry_diagnostic.unwrap_or_else(|| {
+                    super::client_settlement_trace::EvalAdmissionFacts::unknown(
+                        super::client_settlement_trace::EvalAdmissionStage::WaitRefused,
+                        failure.reason.into(),
+                    )
+                });
+                facts.stage = super::client_settlement_trace::EvalAdmissionStage::WaitRefused;
+                facts.reason = failure.reason.into();
+                #[cfg(test)]
+                self.record_eval_admission_for_test(op, facts);
+                if diagnostics {
+                    super::client_settlement_trace::eval_admission(
+                        op.generation,
+                        op.sequence,
+                        facts,
+                    );
+                }
+                return Err(failure.error);
+            }
         };
+        let mut refusal_diagnostic = None;
         if let Some(facts) = entry_diagnostic {
             #[cfg(test)]
             self.record_eval_admission_for_test(op, facts);
@@ -5047,11 +5155,24 @@ impl ClientEnrollment {
                 ),
             )
             .await?;
+            #[cfg(test)]
+            if entry.kind == "page" {
+                self.pause_component_boundary(CaptureTestPoint::BeforePopupConfigured, op)
+                    .await?;
+            }
             ServiceWorkerAdmission::observe_sync(
                 admission,
                 WorkerAdmissionStep::Configured,
                 || self.targets.configured(&entry.target),
             )?;
+            #[cfg(test)]
+            if entry.kind == "page" {
+                self.pause_component_boundary(
+                    CaptureTestPoint::AfterPopupConfiguredBeforeResumePermit,
+                    op,
+                )
+                .await?;
+            }
             let popup_receipt = {
                 let index = self
                     .index
@@ -9304,6 +9425,52 @@ mod tests {
     include!("client_eval_network_watermark_tests.rs");
     include!("client_popup_preparation_tests.rs");
     include!("client_popup_interposition_test_helpers.rs");
+
+    // Reconstruction: test-only schedules use real configured/permit boundaries.
+    impl ClientEnrollment {
+        pub(crate) fn popup_stage0_schedule_for_test(
+            &self,
+            configured: bool,
+        ) -> PopupCaptureSchedule {
+            let schedule = self.popup_capture_schedule_for_test(true);
+            let mut gates = self.capture_test_gates.lock().unwrap();
+            let initializer = gates
+                .remove(&CaptureTestPoint::AfterPopupResumeAckBeforeComplete)
+                .unwrap();
+            let point = if configured {
+                CaptureTestPoint::AfterPopupConfiguredBeforeResumePermit
+            } else {
+                CaptureTestPoint::BeforePopupConfigured
+            };
+            assert!(gates.insert(point, initializer).is_none());
+            schedule
+        }
+
+        pub(crate) async fn popup_stage0_event_applied_for_test(&self, expected: u64) {
+            let watermark = self.realm_watermark().unwrap();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let changed = self.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    self.check().unwrap();
+                    assert!(watermark.same_subscription(&self.realm_watermark().unwrap()));
+                    assert_eq!(watermark.received().unwrap(), expected);
+                    let applied = {
+                        let index = self.index.lock().unwrap();
+                        assert!(!index.pending_enrollment.is_empty());
+                        index.applied_watermark >= expected
+                    };
+                    if applied {
+                        return;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .expect("fixed lifecycle frontier did not apply while initializer remained retained");
+        }
+    }
     fn coordinator(
         client: Arc<CdpClient>,
         context: &str,

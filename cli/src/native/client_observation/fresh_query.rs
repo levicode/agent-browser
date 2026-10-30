@@ -121,8 +121,7 @@ pub(super) async fn fields(
         return Ok(None);
     }
     witness.stage(Stage::FreshInventory);
-    validate_frame(client, frame, lease).await?;
-    let dom = frame_dom(client, frame, lease).await?;
+    let dom = validated_frame_dom(client, frame, lease).await?;
     let Some((ids, author, domains)) = roots(&dom["root"])? else {
         return Ok(None);
     };
@@ -218,8 +217,7 @@ pub(super) async fn fields(
     // A new/retired author root invalidates the acquired policy rather than
     // turning an unseen closed domain into an empty result. Leaf churn does not.
     witness.stage(Stage::FreshRootsFinal);
-    validate_frame(client, frame, lease).await?;
-    let current = frame_dom(client, frame, lease).await?;
+    let current = validated_frame_dom(client, frame, lease).await?;
     if roots(&current["root"])? != Some((ids, author, domains)) {
         return Err(ObservationError::StaleReference);
     }

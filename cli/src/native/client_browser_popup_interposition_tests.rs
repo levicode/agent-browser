@@ -420,3 +420,6 @@ async fn framed_popup_preparation_actual_ui_wait_navigation_a_b_a_refuses_first_
     .await
     .unwrap();
 }
+
+#[path = "client_popup_stage0_tests.rs"]
+mod stage0_tests;

@@ -78,6 +78,15 @@ struct PopupInitializationProgress {
     // 0 retained, 1 positive after finish, 2 not successful.
     terminal: AtomicU8,
 }
+pub(super) struct PopupPreparationFailure {
+    pub(super) error: ProtocolError,
+    pub(super) reason: diagnostic::EvalPreparationRefusal,
+}
+impl PopupPreparationFailure {
+    pub(super) fn new(error: ProtocolError, reason: diagnostic::EvalPreparationRefusal) -> Self {
+        Self { error, reason }
+    }
+}
 impl PopupInitializationReceipt {
     fn matches_target(&self, registry: &ClientTargets, target: &OwnedTarget) -> bool {
         self.0
@@ -136,35 +145,135 @@ impl PopupInitializationReceipt {
         }
         Ok(current)
     }
+    /// Private preparation is a retained wait, not an evaluation grant. Only the
+    /// already-configured gap before the real resume permit may additionally wait.
+    pub(super) fn capture_for_preparation(
+        &self,
+        registry: &Arc<ClientTargets>,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+        stream: &super::cdp::client::BoundedEventWatermark,
+        received: u64,
+        target: &str,
+        session: &str,
+    ) -> Result<OwnedTarget, ProtocolError> {
+        self.capture_for_preparation_observed(registry, ledger, stream, received, target, session)
+            .map_err(|failure| failure.error)
+    }
+    pub(super) fn capture_for_preparation_observed(
+        &self,
+        registry: &Arc<ClientTargets>,
+        ledger: &Arc<super::client_debt::OwnerDebtLedger>,
+        stream: &super::cdp::client::BoundedEventWatermark,
+        received: u64,
+        target: &str,
+        session: &str,
+    ) -> Result<OwnedTarget, PopupPreparationFailure> {
+        use diagnostic::EvalPreparationRefusal as Refused;
+        if !self.0.stream.same_subscription(stream)
+            || !ledger.matches_eval_preparation_stream(stream)
+            || self
+                .0
+                .ledger
+                .upgrade()
+                .is_none_or(|owner| !Arc::ptr_eq(&owner, ledger))
+            || !ledger.matches_owner(self.0.generation, &registry.identity_scope)
+        {
+            return Err(PopupPreparationFailure::new(
+                ProtocolError::StaleScope,
+                Refused::ReceiptOwner,
+            ));
+        }
+        if self.0.origin == 0 || self.0.origin > received || self.0.origin == u64::MAX {
+            return Err(PopupPreparationFailure::new(
+                ProtocolError::StaleScope,
+                Refused::ReceiptOrigin,
+            ));
+        }
+        registry
+            .require_eval_owner(ledger)
+            .map_err(|error| PopupPreparationFailure::new(error, Refused::ReceiptOwner))?;
+        let current = self.current_observed(registry, true)?;
+        if current.target_id != target || current.session_id != session {
+            return Err(PopupPreparationFailure::new(
+                ProtocolError::StaleScope,
+                Refused::ReceiptTarget,
+            ));
+        }
+        Ok(current)
+    }
     fn current(&self, registry: &Arc<ClientTargets>) -> Result<OwnedTarget, ProtocolError> {
-        let bound = self.0.target.get().ok_or(ProtocolError::ScopeUnavailable)?;
+        self.current_for(registry, false)
+    }
+    fn current_for(
+        &self,
+        registry: &Arc<ClientTargets>,
+        preparation: bool,
+    ) -> Result<OwnedTarget, ProtocolError> {
+        self.current_observed(registry, preparation)
+            .map_err(|failure| failure.error)
+    }
+    fn current_observed(
+        &self,
+        registry: &Arc<ClientTargets>,
+        preparation: bool,
+    ) -> Result<OwnedTarget, PopupPreparationFailure> {
+        use diagnostic::EvalPreparationRefusal as Refused;
+        let fail = |error, reason| PopupPreparationFailure::new(error, reason);
+        let bound = self
+            .0
+            .target
+            .get()
+            .ok_or_else(|| fail(ProtocolError::ScopeUnavailable, Refused::ReceiptBinding))?;
         let state = registry
             .state
             .lock()
-            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            .map_err(|_| fail(ProtocolError::ScopeUnavailable, Refused::RegistryHealth))?;
         let current = state
             .targets
             .get(&bound.target_id)
-            .ok_or(ProtocolError::StaleScope)?;
+            .ok_or_else(|| fail(ProtocolError::StaleScope, Refused::ReceiptTarget))?;
         let stage = self.0.stage.load(Ordering::Acquire);
         let terminal = self.0.terminal.load(Ordering::Acquire);
-        if state.sealed
-            || state.integrity_lost
-            || !self.matches_target(registry, current)
-            || current.kind != "page"
-            || current.purpose != Some(TargetPurpose::Application)
-            || !current.configured
-            || terminal == 2
-            || !(1..=3).contains(&stage)
-            || (stage < 3
-                && (!current.resume_pending
-                    || !current
-                        .tenure
-                        .retained_initialization
-                        .load(Ordering::Acquire)))
-            || (stage == 3 && !current.capture_ready())
+        // This exact custody already completed configuration, but has not issued
+        // a resume permit. Nothing here marks it resumed or capture-ready. The
+        // strict current()/completed() callers never enable this exception.
+        let awaiting_permit = preparation
+            && stage == 0
+            && terminal == 0
+            && !current.resumed
+            && !current.resume_pending
+            && current
+                .tenure
+                .retained_initialization
+                .load(Ordering::Acquire);
+        let reason = if state.sealed || state.integrity_lost {
+            Some(Refused::RegistryHealth)
+        } else if !self.matches_target(registry, current) {
+            Some(Refused::ReceiptBinding)
+        } else if current.kind != "page" || current.purpose != Some(TargetPurpose::Application) {
+            Some(Refused::ReceiptTarget)
+        } else if !current.configured {
+            Some(Refused::Unconfigured)
+        } else if terminal == 2 {
+            Some(Refused::ReceiptTerminal)
+        } else if !awaiting_permit && !(1..=3).contains(&stage) {
+            Some(Refused::ReceiptStage)
+        } else if !awaiting_permit
+            && stage < 3
+            && (!current.resume_pending
+                || !current
+                    .tenure
+                    .retained_initialization
+                    .load(Ordering::Acquire))
         {
-            return Err(ProtocolError::ScopeUnavailable);
+            Some(Refused::ReceiptCustody)
+        } else if stage == 3 && !current.capture_ready() {
+            Some(Refused::ReceiptReadiness)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(fail(ProtocolError::ScopeUnavailable, reason));
         }
         Ok(current.clone())
     }
@@ -184,6 +293,16 @@ impl PopupInitializationReceipt {
             return Err(ProtocolError::ScopeUnavailable);
         }
         Ok(positive)
+    }
+    pub(super) fn preparation_completed(
+        &self,
+        registry: &Arc<ClientTargets>,
+    ) -> Result<bool, ProtocolError> {
+        if self.0.stage.load(Ordering::Acquire) == 0 {
+            self.current_for(registry, true)?;
+            return Ok(false);
+        }
+        self.completed(registry)
     }
     fn unsuccessful(&self) {
         let _ = self

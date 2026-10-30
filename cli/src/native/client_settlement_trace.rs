@@ -1468,6 +1468,153 @@ pub(crate) enum EvalAdmissionReason {
     RealmHealth,
     #[serde(rename = "guard")]
     OtherGuard,
+    #[serde(rename = "p-op")]
+    PreparationEntryOperation,
+    #[serde(rename = "p-entryid")]
+    PreparationEntryIdentity,
+    #[serde(rename = "p-permit")]
+    PreparationEntryPermit,
+    #[serde(rename = "p-ledger")]
+    PreparationEntryLedger,
+    #[serde(rename = "p-eowner")]
+    PreparationEntryOwner,
+    #[serde(rename = "p-stream")]
+    PreparationEntryStream,
+    #[serde(rename = "p-etarget")]
+    PreparationEntryTarget,
+    #[serde(rename = "p-failed")]
+    PreparationIndexFailure,
+    #[serde(rename = "p-index")]
+    PreparationIndexHealth,
+    #[serde(rename = "p-snap")]
+    PreparationLedgerSnapshot,
+    #[serde(rename = "p-empty")]
+    PreparationEmptyCohort,
+    #[serde(rename = "p-front")]
+    PreparationFrontier,
+    #[serde(rename = "p-cap")]
+    PreparationCohortCapacity,
+    #[serde(rename = "p-rootent")]
+    PreparationRootEntry,
+    #[serde(rename = "p-rootid")]
+    PreparationRootIdentity,
+    #[serde(rename = "p-active")]
+    PreparationRootActive,
+    #[serde(rename = "p-roottgt")]
+    PreparationRootTarget,
+    #[serde(rename = "p-rootfrm")]
+    PreparationRootFrame,
+    #[serde(rename = "p-mement")]
+    PreparationMemberEntry,
+    #[serde(rename = "p-memkind")]
+    PreparationMemberKind,
+    #[serde(rename = "p-memfrm")]
+    PreparationMemberFrame,
+    #[serde(rename = "p-missing")]
+    PreparationReceiptMissing,
+    #[serde(rename = "p-owner")]
+    PreparationReceiptOwner,
+    #[serde(rename = "p-origin")]
+    PreparationReceiptOrigin,
+    #[serde(rename = "p-binding")]
+    PreparationReceiptBinding,
+    #[serde(rename = "p-target")]
+    PreparationReceiptTarget,
+    #[serde(rename = "p-health")]
+    PreparationRegistryHealth,
+    #[serde(rename = "p-config")]
+    PreparationUnconfigured,
+    #[serde(rename = "p-term")]
+    PreparationReceiptTerminal,
+    #[serde(rename = "p-stage")]
+    PreparationReceiptStage,
+    #[serde(rename = "p-custody")]
+    PreparationReceiptCustody,
+    #[serde(rename = "p-ready")]
+    PreparationReceiptReadiness,
+    #[serde(rename = "p-confrev")]
+    PreparationConfiguration,
+    #[serde(rename = "p-fence")]
+    PreparationFence,
+}
+/// The first predicate that refused private popup preparation at its original
+/// synchronous observation point. This is diagnostic data, never authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EvalPreparationRefusal {
+    EntryOperation,
+    EntryIdentity,
+    EntryPermit,
+    EntryLedger,
+    EntryOwner,
+    EntryStream,
+    EntryTarget,
+    IndexFailure,
+    IndexHealth,
+    LedgerSnapshot,
+    EmptyCohort,
+    Frontier,
+    CohortCapacity,
+    RootEntry,
+    RootIdentity,
+    RootActive,
+    RootTarget,
+    RootFrame,
+    MemberEntry,
+    MemberKind,
+    MemberFrame,
+    ReceiptMissing,
+    ReceiptOwner,
+    ReceiptOrigin,
+    ReceiptBinding,
+    ReceiptTarget,
+    RegistryHealth,
+    Unconfigured,
+    ReceiptTerminal,
+    ReceiptStage,
+    ReceiptCustody,
+    ReceiptReadiness,
+    Configuration,
+    Fence,
+}
+impl From<EvalPreparationRefusal> for EvalAdmissionReason {
+    fn from(reason: EvalPreparationRefusal) -> Self {
+        match reason {
+            EvalPreparationRefusal::EntryOperation => Self::PreparationEntryOperation,
+            EvalPreparationRefusal::EntryIdentity => Self::PreparationEntryIdentity,
+            EvalPreparationRefusal::EntryPermit => Self::PreparationEntryPermit,
+            EvalPreparationRefusal::EntryLedger => Self::PreparationEntryLedger,
+            EvalPreparationRefusal::EntryOwner => Self::PreparationEntryOwner,
+            EvalPreparationRefusal::EntryStream => Self::PreparationEntryStream,
+            EvalPreparationRefusal::EntryTarget => Self::PreparationEntryTarget,
+            EvalPreparationRefusal::IndexFailure => Self::PreparationIndexFailure,
+            EvalPreparationRefusal::IndexHealth => Self::PreparationIndexHealth,
+            EvalPreparationRefusal::LedgerSnapshot => Self::PreparationLedgerSnapshot,
+            EvalPreparationRefusal::EmptyCohort => Self::PreparationEmptyCohort,
+            EvalPreparationRefusal::Frontier => Self::PreparationFrontier,
+            EvalPreparationRefusal::CohortCapacity => Self::PreparationCohortCapacity,
+            EvalPreparationRefusal::RootEntry => Self::PreparationRootEntry,
+            EvalPreparationRefusal::RootIdentity => Self::PreparationRootIdentity,
+            EvalPreparationRefusal::RootActive => Self::PreparationRootActive,
+            EvalPreparationRefusal::RootTarget => Self::PreparationRootTarget,
+            EvalPreparationRefusal::RootFrame => Self::PreparationRootFrame,
+            EvalPreparationRefusal::MemberEntry => Self::PreparationMemberEntry,
+            EvalPreparationRefusal::MemberKind => Self::PreparationMemberKind,
+            EvalPreparationRefusal::MemberFrame => Self::PreparationMemberFrame,
+            EvalPreparationRefusal::ReceiptMissing => Self::PreparationReceiptMissing,
+            EvalPreparationRefusal::ReceiptOwner => Self::PreparationReceiptOwner,
+            EvalPreparationRefusal::ReceiptOrigin => Self::PreparationReceiptOrigin,
+            EvalPreparationRefusal::ReceiptBinding => Self::PreparationReceiptBinding,
+            EvalPreparationRefusal::ReceiptTarget => Self::PreparationReceiptTarget,
+            EvalPreparationRefusal::RegistryHealth => Self::PreparationRegistryHealth,
+            EvalPreparationRefusal::Unconfigured => Self::PreparationUnconfigured,
+            EvalPreparationRefusal::ReceiptTerminal => Self::PreparationReceiptTerminal,
+            EvalPreparationRefusal::ReceiptStage => Self::PreparationReceiptStage,
+            EvalPreparationRefusal::ReceiptCustody => Self::PreparationReceiptCustody,
+            EvalPreparationRefusal::ReceiptReadiness => Self::PreparationReceiptReadiness,
+            EvalPreparationRefusal::Configuration => Self::PreparationConfiguration,
+            EvalPreparationRefusal::Fence => Self::PreparationFence,
+        }
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -3841,5 +3988,107 @@ mod eval_admission_schema_tests {
         assert!(!absent.exists());
         assert!(query_capture(Some(&absent)).is_none());
         assert!(!absent.exists());
+    }
+
+    #[test]
+    fn preparation_refusal_codes_are_closed_and_fit_the_existing_reason_budget() {
+        let reasons = [
+            (EvalPreparationRefusal::EntryOperation, "p-op"),
+            (EvalPreparationRefusal::EntryIdentity, "p-entryid"),
+            (EvalPreparationRefusal::EntryPermit, "p-permit"),
+            (EvalPreparationRefusal::EntryLedger, "p-ledger"),
+            (EvalPreparationRefusal::EntryOwner, "p-eowner"),
+            (EvalPreparationRefusal::EntryStream, "p-stream"),
+            (EvalPreparationRefusal::EntryTarget, "p-etarget"),
+            (EvalPreparationRefusal::IndexFailure, "p-failed"),
+            (EvalPreparationRefusal::IndexHealth, "p-index"),
+            (EvalPreparationRefusal::LedgerSnapshot, "p-snap"),
+            (EvalPreparationRefusal::EmptyCohort, "p-empty"),
+            (EvalPreparationRefusal::Frontier, "p-front"),
+            (EvalPreparationRefusal::CohortCapacity, "p-cap"),
+            (EvalPreparationRefusal::RootEntry, "p-rootent"),
+            (EvalPreparationRefusal::RootIdentity, "p-rootid"),
+            (EvalPreparationRefusal::RootActive, "p-active"),
+            (EvalPreparationRefusal::RootTarget, "p-roottgt"),
+            (EvalPreparationRefusal::RootFrame, "p-rootfrm"),
+            (EvalPreparationRefusal::MemberEntry, "p-mement"),
+            (EvalPreparationRefusal::MemberKind, "p-memkind"),
+            (EvalPreparationRefusal::MemberFrame, "p-memfrm"),
+            (EvalPreparationRefusal::ReceiptMissing, "p-missing"),
+            (EvalPreparationRefusal::ReceiptOwner, "p-owner"),
+            (EvalPreparationRefusal::ReceiptOrigin, "p-origin"),
+            (EvalPreparationRefusal::ReceiptBinding, "p-binding"),
+            (EvalPreparationRefusal::ReceiptTarget, "p-target"),
+            (EvalPreparationRefusal::RegistryHealth, "p-health"),
+            (EvalPreparationRefusal::Unconfigured, "p-config"),
+            (EvalPreparationRefusal::ReceiptTerminal, "p-term"),
+            (EvalPreparationRefusal::ReceiptStage, "p-stage"),
+            (EvalPreparationRefusal::ReceiptCustody, "p-custody"),
+            (EvalPreparationRefusal::ReceiptReadiness, "p-ready"),
+            (EvalPreparationRefusal::Configuration, "p-confrev"),
+            (EvalPreparationRefusal::Fence, "p-fence"),
+        ];
+        assert_eq!(reasons.len(), 34);
+        let mut codes = std::collections::BTreeSet::new();
+        for (reason, code) in reasons {
+            assert!(codes.insert(code));
+            let reason = EvalAdmissionReason::from(reason);
+            assert_eq!(serde_json::to_value(reason).unwrap(), code);
+            // Reuse every original fact; the existing longest reason is nine
+            // bytes. No field, scalar width, counter, or record limit is reduced.
+            assert!(code.len() <= "unresumed".len());
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: SAFE_INTEGER,
+                phase: Phase::EvalAdmission,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: false,
+                facts: Facts {
+                    generation: Some(SAFE_INTEGER),
+                    eval: Some(EvalAdmissionFacts {
+                        reason,
+                        ..maximum()
+                    }),
+                    ..Facts::default()
+                },
+            };
+            let mut bytes = serde_json::to_vec(&record).unwrap();
+            bytes.push(b'\n');
+            assert!(
+                bytes.len() <= MAX_RECORD_BYTES,
+                "{code}: {} bytes including LF",
+                bytes.len()
+            );
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["eval"]["c"], code);
+            assert_eq!(value["pid"], u32::MAX);
+            for field in [
+                "record",
+                "operationSeq",
+                "generation",
+                "droppedBefore",
+                "emittedBefore",
+                "suppressedBefore",
+            ] {
+                assert_eq!(value[field], SAFE_INTEGER);
+            }
+            let mut keys = value["eval"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["c", "e", "h", "p", "r", "s", "t", "v", "w"]);
+        }
+        // Outbound diagnostics have no native string parser or fallback variant.
+        // The paired consumer schema must continue to reject every unknown code.
+        assert!(!codes.contains("p-unknown"));
+        assert!(!codes.contains("PRIVATE"));
     }
 }

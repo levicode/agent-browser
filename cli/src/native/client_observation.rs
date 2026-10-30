@@ -15,6 +15,9 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 #[path = "client_observation/author_projection.rs"]
 mod author_projection;
+#[cfg(test)]
+#[path = "client_observation/frame_dom_validation_tests.rs"]
+mod frame_dom_validation_tests;
 #[path = "client_observation/frame_policy.rs"]
 mod frame_policy;
 #[path = "client_observation/fresh_query.rs"]
@@ -527,6 +530,16 @@ async fn validate_frame_impl(
         lease,
     )
     .await?;
+    validate_frame_tree(&tree, frame, semantic_url)
+}
+
+// Pure validation shared only within a fresh command response. This does not
+// confer a reusable frame lease or replace the enclosing ancestry/final checks.
+fn validate_frame_tree(
+    tree: &Value,
+    frame: &ObservationFrame,
+    semantic_url: bool,
+) -> Result<(), ObservationError> {
     fn native_frame<'a>(tree: &'a Value, id: &str) -> Option<&'a Value> {
         if tree["frame"]["id"].as_str() == Some(id) {
             return Some(&tree["frame"]);
@@ -4350,6 +4363,36 @@ async fn frame_dom(
 ) -> Result<Value, ObservationError> {
     let session = &frame.binding.session;
     let frame_tree = command(client, session, "Page.getFrameTree", json!({}), lease).await?;
+    frame_dom_from_tree(client, frame, lease, &frame_tree).await
+}
+
+// Fresh-fields inventory alone combines its immediately adjacent validation and
+// DOM branch read. Each invocation acquires its own frame tree; initial and
+// final inventories never share it. Legacy frame_dom callers stay loader-agnostic.
+async fn validated_frame_dom(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    lease: &OperationLease,
+) -> Result<Value, ObservationError> {
+    let tree = command(
+        client,
+        &frame.binding.session,
+        "Page.getFrameTree",
+        json!({}),
+        lease,
+    )
+    .await?;
+    validate_frame_tree(&tree, frame, false)?;
+    frame_dom_from_tree(client, frame, lease, &tree).await
+}
+
+async fn frame_dom_from_tree(
+    client: &CdpClient,
+    frame: &ObservationFrame,
+    lease: &OperationLease,
+    frame_tree: &Value,
+) -> Result<Value, ObservationError> {
+    let session = &frame.binding.session;
     let dom =
         if frame_tree["frameTree"]["frame"]["id"].as_str() == Some(frame.binding.frame.as_str()) {
             command(

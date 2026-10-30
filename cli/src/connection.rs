@@ -1,3 +1,6 @@
+#[path = "diagnostic_invocation.rs"]
+mod diagnostic_invocation;
+
 #[cfg(feature = "acceptance-faults")]
 use crate::native::client_settlement_trace as settlement_capture;
 use crate::validation::sanitize_session_component;
@@ -966,6 +969,7 @@ fn isolated_client_env_allowed(key: &str) -> bool {
                 | "AGENT_BROWSER_NAMESPACE"
                 | "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE"
                 | "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE"
+                | "AGENT_BROWSER_INVOCATION_CUSTODY"
         )
         || (cfg!(feature = "acceptance-faults") && key == "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
 }
@@ -1022,6 +1026,7 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "AGENT_BROWSER_NAMESPACE",
         "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE",
         "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE",
+        "AGENT_BROWSER_INVOCATION_CUSTODY",
     ] {
         assert!(isolated_client_env_allowed(preserved));
     }
@@ -1040,6 +1045,7 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE_EXTRA",
         "AGENT_BROWSER_QUERY_DIAGNOSTIC",
         "AGENT_BROWSER_QUERY_OTHER",
+        "AGENT_BROWSER_INVOCATION_CUSTODY_EXTRA",
     ] {
         assert!(!isolated_client_env_allowed(removed));
     }
@@ -1173,6 +1179,10 @@ fn ensure_daemon_inner(session: &str, opts: &DaemonOptions) -> Result<DaemonResu
         );
     }
 
+    if let Some(child) = daemon_child.as_ref() {
+        // Exact new child handle; never reused-daemon sidecars or trace-derived PIDs.
+        diagnostic_invocation::record_spawned(child.id());
+    }
     let spawned_pid = daemon_child.as_ref().map(|child| child.id());
     #[cfg(feature = "acceptance-faults")]
     if let Some(daemon_pid) = spawned_pid {
