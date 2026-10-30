@@ -2,20 +2,25 @@
 use super::{ObservationError, OperationLease};
 use crate::native::client_protocol::ProtocolError;
 use crate::native::client_settlement_trace::{self as trace, ObservationReadError, QueryReadStage};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
+
+#[path = "query_command_diagnostic.rs"]
+pub(crate) mod commands;
 
 pub(crate) struct QueryReadWitness {
     enabled: bool,
     generation: u64,
     sequence: u64,
     state: Mutex<(QueryReadStage, bool, Option<FieldTiming>)>,
+    commands: Option<Arc<commands::Collector>>,
 }
 impl QueryReadWitness {
     #[cfg(test)]
     pub(crate) fn schema_test(enabled: bool) -> Self {
         Self {
             enabled,
+            commands: None,
             generation: 1,
             sequence: 2,
             state: Mutex::new((QueryReadStage::CandidatePlan, false, None)),
@@ -29,6 +34,7 @@ impl QueryReadWitness {
     pub(crate) fn new(lease: &OperationLease) -> Self {
         Self {
             enabled: trace::query_diagnostics_enabled(),
+            commands: None,
             generation: lease.generation,
             sequence: lease.sequence,
             state: Mutex::new((QueryReadStage::FrameEntry, false, None)),
@@ -39,6 +45,7 @@ impl QueryReadWitness {
     pub(crate) fn field_dispatch(lease: &OperationLease) -> Self {
         let mut witness = Self::new(lease);
         if witness.enabled {
+            witness.commands = Some(commands::Collector::new());
             witness.state = Mutex::new((
                 QueryReadStage::ReadAdmission,
                 false,
@@ -54,6 +61,9 @@ impl QueryReadWitness {
     }
     pub(crate) fn stage(&self, stage: QueryReadStage) {
         if self.enabled {
+            if let Some(commands) = &self.commands {
+                commands.stage(stage);
+            }
             if let Ok(mut state) = self.state.lock() {
                 if !state.1 {
                     if let Some(timing) = &mut state.2 {
@@ -86,6 +96,9 @@ impl QueryReadWitness {
             classify(error),
             timing,
         );
+        if let Some(commands) = &self.commands {
+            commands.emit_failure(self.generation, self.sequence);
+        }
     }
     pub(crate) fn observe_protocol(&self, error: &ProtocolError) {
         let Some((stage, timing)) = self.take_failure() else {
@@ -98,6 +111,9 @@ impl QueryReadWitness {
             error.clone(),
             timing,
         );
+        if let Some(commands) = &self.commands {
+            commands.emit_failure(self.generation, self.sequence);
+        }
     }
     fn take_failure(&self) -> Option<(QueryReadStage, Option<[u16; 13]>)> {
         if !self.enabled {
@@ -110,6 +126,17 @@ impl QueryReadWitness {
         state.1 = true;
         let timing = state.2.as_mut().map(|timing| timing.finish(Instant::now()));
         Some((state.0, timing))
+    }
+}
+
+pub(crate) async fn field_command_scope<T>(
+    witness: Option<&QueryReadWitness>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    if let Some(collector) = witness.and_then(|witness| witness.commands.as_ref()) {
+        commands::scope(collector.clone(), future).await
+    } else {
+        future.await
     }
 }
 
@@ -191,6 +218,7 @@ mod tests {
     fn witness() -> QueryReadWitness {
         QueryReadWitness {
             enabled: true,
+            commands: None,
             generation: 1,
             sequence: 2,
             state: Mutex::new((QueryReadStage::Ax, false, None)),
@@ -249,6 +277,7 @@ mod tests {
         let now = Instant::now();
         let witness = QueryReadWitness {
             enabled: false,
+            commands: None,
             generation: 1,
             sequence: 2,
             state: Mutex::new((

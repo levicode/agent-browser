@@ -107,9 +107,18 @@ impl ClientBrowser {
             }
             _ => return refused(ProtocolError::UnsupportedCommand),
         };
-        match self.broker.start(operation.generation, operation.sequence) {
-            Ok(true) => {}
-            Ok(false) => return refused(ProtocolError::Cancelled),
+        use super::super::client_session::OperationStart;
+        match self
+            .broker
+            .start_outcome(operation.generation, operation.sequence)
+        {
+            Ok(OperationStart::Started) => {}
+            Ok(OperationStart::AlreadyStarted | OperationStart::Cancelled) => {
+                return refused(ProtocolError::Cancelled);
+            }
+            Ok(OperationStart::DeadlineExceeded) => {
+                return refused(ProtocolError::DeadlineExceeded)
+            }
             Err(error) => return refused(error),
         }
         let mutating = !matches!(&request, Request::Identify(_));
@@ -380,5 +389,49 @@ impl ClientBrowser {
         }));
         drop(slot);
         result.await.map_err(|_| ProtocolError::CleanupFailed)?
+    }
+}
+
+#[cfg(test)]
+mod typed_start_tests {
+    use super::super::super::client_session::{CancelSignal, ClientSession, OperationStart};
+    use super::*;
+
+    #[tokio::test]
+    async fn interop_start_refusal_preserves_deadline_cancel_and_duplicate_taxonomy() {
+        for mode in ["deadline", "cancel", "duplicate"] {
+            let broker = Arc::new(ClientSession::new());
+            let browser = ClientBrowser::new(broker.clone());
+            let operation = broker.admit(1, 1, 10).unwrap();
+            if mode == "cancel" {
+                broker.cancel(1, 1).unwrap();
+            } else if mode == "duplicate" {
+                assert_eq!(broker.start_outcome(1, 1), Ok(OperationStart::Started));
+            }
+            // Await the real admitted absolute deadline, not an arbitrary
+            // scheduler delay. No timer supervisor has signalled this lease.
+            tokio::time::sleep_until(operation.deadline.into()).await;
+            if mode == "deadline" {
+                assert_eq!(*operation.cancellation.borrow(), CancelSignal::None);
+            }
+            let args = serde_json::json!({"identityScope":"typed-start-scope"})
+                .as_object()
+                .unwrap()
+                .clone();
+            let outcome = browser
+                .execute_interop("scope.interop.identify".into(), args, operation)
+                .await;
+            assert_eq!(
+                outcome.result,
+                Err(if mode == "deadline" {
+                    ProtocolError::DeadlineExceeded
+                } else {
+                    ProtocolError::Cancelled
+                })
+            );
+            assert_eq!(outcome.effects, Effects::NotDispatched);
+            assert!(outcome.retention.is_none());
+            assert!(browser.owner.lock().await.is_none());
+        }
     }
 }

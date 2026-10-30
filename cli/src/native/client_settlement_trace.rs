@@ -35,6 +35,8 @@ pub(crate) enum SettlementPhase {
     ReadonlyPrepareFailure,
     QueryScopeRefusal,
     QueryReadFailure,
+    QueryCommandTiming,
+    QueryCommandSummary,
     EvalAdmission,
     UploadPreflightRefusal,
     TerminalCleanupCheckpoint,
@@ -186,6 +188,12 @@ pub(crate) struct Facts {
     pub query_read_error: Option<ObservationReadError>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "readMs")]
     pub query_read_ms: Option<[u16; 13]>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cmd")]
+    pub query_command: Option<[u16; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cmdMs")]
+    pub query_command_ms: Option<[u16; 5]>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cmdSummary")]
+    pub query_command_summary: Option<[u16; 3]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub query_scope_reason: Option<QueryScopeReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1536,6 +1544,112 @@ pub(crate) enum EvalAdmissionReason {
     PreparationConfiguration,
     #[serde(rename = "p-fence")]
     PreparationFence,
+    #[serde(rename = "p-c1s0")]
+    PreparationUnconfiguredConfigurationEnteredUnissued,
+    #[serde(rename = "p-c1s1")]
+    PreparationUnconfiguredConfigurationEnteredIssued,
+    #[serde(rename = "p-c1s2")]
+    PreparationUnconfiguredConfigurationEnteredCompleted,
+    #[serde(rename = "p-c1s3")]
+    PreparationUnconfiguredConfigurationEnteredReleased,
+    #[serde(rename = "p-c1sx")]
+    PreparationUnconfiguredConfigurationEnteredUnknown,
+    #[serde(rename = "p-c2s0")]
+    PreparationUnconfiguredRuntimeEnableEnteredUnissued,
+    #[serde(rename = "p-c2s1")]
+    PreparationUnconfiguredRuntimeEnableEnteredIssued,
+    #[serde(rename = "p-c2s2")]
+    PreparationUnconfiguredRuntimeEnableEnteredCompleted,
+    #[serde(rename = "p-c2s3")]
+    PreparationUnconfiguredRuntimeEnableEnteredReleased,
+    #[serde(rename = "p-c2sx")]
+    PreparationUnconfiguredRuntimeEnableEnteredUnknown,
+    #[serde(rename = "p-c3s0")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedUnissued,
+    #[serde(rename = "p-c3s1")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedIssued,
+    #[serde(rename = "p-c3s2")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedCompleted,
+    #[serde(rename = "p-c3s3")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedReleased,
+    #[serde(rename = "p-c3sx")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedUnknown,
+    #[serde(rename = "p-c4s0")]
+    PreparationUnconfiguredScriptsAcknowledgedUnissued,
+    #[serde(rename = "p-c4s1")]
+    PreparationUnconfiguredScriptsAcknowledgedIssued,
+    #[serde(rename = "p-c4s2")]
+    PreparationUnconfiguredScriptsAcknowledgedCompleted,
+    #[serde(rename = "p-c4s3")]
+    PreparationUnconfiguredScriptsAcknowledgedReleased,
+    #[serde(rename = "p-c4sx")]
+    PreparationUnconfiguredScriptsAcknowledgedUnknown,
+    #[serde(rename = "p-c5s0")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedUnissued,
+    #[serde(rename = "p-c5s1")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedIssued,
+    #[serde(rename = "p-c5s2")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedCompleted,
+    #[serde(rename = "p-c5s3")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedReleased,
+    #[serde(rename = "p-c5sx")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedUnknown,
+    #[serde(rename = "p-c6s0")]
+    PreparationUnconfiguredConfiguredCommitObservedUnissued,
+    #[serde(rename = "p-c6s1")]
+    PreparationUnconfiguredConfiguredCommitObservedIssued,
+    #[serde(rename = "p-c6s2")]
+    PreparationUnconfiguredConfiguredCommitObservedCompleted,
+    #[serde(rename = "p-c6s3")]
+    PreparationUnconfiguredConfiguredCommitObservedReleased,
+    #[serde(rename = "p-c6sx")]
+    PreparationUnconfiguredConfiguredCommitObservedUnknown,
+}
+/// Observed initializer checkpoints only. Entered does not prove wire submission;
+/// an acknowledged checkpoint does not authorize evaluation or certify later setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PopupSetupCheckpoint {
+    ConfigurationEntered = 1,
+    RuntimeEnableEntered = 2,
+    RuntimeEnableAcknowledged = 3,
+    ScriptsAcknowledged = 4,
+    RecursiveAttachAcknowledged = 5,
+    ConfiguredCommitObserved = 6,
+}
+impl PopupSetupCheckpoint {
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::ConfigurationEntered),
+            2 => Some(Self::RuntimeEnableEntered),
+            3 => Some(Self::RuntimeEnableAcknowledged),
+            4 => Some(Self::ScriptsAcknowledged),
+            5 => Some(Self::RecursiveAttachAcknowledged),
+            6 => Some(Self::ConfiguredCommitObserved),
+            _ => None,
+        }
+    }
+}
+/// Actual receipt stage sampled at the original unconfigured refusal. Unknown
+/// is not a completion or custody claim, and no terminal flag is inferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PopupReceiptStage {
+    Unissued,
+    Issued,
+    Completed,
+    Released,
+    Unknown,
+}
+impl PopupReceiptStage {
+    pub(crate) fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Unissued,
+            1 => Self::Issued,
+            2 => Self::Completed,
+            3 => Self::Released,
+            _ => Self::Unknown,
+        }
+    }
 }
 /// The first predicate that refused private popup preparation at its original
 /// synchronous observation point. This is diagnostic data, never authority.
@@ -1569,6 +1683,7 @@ pub(crate) enum EvalPreparationRefusal {
     ReceiptTarget,
     RegistryHealth,
     Unconfigured,
+    UnconfiguredAt(PopupSetupCheckpoint, PopupReceiptStage),
     ReceiptTerminal,
     ReceiptStage,
     ReceiptCustody,
@@ -1607,6 +1722,126 @@ impl From<EvalPreparationRefusal> for EvalAdmissionReason {
             EvalPreparationRefusal::ReceiptTarget => Self::PreparationReceiptTarget,
             EvalPreparationRefusal::RegistryHealth => Self::PreparationRegistryHealth,
             EvalPreparationRefusal::Unconfigured => Self::PreparationUnconfigured,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedUnknown,
             EvalPreparationRefusal::ReceiptTerminal => Self::PreparationReceiptTerminal,
             EvalPreparationRefusal::ReceiptStage => Self::PreparationReceiptStage,
             EvalPreparationRefusal::ReceiptCustody => Self::PreparationReceiptCustody,
@@ -1692,6 +1927,46 @@ fn record_eval_admission(
 pub(crate) fn query_diagnostics_enabled() -> bool {
     QUERY_SINK.get().and_then(Option::as_ref).is_some()
 }
+// Failure-only command prefix. Original failure is emitted first; bounded rows
+// follow in local ordinal order, then exactly one summary. Global record order
+// may interleave other operations; generation/sequence retain exact custody.
+pub(crate) fn query_command_timing(
+    generation: u64,
+    sequence: u64,
+    stage: QueryReadStage,
+    command: [u16; 3],
+    timing: [u16; 5],
+) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryCommandTiming,
+            Facts {
+                generation: Some(generation),
+                query_read_stage: Some(stage),
+                query_command: Some(command),
+                query_command_ms: Some(timing),
+                ..Facts::default()
+            },
+        );
+    }
+}
+pub(crate) fn query_command_summary(generation: u64, sequence: u64, summary: [u16; 3]) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryCommandSummary,
+            Facts {
+                generation: Some(generation),
+                query_command_summary: Some(summary),
+                ..Facts::default()
+            },
+        );
+    }
+}
+
 pub(crate) fn query_read_failure(
     generation: u64,
     sequence: u64,
@@ -4090,5 +4365,76 @@ mod eval_admission_schema_tests {
         // The paired consumer schema must continue to reject every unknown code.
         assert!(!codes.contains("p-unknown"));
         assert!(!codes.contains("PRIVATE"));
+    }
+    include!("client_popup_setup_schema_tests.rs");
+}
+
+#[cfg(test)]
+mod query_command_schema_tests {
+    use super::*;
+    #[test]
+    fn maximum_command_rows_and_summary_fit_original_line_cap() {
+        for (phase, facts) in [
+            (
+                Phase::QueryCommandTiming,
+                Facts {
+                    generation: Some(SAFE_INTEGER),
+                    query_read_stage: Some(QueryReadStage::CandidatePlanMissingRecord),
+                    query_command: Some([23, 7, 6]),
+                    query_command_ms: Some([u16::MAX; 5]),
+                    ..Facts::default()
+                },
+            ),
+            (
+                Phase::QueryCommandSummary,
+                Facts {
+                    generation: Some(SAFE_INTEGER),
+                    query_command_summary: Some([u16::MAX, 24, 15]),
+                    ..Facts::default()
+                },
+            ),
+        ] {
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: SAFE_INTEGER,
+                phase,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: false,
+                facts,
+            };
+            let bytes = serde_json::to_vec(&record).unwrap();
+            assert!(bytes.len() + 1 <= MAX_RECORD_BYTES, "{}", bytes.len());
+            let object: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let keys: std::collections::BTreeSet<_> = object
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let mut expected = std::collections::BTreeSet::from([
+                "schemaVersion",
+                "source",
+                "pid",
+                "record",
+                "operationSeq",
+                "phase",
+                "droppedBefore",
+                "emittedBefore",
+                "suppressedBefore",
+                "overflow",
+                "generation",
+            ]);
+            if matches!(phase, Phase::QueryCommandTiming) {
+                expected.extend(["queryReadStage", "cmd", "cmdMs"]);
+            } else {
+                expected.insert("cmdSummary");
+            }
+            assert_eq!(keys, expected);
+        }
     }
 }

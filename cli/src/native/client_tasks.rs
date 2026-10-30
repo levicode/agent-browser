@@ -160,8 +160,8 @@ impl RetainedTasks {
             let changed = self.operations.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if *cancellation.borrow() != super::client_session::CancelSignal::None {
-                return Err(ProtocolError::Cancelled);
+            if let Some(error) = (*cancellation.borrow()).error() {
+                return Err(error);
             }
             if std::time::Instant::now() >= operation.deadline {
                 return Err(ProtocolError::DeadlineExceeded);
@@ -170,8 +170,8 @@ impl RetainedTasks {
                 return Ok(());
             }
             tokio::select! { biased;
-                _ = cancellation.changed() => return Err(ProtocolError::Cancelled),
-                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(ProtocolError::DeadlineExceeded),
+                _ = cancellation.changed() => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled)),
+                _ = tokio::time::sleep_until(operation.deadline.into()) => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)),
                 _ = &mut changed => {},
             }
         }
@@ -560,6 +560,66 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn application_wait_preserves_typed_stop_before_and_after_pending() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_session::{CancelSignal, OperationLease};
+        for presignalled in [false, true] {
+            for signal in [
+                CancelSignal::None,
+                CancelSignal::Requested,
+                CancelSignal::DeadlineExceeded,
+                CancelSignal::SessionClosed,
+                CancelSignal::OwnerRetirement,
+            ] {
+                let tasks = RetainedTasks::default();
+                let key = OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                };
+                let journal = OwnerDebtLedger::new(1, "scope".into())
+                    .operation(key, "target".into(), "session".into())
+                    .unwrap();
+                tasks.operations.register(journal).unwrap();
+                tasks.operations.retire(key).unwrap();
+                assert!(!tasks.operations.application_ready().unwrap());
+                let (sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+                let operation = OperationLease {
+                    is_callback: false,
+                    generation: 1,
+                    sequence: 2,
+                    deadline: std::time::Instant::now() + Duration::from_secs(10),
+                    cancellation,
+                };
+                let original_deadline = operation.deadline;
+                if presignalled && signal != CancelSignal::None {
+                    sender.send_replace(signal);
+                }
+                let waiting = tasks.wait_application(&operation);
+                tokio::pin!(waiting);
+                if !presignalled || signal == CancelSignal::None {
+                    assert!(futures_util::poll!(&mut waiting).is_pending());
+                    if signal == CancelSignal::None {
+                        assert!(!tasks.operations.finish(key, false));
+                        tasks.operations.fix_result(key);
+                    } else {
+                        sender.send_replace(signal);
+                    }
+                }
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), &mut waiting)
+                        .await
+                        .unwrap(),
+                    signal.error().map_or(Ok(()), Err)
+                );
+                assert_eq!(operation.deadline, original_deadline);
+                if signal != CancelSignal::None {
+                    assert!(!tasks.operations.application_ready().unwrap());
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn media_wait_uses_retained_notifications_and_original_cancellation_deadline() {

@@ -4932,7 +4932,7 @@ impl ClientEnrollment {
             self.page.ensure_service_worker_policy(&lease, op)?;
         }
         entry.application = true;
-        {
+        let popup_setup_diagnostic = {
             let mut index = self
                 .index
                 .lock()
@@ -4947,7 +4947,35 @@ impl ClientEnrollment {
                 .application_epoch
                 .checked_add(1)
                 .ok_or(ProtocolError::IdentifierExhausted)?;
-        }
+            // No new blocking lock, await, error path or authority. Non-opt-in
+            // execution retains no diagnostic receipt and does no checkpoint work.
+            if super::client_settlement_trace::query_diagnostics_enabled()
+                && entry.kind == "page"
+                && entry.root == entry.session
+                && entry.init_paused_by_attachment
+                && !entry.observation_only
+            {
+                index
+                    .pending_eval_initialization
+                    .get(&entry.session)
+                    .cloned()
+            } else {
+                None
+            }
+        };
+        let observe_popup_setup = |checkpoint| {
+            if let Some(receipt) = &popup_setup_diagnostic {
+                receipt.observe_setup_checkpoint(
+                    &self.targets,
+                    &entry.target,
+                    &entry.session,
+                    checkpoint,
+                );
+            }
+        };
+        observe_popup_setup(
+            super::client_settlement_trace::PopupSetupCheckpoint::ConfigurationEntered,
+        );
         // Register before Network.enable; event accounting must see the first
         // request, including a request emitted during configuration itself.
         self.page
@@ -5118,12 +5146,19 @@ impl ClientEnrollment {
             // whose new attachment explicitly reports waitingForDebugger, the
             // registration below also executes in that existing paused world.
             // Runtime events are already subscribed; resume remains after all ACKs.
+            // Entering the command future is not a wire-submission receipt.
+            observe_popup_setup(
+                super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableEntered,
+            );
             ServiceWorkerAdmission::observe(
                 admission,
                 WorkerAdmissionStep::RuntimeEnable,
                 self.initialization_command(op, Some(&entry.session), "Runtime.enable", json!({})),
             )
             .await?;
+            observe_popup_setup(
+                super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+            );
             if page_target {
                 let revision = if entry.kind == "page"
                     && entry.init_paused_by_attachment
@@ -5143,6 +5178,9 @@ impl ClientEnrollment {
                     return Err(ProtocolError::StaleScope.into());
                 }
             }
+            observe_popup_setup(
+                super::client_settlement_trace::PopupSetupCheckpoint::ScriptsAcknowledged,
+            );
             // Autoattach is recursive. Install it while this target is paused.
             ServiceWorkerAdmission::observe(
                 admission,
@@ -5155,6 +5193,9 @@ impl ClientEnrollment {
                 ),
             )
             .await?;
+            observe_popup_setup(
+                super::client_settlement_trace::PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+            );
             #[cfg(test)]
             if entry.kind == "page" {
                 self.pause_component_boundary(CaptureTestPoint::BeforePopupConfigured, op)
@@ -5165,6 +5206,9 @@ impl ClientEnrollment {
                 WorkerAdmissionStep::Configured,
                 || self.targets.configured(&entry.target),
             )?;
+            observe_popup_setup(
+                super::client_settlement_trace::PopupSetupCheckpoint::ConfiguredCommitObserved,
+            );
             #[cfg(test)]
             if entry.kind == "page" {
                 self.pause_component_boundary(

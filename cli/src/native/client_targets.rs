@@ -77,6 +77,58 @@ struct PopupInitializationProgress {
     stage: AtomicU8,
     // 0 retained, 1 positive after finish, 2 not successful.
     terminal: AtomicU8,
+    // Opt-in observation only; never read by admission/completion predicates.
+    setup_diagnostic: PopupSetupProgress,
+}
+/// Diagnostic-only monotonic checkpoint. A skipped/duplicate transition loses
+/// detail permanently rather than inventing an ACK or silently repairing order.
+#[derive(Default)]
+struct PopupSetupProgress(AtomicU8);
+impl PopupSetupProgress {
+    fn observe_bound(
+        &self,
+        registry: &ClientTargets,
+        bound: &OwnedTarget,
+        checkpoint: diagnostic::PopupSetupCheckpoint,
+    ) {
+        // Never wait on diagnostics. Lost observation is explicit and cannot
+        // recover into a claim about a replacement or a different owner.
+        let Ok(state) = registry.state.try_lock() else {
+            self.0.store(u8::MAX, Ordering::Release);
+            return;
+        };
+        if state.sealed
+            || state.integrity_lost
+            || !Arc::ptr_eq(&registry.attachment_owner, &bound.tenure.owner)
+            || !state
+                .targets
+                .get(&bound.target_id)
+                .is_some_and(|current| current.same_initialization_attachment(bound))
+        {
+            self.0.store(u8::MAX, Ordering::Release);
+            return;
+        }
+        self.advance(checkpoint);
+    }
+    fn advance(&self, checkpoint: diagnostic::PopupSetupCheckpoint) {
+        let next = checkpoint as u8;
+        if self
+            .0
+            .compare_exchange(next - 1, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.0.store(u8::MAX, Ordering::Release);
+        }
+    }
+    fn unconfigured_refusal(&self, stage: u8) -> diagnostic::EvalPreparationRefusal {
+        match diagnostic::PopupSetupCheckpoint::from_code(self.0.load(Ordering::Acquire)) {
+            Some(checkpoint) => diagnostic::EvalPreparationRefusal::UnconfiguredAt(
+                checkpoint,
+                diagnostic::PopupReceiptStage::from_code(stage),
+            ),
+            None => diagnostic::EvalPreparationRefusal::Unconfigured,
+        }
+    }
 }
 pub(super) struct PopupPreparationFailure {
     pub(super) error: ProtocolError,
@@ -88,6 +140,27 @@ impl PopupPreparationFailure {
     }
 }
 impl PopupInitializationReceipt {
+    /// Only the initializer's already-retained exact receipt is observed. A
+    /// stale/wrong receipt cannot alter another cohort or grant any authority.
+    pub(super) fn observe_setup_checkpoint(
+        &self,
+        registry: &ClientTargets,
+        target: &str,
+        session: &str,
+        checkpoint: diagnostic::PopupSetupCheckpoint,
+    ) {
+        if let Some(bound) = self.0.target.get().filter(|bound| {
+            bound.target_id == target
+                && bound.session_id == session
+                && self.matches_target(registry, bound)
+        }) {
+            self.0
+                .setup_diagnostic
+                .observe_bound(registry, bound, checkpoint);
+        } else {
+            self.0.setup_diagnostic.0.store(u8::MAX, Ordering::Release);
+        }
+    }
     fn matches_target(&self, registry: &ClientTargets, target: &OwnedTarget) -> bool {
         self.0
             .registry
@@ -253,7 +326,8 @@ impl PopupInitializationReceipt {
         } else if current.kind != "page" || current.purpose != Some(TargetPurpose::Application) {
             Some(Refused::ReceiptTarget)
         } else if !current.configured {
-            Some(Refused::Unconfigured)
+            // Sample once in the actual first-failed branch, before returning.
+            Some(self.0.setup_diagnostic.unconfigured_refusal(stage))
         } else if terminal == 2 {
             Some(Refused::ReceiptTerminal)
         } else if !awaiting_permit && !(1..=3).contains(&stage) {
@@ -347,6 +421,7 @@ impl RetainedInitialization {
             target: std::sync::OnceLock::new(),
             stage: AtomicU8::new(0),
             terminal: AtomicU8::new(0),
+            setup_diagnostic: PopupSetupProgress::default(),
         }));
         Ok(Self {
             registry,
@@ -5259,3 +5334,7 @@ mod eval_diagnostic_target_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "client_popup_setup_diagnostic_tests.rs"]
+mod popup_setup_diagnostic_tests;

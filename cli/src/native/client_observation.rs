@@ -277,9 +277,19 @@ pub(crate) async fn capture_retired() {
     // Dropping an admission sender is not supersession. Only true retires work.
     std::future::pending::<()>().await;
 }
+// Preserve the broker's exact stop cause; elapsed time never relabels a cancel.
+fn observed_stop(signal: CancelSignal) -> Option<ObservationError> {
+    match signal {
+        CancelSignal::None => None,
+        CancelSignal::DeadlineExceeded => Some(ObservationError::DeadlineExceeded),
+        CancelSignal::Requested | CancelSignal::SessionClosed | CancelSignal::OwnerRetirement => {
+            Some(ObservationError::Cancelled)
+        }
+    }
+}
 fn check(lease: &OperationLease) -> Result<(), ObservationError> {
-    if *lease.cancellation.borrow() != CancelSignal::None {
-        return Err(ObservationError::Cancelled);
+    if let Some(error) = observed_stop(*lease.cancellation.borrow()) {
+        return Err(error);
     }
     if std::time::Instant::now() >= lease.deadline {
         return Err(ObservationError::DeadlineExceeded);
@@ -290,8 +300,8 @@ fn check(lease: &OperationLease) -> Result<(), ObservationError> {
     Ok(())
 }
 fn settled_stop(error: ObservationError, lease: &OperationLease) -> ObservationError {
-    if error == ObservationError::Superseded && *lease.cancellation.borrow() != CancelSignal::None {
-        ObservationError::Cancelled
+    if error == ObservationError::Superseded {
+        observed_stop(*lease.cancellation.borrow()).unwrap_or(error)
     } else {
         error
     }
@@ -324,8 +334,8 @@ pub(crate) async fn retained_read_command(
                 if !produces_remote_objects(method) { check(lease)?; }
                 result.map_err(|_| ObservationError::BackendFailure)
             }
-            _ = cancellation.changed() => Err(ObservationError::Cancelled),
-            _ = tokio::time::sleep_until(lease.deadline.into()) => Err(ObservationError::DeadlineExceeded),
+            _ = cancellation.changed() => Err(observed_stop(*cancellation.borrow()).unwrap_or(ObservationError::Cancelled)),
+            _ = tokio::time::sleep_until(lease.deadline.into()) => Err(observed_stop(*cancellation.borrow()).unwrap_or(ObservationError::DeadlineExceeded)),
         };
     }
     let owns_resources = produces_remote_objects(method);
@@ -343,8 +353,8 @@ pub(crate) async fn retained_read_command(
             if !owns_resources { check(lease)?; }
             return result.map_err(|_| ObservationError::BackendFailure);
         }
-        _ = cancellation.changed() => ObservationError::Cancelled,
-        _ = tokio::time::sleep_until(lease.deadline.into()) => ObservationError::DeadlineExceeded,
+        _ = cancellation.changed() => observed_stop(*cancellation.borrow()).unwrap_or(ObservationError::Cancelled),
+        _ = tokio::time::sleep_until(lease.deadline.into()) => observed_stop(*cancellation.borrow()).unwrap_or(ObservationError::DeadlineExceeded),
     };
     // This exact CDP inventory returns value data only: no remote handles and
     // no mutation. Waiting another 250ms would consume an optional pixel
@@ -353,11 +363,9 @@ pub(crate) async fn retained_read_command(
     // its debt until the matching late response arrives; it cannot continue
     // this abandoned capture. Do not generalize this to Runtime or other reads.
     if method == "DOMSnapshot.captureSnapshot" {
-        return Err(if *lease.cancellation.borrow() != CancelSignal::None {
-            ObservationError::Cancelled
-        } else {
-            settled_stop(interrupted, lease)
-        });
+        // `interrupted` already captured the stop at the selected arm. A later
+        // explicit cancel must not relabel an observed deadline during return.
+        return Err(settled_stop(interrupted, lease));
     }
     let result = tokio::time::timeout(std::time::Duration::from_millis(250), &mut command).await;
     let primary = settled_stop(interrupted, lease);
@@ -5598,6 +5606,67 @@ pub async fn project_geometry(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn observation_check_preserves_typed_stop_before_clock() {
+        for signal in [
+            CancelSignal::None,
+            CancelSignal::Requested,
+            CancelSignal::DeadlineExceeded,
+            CancelSignal::SessionClosed,
+            CancelSignal::OwnerRetirement,
+        ] {
+            let (_sender, cancellation) = tokio::sync::watch::channel(signal);
+            let mut lease = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(10),
+                cancellation,
+            };
+            assert_eq!(check(&lease), observed_stop(signal).map_or(Ok(()), Err));
+            lease.deadline = std::time::Instant::now();
+            assert_eq!(
+                check(&lease),
+                Err(observed_stop(signal).unwrap_or(ObservationError::DeadlineExceeded))
+            );
+        }
+    }
+
+    #[test]
+    fn observation_settled_stop_never_relabels_hard_or_cleanup_failures() {
+        for signal in [
+            CancelSignal::None,
+            CancelSignal::Requested,
+            CancelSignal::DeadlineExceeded,
+        ] {
+            let (_sender, cancellation) = tokio::sync::watch::channel(signal);
+            let lease = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: std::time::Instant::now(),
+                cancellation,
+            };
+            assert_eq!(
+                settled_stop(ObservationError::Superseded, &lease),
+                observed_stop(signal).unwrap_or(ObservationError::Superseded)
+            );
+            for error in [
+                ObservationError::Cancelled,
+                ObservationError::DeadlineExceeded,
+                ObservationError::BackendFailure,
+                ObservationError::StaleReference,
+                ObservationError::PolicyDenied,
+                ObservationError::ResourceLimit,
+                ObservationError::CleanupFailed {
+                    primary: Some(Box::new(ObservationError::Cancelled)),
+                },
+            ] {
+                assert_eq!(settled_stop(error.clone(), &lease), error);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn retained_security_inventory_preserves_many_closed_roots_and_property_array() {
         use super::super::client_debt::{OperationKey, OwnerDebtLedger};

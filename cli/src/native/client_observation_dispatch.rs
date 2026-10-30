@@ -725,16 +725,16 @@ impl ObservationDispatch {
         operation: &OperationLease,
     ) -> Result<(u64, RefMap, u64), ProtocolError> {
         let mut cancellation = operation.cancellation.clone();
-        if *cancellation.borrow() != CancelSignal::None {
-            return Err(ProtocolError::Cancelled);
+        if let Some(error) = (*cancellation.borrow()).error() {
+            return Err(error);
         }
         if Instant::now() >= operation.deadline {
             return Err(ProtocolError::DeadlineExceeded);
         }
         let publication = tokio::select! {
             biased;
-            _=cancellation.changed()=>return Err(ProtocolError::Cancelled),
-            _=tokio::time::sleep_until(operation.deadline.into())=>return Err(ProtocolError::DeadlineExceeded),
+            _=cancellation.changed()=>return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled)),
+            _=tokio::time::sleep_until(operation.deadline.into())=>return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)),
             publication=self.publication.lock()=>publication,
         };
         let refs = self
@@ -742,8 +742,8 @@ impl ObservationDispatch {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             .clone();
-        if *cancellation.borrow() != CancelSignal::None {
-            return Err(ProtocolError::Cancelled);
+        if let Some(error) = (*cancellation.borrow()).error() {
+            return Err(error);
         }
         if Instant::now() >= operation.deadline {
             return Err(ProtocolError::DeadlineExceeded);
@@ -1006,14 +1006,7 @@ impl ObservationDispatch {
                 witness.finish(Some(&targets));
             }
             if let Err(failure) = &mut output {
-                // A cancellation already visible at this unsettled boundary
-                // wins over clean supersession, never over cleanup uncertainty.
-                if !failure.cleanup_integrity_lost
-                    && failure.error == ProtocolError::StaleReference
-                    && *cancellation.borrow() != CancelSignal::None
-                {
-                    failure.error = ProtocolError::Cancelled;
-                }
+                preserve_observed_stop(failure, *cancellation.borrow());
             }
             match output {
                 Ok(output) => {
@@ -2039,26 +2032,33 @@ impl ObservationDispatch {
             };
             check_authority().map_err(failure)?;
             field_stage(FieldStage::ReadFramesBefore);
-            let frames =
-                verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
-                    .await
-                    .map_err(failure)?;
-            let values = observation::query_fields(
-                &context.page.client,
-                &frames,
-                &read.options,
-                &read.fields,
-                &operation,
+            let frames = observation::query_diagnostic::field_command_scope(
                 field_witness.as_ref(),
+                verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup)),
+            )
+            .await
+            .map_err(failure)?;
+            let values = observation::query_diagnostic::field_command_scope(
+                field_witness.as_ref(),
+                observation::query_fields(
+                    &context.page.client,
+                    &frames,
+                    &read.options,
+                    &read.fields,
+                    &operation,
+                    field_witness.as_ref(),
+                ),
             )
             .await
             .map_err(map_observation)
             .map_err(failure)?;
             field_stage(FieldStage::ReadFramesAfter);
-            let current =
-                verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup))
-                    .await
-                    .map_err(failure)?;
+            let current = observation::query_diagnostic::field_command_scope(
+                field_witness.as_ref(),
+                verified_frames_with_cleanup(&context.page, &operation, Some(&observation_cleanup)),
+            )
+            .await
+            .map_err(failure)?;
             same_frames(&frames, &current).map_err(failure)?;
             field_stage(FieldStage::ReadPublish);
             check_authority().map_err(failure)?;
@@ -2079,8 +2079,8 @@ impl ObservationDispatch {
                 check(&context.page, &operation).map_err(failure)?;
                 return Err(failure(ProtocolError::StaleReference));
             },
-            _ = cancellation.changed() => return Err(failure(ProtocolError::Cancelled)),
-            _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(failure(ProtocolError::DeadlineExceeded)),
+            _ = cancellation.changed() => return Err(failure((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled))),
+            _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(failure((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded))),
         };
         check(&context.page, &operation).map_err(failure)?;
         self.check_publication_fence(retirement_fence)
@@ -2836,10 +2836,26 @@ fn blob_error(error: BlobError) -> ProtocolError {
         _ => ProtocolError::BrowserFailure,
     }
 }
+// Nested UI/owner helpers may still return an undifferentiated stop. At this
+// joined result boundary preserve only the exact broker signal, never a clock
+// inference. An already observed deadline, hard failures and uncertain cleanup
+// retain their original reason even if a later stop becomes visible.
+fn preserve_observed_stop(failure: &mut DispatchFailure, signal: CancelSignal) {
+    if !failure.cleanup_integrity_lost
+        && matches!(
+            failure.error,
+            ProtocolError::Cancelled | ProtocolError::StaleReference
+        )
+    {
+        if let Some(error) = signal.error() {
+            failure.error = error;
+        }
+    }
+}
 fn check(page: &BrowserExecutionLease, operation: &OperationLease) -> Result<(), ProtocolError> {
     page.permit.check()?;
-    if *operation.cancellation.borrow() != CancelSignal::None {
-        return Err(ProtocolError::Cancelled);
+    if let Some(error) = (*operation.cancellation.borrow()).error() {
+        return Err(error);
     }
     if Instant::now() >= operation.deadline {
         return Err(ProtocolError::DeadlineExceeded);
@@ -2860,8 +2876,8 @@ async fn command(
     let mut cancellation = operation.cancellation.clone();
     tokio::select! {
         result = page.client.send_command(method, Some(args), Some(session)) => { check(page, operation)?; result.map_err(|_| ProtocolError::BrowserFailure) },
-        _ = cancellation.changed() => Err(ProtocolError::Cancelled),
-        _ = tokio::time::sleep_until(operation.deadline.into()) => Err(ProtocolError::DeadlineExceeded),
+        _ = cancellation.changed() => Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled)),
+        _ = tokio::time::sleep_until(operation.deadline.into()) => Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)),
     }
 }
 /// Derive frame/session ownership from native session evidence, never from the
@@ -3841,6 +3857,96 @@ fn capture_error(error: CaptureReason) -> ProtocolError {
 mod tests {
     use super::super::element::ExactBinding;
     use super::*;
+
+    #[tokio::test]
+    async fn publication_wait_preserves_typed_stop_on_actual_pending_lock() {
+        for (signal, expected) in [
+            (
+                CancelSignal::DeadlineExceeded,
+                ProtocolError::DeadlineExceeded,
+            ),
+            (CancelSignal::Requested, ProtocolError::Cancelled),
+            (CancelSignal::SessionClosed, ProtocolError::Cancelled),
+        ] {
+            let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+            let (sender, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+            let operation = OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: Instant::now() + Duration::from_secs(10),
+                cancellation,
+            };
+            let held = dispatch.publication.lock().await;
+            let waiting = dispatch.snapshot_with_observation(&operation);
+            tokio::pin!(waiting);
+            assert!(futures_util::poll!(&mut waiting).is_pending());
+            sender.send_replace(signal);
+            let result = tokio::time::timeout(Duration::from_secs(2), &mut waiting)
+                .await
+                .unwrap();
+            assert!(matches!(result, Err(error) if error == expected));
+            drop(held);
+        }
+    }
+
+    #[test]
+    fn joined_dispatch_stop_preserves_uncertainty_and_hard_errors() {
+        for signal in [
+            CancelSignal::None,
+            CancelSignal::Requested,
+            CancelSignal::DeadlineExceeded,
+            CancelSignal::SessionClosed,
+            CancelSignal::OwnerRetirement,
+        ] {
+            for dirty in [false, true] {
+                for error in [
+                    ProtocolError::Cancelled,
+                    ProtocolError::DeadlineExceeded,
+                    ProtocolError::StaleReference,
+                    ProtocolError::StaleScope,
+                    ProtocolError::CleanupFailed,
+                    ProtocolError::BrowserFailure,
+                    ProtocolError::PolicyDenied,
+                    ProtocolError::CapacityExceeded,
+                ] {
+                    let mut failure = DispatchFailure {
+                        error: error.clone(),
+                        identity_scope: "typed-stop-scope".into(),
+                        cleanup_integrity_lost: dirty,
+                    };
+                    preserve_observed_stop(&mut failure, signal);
+                    let expected = if !dirty
+                        && matches!(
+                            error,
+                            ProtocolError::Cancelled | ProtocolError::StaleReference
+                        ) {
+                        signal.error().unwrap_or(error.clone())
+                    } else {
+                        error.clone()
+                    };
+                    assert_eq!(failure.error, expected);
+                    assert_eq!(failure.cleanup_integrity_lost, dirty);
+                    let (outcome, lost) = super::super::client_browser::settle_observation_dispatch(
+                        Ok(Err(failure)),
+                        Ok(Ok(())),
+                    );
+                    assert_eq!(outcome.result, Err(expected));
+                    let uncertain = dirty || error == ProtocolError::CleanupFailed;
+                    assert_eq!(lost, uncertain);
+                    assert_eq!(
+                        outcome.effects,
+                        if uncertain {
+                            super::super::client_protocol::Effects::Unknown
+                        } else {
+                            super::super::client_protocol::Effects::NotDispatched
+                        }
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn only_live_callback_fields_can_read_over_unchanged_unrelated_input_debt() {
         use super::super::client_debt::{AdmissionClass, OperationKey, OwnerDebtLedger};

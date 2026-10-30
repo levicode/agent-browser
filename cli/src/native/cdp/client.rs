@@ -812,6 +812,7 @@ impl Drop for PendingGuard {
 /// A submitted command keeps its waiter guard until its real response is read.
 /// Dropping the waiter never removes the reader-owned submission/debt record.
 struct CommandResponse {
+    timing: Option<crate::native::client_observation::query_diagnostic::commands::Timer>,
     receiver: oneshot::Receiver<CommandReply>,
     guard: PendingGuard,
 }
@@ -2488,6 +2489,8 @@ impl CdpClient {
         owner_deadline: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
         stop: &mut AdmissionObservation,
     ) -> Result<CommandResponse, String> {
+        use crate::native::client_observation::query_diagnostic::commands::Timer;
+        let mut timing = Timer::start(method);
         let id = self.next_command_id()?;
 
         let cmd = CdpCommand {
@@ -2510,9 +2513,12 @@ impl CdpClient {
         };
 
         {
+            Timer::advance(&mut timing, 1);
             let mut ws_tx = self.transport.ws_tx.lock().await;
+            Timer::advance(&mut timing, 2);
             self.ensure_open()?;
             let mut pending = self.transport.pending.lock().await;
+            Timer::advance(&mut timing, 3);
             if let Some((expected, deadline)) = &owner_deadline {
                 self.check_cleanup_owner(expected)
                     .map_err(|_| "Native cleanup owner changed".to_string())?;
@@ -2536,7 +2542,9 @@ impl CdpClient {
             }
         }
 
+        Timer::advance(&mut timing, 4);
         Ok(CommandResponse {
+            timing,
             receiver: rx,
             guard,
         })
@@ -2579,7 +2587,9 @@ impl CdpClient {
         response: CommandResponse,
         deadline: Option<std::time::Instant>,
     ) -> Result<CommandReply, CommandWaitFailure> {
+        use crate::native::client_observation::query_diagnostic::commands::{Outcome, Timer};
         let CommandResponse {
+            mut timing,
             receiver,
             mut guard,
         } = response;
@@ -2587,6 +2597,14 @@ impl CdpClient {
             Some(deadline) => tokio::time::timeout_at(deadline.into(), receiver).await,
             None => tokio::time::timeout(Duration::from_secs(30), receiver).await,
         };
+        let outcome = match &received {
+            Ok(Ok(CommandReply::Success(_))) => Outcome::Success,
+            Ok(Ok(CommandReply::ErrorAck(_))) => Outcome::ErrorAck,
+            Ok(Ok(CommandReply::LocalFailure(_))) => Outcome::LocalFailure,
+            Ok(Err(_)) => Outcome::ChannelClosed,
+            Err(_) => Outcome::WaitDeadline,
+        };
+        Timer::finish(&mut timing, outcome);
         match received {
             Ok(Ok(reply)) => {
                 guard.done = true;
@@ -3499,6 +3517,56 @@ mod tests {
         });
         let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
         (client, seen, replies, peer)
+    }
+
+    #[tokio::test]
+    async fn query_command_timing_preserves_reply_and_dropped_waiter() {
+        use crate::native::client_observation::query_diagnostic::commands::{self, Collector};
+        for abandon in [false, true] {
+            let (transport, mut requests, replies, peer) =
+                tokio::time::timeout(Duration::from_secs(1), service_worker_test_peer())
+                    .await
+                    .expect("command timing fixture setup timed out");
+            let collector = Collector::new();
+            let sender = transport.clone();
+            let command = tokio::spawn(commands::scope(collector.clone(), async move {
+                sender
+                    .send_command("Page.getFrameTree", None, Some("page"))
+                    .await
+            }));
+            let request = service_worker_request(&mut requests).await;
+            assert_eq!(request["method"], "Page.getFrameTree");
+            if abandon {
+                command.abort();
+                assert!(tokio::time::timeout(Duration::from_secs(1), command)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .is_cancelled());
+            } else {
+                replies
+                    .send(json!({"id":request["id"],"sessionId":"page","result":{"unchanged":7}}))
+                    .unwrap();
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(1), command)
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap(),
+                    json!({"unchanged":7})
+                );
+            }
+            let (rows, summary) = collector.test_commands();
+            assert_eq!(summary, [1, 1, 0], "abandon={abandon}");
+            assert_eq!(rows, vec![[0, 1, if abandon { 6 } else { 1 }]]);
+            tokio::time::timeout(Duration::from_secs(1), transport.close())
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(1), peer)
+                .await
+                .unwrap()
+                .unwrap();
+        }
     }
 
     #[tokio::test]

@@ -21,6 +21,15 @@ const MAX_REGISTRIES: usize = 256;
 mod operation_lease;
 pub use operation_lease::{CancelSignal, OperationLease};
 
+/// Closed broker decision made under the operation lock, before executor entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OperationStart {
+    Started,
+    AlreadyStarted,
+    Cancelled,
+    DeadlineExceeded,
+}
+
 /// A stop observed at the exact operation-channel guard/select that returned it.
 /// This carries no owner/registry authority; only enrollment may classify its
 /// own exact producer channel as lifecycle retirement. Fields stay private.
@@ -693,19 +702,44 @@ impl ClientSession {
     }
 
     /// Called immediately before entering an action, not when dequeued earlier.
-    pub fn start(&self, generation: u64, sequence: u64) -> Result<bool, ProtocolError> {
+    pub(crate) fn start_outcome(
+        &self,
+        generation: u64,
+        sequence: u64,
+    ) -> Result<OperationStart, ProtocolError> {
         let mut inner = self.lock()?;
         Self::check_control(&inner, generation, sequence)?;
         let op = inner
             .operations
             .get_mut(&sequence)
             .ok_or(ProtocolError::OperationMissing)?;
-        if op.started || Instant::now() >= op.deadline || *op.cancel.borrow() != CancelSignal::None
-        {
-            return Ok(false);
+        if op.started {
+            return Ok(OperationStart::AlreadyStarted);
+        }
+        // The first broker stop wins over the clock. A deadline before the
+        // supervisor has signalled it is classified here, not after returning
+        // an ambiguous cancellation to the caller.
+        match *op.cancel.borrow() {
+            CancelSignal::DeadlineExceeded => return Ok(OperationStart::DeadlineExceeded),
+            CancelSignal::Requested
+            | CancelSignal::SessionClosed
+            | CancelSignal::OwnerRetirement => {
+                return Ok(OperationStart::Cancelled);
+            }
+            CancelSignal::None => {}
+        }
+        if Instant::now() >= op.deadline {
+            return Ok(OperationStart::DeadlineExceeded);
         }
         op.started = true;
-        Ok(true)
+        Ok(OperationStart::Started)
+    }
+
+    /// Historical test-fixture shorthand. Production must inspect the typed decision.
+    #[cfg(test)]
+    pub fn start(&self, generation: u64, sequence: u64) -> Result<bool, ProtocolError> {
+        self.start_outcome(generation, sequence)
+            .map(|outcome| outcome == OperationStart::Started)
     }
 
     /// Binding is authorization for one native window, never a causal parent.
@@ -905,8 +939,8 @@ impl ClientSession {
             let changed = self.publication_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            if *cancellation.borrow() != CancelSignal::None {
-                return Err(ProtocolError::Cancelled);
+            if let Some(error) = (*cancellation.borrow()).error() {
+                return Err(error);
             }
             if Instant::now() >= operation.deadline {
                 return Err(ProtocolError::DeadlineExceeded);
@@ -915,8 +949,8 @@ impl ClientSession {
                 return Ok(());
             }
             tokio::select! { biased;
-                _=cancellation.changed()=>return Err(ProtocolError::Cancelled),
-                _=tokio::time::sleep_until(operation.deadline.into())=>return Err(ProtocolError::DeadlineExceeded),
+                _=cancellation.changed()=>return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled)),
+                _=tokio::time::sleep_until(operation.deadline.into())=>return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::DeadlineExceeded)),
                 _=&mut changed=>{},
             }
         }
@@ -1983,6 +2017,149 @@ impl ClientSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn application_publication_wait_preserves_typed_stop_before_and_after_pending() {
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        use super::super::client_operation_state::OperationRegistry;
+        for presignalled in [false, true] {
+            for signal in [
+                CancelSignal::None,
+                CancelSignal::Requested,
+                CancelSignal::DeadlineExceeded,
+                CancelSignal::SessionClosed,
+                CancelSignal::OwnerRetirement,
+            ] {
+                let broker = ClientSession::new();
+                broker.admit(1, 1, 10_000).unwrap();
+                let operation = broker.admit(1, 2, 10_000).unwrap();
+                let original_deadline = operation.deadline;
+                let key = OperationKey {
+                    generation: 1,
+                    operation_seq: 1,
+                };
+                let journal = OwnerDebtLedger::new(1, "scope".into())
+                    .operation(key, "target".into(), "session".into())
+                    .unwrap();
+                let registry = OperationRegistry::default();
+                registry.register(journal).unwrap();
+                registry.retire(key).unwrap();
+                assert!(!registry.finish(key, false));
+                let proof = registry.status(key).proof().unwrap();
+                broker.begin_operation_retirement(key, &proof).unwrap();
+                assert!(!broker.check_application_publication(1).unwrap());
+                let sender = broker.lock().unwrap().operations[&2].cancel.clone();
+                if presignalled && signal != CancelSignal::None {
+                    sender.send_replace(signal);
+                }
+                let waiting = broker.wait_application_publication(&operation);
+                tokio::pin!(waiting);
+                if !presignalled || signal == CancelSignal::None {
+                    assert!(futures_util::poll!(&mut waiting).is_pending());
+                    if signal == CancelSignal::None {
+                        broker.finish_operation_publication(key).unwrap();
+                    } else {
+                        sender.send_replace(signal);
+                    }
+                }
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), &mut waiting)
+                        .await
+                        .unwrap(),
+                    signal.error().map_or(Ok(()), Err)
+                );
+                assert_eq!(operation.deadline, original_deadline);
+                if signal != CancelSignal::None {
+                    assert!(!broker.check_application_publication(1).unwrap());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_start_classifies_unsignalled_expiry_at_the_locked_decision() {
+        let broker = ClientSession::new();
+        let lease = broker.admit(1, 1, 1000).unwrap();
+        broker
+            .lock()
+            .unwrap()
+            .operations
+            .get_mut(&1)
+            .unwrap()
+            .deadline = Instant::now();
+        assert_eq!(*lease.cancellation.borrow(), CancelSignal::None);
+        assert_eq!(
+            broker.start_outcome(1, 1),
+            Ok(OperationStart::DeadlineExceeded)
+        );
+        assert!(!broker.has_started(1));
+        assert_eq!(*lease.cancellation.borrow(), CancelSignal::None);
+    }
+
+    #[test]
+    fn typed_start_preserves_first_stop_before_expired_clock() {
+        for first in [CancelSignal::Requested, CancelSignal::DeadlineExceeded] {
+            let broker = ClientSession::new();
+            let lease = broker.admit(1, 1, 1000).unwrap();
+            broker
+                .lock()
+                .unwrap()
+                .operations
+                .get_mut(&1)
+                .unwrap()
+                .deadline = Instant::now();
+            if first == CancelSignal::Requested {
+                broker.cancel(1, 1).unwrap();
+                broker.expire(1, 1).unwrap();
+            } else {
+                broker.expire(1, 1).unwrap();
+                broker.cancel(1, 1).unwrap();
+            }
+            assert_eq!(*lease.cancellation.borrow(), first);
+            assert_eq!(
+                broker.start_outcome(1, 1),
+                Ok(if first == CancelSignal::Requested {
+                    OperationStart::Cancelled
+                } else {
+                    OperationStart::DeadlineExceeded
+                })
+            );
+            assert!(!broker.has_started(1));
+        }
+    }
+
+    #[test]
+    fn typed_start_keeps_duplicate_and_hard_authority_checks_distinct() {
+        let broker = ClientSession::new();
+        broker.admit(1, 1, 1000).unwrap();
+        assert_eq!(broker.start_outcome(1, 1), Ok(OperationStart::Started));
+        broker.cancel(1, 1).unwrap();
+        broker
+            .lock()
+            .unwrap()
+            .operations
+            .get_mut(&1)
+            .unwrap()
+            .deadline = Instant::now();
+        assert_eq!(
+            broker.start_outcome(1, 1),
+            Ok(OperationStart::AlreadyStarted)
+        );
+        assert!(!broker.start(1, 1).unwrap());
+        assert_eq!(
+            broker.start_outcome(2, 1),
+            Err(ProtocolError::StaleGeneration)
+        );
+        assert_eq!(
+            broker.start_outcome(1, 2),
+            Err(ProtocolError::OperationMissing)
+        );
+        broker.quarantine().unwrap();
+        assert_eq!(
+            broker.start_outcome(1, 1),
+            Err(ProtocolError::ScopeUnavailable)
+        );
+    }
 
     fn elapsed_operation(broker: &ClientSession) -> OperationLease {
         let operation = broker.admit(1, 1, 5000).unwrap();

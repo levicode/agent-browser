@@ -3187,12 +3187,20 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 };
             }
         }
-        match self.broker.start(lease.generation, lease.sequence) {
-            Ok(true) => {}
-            Ok(false) => {
+        use super::client_session::OperationStart;
+        match self.broker.start_outcome(lease.generation, lease.sequence) {
+            Ok(OperationStart::Started) => {}
+            Ok(OperationStart::AlreadyStarted | OperationStart::Cancelled) => {
                 return NativeOutcome {
                     retention: None,
                     result: Err(ProtocolError::Cancelled),
+                    effects: Effects::NotDispatched,
+                }
+            }
+            Ok(OperationStart::DeadlineExceeded) => {
+                return NativeOutcome {
+                    retention: None,
+                    result: Err(ProtocolError::DeadlineExceeded),
                     effects: Effects::NotDispatched,
                 }
             }
