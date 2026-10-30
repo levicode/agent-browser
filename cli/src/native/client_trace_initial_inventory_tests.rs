@@ -31,6 +31,31 @@ enum Race {
     ReleaseError,
     ReleaseWrongSession,
 }
+// Test-only rendezvous: disposal may arrive before or after the final frame
+// request, but neither reply escapes until both exact requests are captured.
+#[derive(Default)]
+struct ReleaseFenceReplies {
+    release: Option<Value>,
+    frame: Option<Value>,
+    completed: bool,
+}
+impl ReleaseFenceReplies {
+    fn capture(&mut self, is_release: bool, reply: Value) -> Option<[Value; 2]> {
+        assert!(!self.completed, "duplicate release/frame rendezvous");
+        let slot = if is_release {
+            &mut self.release
+        } else {
+            &mut self.frame
+        };
+        assert!(slot.replace(reply).is_none(), "duplicate rendezvous side");
+        if self.release.is_some() && self.frame.is_some() {
+            self.completed = true;
+            Some([self.release.take().unwrap(), self.frame.take().unwrap()])
+        } else {
+            None
+        }
+    }
+}
 struct Fixture {
     context: DispatchContext,
     operation: OperationLease,
@@ -42,6 +67,7 @@ struct Fixture {
     log: Arc<Mutex<Vec<Value>>>,
     peer: tokio::task::JoinHandle<()>,
     readonly_replies: tokio::sync::mpsc::UnboundedSender<Value>,
+    release_fence_receipt: Option<tokio::sync::oneshot::Receiver<[Value; 2]>>,
 }
 async fn ready(targets: &Arc<ClientTargets>) {
     targets
@@ -73,6 +99,7 @@ impl Fixture {
         let log = Arc::new(Mutex::new(Vec::new()));
         let peer_log = log.clone();
         let (readonly_replies, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<Value>();
+        let (release_fence_tx, release_fence_receipt) = tokio::sync::oneshot::channel();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let endpoint = format!("ws://{}", listener.local_addr().unwrap());
         let peer = tokio::spawn(async move {
@@ -86,6 +113,10 @@ impl Fixture {
             let mut reservation = None;
             let mut delayed_final_ack = None;
             let mut first_release_acked = false;
+            let release_fence =
+                readonly && matches!(race, Race::ReleaseError | Race::ReleaseWrongSession);
+            let mut release_fence_replies = ReleaseFenceReplies::default();
+            let mut release_fence_tx = Some(release_fence_tx);
             let child = matches!(
                 race,
                 Race::HeldRelease
@@ -204,7 +235,7 @@ impl Fixture {
                                         | Race::ReleaseWrongSession
                                 )
                                 && completed == 0
-                                && !first_release_acked;
+                                && (release_fence || !first_release_acked);
                         }
                         result
                     }
@@ -295,6 +326,31 @@ impl Fixture {
                 }
                 if wrong_session {
                     response["sessionId"] = "other-session".into();
+                }
+                if release_fence && (method == "Runtime.releaseObjectGroup" || delay_final_ack) {
+                    // An early failed release may correctly refuse the remaining
+                    // frame commands. This case instead tests the completed,
+                    // revision-raced prefix: never depend on TCP batching to
+                    // postpone that release until the final request is in flight.
+                    if let Some(replies) = release_fence_replies
+                        .capture(method == "Runtime.releaseObjectGroup", response)
+                    {
+                        assert_eq!(peer_samples.load(Ordering::SeqCst), 1, "{race:?}");
+                        for reply in &replies {
+                            socket
+                                .send(Message::Text(reply.to_string()))
+                                .await
+                                .unwrap_or_else(|error| {
+                                    panic!("{race:?} rendezvous send: {error}")
+                                });
+                        }
+                        release_fence_tx
+                            .take()
+                            .expect("duplicate release-fence receipt")
+                            .send(replies)
+                            .unwrap_or_else(|_| panic!("{race:?} release-fence receiver dropped"));
+                    }
+                    continue;
                 }
                 if delay_final_ack {
                     assert!(delayed_final_ack.replace(response).is_none());
@@ -395,6 +451,7 @@ impl Fixture {
             log,
             peer,
             readonly_replies,
+            release_fence_receipt: Some(release_fence_receipt),
         }
     }
 }

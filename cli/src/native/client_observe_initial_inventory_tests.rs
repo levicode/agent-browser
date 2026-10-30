@@ -212,22 +212,88 @@ async fn observe_initial_first_success_keeps_original_accounted_group_contract()
 
 #[tokio::test]
 async fn observe_initial_release_error_and_wrong_session_never_authorize_reacquisition() {
+    // Exercise both arrival orders through the same pure rendezvous used by the
+    // socket peer; a lone request must never produce either response.
+    for release_first in [false, true] {
+        let release =
+            json!({"id":1,"sessionId":"session","error":{"code":-32000,"message":"release"}});
+        let frame = json!({"id":2,"sessionId":"session","result":{}});
+        let mut replies = ReleaseFenceReplies::default();
+        let (first, second) = if release_first {
+            (release.clone(), frame.clone())
+        } else {
+            (frame.clone(), release.clone())
+        };
+        assert!(replies.capture(release_first, first).is_none());
+        assert_eq!(
+            replies.capture(!release_first, second),
+            Some([release, frame]),
+            "release_first={release_first}"
+        );
+    }
     for race in [Race::ReleaseError, Race::ReleaseWrongSession] {
         let fixture = Fixture::new_mode(race, true).await;
-        let (fixture, capture, fence) = prepare(fixture);
+        let (mut fixture, capture, fence) = prepare(fixture);
         let cleanup = AtomicBool::new(false);
         let result = acquire(&fixture, &capture, fence, &cleanup, None).await;
-        assert!(result.is_err(), "{race:?}");
-        assert_eq!(fixture.samples.load(Ordering::SeqCst), 1);
-        assert!(fixture.ledger.snapshot().object_debt > 0);
-        assert!(fixture.ledger.snapshot().outstanding_commands > 0);
+        let replies = tokio::time::timeout(
+            Duration::from_secs(1),
+            fixture.release_fence_receipt.take().unwrap(),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("{race:?} missing release/final-frame wire-order receipt"))
+        .unwrap_or_else(|_| panic!("{race:?} peer ended before the ordered response pair"));
+        let requests = fixture.log.lock().unwrap().clone();
+        let release_requests: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "Runtime.releaseObjectGroup")
+            .collect();
+        let trees: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "Page.getFrameTree")
+            .collect();
+        assert_eq!(release_requests.len(), 1, "{race:?}: {requests:?}");
+        assert_eq!(trees.len(), 4, "{race:?}: {requests:?}");
+        assert_eq!(replies[0]["id"], release_requests[0]["id"], "{race:?}");
+        assert_eq!(replies[1]["id"], trees[3]["id"], "{race:?}");
+        assert_eq!(replies[1]["sessionId"], "session", "{race:?}");
+        assert!(replies[1]["result"]["frameTree"].is_object(), "{race:?}");
+        if race == Race::ReleaseError {
+            assert_eq!(replies[0]["sessionId"], "session", "{race:?}");
+            assert_eq!(replies[0]["error"]["code"], -32000, "{race:?}");
+            assert!(replies[0].get("result").is_none(), "{race:?}");
+        } else {
+            assert_eq!(replies[0]["sessionId"], "other-session", "{race:?}");
+            assert_eq!(replies[0]["result"], json!({}), "{race:?}");
+            assert!(replies[0].get("error").is_none(), "{race:?}");
+        }
+        assert!(result.is_err(), "{race:?}: {replies:?}");
+        assert!(
+            !matches!(
+                &result,
+                Err(ProtocolError::DeadlineExceeded | ProtocolError::Cancelled)
+            ),
+            "{race:?} must refuse the poisoned prefix, not expire: {result:?}; {replies:?}"
+        );
+        assert_eq!(fixture.samples.load(Ordering::SeqCst), 1, "{race:?}");
+        assert!(fixture.ledger.snapshot().object_debt > 0, "{race:?}");
+        assert!(
+            fixture.ledger.snapshot().outstanding_commands > 0,
+            "{race:?}"
+        );
         assert_eq!(
             fixture.ledger.snapshot().integrity_lost,
-            race == Race::ReleaseWrongSession
+            race == Race::ReleaseWrongSession,
+            "{race:?}: {replies:?}"
         );
         no_publication_or_semantics(&fixture);
-        fixture.context.page.client.close().await;
-        fixture.peer.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), fixture.context.page.client.close())
+            .await
+            .unwrap_or_else(|_| panic!("{race:?} client close timed out"));
+        tokio::time::timeout(Duration::from_secs(1), fixture.peer)
+            .await
+            .unwrap_or_else(|_| panic!("{race:?} peer join timed out"))
+            .unwrap_or_else(|error| panic!("{race:?} peer failed: {error}"));
     }
 }
 
