@@ -4408,7 +4408,7 @@ mod query_command_schema_tests {
                 facts,
             };
             let bytes = serde_json::to_vec(&record).unwrap();
-            assert!(bytes.len() + 1 <= MAX_RECORD_BYTES, "{}", bytes.len());
+            assert!(bytes.len() < MAX_RECORD_BYTES, "{}", bytes.len());
             let object: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
             let keys: std::collections::BTreeSet<_> = object
                 .as_object()

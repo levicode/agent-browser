@@ -1,8 +1,8 @@
 //! Diagnostic-only unit controls. No transport or browser is created.
-use super::*;
-use diagnostic::{
+use super::diagnostic::{
     EvalPreparationRefusal as Refused, PopupReceiptStage as Stage, PopupSetupCheckpoint as Point,
 };
+use super::*;
 
 #[test]
 fn popup_setup_checkpoints_never_infer_ack_from_entered_or_rewrite_first_failure() {
