@@ -1,8 +1,14 @@
 //! Native request ownership and token dispatch. ECMAScript route matching and
 //! callbacks stay in e2e; no JavaScript function or matcher is interpreted here.
 #[cfg(test)]
+#[path = "client_network_child_retirement_tests.rs"]
+mod child_retirement_tests;
+#[cfg(test)]
 #[path = "client_dialog_retirement_regression_tests.rs"]
 mod dialog_retirement_regression_tests;
+#[cfg(test)]
+#[path = "client_network_retirement_receipt_tests.rs"]
+mod retirement_receipt_tests;
 use super::cdp::client::CdpClient;
 use super::cdp::types::CdpEvent;
 use super::client_app_events::{
@@ -47,11 +53,18 @@ pub struct ClientNetwork {
     cancellation: tokio::sync::watch::Sender<CancelSignal>,
     sessions: Mutex<HashMap<String, EnrolledSession>>,
     tasks: Mutex<tokio::task::JoinSet<Result<(), ProtocolError>>>,
+    #[cfg(test)]
+    task_result_gate: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     blocking_reads: Mutex<tokio::task::JoinSet<()>>,
     dialog_enabled: AtomicBool,
     auth_attempts: Mutex<std::collections::HashSet<(String, String)>>,
     request_ids: Mutex<HashMap<(String, String), String>>,
-    pending_interceptions: Mutex<HashMap<(String, String, String), ()>>,
+    pending_interceptions: Mutex<HashMap<(String, String, String), Arc<()>>>,
     dialog_commands: Mutex<HashMap<(String, String, String), DialogCommandReceipt>>,
     response_subscriptions: Mutex<std::collections::HashSet<String>>,
     responses: Mutex<HashMap<(String, String), String>>,
@@ -70,6 +83,17 @@ struct DialogCommandReceipt {
     status: super::client_debt::CommandStatusHandle,
 }
 
+/// Operation/setup errors retain their old projection. A terminal callback
+/// command failure carries its captured outcome past asynchronous detach apply.
+enum NetworkTaskFailure {
+    Operation(ProtocolError),
+    Command(super::cdp::client::NetworkCommandFailure),
+}
+impl From<ProtocolError> for NetworkTaskFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self::Operation(error)
+    }
+}
 enum NetworkCloseState {
     Open,
     Running(tokio::task::JoinHandle<Result<(), ProtocolError>>),
@@ -457,6 +481,8 @@ impl ClientNetwork {
             cancellation,
             sessions: Mutex::new(HashMap::new()),
             tasks: Mutex::new(tokio::task::JoinSet::new()),
+            #[cfg(test)]
+            task_result_gate: Mutex::new(None),
             blocking_reads: Mutex::new(tokio::task::JoinSet::new()),
             dialog_enabled: AtomicBool::new(false),
             auth_attempts: Mutex::new(std::collections::HashSet::new()),
@@ -1491,6 +1517,7 @@ impl ClientNetwork {
             )),
             _ => None,
         };
+        let pending_occurrence = pending_key.as_ref().map(|_| Arc::new(()));
         if let Some(key) = &pending_key {
             let mut pending = self
                 .pending_interceptions
@@ -1499,7 +1526,7 @@ impl ClientNetwork {
             if pending.len() >= 2048 {
                 return Err(ProtocolError::CapacityExceeded);
             }
-            pending.insert(key.clone(), ());
+            pending.insert(key.clone(), pending_occurrence.as_ref().unwrap().clone());
         }
         // Accounting happens in event order before tasks are launched.
         if event.method == "Fetch.requestPaused" {
@@ -1741,23 +1768,53 @@ impl ClientNetwork {
                     )
                     .await
                 }
-                "Network.loadingFinished" => {
-                    this.response_finished(&session, event.params, deadline, &session_tenure)
-                        .await
-                }
+                "Network.loadingFinished" => this
+                    .response_finished(&session, event.params, deadline, &session_tenure)
+                    .await
+                    .map_err(NetworkTaskFailure::Operation),
                 _ => Ok(()),
             };
-            if result.is_ok() {
-                if let Some(key) = pending_key {
-                    this.pending_interceptions
-                        .lock()
-                        .map_err(|_| ProtocolError::CleanupFailed)?
-                        .remove(&key);
-                    this.dialog_commands
-                        .lock()
-                        .map_err(|_| ProtocolError::CleanupFailed)?
-                        .remove(&key);
+            #[cfg(test)]
+            this.pause_network_task_result_for_test().await;
+            // Captured command errors outrank later asynchronous table removal.
+            // In particular an ErrorAck cannot become normal retirement merely
+            // because detach was applied while this task was awaiting its turn.
+            let result = match result {
+                Ok(()) => Ok(()),
+                Err(NetworkTaskFailure::Operation(error)) => Err(error),
+                Err(NetworkTaskFailure::Command(failure)) => {
+                    if let Some(receipt) = failure.into_retirement() {
+                        if this.client.consume_network_retirement(
+                            receipt,
+                            this.scope.generation,
+                            &this.scope.identity_scope,
+                            &session.session_id,
+                        ) && matches!(
+                            this.finish_callback_occurrence(
+                                &session.session_id,
+                                &session_tenure,
+                                pending_key.as_ref(),
+                                pending_occurrence.as_ref()
+                            ),
+                            Ok(true)
+                        ) {
+                            // Exact reader destruction, NOT a fabricated ACK.
+                            return Ok(());
+                        }
+                    }
+                    if !this.sealed.load(Ordering::Acquire) {
+                        let _ = this.broker.quarantine();
+                    }
+                    return Err(ProtocolError::BrowserFailure);
                 }
+            };
+            if result.is_ok() {
+                this.finish_callback_occurrence(
+                    &session.session_id,
+                    &session_tenure,
+                    pending_key.as_ref(),
+                    pending_occurrence.as_ref(),
+                )?;
             }
             if !this
                 .sessions
@@ -1967,6 +2024,52 @@ impl ClientNetwork {
         Ok(true)
     }
 
+    #[cfg(test)]
+    async fn pause_network_task_result_for_test(&self) {
+        let gate = { self.task_result_gate.lock().unwrap().take() };
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
+    }
+    fn finish_callback_occurrence(
+        &self,
+        session: &str,
+        tenure: &tokio::sync::watch::Receiver<bool>,
+        key: Option<&(String, String, String)>,
+        occurrence: Option<&Arc<()>>,
+    ) -> Result<bool, ProtocolError> {
+        let (Some(key), Some(occurrence)) = (key, occurrence) else {
+            return Ok(true);
+        };
+        let sessions = self
+            .sessions
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        if sessions
+            .get(session)
+            .is_some_and(|current| !current.configuration_ready.subscribe().same_channel(tenure))
+        {
+            return Ok(false);
+        }
+        let mut pending = self
+            .pending_interceptions
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        match pending.get(key) {
+            Some(current) if !Arc::ptr_eq(current, occurrence) => return Ok(false),
+            None => return Ok(true), // Already removed by exact lifecycle cleanup.
+            Some(_) => {}
+        }
+        // Keep the occurrence map locked until both entries have been retired;
+        // a new same-key event cannot install its dialog receipt in between.
+        self.dialog_commands
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?
+            .remove(key);
+        pending.remove(key);
+        Ok(true)
+    }
     fn session_tenure_live(
         &self,
         session: &str,
@@ -2340,13 +2443,13 @@ impl ClientNetwork {
         session: &str,
         params: Value,
         sink: &ClientEventSink,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), NetworkTaskFailure> {
         let request_id = required_string(&params, "requestId")?;
         let challenge = params
             .get("authChallenge")
             .ok_or(ProtocolError::InvalidArguments)?;
         if challenge.get("source").and_then(Value::as_str) != Some("Server") {
-            return self.client.send_command("Fetch.continueWithAuth",Some(json!({"requestId":request_id,"authChallengeResponse":{"response":"CancelAuth"}})),Some(session)).await.map(|_|()).map_err(|_|ProtocolError::BrowserFailure);
+            return self.client.send_network_task_command("Fetch.continueWithAuth",json!({"requestId":request_id,"authChallengeResponse":{"response":"CancelAuth"}}),session).await.map(|_|()).map_err(NetworkTaskFailure::Command);
         }
         let origin = required_string(challenge, "origin")?;
         let parsed = url::Url::parse(origin).map_err(|_| ProtocolError::InvalidArguments)?;
@@ -2354,7 +2457,7 @@ impl ClientNetwork {
             || !parsed.username().is_empty()
             || parsed.password().is_some()
         {
-            return Err(ProtocolError::PolicyDenied);
+            return Err(ProtocolError::PolicyDenied.into());
         }
         let request_url = params
             .get("request")
@@ -2370,12 +2473,12 @@ impl ClientNetwork {
                 .lock()
                 .map_err(|_| ProtocolError::ScopeUnavailable)?;
             if attempts.len() >= 1024 {
-                return Err(ProtocolError::CapacityExceeded);
+                return Err(ProtocolError::CapacityExceeded.into());
             }
             !attempts.insert((session.into(), request_id.into()))
         };
         if request_origin != parsed.origin() || attempted {
-            return self.client.send_command("Fetch.continueWithAuth",Some(json!({"requestId":request_id,"authChallengeResponse":{"response":"CancelAuth"}})),Some(session)).await.map(|_|()).map_err(|_|ProtocolError::BrowserFailure);
+            return self.client.send_network_task_command("Fetch.continueWithAuth",json!({"requestId":request_id,"authChallengeResponse":{"response":"CancelAuth"}}),session).await.map(|_|()).map_err(NetworkTaskFailure::Command);
         }
         let lease = self.broker.decision_scoped_with_eval(
             self.scope.generation,
@@ -2401,14 +2504,14 @@ impl ClientNetwork {
             _ => json!({"response":"CancelAuth"}),
         };
         self.client
-            .send_command(
+            .send_network_task_command(
                 "Fetch.continueWithAuth",
-                Some(json!({"requestId":request_id,"authChallengeResponse":response})),
-                Some(session),
+                json!({"requestId":request_id,"authChallengeResponse":response}),
+                session,
             )
             .await
             .map(|_| ())
-            .map_err(|_| ProtocolError::BrowserFailure)
+            .map_err(NetworkTaskFailure::Command)
     }
 
     async fn dialog(
@@ -2417,10 +2520,10 @@ impl ClientNetwork {
         params: Value,
         sink: &ClientEventSink,
         pending_key: &(String, String, String),
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), NetworkTaskFailure> {
         let kind = required_string(&params, "type")?;
         if !matches!(kind, "alert" | "confirm" | "prompt" | "beforeunload") {
-            return Err(ProtocolError::InvalidArguments);
+            return Err(ProtocolError::InvalidArguments.into());
         }
         let message = required_string(&params, "message")?;
         let lease = self.broker.decision_scoped_with_eval(
@@ -2483,15 +2586,15 @@ impl ClientNetwork {
                 );
         }
         self.client
-            .send_reserved_command(
+            .send_reserved_network_task_command(
                 "Page.handleJavaScriptDialog",
-                Some(arguments),
-                Some(session),
+                arguments,
+                session,
                 reservation,
             )
             .await
             .map(|_| ())
-            .map_err(|_| ProtocolError::BrowserFailure)
+            .map_err(NetworkTaskFailure::Command)
     }
 
     fn new_resource(&self) -> Result<(String, Arc<BodyResource>), ProtocolError> {
@@ -3020,7 +3123,7 @@ impl ClientNetwork {
         params: Value,
         mut lease: DecisionLease,
         sink: &ClientEventSink,
-    ) -> Result<(), ProtocolError> {
+    ) -> Result<(), NetworkTaskFailure> {
         self.check()?;
         let request_id = params
             .get("requestId")
@@ -3084,7 +3187,7 @@ impl ClientNetwork {
                 .as_millis()
                 .min(u64::MAX as u128) as u64;
             if remaining == 0 {
-                return self.abort_request(session, &request_id).await;
+                return self.abort_request_task(session, &request_id).await;
             }
             let token = lease.token.clone();
             let _token_cleanup = self.track_token(session, &token)?;
@@ -3168,10 +3271,10 @@ impl ClientNetwork {
                     }
                     return self
                         .client
-                        .send_command("Fetch.continueRequest", Some(command), Some(session))
+                        .send_network_task_command("Fetch.continueRequest", command, session)
                         .await
                         .map(|_| ())
-                        .map_err(|_| ProtocolError::BrowserFailure);
+                        .map_err(NetworkTaskFailure::Command);
                 }
                 DecisionOutcome::Selected(Decision::Fulfill {
                     status,
@@ -3195,15 +3298,15 @@ impl ClientNetwork {
                     };
                     return self
                         .client
-                        .send_command(
+                        .send_network_task_command(
                             "Fetch.fulfillRequest",
-                            Some(json!({"requestId": request_id,
-                        "responseCode": status, "responseHeaders": headers, "body": body_base64})),
-                            Some(session),
+                            json!({"requestId": request_id,
+                        "responseCode": status, "responseHeaders": headers, "body": body_base64}),
+                            session,
                         )
                         .await
                         .map(|_| ())
-                        .map_err(|_| ProtocolError::BrowserFailure);
+                        .map_err(NetworkTaskFailure::Command);
                 }
                 DecisionOutcome::Selected(Decision::Abort {})
                 | DecisionOutcome::Expired
@@ -3212,13 +3315,28 @@ impl ClientNetwork {
                     self.blobs
                         .discard_reserved(&token)
                         .map_err(|_| ProtocolError::CleanupFailed)?;
-                    return self.abort_request(session, &request_id).await;
+                    return self.abort_request_task(session, &request_id).await;
                 }
-                _ => return Err(ProtocolError::DecisionKindMismatch),
+                _ => return Err(ProtocolError::DecisionKindMismatch.into()),
             }
         }
     }
 
+    async fn abort_request_task(
+        &self,
+        session: &str,
+        request_id: &str,
+    ) -> Result<(), NetworkTaskFailure> {
+        self.client
+            .send_network_task_command(
+                "Fetch.failRequest",
+                json!({"requestId": request_id, "errorReason": "Aborted"}),
+                session,
+            )
+            .await
+            .map(|_| ())
+            .map_err(NetworkTaskFailure::Command)
+    }
     async fn abort_request(&self, session: &str, request_id: &str) -> Result<(), ProtocolError> {
         self.client
             .send_command(
@@ -5500,7 +5618,7 @@ mod bridge_tests {
                         "Fetch.requestPaused".into(),
                         format!("request-{index}"),
                     ),
-                    (),
+                    Arc::new(()),
                 );
             }
         }

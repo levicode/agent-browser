@@ -89,6 +89,40 @@ enum CommandWaitFailure {
     ChannelClosed,
     Deadline,
 }
+/// A callback command's original failure. Only the real ChannelClosed arm may
+/// attach exact reader destruction; error ACKs and later lifecycle changes cannot.
+pub(crate) struct NetworkCommandFailure {
+    retirement: Option<NetworkCommandRetirement>,
+}
+impl std::fmt::Debug for NetworkCommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NetworkCommandFailure")
+            .field("exact_retired", &self.retirement.is_some())
+            .finish()
+    }
+}
+impl NetworkCommandFailure {
+    pub(crate) fn into_retirement(self) -> Option<NetworkCommandRetirement> {
+        self.retirement
+    }
+}
+impl From<String> for NetworkCommandFailure {
+    fn from(_: String) -> Self {
+        Self { retirement: None }
+    }
+}
+/// Non-cloneable, internal local-retirement evidence; never an ACK or authority.
+pub(crate) struct NetworkCommandRetirement {
+    owner: Arc<OwnerDebtLedger>,
+    status: CommandStatusHandle,
+    session: String,
+}
+struct NetworkFailureCapture {
+    owner: Arc<OwnerDebtLedger>,
+    status: CommandStatusHandle,
+    session: String,
+    retirement: Option<NetworkCommandRetirement>,
+}
 enum WorkerStartupReply {
     Success,
     ErrorAck(CdpError),
@@ -1724,6 +1758,174 @@ impl CdpClient {
         )
         .await
     }
+    /// Fixed native callback terminal commands only. No operation journal is
+    /// invented: the managed owner view reserves its existing service command.
+    pub(crate) async fn send_network_task_command(
+        &self,
+        method: &str,
+        params: Value,
+        session: &str,
+    ) -> Result<Value, NetworkCommandFailure> {
+        if !matches!(
+            method,
+            "Fetch.continueRequest"
+                | "Fetch.fulfillRequest"
+                | "Fetch.failRequest"
+                | "Fetch.continueWithAuth"
+                | "Page.handleJavaScriptDialog"
+        ) {
+            return Err(NetworkCommandFailure { retirement: None });
+        }
+        let reservation = self.reserve_tracked_command(method, Some(&params), Some(session))?;
+        self.send_reserved_network_task_command(method, params, session, reservation)
+            .await
+    }
+    /// Dialogs already own a reservation/status used by borrowed cleanup. Reuse
+    /// that exact reservation rather than charging or submitting a second one.
+    pub(crate) async fn send_reserved_network_task_command(
+        &self,
+        method: &str,
+        params: Value,
+        session: &str,
+        reservation: Option<CommandReservation>,
+    ) -> Result<Value, NetworkCommandFailure> {
+        self.send_reserved_network_task_command_bound(method, params, session, reservation, None)
+            .await
+    }
+    #[cfg(test)]
+    pub(crate) async fn send_network_task_command_with_deadline_for_test(
+        &self,
+        method: &str,
+        params: Value,
+        session: &str,
+        deadline: std::time::Instant,
+    ) -> Result<Value, NetworkCommandFailure> {
+        let reservation = self.reserve_tracked_command(method, Some(&params), Some(session))?;
+        self.send_reserved_network_task_command_bound(
+            method,
+            params,
+            session,
+            reservation,
+            Some(deadline),
+        )
+        .await
+    }
+    async fn send_reserved_network_task_command_bound(
+        &self,
+        method: &str,
+        params: Value,
+        session: &str,
+        reservation: Option<CommandReservation>,
+        response_deadline: Option<std::time::Instant>,
+    ) -> Result<Value, NetworkCommandFailure> {
+        if !matches!(
+            method,
+            "Fetch.continueRequest"
+                | "Fetch.fulfillRequest"
+                | "Fetch.failRequest"
+                | "Fetch.continueWithAuth"
+                | "Page.handleJavaScriptDialog"
+        ) || reservation.as_ref().is_some_and(|reservation| {
+            reservation.is_owner_cleanup()
+                || !reservation.matches_envelope(method, Some(&params), Some(session))
+        }) {
+            return Err(NetworkCommandFailure { retirement: None });
+        }
+        let mut capture = match (self.owner.as_ref(), reservation.as_ref()) {
+            (Some(owner), Some(reservation)) if reservation.belongs_to(owner) => {
+                Some(NetworkFailureCapture {
+                    owner: owner.clone(),
+                    status: reservation.status(),
+                    session: session.to_owned(),
+                    retirement: None,
+                })
+            }
+            _ => None,
+        };
+        let budget = reservation
+            .as_ref()
+            .and_then(CommandReservation::initialization_budget);
+        let result = within_initialization(budget, async {
+            let response = self
+                .submit_reserved_command_bound(
+                    method,
+                    Some(params),
+                    Some(session),
+                    reservation,
+                    None,
+                )
+                .await?;
+            let reply = self
+                .await_command_reply_observed(response, response_deadline, capture.as_mut())
+                .await;
+            match reply {
+                Ok(CommandReply::Success(value)) => Ok(value),
+                Ok(CommandReply::ErrorAck(error)) => {
+                    Err(format!("CDP error ({}): {}", method, error))
+                }
+                // These fixed terminal methods carry no remote-object courier.
+                // An unvalidated envelope is never a success or retirement ACK.
+                Ok(CommandReply::LocalFailure(_)) => {
+                    Err("Unvalidated network terminal reply".into())
+                }
+                Err(CommandWaitFailure::ChannelClosed) => Err("CDP response channel closed".into()),
+                Err(CommandWaitFailure::Deadline) => {
+                    Err(format!("CDP command timed out: {}", method))
+                }
+            }
+        })
+        .await;
+        result.map_err(|_| NetworkCommandFailure {
+            retirement: capture.and_then(|capture| capture.retirement),
+        })
+    }
+    fn capture_network_retirement(&self, capture: &mut NetworkFailureCapture) {
+        // Keep current transport identity and original active ledger state in
+        // one synchronous lock decision. This is the existing owner->ledger order.
+        let Ok(current) = self.transport.debt_owner.lock() else {
+            return;
+        };
+        if self
+            .owner
+            .as_ref()
+            .is_some_and(|owner| Arc::ptr_eq(owner, &capture.owner))
+            && current
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, &capture.owner))
+            && capture
+                .owner
+                .network_command_destroyed_active(&capture.status)
+        {
+            capture.retirement = Some(NetworkCommandRetirement {
+                owner: capture.owner.clone(),
+                status: capture.status.clone(),
+                session: capture.session.clone(),
+            });
+        }
+    }
+    pub(crate) fn consume_network_retirement(
+        &self,
+        receipt: NetworkCommandRetirement,
+        generation: u64,
+        scope: &str,
+        session: &str,
+    ) -> bool {
+        let Ok(current) = self.transport.debt_owner.lock() else {
+            return false;
+        };
+        receipt.session == session
+            && receipt.owner.matches_owner(generation, scope)
+            && self
+                .owner
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, &receipt.owner))
+            && current
+                .as_ref()
+                .is_some_and(|owner| Arc::ptr_eq(owner, &receipt.owner))
+            && receipt
+                .owner
+                .network_command_destroyed_active(&receipt.status)
+    }
     pub(crate) async fn send_action_command(
         &self,
         method: &str,
@@ -2639,6 +2841,15 @@ impl CdpClient {
         response: CommandResponse,
         deadline: Option<std::time::Instant>,
     ) -> Result<CommandReply, CommandWaitFailure> {
+        self.await_command_reply_observed(response, deadline, None)
+            .await
+    }
+    async fn await_command_reply_observed(
+        &self,
+        response: CommandResponse,
+        deadline: Option<std::time::Instant>,
+        capture: Option<&mut NetworkFailureCapture>,
+    ) -> Result<CommandReply, CommandWaitFailure> {
         use crate::native::client_observation::query_diagnostic::commands::{Outcome, Timer};
         let CommandResponse {
             mut timing,
@@ -2664,6 +2875,9 @@ impl CdpClient {
             }
             Ok(Err(_)) => {
                 guard.done = true;
+                if let Some(capture) = capture {
+                    self.capture_network_retirement(capture);
+                }
                 Err(CommandWaitFailure::ChannelClosed)
             }
             Err(_) => {

@@ -88,14 +88,37 @@ enum Control {
     ReleaseHeld(oneshot::Sender<()>),
     Disarm(oneshot::Sender<()>),
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerExit {
+    NativeCloseFrame,
+    NativeEndOfStream,
+    TestDisconnect,
+}
+#[derive(Debug)]
+struct PeerReport {
+    mode: Mode,
+    exit: PeerExit,
+    armed: bool,
+    application_count: usize,
+    release_seen: bool,
+    held_response_pending: bool,
+    final_tree_response_pending: bool,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Disarm {
+    Acknowledged,
+    ControlClosedBeforeSend,
+    ControlClosedBeforeAck,
+}
 struct Peer {
+    mode: Mode,
     endpoint: String,
     application: Arc<Mutex<Vec<Value>>>,
     releases: Arc<Mutex<Vec<Value>>>,
     control: mpsc::UnboundedSender<Control>,
     held: mpsc::UnboundedReceiver<()>,
     disconnect: oneshot::Sender<()>,
-    task: tokio::task::JoinHandle<()>,
+    task: tokio::task::JoinHandle<PeerReport>,
 }
 async fn control(peer: &Peer, make: impl FnOnce(oneshot::Sender<()>) -> Control) {
     let (send, receive) = oneshot::channel();
@@ -104,6 +127,22 @@ async fn control(peer: &Peer, make: impl FnOnce(oneshot::Sender<()>) -> Control)
         .await
         .expect("peer control not consumed")
         .unwrap();
+}
+// Only terminal teardown may observe an already exited peer. Arm and exact
+// held-ACK release still use control(), whose ACK is mandatory. A closed
+// Disarm channel is not success: finish() must join and validate PeerReport.
+async fn disarm(peer: &Peer) -> Disarm {
+    let (send, receive) = oneshot::channel();
+    if peer.control.send(Control::Disarm(send)).is_err() {
+        return Disarm::ControlClosedBeforeSend;
+    }
+    match tokio::time::timeout(Duration::from_secs(2), receive)
+        .await
+        .expect("peer teardown control not consumed")
+    {
+        Ok(()) => Disarm::Acknowledged,
+        Err(_) => Disarm::ControlClosedBeforeAck,
+    }
 }
 fn reply(request: &Value, result: Value) -> Value {
     let mut response = json!({"id":request["id"],"result":result});
@@ -170,7 +209,7 @@ fn application_reply(request: &Value, group: &mut Option<String>) -> Value {
             assert_eq!(
                 request["params"]["arguments"],
                 json!([
-                    {"value":expression()}, {"value":["value"]},
+                    {"value":canonical_expression()}, {"value":["value"]},
                     {"value":"data-testid"}, {"value":FIXTURE_SECURE_SELECTOR},
                     {"value":[true]}, {"value":[0]}, {"objectId":"field-root"}
                 ])
@@ -205,9 +244,9 @@ async fn peer(mode: Mode) -> Peer {
         let mut release_seen = false;
         let mut held_response = None;
         let mut final_tree_response = None;
-        loop {
+        let exit = loop {
             tokio::select! {
-                _ = &mut disconnected => break,
+                _ = &mut disconnected => break PeerExit::TestDisconnect,
                 command = controls.recv() => {
                     match command.expect("peer controls remain owned") {
                         Control::Arm(done) => {
@@ -229,7 +268,20 @@ async fn peer(mode: Mode) -> Peer {
                     }
                 }
                 message = socket.next() => {
-                    let Some(Ok(Message::Text(text))) = message else { break; };
+                    let text = match message {
+                        Some(Ok(Message::Text(text))) => text,
+                        Some(Ok(Message::Ping(payload))) => {
+                            socket.send(Message::Pong(payload)).await.unwrap();
+                            continue;
+                        }
+                        Some(Ok(Message::Pong(_))) => continue,
+                        Some(Ok(Message::Close(_))) => break PeerExit::NativeCloseFrame,
+                        None => break PeerExit::NativeEndOfStream,
+                        Some(Ok(Message::Binary(_) | Message::Frame(_))) => {
+                            panic!("unexpected field fixture WebSocket frame")
+                        }
+                        Some(Err(error)) => panic!("field fixture WebSocket failed: {error}"),
+                    };
                     let request: Value = serde_json::from_str(&text).unwrap();
                     let method = request["method"].as_str().unwrap();
                     if armed {
@@ -281,6 +333,11 @@ async fn peer(mode: Mode) -> Peer {
                         }
                         continue;
                     }
+                    // Setup may perform these reads; terminal cleanup may not
+                    // silently resume the completed field application script.
+                    if ordinal != 0 {
+                        assert!(!APPLICATION.contains(&method), "late application read after Disarm: {method}");
+                    }
                     let session = request["sessionId"].as_str().unwrap_or("");
                     let result = match method {
                         "Browser.getVersion" => json!({"protocolVersion":"1.3","product":"Synthetic Chromium/1.0","revision":"synthetic","userAgent":"Synthetic Chromium Linux","jsVersion":"synthetic"}),
@@ -316,9 +373,19 @@ async fn peer(mode: Mode) -> Peer {
                     }
                 }
             }
+        };
+        PeerReport {
+            mode,
+            exit,
+            armed,
+            application_count: ordinal,
+            release_seen,
+            held_response_pending: held_response.is_some(),
+            final_tree_response_pending: final_tree_response.is_some(),
         }
     });
     Peer {
+        mode,
         endpoint,
         application,
         releases,
@@ -330,7 +397,15 @@ async fn peer(mode: Mode) -> Peer {
 }
 
 fn expression() -> Value {
+    // Public input deliberately omits the optional/defaulted state filter.
     json!({"kind":"query","query":{"kind":"testId","value":{"kind":"string","value":"city","exact":true}}})
+}
+fn canonical_expression() -> Value {
+    // SemanticQuery.states has serde(default), but no skip_serializing_if.
+    // ClientBrowser deserializes the public input before fresh_query serializes
+    // this typed expression into callFunctionOn arguments. Compare the exact
+    // canonical wire value, not the unnormalized public request object.
+    json!({"kind":"query","query":{"kind":"testId","value":{"kind":"string","value":"city","exact":true},"states":{}}})
 }
 async fn debt_settled(ledger: &OwnerDebtLedger) {
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -348,6 +423,7 @@ async fn debt_settled(ledger: &OwnerDebtLedger) {
     .expect("exact command/group ACK did not settle");
 }
 async fn setup(mode: Mode) -> (Peer, Arc<ClientBrowser>, FramedFixture, String) {
+    eprintln!("PUBLIC_FIELD_CASE mode={mode:?} phase=setup");
     let peer = peer(mode).await;
     let broker = Arc::new(ClientSession::new());
     let browser = Arc::new(ClientBrowser::new(broker.clone()));
@@ -436,8 +512,8 @@ async fn result(fixture: &mut FramedFixture, cancellation: bool) -> Value {
                 }
                 other => panic!("unexpected ReadFields frame {other:?}: {frame}"),
             }
-            if result.is_some() && (!cancellation || cancelled) {
-                return result.unwrap();
+            if let Some(value) = result.take_if(|_| !cancellation || cancelled) {
+                return value;
             }
         }
         panic!("ReadFields frame bound exhausted");
@@ -475,24 +551,77 @@ fn assert_rejected(value: &Value, browser: &ClientBrowser) {
     );
 }
 async fn finish(peer: Peer, fixture: FramedFixture, poisoned: bool) {
-    control(&peer, Control::Disarm).await;
-    let cleanup = tokio::time::timeout(Duration::from_secs(10), fixture.finish())
+    // All public result/ledger assertions run before this call. Recheck the
+    // exact completed script before allowing any terminal-only alternative.
+    let mode = peer.mode;
+    assert_eq!(poisoned, mode.foreign());
+    assert_script(&peer, mode);
+    let expected_count = mode.boundary().map_or(APPLICATION.len(), |at| at + 1);
+    let application = peer.application.clone();
+    let releases = peer.releases.clone();
+    let completed_application = application.lock().unwrap().clone();
+    let completed_releases = releases.lock().unwrap().clone();
+    eprintln!("PUBLIC_FIELD_CASE mode={mode:?} phase=business-assertions-complete");
+    let disarm = disarm(&peer).await;
+    // Match FramedFixture::finish's real EOF/server join, but do not collapse
+    // a native framed-server panic into the expected poisoned cleanup refusal.
+    drop(fixture.stream);
+    let cleanup = tokio::time::timeout(Duration::from_secs(10), fixture.server)
         .await
-        .expect("framed shutdown stalled");
-    assert_eq!(
-        cleanup.is_err(),
-        poisoned,
-        "poisoned custody cannot report clean shutdown"
-    );
-    if poisoned {
-        // Test teardown only, after all public result/debt assertions. EOF is
-        // not an ACK and is never used to justify the operation's refusal.
+        .expect("framed shutdown stalled")
+        .expect("native framed server panicked");
+    if poisoned && disarm == Disarm::Acknowledged {
+        // Teardown only, after native shutdown has actually been joined. If
+        // Disarm lost its ACK, do NOT force a close and mistake it for evidence
+        // of the native close that must instead explain the missing control.
         let _ = peer.disconnect.send(());
     }
-    tokio::time::timeout(Duration::from_secs(2), peer.task)
+    let report = tokio::time::timeout(Duration::from_secs(2), peer.task)
         .await
         .expect("CDP peer not joined")
-        .unwrap();
+        .expect("CDP peer panicked");
+    eprintln!(
+        "PUBLIC_FIELD_PEER_TEARDOWN mode={mode:?} disarm={disarm:?} report={report:?} cleanup_failed={}",
+        !cleanup
+    );
+    assert_eq!(
+        !cleanup, poisoned,
+        "poisoned custody cannot report clean shutdown"
+    );
+    assert_eq!(report.mode, mode);
+    assert_eq!(*application.lock().unwrap(), completed_application);
+    assert_eq!(*releases.lock().unwrap(), completed_releases);
+    assert_eq!(report.application_count, expected_count);
+    assert_eq!(report.release_seen, expected_count > 9);
+    assert!(
+        !report.held_response_pending,
+        "teardown lost a required held ACK"
+    );
+    assert!(
+        !report.final_tree_response_pending,
+        "teardown lost a final-tree rendezvous"
+    );
+    match disarm {
+        Disarm::Acknowledged => {
+            assert!(!report.armed);
+            if !poisoned {
+                assert_ne!(report.exit, PeerExit::TestDisconnect);
+            }
+        }
+        Disarm::ControlClosedBeforeSend | Disarm::ControlClosedBeforeAck => {
+            // Unknown/quarantined public results automatically start native
+            // shutdown. That real close can win before test-side Disarm. Only
+            // exact native Close/EOF plus joined, complete, debt-checked work is
+            // acceptable; timeout, peer panic, unknown I/O failure, or test-side
+            // disconnect cannot substitute for that lifecycle evidence.
+            assert!(poisoned, "usable operation lost its live peer control");
+            assert!(report.armed);
+            assert!(matches!(
+                report.exit,
+                PeerExit::NativeCloseFrame | PeerExit::NativeEndOfStream
+            ));
+        }
+    }
 }
 
 #[tokio::test]
@@ -641,6 +770,7 @@ async fn public_read_fields_valid_async_cleanup_custody_does_not_require_release
 async fn public_read_fields_original_stop_survives_held_inventory_ack() {
     for mode in [Mode::HeldInitialDescription, Mode::HeldFinalDescription] {
         for cancel in [false, true] {
+            eprintln!("PUBLIC_FIELD_STOP mode={mode:?} cancel={cancel}");
             let (mut peer, browser, mut fixture, scope) = setup(mode).await;
             let ledger = browser
                 .page_lease(false)

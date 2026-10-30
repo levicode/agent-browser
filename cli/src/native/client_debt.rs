@@ -3256,6 +3256,13 @@ impl OwnerDebtLedger {
                 })
         })
     }
+    /// Exact reader destruction, not aggregate zero debt or lifecycle absence.
+    /// The caller holds the transport owner lock across this synchronous check.
+    pub(crate) fn network_command_destroyed_active(&self, status: &CommandStatusHandle) -> bool {
+        self.state.lock().is_ok_and(|state| {
+            !state.retired && !state.integrity_lost && status.snapshot() == CommandStatus::Destroyed
+        })
+    }
     pub(crate) fn connection_lost(&self) {
         let _notification = DebtChange(&self.changed);
         match self.state.lock() {
