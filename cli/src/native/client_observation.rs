@@ -4412,7 +4412,51 @@ async fn validated_frame_dom(
     )
     .await?;
     validate_frame_tree(&tree, frame, false)?;
+    if tree["frameTree"]["frame"]["id"].as_str() == Some(frame.binding.frame.as_str()) {
+        // getDocument resets earlier frontend bindings, including Observe's.
+        // Bind only its Document here: a deep tracked read subscribes the
+        // renderer to needless mutation events for every acquired descendant.
+        // The full policy tree is still fetched fresh, without frontend IDs.
+        let document = command(
+            client,
+            &frame.binding.session,
+            "DOM.getDocument",
+            json!({"depth":0,"pierce":true}),
+            lease,
+        )
+        .await?;
+        let backend = document_backend(&document["root"])?;
+        let described = command(
+            client,
+            &frame.binding.session,
+            "DOM.describeNode",
+            json!({"backendNodeId":backend,"depth":-1,"pierce":true}),
+            lease,
+        )
+        .await?;
+        let root = &described["node"];
+        if document_backend(root)? != backend {
+            return Err(ObservationError::StaleReference);
+        }
+        // A depth -1 Document description includes its children array even
+        // when empty. Never substitute the shallow seed for missing deep data.
+        if !root["children"].is_array() {
+            return Err(ObservationError::BackendFailure);
+        }
+        return Ok(json!({"root":root}));
+    }
+    // A same-session child keeps its original stateless contentDocument path.
     frame_dom_from_tree(client, frame, lease, &tree).await
+}
+
+fn document_backend(node: &Value) -> Result<i64, ObservationError> {
+    if node["nodeType"] != 9 {
+        return Err(ObservationError::BackendFailure);
+    }
+    node["backendNodeId"]
+        .as_i64()
+        .filter(|backend| *backend > 0)
+        .ok_or(ObservationError::BackendFailure)
 }
 
 async fn frame_dom_from_tree(
@@ -8901,7 +8945,14 @@ mod tests {
                         seen.lock().unwrap().push(request.clone());
                         let result = match request["method"].as_str().unwrap() {
                             "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}}),
-                            "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":99,"children":[]}}),
+                            "DOM.getDocument" => {
+                                assert_eq!(request["params"], json!({"depth":0,"pierce":true}));
+                                json!({"root":{"nodeType":9,"backendNodeId":99}})
+                            },
+                            "DOM.describeNode" => {
+                                assert_eq!(request["params"], json!({"backendNodeId":99,"depth":-1,"pierce":true}));
+                                json!({"node":{"nodeId":0,"nodeType":9,"backendNodeId":99,"children":[]}})
+                            },
                             "Page.createIsolatedWorld" => {
                                 world_count += 1;
                                 if world_count <= 32 {
@@ -9157,7 +9208,14 @@ mod tests {
                         seen.lock().unwrap().push(request.clone());
                         let result = match request["method"].as_str().unwrap() {
                             "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}}),
-                            "DOM.getDocument" => json!({"root":{"nodeType":9,"backendNodeId":99,"children":[]}}),
+                            "DOM.getDocument" => {
+                                assert_eq!(request["params"], json!({"depth":0,"pierce":true}));
+                                json!({"root":{"nodeType":9,"backendNodeId":99}})
+                            },
+                            "DOM.describeNode" => {
+                                assert_eq!(request["params"], json!({"backendNodeId":99,"depth":-1,"pierce":true}));
+                                json!({"node":{"nodeId":0,"nodeType":9,"backendNodeId":99,"children":[]}})
+                            },
                             "Page.createIsolatedWorld" => json!({"executionContextId":1}),
                             "DOM.resolveNode" | "Runtime.releaseObjectGroup" => {
                                 held_tx.send(request).unwrap();

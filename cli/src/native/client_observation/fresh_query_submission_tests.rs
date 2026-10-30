@@ -68,9 +68,16 @@ async fn boundary_case(stop: Stop) {
                     seen.lock().unwrap().push(request.clone());
                     let result = match request["method"].as_str().unwrap() {
                         "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"main","loaderId":"doc"}}}),
-                        "DOM.getDocument" => if mixed {
-                            json!({"root":{"nodeType":9,"backendNodeId":99,"children":[{"nodeType":1,"backendNodeId":100,"children":[],"shadowRoots":[{"nodeType":11,"backendNodeId":11,"shadowRootType":"closed","children":[]}]}]}})
-                        } else { json!({"root":{"nodeType":9,"backendNodeId":99,"children":[]}}) },
+                        "DOM.getDocument" => {
+                            assert_eq!(request["params"], json!({"depth":0,"pierce":true}));
+                            json!({"root":{"nodeType":9,"backendNodeId":99}})
+                        },
+                        "DOM.describeNode" => {
+                            assert_eq!(request["params"], json!({"backendNodeId":99,"depth":-1,"pierce":true}));
+                            if mixed {
+                                json!({"node":{"nodeId":0,"nodeType":9,"backendNodeId":99,"children":[{"nodeId":0,"nodeType":1,"backendNodeId":100,"children":[],"shadowRoots":[{"nodeId":0,"nodeType":11,"backendNodeId":11,"shadowRootType":"closed","children":[]}]}]}})
+                            } else { json!({"node":{"nodeId":0,"nodeType":9,"backendNodeId":99,"children":[]}}) }
+                        },
                         "Page.createIsolatedWorld" => json!({"executionContextId":1}),
                         "DOM.resolveNode" | "Runtime.releaseObjectGroup" => {
                             held_tx.send(request).unwrap();

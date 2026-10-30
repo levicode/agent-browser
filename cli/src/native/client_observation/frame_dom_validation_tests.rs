@@ -18,12 +18,18 @@ struct Step {
     method: &'static str,
     params: Option<Value>,
     result: Value,
+    stop: Option<CancelSignal>,
+    error: Option<Value>,
+    reply_session: Option<&'static str>,
 }
 fn step(method: &'static str, params: Value, result: Value) -> Step {
     Step {
         method,
         params: Some(params),
         result,
+        stop: None,
+        error: None,
+        reply_session: None,
     }
 }
 fn frame(child: bool) -> ObservationFrame {
@@ -74,11 +80,18 @@ fn inventory(child: bool, backend: i64) -> Vec<Step> {
             ),
         ]);
     } else {
-        steps.push(step(
-            "DOM.getDocument",
-            json!({"depth":-1,"pierce":true}),
-            dom(backend),
-        ));
+        steps.extend([
+            step(
+                "DOM.getDocument",
+                json!({"depth":0,"pierce":true}),
+                json!({"root":{"nodeType":9,"backendNodeId":backend}}),
+            ),
+            step(
+                "DOM.describeNode",
+                json!({"backendNodeId":backend,"depth":-1,"pierce":true}),
+                json!({"node":dom(backend)["root"]}),
+            ),
+        ]);
     }
     steps
 }
@@ -93,16 +106,25 @@ fn fields_prefix(child: bool) -> Vec<Step> {
         Step {
             method: "DOM.resolveNode",
             params: None,
+            stop: None,
+            error: None,
+            reply_session: None,
             result: json!({"object":{"objectId":"root-object","subtype":"node"}}),
         },
         Step {
             method: "Runtime.callFunctionOn",
             params: None,
+            stop: None,
+            error: None,
+            reply_session: None,
             result: json!({"result":{"value":{"values":[]}}}),
         },
         Step {
             method: "Runtime.releaseObjectGroup",
             params: None,
+            stop: None,
+            error: None,
+            reply_session: None,
             result: json!({}),
         },
     ]);
@@ -114,9 +136,19 @@ async fn run_case(
     selected: ObservationFrame,
     steps: Vec<Step>,
 ) -> (Result<Value, ObservationError>, Vec<Value>) {
+    run_case_with_integrity(read, selected, steps, false).await
+}
+async fn run_case_with_integrity(
+    read: Read,
+    selected: ObservationFrame,
+    steps: Vec<Step>,
+    expect_integrity_loss: bool,
+) -> (Result<Value, ObservationError>, Vec<Value>) {
     let expected_count = steps.len();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+    let (cancellation, receiver) = tokio::sync::watch::channel(CancelSignal::None);
+    let peer_cancellation = cancellation.clone();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
         let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -155,11 +187,16 @@ async fn run_case(
             if let Some(params) = expected.params {
                 assert_eq!(request["params"], params);
             }
+            if let Some(stop) = expected.stop {
+                peer_cancellation.send_replace(stop);
+            }
+            let session = expected.reply_session.unwrap_or("renderer");
+            let response = match expected.error {
+                Some(error) => json!({"id":request["id"],"sessionId":session,"error":error}),
+                None => json!({"id":request["id"],"sessionId":session,"result":expected.result}),
+            };
             socket
-                .send(Message::Text(
-                    json!({"id":request["id"],"sessionId":"renderer","result":expected.result})
-                        .to_string(),
-                ))
+                .send(Message::Text(response.to_string()))
                 .await
                 .unwrap();
             requests.push(request);
@@ -181,7 +218,6 @@ async fn run_case(
     let ledger = OwnerDebtLedger::new(1, "frame-dom-owner".into());
     transport.install_debt_ledger(ledger.clone()).unwrap();
     let client = transport.owner_view(ledger.clone()).unwrap();
-    let (_cancellation, receiver) = tokio::sync::watch::channel(CancelSignal::None);
     let lease = OperationLease {
         is_callback: false,
         generation: 1,
@@ -230,24 +266,40 @@ async fn run_case(
     )
     .await
     .expect("bounded field/frame read did not finish");
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let snapshot = ledger.snapshot();
-            assert!(
-                !snapshot.integrity_lost,
-                "cleanup accounting lost integrity"
-            );
-            if snapshot.outstanding_commands == 0 && snapshot.object_debt == 0 {
-                break;
+    if expect_integrity_loss {
+        // A foreign-session ACK is not settlement. Observe exact retained debt;
+        // do not route this adversarial case through the clean-debt success wait.
+        let snapshot = ledger.snapshot();
+        assert!(snapshot.integrity_lost, "foreign ACK must poison authority");
+        assert_eq!(
+            snapshot.outstanding_commands, 1,
+            "foreign ACK must not settle the read"
+        );
+        assert_eq!(
+            snapshot.object_debt, 0,
+            "inventory cannot create object handles"
+        );
+        assert_eq!(snapshot.input_debt, 0);
+    } else {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = ledger.snapshot();
+                assert!(
+                    !snapshot.integrity_lost,
+                    "cleanup accounting lost integrity"
+                );
+                if snapshot.outstanding_commands == 0 && snapshot.object_debt == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("accounted release did not settle exact command and object debt");
-    assert_eq!(ledger.snapshot().object_debt, 0);
-    assert_eq!(ledger.snapshot().input_debt, 0);
-    assert!(!ledger.snapshot().integrity_lost);
+        })
+        .await
+        .expect("accounted release did not settle exact command and object debt");
+        assert_eq!(ledger.snapshot().object_debt, 0);
+        assert_eq!(ledger.snapshot().input_debt, 0);
+        assert!(!ledger.snapshot().integrity_lost);
+    }
     assert!(!journal.snapshot().mutation_dispatched);
     tokio::time::timeout(Duration::from_secs(1), transport.close())
         .await
@@ -324,7 +376,7 @@ async fn root_and_child_dom_keep_exact_branches_with_one_fresh_tree_each() {
         let (result, requests) =
             run_case(Read::Validated, frame(child), inventory(child, 99)).await;
         assert_eq!(result, Ok(dom(99)));
-        assert_eq!(requests.len(), if child { 4 } else { 2 });
+        assert_eq!(requests.len(), if child { 4 } else { 3 });
         assert_eq!(
             requests
                 .iter()
@@ -342,7 +394,7 @@ async fn selected_child_that_is_its_session_root_uses_get_document() {
     steps[0].result = json!({"frameTree":{"frame":{"id":"child","loaderId":"doc"}}});
     let (result, requests) = run_case(Read::Validated, selected, steps).await;
     assert_eq!(result, Ok(dom(99)));
-    assert_eq!(requests.len(), 2);
+    assert_eq!(requests.len(), 3);
     assert_eq!(requests[1]["method"], "DOM.getDocument");
 }
 
@@ -386,7 +438,18 @@ async fn child_without_content_document_keeps_existing_backend_failure() {
 #[tokio::test]
 async fn legacy_frame_dom_keeps_loader_agnostic_root_and_child_behavior() {
     for child in [false, true] {
-        let mut steps = inventory(child, 99);
+        let mut steps = if child {
+            inventory(true, 99)
+        } else {
+            vec![
+                step("Page.getFrameTree", json!({}), tree(false, "doc")),
+                step(
+                    "DOM.getDocument",
+                    json!({"depth":-1,"pierce":true}),
+                    dom(99),
+                ),
+            ]
+        };
         steps[0].result = tree(child, "other-doc");
         let (result, _) = run_case(Read::Legacy, frame(child), steps).await;
         assert_eq!(result, Ok(dom(99)));
@@ -400,7 +463,7 @@ async fn fresh_fields_reacquire_final_inventory_with_exact_cdp_counts() {
         steps.extend(inventory(child, 99));
         let (result, requests) = run_case(Read::Fields, frame(child), steps).await;
         assert_eq!(result, Ok(json!([])));
-        assert_eq!(requests.len(), if child { 12 } else { 8 });
+        assert_eq!(requests.len(), if child { 12 } else { 10 });
         assert_eq!(
             requests
                 .iter()
@@ -460,5 +523,192 @@ async fn fresh_fields_final_loader_and_root_changes_still_reject_publication() {
         steps.extend(inventory(child, 100));
         let (result, _) = run_case(Read::Fields, frame(child), steps).await;
         assert_eq!(result, Err(ObservationError::StaleReference));
+    }
+}
+
+#[tokio::test]
+async fn stateless_root_rejects_malformed_seed_and_deep_document_identity() {
+    for root in [
+        Value::Null,
+        json!({"nodeType":1,"backendNodeId":99}),
+        json!({"nodeType":9}),
+        json!({"nodeType":9,"backendNodeId":0}),
+        json!({"nodeType":9,"backendNodeId":-1}),
+        json!({"nodeType":9,"backendNodeId":1.5}),
+        json!({"nodeType":9,"backendNodeId":"99"}),
+    ] {
+        let mut steps = inventory(false, 99);
+        steps.truncate(2);
+        steps[1].result = json!({"root":root});
+        let (result, requests) = run_case(Read::Validated, frame(false), steps).await;
+        assert_eq!(result, Err(ObservationError::BackendFailure));
+        assert_eq!(
+            requests.len(),
+            2,
+            "malformed seed must not reach describeNode"
+        );
+    }
+    for (node, error) in [
+        (Value::Null, ObservationError::BackendFailure),
+        (
+            json!({"nodeType":1,"backendNodeId":99,"children":[]}),
+            ObservationError::BackendFailure,
+        ),
+        (
+            json!({"nodeType":9,"backendNodeId":0,"children":[]}),
+            ObservationError::BackendFailure,
+        ),
+        (
+            json!({"nodeType":9,"backendNodeId":99}),
+            ObservationError::BackendFailure,
+        ),
+        (
+            json!({"nodeType":9,"backendNodeId":99,"children":{}}),
+            ObservationError::BackendFailure,
+        ),
+        (
+            json!({"nodeType":9,"backendNodeId":100,"children":[]}),
+            ObservationError::StaleReference,
+        ),
+    ] {
+        let mut steps = inventory(false, 99);
+        steps[2].result = json!({"node":node});
+        let (result, requests) = run_case(Read::Validated, frame(false), steps).await;
+        assert_eq!(result, Err(error));
+        assert_eq!(requests.len(), 3);
+    }
+}
+
+#[tokio::test]
+async fn stateless_root_keeps_zero_frontend_ids_and_full_shadow_security_inventory() {
+    for ua_password in [false, true] {
+        let deep = json!({"nodeId":0,"nodeType":9,"backendNodeId":99,"children":[
+            {"nodeId":0,"parentId":0,"nodeType":1,"nodeName":"DIV","backendNodeId":40,"children":[],
+             "shadowRoots":[{"nodeId":0,"nodeType":11,"backendNodeId":41,"shadowRootType":"closed","children":[]}]},
+            {"nodeId":0,"parentId":0,"nodeType":1,"nodeName":"DIV","backendNodeId":60,"children":[],
+             "shadowRoots":[{"nodeId":0,"nodeType":11,"backendNodeId":61,"shadowRootType":"open","children":[]}]},
+            {"nodeId":0,"parentId":0,"nodeType":1,"nodeName":"INPUT","backendNodeId":50,"children":[],
+             "shadowRoots":[{"nodeId":0,"nodeType":11,"backendNodeId":51,"shadowRootType":"user-agent","children":[
+                 {"nodeId":0,"nodeType":1,"nodeName":if ua_password {"INPUT"} else {"DIV"},"backendNodeId":52,
+                  "attributes":if ua_password {json!(["type","password"])} else {json!([])},"children":[]}
+             ]}]}
+        ]});
+        let mut steps = inventory(false, 99);
+        steps[2].result = json!({"node":deep});
+        let (result, requests) = run_case(Read::Validated, frame(false), steps).await;
+        assert_eq!(
+            result,
+            Ok(json!({"root":deep})),
+            "full native tree must be preserved"
+        );
+        assert_eq!(requests[1]["params"], json!({"depth":0,"pierce":true}));
+        assert_eq!(
+            requests[2]["params"],
+            json!({"backendNodeId":99,"depth":-1,"pierce":true})
+        );
+        assert_eq!(
+            fresh_query::roots(&deep).unwrap(),
+            if ua_password {
+                None
+            } else {
+                Some((vec![99, 41, 61], vec![true, true, true], vec![0, 1]))
+            }
+        );
+        // Frontend mirror numbers are neither root authority nor policy input.
+        fn front_ids(node: &mut Value) {
+            node["nodeId"] = json!(700);
+            node["parentId"] = json!(701);
+            for key in ["children", "shadowRoots"] {
+                if let Some(children) = node[key].as_array_mut() {
+                    for child in children {
+                        front_ids(child);
+                    }
+                }
+            }
+        }
+        let mut tracked = deep.clone();
+        front_ids(&mut tracked);
+        assert_eq!(fresh_query::roots(&deep), fresh_query::roots(&tracked));
+    }
+}
+
+#[tokio::test]
+async fn stateless_root_boundary_keeps_original_cancel_and_deadline_without_group_debt() {
+    for signal in [CancelSignal::Requested, CancelSignal::DeadlineExceeded] {
+        for boundary in [1usize, 2] {
+            let mut steps = inventory(false, 99);
+            steps.truncate(boundary + 1);
+            steps[boundary].stop = Some(signal);
+            let (result, requests) = run_case(Read::Validated, frame(false), steps).await;
+            assert_eq!(
+                result,
+                Err(if signal == CancelSignal::Requested {
+                    ObservationError::Cancelled
+                } else {
+                    ObservationError::DeadlineExceeded
+                })
+            );
+            assert_eq!(requests.len(), boundary + 1);
+            assert!(!requests
+                .iter()
+                .any(|request| request["method"] == "DOM.resolveNode"
+                    || request["method"] == "Runtime.releaseObjectGroup"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn fresh_fields_stateless_final_description_navigation_and_closed_root_changes_reject() {
+    for changed_document in [false, true] {
+        let mut steps = fields_prefix(false);
+        let mut final_inventory = inventory(false, 99);
+        final_inventory[2].result = if changed_document {
+            // The second RPC may never substitute another Document for its seed.
+            json!({"node":{"nodeType":9,"backendNodeId":100,"children":[]}})
+        } else {
+            json!({"node":{"nodeId":0,"nodeType":9,"backendNodeId":99,"children":[
+                {"nodeId":0,"nodeType":1,"backendNodeId":40,"shadowRoots":[
+                    {"nodeId":0,"nodeType":11,"backendNodeId":41,"shadowRootType":"closed","children":[]}
+                ]}
+            ]}})
+        };
+        steps.extend(final_inventory);
+        let (result, requests) = run_case(Read::Fields, frame(false), steps).await;
+        assert_eq!(result, Err(ObservationError::StaleReference));
+        assert_eq!(requests.len(), 10);
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "DOM.getDocument")
+                .count(),
+            2
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request["method"] == "DOM.describeNode")
+                .count(),
+            2
+        );
+    }
+}
+
+#[tokio::test]
+async fn stateless_root_describe_errors_stay_opaque_and_foreign_ack_keeps_debt() {
+    for foreign_session in [false, true] {
+        let mut steps = inventory(false, 99);
+        if foreign_session {
+            steps[2].reply_session = Some("foreign-renderer");
+        } else {
+            // Opaque browser wording is not evidence of this operation's stop.
+            steps[2].error =
+                Some(json!({"code":-32000,"message":"deadline exceeded in another operation"}));
+        }
+        let (result, requests) =
+            run_case_with_integrity(Read::Validated, frame(false), steps, foreign_session).await;
+        assert_eq!(result, Err(ObservationError::BackendFailure));
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2]["method"], "DOM.describeNode");
+        assert_eq!(requests[2]["sessionId"], "renderer");
     }
 }
