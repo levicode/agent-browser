@@ -1601,7 +1601,7 @@ impl GeometrySnapshot {
         {
             return Err(GeometryError::StaleIdentity);
         }
-        let (model, _) = read_exact_box_impl(
+        let (model, _) = read_exact_box_with_evidence(
             client,
             &frame.binding,
             backend,
@@ -1662,18 +1662,30 @@ async fn read_exact_box(
     operation: &OperationLease,
     readonly_disposal: bool,
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
-    read_exact_box_impl(
+    read_exact_box_impl(client, binding, backend, operation, true, readonly_disposal).await
+}
+// Preserve the existing six-argument strict entry, including cfg(test) callers.
+// Only the semantic Observe path supplies node-negative evidence separately.
+async fn read_exact_box_impl(
+    client: &CdpClient,
+    binding: &element::ExactBinding,
+    backend: i64,
+    operation: &OperationLease,
+    require_owner_size: bool,
+    readonly_disposal: bool,
+) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
+    read_exact_box_with_evidence(
         client,
         binding,
         backend,
         operation,
-        true,
+        require_owner_size,
         readonly_disposal,
         None,
     )
     .await
 }
-async fn read_exact_box_impl(
+async fn read_exact_box_with_evidence(
     client: &CdpClient,
     binding: &element::ExactBinding,
     backend: i64,
