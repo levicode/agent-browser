@@ -773,6 +773,45 @@ fn extract_command_id(msg: &str) -> Option<u64> {
     envelope.id.filter(|id| *id > 0)
 }
 
+// Private test-scoped facts use only closed caller projections and scalars.
+// No broker, operation lease, or debt type enters this diagnostic payload.
+#[cfg(test)]
+#[derive(Default)]
+struct ActivationDiagnosticFacts {
+    cancel_signal: Option<&'static str>,
+    entry_deadline_elapsed: Option<bool>,
+    transport_closed: Option<bool>,
+    remote_closed_observed: Option<bool>,
+}
+#[cfg(test)]
+fn activation_signal_fact(signal: &str) -> &'static str {
+    match signal {
+        "none" => "none",
+        "requested" => "requested",
+        "deadline-exceeded" => "deadline-exceeded",
+        "session-closed" => "session-closed",
+        "owner-retirement" => "owner-retirement",
+        _ => "unknown",
+    }
+}
+#[cfg(test)]
+impl ActivationDiagnosticFacts {
+    fn insert_into(self, record: &mut Value) {
+        if let Some(signal) = self.cancel_signal {
+            record["cancelSignal"] = activation_signal_fact(signal).into();
+        }
+        if let Some(value) = self.entry_deadline_elapsed {
+            record["entryDeadlineElapsed"] = value.into();
+        }
+        if let Some(value) = self.transport_closed {
+            record["transportClosed"] = value.into();
+        }
+        if let Some(value) = self.remote_closed_observed {
+            record["remoteClosedObserved"] = value.into();
+        }
+    }
+}
+
 /// A handle is either the legacy physical owner or an immutable native-owner
 /// view. Views share one reader/writer/task set and cannot close that transport.
 pub struct CdpClient {
@@ -1402,6 +1441,12 @@ impl CdpClient {
         // A captured runtime view never owns the connection or its tasks.
         if self.owner.is_some() {
             return;
+        }
+        // Intent only, before acquiring any close/debt lock. Another closer
+        // can win later; this is not a completion or remote-cause receipt.
+        #[cfg(test)]
+        if !self.transport.close_complete.load(Ordering::SeqCst) {
+            self.activation_diagnostic("cdp-close-request", None, "entered", None, None);
         }
         let _close_guard = self.transport.close_lock.lock().await;
         if self.transport.close_complete.load(Ordering::SeqCst) {
@@ -2812,6 +2857,25 @@ impl CdpClient {
     ) -> Result<Value, String> {
         let reply = self.await_command_reply(response, deadline).await;
         #[cfg(test)]
+        if matches!(&reply, Err(CommandWaitFailure::ChannelClosed)) {
+            // Independent observations, not one atomic cause classification.
+            // Release the watch Ref before serialization or output.
+            let transport_closed = self.transport.closed.load(Ordering::SeqCst);
+            let remote_closed_observed = { *self.transport.remote_closed.borrow() };
+            self.activation_diagnostic_with_facts(
+                "cdp-channel-closed-facts",
+                Some(method),
+                "observed",
+                None,
+                None,
+                ActivationDiagnosticFacts {
+                    transport_closed: Some(transport_closed),
+                    remote_closed_observed: Some(remote_closed_observed),
+                    ..Default::default()
+                },
+            );
+        }
+        #[cfg(test)]
         self.activation_diagnostic(
             "cdp-reply",
             Some(method),
@@ -3244,6 +3308,46 @@ impl CdpClient {
         error: Option<&ProtocolError>,
         matches: Option<[bool; 4]>,
     ) {
+        self.activation_diagnostic_with_facts(
+            stage,
+            method,
+            outcome,
+            error,
+            matches,
+            Default::default(),
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activation_interruption_diagnostic(
+        &self,
+        signal: &'static str,
+        entry_deadline_elapsed: bool,
+    ) {
+        self.activation_diagnostic_with_facts(
+            "nav-interruption-facts",
+            Some("Page.navigate"),
+            "observed",
+            None,
+            None,
+            ActivationDiagnosticFacts {
+                cancel_signal: Some(activation_signal_fact(signal)),
+                entry_deadline_elapsed: Some(entry_deadline_elapsed),
+                ..Default::default()
+            },
+        );
+    }
+
+    #[cfg(test)]
+    fn activation_diagnostic_with_facts(
+        &self,
+        stage: &'static str,
+        method: Option<&str>,
+        outcome: &'static str,
+        error: Option<&ProtocolError>,
+        matches: Option<[bool; 4]>,
+        facts: ActivationDiagnosticFacts,
+    ) {
         let Ok(sequence) = self.transport.activation_diagnostic_sequence.try_update(
             Ordering::SeqCst,
             Ordering::SeqCst,
@@ -3272,6 +3376,9 @@ impl CdpClient {
             | "cdp-reserve"
             | "cdp-reply"
             | "cdp-result"
+            | "cdp-channel-closed-facts"
+            | "cdp-close-request"
+            | "nav-interruption-facts"
             | "cdp-admission"
             | "cdp-submit"
             | "nav-enter"
@@ -3319,16 +3426,15 @@ impl CdpClient {
             | "channel-closed" | "deadline" | "owner-changed" | "admission-refused"
             | "admission-revoked" | "transport-closed" | "cdp-error" | "send-failed"
             | "other-failure" | "overflow" | "malformed-frame" | "download" | "error-text"
-            | "cancelled" | "received" => outcome,
+            | "cancelled" | "received" | "observed" => outcome,
             _ => "other-outcome",
         };
-        println!(
-            "PERSISTENT_ACTIVATION_DIAGNOSTIC {}",
-            serde_json::json!({
-                "sequence":sequence,"stage":stage,"method":method,"outcome":outcome,
-                "protocolError":error,"matches":matches,"limitReached":sequence >= 128,
-            })
-        );
+        let mut record = serde_json::json!({
+            "sequence":sequence,"stage":stage,"method":method,"outcome":outcome,
+            "protocolError":error,"matches":matches,"limitReached":sequence >= 128,
+        });
+        facts.insert_into(&mut record);
+        println!("PERSISTENT_ACTIVATION_DIAGNOSTIC {}", record);
     }
 
     #[cfg(test)]
@@ -8011,3 +8117,7 @@ mod tests {
         server.abort();
     }
 }
+
+#[cfg(test)]
+#[path = "activation_facts_tests.rs"]
+mod activation_facts_tests;

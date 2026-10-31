@@ -364,6 +364,28 @@ impl AcknowledgedNavigation {
     }
 }
 
+// Native caller projects its own typed signal; the CDP diagnostic interface
+// receives only closed strings/bools. No watch borrow survives the call.
+#[cfg(test)]
+fn observe_trigger_interruption(
+    page: &BrowserExecutionLease,
+    operation: &OperationLease,
+    entry_deadline_elapsed: bool,
+) {
+    let signal = {
+        let signal = *operation.cancellation.borrow();
+        match signal {
+            CancelSignal::None => "none",
+            CancelSignal::Requested => "requested",
+            CancelSignal::DeadlineExceeded => "deadline-exceeded",
+            CancelSignal::SessionClosed => "session-closed",
+            CancelSignal::OwnerRetirement => "owner-retirement",
+        }
+    };
+    page.client
+        .activation_interruption_diagnostic(signal, entry_deadline_elapsed);
+}
+
 // Keep the original trigger, frame/loader baseline, bounded subscription and
 // existing producer explicit. No generic cleanup envelope or caller retry.
 #[allow(clippy::too_many_arguments)]
@@ -384,7 +406,15 @@ pub(super) async fn trigger(
     if method != "Page.navigate" {
         return Err(ProtocolError::InvalidArguments);
     }
-    check(page, operation)?;
+    let checked = check(page, operation);
+    #[cfg(test)]
+    if matches!(
+        &checked,
+        Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
+    ) {
+        observe_trigger_interruption(page, operation, Instant::now() >= operation.deadline);
+    }
+    checked?;
     let attachment = page.targets.owned_target(&page.target_id)?;
     let journal = OperationJournalHandle::current().ok_or(ProtocolError::ScopeUnavailable)?;
     if journal.key()
@@ -429,7 +459,12 @@ pub(super) async fn trigger(
     let mut cancellation = operation.cancellation.clone();
     let reason = tokio::select! {
         value = &mut original => {
-            check(page, operation)?;
+            let checked = check(page, operation);
+            #[cfg(test)]
+            if matches!(&checked, Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)) {
+                observe_trigger_interruption(page, operation, Instant::now() >= operation.deadline);
+            }
+            checked?;
             let response = value.map_err(|_| ProtocolError::BrowserFailure)?;
             if status.snapshot() == CommandStatus::Acknowledged && !status.is_error_ack() {
                 *acknowledged = AcknowledgedBoundary::from_ack(
@@ -442,13 +477,20 @@ pub(super) async fn trigger(
             return Ok(response);
         },
         _ = cancellation.changed() => {
-            if Instant::now() >= operation.deadline {
+            let entry_deadline_elapsed = Instant::now() >= operation.deadline;
+            #[cfg(test)]
+            observe_trigger_interruption(page, operation, entry_deadline_elapsed);
+            if entry_deadline_elapsed {
                 ProtocolError::DeadlineExceeded
             } else {
                 ProtocolError::Cancelled
             }
         },
-        _ = tokio::time::sleep_until(operation.deadline.into()) => ProtocolError::DeadlineExceeded,
+        _ = tokio::time::sleep_until(operation.deadline.into()) => {
+            #[cfg(test)]
+            observe_trigger_interruption(page, operation, Instant::now() >= operation.deadline);
+            ProtocolError::DeadlineExceeded
+        },
     };
     // Reserved/abandoned work never grants stop authority. A submitted command
     // remains owned by the exact CDP reader even if this waiter later expires.
