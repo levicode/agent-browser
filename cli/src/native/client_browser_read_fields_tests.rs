@@ -1227,6 +1227,9 @@ async fn public_read_fields_unresumed_worker_never_publishes_values_or_refs() {
         );
         assert_script(&peer, mode);
         page.targets.detach("unready-worker").unwrap();
+        // Release the fixture-owned ScopePermit before shutdown waits for
+        // the scope reader gate to drain and closes the real CDP transport.
+        drop(page);
         finish(peer, fixture, false).await;
     }
 }
@@ -1281,5 +1284,8 @@ async fn public_read_fields_extra_renderer_enters_full_final_lineage_without_res
     );
     assert_script(&peer, mode);
     page.targets.detach("extra-renderer").unwrap();
+    // Release the fixture-owned ScopePermit before shutdown waits for
+    // the scope reader gate to drain and closes the real CDP transport.
+    drop(page);
     finish(peer, fixture, false).await;
 }

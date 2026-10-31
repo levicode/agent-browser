@@ -450,6 +450,9 @@ const _: () = {
     assert!(MAX_RECORDS * std::mem::size_of::<RetainedRecord>() <= 4 * 1024 * 1024);
     assert!(QUERY_MAX_RECORDS * std::mem::size_of::<RetainedRecord>() <= 256 * 1024);
 };
+#[cfg(test)]
+type DrainHook = Arc<dyn Fn(DrainPoint) + Send + Sync>;
+
 struct Capture {
     source: Source,
     sink: Mutex<AppendSink>,
@@ -460,7 +463,7 @@ struct Capture {
     work: AtomicUsize,
     failed: AtomicBool,
     #[cfg(test)]
-    hook: Mutex<Option<Arc<dyn Fn(DrainPoint) + Send + Sync>>>,
+    hook: Mutex<Option<DrainHook>>,
 }
 impl Capture {
     fn new(source: Source, sink: AppendSink) -> Self {
