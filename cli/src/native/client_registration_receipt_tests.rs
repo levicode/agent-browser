@@ -149,7 +149,7 @@ fn registration_receipt_precommit_refusal_and_duplicate_do_not_fabricate_commit(
 fn registration_receipt_opt_out_keeps_slot_and_legacy_entry_unchanged() {
     let registry = ClientTargets::new("ctx".into(), "scope".into());
     assert!(registry
-        .attached_enrolled("ctx", "page".into(), "session".into(), "page".into())
+        .attached_enrolled("ctx", "page".into(), "session".into(), "page".into(), None)
         .unwrap());
     assert!(registry.state.try_lock().is_ok());
     assert!(RegistrationDiagnosticReceipt::default()
