@@ -1067,6 +1067,8 @@ pub struct ClientEnrollment {
     #[cfg(test)]
     retire_after_initialization_gate_error: AtomicBool,
 }
+type RegistrationResult = InitResult<Option<(Attribution, Option<IframeInitialization>)>>;
+
 struct EnrollmentAttachmentContext<'a> {
     context: &'a str,
     target: &'a str,
@@ -1970,19 +1972,16 @@ impl ClientEnrollment {
         use super::client_settlement_trace::EvalPreparationRefusal as Refused;
         use super::client_targets::PopupPreparationFailure as Failure;
         let (received, snapshot) = entry_snapshot;
-        // Freeze only the already-registered cohort. The configured stage-zero
-        // wait does not forgive a received-but-unapplied attachment or any other
-        // missing frontier proof. Record the predicate at its actual check.
+        // Freeze only the already-registered cohort and the original received
+        // prefix. An unapplied prefix is wait-only: every other predicate below
+        // must hold, and check_eval_preparation_locked still requires applied >=
+        // this fixed received frontier before preparation can complete. A new
+        // registration in that prefix revokes the original ledger fence; never
+        // recapture the cohort or forgive its missing receipt here.
         if index.pending_enrollment.is_empty() {
             return Err(Failure::new(
                 ProtocolError::ScopeUnavailable,
                 Refused::EmptyCohort,
-            ));
-        }
-        if index.applied_watermark < received {
-            return Err(Failure::new(
-                ProtocolError::ScopeUnavailable,
-                Refused::Frontier,
             ));
         }
         if index.pending_enrollment.len() > MAX_TASKS {
@@ -4305,51 +4304,33 @@ impl ClientEnrollment {
         self.ensure_supervisor().await?;
         #[cfg(test)]
         self.trace_capture_admission(CaptureLifecycleStep::EnrollingExisting, target, session);
-        let (entry, initialization) = self
-            .register_with_initialization(&self.targets.context_id, target, session, kind, None)
+        let (registration, diagnostic) = self.register_with_custody_observed(
+            EnrollmentAttachmentContext {
+                context: &self.targets.context_id,
+                target,
+                session,
+                kind,
+                parent: None,
+            },
+            None,
+            false,
+            false,
+            (
+                super::client_settlement_trace::DiagnosticTargetOrigin::InitialDiscovery,
+                op.sequence,
+            ),
+        );
+        let (entry, initialization) = registration
             .map_err(InitFailure::into_protocol)?
             .ok_or(ProtocolError::InvalidArguments)?;
-        self.diagnostic_registration(
-            &entry,
-            super::client_settlement_trace::DiagnosticTargetOrigin::InitialDiscovery,
-            op.sequence,
-        );
         let result = self
-            .initialize_observed(entry, op, None, initialization)
+            .initialize_with_registration(entry, op, None, initialization, Some(diagnostic))
             .await
             .map_err(InitFailure::into_protocol);
         if let Err(error) = &result {
             self.poison(error.clone());
         }
         result.and_then(InitializationOutcome::result)
-    }
-    fn diagnostic_registration(
-        &self,
-        entry: &Attribution,
-        origin: super::client_settlement_trace::DiagnosticTargetOrigin,
-        sequence: u64,
-    ) {
-        if !super::client_settlement_trace::inventory_enabled() {
-            return;
-        }
-        let Ok(index) = self.index.try_lock() else {
-            super::client_settlement_trace::target_observation_lost(self.generation, sequence);
-            return;
-        };
-        let parent = entry
-            .parent
-            .as_ref()
-            .and_then(|id| index.sessions.get(id))
-            .map(|e| e.target.clone());
-        let root = index.sessions.get(&entry.root).map(|e| e.target.clone());
-        drop(index);
-        self.targets.diagnostic_register(
-            &entry.target,
-            parent.as_deref(),
-            root.as_deref(),
-            origin,
-            (self.generation, sequence),
-        );
     }
     #[cfg(test)]
     fn register(
@@ -4364,6 +4345,7 @@ impl ClientEnrollment {
             .map(|registered| registered.map(|(entry, _)| entry))
             .map_err(InitFailure::into_protocol)
     }
+    #[cfg(test)]
     fn register_with_initialization(
         &self,
         context: &str,
@@ -4385,6 +4367,7 @@ impl ClientEnrollment {
             false,
         )
     }
+    #[cfg(test)]
     fn register_with_custody(
         &self,
         attachment: EnrollmentAttachmentContext<'_>,
@@ -4392,6 +4375,50 @@ impl ClientEnrollment {
         opaque_parentless: bool,
         paused_by_attachment: bool,
     ) -> InitResult<Option<(Attribution, Option<IframeInitialization>)>> {
+        self.register_with_custody_recording(
+            attachment,
+            custody,
+            opaque_parentless,
+            paused_by_attachment,
+            None,
+            &mut Default::default(),
+        )
+    }
+    fn register_with_custody_observed(
+        &self,
+        attachment: EnrollmentAttachmentContext<'_>,
+        custody: Option<&mut super::client_targets::RetainedInitialization>,
+        opaque_parentless: bool,
+        paused_by_attachment: bool,
+        diagnostic: (super::client_settlement_trace::DiagnosticTargetOrigin, u64),
+    ) -> (
+        RegistrationResult,
+        super::client_targets::RegistrationDiagnosticReceipt,
+    ) {
+        let mut receipt = super::client_targets::RegistrationDiagnosticReceipt::default();
+        let origin = super::client_settlement_trace::inventory_enabled().then_some(diagnostic.0);
+        let result = self.register_with_custody_recording(
+            attachment,
+            custody,
+            opaque_parentless,
+            paused_by_attachment,
+            origin,
+            &mut receipt,
+        );
+        // All inner registration locks have exited, including every Err path.
+        // This is emission order, not a global target-commit ordering promise.
+        receipt.emit(self.generation, diagnostic.1);
+        (result, receipt)
+    }
+    fn register_with_custody_recording(
+        &self,
+        attachment: EnrollmentAttachmentContext<'_>,
+        custody: Option<&mut super::client_targets::RetainedInitialization>,
+        opaque_parentless: bool,
+        paused_by_attachment: bool,
+        diagnostic: Option<super::client_settlement_trace::DiagnosticTargetOrigin>,
+        receipt: &mut super::client_targets::RegistrationDiagnosticReceipt,
+    ) -> RegistrationResult {
         let EnrollmentAttachmentContext {
             context,
             target,
@@ -4503,26 +4530,55 @@ impl ClientEnrollment {
             && root == session
             && (matches!(kind, "browser" | "tab" | "browser_ui")
                 || (kind == "other" && opaque_parentless && opaque_pending_verified));
+        let diagnostic_context = diagnostic.map(|origin| {
+            let parent_entry = parent.and_then(|id| index.sessions.get(id));
+            let root_identity = if root == session {
+                Some((target, session))
+            } else {
+                index
+                    .sessions
+                    .get(&root)
+                    .map(|entry| (entry.target.as_str(), entry.session.as_str()))
+            };
+            super::client_targets::RegistrationDiagnosticContext {
+                generation: self.generation,
+                origin,
+                parent: parent_entry.map(|entry| (entry.target.as_str(), entry.session.as_str())),
+                root: root_identity,
+                lineage_complete: (parent.is_none() || parent_entry.is_some())
+                    && root_identity.is_some(),
+            }
+        });
         if let Some(custody) = custody {
-            custody.attach_with_ancestry(
+            custody.attach_with_ancestry_observed(
                 &self.targets,
-                context,
-                target.into(),
-                session.into(),
-                kind.into(),
+                super::client_targets::RegistrationAttachment {
+                    context,
+                    target: target.into(),
+                    session: session.into(),
+                    kind: kind.into(),
+                },
                 crate::native::client_targets::AttachmentAncestry {
                     root: root_ticket,
                     verified_self_root,
                 },
+                diagnostic_context
+                    .as_ref()
+                    .map(|context| (context, &mut *receipt)),
             )?;
         } else {
-            self.targets.attached_enrolled_with_ancestry(
-                context,
-                target.into(),
-                session.into(),
-                kind.into(),
+            self.targets.attached_enrolled_observed(
+                super::client_targets::RegistrationAttachment {
+                    context,
+                    target: target.into(),
+                    session: session.into(),
+                    kind: kind.into(),
+                },
                 root_ticket.as_ref(),
                 verified_self_root,
+                diagnostic_context
+                    .as_ref()
+                    .map(|context| (context, &mut *receipt)),
             )?;
         }
         if pending_query_invalid {
@@ -4617,6 +4673,7 @@ impl ClientEnrollment {
             .map_err(InitFailure::into_protocol)
             .and_then(InitializationOutcome::result)
     }
+    #[cfg(test)]
     async fn initialize_observed(
         &self,
         entry: Attribution,
@@ -4624,17 +4681,31 @@ impl ClientEnrollment {
         admission: Option<&ServiceWorkerAdmission>,
         initialization: Option<IframeInitialization>,
     ) -> InitResult<InitializationOutcome> {
+        self.initialize_with_registration(entry, op, admission, initialization, None)
+            .await
+    }
+    async fn initialize_with_registration(
+        &self,
+        entry: Attribution,
+        op: &OperationLease,
+        admission: Option<&ServiceWorkerAdmission>,
+        initialization: Option<IframeInitialization>,
+        registration: Option<super::client_targets::RegistrationDiagnosticReceipt>,
+    ) -> InitResult<InitializationOutcome> {
         self.check_initialization_admission(op)?;
         // Retain only the existing bounded diagnostic fields before an event
         // can remove this attachment. Diagnostics grant no retirement authority.
-        let diagnostic = super::client_settlement_trace::inventory_enabled()
-            .then(|| {
-                self.targets
-                    .owned_target(&entry.target)
-                    .ok()
-                    .and_then(|target| target.diagnostic_snapshot())
-            })
-            .flatten();
+        let diagnostic = match registration {
+            Some(receipt) => receipt.snapshot(),
+            None => super::client_settlement_trace::inventory_enabled()
+                .then(|| {
+                    self.targets
+                        .owned_target(&entry.target)
+                        .ok()
+                        .and_then(|target| target.diagnostic_snapshot())
+                })
+                .flatten(),
+        };
         let child = if initialization.is_some() {
             initialization
         } else if entry.kind == "iframe" && !entry.observation_only {
@@ -7399,11 +7470,13 @@ impl ClientEnrollment {
         }
         #[cfg(test)]
         self.trace_capture_admission(CaptureLifecycleStep::RegisteringAttached, target, &session);
+        let mut registration_diagnostic =
+            super::client_targets::RegistrationDiagnosticReceipt::default();
         match ServiceWorkerAdmission::observe_sync(
             admission.as_ref(),
             WorkerAdmissionStep::Register,
             || {
-                self.register_with_custody(
+                let (result, receipt) = self.register_with_custody_observed(
                     EnrollmentAttachmentContext {
                         context,
                         target,
@@ -7418,20 +7491,22 @@ impl ClientEnrollment {
                         .get("waitingForDebugger")
                         .and_then(Value::as_bool)
                         == Some(true),
-                )
+                    (
+                        super::client_settlement_trace::DiagnosticTargetOrigin::AutoAttach,
+                        0,
+                    ),
+                );
+                registration_diagnostic = receipt;
+                result
             },
         )? {
             Some((entry, initialization)) => {
-                self.diagnostic_registration(
-                    &entry,
-                    super::client_settlement_trace::DiagnosticTargetOrigin::AutoAttach,
-                    0,
-                );
-                self.initialize_observed(
+                self.initialize_with_registration(
                     entry,
                     &self.operation(),
                     admission.as_ref(),
                     initialization,
+                    Some(registration_diagnostic),
                 )
                 .await
             }

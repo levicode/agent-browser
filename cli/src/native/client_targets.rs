@@ -395,7 +395,8 @@ impl PopupInitializationReceipt {
                 .retained_initialization
                 .load(Ordering::Acquire);
         // The fixed entry boundary must include the proof's receive frontier;
-        // enrollment additionally requires applied >= received before freezing.
+        // enrollment additionally requires applied >= that fixed received prefix
+        // before preparation completes, not before its wait-only fence is frozen.
         // Later Runtime/foreign events still invalidate the original fence.
         let awaiting_configuration = awaiting_permit
             && preparation.is_some_and(|(received, revision)| {
@@ -585,6 +586,31 @@ impl RetainedInitialization {
         kind: String,
         ancestry: AttachmentAncestry,
     ) -> Result<bool, ProtocolError> {
+        self.attach_with_ancestry_observed(
+            registry,
+            RegistrationAttachment {
+                context,
+                target,
+                session,
+                kind,
+            },
+            ancestry,
+            None,
+        )
+    }
+    pub(super) fn attach_with_ancestry_observed(
+        &mut self,
+        registry: &Arc<ClientTargets>,
+        attachment: RegistrationAttachment<'_>,
+        ancestry: AttachmentAncestry,
+        observation: RegistrationObservation<'_, '_>,
+    ) -> Result<bool, ProtocolError> {
+        let RegistrationAttachment {
+            context,
+            target,
+            session,
+            kind,
+        } = attachment;
         let AttachmentAncestry {
             root,
             verified_self_root,
@@ -592,17 +618,20 @@ impl RetainedInitialization {
         if self.target.is_some() || !Arc::ptr_eq(&self.registry, registry) {
             return Err(ProtocolError::StaleScope);
         }
-        let attached = registry.attach_inner(
-            context,
-            target,
-            session,
-            kind,
+        let attached = registry.attach_inner_observed(
+            RegistrationAttachment {
+                context,
+                target,
+                session,
+                kind,
+            },
             AttachmentRegistrationContext {
                 retained: true,
                 root: root.as_ref(),
                 enrolled: true,
                 verified_self_root,
             },
+            observation,
         )?;
         if let Some(target) = &attached {
             // The registry marked the exact fresh tenure under its insertion
@@ -921,6 +950,43 @@ impl Registry {
             ..Default::default()
         })
     }
+    fn registration_diagnostic(
+        &mut self,
+        target: &mut OwnedTarget,
+        context: &RegistrationDiagnosticContext<'_>,
+    ) -> Option<diagnostic::DiagnosticAttachment> {
+        let ordinal = |identity: (&str, &str)| {
+            if identity == (target.target_id.as_str(), target.session_id.as_str()) {
+                return target
+                    .diagnostic
+                    .map(|value| value.attachment)
+                    .filter(|value| *value != 0);
+            }
+            self.targets
+                .get(identity.0)
+                .filter(|current| {
+                    current.session_id == identity.1
+                        && Arc::ptr_eq(&current.tenure.owner, &target.tenure.owner)
+                })
+                .and_then(|current| current.diagnostic.map(|value| value.attachment))
+                .filter(|value| *value != 0)
+        };
+        let parent = context.parent.map(ordinal).unwrap_or(Some(0));
+        let root = context.root.and_then(ordinal);
+        let valid = context.lineage_complete && parent.is_some() && root.is_some();
+        if let Some(value) = target.diagnostic.as_mut() {
+            value.generation = context.generation;
+            value.origin = context.origin;
+            value.parent = parent.unwrap_or(0);
+            value.root = root.unwrap_or(0);
+            value.stage = diagnostic::DiagnosticTargetStage::Registered;
+        }
+        let snapshot = target
+            .diagnostic_snapshot()
+            .filter(|value| valid && value.attachment != 0 && value.target != 0);
+        self.diagnostic_lost |= snapshot.is_none();
+        snapshot
+    }
     fn diagnostic_inventory(&self) -> diagnostic::InventorySnapshot {
         let mut inventory = diagnostic::DiagnosticTargetInventory {
             observed: !self.diagnostic_lost
@@ -1007,6 +1073,51 @@ pub(crate) enum AuxiliaryDisposition {
     Ordinary,
     RecorderOwned,
 }
+/// Diagnostic input borrowed from the original enrollment index transaction.
+/// No payload identity escapes into the trace; only existing closed ordinals do.
+pub(super) struct RegistrationDiagnosticContext<'a> {
+    pub generation: u64,
+    pub origin: diagnostic::DiagnosticTargetOrigin,
+    pub parent: Option<(&'a str, &'a str)>,
+    pub root: Option<(&'a str, &'a str)>,
+    pub lineage_complete: bool,
+}
+#[derive(Clone, Copy, Default)]
+pub(super) enum RegistrationDiagnosticReceipt {
+    #[default]
+    NotCommitted,
+    Committed(diagnostic::DiagnosticAttachment),
+    Lost,
+}
+impl RegistrationDiagnosticReceipt {
+    pub(super) fn snapshot(self) -> Option<diagnostic::DiagnosticAttachment> {
+        match self {
+            Self::Committed(value) => Some(value),
+            _ => None,
+        }
+    }
+    /// Caller must have left all registration locks before this synchronous emit.
+    pub(super) fn emit(self, generation: u64, sequence: u64) {
+        match self {
+            Self::NotCommitted => {}
+            Self::Committed(value) => {
+                diagnostic::target_lifecycle(generation, sequence, value, None)
+            }
+            Self::Lost => diagnostic::target_observation_lost(generation, sequence),
+        }
+    }
+}
+pub(super) struct RegistrationAttachment<'a> {
+    pub context: &'a str,
+    pub target: String,
+    pub session: String,
+    pub kind: String,
+}
+type RegistrationObservation<'a, 'b> = Option<(
+    &'a RegistrationDiagnosticContext<'a>,
+    &'b mut RegistrationDiagnosticReceipt,
+)>;
+
 pub struct InventoryStamp {
     pub revision: u64,
     pub identity_scope: String,
@@ -1960,6 +2071,36 @@ impl ClientTargets {
         )
         .map(|target| target.is_some())
     }
+    pub(super) fn attached_enrolled_observed(
+        &self,
+        attachment: RegistrationAttachment<'_>,
+        root: Option<&OwnedTarget>,
+        verified_self_root: bool,
+        observation: RegistrationObservation<'_, '_>,
+    ) -> Result<bool, ProtocolError> {
+        let RegistrationAttachment {
+            context,
+            target,
+            session,
+            kind,
+        } = attachment;
+        self.attach_inner_observed(
+            RegistrationAttachment {
+                context,
+                target,
+                session,
+                kind,
+            },
+            AttachmentRegistrationContext {
+                retained: false,
+                root,
+                enrolled: true,
+                verified_self_root,
+            },
+            observation,
+        )
+        .map(|target| target.is_some())
+    }
     fn attach_inner(
         &self,
         context_id: &str,
@@ -1968,6 +2109,29 @@ impl ClientTargets {
         kind: String,
         context: AttachmentRegistrationContext<'_>,
     ) -> Result<Option<OwnedTarget>, ProtocolError> {
+        self.attach_inner_observed(
+            RegistrationAttachment {
+                context: context_id,
+                target: target_id,
+                session: session_id,
+                kind,
+            },
+            context,
+            None,
+        )
+    }
+    fn attach_inner_observed(
+        &self,
+        attachment: RegistrationAttachment<'_>,
+        context: AttachmentRegistrationContext<'_>,
+        observation: RegistrationObservation<'_, '_>,
+    ) -> Result<Option<OwnedTarget>, ProtocolError> {
+        let RegistrationAttachment {
+            context: context_id,
+            target: target_id,
+            session: session_id,
+            kind,
+        } = attachment;
         let AttachmentRegistrationContext {
             retained,
             root,
@@ -2035,7 +2199,7 @@ impl ClientTargets {
                 ..Default::default()
             });
             let observed_tenure = diagnostic::inventory_enabled().then(|| tenure.clone());
-            let target = OwnedTarget {
+            let mut target = OwnedTarget {
                 target_id,
                 session_id,
                 kind,
@@ -2046,9 +2210,20 @@ impl ClientTargets {
                 tenure,
                 diagnostic,
             };
+            let observed = observation.map(|(context, slot)| {
+                let snapshot = state.registration_diagnostic(&mut target, context);
+                (slot, snapshot)
+            });
             state
                 .targets
                 .insert(target.target_id.clone(), target.clone());
+            // Written at the actual commit, before any fallible custody/index work.
+            if let Some((slot, snapshot)) = observed {
+                *slot = snapshot.map_or(
+                    RegistrationDiagnosticReceipt::Lost,
+                    RegistrationDiagnosticReceipt::Committed,
+                );
+            }
             if let Some(tenure) = observed_tenure {
                 state.note_revision_enabled(
                     diagnostic::InventoryRevisionEvent::Attach,
@@ -2876,45 +3051,6 @@ impl ClientTargets {
             .try_lock()
             .map(|state| state.diagnostic_inventory())
             .unwrap_or_default()
-    }
-    pub(crate) fn diagnostic_register(
-        &self,
-        target_id: &str,
-        parent: Option<&str>,
-        root: Option<&str>,
-        origin: diagnostic::DiagnosticTargetOrigin,
-        operation: (u64, u64),
-    ) {
-        if !diagnostic::inventory_enabled() {
-            return;
-        }
-        let Ok(mut state) = self.state.try_lock() else {
-            diagnostic::target_observation_lost(operation.0, operation.1);
-            return;
-        };
-        let parent = parent
-            .and_then(|id| state.targets.get(id))
-            .and_then(|t| t.diagnostic)
-            .map_or(0, |t| t.attachment);
-        let root = root
-            .and_then(|id| state.targets.get(id))
-            .and_then(|t| t.diagnostic)
-            .map_or(0, |t| t.attachment);
-        let observed = state.targets.get_mut(target_id).and_then(|target| {
-            let value = target.diagnostic.as_mut()?;
-            value.generation = operation.0;
-            value.origin = origin;
-            value.parent = parent;
-            value.root = root;
-            value.stage = diagnostic::DiagnosticTargetStage::Registered;
-            target.diagnostic_snapshot()
-        });
-        drop(state);
-        if let Some(value) = observed {
-            diagnostic::target_lifecycle(operation.0, operation.1, value, None);
-        } else {
-            diagnostic::target_observation_lost(operation.0, operation.1);
-        }
     }
     /// Capture diagnostic identity before an await. This carries no authority,
     /// never waits for the registry, and cannot be rebound to a later attachment.
@@ -5452,3 +5588,7 @@ mod popup_setup_diagnostic_tests;
 #[cfg(test)]
 #[path = "client_popup_configuration_proof_unit_tests.rs"]
 mod popup_configuration_proof_unit_tests;
+
+#[cfg(test)]
+#[path = "client_registration_receipt_tests.rs"]
+mod registration_receipt_tests;

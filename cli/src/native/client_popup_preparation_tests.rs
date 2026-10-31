@@ -559,3 +559,245 @@ async fn popup_preparation_withheld_resume_ack_preserves_original_deadline_and_d
 async fn popup_preparation_negative_resume_ack_never_publishes_completion() {
     popup_preparation_unacknowledged_resume_case(true).await;
 }
+
+// The original cohort is already registered; a real bounded event is received
+// but held at the supervisor's existing apply gate. These controls do not forge
+// a watermark, insert receipts, or manufacture a positive initializer terminal.
+async fn popup_preparation_fixed_prefix_case(mode: &str) {
+    let (owner, page, _notices, log, emit, server, connection) =
+        popup_preparation_owner("owner-retirement").await;
+    let schedule = owner.popup_capture_schedule_for_test(true);
+    // Hold the completed original initializer after it releases config_gate,
+    // retaining its actual custody/receipt until the test explicitly releases it.
+    {
+        let mut gates = owner.capture_test_gates.lock().unwrap();
+        let held = gates
+            .remove(&CaptureTestPoint::AfterPopupResumeAckBeforeComplete)
+            .unwrap();
+        gates.insert(CaptureTestPoint::BeforeInitializationResumeRelease, held);
+    }
+    send_preparation_popup(&emit, "popup-session", "popup-target").await;
+    tokio::time::timeout(Duration::from_secs(2), schedule.initializer_held())
+        .await
+        .unwrap();
+    let original = owner.index.lock().unwrap().pending_eval_initialization["popup-session"].clone();
+    let apply = CaptureTestGate::new();
+    let recheck = CaptureTestGate::new();
+    {
+        let mut gates = owner.capture_test_gates.lock().unwrap();
+        gates.insert(CaptureTestPoint::BeforeEventApply, apply.clone());
+        gates.insert(
+            CaptureTestPoint::BeforeEvalPreparationRecheck,
+            recheck.clone(),
+        );
+    }
+    if mode == "new-prefix" {
+        send_preparation_popup(&emit, "prefix-session", "prefix-target").await;
+    } else {
+        emit.send(
+            json!({"method":"Runtime.consoleAPICalled", "sessionId":"initial",
+            "params":{"type":"log","args":[],"executionContextId":1,"timestamp":0}}),
+        )
+        .await
+        .unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), apply.wait_entered())
+        .await
+        .unwrap();
+    let watermark = owner.realm_watermark().unwrap();
+    let fixed = watermark.received().unwrap();
+    {
+        let index = owner.index.lock().unwrap();
+        assert!(index.applied_watermark < fixed);
+        assert_eq!(index.pending_enrollment.len(), 1);
+        assert!(!index.sessions.contains_key("prefix-session"));
+    }
+    let (cancel, cancellation) = watch::channel(CancelSignal::None);
+    let operation = OperationLease {
+        is_callback: false,
+        generation: owner.generation,
+        sequence: 74,
+        deadline: Instant::now()
+            + if mode == "deadline" {
+                Duration::from_secs(1)
+            } else {
+                Duration::from_secs(5)
+            },
+        cancellation,
+    };
+    let task_owner = owner.clone();
+    let mut task = tokio::spawn(async move {
+        let result = task_owner.wait_eval_ingress(&page, &operation).await;
+        (result, page, operation)
+    });
+    // Early failure is a regression, not a timeout hidden by a helper retry.
+    tokio::select! {
+        result = &mut task => panic!("fixed-prefix admission returned before its original wait: {:?}", result.unwrap().0.err()),
+        _ = recheck.wait_entered() => {},
+    }
+    if mode == "cancel" {
+        cancel.send_replace(CancelSignal::Requested);
+    } else if mode != "deadline" {
+        schedule.release();
+        owner.popup_initializer_finished_for_test().await;
+        assert!(original.completed(&owner.targets).unwrap());
+        assert!(owner.index.lock().unwrap().pending_enrollment.is_empty());
+        assert!(!owner
+            .index
+            .lock()
+            .unwrap()
+            .pending_eval_initialization
+            .contains_key("popup-session"));
+        if mode == "new-prefix" {
+            // The received prefix contains a target not present in original C.
+            // Let it register AND finish while the waiter's original fence is
+            // held between polls; an empty pending map cannot forgive that fact.
+            let finish = CaptureTestGate::new();
+            owner.capture_test_gates.lock().unwrap().insert(
+                CaptureTestPoint::AfterPopupCustodyFinishBeforeReceipt,
+                finish.clone(),
+            );
+            apply.release();
+            tokio::time::timeout(Duration::from_secs(2), finish.wait_entered())
+                .await
+                .unwrap();
+            let later =
+                owner.index.lock().unwrap().pending_eval_initialization["prefix-session"].clone();
+            finish.release();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let changed = owner.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if !owner
+                        .index
+                        .lock()
+                        .unwrap()
+                        .pending_enrollment
+                        .contains_key("prefix-session")
+                    {
+                        assert!(later.completed(&owner.targets).unwrap());
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(owner.index.lock().unwrap().pending_enrollment.is_empty());
+        } else {
+            // Receipt has left the index, but the original Arc must remain the
+            // completion proof. A second poll still cannot pass unapplied F.
+            let second = CaptureTestGate::new();
+            owner.capture_test_gates.lock().unwrap().insert(
+                CaptureTestPoint::BeforeEvalPreparationRecheck,
+                second.clone(),
+            );
+            recheck.release();
+            tokio::select! {
+                result = &mut task => panic!("positive receipt bypassed unapplied prefix: {:?}", result.unwrap().0.err()),
+                _ = second.wait_entered() => {},
+            }
+            apply.release();
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let changed = owner.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    if owner.index.lock().unwrap().applied_watermark >= fixed {
+                        break;
+                    }
+                    changed.await;
+                }
+            })
+            .await
+            .unwrap();
+            // Notify happened before changed.await in the real wait loop.
+            // Its already-enabled notification must prevent a lost wakeup.
+            second.release();
+        }
+        recheck.release();
+    }
+    let (result, page, operation) = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    if mode == "cancel" || mode == "deadline" {
+        assert_eq!(
+            result.err(),
+            Some(if mode == "cancel" {
+                ProtocolError::Cancelled
+            } else {
+                ProtocolError::DeadlineExceeded
+            })
+        );
+        apply.release();
+        recheck.release();
+        schedule.release();
+        owner.popup_initializer_finished_for_test().await;
+    } else if mode == "new-prefix" {
+        assert_eq!(result.err(), Some(ProtocolError::StaleScope));
+    } else {
+        let prepared = result.unwrap().unwrap();
+        assert_eq!(prepared.received, fixed);
+        assert_eq!(prepared.cohort.len(), 1);
+        assert!(prepared.cohort[0].receipt.same_receipt(&original));
+        assert!(owner
+            .capture_prepared_eval_authority(&page, &operation, Some(&prepared))
+            .is_ok());
+        // Successful prefix waiting is not a permanent authority grant. The
+        // existing strict capture must reject a later received/unapplied event.
+        let late = CaptureTestGate::new();
+        owner
+            .capture_test_gates
+            .lock()
+            .unwrap()
+            .insert(CaptureTestPoint::BeforeEventApply, late.clone());
+        emit.send(
+            json!({"method":"Runtime.consoleAPICalled", "sessionId":"initial",
+            "params":{"type":"log","args":[],"executionContextId":1,"timestamp":0}}),
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), late.wait_entered())
+            .await
+            .unwrap();
+        assert!(watermark.received().unwrap() > fixed);
+        assert!(owner
+            .capture_prepared_eval_authority(&page, &operation, Some(&prepared))
+            .is_err());
+        late.release();
+    }
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["sessionId"] == "popup-session"
+                && request["method"] == "Runtime.runIfWaitingForDebugger")
+            .count(),
+        1,
+        "fixed-prefix wait must not replay the initializer"
+    );
+    // Release this test's original execution permit before harness teardown.
+    // Teardown is not an asserted cleanup/ACK outcome for the tested operation.
+    drop(page);
+    let _ = owner.close().await;
+    connection.close().await;
+    server.abort();
+    let _ = server.await;
+}
+
+#[tokio::test]
+async fn popup_preparation_fixed_prefix_retains_receipt_and_armed_notification() {
+    popup_preparation_fixed_prefix_case("positive").await;
+}
+#[tokio::test]
+async fn popup_preparation_fixed_prefix_unseen_target_finished_between_polls_is_foreign() {
+    popup_preparation_fixed_prefix_case("new-prefix").await;
+}
+#[tokio::test]
+async fn popup_preparation_fixed_prefix_preserves_cancel_and_original_deadline() {
+    for mode in ["cancel", "deadline"] {
+        popup_preparation_fixed_prefix_case(mode).await;
+    }
+}
