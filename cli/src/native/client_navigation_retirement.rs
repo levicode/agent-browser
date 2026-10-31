@@ -92,6 +92,278 @@ fn identity(value: Option<&str>) -> Option<&str> {
     value.filter(|value| !value.is_empty() && value.len() <= 4096)
 }
 
+// Successful original ACKs have a different terminal proof from ERR_ABORTED.
+// This witness is private to the original producer and never follows a replacement
+// loader. Invalid evidence is sticky and does not alter normal navigation success.
+struct AcknowledgedBoundary {
+    session: String,
+    frame: String,
+    previous_loader: Option<String>,
+    requested_url: String,
+    loader: String,
+    sequence: u64,
+    trigger_sequence: u64,
+    started: bool,
+    current: bool,
+    invalid: bool,
+    stop_baseline: Option<u64>,
+    stopped: bool,
+}
+impl AcknowledgedBoundary {
+    fn from_ack(
+        response: &Value,
+        session: &str,
+        frame: &str,
+        previous_loader: Option<&str>,
+        requested_url: String,
+        trigger_sequence: u64,
+    ) -> Option<Self> {
+        let loader = identity(response["loaderId"].as_str())?;
+        if identity(response["frameId"].as_str())? != frame
+            || Some(loader) == previous_loader
+            || response
+                .get("errorText")
+                .is_some_and(|value| value.as_str() != Some(""))
+        {
+            return None;
+        }
+        if !matches!(response.get("isDownload"), None | Some(Value::Bool(false))) {
+            return None;
+        }
+        Some(Self {
+            session: session.to_owned(),
+            frame: frame.to_owned(),
+            previous_loader: previous_loader.map(str::to_owned),
+            requested_url,
+            loader: loader.to_owned(),
+            sequence: 0,
+            trigger_sequence,
+            started: false,
+            current: false,
+            invalid: false,
+            stop_baseline: None,
+            stopped: false,
+        })
+    }
+    fn observe(&mut self, sequence: u64, event: &CdpEvent) {
+        if self.invalid {
+            return;
+        }
+        if self.observe_valid(sequence, event).is_none() {
+            self.invalid = true;
+        }
+    }
+    fn observe_valid(&mut self, sequence: u64, event: &CdpEvent) -> Option<()> {
+        if sequence != self.sequence.checked_add(1)? {
+            return None;
+        }
+        self.sequence = sequence;
+        if event.method == "Target.detachedFromTarget" {
+            return (identity(event.params["sessionId"].as_str())? != self.session).then_some(());
+        }
+        if event.session_id.as_deref()? != self.session {
+            return Some(());
+        }
+        if event.method == "Inspector.detached" {
+            return None;
+        }
+        let frame = if event.method == "Page.frameNavigated" {
+            event.params.pointer("/frame/id").and_then(Value::as_str)
+        } else {
+            event.params["frameId"].as_str()
+        };
+        if identity(frame)? != self.frame {
+            return Some(());
+        }
+        match event.method.as_str() {
+            "Page.frameStartedNavigating" => {
+                if self.started
+                    || sequence <= self.trigger_sequence
+                    || event.params["url"].as_str() != Some(self.requested_url.as_str())
+                    || event.params["loaderId"].as_str() != Some(self.loader.as_str())
+                {
+                    return None;
+                }
+                self.started = true;
+            }
+            "Page.lifecycleEvent" | "Page.frameNavigated" => {
+                let loader = if event.method == "Page.frameNavigated" {
+                    event
+                        .params
+                        .pointer("/frame/loaderId")
+                        .and_then(Value::as_str)
+                } else {
+                    event.params["loaderId"].as_str()
+                };
+                let loader = identity(loader)?;
+                if self.started {
+                    // Unlike the pre-ACK boundary, a previous-loader event is
+                    // no longer admissible after this ACK loader has started.
+                    if loader != self.loader {
+                        return None;
+                    }
+                    // A lifecycle callback alone is not a current-document
+                    // commit witness; only frameNavigated binds the ACK loader.
+                    if event.method == "Page.frameNavigated" {
+                        self.current = true;
+                    }
+                } else if Some(loader) != self.previous_loader.as_deref() {
+                    return None;
+                }
+            }
+            "Page.frameStoppedLoading" => {
+                if self.ready()
+                    && self
+                        .stop_baseline
+                        .is_some_and(|baseline| sequence > baseline)
+                {
+                    self.stopped = true;
+                }
+            }
+            "Page.navigatedWithinDocument" | "Page.frameDetached" => return None,
+            _ => return None,
+        }
+        Some(())
+    }
+    fn ready(&self) -> bool {
+        !self.invalid && self.started && self.current
+    }
+    fn begin_stop(&mut self) -> Option<()> {
+        if !self.ready() || self.stop_baseline.is_some() {
+            return None;
+        }
+        self.stop_baseline = Some(self.sequence);
+        self.stopped = false;
+        Some(())
+    }
+    fn terminal(&self) -> bool {
+        self.ready() && self.stop_baseline.is_some() && self.stopped
+    }
+    async fn drain(&mut self, events: &mut BoundedMethodEvents, boundary: u64) -> Option<()> {
+        while self.sequence < boundary {
+            let event = events.recv().await.ok()?;
+            self.observe(event.sequence(), &event);
+            if self.invalid {
+                return None;
+            }
+        }
+        (!self.invalid).then_some(())
+    }
+}
+
+// Freeze the same deadline precedence as the Submitted branch at interruption
+// entry, before cleanup consumes time. A receipt must not bypass the dispatcher's
+// old timeout normalization and accidentally turn an expired operation Cancelled.
+pub(super) fn acknowledged_interruption_reason(
+    reason: ProtocolError,
+    deadline_elapsed: bool,
+) -> ProtocolError {
+    if deadline_elapsed && matches!(reason, ProtocolError::Cancelled) {
+        ProtocolError::DeadlineExceeded
+    } else {
+        reason
+    }
+}
+
+pub(super) struct AcknowledgedNavigation {
+    boundary: AcknowledgedBoundary,
+    original: crate::native::client_debt::CommandStatusHandle,
+    attachment: crate::native::client_targets::OwnedTarget,
+    journal: OperationJournalHandle,
+}
+impl AcknowledgedNavigation {
+    pub(super) fn observe(&mut self, event: &BoundedCdpEvent) {
+        self.boundary.observe(event.sequence(), event);
+    }
+    fn exact_owner(&self, page: &BrowserExecutionLease, operation: &OperationLease) -> Option<()> {
+        page.permit.check().ok()?;
+        let current = page.targets.owned_target(&page.target_id).ok()?;
+        if self.journal.key()
+            != (OperationKey {
+                generation: operation.generation,
+                operation_seq: operation.sequence,
+            })
+            || !self
+                .journal
+                .ledger()
+                .matches_owner(operation.generation, &page.identity_scope)
+            || !self.attachment.same_attachment(&current)
+            || current.session_id != page.page_session_id
+            || self.journal.snapshot().integrity_lost
+            || self.original.snapshot() != CommandStatus::Acknowledged
+            || self.original.is_error_ack()
+        {
+            return None;
+        }
+        Some(())
+    }
+    // Consuming self makes a second stop impossible, including top-check/select
+    // cancellation races. The original subscriber and absolute bound stay owned.
+    pub(super) async fn retire(
+        mut self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+        tasks: &RetainedTasks,
+        events: &mut BoundedMethodEvents,
+    ) -> Option<NavigationInterruptionProof> {
+        self.exact_owner(page, operation)?;
+        let key = self.journal.key();
+        tasks.cancel_operation_producer(key);
+        let retained = tasks
+            .operation_retention_status(key)
+            .proof()
+            .filter(|proof| proof.matches(key))?;
+        let deadline = retained
+            .retirement_deadline()
+            .min(Instant::now() + Duration::from_secs(2));
+        let cleanup = async {
+            let watermark = events.watermark();
+            self.boundary
+                .drain(events, watermark.received().ok()?)
+                .await?;
+            self.exact_owner(page, operation)?;
+            if Instant::now() >= deadline {
+                return None;
+            }
+            self.boundary.begin_stop()?;
+            let stop = page
+                .client
+                .stop_retiring_navigation(&page.page_session_id, key, deadline)
+                .await
+                .ok()?;
+            if stop.snapshot() != CommandStatus::Acknowledged || stop.is_error_ack() {
+                return None;
+            }
+            self.boundary
+                .drain(events, watermark.received().ok()?)
+                .await?;
+            while !self.boundary.terminal() {
+                let event = events.recv().await.ok()?;
+                self.boundary.observe(event.sequence(), &event);
+                if self.boundary.invalid {
+                    return None;
+                }
+            }
+            self.boundary
+                .drain(events, watermark.received().ok()?)
+                .await?;
+            self.exact_owner(page, operation)?;
+            if !self.boundary.terminal() || Instant::now() >= deadline {
+                return None;
+            }
+            Some(NavigationInterruptionProof {
+                key,
+                identity_scope: page.identity_scope.clone(),
+                attachment: self.attachment.clone(),
+            })
+        };
+        tokio::time::timeout_at(deadline.into(), cleanup)
+            .await
+            .ok()
+            .flatten()
+    }
+}
+
 // Keep the original trigger, frame/loader baseline, bounded subscription and
 // existing producer explicit. No generic cleanup envelope or caller retry.
 #[allow(clippy::too_many_arguments)]
@@ -104,6 +376,7 @@ pub(super) async fn trigger(
     previous_loader: Option<&str>,
     events: &mut BoundedMethodEvents,
     retirement: Option<(&RetainedTasks, &mut Option<NavigationInterruptionProof>)>,
+    acknowledged: &mut Option<AcknowledgedNavigation>,
 ) -> Result<Value, ProtocolError> {
     let Some((tasks, receipt)) = retirement else {
         return command(page, operation, Some(&page.page_session_id), method, args).await;
@@ -157,7 +430,16 @@ pub(super) async fn trigger(
     let reason = tokio::select! {
         value = &mut original => {
             check(page, operation)?;
-            return value.map_err(|_| ProtocolError::BrowserFailure);
+            let response = value.map_err(|_| ProtocolError::BrowserFailure)?;
+            if status.snapshot() == CommandStatus::Acknowledged && !status.is_error_ack() {
+                *acknowledged = AcknowledgedBoundary::from_ack(
+                    &response, &page.page_session_id, frame, previous_loader,
+                    requested_url, trigger_sequence,
+                ).map(|boundary| AcknowledgedNavigation {
+                    boundary, original: status, attachment, journal,
+                });
+            }
+            return Ok(response);
         },
         _ = cancellation.changed() => {
             if Instant::now() >= operation.deadline {

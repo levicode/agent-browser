@@ -239,7 +239,7 @@ impl RetainedTasks {
                     if let Some(deadline) = monitor_registry.retire(key) {
                         tokio::time::sleep_until(deadline.into()).await;
                         if monitor_registry.expire(key, std::time::Instant::now()) {
-                            monitor_targets.seal();
+                            monitor_targets.seal_diagnostic(super::client_settlement_trace::InventoryFirstLoss::RetainedDeadlineSeal);
                             let _ = monitor_broker.quarantine();
                         }
                     }
@@ -316,7 +316,7 @@ impl RetainedTasks {
                     if remote_only {
                         task_targets.seal_remote_connection(&journal.ledger());
                     } else {
-                        task_targets.seal();
+                        task_targets.seal_diagnostic(super::client_settlement_trace::InventoryFirstLoss::RetainedSettlementSeal);
                     }
                     let _ = broker.quarantine();
                 }
@@ -422,10 +422,10 @@ impl RetainedTasks {
                     {
                         targets.seal_remote_connection(&ledger);
                     } else {
-                        targets.seal();
+                        targets.seal_diagnostic(super::client_settlement_trace::InventoryFirstLoss::RetainedCompletionSeal);
                     }
                 } else {
-                    targets.seal();
+                    targets.seal_diagnostic(super::client_settlement_trace::InventoryFirstLoss::RetainedCompletionSeal);
                 }
             }
             // Any orphaned blob handles remain in the captured bounded BlobStore
@@ -491,20 +491,53 @@ impl RetainedTasks {
         while let Some(result) = tasks.tasks.join_next().await {
             tasks.record(result);
         }
-        if !tasks.closing
-            || tasks.unscoped_failure
-            || tasks.failures.iter().any(|failure| {
-                !failure.operation.is_some_and(|key| {
-                    self.operations.disconnected_failure_retired(key)
-                        || self.operations.terminal_failure_retired(key)
-                        || (failure.identity_scope == ledger.identity_scope()
-                            && self.operations.terminal_failure_matches(key, ledger))
-                })
+        use super::client_settlement_trace::{TerminalCleanupStage, TerminalProofRefusal};
+        // Capture under the existing lock, then emit only after releasing it.
+        // Keep the original short-circuit predicate and failure iteration order.
+        let refusal = if !tasks.closing {
+            Some((None, TerminalProofRefusal::TasksNotClosing))
+        } else if tasks.unscoped_failure {
+            Some((None, TerminalProofRefusal::UnscopedTaskFailure))
+        } else {
+            tasks.failures.iter().find_map(|failure| {
+                let Some(key) = failure.operation else {
+                    return Some((None, TerminalProofRefusal::TaskOperationMissing));
+                };
+                if self.operations.disconnected_failure_retired(key)
+                    || self.operations.terminal_failure_retired(key)
+                {
+                    return None;
+                }
+                if failure.identity_scope != ledger.identity_scope() {
+                    return Some((Some(key), TerminalProofRefusal::TaskOwnerMismatch));
+                }
+                self.operations
+                    .terminal_failure_refusal(key, ledger)
+                    .map(|reason| (Some(key), reason))
             })
-        {
+        };
+        if let Some((key, reason)) = refusal {
+            drop(tasks);
+            super::client_settlement_trace::terminal_proof_refusal(
+                TerminalCleanupStage::TaskProof,
+                key,
+                reason,
+            );
             return Err(ProtocolError::CleanupFailed);
         }
-        self.operations.check_terminal_read_only(ledger)
+        let checked = self.operations.check_terminal_read_only(ledger);
+        // Preserve the original task-lock coverage through the registry check.
+        // Release it explicitly before the new diagnostic call; NLL does not
+        // establish a MutexGuard drop boundary.
+        drop(tasks);
+        checked.map_err(|(key, reason)| {
+            super::client_settlement_trace::terminal_proof_refusal(
+                TerminalCleanupStage::TaskProof,
+                key,
+                reason,
+            );
+            ProtocolError::CleanupFailed
+        })
     }
     pub(crate) fn commit_terminal_read_only(
         &self,

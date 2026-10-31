@@ -1034,6 +1034,78 @@ struct ContainmentState {
     task: Option<JoinHandle<Result<(), ProtocolError>>>,
     result: Option<Result<(), ProtocolError>>,
 }
+/// One original lifecycle operation armed this network while close was Open.
+/// Construction is not retirement proof: every sink use rechecks joined owner
+/// state and the exact retained network result before it can emit the fence.
+pub(crate) struct OrdinaryCallbackRetirement {
+    owner: Arc<ClientEnrollment>,
+    network: super::client_network::CallbackDrainTicket,
+    operation: OperationLease,
+}
+impl OrdinaryCallbackRetirement {
+    fn check(&self) -> Result<(), ProtocolError> {
+        if !self.owner.sealed.load(Ordering::Acquire) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let supervisor = self
+            .owner
+            .supervisor
+            .try_lock()
+            .map_err(|_| ProtocolError::StaleScope)?;
+        if supervisor.is_some() {
+            return Err(ProtocolError::StaleScope);
+        }
+        let index = self
+            .owner
+            .index
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if let Some(error) = &index.failure {
+            return Err(error.clone());
+        }
+        self.owner.network.check_callback_drain(
+            &self.network,
+            &self.operation,
+            &self.owner.targets.identity_scope,
+        )
+    }
+    pub(crate) fn check_network(&self, network: &ClientNetwork) -> Result<(), ProtocolError> {
+        if !std::ptr::eq(network, self.owner.network.as_ref()) {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.check()
+    }
+    pub(crate) fn check_event_sink(
+        &self,
+        sink: &super::client_transport::ClientEventSink,
+    ) -> Result<(), ProtocolError> {
+        self.check()?;
+        self.owner.network.check_event_sink(sink)
+    }
+    pub(crate) fn generation(&self) -> u64 {
+        self.operation.generation
+    }
+    pub(crate) fn identity_scope(&self) -> &str {
+        &self.owner.targets.identity_scope
+    }
+    pub(crate) fn finish(
+        self,
+        owner: &Arc<ClientEnrollment>,
+        operation: &OperationLease,
+    ) -> Result<(), ProtocolError> {
+        if !Arc::ptr_eq(owner, &self.owner) {
+            return Err(ProtocolError::StaleScope);
+        }
+        owner.network.check_callback_drain(
+            &self.network,
+            operation,
+            &owner.targets.identity_scope,
+        )?;
+        self.check()?;
+        owner.network.retire_callbacks_after_owner_drain(&self)
+    }
+}
+
 pub struct ClientEnrollment {
     client: Arc<CdpClient>,
     targets: Arc<ClientTargets>,
@@ -8289,6 +8361,26 @@ impl ClientEnrollment {
             });
         }
         self.seal();
+    }
+    pub(crate) fn prepare_callback_retirement(
+        self: &Arc<Self>,
+        operation: &OperationLease,
+    ) -> Result<OrdinaryCallbackRetirement, ProtocolError> {
+        self.check()?;
+        if self.sealed.load(Ordering::Acquire) || self.generation != operation.generation {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(OrdinaryCallbackRetirement {
+            owner: self.clone(),
+            network: self.network.prepare_callback_drain(operation)?,
+            operation: OperationLease {
+                is_callback: operation.is_callback,
+                generation: operation.generation,
+                sequence: operation.sequence,
+                deadline: operation.deadline,
+                cancellation: operation.cancellation.clone(),
+            },
+        })
     }
     pub async fn drain(&self) -> Result<(), ProtocolError> {
         let mut slot = self.supervisor.lock().await;

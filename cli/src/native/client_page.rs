@@ -1304,7 +1304,7 @@ impl ClientPageState {
         method: &str,
         args: Value,
         wait: &str,
-        retirement: Option<(
+        mut retirement: Option<(
             &super::client_tasks::RetainedTasks,
             &mut Option<NavigationInterruptionProof>,
         )>,
@@ -1392,6 +1392,7 @@ impl ClientPageState {
                 .ok_or(ProtocolError::ScopeUnavailable)?
                 .quiet_since = Instant::now();
         }
+        let mut acknowledged = None;
         let response = navigation_retirement::trigger(
             page,
             op,
@@ -1400,7 +1401,10 @@ impl ClientPageState {
             &frame,
             previous_loader.as_deref(),
             &mut events,
-            retirement,
+            retirement
+                .as_mut()
+                .map(|(tasks, receipt)| (*tasks, &mut **receipt)),
+            &mut acknowledged,
         )
         .await;
         #[cfg(test)]
@@ -1453,7 +1457,27 @@ impl ClientPageState {
             let mut reached = BTreeSet::new();
             let mut restored_milestones_requested = false;
             loop {
-                check(page, op)?;
+                if let Err(reason) = check(page, op) {
+                    let reason = if acknowledged.is_some() {
+                        navigation_retirement::acknowledged_interruption_reason(
+                            reason,
+                            Instant::now() >= op.deadline,
+                        )
+                    } else {
+                        reason
+                    };
+                    if matches!(
+                        reason,
+                        ProtocolError::Cancelled | ProtocolError::DeadlineExceeded
+                    ) {
+                        if let (Some(witness), Some((tasks, receipt))) =
+                            (acknowledged.take(), retirement.as_mut())
+                        {
+                            **receipt = witness.retire(page, op, tasks, &mut events).await;
+                        }
+                    }
+                    return Err(reason);
+                }
                 let event = tokio::select! {
                     event=events.recv()=>event.map_err(|_error| {
                         #[cfg(test)]
@@ -1463,14 +1487,28 @@ impl ClientPageState {
                     _=cancel.changed()=> {
                         #[cfg(test)]
                         page.client.activation_diagnostic("nav-wait", None, "cancelled", None, None);
-                        return Err(ProtocolError::Cancelled);
+                        let reason = if acknowledged.is_some() {
+                            navigation_retirement::acknowledged_interruption_reason(ProtocolError::Cancelled, Instant::now() >= op.deadline)
+                        } else { ProtocolError::Cancelled };
+                        if let (Some(witness), Some((tasks, receipt))) = (acknowledged.take(), retirement.as_mut()) {
+                            **receipt = witness.retire(page, op, tasks, &mut events).await;
+                        }
+                        return Err(reason);
                     },
                     _=tokio::time::sleep_until(op.deadline.into())=> {
                         #[cfg(test)]
                         page.client.activation_diagnostic("nav-wait", None, "deadline", None, None);
+                        if let (Some(witness), Some((tasks, receipt))) = (acknowledged.take(), retirement.as_mut()) {
+                            **receipt = witness.retire(page, op, tasks, &mut events).await;
+                        }
                         return Err(ProtocolError::DeadlineExceeded);
                     },
                 };
+                // Feed before every business continue/break; invalidation never
+                // changes ordinary successful navigation handling.
+                if let Some(witness) = acknowledged.as_mut() {
+                    witness.observe(&event);
+                }
                 #[cfg(test)]
                 page.client.activation_diagnostic(
                     "nav-event",
@@ -1571,6 +1609,7 @@ impl ClientPageState {
                 }
             }
         }
+        drop(acknowledged);
         if wait == "networkidle" {
             self.wait_network_idle(page, op).await?;
         }

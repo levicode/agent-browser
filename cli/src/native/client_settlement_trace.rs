@@ -203,6 +203,8 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub terminal_cleanup_ok: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_proof_refusal: Option<TerminalProofRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub restart_post_create_stage: Option<RestartPostCreateStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scope_replacement_stage: Option<ScopeReplacementStage>,
@@ -254,6 +256,8 @@ pub(crate) struct Facts {
     pub inventory_sealed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_integrity_lost: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_first_loss: Option<InventoryFirstLoss>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inventory_reservations: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -830,6 +834,7 @@ pub(crate) struct InventorySnapshot {
     pub observed: bool,
     pub sealed: bool,
     pub integrity_lost: bool,
+    pub first_loss: Option<InventoryFirstLoss>,
     pub reservations: usize,
     pub unconfigured: usize,
     pub attachments: Option<DiagnosticTargetInventory>,
@@ -1469,6 +1474,71 @@ pub(crate) enum TerminalCleanupStage {
     OrdinaryClose,
     ShutdownJoins,
     FinalCommit,
+}
+/// First rejecting predicate in the original evaluation order, not a claim
+/// about the chronologically first failure across concurrent operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalProofRefusal {
+    TasksNotClosing,
+    UnscopedTaskFailure,
+    TaskOperationMissing,
+    TaskOwnerMismatch,
+    LedgerOwnerMismatch,
+    RegistryUnavailable,
+    ResultNotFixed,
+    ProducerNotIntegrityLost,
+    IntegrityReasonNotRemoteEof,
+    RetentionLocalProducerFailed,
+    RetentionDeadline,
+    RetentionOwnerAccountingLost,
+    RetentionReasonMissing,
+    LocalProducersUnfinished,
+    SubmissionNotRevoked,
+    MutationDispatched,
+    InputDebt,
+    ObjectDebt,
+    LocalIntegrityLost,
+    NoOwnerOperations,
+}
+/// Set once under the original target registry lock. No payload or runtime
+/// identifier is retained; ExplicitSeal intentionally leaves the caller unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryFirstLoss {
+    ResumeIdentityMismatch,
+    ResumePermitDropped,
+    AuxiliaryCapacity,
+    QueryRevisionExhausted,
+    UnknownQueryRevisionExhausted,
+    ExplicitSeal,
+    InvalidRetirementAuthority,
+    AuxiliaryAckMismatch,
+    AuxiliaryAbandoned,
+    CreationAbandoned,
+    RetainedDeadlineSeal,
+    RetainedSettlementSeal,
+    RetainedCompletionSeal,
+}
+pub(crate) fn terminal_proof_refusal(
+    stage: TerminalCleanupStage,
+    key: Option<super::client_debt::OperationKey>,
+    reason: TerminalProofRefusal,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            key.map_or(0, |key| key.operation_seq),
+            Phase::TerminalCleanupCheckpoint,
+            Facts {
+                generation: key.map(|key| key.generation),
+                terminal_cleanup_stage: Some(stage),
+                terminal_cleanup_ok: Some(false),
+                terminal_proof_refusal: Some(reason),
+                ..Facts::default()
+            },
+        );
+    }
 }
 pub(crate) fn terminal_cleanup_checkpoint(stage: TerminalCleanupStage, ok: bool) {
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
@@ -2407,6 +2477,7 @@ fn inventory_snapshot_into(
             ),
             inventory_sealed: Some(snapshot.sealed),
             inventory_integrity_lost: Some(snapshot.integrity_lost),
+            inventory_first_loss: snapshot.first_loss,
             inventory_reservations: Some(snapshot.reservations.min(8192) as u64),
             inventory_unconfigured: Some(snapshot.unconfigured.min(8192) as u64),
             ..Facts::default()
@@ -5120,5 +5191,27 @@ mod retained_capture_boundary_tests {
             .iter()
             .all(|slot| slot.record.get().is_none()));
         assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod refusal_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn new_failure_facts_serialize_only_closed_scalars() {
+        let value = serde_json::to_value(Facts {
+            terminal_cleanup_stage: Some(TerminalCleanupStage::TaskProof),
+            terminal_cleanup_ok: Some(false),
+            terminal_proof_refusal: Some(TerminalProofRefusal::ObjectDebt),
+            inventory_first_loss: Some(InventoryFirstLoss::ResumePermitDropped),
+            ..Facts::default()
+        })
+        .unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert_eq!(object["terminalCleanupStage"], "task-proof");
+        assert_eq!(object["terminalCleanupOk"], false);
+        assert_eq!(object["terminalProofRefusal"], "object-debt");
+        assert_eq!(object["inventoryFirstLoss"], "resume-permit-dropped");
     }
 }

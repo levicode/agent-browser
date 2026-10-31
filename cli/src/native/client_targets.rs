@@ -778,6 +778,7 @@ struct Registry {
     revision_history: Option<RevisionHistory>,
     sealed: bool,
     integrity_lost: bool,
+    first_loss: Option<diagnostic::InventoryFirstLoss>,
     owner_retirement_inventory: Option<bool>,
     reservations: usize,
     creation_sequence: u64,
@@ -1009,6 +1010,7 @@ impl Registry {
             observed: true,
             sealed: self.sealed,
             integrity_lost: self.integrity_lost,
+            first_loss: self.first_loss,
             reservations: self.reservations,
             unconfigured: self
                 .targets
@@ -1025,7 +1027,8 @@ impl Registry {
                 .values()
                 .all(|target| target.purpose.is_some() && target.configured)
     }
-    fn lose_integrity(&mut self) {
+    fn lose_integrity(&mut self, reason: diagnostic::InventoryFirstLoss) {
+        self.first_loss.get_or_insert(reason);
         self.sealed = true;
         self.integrity_lost = true;
     }
@@ -1287,7 +1290,7 @@ impl ResumePermit {
                     || target.purpose != Some(TargetPurpose::Application)
                     || target.configured))
         {
-            state.lose_integrity();
+            state.lose_integrity(diagnostic::InventoryFirstLoss::ResumeIdentityMismatch);
             return Err(ProtocolError::StaleScope);
         }
         check_bounds()?;
@@ -1380,7 +1383,7 @@ impl Drop for ResumePermit {
                 }
                 state.resuming = state.resuming.saturating_sub(1);
                 if !self.completed {
-                    state.lose_integrity();
+                    state.lose_integrity(diagnostic::InventoryFirstLoss::ResumePermitDropped);
                 }
             }
             self.registry.changed.notify_waiters();
@@ -1952,7 +1955,7 @@ impl ClientTargets {
                 if pending.candidates.len() >= 64 && !pending.candidates.contains(session_id) {
                     revoke();
                     pending.failed = true;
-                    state.lose_integrity();
+                    state.lose_integrity(diagnostic::InventoryFirstLoss::AuxiliaryCapacity);
                     self.changed.notify_waiters();
                     return Err(ProtocolError::CapacityExceeded);
                 }
@@ -2713,13 +2716,15 @@ impl ClientTargets {
             {
                 let Some(next) = tenure.query_revision.load(Ordering::Acquire).checked_add(1)
                 else {
-                    state.lose_integrity();
+                    state.lose_integrity(diagnostic::InventoryFirstLoss::QueryRevisionExhausted);
                     return Err(ProtocolError::IdentifierExhausted);
                 };
                 tenure.query_revision.store(next, Ordering::Release);
             } else {
                 let Some(next) = state.query_unknown_revision.checked_add(1) else {
-                    state.lose_integrity();
+                    state.lose_integrity(
+                        diagnostic::InventoryFirstLoss::UnknownQueryRevisionExhausted,
+                    );
                     return Err(ProtocolError::IdentifierExhausted);
                 };
                 state.query_unknown_revision = next;
@@ -2920,10 +2925,13 @@ impl ClientTargets {
         }
     }
     pub fn seal(&self) {
+        self.seal_diagnostic(diagnostic::InventoryFirstLoss::ExplicitSeal);
+    }
+    pub(crate) fn seal_diagnostic(&self, reason: diagnostic::InventoryFirstLoss) {
         self.eval_invalidation(|revoke| {
             revoke();
             if let Ok(mut state) = self.state.lock() {
-                state.lose_integrity();
+                state.lose_integrity(reason);
             }
             self.changed.notify_waiters();
         })
@@ -2950,7 +2958,8 @@ impl ClientTargets {
             revoke();
             if let Ok(mut state) = self.state.lock() {
                 if !authority.authorizes(self) {
-                    state.lose_integrity();
+                    state
+                        .lose_integrity(diagnostic::InventoryFirstLoss::InvalidRetirementAuthority);
                     self.changed.notify_waiters();
                     return;
                 }
@@ -3259,7 +3268,7 @@ impl AuxiliaryAttachmentReservation {
             entry.acknowledged_session = Some(session_id.into());
             if !valid {
                 entry.failed = true;
-                state.lose_integrity();
+                state.lose_integrity(diagnostic::InventoryFirstLoss::AuxiliaryAckMismatch);
                 drop(state);
                 self.registry.changed.notify_waiters();
                 return Err(ProtocolError::StaleScope);
@@ -3283,7 +3292,7 @@ impl AuxiliaryAttachmentReservation {
                         entry.cleanup_owned.extend(entry.candidates.iter().cloned());
                     }
                 }
-                state.lose_integrity();
+                state.lose_integrity(diagnostic::InventoryFirstLoss::AuxiliaryAbandoned);
             }
             self.registry.changed.notify_waiters();
         })
@@ -3534,7 +3543,7 @@ impl Drop for CreationReservation {
                 // An abandoned create may still produce a late browser target.
                 // Never reinterpret that unclaimed bootstrap as application work.
                 if !self.claimed {
-                    state.lose_integrity();
+                    state.lose_integrity(diagnostic::InventoryFirstLoss::CreationAbandoned);
                     if self.purpose == TargetPurpose::StateBootstrap
                         && self.native_created_target.is_none()
                     {
@@ -5592,3 +5601,21 @@ mod popup_configuration_proof_unit_tests;
 #[cfg(test)]
 #[path = "client_registration_receipt_tests.rs"]
 mod registration_receipt_tests;
+
+#[cfg(test)]
+mod first_loss_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn first_loss_is_immutable_and_does_not_change_seal_semantics() {
+        let mut registry = Registry::default();
+        assert!(registry.first_loss.is_none());
+        registry.lose_integrity(diagnostic::InventoryFirstLoss::ResumePermitDropped);
+        assert!(registry.sealed && registry.integrity_lost);
+        registry.lose_integrity(diagnostic::InventoryFirstLoss::ExplicitSeal);
+        assert_eq!(
+            registry.first_loss,
+            Some(diagnostic::InventoryFirstLoss::ResumePermitDropped)
+        );
+        assert!(registry.sealed && registry.integrity_lost);
+    }
+}

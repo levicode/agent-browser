@@ -7,6 +7,9 @@ mod child_retirement_tests;
 #[path = "client_dialog_retirement_regression_tests.rs"]
 mod dialog_retirement_regression_tests;
 #[cfg(test)]
+#[path = "client_network_owner_drain_tests.rs"]
+mod owner_drain_tests;
+#[cfg(test)]
 #[path = "client_network_retirement_receipt_tests.rs"]
 mod retirement_receipt_tests;
 use super::cdp::client::CdpClient;
@@ -43,6 +46,7 @@ pub struct ClientNetwork {
     routes_frozen: AtomicBool,
     close_gate: tokio::sync::Mutex<NetworkCloseState>,
     cleanup_drained: AtomicBool,
+    callback_drain: Mutex<Option<Arc<CallbackDrainEvidence>>>,
     tokens: Mutex<HashMap<String, String>>,
     scope: BlobScope,
     policy: Mutex<NetworkPolicy>,
@@ -98,6 +102,40 @@ enum NetworkCloseState {
     Open,
     Running(tokio::task::JoinHandle<Result<(), ProtocolError>>),
     Finished(Result<(), ProtocolError>),
+}
+
+/// Private, one-shot registration before this owner's close starts. A later
+/// reset cannot borrow a cached ordinary/EOF close result from another operation.
+pub(crate) struct CallbackDrainTicket {
+    network: Arc<ClientNetwork>,
+    evidence: Arc<CallbackDrainEvidence>,
+}
+struct CallbackDrainEvidence {
+    generation: u64,
+    sequence: u64,
+    deadline: std::time::Instant,
+    outcome: Mutex<Option<Result<(), ProtocolError>>>,
+    invalid: AtomicBool,
+}
+
+impl CallbackDrainEvidence {
+    fn record(&self, outcome: Result<(), ProtocolError>) {
+        match self.outcome.lock() {
+            Ok(mut slot) if slot.is_none() => *slot = Some(outcome),
+            _ => self.invalid.store(true, Ordering::Release),
+        };
+    }
+    fn result(&self) -> Result<(), ProtocolError> {
+        if self.invalid.load(Ordering::Acquire) {
+            return Err(ProtocolError::StaleScope);
+        }
+        self.outcome
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?
+            .as_ref()
+            .ok_or(ProtocolError::StaleScope)?
+            .clone()
+    }
 }
 
 /// Native private authority across one exact old-to-new scope transition.
@@ -471,6 +509,7 @@ impl ClientNetwork {
             routes_frozen: AtomicBool::new(false),
             close_gate: tokio::sync::Mutex::new(NetworkCloseState::Open),
             cleanup_drained: AtomicBool::new(false),
+            callback_drain: Mutex::new(None),
             tokens: Mutex::new(HashMap::new()),
             scope,
             policy: Mutex::new(policy),
@@ -498,6 +537,92 @@ impl ClientNetwork {
             download_ready: AtomicBool::new(false),
             download_subscriptions: Mutex::new(std::collections::HashSet::new()),
         }
+    }
+
+    pub(crate) fn prepare_callback_drain(
+        self: &Arc<Self>,
+        operation: &OperationLease,
+    ) -> Result<CallbackDrainTicket, ProtocolError> {
+        self.check()?;
+        if operation.generation != self.scope.generation || operation.is_callback {
+            return Err(ProtocolError::StaleScope);
+        }
+        let close = self
+            .close_gate
+            .try_lock()
+            .map_err(|_| ProtocolError::StaleScope)?;
+        if !matches!(*close, NetworkCloseState::Open) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let mut slot = self
+            .callback_drain
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if slot.is_some() {
+            return Err(ProtocolError::StaleScope);
+        }
+        let evidence = Arc::new(CallbackDrainEvidence {
+            generation: operation.generation,
+            sequence: operation.sequence,
+            deadline: operation.deadline,
+            outcome: Mutex::new(None),
+            invalid: AtomicBool::new(false),
+        });
+        *slot = Some(evidence.clone());
+        Ok(CallbackDrainTicket {
+            network: self.clone(),
+            evidence,
+        })
+    }
+
+    pub(crate) fn check_callback_drain(
+        self: &Arc<Self>,
+        ticket: &CallbackDrainTicket,
+        operation: &OperationLease,
+        identity_scope: &str,
+    ) -> Result<(), ProtocolError> {
+        if identity_scope != self.scope.identity_scope
+            || !Arc::ptr_eq(self, &ticket.network)
+            || operation.generation != ticket.evidence.generation
+            || operation.sequence != ticket.evidence.sequence
+            || operation.deadline != ticket.evidence.deadline
+            || ticket.evidence.invalid.load(Ordering::Acquire)
+            || !self.sealed.load(Ordering::Acquire)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        if *operation.cancellation.borrow() != CancelSignal::None {
+            return Err(ProtocolError::Cancelled);
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err(ProtocolError::DeadlineExceeded);
+        }
+        let close = self
+            .close_gate
+            .try_lock()
+            .map_err(|_| ProtocolError::StaleScope)?;
+        let NetworkCloseState::Finished(result) = &*close else {
+            return Err(ProtocolError::StaleScope);
+        };
+        // Preserve the exact inner producer error rather than projecting it to
+        // generic cleanup-failed. This new normal-reset gate is deliberately
+        // stricter than legacy close's inner-result accounting.
+        ticket.evidence.result()?;
+        result.clone()
+    }
+
+    pub(crate) fn retire_callbacks_after_owner_drain(
+        &self,
+        proof: &super::client_enrollment::OrdinaryCallbackRetirement,
+    ) -> Result<(), ProtocolError> {
+        proof.check_network(self)?;
+        proof.check_event_sink(&self.retirement_sink)?;
+        // Enrollment has joined initializers as well as network close. Catch a
+        // token captured between the first revoke and producer cancellation.
+        self.broker
+            .revoke_scope_decisions(&self.scope.identity_scope)?;
+        self.retirement_sink
+            .retire_callbacks_after_owner_drain(proof)
     }
 
     pub(crate) fn check_event_sink(&self, sink: &ClientEventSink) -> Result<(), ProtocolError> {
@@ -2301,12 +2426,33 @@ impl ClientNetwork {
                 }
             }
             let network = self.clone();
+            // Failure of the optional proof observer must never skip the
+            // existing retained worker after revoke/abort has begun.
+            let callback_drain = self
+                .callback_drain
+                .lock()
+                .ok()
+                .and_then(|slot| slot.clone());
+            let ordinary = proof.is_none() && final_local.is_none();
             let terminal = proof.cloned();
             let final_local = final_local.cloned();
             *state = NetworkCloseState::Running(tokio::spawn(async move {
-                network
-                    .close_retained(failed, terminal, final_local, diagnostics)
-                    .await
+                if callback_drain.is_some() {
+                    network
+                        .close_retained_observed(
+                            failed,
+                            terminal,
+                            final_local,
+                            diagnostics,
+                            callback_drain,
+                            ordinary,
+                        )
+                        .await
+                } else {
+                    network
+                        .close_retained(failed, terminal, final_local, diagnostics)
+                        .await
+                }
             }));
         }
         let result = match &mut *state {
@@ -2332,10 +2478,22 @@ impl ClientNetwork {
     }
     async fn close_retained(
         self: &Arc<Self>,
+        failed: bool,
+        terminal: Option<super::client_enrollment::NativeTerminalProof>,
+        final_local: Option<super::client_enrollment::FinalLocalEofProof>,
+        diagnostics: Option<super::client_settlement_trace::CleanupObserver>,
+    ) -> Result<(), ProtocolError> {
+        self.close_retained_observed(failed, terminal, final_local, diagnostics, None, false)
+            .await
+    }
+    async fn close_retained_observed(
+        self: &Arc<Self>,
         mut failed: bool,
         terminal: Option<super::client_enrollment::NativeTerminalProof>,
         final_local: Option<super::client_enrollment::FinalLocalEofProof>,
         diagnostics: Option<super::client_settlement_trace::CleanupObserver>,
+        callback_drain: Option<Arc<CallbackDrainEvidence>>,
+        ordinary: bool,
     ) -> Result<(), ProtocolError> {
         // Cleanup failure never short-circuits owned-task drainage. In
         // particular spawn_blocking cannot be canceled by dropping its handle.
@@ -2349,7 +2507,11 @@ impl ClientNetwork {
             };
             std::mem::take(&mut *current)
         };
+        let mut producer_failure = None;
         while let Some(result) = tasks.join_next().await {
+            if let Ok(Err(error)) = &result {
+                producer_failure.get_or_insert_with(|| error.clone());
+            }
             if let Err(error) = result {
                 if !error.is_cancelled() {
                     if let Some(cell) = &diagnostics {
@@ -2358,6 +2520,20 @@ impl ClientNetwork {
                     failed = true;
                 }
             }
+        }
+        if let Some(evidence) = callback_drain {
+            let outcome = if !ordinary {
+                Err(ProtocolError::StaleScope)
+            } else if let Some(error) = producer_failure {
+                Err(error)
+            } else if failed {
+                Err(ProtocolError::CleanupFailed)
+            } else {
+                Ok(())
+            };
+            evidence.record(outcome);
+            // A refused observer is not permission to abandon file readers,
+            // downloads or the existing terminal/final-local cleanup below.
         }
         if let Some(proof) = terminal {
             // Enrollment has stopped intake and every asynchronous emitter has
@@ -6530,4 +6706,68 @@ mod bridge_tests {
 #[derive(Clone, Copy, Default)]
 pub struct NetworkPolicy {
     pub bypass_service_worker: bool,
+}
+
+// Local receipt-state controls only: these do not substitute for executing the
+// original enrollment/network/interop lifecycle or proving browser behavior.
+#[cfg(test)]
+mod ordinary_callback_drain_evidence_tests {
+    use super::{AtomicBool, CallbackDrainEvidence, Mutex, ProtocolError};
+
+    fn pending() -> CallbackDrainEvidence {
+        CallbackDrainEvidence {
+            generation: 7,
+            sequence: 11,
+            deadline: std::time::Instant::now(),
+            outcome: Mutex::new(None),
+            invalid: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn unrecorded_join_is_not_proof() {
+        assert_eq!(pending().result(), Err(ProtocolError::StaleScope));
+    }
+
+    #[test]
+    fn exact_inner_error_is_not_generic_cleanup_failure() {
+        let evidence = pending();
+        evidence.record(Err(ProtocolError::DecisionKindMismatch));
+        assert_eq!(evidence.result(), Err(ProtocolError::DecisionKindMismatch));
+    }
+
+    #[test]
+    fn inner_cancelled_is_not_successful_abort_join() {
+        let evidence = pending();
+        evidence.record(Err(ProtocolError::Cancelled));
+        assert_eq!(evidence.result(), Err(ProtocolError::Cancelled));
+    }
+
+    #[test]
+    fn duplicate_record_cannot_overwrite_a_refusal() {
+        let evidence = pending();
+        evidence.record(Err(ProtocolError::BrowserFailure));
+        evidence.record(Ok(()));
+        assert_eq!(evidence.result(), Err(ProtocolError::StaleScope));
+    }
+
+    #[test]
+    fn observer_poison_refuses_proof_without_panicking_record() {
+        let evidence = pending();
+        let poisoned = std::panic::catch_unwind(|| {
+            let _guard = evidence.outcome.lock().unwrap();
+            panic!("local observer fault");
+        });
+        assert!(poisoned.is_err());
+        evidence.record(Ok(()));
+        assert_eq!(evidence.result(), Err(ProtocolError::StaleScope));
+    }
+
+    #[test]
+    fn one_successful_record_is_read_only_and_repeatable() {
+        let evidence = pending();
+        evidence.record(Ok(()));
+        assert_eq!(evidence.result(), Ok(()));
+        assert_eq!(evidence.result(), Ok(()));
+    }
 }

@@ -717,6 +717,13 @@ impl ClientEventSink {
         proof.check_event_sink(self)?;
         self.retire_scope_callbacks(proof.generation(), proof.identity_scope())
     }
+    pub(crate) fn retire_callbacks_after_owner_drain(
+        &self,
+        proof: &super::client_enrollment::OrdinaryCallbackRetirement,
+    ) -> Result<(), ProtocolError> {
+        proof.check_event_sink(self)?;
+        self.retire_scope_callbacks(proof.generation(), proof.identity_scope())
+    }
     fn retire_scope_callbacks(&self, generation: u64, scope: &str) -> Result<(), ProtocolError> {
         self.retire_scope_callbacks_checked(generation, scope, None)
             .map(|_| ())

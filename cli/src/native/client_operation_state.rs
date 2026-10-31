@@ -486,41 +486,67 @@ impl OperationRegistry {
     fn terminal_keys(
         entries: &HashMap<OperationKey, Entry>,
         ledger: &std::sync::Arc<super::client_debt::OwnerDebtLedger>,
-    ) -> Result<Vec<OperationKey>, ProtocolError> {
+    ) -> Result<
+        Vec<OperationKey>,
+        (
+            Option<OperationKey>,
+            super::client_settlement_trace::TerminalProofRefusal,
+        ),
+    > {
+        use super::client_settlement_trace::TerminalProofRefusal;
         let mut keys = Vec::new();
         for (key, entry) in entries
             .iter()
             .filter(|(_, entry)| std::sync::Arc::ptr_eq(&entry.journal.ledger(), ledger))
         {
             let snapshot = entry.journal.snapshot();
-            if !entry.result_fixed
-                || entry.state != ProducerState::IntegrityLost
-                || entry.integrity_reason != Some(RetentionIntegrityReason::RemoteConnectionLost)
-                || !snapshot.local_producers_finished
-                || !snapshot.submission_revoked
-                || snapshot.mutation_dispatched
-                || snapshot.input_debt != 0
-                || snapshot.object_debt != 0
-                || !entry.journal.local_integrity_intact()
+            let reason = if !entry.result_fixed {
+                Some(TerminalProofRefusal::ResultNotFixed)
+            } else if entry.state != ProducerState::IntegrityLost {
+                Some(TerminalProofRefusal::ProducerNotIntegrityLost)
+            } else if entry.integrity_reason != Some(RetentionIntegrityReason::RemoteConnectionLost)
             {
-                return Err(ProtocolError::CleanupFailed);
+                Some(Self::terminal_integrity_refusal(entry.integrity_reason))
+            } else if !snapshot.local_producers_finished {
+                Some(TerminalProofRefusal::LocalProducersUnfinished)
+            } else if !snapshot.submission_revoked {
+                Some(TerminalProofRefusal::SubmissionNotRevoked)
+            } else if snapshot.mutation_dispatched {
+                Some(TerminalProofRefusal::MutationDispatched)
+            } else if snapshot.input_debt != 0 {
+                Some(TerminalProofRefusal::InputDebt)
+            } else if snapshot.object_debt != 0 {
+                Some(TerminalProofRefusal::ObjectDebt)
+            } else if !entry.journal.local_integrity_intact() {
+                Some(TerminalProofRefusal::LocalIntegrityLost)
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err((Some(*key), reason));
             }
             keys.push(*key);
         }
         if keys.is_empty() {
-            return Err(ProtocolError::CleanupFailed);
+            return Err((None, TerminalProofRefusal::NoOwnerOperations));
         }
         Ok(keys)
     }
     pub(crate) fn check_terminal_read_only(
         &self,
         ledger: &std::sync::Arc<super::client_debt::OwnerDebtLedger>,
-    ) -> Result<Vec<OperationKey>, ProtocolError> {
-        let entries = self
-            .entries
-            .lock()
-            .map_err(|_| ProtocolError::CleanupFailed)?;
-        Self::terminal_keys(&entries, ledger)
+    ) -> Result<
+        Vec<OperationKey>,
+        (
+            Option<OperationKey>,
+            super::client_settlement_trace::TerminalProofRefusal,
+        ),
+    > {
+        use super::client_settlement_trace::TerminalProofRefusal;
+        match self.entries.lock() {
+            Ok(entries) => Self::terminal_keys(&entries, ledger),
+            Err(_) => Err((None, TerminalProofRefusal::RegistryUnavailable)),
+        }
     }
     pub(crate) fn commit_terminal_read_only(
         &self,
@@ -530,7 +556,8 @@ impl OperationRegistry {
             .entries
             .lock()
             .map_err(|_| ProtocolError::CleanupFailed)?;
-        let keys = Self::terminal_keys(&entries, proof.ledger())?;
+        let keys = Self::terminal_keys(&entries, proof.ledger())
+            .map_err(|_| ProtocolError::CleanupFailed)?;
         if keys.len() != proof.operations().len()
             || !keys.iter().all(|key| proof.operations().contains(key))
         {
@@ -562,19 +589,53 @@ impl OperationRegistry {
             && ledger.remote_eof_only())
         .then_some(ledger)
     }
-    pub(crate) fn terminal_failure_matches(
+    fn terminal_integrity_refusal(
+        reason: Option<RetentionIntegrityReason>,
+    ) -> super::client_settlement_trace::TerminalProofRefusal {
+        use super::client_settlement_trace::TerminalProofRefusal;
+        match reason {
+            Some(RetentionIntegrityReason::LocalProducerFailed) => {
+                TerminalProofRefusal::RetentionLocalProducerFailed
+            }
+            Some(RetentionIntegrityReason::RetirementDeadline) => {
+                TerminalProofRefusal::RetentionDeadline
+            }
+            Some(RetentionIntegrityReason::OwnerAccountingLost) => {
+                TerminalProofRefusal::RetentionOwnerAccountingLost
+            }
+            Some(RetentionIntegrityReason::RegistryUnavailable) => {
+                TerminalProofRefusal::RegistryUnavailable
+            }
+            // RemoteConnectionLost is excluded by the original predicate at callers.
+            Some(RetentionIntegrityReason::RemoteConnectionLost) => {
+                TerminalProofRefusal::IntegrityReasonNotRemoteEof
+            }
+            None => TerminalProofRefusal::RetentionReasonMissing,
+        }
+    }
+    /// Same lookup and short-circuit order as terminal_failure_matches. Capture
+    /// a closed refusal while holding its original registry lock; never emit here.
+    pub(crate) fn terminal_failure_refusal(
         &self,
         key: OperationKey,
         ledger: &std::sync::Arc<super::client_debt::OwnerDebtLedger>,
-    ) -> bool {
-        self.entries.lock().is_ok_and(|entries| {
-            entries.get(&key).is_some_and(|entry| {
-                std::sync::Arc::ptr_eq(&entry.journal.ledger(), ledger)
-                    && entry.state == ProducerState::IntegrityLost
-                    && entry.integrity_reason
-                        == Some(RetentionIntegrityReason::RemoteConnectionLost)
-            })
-        })
+    ) -> Option<super::client_settlement_trace::TerminalProofRefusal> {
+        use super::client_settlement_trace::TerminalProofRefusal;
+        let Ok(entries) = self.entries.lock() else {
+            return Some(TerminalProofRefusal::RegistryUnavailable);
+        };
+        let Some(entry) = entries.get(&key) else {
+            return Some(TerminalProofRefusal::TaskOperationMissing);
+        };
+        if !std::sync::Arc::ptr_eq(&entry.journal.ledger(), ledger) {
+            Some(TerminalProofRefusal::LedgerOwnerMismatch)
+        } else if entry.state != ProducerState::IntegrityLost {
+            Some(TerminalProofRefusal::ProducerNotIntegrityLost)
+        } else if entry.integrity_reason != Some(RetentionIntegrityReason::RemoteConnectionLost) {
+            Some(Self::terminal_integrity_refusal(entry.integrity_reason))
+        } else {
+            None
+        }
     }
     pub(crate) fn terminal_failure_retired(&self, key: OperationKey) -> bool {
         self.entries.lock().is_ok_and(|entries| {

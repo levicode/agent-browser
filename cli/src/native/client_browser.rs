@@ -532,6 +532,64 @@ struct OwnedRuntime {
     input_gate: Arc<tokio::sync::Mutex<()>>,
     download_cleanup: tokio::sync::Mutex<Option<tokio::task::JoinHandle<std::io::Result<()>>>>,
 }
+// Bound at the original ensure invocation, not inferred later from an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ActivationCommand {
+    Activate,
+    Navigate,
+}
+impl ActivationCommand {
+    fn matches(self, command: &str) -> bool {
+        command
+            == match self {
+                Self::Activate => "page.activate",
+                Self::Navigate => "page.navigate",
+            }
+    }
+}
+fn activation_navigation_error(error: Option<&ProtocolError>) -> bool {
+    matches!(
+        error,
+        Some(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
+    )
+}
+// Neither provenance variant creates authority; the original terminal receipt
+// must still confirm this exact operation/journal/attachment and zero debt.
+enum NavigationInterruption {
+    Requested(super::client_page::NavigationInterruptionProof),
+    Activation {
+        command: ActivationCommand,
+        reason: ProtocolError,
+        proof: super::client_page::NavigationInterruptionProof,
+    },
+}
+impl NavigationInterruption {
+    fn confirms(
+        self,
+        command: &str,
+        result: &Result<serde_json::Value, ProtocolError>,
+        page: &BrowserExecutionLease,
+        operation: &super::client_session::OperationLease,
+        journal: &super::client_debt::OperationJournalHandle,
+    ) -> bool {
+        match self {
+            Self::Requested(proof) => {
+                command == "page.navigate" && proof.confirms(page, operation, journal)
+            }
+            Self::Activation {
+                command: expected,
+                reason,
+                proof,
+            } => {
+                expected.matches(command)
+                    && activation_navigation_error(Some(&reason))
+                    && result.as_ref().err() == Some(&reason)
+                    && proof.confirms(page, operation, journal)
+            }
+        }
+    }
+}
+
 struct PageActivation {
     fresh_document: bool,
     active: Arc<std::sync::atomic::AtomicBool>,
@@ -548,6 +606,44 @@ impl PageActivation {
         page: &BrowserExecutionLease,
         operation: &super::client_session::OperationLease,
         dispatched: &mut bool,
+    ) -> Result<(), ProtocolError> {
+        // Recording and other result-only callers retain the original path.
+        self.ensure_inner(page, operation, dispatched, None).await
+    }
+    async fn ensure_with_retirement(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &super::client_session::OperationLease,
+        dispatched: &mut bool,
+        tasks: &super::client_tasks::RetainedTasks,
+        command: ActivationCommand,
+    ) -> (Result<(), ProtocolError>, Option<NavigationInterruption>) {
+        // No receipt survives from another ensure or from successful navigation.
+        let mut receipt = None;
+        let result = self
+            .ensure_inner(page, operation, dispatched, Some((tasks, &mut receipt)))
+            .await;
+        let interruption = match (receipt, result.as_ref().err()) {
+            (Some(proof), Some(reason)) if activation_navigation_error(Some(reason)) => {
+                Some(NavigationInterruption::Activation {
+                    command,
+                    reason: reason.clone(),
+                    proof,
+                })
+            }
+            _ => None,
+        };
+        (result, interruption)
+    }
+    async fn ensure_inner(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &super::client_session::OperationLease,
+        dispatched: &mut bool,
+        retirement: Option<(
+            &super::client_tasks::RetainedTasks,
+            &mut Option<super::client_page::NavigationInterruptionProof>,
+        )>,
     ) -> Result<(), ProtocolError> {
         #[cfg(test)]
         page.client
@@ -578,16 +674,36 @@ impl PageActivation {
         #[cfg(test)]
         page.client
             .activation_diagnostic("ensure-navigation", None, "entered", None, None);
-        let navigation = self
-            .page_state
-            .execute(
-                page,
-                std::slice::from_ref(&page.page_session_id),
-                operation,
-                "page.navigate",
-                &serde_json::json!({"url":"about:blank","waitUntil":"domcontentloaded"}),
-            )
-            .await;
+        let arguments = serde_json::json!({"url":"about:blank","waitUntil":"domcontentloaded"});
+        let navigation = if let Some((tasks, receipt)) = retirement {
+            let (result, proof) = self
+                .page_state
+                .execute_with_retirement(
+                    page,
+                    std::slice::from_ref(&page.page_session_id),
+                    operation,
+                    "page.navigate",
+                    &arguments,
+                    tasks,
+                )
+                .await;
+            // Only this navigation's own interruption transfers its receipt.
+            // Success then flush/budget/active failure never borrows this proof.
+            if activation_navigation_error(result.as_ref().err()) {
+                *receipt = proof;
+            }
+            result
+        } else {
+            self.page_state
+                .execute(
+                    page,
+                    std::slice::from_ref(&page.page_session_id),
+                    operation,
+                    "page.navigate",
+                    &arguments,
+                )
+                .await
+        };
         #[cfg(test)]
         page.client.activation_diagnostic(
             "ensure-navigation-result",
@@ -4407,7 +4523,10 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         if command == "page.activate" {
                             // Provider recording needs original ensurePage semantics without
                             // starting the native encoder or navigating an already active page.
-                            let activated = activation.ensure(&page, &lease, &mut dispatched).await;
+                            let (activated, interruption) = activation.ensure_with_retirement(
+                                &page, &lease, &mut dispatched, &dispatch_tasks, ActivationCommand::Activate,
+                            ).await;
+                            navigation_interruption = interruption;
                             #[cfg(test)]
                             page.client.activation_diagnostic("ensure-result", None, if activated.is_ok() { "ok" } else { "failed" }, activated.as_ref().err(), None);
                             activated?;
@@ -4431,7 +4550,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let sessions = attachments.iter().map(|target| target.session_id.clone()).collect::<Vec<_>>();
                         if command == "page.navigate" {
                             super::client_page::ClientPageState::validate_navigation(&serde_json::Value::Object(args.clone()))?;
-                            activation.ensure(&page, &lease, &mut dispatched).await?;
+                            let (activated, interruption) = activation.ensure_with_retirement(
+                                &page, &lease, &mut dispatched, &dispatch_tasks, ActivationCommand::Navigate,
+                            ).await;
+                            navigation_interruption = interruption;
+                            activated?;
                         }
                         // The same native primitive implements both direct API
                         // dispatch and callback child execution; no second JS reader.
@@ -4471,7 +4594,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let (output, interruption) = if let Some(grant) = eval_grant {
                             super::client_debt::eval_command_scope(grant, execution).await
                         } else { execution.await };
-                        navigation_interruption = interruption;
+                        navigation_interruption = interruption.map(NavigationInterruption::Requested);
                         if navigation.is_some() {
                             let flushed = enrollment.flush_app_events(&page, &lease).await;
                             if output.is_ok() { flushed?; }
@@ -4486,9 +4609,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 let interruption = (*lease.cancellation.borrow()).error();
                 let expired = interruption.is_some()
                     || std::time::Instant::now() >= lease.deadline;
-                let navigation_settled = command == "page.navigate"
-                    && matches!(result, Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded))
-                    && navigation_interruption.is_some_and(|proof| proof.confirms(&page, &lease, &journal));
+                let navigation_settled = matches!(result, Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded))
+                    && navigation_interruption.is_some_and(|proof| proof.confirms(&command, &result, &page, &lease, &journal));
                 let effects = if !dispatched || matches!(result, Err(ProtocolError::InvalidArguments | ProtocolError::UnsupportedCommand)) {
                     Effects::NotDispatched
                 } else if navigation_settled {
@@ -5202,6 +5324,7 @@ impl ClientBrowser {
                     .map(|prepared| prepared.accept(&operation))
                     .transpose()
                     .map_err(|failure| failure.error)?;
+                let mut callback_retirement = Some(runtime.enrollment.prepare_callback_retirement(&operation)?);
                 failure_stage = ScopeReplacementStage::StopOwner;
                 retirement
                     .lock()
@@ -5247,6 +5370,8 @@ impl ClientBrowser {
                 if interop {
                     failure_stage = ScopeReplacementStage::BeginPeerReplacement;
                     runtime.begin_peer_replacement().await?;
+                    callback_retirement.take().ok_or(ProtocolError::StaleScope)?
+                        .finish(&runtime.enrollment, &operation)?;
                     #[cfg(test)]
                     if let Some(sender) = phase_one_snapshot
                         .lock()
@@ -5288,6 +5413,9 @@ impl ClientBrowser {
                     &resource.targets.protected_read_residual,
                 )?;
                 contained?;
+                if let Some(retirement) = callback_retirement.take() {
+                    retirement.finish(&runtime.enrollment, &operation)?;
+                }
                 failure_stage = ScopeReplacementStage::RetireReferences;
                 refs.lock()
                     .map_err(|_| ProtocolError::ScopeUnavailable)?
@@ -6992,3 +7120,7 @@ mod reconnect_tests;
 #[cfg(test)]
 #[path = "client_browser_recording_attempt_tests.rs"]
 mod recording_attempt_tests;
+
+#[cfg(test)]
+#[path = "client_activation_interruption_tests.rs"]
+mod activation_interruption_tests;
