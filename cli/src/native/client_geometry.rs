@@ -26,6 +26,98 @@ pub enum GeometryError {
     BackendFailure,
     CleanupFailed { primary: Option<Box<GeometryError>> },
 }
+/// Operation-private proof; construction stays at the native geometry reply
+/// or consumes the resolver's opaque receipt. No arbitrary Value factory is
+/// exported to the dispatcher or other production consumers.
+#[derive(Clone, Debug)]
+pub(crate) struct NodeIdentityNegativeProof {
+    binding: element::ExactBinding,
+    backend: i64,
+    origin: NodeIdentityNegativeOrigin,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NodeIdentityNegativeOrigin {
+    Resolution,
+    BoxProof,
+}
+impl NodeIdentityNegativeProof {
+    fn from_resolution(
+        binding: &element::ExactBinding,
+        backend: i64,
+        receipt: element::ResolvedNodeNegativeProof,
+    ) -> Option<Self> {
+        receipt.matches(binding, backend).then(|| Self {
+            binding: binding.clone(),
+            backend,
+            origin: NodeIdentityNegativeOrigin::Resolution,
+        })
+    }
+    pub(crate) fn matches(&self, binding: &element::ExactBinding, backend: i64) -> bool {
+        self.binding == *binding && self.backend == backend
+    }
+    pub(crate) fn binding(&self) -> &element::ExactBinding {
+        &self.binding
+    }
+    pub(crate) fn origin(&self) -> NodeIdentityNegativeOrigin {
+        self.origin
+    }
+}
+fn box_node_negative_proof(
+    binding: &element::ExactBinding,
+    backend: i64,
+    response: &Value,
+) -> Option<NodeIdentityNegativeProof> {
+    let result = response.get("result")?.as_object()?;
+    let value = result.get("value")?.as_object()?;
+    (response.get("exceptionDetails").is_none()
+        && result.get("type").and_then(Value::as_str) == Some("object")
+        && value.get("connected").and_then(Value::as_bool) == Some(false)
+        && !result.contains_key("objectId")
+        && !result.contains_key("unserializableValue")
+        && !result.contains_key("subtype")
+        && result
+            .get("className")
+            .is_none_or(|value| value.as_str() == Some("Object")))
+    .then(|| NodeIdentityNegativeProof {
+        binding: binding.clone(),
+        backend,
+        origin: NodeIdentityNegativeOrigin::BoxProof,
+    })
+}
+#[cfg(test)]
+pub(crate) fn node_negative_proof_for_test(
+    binding: &element::ExactBinding,
+    backend: i64,
+) -> NodeIdentityNegativeProof {
+    box_node_negative_proof(
+        binding,
+        backend,
+        &json!({"result":{"type":"object","value":{"connected":false}}}),
+    )
+    .unwrap()
+}
+/// Closed origin only; proof identities stay inside this operation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum NodeGeometryOrigin {
+    #[default]
+    Other,
+    ReferenceBinding,
+    FrameBinding,
+    ResolveNodeNegative,
+    ResolveBindingNegative,
+    ResolveProofInvalid,
+    ResolveOther,
+    BoxRead,
+    BoxNodeNegative,
+    BoxProofInvalid,
+    MixedHard,
+    MixedNodeNegative,
+}
+#[derive(Default)]
+pub(crate) struct SemanticNodeReadEvidence {
+    pub(crate) negative: Option<NodeIdentityNegativeProof>,
+    pub(crate) origin: NodeGeometryOrigin,
+}
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f64,
@@ -1473,6 +1565,31 @@ impl GeometrySnapshot {
         backend: i64,
         operation: &OperationLease,
     ) -> Result<SemanticBounds, GeometryError> {
+        self.node_semantic_bounds_impl(client, frame, backend, operation, None)
+            .await
+    }
+    pub(crate) async fn node_semantic_bounds_observed(
+        &self,
+        client: &CdpClient,
+        frame: &ObservationFrame,
+        backend: i64,
+        operation: &OperationLease,
+        evidence: &mut SemanticNodeReadEvidence,
+    ) -> Result<SemanticBounds, GeometryError> {
+        self.node_semantic_bounds_impl(client, frame, backend, operation, Some(evidence))
+            .await
+    }
+    async fn node_semantic_bounds_impl(
+        &self,
+        client: &CdpClient,
+        frame: &ObservationFrame,
+        backend: i64,
+        operation: &OperationLease,
+        mut evidence: Option<&mut SemanticNodeReadEvidence>,
+    ) -> Result<SemanticBounds, GeometryError> {
+        if let Some(evidence) = evidence.as_mut() {
+            evidence.origin = NodeGeometryOrigin::FrameBinding;
+        }
         self.require_included(&frame.binding.frame)?;
         let proof = self
             .frames
@@ -1484,8 +1601,16 @@ impl GeometrySnapshot {
         {
             return Err(GeometryError::StaleIdentity);
         }
-        let (model, _) =
-            read_exact_box_impl(client, &frame.binding, backend, operation, false, true).await?;
+        let (model, _) = read_exact_box_impl(
+            client,
+            &frame.binding,
+            backend,
+            operation,
+            false,
+            true,
+            evidence,
+        )
+        .await?;
         self.project_semantic_quad(
             &frame.binding.frame,
             quad_points(&model["model"]["border"])?,
@@ -1537,7 +1662,16 @@ async fn read_exact_box(
     operation: &OperationLease,
     readonly_disposal: bool,
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
-    read_exact_box_impl(client, binding, backend, operation, true, readonly_disposal).await
+    read_exact_box_impl(
+        client,
+        binding,
+        backend,
+        operation,
+        true,
+        readonly_disposal,
+        None,
+    )
+    .await
 }
 async fn read_exact_box_impl(
     client: &CdpClient,
@@ -1546,6 +1680,7 @@ async fn read_exact_box_impl(
     operation: &OperationLease,
     require_owner_size: bool,
     readonly_disposal: bool,
+    evidence: Option<&mut SemanticNodeReadEvidence>,
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
     check(operation)?;
     if readonly_disposal
@@ -1566,6 +1701,7 @@ async fn read_exact_box_impl(
                 operation,
                 require_owner_size,
                 Some(&group),
+                evidence,
             ),
         )
         .await;
@@ -1585,6 +1721,7 @@ async fn read_exact_box_impl(
         operation,
         require_owner_size,
         None,
+        evidence,
     )
     .await
 }
@@ -1614,16 +1751,31 @@ async fn read_exact_box_inner(
     operation: &OperationLease,
     require_owner_size: bool,
     readonly_group: Option<&str>,
+    mut evidence: Option<&mut SemanticNodeReadEvidence>,
 ) -> Result<(Value, Option<(f64, f64)>), GeometryError> {
     check(operation)?;
     let mut cancel = operation.cancellation.clone();
+    let observe_node = evidence.is_some();
+    if let Some(evidence) = evidence.as_mut() {
+        evidence.origin = NodeGeometryOrigin::ResolveOther;
+    }
     let resolution = async {
         match readonly_group {
-            Some(group) => {
-                element::resolve_exact_object_in_readonly_group(client, binding, backend, group)
+            Some(group) if observe_node => {
+                element::resolve_readonly_node_with_negative_proof(client, binding, backend, group)
                     .await
             }
-            None => element::resolve_exact_object_typed(client, binding, backend).await,
+            Some(group) => (
+                element::resolve_exact_object_in_readonly_group(client, binding, backend, group)
+                    .await,
+                None,
+                false,
+            ),
+            None => (
+                element::resolve_exact_object_typed(client, binding, backend).await,
+                None,
+                false,
+            ),
         }
     };
     tokio::pin!(resolution);
@@ -1648,6 +1800,24 @@ async fn read_exact_box_inner(
             }
         },
     };
+    let (resolved, negative, invalid_node_reply) = resolved;
+    let negative = negative
+        .and_then(|receipt| NodeIdentityNegativeProof::from_resolution(binding, backend, receipt));
+    if let Some(evidence) = evidence.as_mut() {
+        evidence.origin = if negative.is_some() {
+            NodeGeometryOrigin::ResolveNodeNegative
+        } else if invalid_node_reply {
+            NodeGeometryOrigin::ResolveProofInvalid
+        } else if matches!(
+            &resolved,
+            Err(element::ExactResolutionError::StaleReference)
+        ) {
+            NodeGeometryOrigin::ResolveBindingNegative
+        } else {
+            NodeGeometryOrigin::ResolveOther
+        };
+        evidence.negative = negative;
+    }
     let object = resolved.map_err(|error| match error {
         // The strict resolver released acquired objects; readonly resolution
         // leaves them with the outer exact group owner. Neither case converts
@@ -1670,6 +1840,9 @@ async fn read_exact_box_inner(
         };
     }
     let mut owned_objects = vec![object.clone()];
+    if let Some(evidence) = evidence.as_mut() {
+        evidence.origin = NodeGeometryOrigin::BoxRead;
+    }
     let result = async {
         let model = command(
             client,
@@ -1706,6 +1879,14 @@ async fn read_exact_box_inner(
         }
         if proof.get("exceptionDetails").is_some() || proof["result"]["value"]["connected"] != true
         {
+            if let Some(evidence) = evidence.as_mut() {
+                evidence.negative = box_node_negative_proof(binding, backend, &proof);
+                evidence.origin = if evidence.negative.is_some() {
+                    NodeGeometryOrigin::BoxNodeNegative
+                } else {
+                    NodeGeometryOrigin::BoxProofInvalid
+                };
+            }
             return Err(GeometryError::StaleIdentity);
         }
         let value = &proof["result"]["value"];
@@ -2925,3 +3106,49 @@ mod tests {
 #[cfg(test)]
 #[path = "client_readonly_disposal_tests.rs"]
 mod readonly_disposal_tests;
+
+#[cfg(test)]
+mod node_identity_box_proof_tests {
+    use super::*;
+    #[test]
+    fn box_negative_requires_exact_plain_by_value_object_envelope() {
+        let binding = element::ExactBinding {
+            page_session: "p".into(),
+            session: "s".into(),
+            frame: "f".into(),
+            loader: "l".into(),
+            actionable: false,
+        };
+        let valid = json!({"result":{"type":"object","value":{"connected":false}}});
+        assert!(box_node_negative_proof(&binding, 1, &valid).is_some());
+        for response in [
+            json!({}),
+            json!({"result":null}),
+            json!({"result":[]}),
+            json!({"result":{"value":{"connected":false}}}),
+            json!({"result":{"type":"string","value":{"connected":false}}}),
+            json!({"result":{"type":"object","value":null}}),
+            json!({"result":{"type":"object","value":[]}}),
+            json!({"result":{"type":"object","value":{"connected":"false"}}}),
+            json!({"result":{"type":"object","value":{"connected":true}}}),
+            json!({"result":{"type":"object","value":{"connected":false}},"exceptionDetails":null}),
+        ] {
+            assert!(box_node_negative_proof(&binding, 1, &response).is_none());
+        }
+        for (key, value) in [
+            ("objectId", "handle"),
+            ("unserializableValue", "NaN"),
+            ("subtype", "null"),
+            ("subtype", "array"),
+            ("className", "Array"),
+        ] {
+            let mut invalid = valid.clone();
+            invalid["result"][key] = value.into();
+            assert!(box_node_negative_proof(&binding, 1, &invalid).is_none());
+        }
+        let mut described = valid.clone();
+        described["result"]["className"] = "Object".into();
+        described["result"]["description"] = "Object".into();
+        assert!(box_node_negative_proof(&binding, 1, &described).is_some());
+    }
+}

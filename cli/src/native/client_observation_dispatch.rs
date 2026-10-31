@@ -1840,6 +1840,73 @@ impl ObservationDispatch {
             Err(error) => Err(error),
         }
     }
+    async fn finish_node_resample_failure(
+        &self,
+        context: &CaptureContext,
+        operation: &OperationLease,
+        capture: Option<&CaptureAdmission>,
+        retirement_fence: u64,
+        mut failure: DispatchFailure,
+        negatives: &[super::client_geometry::NodeIdentityNegativeProof],
+    ) -> DispatchFailure {
+        if failure.cleanup_integrity_lost
+            || failure.error != ProtocolError::StaleScope
+            || negatives.is_empty()
+        {
+            return failure;
+        }
+        let authority = || {
+            self.check_node_resample_authority(&context.page, operation, capture, retirement_fence)
+        };
+        match node_identity_resample_proven(context, operation, negatives, authority).await {
+            Ok(true) => failure.error = ProtocolError::StaleReference,
+            Ok(false) => {}
+            Err(ProtocolError::CleanupFailed) => failure.cleanup_integrity_lost = true,
+            // Only Ok(true) grants new node-resample authority; a concurrent
+            // capture refusal never acquires it by returning the same code.
+            Err(ProtocolError::StaleReference) => failure.error = ProtocolError::StaleScope,
+            Err(error) => failure.error = error,
+        }
+        failure
+    }
+    fn check_node_resample_authority(
+        &self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+        capture: Option<&CaptureAdmission>,
+        retirement_fence: u64,
+    ) -> Result<(), ProtocolError> {
+        check(page, operation)?;
+        let ledger = page
+            .client
+            .debt_ledger()
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        if ledger.operation_has_rejected_cleanup(
+            super::client_debt::OperationKey {
+                generation: operation.generation,
+                operation_seq: operation.sequence,
+            },
+            &page.identity_scope,
+        )? {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        let authority = self
+            .captures
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let capture = capture.ok_or(ProtocolError::StaleScope)?;
+        if authority.retirement_fence != retirement_fence
+            || !capture.owner.matches(page, operation.generation)
+            || capture.sequence != operation.sequence
+            || !authority
+                .latest
+                .iter()
+                .any(|current| std::ptr::eq(current.as_ref(), capture))
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        check(page, operation)
+    }
     #[allow(clippy::too_many_arguments)] // The optional diagnostic borrows only for this run.
     async fn run(
         &self,
@@ -2282,6 +2349,8 @@ impl ObservationDispatch {
             inventory_complete: true,
         };
         let is_observe = matches!(&request, DispatchRequest::Observe(_));
+        let mut node_negatives = Vec::new();
+        let mut node_geometry_mixed_hard = false;
         let outcome = async {
         #[cfg(test)]
         witness.enter(ObserveFailureStage::ProtectedBarrier);
@@ -2414,7 +2483,17 @@ impl ObservationDispatch {
                             }
                             let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                             screenshot_stage(screenshot, ScreenshotStage::SemanticNodeGeometry);
-                            observation::project_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut tree.roots, &operation).await.map_err(map_geometry)?;
+                            if let Err(failure) = observation::project_observe_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut tree.roots, &operation).await {
+                                let mut detail = geometry_read_failure(&failure.error);
+                                if failure.error == super::client_geometry::GeometryError::StaleIdentity && !detail.1 {
+                                    detail.0 = diagnostic::ReadError::Geometry(node_geometry_read_origin(failure.origin));
+                                }
+                                node_geometry_mixed_hard = failure.origin == super::client_geometry::NodeGeometryOrigin::MixedHard;
+                                node_negatives = failure.negatives;
+                                let error = geometry_error_with_cleanup(failure.error, &observation_cleanup);
+                                if let Some(witness) = screenshot { witness.read_failure(detail, &error); }
+                                return Err(error);
+                            }
                             #[cfg(test)]
                             witness.enter(ObserveFailureStage::DocumentRoot);
                             screenshot_stage(screenshot, ScreenshotStage::SemanticDocumentRoot);
@@ -2654,6 +2733,21 @@ impl ObservationDispatch {
                     && !failure.cleanup_integrity_lost
                     && failure.error == ProtocolError::StaleScope =>
             {
+                if node_geometry_mixed_hard {
+                    return Err(failure);
+                }
+                if !node_negatives.is_empty() {
+                    return Err(self
+                        .finish_node_resample_failure(
+                            &capture_context,
+                            &operation,
+                            capture.as_deref(),
+                            retirement_fence,
+                            failure,
+                            &node_negatives,
+                        )
+                        .await);
+                }
                 match document_retirement_proven(&capture_context, &operation).await {
                     Ok(true) => failure.error = ProtocolError::StaleReference,
                     Err(ProtocolError::CleanupFailed) => failure.cleanup_integrity_lost = true,
@@ -2666,6 +2760,61 @@ impl ObservationDispatch {
     }
 }
 
+/// This never rebinds a stale node. Every positive negative belongs to a
+/// frozen input, and the complete original document inventory must survive.
+async fn node_identity_resample_proven(
+    context: &CaptureContext,
+    operation: &OperationLease,
+    negatives: &[super::client_geometry::NodeIdentityNegativeProof],
+    authority: impl Fn() -> Result<(), ProtocolError>,
+) -> Result<bool, ProtocolError> {
+    if negatives.is_empty() {
+        return Ok(false);
+    }
+    authority()?;
+    if !node_negative_frames_match(negatives, &context.frames) {
+        return Ok(false);
+    }
+    let (revision, _) = context.page.targets.inventory()?;
+    let current = verified_frames(&context.page, operation).await?;
+    // Includes page/session/frame/loader/parent/owner and URL, not just one
+    // selected negative's frame. A different document is not this proof.
+    same_frames(&context.frames, &current)?;
+    context.page.targets.check_revision(revision)?;
+    authority()?;
+    Ok(true)
+}
+fn node_negative_frames_match(
+    negatives: &[super::client_geometry::NodeIdentityNegativeProof],
+    frames: &[ObservationFrame],
+) -> bool {
+    !negatives.is_empty()
+        && negatives.iter().all(|negative| {
+            frames
+                .iter()
+                .any(|frame| frame.binding == *negative.binding())
+        })
+}
+fn node_geometry_read_origin(
+    origin: super::client_geometry::NodeGeometryOrigin,
+) -> diagnostic::GeometryReadError {
+    use super::client_geometry::NodeGeometryOrigin as Origin;
+    use diagnostic::GeometryReadError as Kind;
+    match origin {
+        Origin::ReferenceBinding => Kind::NodeReferenceBinding,
+        Origin::FrameBinding => Kind::NodeFrameBinding,
+        Origin::ResolveNodeNegative => Kind::NodeResolveNegative,
+        Origin::ResolveBindingNegative => Kind::NodeResolveBindingNegative,
+        Origin::ResolveProofInvalid => Kind::NodeResolveProofInvalid,
+        Origin::ResolveOther => Kind::NodeResolveOther,
+        Origin::BoxRead => Kind::NodeBoxRead,
+        Origin::BoxNodeNegative => Kind::NodeBoxNegative,
+        Origin::BoxProofInvalid => Kind::NodeBoxProofInvalid,
+        Origin::MixedHard => Kind::NodeMixedHard,
+        Origin::MixedNodeNegative => Kind::NodeMixedNegative,
+        Origin::Other => Kind::StaleIdentity,
+    }
+}
 /// Classify only an observe failure after its cleanup has finished. A stale
 /// capture can also mean layout movement, a retired attempt, or lost inventory
 /// authority; none of those is evidence of document replacement.
@@ -7207,3 +7356,95 @@ mod fixture_acquisition_refusal_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod node_identity_resample_fence_tests {
+    use super::*;
+    fn frame(id: &str) -> ObservationFrame {
+        ObservationFrame {
+            parent_frame_id: None,
+            owner_backend_id: None,
+            url: "https://example.test/".into(),
+            binding: super::super::element::ExactBinding {
+                page_session: "page".into(),
+                session: "renderer".into(),
+                frame: id.into(),
+                loader: "loader".into(),
+                actionable: false,
+            },
+            offset_x: 0.,
+            offset_y: 0.,
+            frame_path: vec![],
+        }
+    }
+    fn negative(
+        frame: &ObservationFrame,
+    ) -> super::super::client_geometry::NodeIdentityNegativeProof {
+        super::super::client_geometry::node_negative_proof_for_test(&frame.binding, 7)
+    }
+    #[test]
+    fn every_negative_must_match_its_original_frame() {
+        let frames = vec![frame("one"), frame("two")];
+        let negatives = vec![negative(&frames[0]), negative(&frames[1])];
+        assert!(node_negative_frames_match(&negatives, &frames));
+        assert!(!node_negative_frames_match(&negatives, &frames[..1]));
+        assert!(!node_negative_frames_match(&[], &frames));
+        let mut replaced = frames.clone();
+        replaced[1].binding.loader = "new-loader".into();
+        assert!(!node_negative_frames_match(&negatives, &replaced));
+    }
+    #[test]
+    fn full_inventory_proof_refuses_every_changed_binding_or_owner() {
+        let before = vec![frame("one"), frame("two")];
+        assert_eq!(same_frames(&before, &before), Ok(()));
+        for field in 0..8 {
+            let mut after = before.clone();
+            match field {
+                0 => after[1].binding.page_session.push('x'),
+                1 => after[1].binding.session.push('x'),
+                2 => after[1].binding.frame.push('x'),
+                3 => after[1].binding.loader.push('x'),
+                4 => after[1].parent_frame_id = Some("new-parent".into()),
+                5 => after[1].owner_backend_id = Some(9),
+                6 => after[1].url.push('x'),
+                _ => {
+                    after.pop();
+                }
+            }
+            assert_eq!(same_frames(&before, &after), Err(ProtocolError::StaleScope));
+        }
+    }
+    #[test]
+    fn origin_diagnostic_is_closed_and_does_not_export_identity() {
+        use super::super::client_geometry::NodeGeometryOrigin as Origin;
+        let cases = [
+            (Origin::ReferenceBinding, "node-reference-binding"),
+            (Origin::FrameBinding, "node-frame-binding"),
+            (Origin::ResolveNodeNegative, "node-resolve-negative"),
+            (
+                Origin::ResolveBindingNegative,
+                "node-resolve-binding-negative",
+            ),
+            (Origin::ResolveOther, "node-resolve-other"),
+            (Origin::ResolveProofInvalid, "node-resolve-proof-invalid"),
+            (Origin::BoxRead, "node-box-read"),
+            (Origin::BoxNodeNegative, "node-box-negative"),
+            (Origin::BoxProofInvalid, "node-box-proof-invalid"),
+            (Origin::MixedHard, "node-mixed-hard"),
+            (Origin::MixedNodeNegative, "node-mixed-negative"),
+        ];
+        for (origin, wire) in cases {
+            assert_eq!(
+                serde_json::to_value(diagnostic::ReadError::Geometry(node_geometry_read_origin(
+                    origin
+                )))
+                .unwrap(),
+                serde_json::json!({"geometry":wire})
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "client_observe_node_identity_chain_tests.rs"]
+mod node_identity_layered_chain_tests;

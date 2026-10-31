@@ -1628,6 +1628,67 @@ pub async fn resolve_exact_object_typed(
     let context = create_exact_realm(client, binding).await?;
     resolve_exact_object_in_realm_typed(client, binding, backend, context).await
 }
+/// Opaque receipt minted only by the exact readonly resolver's native reply.
+/// The geometry owner must still associate it with its original node read.
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedNodeNegativeProof {
+    binding: ExactBinding,
+    backend: i64,
+}
+impl ResolvedNodeNegativeProof {
+    pub(crate) fn matches(&self, binding: &ExactBinding, backend: i64) -> bool {
+        self.binding == *binding && self.backend == backend
+    }
+}
+fn resolution_node_negative_proof(
+    binding: &ExactBinding,
+    backend: i64,
+    response: &Value,
+) -> Option<ResolvedNodeNegativeProof> {
+    let result = response.get("result")?.as_object()?;
+    (response.get("exceptionDetails").is_none()
+        && result.get("type").and_then(Value::as_str) == Some("boolean")
+        && result.get("value").and_then(Value::as_bool) == Some(false)
+        && !result.contains_key("objectId")
+        && !result.contains_key("unserializableValue")
+        && !result.contains_key("subtype")
+        && !result.contains_key("className"))
+    .then(|| ResolvedNodeNegativeProof {
+        binding: binding.clone(),
+        backend,
+    })
+}
+#[derive(Default)]
+struct NodeProofCapture {
+    negative: Option<ResolvedNodeNegativeProof>,
+    invalid_reply: bool,
+}
+pub(crate) async fn resolve_readonly_node_with_negative_proof(
+    client: &CdpClient,
+    binding: &ExactBinding,
+    backend: i64,
+    group: &str,
+) -> (
+    Result<String, ExactResolutionError>,
+    Option<ResolvedNodeNegativeProof>,
+    bool,
+) {
+    let mut capture = NodeProofCapture::default();
+    let result = async {
+        let context = create_exact_realm(client, binding).await?;
+        resolve_exact_object_in_realm_impl(
+            client,
+            binding,
+            backend,
+            context,
+            Some(group),
+            Some(&mut capture),
+        )
+        .await
+    }
+    .await;
+    (result, capture.negative, capture.invalid_reply)
+}
 /// Temporary semantic-geometry objects belong to the caller's unique native
 /// group. That caller retains group custody on every success or refusal.
 pub(crate) async fn resolve_exact_object_in_readonly_group(
@@ -1637,7 +1698,7 @@ pub(crate) async fn resolve_exact_object_in_readonly_group(
     group: &str,
 ) -> Result<String, ExactResolutionError> {
     let context = create_exact_realm(client, binding).await?;
-    resolve_exact_object_in_realm_impl(client, binding, backend, context, Some(group)).await
+    resolve_exact_object_in_realm_impl(client, binding, backend, context, Some(group), None).await
 }
 // Ordinary actions do not have this Observe-only task-local context. Stop
 // before new proof/acquisition commands, never inside mandatory handle release.
@@ -1673,7 +1734,7 @@ pub async fn resolve_exact_object_in_realm_typed(
     backend: i64,
     context: i64,
 ) -> Result<String, ExactResolutionError> {
-    resolve_exact_object_in_realm_impl(client, binding, backend, context, None).await
+    resolve_exact_object_in_realm_impl(client, binding, backend, context, None, None).await
 }
 async fn resolve_exact_object_in_realm_impl(
     client: &CdpClient,
@@ -1681,6 +1742,7 @@ async fn resolve_exact_object_in_realm_impl(
     backend: i64,
     context: i64,
     readonly_group: Option<&str>,
+    mut negative: Option<&mut NodeProofCapture>,
 ) -> Result<String, ExactResolutionError> {
     check_capture_retirement()?;
     let result = client.send_command("DOM.resolveNode", Some(serde_json::json!({
@@ -1705,7 +1767,13 @@ async fn resolve_exact_object_in_realm_impl(
         let result = if result.get("exceptionDetails").is_some() { Err(ExactResolutionError::BackendFailure) } else {
             match result["result"]["value"].as_bool() {
                 Some(true) => validate_exact_binding_typed(client, &binding.page_session, binding).await,
-                Some(false) => Err(ExactResolutionError::StaleReference),
+                Some(false) => {
+                    if let Some(slot) = negative.as_mut() {
+                        slot.negative = resolution_node_negative_proof(binding, backend, &result);
+                        slot.invalid_reply = slot.negative.is_none();
+                    }
+                    Err(ExactResolutionError::StaleReference)
+                },
                 None => Err(ExactResolutionError::BackendFailure),
             }
         };
@@ -4160,5 +4228,68 @@ mod tests {
         let session = resolve_frame_session(None, "parent-session", &iframe_sessions);
 
         assert_eq!(session, "parent-session");
+    }
+}
+
+#[cfg(test)]
+mod node_identity_negative_proof_tests {
+    use super::*;
+    fn binding() -> ExactBinding {
+        ExactBinding {
+            page_session: "page".into(),
+            session: "renderer".into(),
+            frame: "frame".into(),
+            loader: "loader".into(),
+            actionable: false,
+        }
+    }
+    #[test]
+    fn resolution_negative_requires_exact_by_value_boolean_envelope() {
+        let binding = binding();
+        let valid = serde_json::json!({"result":{"type":"boolean","value":false}});
+        assert!(resolution_node_negative_proof(&binding, 1, &valid).is_some());
+        for response in [
+            serde_json::json!({}),
+            serde_json::json!({"result":null}),
+            serde_json::json!({"result":[]}),
+            serde_json::json!({"result":{"value":false}}),
+            serde_json::json!({"result":{"type":"string","value":false}}),
+            serde_json::json!({"result":{"type":"boolean","value":"false"}}),
+            serde_json::json!({"result":{"type":"boolean","value":true}}),
+            serde_json::json!({"result":{"type":"boolean","value":false},"exceptionDetails":null}),
+        ] {
+            assert!(resolution_node_negative_proof(&binding, 1, &response).is_none());
+        }
+        for key in ["objectId", "unserializableValue", "subtype", "className"] {
+            let mut invalid = valid.clone();
+            invalid["result"][key] = serde_json::json!("contradiction");
+            assert!(resolution_node_negative_proof(&binding, 1, &invalid).is_none());
+        }
+        let mut described = valid.clone();
+        described["result"]["description"] = "false".into();
+        assert!(resolution_node_negative_proof(&binding, 1, &described).is_some());
+    }
+    #[test]
+    fn resolver_receipt_never_rebinds_original_node() {
+        let binding = binding();
+        let proof = resolution_node_negative_proof(
+            &binding,
+            1,
+            &serde_json::json!({"result":{"type":"boolean","value":false}}),
+        )
+        .unwrap();
+        assert!(proof.matches(&binding, 1));
+        assert!(!proof.matches(&binding, 2));
+        for index in 0..5 {
+            let mut different = binding.clone();
+            match index {
+                0 => different.page_session.push('x'),
+                1 => different.session.push('x'),
+                2 => different.frame.push('x'),
+                3 => different.loader.push('x'),
+                _ => different.actionable = true,
+            }
+            assert!(!proof.matches(&different, 1));
+        }
     }
 }

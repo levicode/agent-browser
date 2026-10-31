@@ -2255,6 +2255,31 @@ impl OwnerDebtLedger {
     pub(crate) fn matches_owner(&self, generation: u64, identity_scope: &str) -> bool {
         self.generation == generation && self.identity_scope == identity_scope
     }
+    /// Read-only point-in-time guard for the exact observation operation.
+    /// Pending disposal is still valid retained custody, not rejected cleanup.
+    /// A later reply remains owned by this ledger; this is not an ACK seal.
+    pub(crate) fn operation_has_rejected_cleanup(
+        &self,
+        key: OperationKey,
+        identity_scope: &str,
+    ) -> Result<bool, ProtocolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::CleanupFailed)?;
+        if !self.matches_owner(key.generation, identity_scope) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if state.integrity_lost || state.retired {
+            return Err(ProtocolError::CleanupFailed);
+        }
+        Ok(state.commands.values().any(|command| {
+            command.provenance.operation == Some(key)
+                && command.submitted
+                && (command.release_group || command.release_object.is_some())
+                && command.status.snapshot() == CommandStatus::RetainedRejected
+        }))
+    }
     /// Sealed final-close evidence, not command settlement. Exact fully drained
     /// enrollment supplies the borrowed bindings; no host detach is invented.
     /// Every unacknowledged command remains in the ledger unchanged.
@@ -7222,3 +7247,108 @@ mod recording_start_status_tests {
 #[cfg(test)]
 #[path = "client_eval_preparation_tests.rs"]
 mod eval_preparation_tests;
+
+#[cfg(test)]
+mod node_resample_cleanup_guard_tests {
+    use super::*;
+
+    // Predicate truth-table only; the separate layered tests deliver actual
+    // release replies through CdpClient and its provenance-validating reader.
+    #[test]
+    fn rejected_cleanup_predicate_requires_exact_operation_release_and_disposition() {
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        ledger.bind_context("context").unwrap();
+        ledger.bind_session("context", "target", "session").unwrap();
+        let key = OperationKey {
+            generation: 1,
+            operation_seq: 1,
+        };
+        let journal = ledger
+            .operation(key, "target".into(), "session".into())
+            .unwrap();
+        let reservation = ledger
+            .reserve_command(Some(&journal), "Page.getFrameTree", None, Some("session"))
+            .unwrap();
+        let id = reservation.id;
+        for submitted in [false, true] {
+            for kind in 0..3 {
+                for status in [
+                    CommandStatus::Reserved,
+                    CommandStatus::Submitted,
+                    CommandStatus::Acknowledged,
+                    CommandStatus::Destroyed,
+                    CommandStatus::RetainedRejected,
+                ] {
+                    {
+                        let mut state = ledger.state.lock().unwrap();
+                        let command = state.commands.get_mut(&id).unwrap();
+                        command.submitted = submitted;
+                        command.release_group = kind == 1;
+                        command.release_object = (kind == 2).then(|| "object".into());
+                        command.status.set(status);
+                    }
+                    let expected =
+                        submitted && kind != 0 && status == CommandStatus::RetainedRejected;
+                    assert_eq!(
+                        ledger.operation_has_rejected_cleanup(key, "scope"),
+                        Ok(expected)
+                    );
+                    assert_eq!(
+                        ledger.operation_has_rejected_cleanup(
+                            OperationKey {
+                                generation: 1,
+                                operation_seq: 2
+                            },
+                            "scope"
+                        ),
+                        Ok(false)
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            ledger.operation_has_rejected_cleanup(key, "other"),
+            Err(ProtocolError::StaleScope)
+        );
+        assert_eq!(
+            ledger.operation_has_rejected_cleanup(
+                OperationKey {
+                    generation: 2,
+                    operation_seq: 1
+                },
+                "scope"
+            ),
+            Err(ProtocolError::StaleScope)
+        );
+    }
+
+    #[test]
+    fn rejected_cleanup_predicate_refuses_retired_integrity_lost_and_poisoned_owner() {
+        let key = OperationKey {
+            generation: 1,
+            operation_seq: 1,
+        };
+        for retired in [false, true] {
+            let ledger = OwnerDebtLedger::new(1, "scope".into());
+            {
+                let mut state = ledger.state.lock().unwrap();
+                state.retired = retired;
+                state.integrity_lost = !retired;
+            }
+            assert_eq!(
+                ledger.operation_has_rejected_cleanup(key, "scope"),
+                Err(ProtocolError::CleanupFailed)
+            );
+        }
+        let ledger = OwnerDebtLedger::new(1, "scope".into());
+        let poisoned = ledger.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poisoned.state.lock().unwrap();
+            panic!("deterministic predicate mutex poison");
+        }));
+        assert_eq!(
+            ledger.operation_has_rejected_cleanup(key, "scope"),
+            Err(ProtocolError::CleanupFailed)
+        );
+    }
+}

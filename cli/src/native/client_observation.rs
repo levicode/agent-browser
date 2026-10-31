@@ -5707,6 +5707,200 @@ pub async fn project_geometry(
     Ok(())
 }
 
+/// Observe-only failure evidence; identities remain private to this capture.
+pub(crate) struct ObserveGeometryFailure {
+    pub(crate) error: super::client_geometry::GeometryError,
+    pub(crate) origin: super::client_geometry::NodeGeometryOrigin,
+    pub(crate) negatives: Vec<super::client_geometry::NodeIdentityNegativeProof>,
+}
+type ObserveRectangleRead = (
+    Result<(String, Rect), super::client_geometry::GeometryError>,
+    super::client_geometry::SemanticNodeReadEvidence,
+);
+fn merge_observe_rectangles(
+    rectangles: Vec<ObserveRectangleRead>,
+) -> Result<HashMap<String, Rect>, ObserveGeometryFailure> {
+    use super::client_geometry::{GeometryError, NodeGeometryOrigin};
+    let clean_negative =
+        |error: &GeometryError, evidence: &super::client_geometry::SemanticNodeReadEvidence| {
+            *error == GeometryError::StaleIdentity && evidence.negative.is_some()
+        };
+    // All started reads have joined. Cleanup dominates every result; then any
+    // non-positive refusal dominates transient node evidence, regardless of
+    // buffered completion/input order. No first-node error may hide another.
+    let cleanup = rectangles
+        .iter()
+        .find(|(result, _)| matches!(result, Err(GeometryError::CleanupFailed { .. })));
+    let hard = cleanup.or_else(|| {
+        rectangles.iter().find(|(result, evidence)| {
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| !clean_negative(error, evidence))
+        })
+    });
+    if let Some((Err(error), evidence)) = hard {
+        let mixed = rectangles.iter().any(|(result, evidence)| {
+            result
+                .as_ref()
+                .err()
+                .is_some_and(|error| clean_negative(error, evidence))
+        });
+        return Err(ObserveGeometryFailure {
+            error: error.clone(),
+            origin: if mixed {
+                NodeGeometryOrigin::MixedHard
+            } else {
+                evidence.origin
+            },
+            negatives: vec![],
+        });
+    }
+    let mut values = HashMap::new();
+    let mut negatives = Vec::new();
+    let mut origin = NodeGeometryOrigin::Other;
+    for (result, evidence) in rectangles {
+        match result {
+            Ok((id, rect)) => {
+                values.insert(id, rect);
+            }
+            Err(error) => {
+                // The scan above established this is a positive node-negative.
+                let Some(proof) = evidence.negative else {
+                    return Err(ObserveGeometryFailure {
+                        error,
+                        origin: evidence.origin,
+                        negatives: vec![],
+                    });
+                };
+                let proof_origin = match proof.origin() {
+                    super::client_geometry::NodeIdentityNegativeOrigin::Resolution => {
+                        NodeGeometryOrigin::ResolveNodeNegative
+                    }
+                    super::client_geometry::NodeIdentityNegativeOrigin::BoxProof => {
+                        NodeGeometryOrigin::BoxNodeNegative
+                    }
+                };
+                if negatives.is_empty() {
+                    origin = proof_origin;
+                } else if origin != proof_origin {
+                    origin = NodeGeometryOrigin::MixedNodeNegative;
+                }
+                negatives.push(proof);
+            }
+        }
+    }
+    if !negatives.is_empty() {
+        return Err(ObserveGeometryFailure {
+            error: GeometryError::StaleIdentity,
+            origin,
+            negatives,
+        });
+    }
+    Ok(values)
+}
+pub(crate) async fn project_observe_geometry(
+    client: &CdpClient,
+    frames: &[ObservationFrame],
+    refs: &RefMap,
+    geometry: &super::client_geometry::GeometrySnapshot,
+    nodes: &mut [SemanticNode],
+    lease: &OperationLease,
+) -> Result<(), ObserveGeometryFailure> {
+    use super::client_geometry::{GeometryError, NodeGeometryOrigin, SemanticNodeReadEvidence};
+    use futures_util::{stream, StreamExt};
+    let requests = (|| {
+        let mut pending = nodes.iter().map(|node| (node, 0usize)).collect::<Vec<_>>();
+        let mut requests = Vec::new();
+        let mut visited = 0usize;
+        while let Some((node, depth)) = pending.pop() {
+            visited += 1;
+            if visited > 100_000 || depth > 256 {
+                return Err(GeometryError::InvalidGeometry);
+            }
+            pending.extend(node.children.iter().map(|child| (child, depth + 1)));
+            if node.rect.is_none() {
+                continue;
+            }
+            let id = super::element::parse_ref(&node.reference.id)
+                .ok_or(GeometryError::StaleIdentity)?;
+            let entry = refs.get(&id).ok_or(GeometryError::StaleIdentity)?;
+            if entry.kind != super::element::NativeReferenceKind::Dom {
+                return Err(GeometryError::InvalidGeometry);
+            }
+            let binding = entry
+                .exact_binding
+                .as_ref()
+                .ok_or(GeometryError::StaleIdentity)?;
+            let frame = frames
+                .iter()
+                .find(|frame| {
+                    frame.binding.page_session == binding.page_session
+                        && frame.binding.session == binding.session
+                        && frame.binding.frame == binding.frame
+                        && frame.binding.loader == binding.loader
+                })
+                .ok_or(GeometryError::StaleIdentity)?
+                .clone();
+            requests.push((
+                node.reference.id.clone(),
+                frame,
+                entry.backend_node_id.ok_or(GeometryError::StaleIdentity)?,
+            ));
+        }
+        Ok(requests)
+    })()
+    .map_err(|error| ObserveGeometryFailure {
+        error,
+        origin: NodeGeometryOrigin::ReferenceBinding,
+        negatives: vec![],
+    })?;
+    let rectangles = stream::iter(requests.into_iter().map(|(id, frame, backend)| async move {
+        let mut evidence = SemanticNodeReadEvidence::default();
+        let result = geometry
+            .node_semantic_bounds_observed(client, &frame, backend, lease, &mut evidence)
+            .await
+            .map(|bounds| {
+                let b = bounds.bounds();
+                (
+                    id,
+                    Rect {
+                        x: b.x,
+                        y: b.y,
+                        width: b.width,
+                        height: b.height,
+                    },
+                )
+            });
+        // A proof must belong to this exact staged node read, never another
+        // task's negative result or a freshly rebound document.
+        if evidence
+            .negative
+            .as_ref()
+            .is_some_and(|proof| !proof.matches(&frame.binding, backend))
+        {
+            evidence.negative = None;
+            evidence.origin = NodeGeometryOrigin::FrameBinding;
+            return (Err(GeometryError::StaleIdentity), evidence);
+        }
+        (result, evidence)
+    }))
+    .buffered(16)
+    .collect::<Vec<_>>()
+    .await;
+    let rectangles = merge_observe_rectangles(rectangles)?;
+    fn apply(nodes: &mut [SemanticNode], rectangles: &HashMap<String, Rect>) {
+        for node in nodes {
+            if let Some(rect) = rectangles.get(&node.reference.id) {
+                node.rect = Some(rect.clone());
+            }
+            apply(&mut node.children, rectangles);
+        }
+    }
+    apply(nodes, &rectangles);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -12011,3 +12205,90 @@ mod tests {
 #[cfg(test)]
 #[path = "client_observation_equivalence_tests.rs"]
 pub(crate) mod equivalence_tests;
+
+#[cfg(test)]
+mod node_identity_resample_merge_tests {
+    use super::*;
+    use crate::native::client_geometry::{
+        GeometryError, NodeGeometryOrigin, SemanticNodeReadEvidence,
+    };
+    fn negative(frame: &str) -> ObserveRectangleRead {
+        let binding = ExactBinding {
+            page_session: "page".into(),
+            session: "renderer".into(),
+            frame: frame.into(),
+            loader: "loader".into(),
+            actionable: false,
+        };
+        let proof = super::super::client_geometry::node_negative_proof_for_test(&binding, 7);
+        (
+            Err(GeometryError::StaleIdentity),
+            SemanticNodeReadEvidence {
+                negative: Some(proof),
+                origin: NodeGeometryOrigin::BoxNodeNegative,
+            },
+        )
+    }
+    fn refusal(error: GeometryError) -> ObserveRectangleRead {
+        (Err(error), SemanticNodeReadEvidence::default())
+    }
+    #[test]
+    fn every_hard_refusal_dominates_node_negative_in_both_orders() {
+        for hard in [
+            GeometryError::StaleIdentity,
+            GeometryError::InvalidGeometry,
+            GeometryError::IncompleteInventory,
+            GeometryError::Cancelled,
+            GeometryError::DeadlineExceeded,
+            GeometryError::Superseded,
+            GeometryError::BackendFailure,
+            GeometryError::CleanupFailed {
+                primary: Some(Box::new(GeometryError::StaleIdentity)),
+            },
+        ] {
+            for reversed in [false, true] {
+                let mut reads = vec![negative("frame"), refusal(hard.clone())];
+                if reversed {
+                    reads.reverse();
+                }
+                let Err(result) = merge_observe_rectangles(reads) else {
+                    panic!("refusal was erased");
+                };
+                assert_eq!(result.error, hard);
+                assert!(result.negatives.is_empty());
+                assert_eq!(result.origin, NodeGeometryOrigin::MixedHard);
+            }
+        }
+    }
+    #[test]
+    fn cleanup_dominates_hard_and_negative_across_more_than_one_buffer() {
+        let mut reads = (0..40).map(|_| negative("frame")).collect::<Vec<_>>();
+        reads.insert(0, refusal(GeometryError::Cancelled));
+        reads.push(refusal(GeometryError::CleanupFailed { primary: None }));
+        let Err(result) = merge_observe_rectangles(reads) else {
+            panic!("cleanup was erased");
+        };
+        assert_eq!(result.error, GeometryError::CleanupFailed { primary: None });
+        assert!(result.negatives.is_empty());
+    }
+    #[test]
+    fn all_negative_bindings_are_retained_not_only_first() {
+        let Err(result) = merge_observe_rectangles(vec![negative("first"), negative("second")])
+        else {
+            panic!("stale nodes published");
+        };
+        assert_eq!(result.negatives.len(), 2);
+        assert_eq!(result.negatives[0].binding().frame, "first");
+        assert_eq!(result.negatives[1].binding().frame, "second");
+        assert_eq!(result.origin, NodeGeometryOrigin::BoxNodeNegative);
+    }
+    #[test]
+    fn ordinary_stale_reference_has_no_positive_node_proof() {
+        let Err(result) = merge_observe_rectangles(vec![refusal(GeometryError::StaleIdentity)])
+        else {
+            panic!("refusal was erased");
+        };
+        assert!(result.negatives.is_empty());
+        assert_eq!(result.origin, NodeGeometryOrigin::Other);
+    }
+}

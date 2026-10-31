@@ -1377,6 +1377,17 @@ pub(crate) enum GeometryReadError {
     DeadlineExceeded,
     BackendFailure,
     CleanupFailed,
+    NodeReferenceBinding,
+    NodeFrameBinding,
+    NodeResolveNegative,
+    NodeResolveBindingNegative,
+    NodeResolveProofInvalid,
+    NodeResolveOther,
+    NodeBoxRead,
+    NodeBoxNegative,
+    NodeBoxProofInvalid,
+    NodeMixedHard,
+    NodeMixedNegative,
 }
 pub(crate) struct ScreenshotFailure {
     pub stage: ScreenshotStage,
