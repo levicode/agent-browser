@@ -1522,16 +1522,16 @@ pub(crate) enum InventoryFirstLoss {
 }
 pub(crate) fn terminal_proof_refusal(
     stage: TerminalCleanupStage,
-    key: Option<super::client_debt::OperationKey>,
+    key: Option<(u64, u64)>,
     reason: TerminalProofRefusal,
 ) {
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
         record_capture(
             capture,
-            key.map_or(0, |key| key.operation_seq),
+            key.map_or(0, |(_, operation_seq)| operation_seq),
             Phase::TerminalCleanupCheckpoint,
             Facts {
-                generation: key.map(|key| key.generation),
+                generation: key.map(|(generation, _)| generation),
                 terminal_cleanup_stage: Some(stage),
                 terminal_cleanup_ok: Some(false),
                 terminal_proof_refusal: Some(reason),

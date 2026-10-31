@@ -96,7 +96,7 @@ impl Registry {
                     .load(Ordering::Acquire)
                     .checked_add(1)
                 else {
-                    self.lose_integrity();
+                    self.lose_integrity(diagnostic::InventoryFirstLoss::QueryRevisionExhausted);
                     return Err(ProtocolError::IdentifierExhausted);
                 };
                 root.tenure.query_revision.store(next, Ordering::Release);
@@ -105,7 +105,9 @@ impl Registry {
             | AttachmentLineage::ReadyAuxiliary
             | AttachmentLineage::UnpartitionedDependency => {
                 let Some(next) = self.query_unknown_revision.checked_add(1) else {
-                    self.lose_integrity();
+                    self.lose_integrity(
+                        diagnostic::InventoryFirstLoss::UnknownQueryRevisionExhausted,
+                    );
                     return Err(ProtocolError::IdentifierExhausted);
                 };
                 self.query_unknown_revision = next;

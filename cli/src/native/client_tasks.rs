@@ -520,7 +520,7 @@ impl RetainedTasks {
             drop(tasks);
             super::client_settlement_trace::terminal_proof_refusal(
                 TerminalCleanupStage::TaskProof,
-                key,
+                key.map(|key| (key.generation, key.operation_seq)),
                 reason,
             );
             return Err(ProtocolError::CleanupFailed);
@@ -533,7 +533,7 @@ impl RetainedTasks {
         checked.map_err(|(key, reason)| {
             super::client_settlement_trace::terminal_proof_refusal(
                 TerminalCleanupStage::TaskProof,
-                key,
+                key.map(|key| (key.generation, key.operation_seq)),
                 reason,
             );
             ProtocolError::CleanupFailed
