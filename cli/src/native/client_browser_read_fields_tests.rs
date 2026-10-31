@@ -42,28 +42,9 @@ const REQUIRES_AX_APPLICATION: [&str; 15] = [
     "Page.getFrameTree", // AX entry frame validation
     "Accessibility.getFullAXTree",
 ];
-const LEGACY_APPLICATION: [&str; 19] = [
-    "Page.getFrameTree", // initial lineage
-    "Page.getFrameTree", // initial enumeration
-    "Page.createIsolatedWorld",
-    "Page.getFrameTree", // initial enumeration validation
-    "Page.getFrameTree", // initial policy inventory
-    "DOM.getDocument",
-    "DOM.describeNode",
-    "Page.createIsolatedWorld",
-    "DOM.resolveNode",
-    "Runtime.callFunctionOn",
-    "Page.getFrameTree", // final policy inventory
-    "DOM.getDocument",
-    "DOM.describeNode",
-    "Page.getFrameTree", // query_fields ancestry
-    "Page.getFrameTree", // query_fields root
-    "Page.getFrameTree", // final lineage
-    "Page.getFrameTree", // final enumeration
-    "Page.createIsolatedWorld",
-    "Page.getFrameTree", // final enumeration validation
-];
-const FINAL_EXTRA_WORKER_APPLICATION: [&str; 13] = [
+// Final multiple-renderer eligibility must enter the full lineage proof. The
+// peer refuses its second renderer tree after observing both exact sessions.
+const FINAL_EXTRA_RENDERER_APPLICATION: [&str; 11] = [
     "Page.getFrameTree",
     "Page.createIsolatedWorld",
     "Page.getFrameTree",
@@ -74,8 +55,6 @@ const FINAL_EXTRA_WORKER_APPLICATION: [&str; 13] = [
     "DOM.getDocument",
     "DOM.describeNode",
     "Page.getFrameTree",
-    "Page.getFrameTree",
-    "Page.createIsolatedWorld",
     "Page.getFrameTree",
 ];
 const SAMPLE_INDEX: usize = 6;
@@ -89,6 +68,9 @@ enum Mode {
     RequiresAxBackendError,
     InitialExtraWorker,
     FinalExtraWorker,
+    InitialUnreadyWorker,
+    FinalUnreadyWorker,
+    FinalExtraRenderer,
     ForeignInitialFrame,
     ForeignInitialDescription,
     ForeignFinalDescription,
@@ -110,17 +92,14 @@ impl Mode {
     fn script(self) -> &'static [&'static str] {
         match self {
             Self::RequiresAxBackendError => &REQUIRES_AX_APPLICATION,
-            Self::InitialExtraWorker => &LEGACY_APPLICATION,
-            Self::FinalExtraWorker => &FINAL_EXTRA_WORKER_APPLICATION,
+            Self::FinalExtraRenderer => &FINAL_EXTRA_RENDERER_APPLICATION,
+            Self::InitialUnreadyWorker => &[],
+            Self::FinalUnreadyWorker => &APPLICATION[..FINAL_TOPOLOGY_INDEX],
             _ => &APPLICATION,
         }
     }
     fn sample_index(self) -> usize {
-        if self == Self::InitialExtraWorker {
-            9
-        } else {
-            SAMPLE_INDEX
-        }
+        SAMPLE_INDEX
     }
     fn boundary(self) -> Option<usize> {
         match self {
@@ -142,7 +121,10 @@ impl Mode {
             | Self::FinalLeafChurn
             | Self::RequiresAxBackendError
             | Self::InitialExtraWorker
-            | Self::FinalExtraWorker => None,
+            | Self::FinalExtraWorker
+            | Self::InitialUnreadyWorker
+            | Self::FinalUnreadyWorker
+            | Self::FinalExtraRenderer => None,
         }
     }
     fn foreign(self) -> bool {
@@ -254,6 +236,17 @@ fn application_reply(
     mode: Mode,
     ordinal: usize,
 ) -> Value {
+    if mode == Mode::FinalExtraRenderer && ordinal >= FINAL_TOPOLOGY_INDEX {
+        assert_eq!(request["method"], "Page.getFrameTree");
+        assert_eq!(request["params"], json!({}));
+        return match request["sessionId"].as_str() {
+            Some("host-session") => frame_tree(),
+            Some("extra-renderer-session") => {
+                json!({"frameTree":{"frame":{"id":"extra-frame","loaderId":"extra-loader","url":"about:blank"}}})
+            }
+            other => panic!("unexpected renderer lineage session {other:?}"),
+        };
+    }
     assert_eq!(request["sessionId"], "host-session");
     match request["method"].as_str().unwrap() {
         "Page.getFrameTree" => {
@@ -418,6 +411,10 @@ async fn peer(mode: Mode) -> Peer {
                                 response["error"] = json!({"code":-32000,"message":"explicit AX control failure"});
                             }
                         }
+                        if mode == Mode::FinalExtraRenderer && current == FINAL_EXTRA_RENDERER_APPLICATION.len() - 1 {
+                            response.as_object_mut().unwrap().remove("result");
+                            response["error"] = json!({"code":-32000,"message":"explicit second-renderer lineage control failure"});
+                        }
                         if current == FINAL_DOCUMENT_INDEX && mode == Mode::FinalDocument {
                             response["result"]["root"]["backendNodeId"] = json!(101);
                         }
@@ -441,7 +438,7 @@ async fn peer(mode: Mode) -> Peer {
                                 _ => {}
                             }
                         }
-                        if mode == Mode::FinalExtraWorker && current == FINAL_DESCRIPTION_INDEX {
+                        if matches!(mode, Mode::FinalExtraWorker | Mode::FinalUnreadyWorker | Mode::FinalExtraRenderer) && current == FINAL_DESCRIPTION_INDEX {
                             assert!(held_response.replace(response).is_none());
                             held_send.send(()).unwrap();
                             continue;
@@ -665,9 +662,25 @@ fn assert_script(peer: &Peer, mode: Mode) {
     let application = peer.application.lock().unwrap();
     let expected_count = mode.boundary().map_or(mode.script().len(), |at| at + 1);
     assert_eq!(application.len(), expected_count, "{mode:?}");
-    for (request, method) in application.iter().zip(mode.script().iter().copied()) {
+    for (ordinal, (request, method)) in application
+        .iter()
+        .zip(mode.script().iter().copied())
+        .enumerate()
+    {
         assert_eq!(request["method"], method);
-        assert_eq!(request["sessionId"], "host-session");
+        if mode != Mode::FinalExtraRenderer || ordinal < FINAL_TOPOLOGY_INDEX {
+            assert_eq!(request["sessionId"], "host-session");
+        }
+    }
+    if mode == Mode::FinalExtraRenderer {
+        let sessions: std::collections::HashSet<_> = application[FINAL_TOPOLOGY_INDEX..]
+            .iter()
+            .map(|request| request["sessionId"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            sessions,
+            std::collections::HashSet::from(["host-session", "extra-renderer-session"])
+        );
     }
     assert_eq!(
         peer.releases.lock().unwrap().len(),
@@ -1100,7 +1113,8 @@ async fn add_ready_worker(browser: &ClientBrowser) {
 }
 
 #[tokio::test]
-async fn public_read_fields_extra_ready_worker_uses_full_inventory_without_resampling() {
+async fn public_read_fields_extra_ready_worker_preserves_single_renderer_proof_without_resampling()
+{
     for mode in [Mode::InitialExtraWorker, Mode::FinalExtraWorker] {
         let (mut peer, browser, mut fixture, scope) = setup(mode).await;
         let ledger = browser
@@ -1151,4 +1165,121 @@ async fn public_read_fields_extra_ready_worker_uses_full_inventory_without_resam
             .unwrap();
         finish(peer, fixture, false).await;
     }
+}
+
+// A configured but not resumed worker is present in a complete registry
+// inventory. The optimized shape check must still enforce the original
+// per-application-target readiness rule before reading or publishing.
+#[tokio::test]
+async fn public_read_fields_unresumed_worker_never_publishes_values_or_refs() {
+    for mode in [Mode::InitialUnreadyWorker, Mode::FinalUnreadyWorker] {
+        let (mut peer, browser, mut fixture, scope) = setup(mode).await;
+        let page = browser.page_lease(false).await.unwrap();
+        let ledger = page.client.debt_ledger().unwrap();
+        if mode == Mode::FinalUnreadyWorker {
+            request(&mut fixture, &scope, 5_000).await;
+            tokio::time::timeout(Duration::from_secs(2), peer.held.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(page
+            .targets
+            .attached(
+                "host-context",
+                "unready-worker".into(),
+                "unready-session".into(),
+                "worker".into()
+            )
+            .unwrap());
+        page.targets.configured("unready-worker").unwrap();
+        let (_, targets) = page.targets.inventory().unwrap();
+        assert_eq!(targets.len(), 2);
+        let worker = targets
+            .iter()
+            .find(|target| target.target_id == "unready-worker")
+            .unwrap();
+        assert!(worker.configured);
+        assert!(!worker.resumed);
+        assert_eq!(
+            worker.purpose,
+            Some(crate::native::client_targets::TargetPurpose::Application)
+        );
+        if mode == Mode::InitialUnreadyWorker {
+            request(&mut fixture, &scope, 5_000).await;
+        } else {
+            control(&peer, Control::ReleaseHeld).await;
+        }
+        let value = result(&mut fixture, false).await;
+        assert_rejected(&value, &browser);
+        assert_eq!(value["error"]["code"], "scope-unavailable");
+        assert_eq!(value["effects"], "not-dispatched");
+        assert_eq!(value["scopeState"], "usable");
+        debt_settled(&ledger).await;
+        assert_eq!(
+            peer.application
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request["method"] == "Runtime.callFunctionOn")
+                .count(),
+            usize::from(mode == Mode::FinalUnreadyWorker)
+        );
+        assert_script(&peer, mode);
+        page.targets.detach("unready-worker").unwrap();
+        finish(peer, fixture, false).await;
+    }
+}
+
+#[tokio::test]
+async fn public_read_fields_extra_renderer_enters_full_final_lineage_without_resampling() {
+    let mode = Mode::FinalExtraRenderer;
+    let (mut peer, browser, mut fixture, scope) = setup(mode).await;
+    let page = browser.page_lease(false).await.unwrap();
+    let ledger = page.client.debt_ledger().unwrap();
+    request(&mut fixture, &scope, 5_000).await;
+    tokio::time::timeout(Duration::from_secs(2), peer.held.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(page
+        .targets
+        .attached(
+            "host-context",
+            "extra-renderer".into(),
+            "extra-renderer-session".into(),
+            "page".into()
+        )
+        .unwrap());
+    page.targets.configured("extra-renderer").unwrap();
+    page.targets
+        .resume_permit("extra-renderer")
+        .await
+        .unwrap()
+        .complete()
+        .unwrap();
+    let (_, targets) = page.targets.inventory().unwrap();
+    assert_eq!(targets.len(), 2);
+    assert!(targets
+        .iter()
+        .all(|target| target.kind == "page" && target.capture_ready()));
+    control(&peer, Control::ReleaseHeld).await;
+    let value = result(&mut fixture, false).await;
+    assert_rejected(&value, &browser);
+    assert_eq!(value["error"]["code"], "browser-failure");
+    assert_eq!(value["effects"], "not-dispatched");
+    assert_eq!(value["scopeState"], "usable");
+    debt_settled(&ledger).await;
+    assert_eq!(
+        peer.application
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|request| request["method"] == "Runtime.callFunctionOn")
+            .count(),
+        1
+    );
+    assert_script(&peer, mode);
+    page.targets.detach("extra-renderer").unwrap();
+    finish(peer, fixture, false).await;
 }

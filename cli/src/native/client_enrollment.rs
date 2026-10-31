@@ -5338,11 +5338,15 @@ impl ClientEnrollment {
             )
             .await?;
             *pending_resume = Some(permit);
-            let resume_diagnostic = self.targets.diagnostic_attachment_for_session(
-                &entry.target,
-                &entry.session,
-                (op.generation, op.sequence),
-            );
+            let resume_diagnostic = if entry.kind == "page" {
+                self.targets.diagnostic_attachment_for_session(
+                    &entry.target,
+                    &entry.session,
+                    (op.generation, op.sequence),
+                )
+            } else {
+                None
+            };
             let observe_resume = |stage| {
                 if let Some(mut target) = resume_diagnostic {
                     target.stage = stage;

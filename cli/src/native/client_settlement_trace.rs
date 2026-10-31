@@ -7,7 +7,7 @@ use std::cell::Cell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use serde::Serialize;
@@ -175,7 +175,7 @@ pub(crate) enum MessageKind {
     Close,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -390,7 +390,7 @@ impl Facts {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Record {
     schema_version: u8,
@@ -436,11 +436,68 @@ fn increment(value: &AtomicU64, amount: u64, overflow: &AtomicBool) -> u64 {
         .unwrap_or_else(|old| old)
 }
 
+#[derive(Default)]
+struct RetainedRecord {
+    record: OnceLock<Record>,
+    lost: AtomicBool,
+}
+// Compile-time conservative RAM ceiling; not a measured runtime allocation.
+// Slot count follows the unchanged output record caps. Capture/allocator
+// metadata is additional; ordinary and query captures remain separate.
+const _: () = {
+    assert!(std::mem::size_of::<Record>() <= std::mem::size_of::<RetainedRecord>());
+    assert!(std::mem::size_of::<RetainedRecord>() <= 2048);
+    assert!(MAX_RECORDS * std::mem::size_of::<RetainedRecord>() <= 4 * 1024 * 1024);
+    assert!(QUERY_MAX_RECORDS * std::mem::size_of::<RetainedRecord>() <= 256 * 1024);
+};
 struct Capture {
     source: Source,
     sink: Mutex<AppendSink>,
     counters: Counters,
+    // Unique attempted ordinals own unique cells; never reused or renumbered.
+    retained: Box<[RetainedRecord]>,
+    next: AtomicUsize,
+    work: AtomicUsize,
+    failed: AtomicBool,
+    #[cfg(test)]
+    hook: Mutex<Option<Arc<dyn Fn(DrainPoint) + Send + Sync>>>,
 }
+impl Capture {
+    fn new(source: Source, sink: AppendSink) -> Self {
+        let retained = (0..sink.max_records)
+            .map(|_| RetainedRecord::default())
+            .collect();
+        Self {
+            source,
+            sink: Mutex::new(sink),
+            counters: Counters::default(),
+            retained,
+            next: AtomicUsize::new(0),
+            work: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            #[cfg(test)]
+            hook: Mutex::new(None),
+        }
+    }
+    #[cfg(test)]
+    fn observe(&self, point: DrainPoint) {
+        let hook = self.hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrainPoint {
+    Reserved,
+    Published,
+    Locked,
+    EmptyPrefix,
+    BeforeRelease,
+    Released,
+}
+
 static SINK: OnceLock<Option<Capture>> = OnceLock::new();
 
 pub(super) fn initialize() {
@@ -457,11 +514,10 @@ fn initialize_source(source: Source) {
     let capture = SINK.get_or_init(|| {
         created = true;
         let path = PathBuf::from(std::env::var_os(PATH_ENV)?);
-        Some(Capture {
+        Some(Capture::new(
             source,
-            sink: Mutex::new(AppendSink::open(&path, MAX_RECORDS, MAX_BYTES).ok()?),
-            counters: Counters::default(),
-        })
+            AppendSink::open(&path, MAX_RECORDS, MAX_BYTES).ok()?,
+        ))
     });
     if created && capture.is_some() {
         record_source(source, 0, Phase::CaptureStarted, Facts::default());
@@ -492,7 +548,6 @@ fn record_source(source: Source, operation_seq: u64, phase: Phase, facts: Facts)
 fn record_capture(capture: &Capture, operation_seq: u64, phase: Phase, mut facts: Facts) {
     let source = capture.source;
     let counters = &capture.counters;
-    let ordinal = increment(&counters.attempted, 1, &counters.overflow);
     let mut overflow = counters.overflow.load(Ordering::Relaxed);
     let operation_seq = bounded(operation_seq, &mut overflow);
     facts.clamp(&mut overflow);
@@ -503,7 +558,7 @@ fn record_capture(capture: &Capture, operation_seq: u64, phase: Phase, mut facts
         schema_version: 2,
         source,
         pid: std::process::id(),
-        record: ordinal,
+        record: 0,
         operation_seq,
         phase,
         dropped_before: 0,
@@ -512,7 +567,123 @@ fn record_capture(capture: &Capture, operation_seq: u64, phase: Phase, mut facts
         overflow,
         facts,
     };
-    emit(&capture.sink, record, counters);
+    publish_record(capture, record);
+}
+
+fn publish_record(capture: &Capture, mut record: Record) {
+    // No allocation, serialization, I/O, await, or user callback follows this
+    // reservation before publication (test-only pause hooks are excluded).
+    let ordinal = increment(&capture.counters.attempted, 1, &capture.counters.overflow);
+    let Some(slot) = usize::try_from(ordinal)
+        .ok()
+        .and_then(|n| capture.retained.get(n))
+    else {
+        increment(&capture.counters.dropped, 1, &capture.counters.overflow);
+        return;
+    };
+    if capture.failed.load(Ordering::Acquire) {
+        lose_retained(capture, ordinal as usize);
+        return;
+    }
+    record.record = ordinal;
+    if ordinal as usize == capture.retained.len() - 1 {
+        // Reserve the final cell for explicit exhaustion, even if earlier
+        // actual I/O loss left fewer physical rows in the append file.
+        record.phase = Phase::CaptureLimitReached;
+        record.operation_seq = 0;
+        record.facts = Facts::default();
+        // emit_locked counts the replaced observation once when this marker
+        // is acknowledged (or once as an I/O loss if it cannot be written).
+    }
+    #[cfg(test)]
+    capture.observe(DrainPoint::Reserved);
+    if slot.record.set(record).is_err() {
+        // Unreachable for a unique unsaturated ordinal; never hide a violation.
+        increment(&capture.counters.dropped, 1, &capture.counters.overflow);
+    }
+    #[cfg(test)]
+    capture.observe(DrainPoint::Published);
+    signal_drain(capture, ordinal as usize);
+}
+
+fn lose_retained(capture: &Capture, ordinal: usize) {
+    // Only undrained cells can be lost by a terminal internal failure. The
+    // per-cell bit reconciles reservations/publishers racing the failure scan.
+    if ordinal >= capture.next.load(Ordering::Acquire) {
+        if let Some(slot) = capture.retained.get(ordinal) {
+            if !slot.lost.swap(true, Ordering::AcqRel) {
+                increment(&capture.counters.dropped, 1, &capture.counters.overflow);
+            }
+        }
+    }
+}
+fn signal_drain(capture: &Capture, ordinal: usize) {
+    if capture.failed.load(Ordering::Acquire) {
+        lose_retained(capture, ordinal);
+        capture.work.swap(0, Ordering::AcqRel);
+        return;
+    }
+    if capture.work.fetch_add(1, Ordering::AcqRel) != 0 {
+        if capture.failed.load(Ordering::Acquire) {
+            lose_retained(capture, ordinal);
+            capture.work.swap(0, Ordering::AcqRel);
+        }
+        return;
+    }
+    let mut consumed = 1;
+    loop {
+        if capture.failed.load(Ordering::Acquire) {
+            lose_retained(capture, ordinal);
+            capture.work.swap(0, Ordering::AcqRel);
+            return;
+        }
+        {
+            // Only the work owner touches the sink. Release the mutex BEFORE
+            // relinquishing work ownership so a new owner cannot collide.
+            let Ok(mut sink) = capture.sink.try_lock() else {
+                // A poisoned/invariant-broken sink cannot certify completion.
+                capture.failed.store(true, Ordering::Release);
+                // Acquire completed publishers' notification release sequence
+                // before sampling their attempted frontier. Later publishers
+                // observe failed and reconcile their own cell's loss bit.
+                capture.work.swap(0, Ordering::AcqRel);
+                let admitted = capture
+                    .counters
+                    .attempted
+                    .load(Ordering::Acquire)
+                    .min(capture.retained.len() as u64) as usize;
+                for pending in capture.next.load(Ordering::Acquire)..admitted {
+                    lose_retained(capture, pending);
+                }
+                lose_retained(capture, ordinal);
+                capture.counters.overflow.store(true, Ordering::Release);
+                capture.work.swap(0, Ordering::AcqRel);
+                return;
+            };
+            #[cfg(test)]
+            capture.observe(DrainPoint::Locked);
+            let mut next = capture.next.load(Ordering::Relaxed);
+            while let Some(slot) = capture.retained.get(next) {
+                let Some(record) = slot.record.get() else {
+                    #[cfg(test)]
+                    capture.observe(DrainPoint::EmptyPrefix);
+                    break;
+                };
+                emit_locked(&mut sink, record.clone(), &capture.counters);
+                next += 1;
+                capture.next.store(next, Ordering::Relaxed);
+            }
+        }
+        #[cfg(test)]
+        capture.observe(DrainPoint::BeforeRelease);
+        let previous = capture.work.fetch_sub(consumed, Ordering::AcqRel);
+        if previous == consumed {
+            #[cfg(test)]
+            capture.observe(DrainPoint::Released);
+            return;
+        }
+        consumed = previous - consumed;
+    }
 }
 
 // This cell is diagnostic data only: it owns no client, task, native identity,
@@ -614,11 +785,10 @@ pub(super) fn initialize_cleanup() {
     }
 }
 fn query_capture(path: Option<&Path>) -> Option<Capture> {
-    Some(Capture {
-        source: Source::Native,
-        sink: Mutex::new(AppendSink::open(path?, QUERY_MAX_RECORDS, QUERY_MAX_BYTES).ok()?),
-        counters: Counters::default(),
-    })
+    Some(Capture::new(
+        Source::Native,
+        AppendSink::open(path?, QUERY_MAX_RECORDS, QUERY_MAX_BYTES).ok()?,
+    ))
 }
 fn critical_query_refusal(
     capture: &Capture,
@@ -640,11 +810,10 @@ fn critical_query_refusal(
     );
 }
 fn cleanup_capture(path: Option<&Path>) -> Option<Capture> {
-    Some(Capture {
-        source: Source::Native,
-        sink: Mutex::new(AppendSink::open(path?, MAX_RECORDS, MAX_BYTES).ok()?),
-        counters: Counters::default(),
-    })
+    Some(Capture::new(
+        Source::Native,
+        AppendSink::open(path?, MAX_RECORDS, MAX_BYTES).ok()?,
+    ))
 }
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2576,11 +2745,15 @@ fn suppress(source: Source) {
     }
 }
 
-fn emit(sink: &Mutex<AppendSink>, mut record: Record, counters: &Counters) {
+#[cfg(test)]
+fn emit(sink: &Mutex<AppendSink>, record: Record, counters: &Counters) {
     let Ok(mut sink) = sink.try_lock() else {
         increment(&counters.dropped, 1, &counters.overflow);
         return;
     };
+    emit_locked(&mut sink, record, counters);
+}
+fn emit_locked(sink: &mut AppendSink, mut record: Record, counters: &Counters) {
     record.dropped_before = counters.dropped.load(Ordering::Relaxed);
     record.emitted_before = counters.emitted.load(Ordering::Relaxed);
     record.suppressed_before = counters.suppressed.load(Ordering::Relaxed);
@@ -2605,11 +2778,20 @@ enum Appended {
     Limit,
     Dropped,
 }
+#[cfg(test)]
+#[derive(Default)]
+struct SinkFault {
+    partial_after: Option<usize>,
+    read: bool,
+    unlock: bool,
+}
 struct AppendSink {
     file: File,
     max_records: usize,
     max_bytes: usize,
     stopped: bool,
+    #[cfg(test)]
+    fault: SinkFault,
 }
 
 impl AppendSink {
@@ -2635,6 +2817,8 @@ impl AppendSink {
             max_records,
             max_bytes,
             stopped: false,
+            #[cfg(test)]
+            fault: SinkFault::default(),
         })
     }
 
@@ -2645,10 +2829,25 @@ impl AppendSink {
         self.file.try_lock().map_err(io::Error::other)?;
         let result = self.append_locked(record);
         let unlocked = self.file.unlock();
+        #[cfg(test)]
+        let unlocked = if self.fault.unlock {
+            Err(io::Error::other("synthetic unlock failure"))
+        } else {
+            unlocked
+        };
         match result {
             Ok(appended) => unlocked.map(|()| appended),
             Err(error) => Err(error),
         }
+    }
+
+    fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(prefix) = self.fault.partial_after {
+            self.file.write_all(&line[..prefix.min(line.len())])?;
+            return Err(io::Error::other("synthetic partial write failure"));
+        }
+        self.file.write_all(line)
     }
 
     fn append_locked(&mut self, record: &Record) -> io::Result<Appended> {
@@ -2659,6 +2858,10 @@ impl AppendSink {
         }
         self.file.seek(SeekFrom::Start(0))?;
         let mut prior = Vec::new();
+        #[cfg(test)]
+        if self.fault.read {
+            return Err(io::Error::other("synthetic read failure"));
+        }
         Read::by_ref(&mut self.file)
             .take(self.max_bytes as u64 + 1)
             .read_to_end(&mut prior)?;
@@ -2672,7 +2875,8 @@ impl AppendSink {
             return Ok(Appended::Dropped);
         }
         let count = prior.iter().filter(|byte| **byte == b'\n').count();
-        let limited = count.saturating_add(1) >= self.max_records
+        let limited = record.phase == Phase::CaptureLimitReached
+            || count.saturating_add(1) >= self.max_records
             || prior
                 .len()
                 .saturating_add(line.len())
@@ -2701,7 +2905,7 @@ impl AppendSink {
         }
         // Any partial append makes this artifact terminally incomplete. Never
         // repair, truncate, reopen or retry it after a write failure.
-        if let Err(error) = self.file.write_all(&line) {
+        if let Err(error) = self.write_line(&line) {
             self.stopped = true;
             return Err(error);
         }
@@ -3289,6 +3493,8 @@ mod tests {
             max_records: MAX_RECORDS,
             max_bytes: MAX_BYTES,
             stopped: false,
+            #[cfg(test)]
+            fault: SinkFault::default(),
         });
         emit(&read_only, sample(1), &counters);
         assert_eq!(counters.dropped.load(Ordering::Relaxed), 2);
@@ -3468,6 +3674,8 @@ mod tests {
             max_records: MAX_RECORDS,
             max_bytes: MAX_BYTES,
             stopped: false,
+            #[cfg(test)]
+            fault: SinkFault::default(),
         };
         assert!(sink.append(&sample(0)).is_err());
         assert!(sink.stopped);
@@ -3819,11 +4027,10 @@ mod critical_query_stream_tests {
     fn critical_query_stream_is_independent_bounded_and_closed() {
         let ordinary = tempfile::NamedTempFile::new().unwrap();
         let critical = tempfile::NamedTempFile::new().unwrap();
-        let ordinary_capture = Capture {
-            source: Source::Native,
-            sink: Mutex::new(AppendSink::open(ordinary.path(), 2, 2048).unwrap()),
-            counters: Counters::default(),
-        };
+        let ordinary_capture = Capture::new(
+            Source::Native,
+            AppendSink::open(ordinary.path(), 2, 2048).unwrap(),
+        );
         for _ in 0..8 {
             record_capture(
                 &ordinary_capture,
@@ -3881,7 +4088,7 @@ mod critical_query_stream_tests {
         assert!(capture.counters.dropped.load(Ordering::Relaxed) > 0);
     }
     #[test]
-    fn critical_query_stream_contention_is_explicit_not_lossless() {
+    fn critical_query_internal_owner_violation_is_terminal_not_complete() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let capture = query_capture(Some(file.path())).unwrap();
         let held = capture.sink.lock().unwrap();
@@ -3901,11 +4108,11 @@ mod critical_query_stream_tests {
             QueryScopeStage::InitialFrames,
             QueryScopeReason::WatermarkPending,
         );
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
-        assert_eq!(value["droppedBefore"], 1);
-        assert_eq!(value["operationSeq"], 4);
-        assert_eq!(value["record"], 1);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+        assert!(capture.failed.load(Ordering::Acquire));
+        assert!(capture.counters.overflow.load(Ordering::Acquire));
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
     }
     #[test]
     fn critical_query_stream_requires_explicit_existing_regular_file() {
@@ -4487,5 +4694,417 @@ mod popup_startup_diagnostic_tests {
             };
             assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
         }
+    }
+}
+
+#[cfg(test)]
+mod retained_capture_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    fn capture(cap: usize, bytes: usize) -> (tempfile::NamedTempFile, Arc<Capture>) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = Arc::new(Capture::new(
+            Source::Native,
+            AppendSink::open(file.path(), cap, bytes).unwrap(),
+        ));
+        (file, capture)
+    }
+    fn record(capture: &Capture) {
+        record_capture(capture, 0, Phase::TargetLifecycle, Facts::default());
+    }
+    fn rows(file: &tempfile::NamedTempFile) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(file.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    fn ordered(file: &tempfile::NamedTempFile, capture: &Capture, count: usize) {
+        let rows = rows(file);
+        assert_eq!(rows.len(), count);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row["record"], i);
+            assert_eq!(row["droppedBefore"], 0);
+            assert_eq!(row["emittedBefore"], i);
+            assert_eq!(row["overflow"], false);
+        }
+        assert_eq!(capture.next.load(Ordering::Relaxed), count);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 0);
+    }
+    fn pause_once(capture: &Capture, point: DrainPoint) -> (Arc<Barrier>, Arc<Barrier>) {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (a, b) = (entered.clone(), release.clone());
+        let once = AtomicBool::new(false);
+        *capture.hook.lock().unwrap() = Some(Arc::new(move |seen| {
+            if seen == point && !once.swap(true, Ordering::AcqRel) {
+                a.wait();
+                b.wait();
+            }
+        }));
+        (entered, release)
+    }
+    #[test]
+    fn held_drainer_retains_concurrent_startup_burst_and_terminal() {
+        let (file, capture) = capture(128, 64 * 1024);
+        let (entered, release) = pause_once(&capture, DrainPoint::Locked);
+        let owner = capture.clone();
+        let thread = std::thread::spawn(move || record(&owner));
+        entered.wait();
+        // More than the actual S14 concurrent browser-ui startup burst.
+        for _ in 0..24 {
+            record(&capture);
+        }
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::ShutdownJoins, true);
+        assert!(rows(&file).is_empty());
+        release.wait();
+        thread.join().unwrap();
+        ordered(&file, &capture, 26);
+        assert_eq!(
+            rows(&file).last().unwrap()["phase"],
+            "TerminalCleanupCheckpoint"
+        );
+    }
+    #[test]
+    fn earlier_reserved_hole_never_reorders_later_publication() {
+        let (file, capture) = capture(16, 8192);
+        let (entered, release) = pause_once(&capture, DrainPoint::Reserved);
+        let owner = capture.clone();
+        let thread = std::thread::spawn(move || record(&owner));
+        entered.wait();
+        record(&capture);
+        record(&capture);
+        assert!(rows(&file).is_empty());
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        release.wait();
+        thread.join().unwrap();
+        ordered(&file, &capture, 3);
+    }
+    #[test]
+    fn consumed_before_notification_is_not_written_twice() {
+        let (file, capture) = capture(16, 8192);
+        let (entered, release) = pause_once(&capture, DrainPoint::Published);
+        let owner = capture.clone();
+        let thread = std::thread::spawn(move || record(&owner));
+        entered.wait();
+        record(&capture);
+        ordered(&file, &capture, 2);
+        release.wait();
+        thread.join().unwrap();
+        ordered(&file, &capture, 2);
+    }
+    #[test]
+    fn empty_prefix_and_release_handoffs_do_not_strand_last_record() {
+        for point in [
+            DrainPoint::EmptyPrefix,
+            DrainPoint::BeforeRelease,
+            DrainPoint::Released,
+        ] {
+            let (file, capture) = capture(16, 8192);
+            let weak = Arc::downgrade(&capture);
+            let once = AtomicBool::new(false);
+            *capture.hook.lock().unwrap() = Some(Arc::new(move |seen| {
+                if seen == point && !once.swap(true, Ordering::AcqRel) {
+                    record(&weak.upgrade().unwrap());
+                }
+            }));
+            record(&capture);
+            ordered(&file, &capture, 2);
+        }
+    }
+    #[test]
+    fn terminal_failure_scan_and_late_publisher_count_each_cell_once() {
+        let (file, capture) = capture(16, 8192);
+        let (entered, release) = pause_once(&capture, DrainPoint::Reserved);
+        let owner = capture.clone();
+        let thread = std::thread::spawn(move || record(&owner));
+        entered.wait();
+        let held = capture.sink.lock().unwrap();
+        record(&capture); // Explicitly violate the sole-drainer lock invariant.
+        assert!(capture.failed.load(Ordering::Acquire));
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 2);
+        drop(held);
+        release.wait();
+        thread.join().unwrap();
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 2);
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::ShutdownJoins, true);
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 3);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn final_retained_slot_marks_limit_once_and_never_grows() {
+        let (file, capture) = capture(3, 8192);
+        for _ in 0..8 {
+            record(&capture);
+        }
+        let rows = rows(&file);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2]["phase"], "CaptureLimitReached");
+        assert_eq!(capture.retained.len(), 3);
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 6);
+        assert_eq!(capture.counters.emitted.load(Ordering::Relaxed), 3);
+        assert_eq!(capture.next.load(Ordering::Relaxed), 3);
+        assert_eq!(capture.work.load(Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn external_file_lock_loss_is_not_replayed_or_called_complete() {
+        let (file, capture) = capture(16, 8192);
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.path())
+            .unwrap();
+        other.lock().unwrap();
+        record(&capture);
+        other.unlock().unwrap();
+        record(&capture);
+        let rows = rows(&file);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["record"], 1);
+        assert_eq!(rows[0]["droppedBefore"], 1);
+        assert_eq!(capture.next.load(Ordering::Relaxed), 2);
+    }
+    #[test]
+    fn partial_prior_file_stays_terminal_and_unmodified() {
+        let (file, capture) = capture(16, 8192);
+        std::fs::write(file.path(), b"partial").unwrap();
+        record(&capture);
+        record(&capture);
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"partial");
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(capture.counters.emitted.load(Ordering::Relaxed), 0);
+        assert!(capture.sink.lock().unwrap().stopped);
+    }
+    #[test]
+    fn retained_payload_memory_is_fixed_and_reported() {
+        let slot = std::mem::size_of::<RetainedRecord>();
+        eprintln!(
+            "retained Record={} slot={} native={} query={} bytes",
+            std::mem::size_of::<Record>(),
+            slot,
+            slot * MAX_RECORDS,
+            slot * QUERY_MAX_RECORDS
+        );
+        assert!(slot <= 2048, "closed Facts growth needs renewed RAM review");
+        assert_eq!(MAX_RECORDS, 2048);
+        assert_eq!(MAX_BYTES, 256 * 1024);
+        assert_eq!(QUERY_MAX_RECORDS, 128);
+        assert_eq!(QUERY_MAX_BYTES, 64 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod retained_capture_boundary_tests {
+    use super::*;
+    fn capture(cap: usize, bytes: usize) -> (tempfile::NamedTempFile, Arc<Capture>) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = Arc::new(Capture::new(
+            Source::Native,
+            AppendSink::open(file.path(), cap, bytes).unwrap(),
+        ));
+        (file, capture)
+    }
+    fn record(capture: &Capture) {
+        record_capture(capture, 0, Phase::TargetLifecycle, Facts::default());
+    }
+    #[test]
+    fn unpublished_reservation_blocks_terminal_and_is_not_complete() {
+        let (file, capture) = capture(16, 8192);
+        // Simulate a thread preempted immediately after its unique reservation.
+        assert_eq!(
+            increment(&capture.counters.attempted, 1, &capture.counters.overflow),
+            0
+        );
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::ShutdownJoins, true);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+        assert_eq!(capture.next.load(Ordering::Acquire), 0);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        // Zero drop counter/EOF is deliberately not a terminal completeness proof.
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn retained_two_tenures_do_not_rebind_same_target_ordinal() {
+        let (file, capture) = capture(16, 8192);
+        let weak = Arc::downgrade(&capture);
+        let once = AtomicBool::new(false);
+        *capture.hook.lock().unwrap() = Some(Arc::new(move |point| {
+            if point == DrainPoint::Locked && !once.swap(true, Ordering::AcqRel) {
+                record_capture(
+                    &weak.upgrade().unwrap(),
+                    8,
+                    Phase::TargetAttribution,
+                    Facts {
+                        target_ordinal: Some(9),
+                        attachment_ordinal: Some(2),
+                        generation: Some(1),
+                        ..Facts::default()
+                    },
+                );
+            }
+        }));
+        record_capture(
+            &capture,
+            7,
+            Phase::TargetAttribution,
+            Facts {
+                target_ordinal: Some(9),
+                attachment_ordinal: Some(1),
+                generation: Some(1),
+                ..Facts::default()
+            },
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(file.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["attachmentOrdinal"], 1);
+        assert_eq!(rows[1]["attachmentOrdinal"], 2);
+        assert_eq!(rows[0]["operationSeq"], 7);
+        assert_eq!(rows[1]["operationSeq"], 8);
+        assert_eq!(rows[0]["targetOrdinal"], 9);
+        assert_eq!(rows[1]["targetOrdinal"], 9);
+    }
+    #[test]
+    fn maximum_retained_burst_is_bounded_even_when_byte_cap_stops_earlier() {
+        let (file, capture) = capture(MAX_RECORDS, MAX_BYTES);
+        let weak = Arc::downgrade(&capture);
+        let once = AtomicBool::new(false);
+        *capture.hook.lock().unwrap() = Some(Arc::new(move |point| {
+            if point == DrainPoint::Locked && !once.swap(true, Ordering::AcqRel) {
+                for _ in 1..MAX_RECORDS {
+                    record(&weak.upgrade().unwrap());
+                }
+            }
+        }));
+        record(&capture);
+        let bytes = std::fs::read(file.path()).unwrap();
+        assert!(bytes.len() <= MAX_BYTES);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.lines().count() <= MAX_RECORDS);
+        assert_eq!(text.matches("CaptureLimitReached").count(), 1);
+        assert_eq!(capture.next.load(Ordering::Acquire), MAX_RECORDS);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        assert!(!capture.failed.load(Ordering::Acquire));
+        assert_eq!(
+            capture.counters.attempted.load(Ordering::Acquire),
+            MAX_RECORDS as u64
+        );
+        assert_eq!(
+            capture.counters.emitted.load(Ordering::Acquire)
+                + capture.counters.dropped.load(Ordering::Acquire),
+            MAX_RECORDS as u64 + 1
+        );
+    }
+    #[test]
+    fn partial_write_is_terminal_and_never_repaired_or_replayed() {
+        let (file, capture) = capture(16, 8192);
+        capture.sink.lock().unwrap().fault.partial_after = Some(7);
+        record(&capture);
+        let bytes = std::fs::read(file.path()).unwrap();
+        assert_eq!(bytes.len(), 7);
+        capture.sink.lock().unwrap().fault.partial_after = None;
+        record(&capture);
+        assert_eq!(std::fs::read(file.path()).unwrap(), bytes);
+        assert!(capture.sink.lock().unwrap().stopped);
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 2);
+        assert_eq!(capture.counters.emitted.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn read_and_unlock_failures_remain_explicit_not_retried() {
+        let (file, capture) = capture(16, 8192);
+        capture.sink.lock().unwrap().fault.read = true;
+        record(&capture);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+        capture.sink.lock().unwrap().fault.read = false;
+        capture.sink.lock().unwrap().fault.unlock = true;
+        record(&capture); // Physical row may exist despite unacknowledged unlock.
+        assert_eq!(
+            std::fs::read_to_string(file.path())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(capture.counters.emitted.load(Ordering::Acquire), 0);
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 2);
+        capture.sink.lock().unwrap().fault.unlock = false;
+        record(&capture);
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["record"], 2);
+        assert_eq!(last["droppedBefore"], 2);
+        // emitted counts successful append+unlock acknowledgment, not all
+        // possibly physical writes. Existing fail-closed loss is preserved.
+        assert_eq!(last["emittedBefore"], 0);
+    }
+    #[test]
+    fn poisoned_internal_sink_is_terminal_not_a_successful_tail() {
+        let (file, capture) = capture(16, 8192);
+        let other = capture.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = other.sink.lock().unwrap();
+            panic!("synthetic sink poison");
+        })
+        .join();
+        record(&capture);
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::ShutdownJoins, true);
+        assert!(capture.failed.load(Ordering::Acquire));
+        assert!(capture.counters.overflow.load(Ordering::Acquire));
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+    #[test]
+    fn oversized_closed_record_is_lost_once_and_never_replayed() {
+        let (file, capture) = capture(16, 8192);
+        let facts = Facts {
+            query_read_ms: Some([u16::MAX; 13]),
+            query_command_ms: Some([u16::MAX; 5]),
+            generation: Some(SAFE_INTEGER),
+            attachment_ordinal: Some(SAFE_INTEGER),
+            target_ordinal: Some(SAFE_INTEGER),
+            inventory_ordinal: Some(SAFE_INTEGER),
+            parent_attachment_ordinal: Some(SAFE_INTEGER),
+            root_attachment_ordinal: Some(SAFE_INTEGER),
+            target_kind: Some(DiagnosticTargetKind::ServiceWorker),
+            target_origin: Some(DiagnosticTargetOrigin::InitialDiscovery),
+            target_stage: Some(DiagnosticTargetStage::ConfigureStarted),
+            target_purpose: Some(DiagnosticTargetPurpose::StateBootstrap),
+            target_classification: Some(DiagnosticTargetClassification::ReservationRemainder),
+            ..Facts::default()
+        };
+        record_capture(&capture, 0, Phase::TargetLifecycle, facts);
+        let first = capture.retained[0].record.get().unwrap();
+        assert!(serde_json::to_vec(first).unwrap().len() + 1 > MAX_RECORD_BYTES);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+        record(&capture);
+        let row: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        assert_eq!(row["record"], 1);
+        assert_eq!(row["droppedBefore"], 1);
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn impossible_counter_overflow_does_not_reuse_an_earlier_cell() {
+        let (file, capture) = capture(16, 8192);
+        capture
+            .counters
+            .attempted
+            .store(SAFE_INTEGER, Ordering::Release);
+        record(&capture);
+        assert!(capture.counters.overflow.load(Ordering::Acquire));
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 1);
+        assert!(capture
+            .retained
+            .iter()
+            .all(|slot| slot.record.get().is_none()));
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
     }
 }

@@ -284,11 +284,10 @@ fn bounds_contention_and_write_failure_do_not_change_terminal_owner_or_result() 
     let replacement_ready = owner.replacement_ready();
     let original: Result<(), ProtocolError> = Err(ProtocolError::Cancelled);
     let file = tempfile::NamedTempFile::new().unwrap();
-    let capture = Capture {
-        source: Source::Native,
-        sink: Mutex::new(AppendSink::open(file.path(), 2, 4096).unwrap()),
-        counters: Counters::default(),
-    };
+    let capture = Capture::new(
+        Source::Native,
+        AppendSink::open(file.path(), 2, 4096).unwrap(),
+    );
     let a = attempt(&owner.cleanup_diagnostics, 1);
     owner
         .cleanup_diagnostics
@@ -303,16 +302,16 @@ fn bounds_contention_and_write_failure_do_not_change_terminal_owner_or_result() 
     attempt(&owner.cleanup_diagnostics, 2).finish_into(&original, Some(&capture));
     assert_eq!(std::fs::read(file.path()).unwrap(), before);
     let file = tempfile::NamedTempFile::new().unwrap();
-    let read_only = Capture {
-        source: Source::Native,
-        sink: Mutex::new(AppendSink {
+    let read_only = Capture::new(
+        Source::Native,
+        AppendSink {
             file: File::open(file.path()).unwrap(),
             max_records: MAX_RECORDS,
             max_bytes: MAX_BYTES,
             stopped: false,
-        }),
-        counters: Counters::default(),
-    };
+            fault: SinkFault::default(),
+        },
+    );
     attempt(&owner.cleanup_diagnostics, 3).finish_into(&original, Some(&read_only));
     assert!(read_only.sink.lock().unwrap().stopped);
     assert!(std::fs::read(file.path()).unwrap().is_empty());

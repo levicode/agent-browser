@@ -18,7 +18,7 @@ use super::client_settlement_trace::{
     self as diagnostic, InventoryAfterFailure, ScreenshotCapturePhase, ScreenshotFailure,
     ScreenshotStage,
 };
-use super::client_targets::TargetPurpose;
+use super::client_targets::{OwnedTarget, TargetPurpose};
 use super::client_ui::UiGate;
 use super::element::{parse_ref, RefMap};
 use serde::Deserialize;
@@ -3377,6 +3377,33 @@ async fn query_frames(
         .map(|inventory| inventory.frames)
         .map_err(|error| error.record(screenshot))
 }
+// Keep the original full-inventory application readiness/session proof even
+// when only one application renderer needs a tree. Non-renderer targets remain
+// in the complete registry and its phase revision fence; they are not discarded
+// or treated as independent authority merely because they need no frame tree.
+fn single_application_renderer(targets: &[OwnedTarget]) -> Result<bool, ProtocolError> {
+    let mut sessions = HashSet::new();
+    let mut renderers = 0;
+    for target in targets {
+        if target.purpose != Some(TargetPurpose::Application) {
+            continue;
+        }
+        if !target.configured || !target.resumed {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if !sessions.insert(&target.session_id) {
+            return Err(ProtocolError::StaleScope);
+        }
+        if matches!(target.kind.as_str(), "page" | "iframe") {
+            renderers += 1;
+        }
+    }
+    Ok(renderers == 1)
+}
+#[cfg(test)]
+#[path = "client_observation_dispatch_renderer_inventory_tests.rs"]
+mod renderer_inventory_tests;
+
 // Private ReadFields phase proofs. No generic inventory semantics change.
 async fn single_root_fields_before<'a>(
     page: &'a BrowserExecutionLease,
@@ -3402,7 +3429,7 @@ async fn single_root_fields_before<'a>(
     if !main.configured || !main.resumed {
         return Err(ProtocolError::ScopeUnavailable);
     }
-    if targets.len() != 1 {
+    if !single_application_renderer(&targets)? {
         return Ok(None);
     }
     let tree = command(
@@ -3457,7 +3484,8 @@ async fn single_root_fields_after(
     if !main.configured || !main.resumed {
         return Err(ProtocolError::ScopeUnavailable);
     }
-    if full_final || targets.len() != 1 {
+    let single_renderer = single_application_renderer(&targets)?;
+    if full_final || !single_renderer {
         // Eligibility decline is not a failed-proof retry: same samples, lease,
         // custody and initial root; the original full final proof decides.
         let current = verified_frames_with_cleanup(page, operation, Some(cleanup)).await?;
