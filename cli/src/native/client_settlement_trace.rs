@@ -29,6 +29,8 @@ pub(crate) enum SettlementPhase {
     TargetInventorySummary,
     TargetObservationLost,
     ScreenshotFirstFailure,
+    ObserveInitialAcquisition,
+    FrameInventoryAttribution,
     ProtectedCaptureFailure,
     ObservationPixelResult,
     FrameInventoryRejection,
@@ -265,6 +267,20 @@ pub(crate) struct Facts {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot_stage: Option<ScreenshotStage>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_sample: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_check: Option<ObserveInitialPrefixCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_refusal: Option<ObserveInitialPrefixRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_debt: Option<[u16; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_debt_capped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub read_error: Option<ReadError>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "readDirty")]
     pub read_cleanup_lost: Option<bool>,
@@ -373,6 +389,8 @@ impl Facts {
             &mut self.generation,
             &mut self.capture_budget_ms,
             &mut self.attachment_ordinal,
+            &mut self.last_attachment_ordinal,
+            &mut self.selected_attachment_ordinal,
             &mut self.inventory_ordinal,
             &mut self.target_ordinal,
             &mut self.parent_attachment_ordinal,
@@ -1394,7 +1412,35 @@ pub(crate) enum GeometryReadError {
     NodeMixedHard,
     NodeMixedNegative,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ObserveInitialPrefixCheck {
+    BeforeYield,
+    AfterYield,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ObserveInitialPrefixRefusal {
+    LedgerUnavailable,
+    CleanupObserved,
+    OwnerMismatch,
+    CleanupOwnerRefused,
+    AdmissionRefused,
+    IntegrityLost,
+    InputDebt,
+    ObjectDebt,
+    OutstandingCommands,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ObserveInitialPrefix {
+    pub check: ObserveInitialPrefixCheck,
+    pub refusal: ObserveInitialPrefixRefusal,
+    pub debt: Option<[u16; 3]>,
+    pub debt_capped: Option<bool>,
+}
 pub(crate) struct ScreenshotFailure {
+    pub initial_sample: Option<u8>,
+    pub prefix: Option<ObserveInitialPrefix>,
     pub stage: ScreenshotStage,
     pub read_error: Option<ReadError>,
     pub read_cleanup_lost: Option<bool>,
@@ -1428,6 +1474,27 @@ fn screenshot_failure_into(
             ..Facts::default()
         },
     );
+}
+// Called after both original failure records. Missing diagnostics stay unknown.
+// The sample count describes initial acquisition, even for a later-stage fault.
+pub(crate) fn observe_initial_acquisition(
+    generation: u64,
+    sequence: u64,
+    initial_sample: Option<u8>,
+    prefix: Option<ObserveInitialPrefix>,
+) {
+    if initial_sample.is_none() && prefix.is_none() { return; }
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(capture, sequence, Phase::ObserveInitialAcquisition, Facts {
+            generation: Some(generation),
+            initial_sample,
+            prefix_check: prefix.map(|value| value.check),
+            prefix_refusal: prefix.map(|value| value.refusal),
+            prefix_debt: prefix.and_then(|value| value.debt),
+            prefix_debt_capped: prefix.and_then(|value| value.debt_capped),
+            ..Facts::default()
+        });
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -2400,6 +2467,8 @@ pub(crate) enum InventoryRevisionTarget {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FrameInventoryRejection {
+    pub last_attachment: Option<u64>,
+    pub selected_attachment: Option<u64>,
     pub pass: FrameInventoryPass,
     pub sealed: bool,
     pub revision_mismatch: bool,
@@ -2443,6 +2512,13 @@ fn frame_inventory_rejection_into(
             ..Facts::default()
         },
     );
+    record_capture(capture, sequence, Phase::FrameInventoryAttribution, Facts {
+        generation: Some(generation),
+        frame_pass: Some(failure.pass),
+            last_attachment_ordinal: failure.last_attachment,
+            selected_attachment_ordinal: failure.selected_attachment,
+        ..Facts::default()
+    });
 }
 pub(crate) fn inventory_snapshot(
     generation: u64,
@@ -5214,4 +5290,74 @@ mod refusal_diagnostic_tests {
         assert_eq!(object["terminalProofRefusal"], "object-debt");
         assert_eq!(object["inventoryFirstLoss"], "resume-permit-dropped");
     }
+}
+
+#[cfg(test)]
+mod observe_initial_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn observe_initial_diagnostic_wire_is_closed_bounded_and_optional() {
+        let empty = serde_json::to_value(Facts::default()).unwrap();
+        for key in ["initialSample", "prefixCheck", "prefixRefusal", "prefixDebt", "prefixDebtCapped", "lastAttachmentOrdinal", "selectedAttachmentOrdinal"] {
+            assert!(empty.get(key).is_none());
+        }
+        let facts = Facts {
+            initial_sample: Some(1),
+            prefix_check: Some(ObserveInitialPrefixCheck::BeforeYield),
+            prefix_refusal: Some(ObserveInitialPrefixRefusal::ObjectDebt),
+            prefix_debt: Some([0, u16::MAX, u16::MAX]),
+            prefix_debt_capped: Some(true),
+            last_attachment_ordinal: Some(5),
+            selected_attachment_ordinal: Some(1),
+            ..Facts::default()
+        };
+        let value = serde_json::to_value(facts).unwrap();
+        assert_eq!(value["initialSample"], 1);
+        assert_eq!(value["prefixCheck"], "before-yield");
+        assert_eq!(value["prefixRefusal"], "object-debt");
+        assert_eq!(value["prefixDebt"], serde_json::json!([0, 65535, 65535]));
+        assert_eq!(value["prefixDebtCapped"], true);
+        assert_eq!(value["lastAttachmentOrdinal"], 5);
+        assert_eq!(value["selectedAttachmentOrdinal"], 1);
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert!(serde_json::to_vec(&value).unwrap().len() < MAX_RECORD_BYTES);
+    }
+    #[test]
+    fn observe_initial_full_records_fit_existing_cap_at_maximum_headers() {
+        for (phase, facts) in [
+            (Phase::ObserveInitialAcquisition, Facts {
+                generation: Some(SAFE_INTEGER),
+                initial_sample: Some(2),
+                prefix_check: Some(ObserveInitialPrefixCheck::BeforeYield),
+                prefix_refusal: Some(ObserveInitialPrefixRefusal::OutstandingCommands),
+                prefix_debt: Some([u16::MAX; 3]),
+                prefix_debt_capped: Some(false),
+                ..Facts::default()
+            }),
+            (Phase::FrameInventoryAttribution, Facts {
+                generation: Some(SAFE_INTEGER),
+                frame_pass: Some(FrameInventoryPass::Protected),
+                last_attachment_ordinal: Some(SAFE_INTEGER),
+                selected_attachment_ordinal: Some(SAFE_INTEGER),
+                ..Facts::default()
+            }),
+        ] {
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: SAFE_INTEGER,
+                phase,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: false,
+                facts,
+            };
+            let bytes = serde_json::to_vec(&record).unwrap();
+            assert!(bytes.len() + 1 <= MAX_RECORD_BYTES, "record plus LF: {}", bytes.len() + 1);
+        }
+    }
+
 }

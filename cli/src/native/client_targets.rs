@@ -806,6 +806,7 @@ struct RevisionHistory {
     last: Option<(
         diagnostic::InventoryRevisionEvent,
         Option<Arc<AttachmentTenure>>,
+        Option<u64>,
     )>,
 }
 #[derive(Default)]
@@ -827,6 +828,7 @@ impl Registry {
         &mut self,
         event: diagnostic::InventoryRevisionEvent,
         attachment: Option<Arc<AttachmentTenure>>,
+        attachment_ordinal: Option<u64>,
     ) {
         let history = self
             .revision_history
@@ -837,7 +839,13 @@ impl Registry {
             None => history.overflow = true,
         }
         history.last_revision = self.revision;
-        history.last = Some((event, attachment));
+        // Retain the closed ordinal at the same commit as the revision. A later
+        // registration emission or identical-text reattachment cannot rewrite it.
+        history.last = Some((
+            event,
+            attachment,
+            attachment_ordinal.filter(|value| *value != 0),
+        ));
     }
     fn revision_snapshot(&mut self) -> RevisionSnapshot {
         let history = self
@@ -888,26 +896,30 @@ impl Registry {
                         .try_fold(0u64, |sum, count| sum.checked_add(*count))
                         == delta
             });
-        let (last_event, last_target) = if delta == Some(0) && counts.is_some() {
-            (Event::None, Target::Unknown)
+        let (last_event, last_target, last_attachment) = if delta == Some(0) && counts.is_some() {
+            (Event::None, Target::Unknown, None)
         } else if delta.is_some_and(|delta| delta > 0) && counts.is_some() {
             history
                 .filter(|history| history.last_revision == self.revision)
                 .and_then(|history| history.last.as_ref())
-                .map_or((Event::Unknown, Target::Unknown), |(event, attachment)| {
-                    (
-                        *event,
-                        attachment.as_ref().map_or(Target::Unknown, |attachment| {
-                            if Arc::ptr_eq(attachment, &selected.tenure) {
-                                Target::Same
-                            } else {
-                                Target::Other
-                            }
-                        }),
-                    )
-                })
+                .map_or(
+                    (Event::Unknown, Target::Unknown, None),
+                    |(event, attachment, ordinal)| {
+                        (
+                            *event,
+                            attachment.as_ref().map_or(Target::Unknown, |attachment| {
+                                if Arc::ptr_eq(attachment, &selected.tenure) {
+                                    Target::Same
+                                } else {
+                                    Target::Other
+                                }
+                            }),
+                            *ordinal,
+                        )
+                    },
+                )
         } else {
-            (Event::Unknown, Target::Unknown)
+            (Event::Unknown, Target::Unknown, None)
         };
         diagnostic::FrameInventoryRejection {
             pass,
@@ -919,6 +931,11 @@ impl Registry {
             exact,
             last_event,
             last_target,
+            last_attachment,
+            selected_attachment: selected
+                .diagnostic
+                .map(|value| value.attachment)
+                .filter(|value| *value != 0),
         }
     }
     // Opt-in history is bounded and cannot return a product error or grant authority.
@@ -2231,6 +2248,7 @@ impl ClientTargets {
                 state.note_revision_enabled(
                     diagnostic::InventoryRevisionEvent::Attach,
                     Some(tenure),
+                    target.diagnostic.map(|value| value.attachment),
                 );
             }
             drop(state);
@@ -2664,6 +2682,9 @@ impl ClientTargets {
                     state.note_revision_enabled(
                         diagnostic::InventoryRevisionEvent::Detach,
                         removed.as_ref().map(|target| target.tenure.clone()),
+                        removed
+                            .as_ref()
+                            .and_then(|target| target.diagnostic.map(|value| value.attachment)),
                     );
                 }
             }
@@ -2733,7 +2754,10 @@ impl ClientTargets {
                 let attachment = target
                     .and_then(|target| state.targets.get(target))
                     .map(|target| target.tenure.clone());
-                state.note_revision_enabled(event, attachment);
+                let ordinal = target
+                    .and_then(|target| state.targets.get(target))
+                    .and_then(|target| target.diagnostic.map(|value| value.attachment));
+                state.note_revision_enabled(event, attachment, ordinal);
             }
             Ok(())
         })
@@ -5393,7 +5417,11 @@ mod atomic_revision_diagnostic_tests {
     }
     fn advance(state: &mut Registry, event: Event, target: Option<&OwnedTarget>) {
         state.revision += 1;
-        state.note_revision_enabled(event, target.map(|target| target.tenure.clone()));
+        state.note_revision_enabled(
+            event,
+            target.map(|target| target.tenure.clone()),
+            target.and_then(|target| target.diagnostic.map(|value| value.attachment)),
+        );
     }
     #[test]
     fn atomic_revision_causes_keep_original_result_and_snapshot() {
@@ -5494,6 +5522,62 @@ mod atomic_revision_diagnostic_tests {
         assert_eq!(lost.last_target, Target::Unknown);
     }
     #[test]
+    fn atomic_revision_ordinals_follow_commit_not_later_attachment_state() {
+        let mut state = Registry::default();
+        let mut target = selected();
+        target.diagnostic = Some(diagnostic::DiagnosticAttachment {
+            attachment: 11,
+            ..Default::default()
+        });
+        let mut other = selected();
+        other.diagnostic = Some(diagnostic::DiagnosticAttachment {
+            attachment: 22,
+            ..Default::default()
+        });
+        let before = state.revision_snapshot();
+        advance(&mut state, Event::Attach, Some(&other));
+        let captured = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
+        assert_eq!(captured.last_attachment, Some(22));
+        assert_eq!(captured.selected_attachment, Some(11));
+        assert_eq!(captured.last_target, Target::Other);
+        assert_eq!(captured.events, Some([1, 0, 0, 0, 0, 0, 0]));
+        assert!(captured.exact);
+
+        // Identical native strings are not attachment identity. A later snapshot
+        // or registration receipt cannot retrospectively name the previous event.
+        other.tenure = Arc::new(AttachmentTenure::default());
+        other.diagnostic.as_mut().unwrap().attachment = 33;
+        state.targets.insert(other.target_id.clone(), other.clone());
+        let retained = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
+        assert_eq!(retained.last_attachment, Some(22));
+        advance(&mut state, Event::Attach, Some(&other));
+        let later = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
+        assert_eq!(later.last_attachment, Some(33));
+        assert_eq!(captured.last_attachment, Some(22));
+        assert_eq!(captured.selected_attachment, Some(11));
+        assert_eq!(captured.delta, Some(1));
+        assert_eq!(later.delta, Some(2));
+    }
+    #[test]
+    fn atomic_revision_missing_and_zero_ordinals_never_invent_identity() {
+        for ordinal in [None, Some(0)] {
+            let mut state = Registry::default();
+            let mut target = selected();
+            target.diagnostic = ordinal.map(|attachment| diagnostic::DiagnosticAttachment {
+                attachment,
+                ..Default::default()
+            });
+            let before = state.revision_snapshot();
+            advance(&mut state, Event::Attach, Some(&target));
+            let fact = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
+            assert_eq!(fact.last_attachment, None);
+            assert_eq!(fact.selected_attachment, None);
+            // Ordinal availability never changes the authoritative tenure relation.
+            assert_eq!(fact.last_target, Target::Same);
+            assert!(fact.exact);
+        }
+    }
+    #[test]
     fn atomic_revision_missing_reset_and_overflow_are_unknown_not_zero() {
         let target = selected();
         for mode in ["missing", "reset", "overflow", "underflow", "reverse"] {
@@ -5523,6 +5607,7 @@ mod atomic_revision_diagnostic_tests {
             }
             assert_eq!(fact.last_event, Event::Unknown);
             assert_eq!(fact.last_target, Target::Unknown);
+            assert_eq!(fact.last_attachment, None);
         }
     }
     #[test]
@@ -5532,13 +5617,13 @@ mod atomic_revision_diagnostic_tests {
         let before = state.revision_snapshot();
         state.revision = 65_536;
         state.revision_history.as_mut().unwrap().counts[2] = 65_535;
-        state.note_revision_enabled(Event::Info, Some(target.tenure.clone()));
+        state.note_revision_enabled(Event::Info, Some(target.tenure.clone()), None);
         let fact = state.revision_rejection(0, Some(&before), &target, Pass::Initial);
         assert!(!fact.exact);
         assert_eq!(fact.delta, Some(65_535));
         assert_eq!(fact.events, Some([0, 0, 65_535, 0, 0, 0, 0]));
         state.revision_history.as_mut().unwrap().counts[2] = u64::MAX;
-        state.note_revision_enabled(Event::Info, Some(target.tenure.clone()));
+        state.note_revision_enabled(Event::Info, Some(target.tenure.clone()), None);
         assert!(state.revision_history.as_ref().unwrap().overflow);
         assert_eq!(
             state

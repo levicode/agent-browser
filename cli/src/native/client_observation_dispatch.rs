@@ -105,6 +105,8 @@ struct ScreenshotFailureState {
     revision: Option<u64>,
     inventory_rejection: Option<diagnostic::FrameInventoryRejection>,
     read_failure: Option<(diagnostic::ReadError, bool)>,
+    initial_sample: Option<u8>,
+    prefix: Option<diagnostic::ObserveInitialPrefix>,
 }
 impl ScreenshotFailureWitness {
     fn new(request: &DispatchRequest, operation: &OperationLease, enabled: bool) -> Option<Self> {
@@ -120,8 +122,26 @@ impl ScreenshotFailureWitness {
                 revision: None,
                 inventory_rejection: None,
                 read_failure: None,
+                initial_sample: None,
+                prefix: None,
             }),
         })
+    }
+    // These facts describe only an INITIAL Observe acquisition. Once the first
+    // refusal is stored, later cleanup/attempts cannot rewrite its provenance.
+    fn initial_sample(&self, sample: u8) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() {
+                state.initial_sample = Some(sample);
+            }
+        }
+    }
+    fn prefix_refusal(&self, prefix: diagnostic::ObserveInitialPrefix) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.first.is_none() && state.prefix.is_none() {
+                state.prefix = Some(prefix);
+            }
+        }
     }
     fn enter(&self, stage: ScreenshotStage) {
         if let Ok(mut state) = self.state.lock() {
@@ -212,6 +232,8 @@ impl ScreenshotFailureWitness {
         if let Some(failure) = self.take_failure(|| {
             targets.and_then(|targets| targets.inventory().ok().map(|(revision, _)| revision))
         }) {
+            let initial_sample = failure.initial_sample;
+            let prefix = failure.prefix;
             diagnostic::screenshot_failure(self.generation, self.sequence, failure);
             let inventory = self
                 .state
@@ -221,10 +243,12 @@ impl ScreenshotFailureWitness {
             if let Some(inventory) = inventory {
                 diagnostic::frame_inventory_rejection(self.generation, self.sequence, inventory);
             }
+            // Both original failure records take priority over new diagnostics.
+            diagnostic::observe_initial_acquisition(self.generation, self.sequence, initial_sample, prefix);
         }
     }
     fn take_failure(&self, after: impl FnOnce() -> Option<u64>) -> Option<ScreenshotFailure> {
-        let (stage, capture_phase, error, before, read_failure) = {
+        let (stage, capture_phase, error, before, read_failure, initial_sample, prefix) = {
             let mut state = self.state.lock().ok()?;
             let (stage, phase, error) = state.first.take()?;
             (
@@ -233,6 +257,8 @@ impl ScreenshotFailureWitness {
                 error,
                 state.revision,
                 state.read_failure.take(),
+                state.initial_sample,
+                state.prefix,
             )
         };
         let inventory_after_failure = match before {
@@ -244,6 +270,8 @@ impl ScreenshotFailureWitness {
             },
         };
         Some(ScreenshotFailure {
+            initial_sample,
+            prefix,
             stage,
             read_error: read_failure.map(|detail| detail.0),
             read_cleanup_lost: read_failure.map(|detail| detail.1),
@@ -1334,27 +1362,50 @@ impl ObservationDispatch {
         operation: &OperationLease,
         cleanup: &AtomicBool,
     ) -> bool {
-        let Some(ledger) = context.page.client.debt_ledger() else {
-            return false;
+        Self::initial_trace_prefix_settled_with_diagnostic(context, operation, cleanup, None)
+    }
+    fn initial_trace_prefix_settled_with_diagnostic(
+        context: &DispatchContext,
+        operation: &OperationLease,
+        cleanup: &AtomicBool,
+        diagnostic: Option<(&ScreenshotFailureWitness, diagnostic::ObserveInitialPrefixCheck)>,
+    ) -> bool {
+        use diagnostic::ObserveInitialPrefixRefusal as Refusal;
+        let refused = |reason, debt: Option<[u32; 3]>| {
+            if let Some((witness, check)) = diagnostic {
+                witness.prefix_refusal(diagnostic::ObserveInitialPrefix {
+                    check,
+                    refusal: reason,
+                    debt: debt.map(|counts| counts.map(|count| count.min(u16::MAX as u32) as u16)),
+                    debt_capped: debt.map(|counts| counts.iter().any(|count| *count > u16::MAX as u32)),
+                });
+            }
+            false
         };
-        if cleanup.load(Ordering::SeqCst)
-            || !ledger.matches_owner(operation.generation, &context.scope.identity_scope)
-            || context
-                .page
-                .client
-                .check_cleanup_owner(&Some(ledger.clone()))
-                .is_err()
-            || ledger
-                .check_admission(super::client_debt::AdmissionClass::Reference)
-                .is_err()
-        {
-            return false;
+        let Some(ledger) = context.page.client.debt_ledger() else {
+            return refused(Refusal::LedgerUnavailable, None);
+        };
+        // Preserve the original short-circuit order and each original read exactly
+        // once. Diagnostic recording follows the decision; it grants no authority.
+        if cleanup.load(Ordering::SeqCst) {
+            return refused(Refusal::CleanupObserved, None);
+        }
+        if !ledger.matches_owner(operation.generation, &context.scope.identity_scope) {
+            return refused(Refusal::OwnerMismatch, None);
+        }
+        if context.page.client.check_cleanup_owner(&Some(ledger.clone())).is_err() {
+            return refused(Refusal::CleanupOwnerRefused, None);
+        }
+        if ledger.check_admission(super::client_debt::AdmissionClass::Reference).is_err() {
+            return refused(Refusal::AdmissionRefused, None);
         }
         let debt = ledger.snapshot();
-        !debt.integrity_lost
-            && debt.input_debt == 0
-            && debt.object_debt == 0
-            && debt.outstanding_commands == 0
+        let counts = Some([debt.input_debt, debt.object_debt, debt.outstanding_commands]);
+        if debt.integrity_lost { return refused(Refusal::IntegrityLost, counts); }
+        if debt.input_debt != 0 { return refused(Refusal::InputDebt, counts); }
+        if debt.object_debt != 0 { return refused(Refusal::ObjectDebt, counts); }
+        if debt.outstanding_commands != 0 { return refused(Refusal::OutstandingCommands, counts); }
+        true
     }
     async fn initial_trace_frames(
         &self,
@@ -1436,6 +1487,7 @@ impl ObservationDispatch {
             Ok(())
         };
         check_owner()?;
+        if let Some(witness) = screenshot { witness.initial_sample(1); }
         let first = frame_inventory_attempt_impl(
             &context.page,
             operation,
@@ -1458,15 +1510,16 @@ impl ObservationDispatch {
             return Err(rejected.record(screenshot));
         }
         check_owner()?;
-        if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+        if !Self::initial_trace_prefix_settled_with_diagnostic(context, operation, cleanup, screenshot.map(|witness| (witness, diagnostic::ObserveInitialPrefixCheck::BeforeYield))) {
             return Err(rejected.record(screenshot));
         }
         tokio::task::yield_now().await;
         check_owner()?;
-        if !Self::initial_trace_prefix_settled(context, operation, cleanup) {
+        if !Self::initial_trace_prefix_settled_with_diagnostic(context, operation, cleanup, screenshot.map(|witness| (witness, diagnostic::ObserveInitialPrefixCheck::AfterYield))) {
             return Err(rejected.record(screenshot));
         }
         // No loop: the old sample is discarded and a second raced sample fails.
+        if let Some(witness) = screenshot { witness.initial_sample(2); }
         let inventory = frame_inventory_attempt_impl(
             &context.page,
             operation,
@@ -7160,10 +7213,50 @@ mod tests {
         assert!(!flags.pixels);
     }
     #[test]
+    fn observe_initial_diagnostic_keeps_sample_and_prefix_at_first_failure() {
+        let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
+        witness.initial_sample(1);
+        let prefix = diagnostic::ObserveInitialPrefix {
+            check: diagnostic::ObserveInitialPrefixCheck::BeforeYield,
+            refusal: diagnostic::ObserveInitialPrefixRefusal::ObjectDebt,
+            debt: Some([0, 1, 1]),
+            debt_capped: Some(false),
+        };
+        witness.prefix_refusal(prefix);
+        witness.failure(&ProtocolError::StaleScope);
+        // Later observations/cleanup cannot reinterpret the rejected first sample.
+        witness.initial_sample(2);
+        witness.prefix_refusal(diagnostic::ObserveInitialPrefix {
+            check: diagnostic::ObserveInitialPrefixCheck::AfterYield,
+            refusal: diagnostic::ObserveInitialPrefixRefusal::AdmissionRefused,
+            debt: None,
+            debt_capped: None,
+        });
+        witness.enter(ScreenshotStage::Restoration);
+        let failure = witness.take_failure(|| None).unwrap();
+        assert_eq!(failure.initial_sample, Some(1));
+        assert_eq!(failure.prefix, Some(prefix));
+        assert_eq!(failure.error, ProtocolError::StaleScope);
+        assert!(witness.take_failure(|| None).is_none());
+    }
+    #[test]
+    fn observe_initial_second_sample_is_distinct_and_diagnostics_stay_opt_in() {
+        assert!(ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), false).is_none());
+        let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
+        witness.initial_sample(1);
+        witness.initial_sample(2);
+        witness.failure(&ProtocolError::StaleScope);
+        let failure = witness.take_failure(|| None).unwrap();
+        assert_eq!(failure.initial_sample, Some(2));
+        assert!(failure.prefix.is_none());
+    }
+    #[test]
     fn atomic_inventory_first_failure_survives_cleanup_and_is_consumed_once() {
         let witness =
             ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
         let fact = diagnostic::FrameInventoryRejection {
+            last_attachment: None,
+            selected_attachment: None,
             pass: diagnostic::FrameInventoryPass::Protected,
             sealed: false,
             revision_mismatch: true,
