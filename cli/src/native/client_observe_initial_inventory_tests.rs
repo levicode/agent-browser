@@ -428,3 +428,228 @@ async fn observe_dispatch_reaches_semantics_only_after_fresh_initial_sample() {
 async fn observe_dispatch_never_reacquires_a_protected_frame_fence() {
     dispatch_stops_before_semantics(Race::Protected).await;
 }
+
+// Receipt-boundary controls use the real admitted lease, retained task registry,
+// dispatch result/join, read-settlement helpers, and same broker settlement.
+// They do not execute the public CLI or infer owner validity from broker health.
+async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt: bool) {
+    use crate::native::client_browser::{
+        protected_read_receipt_eligible, settle_observation_dispatch,
+        settle_protected_read, settle_trace_screenshot,
+    };
+    use crate::native::client_protocol::{Effects, ScopeState};
+    use crate::native::client_session::ClientSession;
+    use crate::native::client_tasks::RetainedTasks;
+
+    let broker = Arc::new(ClientSession::new());
+    let fixture = Fixture::new_mode_with_broker(race, true, Some(broker.clone())).await;
+    let Fixture {
+        context, operation, journal, ledger, dispatch, samples, log, peer,
+        readonly_replies, release_fence_receipt, attached_others, ..
+    } = fixture;
+    let client = context.page.client.clone();
+    let targets = context.page.targets.clone();
+    let original_attachment = context.attachment.clone();
+    assert!(original_attachment.capture_ready());
+    assert!(original_attachment.same_attachment(&targets.owned_target("target").unwrap()));
+    assert_eq!(journal.key(), OperationKey { generation: 1, operation_seq: 1 });
+    assert!(ledger.matches_owner(operation.generation, &context.scope.identity_scope));
+    let attach_other = matches!(race, Race::AttachOtherContinuous | Race::AttachOtherHeldRelease);
+    let witness_receipt = Arc::new(Mutex::new(None));
+    let witness_observer = witness_receipt.clone();
+    let cancellation = operation.cancellation.clone();
+    let identity_scope = context.scope.identity_scope.clone();
+    let receipt_journal = journal.clone();
+    let journal_probe = journal.clone();
+    let retained = RetainedTasks::default();
+    let observed_join = Arc::new(Mutex::new(None));
+    let join_receipt = observed_join.clone();
+    let run_dispatch = dispatch.clone();
+    let receive = retained.start_operation_prepared(
+        identity_scope, targets.clone(), broker.clone(), journal,
+        cancellation,
+        move || {
+            let request = request();
+            let eligible = protected_read_receipt_eligible(&request);
+            let prepared = if attach_other {
+                let mut witness = ScreenshotFailureWitness::new(&request, &operation, true).unwrap();
+                witness.receipt_for_test = Some(witness_observer);
+                let mut prepared = run_dispatch.prepare_inner(context, request, operation, Some(&witness))?;
+                prepared.screenshot = Some(witness);
+                prepared
+            } else {
+                run_dispatch.prepare(context, request, operation)?
+            };
+            Ok(async move {
+                let task = run_dispatch.start_prepared(prepared);
+                let output = task.result.await;
+                assert!(!task.receipt.is_sealed_observation());
+                let original_error = output.as_ref().unwrap().as_ref().err().unwrap().error.clone();
+                let cleanup = task.join.await;
+                // Observe the actual join. Never substitute Ok(cleanup).
+                let joined_clean = matches!(&cleanup, Ok(Ok(())));
+                let (outcome, dirty) = settle_observation_dispatch(output, cleanup);
+                *join_receipt.lock().unwrap() = Some((original_error, joined_clean, dirty));
+                let (outcome, dirty) = settle_trace_screenshot(outcome, dirty, false, &receipt_journal);
+                settle_protected_read(outcome, dirty, eligible, &receipt_journal)
+            })
+        },
+    ).await.unwrap();
+    let outcome = tokio::time::timeout(Duration::from_secs(3), receive).await.unwrap().unwrap();
+    let settled = broker.settle_with_retention(1, 1, outcome.effects, outcome.retention.as_ref()).unwrap();
+    retained.fix_operation_result(OperationKey { generation: 1, operation_seq: 1 });
+    let (original_error, joined_clean, dispatch_dirty) = observed_join.lock().unwrap().clone().unwrap();
+    assert_eq!(outcome.result.as_ref().err(), Some(&original_error));
+    assert!(outcome.retention.is_none());
+    let snapshot = ledger.snapshot();
+    assert_eq!(snapshot.input_debt, 0);
+    assert!(!journal_probe.snapshot().mutation_dispatched);
+    let same_owner = targets.owned_target("target").ok().map(|current| {
+        original_attachment.same_attachment(&current) && current.capture_ready()
+    });
+    let terminal = matches!(race, Race::Sealed | Race::ReleaseError);
+    assert_eq!(outcome.effects, if terminal { Effects::Unknown } else { Effects::NotDispatched });
+    assert_eq!(settled, if terminal { ScopeState::Quarantined } else { ScopeState::Usable });
+    assert_eq!(broker.health().unwrap(), (1, settled));
+    if terminal {
+        assert!(broker.admit(1, 2, 1_000).is_err());
+        assert!(targets.owned_target("target").is_err());
+    } else {
+        assert!(joined_clean && !dispatch_dirty);
+        assert_eq!(original_error, ProtocolError::StaleScope);
+        assert_eq!(same_owner, Some(race != Race::Replacement));
+        assert!(!snapshot.integrity_lost);
+    }
+    if matches!(race, Race::HeldRelease | Race::AttachOtherHeldRelease) {
+        assert_eq!(snapshot.object_debt, 1);
+        assert_eq!(snapshot.outstanding_commands, 1);
+    } else if matches!(race, Race::Continuous | Race::AttachOtherContinuous | Race::Replacement) {
+        assert_eq!(snapshot.object_debt, 0);
+        assert_eq!(snapshot.outstanding_commands, 0);
+    }
+    let expected_samples = if matches!(race, Race::Continuous | Race::AttachOtherContinuous) { 2 } else { 1 };
+    assert_eq!(samples.load(Ordering::SeqCst), expected_samples);
+    if attach_other {
+        // These are actual facts consumed by production witness.finish, not a
+        // reconstruction from peer timing or manually assigned revision history.
+        let (stage, sample, prefix, rejection) = witness_receipt.lock().unwrap().unwrap();
+        assert_eq!(stage, ScreenshotStage::FrameInventoryFence);
+        assert_eq!(sample, Some(expected_samples as u8));
+        let rejection = rejection.unwrap();
+        assert_eq!(rejection.pass, diagnostic::FrameInventoryPass::Initial);
+        assert!(!rejection.sealed && !rejection.reservations);
+        assert!(rejection.revision_mismatch && rejection.exact);
+        assert_eq!(rejection.delta, Some(1));
+        assert_eq!(rejection.events, Some([1, 0, 0, 0, 0, 0, 0]));
+        assert_eq!(rejection.last_event, diagnostic::InventoryRevisionEvent::Attach);
+        assert_eq!(rejection.last_target, diagnostic::InventoryRevisionTarget::Other);
+        let others = attached_others.lock().unwrap();
+        assert_eq!(others.len(), expected_samples);
+        let last = others.last().unwrap();
+        assert!(!original_attachment.same_attachment(last));
+        assert!(last.capture_ready());
+        assert_eq!(last.kind, "browser_ui");
+        assert_eq!(rejection.selected_attachment, Some(original_attachment.diagnostic_snapshot().unwrap().attachment));
+        assert_eq!(rejection.last_attachment, Some(last.diagnostic_snapshot().unwrap().attachment));
+        assert!(rejection.selected_attachment.unwrap() > 0);
+        assert!(rejection.last_attachment.unwrap() > 0);
+        assert_ne!(rejection.last_attachment, rejection.selected_attachment);
+        if race == Race::AttachOtherHeldRelease {
+            assert_eq!(prefix, Some(diagnostic::ObserveInitialPrefix {
+                check: diagnostic::ObserveInitialPrefixCheck::BeforeYield,
+                refusal: diagnostic::ObserveInitialPrefixRefusal::ObjectDebt,
+                debt: Some([0, 1, 1]),
+                debt_capped: Some(false),
+            }));
+        } else {
+            assert!(prefix.is_none());
+        }
+        println!("ATTACH_FENCE_CONTROL {}", json!({
+            "case":format!("{race:?}"), "initialSample":sample,
+            "pass":rejection.pass, "sealed":rejection.sealed,
+            "reservations":rejection.reservations, "exact":rejection.exact,
+            "delta":rejection.delta, "events":rejection.events,
+            "lastEvent":rejection.last_event, "lastTarget":rejection.last_target,
+            "selectedAttachmentOrdinal":rejection.selected_attachment,
+            "lastAttachmentOrdinal":rejection.last_attachment,
+            "prefixCheck":prefix.map(|value| value.check),
+            "prefixRefusal":prefix.map(|value| value.refusal),
+            "prefixDebt":prefix.and_then(|value| value.debt),
+        }));
+    }
+    no_protected_read(&log.lock().unwrap());
+    assert!(!log.lock().unwrap().iter().any(|row| row["method"] == "Accessibility.getFullAXTree"));
+    assert!(dispatch.refs.lock().unwrap().ref_ids().is_empty());
+    {
+        let published = dispatch.publication.lock().await;
+        assert_eq!((published.published_revision, published.observed_revision), (0, 0));
+    }
+    println!("READ_RECEIPT_CONTROL {}", json!({
+        "case":format!("{race:?}"), "ackAfterReceipt":acknowledge_after_receipt,
+        "error":original_error, "effects":outcome.effects, "scopeState":settled,
+        "joinedClean":joined_clean, "dispatchDirty":dispatch_dirty,
+        "sameOriginalAttachment":same_owner, "inputDebt":snapshot.input_debt,
+        "objectDebt":snapshot.object_debt, "outstandingCommands":snapshot.outstanding_commands,
+        "integrityLost":snapshot.integrity_lost,
+    }));
+    if acknowledge_after_receipt {
+        assert_eq!(race, Race::HeldRelease);
+        let requests: Vec<_> = log.lock().unwrap().iter()
+            .filter(|row| row["method"] == "Runtime.releaseObjectGroup").cloned().collect();
+        assert_eq!(requests.len(), 1);
+        readonly_replies.send(json!({"id":requests[0]["id"],"sessionId":"session","result":{}})).unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while ledger.snapshot().object_debt != 0 || ledger.snapshot().outstanding_commands != 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        // Late ACK changes debt, never the already-fixed result or read count.
+        assert_eq!(samples.load(Ordering::SeqCst), 1);
+        assert_eq!(outcome.result.as_ref().err(), Some(&ProtocolError::StaleScope));
+        assert_eq!(outcome.effects, Effects::NotDispatched);
+        assert_eq!(broker.health().unwrap(), (1, ScopeState::Usable));
+        assert!(original_attachment.same_attachment(&targets.owned_target("target").unwrap()));
+    }
+    if race == Race::ReleaseError {
+        let replies = tokio::time::timeout(Duration::from_secs(1), release_fence_receipt.unwrap()).await.unwrap().unwrap();
+        assert_eq!(replies[0]["error"]["code"], -32000);
+    }
+    let drained = retained.drain().await;
+    assert_eq!(drained.is_err(), terminal);
+    tokio::time::timeout(Duration::from_secs(1), client.close()).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), peer).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn observe_receipt_continuous_read_race_keeps_clean_owned_scope() {
+    retained_observe_receipt_control(Race::Continuous, false).await;
+}
+#[tokio::test]
+async fn observe_receipt_held_release_is_not_a_settled_prefix() {
+    retained_observe_receipt_control(Race::HeldRelease, false).await;
+}
+#[tokio::test]
+async fn observe_receipt_late_release_ack_cannot_restart_failed_read() {
+    retained_observe_receipt_control(Race::HeldRelease, true).await;
+}
+#[tokio::test]
+async fn observe_receipt_usable_broker_does_not_restore_replaced_attachment() {
+    retained_observe_receipt_control(Race::Replacement, false).await;
+}
+#[tokio::test]
+async fn observe_receipt_sealed_owner_stays_terminal() {
+    retained_observe_receipt_control(Race::Sealed, false).await;
+}
+#[tokio::test]
+async fn observe_receipt_failed_release_preserves_terminal_cleanup() {
+    retained_observe_receipt_control(Race::ReleaseError, false).await;
+}
+
+#[tokio::test]
+async fn observe_receipt_other_attach_each_sample_has_exact_initial_delta_one() {
+    retained_observe_receipt_control(Race::AttachOtherContinuous, false).await;
+}
+#[tokio::test]
+async fn observe_receipt_other_attach_with_held_release_has_exact_prefix_refusal() {
+    retained_observe_receipt_control(Race::AttachOtherHeldRelease, false).await;
+}

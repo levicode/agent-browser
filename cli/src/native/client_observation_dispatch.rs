@@ -94,10 +94,19 @@ impl ObserveFailureWitness {
 // Production, default-off evidence for one trace or observation read. The cell
 // contains no browser authority and holds no lock across an await. It records
 // the first failed call site before restoration, but emits only after run returns.
+#[cfg(test)]
+type ScreenshotFailureReceiptForTest = (
+    ScreenshotStage,
+    Option<u8>,
+    Option<diagnostic::ObserveInitialPrefix>,
+    Option<diagnostic::FrameInventoryRejection>,
+);
 struct ScreenshotFailureWitness {
     generation: u64,
     sequence: u64,
     state: Mutex<ScreenshotFailureState>,
+    #[cfg(test)]
+    receipt_for_test: Option<Arc<Mutex<Option<ScreenshotFailureReceiptForTest>>>>,
 }
 struct ScreenshotFailureState {
     stage: ScreenshotStage,
@@ -116,6 +125,8 @@ impl ScreenshotFailureWitness {
         (enabled && trace).then(|| Self {
             generation: operation.generation,
             sequence: operation.sequence,
+            #[cfg(test)]
+            receipt_for_test: None,
             state: Mutex::new(ScreenshotFailureState {
                 stage: ScreenshotStage::PrepareScope,
                 first: None,
@@ -232,6 +243,8 @@ impl ScreenshotFailureWitness {
         if let Some(failure) = self.take_failure(|| {
             targets.and_then(|targets| targets.inventory().ok().map(|(revision, _)| revision))
         }) {
+            #[cfg(test)]
+            let stage_for_test = failure.stage;
             let initial_sample = failure.initial_sample;
             let prefix = failure.prefix;
             diagnostic::screenshot_failure(self.generation, self.sequence, failure);
@@ -240,6 +253,12 @@ impl ScreenshotFailureWitness {
                 .lock()
                 .ok()
                 .and_then(|mut state| state.inventory_rejection.take());
+            #[cfg(test)]
+            if let Some(observer) = &self.receipt_for_test {
+                // Copy only the exact facts already consumed by this finish.
+                // No new inventory lookup or result/owner decision is made.
+                *observer.lock().unwrap() = Some((stage_for_test, initial_sample, prefix, inventory));
+            }
             if let Some(inventory) = inventory {
                 diagnostic::frame_inventory_rejection(self.generation, self.sequence, inventory);
             }

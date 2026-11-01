@@ -773,6 +773,8 @@ impl OwnedTarget {
 }
 #[derive(Default)]
 struct Registry {
+    #[cfg(test)]
+    inventory_diagnostics_for_test: bool,
     revision: u64,
     query_unknown_revision: u64,
     revision_history: Option<RevisionHistory>,
@@ -941,7 +943,12 @@ impl Registry {
     // Opt-in history is bounded and cannot return a product error or grant authority.
     fn diagnostic_attachment(&mut self, target: &str) -> Option<diagnostic::DiagnosticAttachment> {
         if !diagnostic::inventory_enabled() {
+            #[cfg(not(test))]
             return None;
+            #[cfg(test)]
+            if !self.inventory_diagnostics_for_test {
+                return None;
+            }
         }
         let identities = self.diagnostic_identities.get_or_insert_with(HashMap::new);
         let target_ordinal = if let Some(ordinal) = identities.get(target) {
@@ -1445,6 +1452,15 @@ impl ClientTargets {
             #[cfg(test)]
             retirement_before_lock: Mutex::new(None),
         })
+    }
+    /// Owned, test-only observation opt-in, before any registration. This flag
+    /// cannot grant target/configuration/read authority or alter another registry.
+    #[cfg(test)]
+    pub(crate) fn enable_inventory_diagnostics_for_test(&self) {
+        let mut state = self.state.lock().unwrap();
+        assert!(state.targets.is_empty() && state.revision_history.is_none());
+        assert_eq!(state.revision, 0);
+        state.inventory_diagnostics_for_test = true;
     }
     /// Deterministic final-lock race fixture; absent from production builds.
     #[cfg(test)]
@@ -2219,6 +2235,10 @@ impl ClientTargets {
                 ..Default::default()
             });
             let observed_tenure = diagnostic::inventory_enabled().then(|| tenure.clone());
+            #[cfg(test)]
+            let observed_tenure = observed_tenure.or_else(|| {
+                state.inventory_diagnostics_for_test.then(|| tenure.clone())
+            });
             let mut target = OwnedTarget {
                 target_id,
                 session_id,
@@ -5702,5 +5722,26 @@ mod first_loss_diagnostic_tests {
             Some(diagnostic::InventoryFirstLoss::ResumePermitDropped)
         );
         assert!(registry.sealed && registry.integrity_lost);
+    }
+}
+
+#[cfg(test)]
+mod owned_inventory_diagnostic_opt_in_tests {
+    use super::*;
+    #[test]
+    fn owned_inventory_diagnostic_opt_in_is_local_and_records_actual_registration() {
+        let enabled = ClientTargets::new("context".into(), "scope".into());
+        let untouched = ClientTargets::new("context".into(), "scope".into());
+        assert!(!enabled.state.lock().unwrap().inventory_diagnostics_for_test);
+        enabled.enable_inventory_diagnostics_for_test();
+        assert!(!untouched.state.lock().unwrap().inventory_diagnostics_for_test);
+        assert!(enabled.attached("context", "target".into(), "session".into(), "page".into()).unwrap());
+        let state = enabled.state.lock().unwrap();
+        let history = state.revision_history.as_ref().unwrap();
+        assert_eq!(state.revision, 1);
+        assert_eq!(history.counts, [1, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(history.last.as_ref().unwrap().0, diagnostic::InventoryRevisionEvent::Attach);
+        assert!(state.targets["target"].diagnostic.unwrap().attachment > 0);
+        assert!(untouched.state.lock().unwrap().targets.is_empty());
     }
 }

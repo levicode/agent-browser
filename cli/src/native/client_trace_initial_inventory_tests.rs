@@ -17,6 +17,8 @@ use tokio_tungstenite::tungstenite::Message;
 enum Race {
     Once,
     Continuous,
+    AttachOtherContinuous,
+    AttachOtherHeldRelease,
     Cancel,
     Sealed,
     Reservation,
@@ -68,6 +70,7 @@ struct Fixture {
     peer: tokio::task::JoinHandle<()>,
     readonly_replies: tokio::sync::mpsc::UnboundedSender<Value>,
     release_fence_receipt: Option<tokio::sync::oneshot::Receiver<[Value; 2]>>,
+    attached_others: Arc<Mutex<Vec<crate::native::client_targets::OwnedTarget>>>,
 }
 async fn ready(targets: &Arc<ClientTargets>) {
     targets
@@ -87,10 +90,30 @@ impl Fixture {
         Self::new_mode(race, false).await
     }
     async fn new_mode(race: Race, readonly: bool) -> Self {
+        Self::new_mode_with_broker(race, readonly, None).await
+    }
+    // Test-only constructor: the receipt controls bind the same broker-admitted
+    // lease before journal creation; legacy acquisition tests keep their seam.
+    async fn new_mode_with_broker(
+        race: Race,
+        readonly: bool,
+        broker: Option<Arc<crate::native::client_session::ClientSession>>,
+    ) -> Self {
+        if broker.is_some() {
+            // These cases do not use the legacy peer-owned cancellation sender.
+            assert!(readonly && matches!(race,
+                Race::Continuous | Race::HeldRelease | Race::Replacement
+                    | Race::Sealed | Race::ReleaseError
+                    | Race::AttachOtherContinuous | Race::AttachOtherHeldRelease));
+        }
         let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
         let peer_dispatch = dispatch.clone();
         let targets = ClientTargets::new("context".into(), "scope".into());
+        let attach_other = matches!(race, Race::AttachOtherContinuous | Race::AttachOtherHeldRelease);
+        if attach_other { targets.enable_inventory_diagnostics_for_test(); }
         ready(&targets).await;
+        let attached_others = Arc::new(Mutex::new(Vec::new()));
+        let peer_attached_others = attached_others.clone();
         let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
         let peer_cancel = cancel.clone();
         let peer_targets = targets.clone();
@@ -120,6 +143,7 @@ impl Fixture {
             let child = matches!(
                 race,
                 Race::HeldRelease
+                    | Race::AttachOtherHeldRelease
                     | Race::HeldReleaseAfterReacquisition
                     | Race::HeldReleaseWithoutMutation
                     | Race::ReleaseError
@@ -151,13 +175,13 @@ impl Fixture {
                         let last = trees == if child { 4 } else { 3 };
                         let loader = if race == Race::InvalidLoader && last {
                             "unmatched-loader"
-                        } else if completed == 0 || race == Race::Protected {
+                        } else if completed == 0 || race == Race::Protected || attach_other {
                             "old-loader"
                         } else {
                             "fresh-loader"
                         };
                         let url = if readonly {
-                            if completed == 0 || race == Race::Protected {
+                            if completed == 0 || race == Race::Protected || attach_other {
                                 "https://fixture.invalid/old"
                             } else {
                                 "https://fixture.invalid/fresh"
@@ -175,12 +199,24 @@ impl Fixture {
                             trees = 0;
                             peer_samples.fetch_add(1, Ordering::SeqCst);
                             let invalidate = match race {
-                                Race::Continuous => true,
+                                Race::Continuous | Race::AttachOtherContinuous => true,
                                 Race::Protected => completed == 1,
                                 Race::InvalidLoader | Race::HeldReleaseWithoutMutation => false,
                                 _ => completed == 0,
                             };
-                            if invalidate {
+                            if invalidate && attach_other {
+                                // The sole revision change is a real production registration.
+                                // Configuration/resume use their normal registry APIs; the
+                                // selected page/loader/tenure is never replaced by this mode.
+                                let target = format!("other-{}", completed + 1);
+                                let session = format!("other-session-{}", completed + 1);
+                                assert!(peer_targets.attached_enrolled_with_ancestry(
+                                    "context", target.clone(), session, "browser_ui".into(), None, true,
+                                ).unwrap());
+                                peer_targets.configured(&target).unwrap();
+                                peer_targets.resume_permit(&target).await.unwrap().complete().unwrap();
+                                peer_attached_others.lock().unwrap().push(peer_targets.owned_target(&target).unwrap());
+                            } else if invalidate {
                                 peer_targets
                                     .invalidate_inventory_for(
                                         if readonly {
@@ -261,7 +297,7 @@ impl Fixture {
                         assert!(instance > 0 && instance < u64::MAX);
                         assert_eq!(instance.to_string(), suffix);
                         releases += 1;
-                        if matches!(race, Race::HeldRelease | Race::HeldReleaseWithoutMutation)
+                        if matches!(race, Race::HeldRelease | Race::AttachOtherHeldRelease | Race::HeldReleaseWithoutMutation)
                             || (race == Race::HeldReleaseAfterReacquisition && releases == 2)
                         {
                             continue;
@@ -380,7 +416,11 @@ impl Fixture {
         let client = Arc::new(CdpClient::connect(&endpoint).await.unwrap());
         let ledger = OwnerDebtLedger::new(1, "scope".into());
         client.install_debt_ledger(ledger.clone()).unwrap();
-        let operation = OperationLease {
+        let operation = if let Some(broker) = broker {
+            let lease = broker.admit(1, 1, 1_000).unwrap();
+            assert!(broker.start(1, 1).unwrap());
+            lease
+        } else { OperationLease {
             is_callback: false,
             generation: 1,
             sequence: 1,
@@ -391,7 +431,7 @@ impl Fixture {
                     Duration::from_secs(if race == Race::Continuous { 1 } else { 5 })
                 },
             cancellation,
-        };
+        }};
         let journal = ledger
             .operation(
                 OperationKey {
@@ -452,6 +492,7 @@ impl Fixture {
             peer,
             readonly_replies,
             release_fence_receipt: Some(release_fence_receipt),
+            attached_others,
         }
     }
 }
