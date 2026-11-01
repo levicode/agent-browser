@@ -700,6 +700,8 @@ fn screenshot_failure_uses_production_sink_without_cleanup_attempt_or_payload() 
         1,
         11,
         ScreenshotFailure {
+            initial_sample: None,
+            prefix: None,
             read_error: None,
             read_cleanup_lost: None,
             stage: ScreenshotStage::Capture,
@@ -854,6 +856,8 @@ fn readonly_prepare_failure_maximal_closed_record_fits_existing_bound() {
 
 fn atomic_inventory_failure() -> FrameInventoryRejection {
     FrameInventoryRejection {
+        last_attachment: None,
+        selected_attachment: None,
         pass: FrameInventoryPass::Protected,
         sealed: false,
         revision_mismatch: true,
@@ -872,7 +876,7 @@ fn atomic_inventory_rejection_uses_production_sink_without_payload_or_cleanup_pa
     record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
     frame_inventory_rejection_into(&capture, 1, 11, atomic_inventory_failure());
     let rows = records(&file);
-    assert_eq!(rows.len(), 2);
+    assert_eq!(rows.len(), 3);
     assert_eq!(rows[1]["phase"], "FrameInventoryRejection");
     assert_eq!(rows[1]["events"], json!([0, 0, 1, 0, 0, 0, 0]));
     assert_eq!(
@@ -896,6 +900,32 @@ fn atomic_inventory_rejection_uses_production_sink_without_payload_or_cleanup_pa
             "revisionMismatch",
             "schemaVersion",
             "sealed",
+            "source",
+            "suppressedBefore"
+        ]
+    );
+    // The original rejection remains first; the new attribution row has no
+    // invented attachment identities when this older fixture supplies unknowns.
+    assert_eq!(rows[2]["phase"], "FrameInventoryAttribution");
+    assert_eq!(rows[2]["pass"], "protected");
+    assert_eq!(rows[2]["generation"], 1);
+    assert_eq!(rows[2]["operationSeq"], 11);
+    assert_eq!(rows[2]["record"], 2);
+    assert!(rows[2].get("lastAttachmentOrdinal").is_none());
+    assert!(rows[2].get("selectedAttachmentOrdinal").is_none());
+    assert_eq!(
+        keys(&rows[2]),
+        [
+            "droppedBefore",
+            "emittedBefore",
+            "generation",
+            "operationSeq",
+            "overflow",
+            "pass",
+            "phase",
+            "pid",
+            "record",
+            "schemaVersion",
             "source",
             "suppressedBefore"
         ]
@@ -962,6 +992,8 @@ fn semantic_read_failure_uses_existing_sink_with_closed_typed_detail_only() {
         1,
         12,
         ScreenshotFailure {
+            initial_sample: None,
+            prefix: None,
             stage: ScreenshotStage::SemanticNodeGeometry,
             capture_phase: ScreenshotCapturePhase::NotEntered,
             inventory_after_failure: InventoryAfterFailure::NotSampled,
