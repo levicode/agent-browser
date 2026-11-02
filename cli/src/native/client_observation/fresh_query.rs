@@ -183,7 +183,8 @@ pub(super) async fn fields_impl(
     let resolve_owner = resolve_custody::ResolveOwner::capture(client, session, &group, lease);
     let mut resolve_receipts = Vec::new();
     let mut sample_started = false;
-    let result = async {
+    let capture = client_debt::ReadonlyGroupCapture::new(&group);
+    let result = capture.scope(async {
         use futures_util::{stream, StreamExt};
         // Collect (not try_collect) drains every creator future before any
         // no-submission decision. No creator is spawned outside this lifetime.
@@ -228,7 +229,7 @@ pub(super) async fn fields_impl(
             samples.push(project_fixture_fields(node, fields)?);
         }
         Ok(single_root_fields::Sample::Values(samples))
-    }.await;
+    }).await;
     // Freeze an actual sample/resolve failure before cleanup can replace it.
     witness.observe(&result);
     witness.stage(Stage::FreshCleanup);
@@ -244,7 +245,7 @@ pub(super) async fn fields_impl(
     let result = if never_submitted {
         result.map_err(|error| settled_stop(error, lease))
     } else {
-        settle_object_group(client, session, &group, result, lease).await
+        settle_captured_object_group(client, session, &group, result, lease, &capture).await
     }?;
     // A new/retired author root invalidates the acquired policy rather than
     // turning an unseen closed domain into an empty result. Leaf churn does not.

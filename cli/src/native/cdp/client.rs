@@ -3177,11 +3177,38 @@ impl CdpClient {
         session: &str,
         group: &str,
     ) -> Result<(), String> {
+        self.handoff_readonly_group_release_inner(session, group, None)
+    }
+
+    pub(crate) fn handoff_captured_readonly_group_release(
+        &self, session: &str, group: &str,
+        capture: &crate::native::client_debt::ReadonlyGroupCapture,
+    ) -> Result<(), String> {
+        self.handoff_readonly_group_release_inner(session, group, Some(capture))
+    }
+
+    fn handoff_readonly_group_release_inner(
+        &self, session: &str, group: &str,
+        capture: Option<&crate::native::client_debt::ReadonlyGroupCapture>,
+    ) -> Result<(), String> {
         self.ensure_open()?;
         let params = serde_json::json!({"objectGroup": group});
-        let reservation = self
-            .reserve_tracked_command("Runtime.releaseObjectGroup", Some(&params), Some(session))?
-            .ok_or_else(|| "Readonly disposal requires an accounted owner".to_string())?;
+        let captured = if let Some(capture) = capture {
+            let ledger = self.debt_ledger().ok_or("Readonly disposal requires an accounted owner")?;
+            let journal = crate::native::client_debt::OperationJournalHandle::current()
+                .ok_or("Readonly disposal requires an exact operation")?;
+            match ledger.reserve_captured_readonly_release(&journal, session, group, capture)
+                .map_err(|_| "Readonly group custody unavailable")? {
+                crate::native::client_debt::ReadonlyRelease::Destroyed => return Ok(()),
+                crate::native::client_debt::ReadonlyRelease::Reserved(reservation) => Some(reservation),
+                crate::native::client_debt::ReadonlyRelease::Uncaptured => None,
+            }
+        } else { None };
+        let reservation = match captured {
+            Some(reservation) => reservation,
+            None => self.reserve_tracked_command("Runtime.releaseObjectGroup", Some(&params), Some(session))?
+                .ok_or_else(|| "Readonly disposal requires an accounted owner".to_string())?,
+        };
         let bytes = serde_json::to_vec(&params)
             .map_err(|_| "Invalid readonly disposal".to_string())?
             .len()

@@ -621,6 +621,23 @@ async fn settle_object_group<T>(
     }
 }
 
+async fn settle_captured_object_group<T>(
+    client: &CdpClient, session: &str, group: &str,
+    result: Result<T, ObservationError>, lease: &OperationLease,
+    capture: &client_debt::ReadonlyGroupCapture,
+) -> Result<T, ObservationError> {
+    if client.debt_ledger().is_none() {
+        return settle_object_group(client, session, group, result, lease).await;
+    }
+    if super::client_actions::release_captured_readonly_group_accounted(client, session, group, capture).await {
+        #[cfg(test)]
+        equivalence_tests::after_group_release(lease, group);
+        result.map_err(|error| settled_stop(error, lease))
+    } else {
+        Err(ObservationError::CleanupFailed { primary: result.err().map(Box::new) })
+    }
+}
+
 // A resolved frame owner is temporary authority, even when the read fails.
 // Cleanup uses a fresh bounded budget rather than the expired read lease.
 async fn settle_owner_object<T>(
@@ -2339,7 +2356,8 @@ impl HiddenFrameProof {
             let group = client
                 .readonly_group_instance(&format!("native-hidden-proof-{}-{index}", lease.sequence))
                 .map_err(|_| ObservationError::ResourceLimit)?;
-            let result = async {
+            let capture = client_debt::ReadonlyGroupCapture::new(&group);
+    let result = capture.scope(async {
                 validate_frame(client, parent, lease).await?;
                 validate_frame(client, child, lease).await?;
                 let backend = child.owner_backend_id.ok_or(ObservationError::BackendFailure)?;
@@ -2366,8 +2384,8 @@ impl HiddenFrameProof {
                 }
                 validate_frame(client, parent, lease).await?;
                 validate_frame(client, child, lease).await
-            }.await;
-            settle_object_group(client, session, &group, result, lease).await?;
+            }).await;
+            settle_captured_object_group(client, session, &group, result, lease, &capture).await?;
         }
         Ok(())
     }
@@ -3839,7 +3857,8 @@ async fn evaluate_query_diagnostic_inner(
     let group = client
         .readonly_group_instance(&format!("native-query-{}", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
-    let result=async {
+    let capture = client_debt::ReadonlyGroupCapture::new(&group);
+    let result=capture.scope(async {
         let ax_nodes:Vec<AXNode>=ids.iter().map(|backend|ax_by_backend.get(backend).map(|n|(*n).clone()).unwrap_or(AXNode{node_id:String::new(),role:None,name:None,value:None,description:None,properties:None,child_ids:None,backend_d_o_m_node_id:Some(*backend),ignored:None})).collect();
     witness.stage(Stage::Metadata);
         for chunk in ax_nodes.chunks(64) {
@@ -3907,10 +3926,10 @@ async fn evaluate_query_diagnostic_inner(
             !projection_holds_visible(expression) || matched.node.states.get("hidden") != Some(&true)
         }).collect();
         Ok(QueryEvaluation { projection_count, matches })
-    }.await;
+    }).await;
     witness.observe(&result);
     witness.stage(Stage::Cleanup);
-    let result = settle_object_group(client, session, &group, result, lease).await;
+    let result = settle_captured_object_group(client, session, &group, result, lease, &capture).await;
     let nodes = result?;
     witness.stage(Stage::FrameFinal);
     validate_frame(client, frame, lease).await?;
@@ -4163,7 +4182,8 @@ async fn main_onclick_hint(
     let group = client
         .readonly_group_instance(&format!("native-onclick-{}-{backend}", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
-    let result = async {
+    let capture = client_debt::ReadonlyGroupCapture::new(&group);
+    let result = capture.scope(async {
         validate_frame(client, frame, lease).await?;
         if !hint_boolean(
             client,
@@ -4220,14 +4240,13 @@ async fn main_onclick_hint(
         }
         validate_frame(client, frame, lease).await?;
         Ok(hint)
-    }
-    .await;
+    }).await;
     #[cfg(test)]
     if result.is_err() {
         // Fixed diagnostic only: page exception descriptions/values are private.
         eprintln!("native observation onclick hint refused: side-effect-restricted exact receiver read unavailable");
     }
-    settle_object_group(client, session, &group, result, lease).await
+    settle_captured_object_group(client, session, &group, result, lease, &capture).await
 }
 
 #[allow(clippy::too_many_arguments)] // Same explicit ownership contract as the single-node reader.
@@ -4285,7 +4304,8 @@ async fn read_batch_with_refs(
             }
         };
     }
-    let result=async {
+    let capture = client_debt::ReadonlyGroupCapture::new(&group);
+    let result=capture.scope(async {
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or("Missing isolated realm")?;
         metadata_stage!(Resolve);
@@ -4379,14 +4399,14 @@ async fn read_batch_with_refs(
             if let (Some(origin),Some(policy))=(origin,&policy){apply_security(&mut node,origin,policy);if node.states.get("secure")==Some(&true){scrub_content(&mut node);}}
             Ok(node)
         }).collect()
-    }.await;
+    }).await;
     #[cfg(test)]
     let primary_failed = result.is_err();
     #[cfg(test)]
     if primary_failed {
         eprintln!("native-metadata-first-failure stage={}", diagnostic_stage);
     }
-    let result = settle_object_group(client, session, &group, result, lease).await;
+    let result = settle_captured_object_group(client, session, &group, result, lease, &capture).await;
     #[cfg(test)]
     if !primary_failed && result.is_err() {
         eprintln!("native-metadata-first-failure stage=ObjectGroupCleanup");
@@ -4861,15 +4881,16 @@ async fn enumerate_frames_impl(
                 let group = client
                     .readonly_group_instance(&format!("native-frame-owner-{}", lease.sequence))
                     .map_err(|_| ObservationError::ResourceLimit)?;
-                let result = async {
+                let capture = client_debt::ReadonlyGroupCapture::new(&group);
+    let result = capture.scope(async {
                     let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":group}),lease).await?;
                     let object = resolved["object"]["objectId"].as_str().ok_or("Frame owner unavailable")?;
                     let value=command(client,&parent.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":FRAME_OWNER_GEOMETRY,"returnByValue":true,"objectGroup":group}),lease).await?;
                     if value.get("exceptionDetails").is_some() { Err(ObservationError::StaleReference) } else { Ok(value) }
-                }.await;
+                }).await;
                 // Includes malformed/exception handles: exact group custody is
                 // independent of whether the readonly proof was accepted.
-                settle_object_group(client, &parent.binding.session, &group, result, lease).await?
+                settle_captured_object_group(client, &parent.binding.session, &group, result, lease, &capture).await?
             } else {
                 let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":"native-frame-enumeration"}),lease).await?;
                 let object = resolved["object"]["objectId"]
@@ -5594,7 +5615,8 @@ async fn security_inventory_for_roots(
     let group = client
         .readonly_group_instance(&format!("native-security-{}", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
-    let result=async{
+    let capture = client_debt::ReadonlyGroupCapture::new(&group);
+    let result=capture.scope(async {
         let world=command(client,session,"Page.createIsolatedWorld",json!({"frameId":frame.binding.frame,"worldName":"agent-browser-native-observation"}),lease).await?;
         let context=world["executionContextId"].as_i64().ok_or(ObservationError::BackendFailure)?;
         let objects:Vec<Result<String,ObservationError>>=stream::iter(ids.into_iter().map(|backend|{let group=&group;async move{
@@ -5623,8 +5645,8 @@ async fn security_inventory_for_roots(
             if let Some(attributes)=node["attributes"].as_array(){for pair in attributes.as_chunks::<2>().0{if pair[0]=="id"{if let Some(id)=pair[1].as_str(){security.label_ids.insert(id.to_string());}}}}
         }
         Ok(security)
-    }.await;
-    let result = settle_object_group(client, session, &group, result, lease).await;
+    }).await;
+    let result = settle_captured_object_group(client, session, &group, result, lease, &capture).await;
     result
 }
 

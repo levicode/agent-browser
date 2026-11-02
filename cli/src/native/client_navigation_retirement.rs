@@ -300,11 +300,21 @@ impl AcknowledgedNavigation {
     // Consuming self makes a second stop impossible, including top-check/select
     // cancellation races. The original subscriber and absolute bound stay owned.
     pub(super) async fn retire(
+        self,
+        page: &BrowserExecutionLease,
+        operation: &OperationLease,
+        tasks: &RetainedTasks,
+        events: &mut BoundedMethodEvents,
+    ) -> Option<NavigationInterruptionProof> {
+        self.retire_before(page, operation, tasks, events, Instant::now() + Duration::from_secs(2)).await
+    }
+    async fn retire_before(
         mut self,
         page: &BrowserExecutionLease,
         operation: &OperationLease,
         tasks: &RetainedTasks,
         events: &mut BoundedMethodEvents,
+        stop_by: Instant,
     ) -> Option<NavigationInterruptionProof> {
         self.exact_owner(page, operation)?;
         let key = self.journal.key();
@@ -315,7 +325,7 @@ impl AcknowledgedNavigation {
             .filter(|proof| proof.matches(key))?;
         let deadline = retained
             .retirement_deadline()
-            .min(Instant::now() + Duration::from_secs(2));
+            .min(stop_by);
         let cleanup = async {
             let watermark = events.watermark();
             self.boundary
@@ -457,24 +467,37 @@ pub(super) async fn trigger(
     );
     tokio::pin!(original);
     let mut cancellation = operation.cancellation.clone();
+    let mut interrupted_response = None;
     let reason = tokio::select! {
         value = &mut original => {
+            #[cfg(test)]
+            tests::pause_after_original_response().await;
             let checked = check(page, operation);
             #[cfg(test)]
             if matches!(&checked, Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)) {
                 observe_trigger_interruption(page, operation, Instant::now() >= operation.deadline);
             }
-            checked?;
-            let response = value.map_err(|_| ProtocolError::BrowserFailure)?;
-            if status.snapshot() == CommandStatus::Acknowledged && !status.is_error_ack() {
-                *acknowledged = AcknowledgedBoundary::from_ack(
-                    &response, &page.page_session_id, frame, previous_loader,
-                    requested_url, trigger_sequence,
-                ).map(|boundary| AcknowledgedNavigation {
-                    boundary, original: status, attachment, journal,
-                });
+            match checked {
+                Ok(()) => {
+                    let response = value.map_err(|_| ProtocolError::BrowserFailure)?;
+                    if status.snapshot() == CommandStatus::Acknowledged && !status.is_error_ack() {
+                        *acknowledged = AcknowledgedBoundary::from_ack(
+                            &response, &page.page_session_id, frame, previous_loader,
+                            requested_url, trigger_sequence,
+                        ).map(|boundary| AcknowledgedNavigation {
+                            boundary, original: status, attachment, journal,
+                        });
+                    }
+                    return Ok(response);
+                }
+                Err(reason @ (ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)) => {
+                    // This exact response is already consumed. Preserve it for
+                    // the same terminal proof used by cancellation after ACK.
+                    interrupted_response = Some(value.map_err(|_| ProtocolError::BrowserFailure));
+                    acknowledged_interruption_reason(reason, Instant::now() >= operation.deadline)
+                }
+                Err(reason) => return Err(reason),
             }
-            return Ok(response);
         },
         _ = cancellation.changed() => {
             let entry_deadline_elapsed = Instant::now() >= operation.deadline;
@@ -494,7 +517,7 @@ pub(super) async fn trigger(
     };
     // Reserved/abandoned work never grants stop authority. A submitted command
     // remains owned by the exact CDP reader even if this waiter later expires.
-    if status.snapshot() != CommandStatus::Submitted {
+    if !matches!(status.snapshot(), CommandStatus::Submitted | CommandStatus::Acknowledged) {
         return Err(reason);
     }
     let key = journal.key();
@@ -509,6 +532,31 @@ pub(super) async fn trigger(
     let deadline = retained
         .retirement_deadline()
         .min(Instant::now() + Duration::from_secs(2));
+    if status.snapshot() == CommandStatus::Acknowledged {
+        // The reader may have acknowledged before either select branch won.
+        // ACK alone grants nothing: require the original successful response,
+        // exact ownership and the unchanged post-stop event/debt proof.
+        let response = match interrupted_response {
+            Some(value) => value,
+            None => match tokio::time::timeout_at(deadline.into(), &mut original).await {
+                Ok(value) => value.map_err(|_| ProtocolError::BrowserFailure),
+                Err(_) => return Err(reason),
+            },
+        };
+        if !status.is_error_ack() {
+            if let Ok(response) = response {
+                if let Some(boundary) = AcknowledgedBoundary::from_ack(
+                    &response, &page.page_session_id, frame, previous_loader,
+                    requested_url, trigger_sequence,
+                ) {
+                    *receipt = AcknowledgedNavigation {
+                        boundary, original: status, attachment, journal,
+                    }.retire_before(page, operation, tasks, events, deadline).await;
+                }
+            }
+        }
+        return Err(reason);
+    }
     let cleanup = async {
         let exact_owner = || {
             page.permit.check().ok()?;

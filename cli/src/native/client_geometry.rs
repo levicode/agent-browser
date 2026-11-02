@@ -1704,7 +1704,8 @@ async fn read_exact_box_with_evidence(
         let group = client
             .readonly_group_instance(&format!("native-semantic-box-{}", operation.sequence))
             .map_err(|_| GeometryError::BackendFailure)?;
-        let result = super::client_debt::native_object_group(
+        let capture = super::client_debt::ReadonlyGroupCapture::new(&group);
+        let result = capture.scope(super::client_debt::native_object_group(
             &group,
             read_exact_box_inner(
                 client,
@@ -1715,9 +1716,8 @@ async fn read_exact_box_with_evidence(
                 Some(&group),
                 evidence,
             ),
-        )
-        .await;
-        if super::client_actions::release_readonly_group_accounted(client, &binding.session, &group)
+        )).await;
+        if super::client_actions::release_captured_readonly_group_accounted(client, &binding.session, &group, &capture)
             .await
         {
             return result;

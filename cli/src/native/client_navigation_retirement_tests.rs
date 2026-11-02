@@ -164,6 +164,24 @@ fn intervening_navigation_detach_and_malformed_events_fail_closed() {
     assert!(!proof.stopped);
 }
 
+// Task-local only: hold the already-consumed original ACK until the caller
+// cancels. No production scheduling, sleep, deadline or global hook is changed.
+struct OriginalResponseGate {
+    selected: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    release: tokio::sync::Notify,
+}
+tokio::task_local! {
+    static ORIGINAL_RESPONSE_GATE: Arc<OriginalResponseGate>;
+}
+pub(super) async fn pause_after_original_response() {
+    if let Ok(gate) = ORIGINAL_RESPONSE_GATE.try_with(Arc::clone) {
+        if let Some(selected) = gate.selected.lock().unwrap().take() {
+            let _ = selected.send(());
+        }
+        gate.release.notified().await;
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 enum Reply {
     Complete,
@@ -193,6 +211,9 @@ async fn run(reply: Reply, cause: Cause) -> (bool, u32, u32) {
     run_mode(reply, cause, false).await
 }
 async fn run_mode(reply: Reply, cause: Cause, post_ack: bool) -> (bool, u32, u32) {
+    run_scheduled(reply, cause, post_ack, false).await
+}
+async fn run_scheduled(reply: Reply, cause: Cause, post_ack: bool, ack_cancel_race: bool) -> (bool, u32, u32) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let (seen_tx, seen_rx) = oneshot::channel();
@@ -223,13 +244,12 @@ async fn run_mode(reply: Reply, cause: Cause, post_ack: bool) -> (bool, u32, u32
                         if matches!(reply, Reply::WrongLoader) {
                             result["loaderId"] = json!("foreign");
                         }
-                        socket
-                            .send(Message::Text(
-                                json!({"id":command["id"],"sessionId":"session","result":result})
-                                    .to_string(),
-                            ))
-                            .await
-                            .unwrap();
+                        let ack = if matches!(reply, Reply::OriginalError) {
+                            json!({"id":command["id"],"sessionId":"session","error":{"code":-32000,"message":"rejected"}})
+                        } else {
+                            json!({"id":command["id"],"sessionId":"session","result":result})
+                        };
+                        socket.send(Message::Text(ack.to_string())).await.unwrap();
                     }
                     seen.take().unwrap().send(()).unwrap();
                 }
@@ -337,6 +357,12 @@ async fn run_mode(reply: Reply, cause: Cause, post_ack: bool) -> (bool, u32, u32
     let owner_journal = journal.clone();
     let (finished_tx, finished_rx) = oneshot::channel();
     let (acknowledged_tx, acknowledged_rx) = oneshot::channel();
+    let (selected_tx, selected_rx) = oneshot::channel();
+    let race_gate = Arc::new(OriginalResponseGate {
+        selected: std::sync::Mutex::new(Some(selected_tx)),
+        release: tokio::sync::Notify::new(),
+    });
+    let producer_gate = race_gate.clone();
     let receive = tasks
         .start_operation(
             "scope".into(),
@@ -347,7 +373,7 @@ async fn run_mode(reply: Reply, cause: Cause, post_ack: bool) -> (bool, u32, u32
             async move {
                 let mut receipt = None;
                 let mut acknowledged = None;
-                let mut result = trigger(
+                let pending = trigger(
                     &page,
                     &operation,
                     "Page.navigate",
@@ -357,9 +383,13 @@ async fn run_mode(reply: Reply, cause: Cause, post_ack: bool) -> (bool, u32, u32
                     &mut events,
                     Some((&owner, &mut receipt)),
                     &mut acknowledged,
-                )
-                .await;
-                if post_ack {
+                );
+                let mut result = if ack_cancel_race {
+                    ORIGINAL_RESPONSE_GATE.scope(producer_gate, pending).await
+                } else {
+                    pending.await
+                };
+                if post_ack && !ack_cancel_race {
                     assert!(result.is_ok(), "fixture must reach successful original ACK");
                     // This is mock-only synchronization, not a production/test API
                     // barrier or a claim that the old 100ms fixture reaches ACK.
@@ -427,7 +457,9 @@ async fn run_mode(reply: Reply, cause: Cause, post_ack: bool) -> (bool, u32, u32
     })
     .await
     .unwrap();
-    if post_ack {
+    if ack_cancel_race {
+        tokio::time::timeout(Duration::from_secs(1), selected_rx).await.unwrap().unwrap();
+    } else if post_ack {
         tokio::time::timeout(Duration::from_secs(1), acknowledged_rx)
             .await
             .unwrap()
@@ -440,6 +472,7 @@ async fn run_mode(reply: Reply, cause: Cause, post_ack: bool) -> (bool, u32, u32
         broker.cancel(1, 1).unwrap();
         broker.cancel(1, 1).unwrap();
     }
+    if ack_cancel_race { race_gate.release.notify_one(); }
     if matches!(cause, Cause::CancelThenLoseReceiver) {
         drop(receive);
     } else {
@@ -826,5 +859,22 @@ fn acknowledged_interruption_reason_freezes_deadline_without_reclassifying_other
         ProtocolError::CleanupFailed,
     ] {
         assert_eq!(acknowledged_interruption_reason(error.clone(), true), error);
+    }
+}
+
+#[tokio::test]
+async fn original_ack_selected_before_cancel_keeps_the_exact_terminal_proof() {
+    let (confirmed, stops, debt) = run_scheduled(Reply::Complete, Cause::Cancel, true, true).await;
+    assert!(confirmed);
+    assert_eq!(stops, 1);
+    assert_eq!(debt, 0);
+}
+
+#[tokio::test]
+async fn ack_cancel_race_still_rejects_wrong_loader_error_and_missing_terminal_events() {
+    for reply in [Reply::WrongLoader, Reply::OriginalError, Reply::StopError, Reply::PreBaselineStopped, Reply::LateOtherLoader] {
+        let (confirmed, stops, _) = run_scheduled(reply, Cause::Cancel, true, true).await;
+        assert!(!confirmed, "accepted {reply:?}");
+        assert!(stops <= 1);
     }
 }

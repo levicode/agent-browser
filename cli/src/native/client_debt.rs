@@ -7,7 +7,7 @@ use super::client_session::{CancelSignal, OperationLease};
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -530,8 +530,49 @@ tokio::task_local! {
     static CURRENT_OPERATION: OperationJournalHandle;
     static COMMAND_OVERRIDE: CommandOverride;
     static NATIVE_OBJECT_GROUP: String;
+    static READONLY_GROUP_CAPTURE: ReadonlyGroupCapture;
     static INITIALIZATION_WORK: (Arc<OwnerDebtLedger>, InitializationWork);
 }
+/// Caller-owned custody for one readonly group. Binding occurs only when the
+/// real ledger registers a native group, never from a later name lookup.
+#[derive(Clone)]
+pub(crate) struct ReadonlyGroupCapture {
+    name: String,
+    state: Arc<Mutex<ReadonlyGroupCaptureState>>,
+}
+#[derive(Default)]
+struct ReadonlyGroupCaptureState {
+    bound: Option<CapturedReadonlyGroup>,
+    consumed: bool,
+}
+#[derive(Clone)]
+struct CapturedReadonlyGroup {
+    ledger: std::sync::Weak<OwnerDebtLedger>,
+    operation: OperationKey,
+    session: String,
+    provenance: Provenance,
+    id: u64,
+    destroyed: Arc<AtomicBool>,
+    unsubmitted_abandoned: Arc<AtomicBool>,
+}
+enum ReadonlyReleaseAdmission {
+    Finished(ReadonlyRelease),
+    Live(CapturedReadonlyGroup),
+}
+pub(crate) enum ReadonlyRelease {
+    Uncaptured,
+    Destroyed,
+    Reserved(CommandReservation),
+}
+impl ReadonlyGroupCapture {
+    pub(crate) fn new(name: &str) -> Self {
+        Self { name: name.to_owned(), state: Arc::new(Mutex::new(ReadonlyGroupCaptureState::default())) }
+    }
+    pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
+        READONLY_GROUP_CAPTURE.scope(self.clone(), future).await
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum InitializationWork {
     StateRestore,
@@ -1095,6 +1136,8 @@ struct ObjectObligation {
     footprint: usize,
 }
 struct GroupObligation {
+    destroyed: Arc<AtomicBool>,
+    unsubmitted_abandoned: Arc<AtomicBool>,
     // Every resource-producing member must share this exact native realm.
     // An unknown member permanently prevents realm-only group retirement.
     realm_complete: bool,
@@ -2687,6 +2730,165 @@ impl OwnerDebtLedger {
             &mut AdmissionObservation::default(),
         )
     }
+    /// No CDP command escapes until the caller-owned registration receipt is
+    /// validated. A real destruction event may discharge that exact lifecycle;
+    /// absence, transport loss and a rejected release never manufacture proof.
+    pub(crate) fn reserve_captured_readonly_release(
+        self: &Arc<Self>,
+        journal: &OperationJournalHandle,
+        session: &str,
+        name: &str,
+        capture: &ReadonlyGroupCapture,
+    ) -> Result<ReadonlyRelease, ProtocolError> {
+        let bound = match self.begin_captured_readonly_release(journal, session, name, capture)? {
+            ReadonlyReleaseAdmission::Finished(result) => return Ok(result),
+            ReadonlyReleaseAdmission::Live(bound) => bound,
+        };
+        // Preserve every ordinary admission failure. In particular, there is
+        // no catch-and-forgive path for policy, integrity or capacity failures.
+        let reservation = self.reserve_command(
+            Some(journal),
+            "Runtime.releaseObjectGroup",
+            Some(&serde_json::json!({"objectGroup": name})),
+            Some(session),
+        )?;
+        self.finish_captured_readonly_release(journal, session, name, &bound, reservation)
+    }
+
+    fn validate_captured_readonly_owner(
+        self: &Arc<Self>,
+        state: &LedgerState,
+        journal: &OperationJournalHandle,
+        session: &str,
+        name: &str,
+        bound: &CapturedReadonlyGroup,
+    ) -> Result<(), ProtocolError> {
+        if state.retired || state.integrity_lost {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        if !Arc::ptr_eq(&journal.ledger, self)
+            || !bound.ledger.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, self))
+            || bound.operation != journal.key()
+            || bound.session != session
+            || bound.provenance.operation != Some(journal.key())
+            || bound.provenance.session.as_deref() != Some(session)
+            || state.targets.get(session).is_some_and(|target| bound.provenance.target.as_ref() != Some(target))
+            || state.groups.iter().any(|(id, group)| {
+                *id != bound.id
+                    && group.name == name
+                    && group.provenance.session.as_deref() == Some(session)
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        // An old destruction receipt cannot stand for a reused context ID.
+        if bound.destroyed.load(Ordering::SeqCst)
+            && bound.provenance.realm.is_some_and(|(context, epoch)| {
+                state.realms.get(&(session.to_owned(), context)).is_some_and(|current| *current != epoch)
+            })
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        Ok(())
+    }
+
+    fn begin_captured_readonly_release(
+        self: &Arc<Self>,
+        journal: &OperationJournalHandle,
+        session: &str,
+        name: &str,
+        capture: &ReadonlyGroupCapture,
+    ) -> Result<ReadonlyReleaseAdmission, ProtocolError> {
+        if !Arc::ptr_eq(&journal.ledger, self) || capture.name != name {
+            return Err(ProtocolError::StaleScope);
+        }
+        let state = self.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let mut receipt = capture.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+        if state.retired || state.integrity_lost || receipt.consumed {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let Some(bound) = receipt.bound.as_ref() else {
+            // No actual registration: keep legacy strict disposal, not a no-op.
+            receipt.consumed = true;
+            return Ok(ReadonlyReleaseAdmission::Finished(ReadonlyRelease::Uncaptured));
+        };
+        self.validate_captured_readonly_owner(&state, journal, session, name, bound)?;
+        let result = if bound.unsubmitted_abandoned.load(Ordering::SeqCst) {
+            ReadonlyReleaseAdmission::Finished(ReadonlyRelease::Uncaptured)
+        } else if bound.destroyed.load(Ordering::SeqCst) {
+            ReadonlyReleaseAdmission::Finished(ReadonlyRelease::Destroyed)
+        } else {
+            let group = state.groups.get(&bound.id).ok_or(ProtocolError::StaleScope)?;
+            if group.name != name
+                || group.provenance != bound.provenance
+                || !Arc::ptr_eq(&group.destroyed, &bound.destroyed)
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            ReadonlyReleaseAdmission::Live(bound.clone())
+        };
+        // Claim once before dropping the lock; a cloned capture cannot race a
+        // second disposal or add a resource-producing command after admission.
+        receipt.consumed = true;
+        Ok(result)
+    }
+
+    fn finish_captured_readonly_release(
+        self: &Arc<Self>,
+        journal: &OperationJournalHandle,
+        session: &str,
+        name: &str,
+        bound: &CapturedReadonlyGroup,
+        reservation: CommandReservation,
+    ) -> Result<ReadonlyRelease, ProtocolError> {
+        let mut state = self.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+        self.validate_captured_readonly_owner(&state, journal, session, name, bound)?;
+        if bound.destroyed.load(Ordering::SeqCst) {
+            if let Some(command) = state.commands.get(&reservation.id) {
+                // Destruction between the first check and reservation can leave
+                // a new, *unsent* release with no group. It is this exact local
+                // reservation only, never a submitted/rejected cleanup sweep.
+                if command.submitted
+                    || !command.release_group
+                    || command.grouped_creation
+                    || command.mutation
+                    || command.creation_slots != 0
+                    || command.provenance.operation != Some(bound.operation)
+                    || command.provenance.session.as_deref() != Some(session)
+                    || command.object_group.as_deref() != Some(name)
+                    || command.group_id.is_some_and(|id| id != bound.id)
+                    || command.status.snapshot() != CommandStatus::Reserved
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
+                let command = remove_command(&mut state, reservation.id).expect("validated unsent release");
+                command.status.set(CommandStatus::Destroyed);
+            } else if reservation.status.snapshot() != CommandStatus::Destroyed {
+                // Destruction after reservation may already have removed it.
+                // Mere missing command is not equivalent to that exact receipt.
+                return Err(ProtocolError::StaleScope);
+            }
+            drop(state);
+            self.changed.notify_waiters();
+            return Ok(ReadonlyRelease::Destroyed);
+        }
+        let group = state.groups.get(&bound.id).ok_or(ProtocolError::StaleScope)?;
+        if group.name != name
+            || group.provenance != bound.provenance
+            || !Arc::ptr_eq(&group.destroyed, &bound.destroyed)
+        {
+            return Err(ProtocolError::StaleScope);
+        }
+        let realm = group.realm_complete.then_some(group.provenance.realm).flatten();
+        let command = state.commands.get_mut(&reservation.id).ok_or(ProtocolError::StaleScope)?;
+        if command.group_id != Some(bound.id) || command.submitted {
+            return Err(ProtocolError::StaleScope);
+        }
+        command.provenance.realm = realm;
+        drop(state);
+        Ok(ReadonlyRelease::Reserved(reservation))
+    }
+
     pub(crate) fn reserve_command_observed(
         self: &Arc<Self>,
         journal: Option<&OperationJournalHandle>,
@@ -3136,6 +3338,25 @@ impl OwnerDebtLedger {
         }) {
             return Err(ProtocolError::Cancelled);
         }
+        let readonly_capture = READONLY_GROUP_CAPTURE.try_with(Clone::clone).ok()
+            .filter(|capture| native_group.as_deref() == Some(capture.name.as_str()));
+        if let Some(capture) = &readonly_capture {
+            let receipt = capture.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if receipt.consumed { return Err(ProtocolError::StaleScope); }
+            if journal.is_none() || provenance.session.is_none()
+                || (receipt.bound.is_none() && existing_group.is_some())
+            {
+                return Err(ProtocolError::StaleScope);
+            }
+            if let Some(bound) = &receipt.bound {
+                if bound.destroyed.load(Ordering::SeqCst)
+                    || !bound.ledger.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, self))
+                    || journal.map(OperationJournalHandle::key) != Some(bound.operation)
+                    || provenance.session.as_deref() != Some(bound.session.as_str())
+                    || existing_group != Some(bound.id)
+                { return Err(ProtocolError::StaleScope); }
+            }
+        }
         let new_group_footprint = if native_group.is_some() && existing_group.is_none() {
             256 + self.identity_scope.len()
                 + provenance.session.as_ref().map_or(0, String::len)
@@ -3223,6 +3444,8 @@ impl OwnerDebtLedger {
             state.groups.insert(
                 group_id,
                 GroupObligation {
+                    destroyed: Arc::new(AtomicBool::new(false)),
+                    unsubmitted_abandoned: Arc::new(AtomicBool::new(false)),
                     realm_complete: provenance.realm.is_some(),
                     provenance: provenance.clone(),
                     name: native_group.clone().expect("native group"),
@@ -3239,6 +3462,21 @@ impl OwnerDebtLedger {
         } else {
             existing_group
         };
+        if let Some(capture) = &readonly_capture {
+            let mut receipt = capture.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+            let id = group_id.ok_or(ProtocolError::StaleScope)?;
+            let group = state.groups.get(&id).ok_or(ProtocolError::StaleScope)?;
+            if receipt.bound.is_none() {
+                receipt.bound = Some(CapturedReadonlyGroup {
+                    ledger: Arc::downgrade(self),
+                    operation: journal.ok_or(ProtocolError::StaleScope)?.key(),
+                    session: provenance.session.clone().ok_or(ProtocolError::StaleScope)?,
+                    provenance: group.provenance.clone(),
+                    id, destroyed: group.destroyed.clone(),
+                    unsubmitted_abandoned: group.unsubmitted_abandoned.clone(),
+                });
+            }
+        }
         if physical_creation_slots > 0 {
             if let Some(group) = group_id.and_then(|id| state.groups.get_mut(&id)) {
                 group.realm_complete &= provenance.realm.is_some()
@@ -3852,6 +4090,11 @@ fn destroy_matching(
         .filter(|(_, group)| matches(&group.provenance) && (!realm_specific || group.realm_complete))
         .map(|(id, _)| *id)
         .collect();
+    for id in &groups {
+        if let Some(group) = state.groups.get(id) {
+            group.destroyed.store(true, Ordering::SeqCst);
+        }
+    }
     state.groups.retain(|id, _| !groups.contains(id));
     state.object_bytes = state.objects.iter().map(|object| object.footprint).sum();
     // Realm destruction discharges objects, not unrelated input effects. Only
@@ -4043,7 +4286,9 @@ impl Drop for CommandReservation {
                         .get(&id)
                         .is_some_and(|group| !group.ever_submitted && group.pending_creations == 0)
                     {
-                        state.groups.remove(&id);
+                        if let Some(group) = state.groups.remove(&id) {
+                            group.unsubmitted_abandoned.store(true, Ordering::SeqCst);
+                        }
                     }
                 }
                 self.status.set(CommandStatus::Abandoned);
@@ -6070,6 +6315,248 @@ pub(crate) mod tests {
         assert!(!state.retired);
     }
 
+    async fn readonly_capture_fixture() -> (Arc<OwnerDebtLedger>, OperationJournalHandle, ReadonlyGroupCapture) {
+        let (ledger, journal) = owner();
+        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
+        let capture = ReadonlyGroupCapture::new("native-query-1");
+        capture.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1","executionContextId":9})))
+            .await.submit().unwrap()
+            .settle(&response(json!({"object":{"objectId":"known-node"}})));
+        (ledger, journal, capture)
+    }
+    fn destroy_readonly_fixture_realm(ledger: &OwnerDebtLedger) {
+        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextDestroyed".into(),
+            session_id: Some("page".into()), params: json!({"executionContextId":9}) });
+    }
+    #[tokio::test]
+    async fn captured_readonly_destroyed_group_consumes_without_new_release_debt() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        destroy_readonly_fixture_realm(&ledger);
+        let before = ledger.snapshot();
+        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture),
+            Ok(ReadonlyRelease::Destroyed)));
+        assert_eq!(ledger.snapshot(), before);
+        assert_eq!(before.object_debt, 0);
+        assert_eq!(before.outstanding_commands, 0);
+        assert_eq!(ledger.state.lock().unwrap().targets.get("page").map(String::as_str), Some("target"));
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+    }
+    #[tokio::test]
+    async fn captured_readonly_live_release_retains_exact_pending_command_until_destruction() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        let ReadonlyRelease::Reserved(reservation) = ledger.reserve_captured_readonly_release(
+            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("live group must retain real disposal") };
+        let status = reservation.status();
+        let _submitted = reservation.submit().unwrap();
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        destroy_readonly_fixture_realm(&ledger);
+        assert_eq!(status.snapshot(), CommandStatus::Destroyed);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(ledger.snapshot().object_debt, 0);
+    }
+    #[tokio::test]
+    async fn captured_readonly_foreign_owner_operation_session_and_name_never_consume_proof() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        destroy_readonly_fixture_realm(&ledger);
+        let (foreign, foreign_journal) = owner();
+        assert!(foreign.reserve_captured_readonly_release(&foreign_journal, "page", "native-query-1", &capture).is_err());
+        let other = ledger.operation(OperationKey { generation: 7, operation_seq: 2 }, "target".into(), "page".into()).unwrap();
+        assert!(ledger.reserve_captured_readonly_release(&other, "page", "native-query-1", &capture).is_err());
+        assert!(ledger.reserve_captured_readonly_release(&journal, "foreign", "native-query-1", &capture).is_err());
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "other-group", &capture).is_err());
+        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture), Ok(ReadonlyRelease::Destroyed)));
+    }
+    #[tokio::test]
+    async fn captured_readonly_old_receipt_cannot_consume_reused_name_or_new_realm_group() {
+        let (ledger, journal, old) = readonly_capture_fixture().await;
+        destroy_readonly_fixture_realm(&ledger);
+        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
+        let fresh = ReadonlyGroupCapture::new("native-query-1");
+        fresh.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1","executionContextId":9})))
+            .await.submit().unwrap().settle(&response(json!({"object":{"objectId":"new-epoch-node"}})));
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &old).is_err());
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &fresh), Ok(ReadonlyRelease::Reserved(_))));
+    }
+    #[tokio::test]
+    async fn captured_readonly_mixed_unknown_creator_never_acquires_destroyed_receipt() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        capture.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1"}))).await.submit().unwrap()
+            .settle(&response(json!({"object":{"objectId":"unknown-realm-node"}})));
+        destroy_readonly_fixture_realm(&ledger);
+        let ReadonlyRelease::Reserved(reservation) = ledger.reserve_captured_readonly_release(
+            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("unknown member requires real cleanup") };
+        let status = reservation.status();
+        reservation.submit().unwrap().settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
+        assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+    }
+    #[tokio::test]
+    async fn captured_readonly_unsent_abandonment_keeps_legacy_strict_disposal_not_destruction() {
+        let (ledger, journal) = owner();
+        let capture = ReadonlyGroupCapture::new("native-query-1");
+        drop(capture.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1"}))).await);
+        assert_eq!(ledger.snapshot().object_debt, 0);
+        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture), Ok(ReadonlyRelease::Uncaptured)));
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+    }
+    #[tokio::test]
+    async fn captured_readonly_integrity_loss_cannot_borrow_prior_destruction() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        destroy_readonly_fixture_realm(&ledger);
+        ledger.connection_lost();
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert!(ledger.snapshot().integrity_lost);
+    }
+    #[tokio::test]
+    async fn captured_readonly_destruction_never_discharges_other_rejected_cleanup() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        let other = ledger.reserve_command(Some(&journal), "Runtime.releaseObject",
+            Some(&json!({"objectId":"unrelated-unproven-object"})), Some("page")).unwrap();
+        let status = other.status();
+        other.submit().unwrap().settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
+        destroy_readonly_fixture_realm(&ledger);
+        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture), Ok(ReadonlyRelease::Destroyed)));
+        assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+    }
+
+    #[tokio::test]
+    async fn captured_readonly_destruction_between_claim_and_reserve_removes_only_own_unsent_release() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        let ReadonlyReleaseAdmission::Live(bound) = ledger.begin_captured_readonly_release(
+            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("live") };
+        assert!(ledger.begin_captured_readonly_release(&journal, "page", "native-query-1", &capture.clone()).is_err());
+        destroy_readonly_fixture_realm(&ledger);
+        let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
+            Some(&json!({"objectGroup":"native-query-1"})), Some("page")).unwrap();
+        let status = reservation.status();
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        assert!(matches!(ledger.finish_captured_readonly_release(&journal, "page", "native-query-1", &bound, reservation), Ok(ReadonlyRelease::Destroyed)));
+        assert_eq!(status.snapshot(), CommandStatus::Destroyed);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+        assert_eq!(ledger.snapshot().object_debt, 0);
+    }
+    #[tokio::test]
+    async fn captured_readonly_destruction_between_reserve_and_finish_accepts_only_destroyed_status() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        let ReadonlyReleaseAdmission::Live(bound) = ledger.begin_captured_readonly_release(
+            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("live") };
+        let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
+            Some(&json!({"objectGroup":"native-query-1"})), Some("page")).unwrap();
+        let status = reservation.status();
+        destroy_readonly_fixture_realm(&ledger);
+        assert_eq!(status.snapshot(), CommandStatus::Destroyed);
+        assert!(matches!(ledger.finish_captured_readonly_release(&journal, "page", "native-query-1", &bound, reservation), Ok(ReadonlyRelease::Destroyed)));
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+    }
+    #[tokio::test]
+    async fn captured_readonly_name_alone_cannot_mint_receipt_for_registered_group() {
+        let (ledger, journal, original) = readonly_capture_fixture().await;
+        let forged = ReadonlyGroupCapture::new("native-query-1");
+        let result = forged.scope(native_object_group("native-query-1", command_scope(
+            CommandCategory::ApplicationObject, false, async {
+                ledger.reserve_command(Some(&journal), "DOM.resolveNode",
+                    Some(&json!({"objectGroup":"native-query-1","executionContextId":9})), Some("page"))
+            }))).await;
+        assert!(matches!(result, Err(ProtocolError::StaleScope)));
+        destroy_readonly_fixture_realm(&ledger);
+        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &forged), Ok(ReadonlyRelease::Uncaptured)));
+        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &original), Ok(ReadonlyRelease::Destroyed)));
+    }
+    #[tokio::test]
+    async fn captured_readonly_context_epoch_reuse_without_new_group_refuses_old_receipt() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        destroy_readonly_fixture_realm(&ledger);
+        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+    }
+    #[tokio::test]
+    async fn captured_readonly_pending_unknown_creator_and_late_ack_preserve_cleanup_debt() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        let unknown = capture.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1"}))).await.submit().unwrap();
+        destroy_readonly_fixture_realm(&ledger);
+        let ReadonlyRelease::Reserved(release) = ledger.reserve_captured_readonly_release(
+            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("unknown member needs cleanup") };
+        let status = release.status();
+        release.submit().unwrap().settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
+        let _late_disposals = unknown.settle_for_delivery(&response(json!({"object":{"objectId":"late-node"}})));
+        assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+    }
+    #[tokio::test]
+    async fn captured_readonly_rejected_release_never_turns_into_success_or_retry() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        let ReadonlyRelease::Reserved(release) = ledger.reserve_captured_readonly_release(
+            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("live") };
+        let status = release.status();
+        release.submit().unwrap().settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"Object group not found"}})).unwrap());
+        assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
+    }
+    #[tokio::test]
+    async fn captured_readonly_retired_owner_never_uses_destruction_noop() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        destroy_readonly_fixture_realm(&ledger);
+        ledger.bind_context("context").unwrap();
+        ledger.retire_after_context_destroy("context").unwrap();
+        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+    }
+
+    #[tokio::test]
+    async fn captured_readonly_destroyed_receipt_preserves_unrelated_pending_input() {
+        let (ledger, journal, capture) = readonly_capture_fixture().await;
+        let input = ledger.reserve_command(Some(&journal), "Input.dispatchKeyEvent", None, Some("page"))
+            .unwrap().submit().unwrap();
+        destroy_readonly_fixture_realm(&ledger);
+        let before = ledger.snapshot();
+        assert!(before.input_debt > 0);
+        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture), Ok(ReadonlyRelease::Destroyed)));
+        assert_eq!(ledger.snapshot(), before);
+        input.settle(&response(json!({})));
+    }
+    #[tokio::test]
+    async fn captured_readonly_child_detach_noop_preserves_parent_group() {
+        let (ledger, parent, _parent_capture) = readonly_capture_fixture().await;
+        let child = ledger.operation(OperationKey { generation: 7, operation_seq: 2 },
+            "child-target".into(), "child-session".into()).unwrap();
+        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
+            session_id: Some("child-session".into()), params: json!({"context":{"id":9}}) });
+        let capture = ReadonlyGroupCapture::new("native-query-2");
+        let creation = capture.scope(native_object_group("native-query-2", command_scope(
+            CommandCategory::ApplicationObject, false, async {
+                ledger.reserve_command(Some(&child), "DOM.resolveNode",
+                    Some(&json!({"objectGroup":"native-query-2","executionContextId":9})), Some("child-session")).unwrap()
+            }))).await.submit().unwrap();
+        creation.settle(&serde_json::from_value(json!({"id":1,"sessionId":"child-session",
+            "result":{"object":{"objectId":"child-node"}}})).unwrap());
+        ledger.observe_event(&CdpEvent { method: "Target.detachedFromTarget".into(),
+            session_id: Some("page".into()), params: json!({"sessionId":"child-session","targetId":"child-target"}) });
+        let before = ledger.snapshot();
+        assert_eq!(before.object_debt, 1);
+        assert!(matches!(ledger.reserve_captured_readonly_release(&child, "child-session", "native-query-2", &capture), Ok(ReadonlyRelease::Destroyed)));
+        assert_eq!(ledger.snapshot(), before);
+        assert_eq!(ledger.state.lock().unwrap().targets.get("page").map(String::as_str), Some("target"));
+        assert_eq!(parent.key().operation_seq, 1);
+    }
+
     #[tokio::test]
     async fn readonly_group_unknown_creator_after_release_reservation_revokes_realm_retirement() {
         let (ledger, journal) = owner();
@@ -6675,6 +7162,8 @@ pub(crate) mod tests {
                         state.groups.insert(
                             1,
                             GroupObligation {
+                                destroyed: Arc::new(AtomicBool::new(false)),
+                                unsubmitted_abandoned: Arc::new(AtomicBool::new(false)),
                                 realm_complete: provenance.realm.is_some(),
                                 provenance,
                                 name: "group".into(),
