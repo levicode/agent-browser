@@ -134,6 +134,49 @@ async fn peer() -> (Owner, tokio::task::JoinHandle<()>) {
         server,
     )
 }
+#[tokio::test]
+async fn prepare_freezes_semantic_cutoff_before_any_async_capture_work() {
+    let (owner, server) = peer().await;
+    let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
+    let (mut op, _cancel) = operation(1);
+    op.deadline = Instant::now() + Duration::from_secs(8);
+    let mut request = observe();
+    if let DispatchRequest::Observe(request) = &mut request {
+        request.options.pixel_fallback = true;
+    }
+    let before = Instant::now();
+    let prepared = dispatch.prepare(owner.context(), request, op).unwrap();
+    let after = Instant::now();
+    let semantic = &prepared.semantic_operation;
+    assert!(
+        semantic.deadline
+            >= prepared_semantic_lease_at(&prepared.request, &prepared.operation, before).deadline
+    );
+    assert!(
+        semantic.deadline
+            <= prepared_semantic_lease_at(&prepared.request, &prepared.operation, after).deadline
+    );
+    assert!(
+        semantic.deadline
+            < prepared_semantic_lease_at(
+                &prepared.request,
+                &prepared.operation,
+                after + Duration::from_secs(1)
+            )
+            .deadline
+    );
+    assert_eq!(semantic.generation, prepared.operation.generation);
+    assert_eq!(semantic.sequence, prepared.operation.sequence);
+    assert_eq!(semantic.is_callback, prepared.operation.is_callback);
+    assert!(semantic
+        .cancellation
+        .same_channel(&prepared.operation.cancellation));
+    assert!(semantic.deadline < prepared.operation.deadline);
+    drop(prepared);
+    owner.client.close().await;
+    server.await.unwrap();
+}
+
 fn staged(owner: &Owner, refs: &RefMap, revision: u64, backend: i64) -> (RefMap, String) {
     let mut staged = refs.clone();
     staged.begin_observation(

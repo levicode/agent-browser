@@ -216,6 +216,20 @@ async fn continuation_recovers_exact_settled_other_attach_race_with_fresh_operat
         .dispatch
         .prepare(s.context(), request(Some(ticket.clone())), op)
         .unwrap();
+    assert_eq!(prepared.operation.deadline, s.deadline);
+    assert_eq!(prepared.semantic_operation.deadline, s.deadline);
+    assert_eq!(
+        prepared.semantic_operation.generation,
+        prepared.operation.generation
+    );
+    assert_eq!(
+        prepared.semantic_operation.sequence,
+        prepared.operation.sequence
+    );
+    assert!(prepared
+        .semantic_operation
+        .cancellation
+        .same_channel(&prepared.operation.cancellation));
     let cleanup = AtomicBool::new(false);
     let frames = journal
         .scope(s.dispatch.initial_observe_frames(

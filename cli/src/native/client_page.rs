@@ -71,15 +71,49 @@ struct Key {
     modifier: i32,
     location: i32,
 }
+struct NetworkRequest {
+    included: bool,
+    frame: Option<(String, String)>,
+    loader: Option<String>,
+}
+#[derive(Default)]
+struct NetworkFrame {
+    loader: Option<String>,
+    retired_loaders: BTreeSet<String>,
+}
 struct NetworkActivity {
-    requests: BTreeMap<(String, String), bool>,
+    requests: BTreeMap<(String, String), NetworkRequest>,
+    frames: BTreeMap<(String, String), NetworkFrame>,
+    retired_loader_count: usize,
     quiet_since: Instant,
     complete: bool,
+}
+impl NetworkActivity {
+    fn counted(&self, request: &NetworkRequest) -> bool {
+        if !request.included {
+            return false;
+        }
+        let Some(frame) = request.frame.as_ref().and_then(|id| self.frames.get(id)) else {
+            return true;
+        };
+        request
+            .loader
+            .as_ref()
+            .is_none_or(|loader| !frame.retired_loaders.contains(loader))
+    }
+    fn counted_requests(&self) -> usize {
+        self.requests
+            .values()
+            .filter(|request| self.counted(request))
+            .count()
+    }
 }
 impl Default for NetworkActivity {
     fn default() -> Self {
         Self {
             requests: BTreeMap::new(),
+            frames: BTreeMap::new(),
+            retired_loader_count: 0,
             quiet_since: Instant::now(),
             complete: true,
         }
@@ -517,6 +551,114 @@ impl ClientPageState {
         self.network_changed.notify_waiters();
         Ok(())
     }
+    /// Enrollment supplies an owned frame snapshot or an exact document commit.
+    /// Only a commit can retire the previously proven loader. Requests never
+    /// establish the current loader, and an unknown/new loader stays counted.
+    pub(super) fn record_network_frame(
+        &self,
+        root_page_session: &str,
+        session: &str,
+        frame_id: &str,
+        loader: Option<&str>,
+        new_document: bool,
+    ) -> Result<(), ProtocolError> {
+        if frame_id.is_empty() || frame_id.len() > 1024 {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        let loader = loader.filter(|loader| !loader.is_empty() && loader.len() <= 4096);
+        let mut state = self.state()?;
+        if state.network_roots.get(session).map(String::as_str) != Some(root_page_session) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let activity = state
+            .network
+            .get_mut(root_page_session)
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        if !activity.complete {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let key = (session.to_owned(), frame_id.to_owned());
+        let previous = activity.frames.get(&key);
+        let old_loader = previous
+            .and_then(|frame| frame.loader.as_ref())
+            .filter(|old| new_document && loader.is_some_and(|new| new != old.as_str()))
+            .cloned();
+        let add_retired = old_loader
+            .as_ref()
+            .is_some_and(|old| previous.is_some_and(|frame| !frame.retired_loaders.contains(old)));
+        // BFCache/history may commit a loader that was previously retired.
+        let remove_retired = new_document
+            && loader.is_some_and(|new| {
+                previous.is_some_and(|frame| frame.retired_loaders.contains(new))
+            });
+        if (previous.is_none() && activity.frames.len() >= 4096)
+            || activity.retired_loader_count + usize::from(add_retired)
+                - usize::from(remove_retired)
+                > 8192
+        {
+            activity.complete = false;
+            drop(state);
+            self.network_changed.notify_waiters();
+            return Err(ProtocolError::CapacityExceeded);
+        }
+        let before = activity.counted_requests();
+        let frame = activity.frames.entry(key).or_default();
+        if new_document {
+            // Missing/malformed loaders cannot retire the last proven loader.
+            if let Some(loader) = loader {
+                if let Some(old) = old_loader {
+                    frame.retired_loaders.insert(old);
+                }
+                frame.retired_loaders.remove(loader);
+                frame.loader = Some(loader.to_owned());
+                activity.retired_loader_count += usize::from(add_retired);
+                activity.retired_loader_count -= usize::from(remove_retired);
+            }
+        } else if frame.loader.is_none() {
+            // A later snapshot cannot overwrite an already applied commit.
+            frame.loader = loader.map(str::to_owned);
+        }
+        if before != activity.counted_requests() {
+            activity.quiet_since = Instant::now();
+        }
+        drop(state);
+        self.network_changed.notify_waiters();
+        Ok(())
+    }
+    /// A new attachment cannot inherit a prior frame tenure's loader evidence.
+    /// Keep every request; unknown attribution conservatively remains counted.
+    pub(super) fn reset_network_frame(
+        &self,
+        root_page_session: &str,
+        session: &str,
+        frame_id: &str,
+    ) -> Result<(), ProtocolError> {
+        if frame_id.is_empty() || frame_id.len() > 1024 {
+            return Err(ProtocolError::InvalidFrame);
+        }
+        let mut state = self.state()?;
+        if state.network_roots.get(session).map(String::as_str) != Some(root_page_session) {
+            return Err(ProtocolError::StaleScope);
+        }
+        let activity = state
+            .network
+            .get_mut(root_page_session)
+            .ok_or(ProtocolError::ScopeUnavailable)?;
+        if !activity.complete {
+            return Err(ProtocolError::ScopeUnavailable);
+        }
+        let key = (session.to_owned(), frame_id.to_owned());
+        let before = activity.counted_requests();
+        if let Some(frame) = activity.frames.remove(&key) {
+            activity.retired_loader_count -= frame.retired_loaders.len();
+        }
+        if before != activity.counted_requests() {
+            activity.quiet_since = Instant::now();
+        }
+        drop(state);
+        self.network_changed.notify_waiters();
+        Ok(())
+    }
     /// Feed only owned sessions from the lossless/bounded native event owner.
     /// Root grouping is proven by the target/frame registry, never inferred
     /// from a URL. Stream overflow must call network_incomplete and quarantine.
@@ -571,14 +713,36 @@ impl ClientPageState {
             ) || url.ends_with("/favicon.ico");
             // CDP reuses requestId through a redirect. Retain exclusion of the
             // original favicon, and never count a redirect as a second request.
-            let previous = activity.requests.get(&key).copied();
-            let counted = previous.unwrap_or(!excluded) && !excluded;
-            activity.requests.insert(key, counted);
-            if counted || previous == Some(true) {
+            let previous = activity.requests.get(&key);
+            let previously_counted = previous.is_some_and(|request| activity.counted(request));
+            let request = NetworkRequest {
+                included: previous.is_none_or(|request| request.included) && !excluded,
+                frame: event
+                    .params
+                    .get("frameId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 1024)
+                    .map(|id| (session.to_owned(), id.to_owned())),
+                loader: event
+                    .params
+                    .get("loaderId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty() && id.len() <= 4096)
+                    .map(str::to_owned),
+            };
+            let counted = activity.counted(&request);
+            activity.requests.insert(key, request);
+            if counted || previously_counted {
                 activity.quiet_since = Instant::now();
             }
-        } else if activity.requests.remove(&key) == Some(true) {
-            activity.quiet_since = Instant::now();
+        } else {
+            let removed = activity.requests.remove(&key);
+            if removed
+                .as_ref()
+                .is_some_and(|request| activity.counted(request))
+            {
+                activity.quiet_since = Instant::now();
+            }
         }
         drop(state);
         self.network_changed.notify_waiters();
@@ -591,7 +755,7 @@ impl ClientPageState {
         self.network_changed.notify_waiters();
         Ok(())
     }
-    async fn wait_network_idle(
+    pub(super) async fn wait_network_idle(
         &self,
         page: &BrowserExecutionLease,
         op: &OperationLease,
@@ -610,7 +774,11 @@ impl ClientPageState {
                 if !activity.complete {
                     return Err(ProtocolError::ScopeUnavailable);
                 }
-                if activity.requests.values().any(|counted| *counted) {
+                if activity
+                    .requests
+                    .values()
+                    .any(|request| activity.counted(request))
+                {
                     None
                 } else {
                     Some(activity.quiet_since + Duration::from_millis(500))
@@ -941,6 +1109,12 @@ impl ClientPageState {
         if let Some(root) = state.network_roots.remove(session) {
             if let Some(activity) = state.network.get_mut(&root) {
                 activity.requests.retain(|(owner, _), _| owner != session);
+                activity.frames.retain(|(owner, _), _| owner != session);
+                activity.retired_loader_count = activity
+                    .frames
+                    .values()
+                    .map(|frame| frame.retired_loaders.len())
+                    .sum();
                 activity.quiet_since = Instant::now();
             }
             if !state.network_roots.values().any(|r| r == &root) {
@@ -4676,10 +4850,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        assert!(!state.state().unwrap().network["page"]
-            .requests
-            .values()
-            .any(|v| *v));
+        assert_eq!(state.state().unwrap().network["page"].counted_requests(), 0);
         state.network_incomplete("page").unwrap();
         assert_eq!(
             state.wait_network_idle(&page, &op).await.unwrap_err(),

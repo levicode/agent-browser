@@ -1506,3 +1506,139 @@ async fn fixed_read_ack_before_remote_eof_keeps_unknown_but_closes_settled_owner
         }
     }
 }
+
+/// A pending metadata consumer must apply its real queued realm lifecycle before
+/// certifying final closure. Paused decisions and invalid lifecycle stay dirty.
+#[tokio::test]
+async fn fixed_read_remote_eof_terminal_close_drains_queued_realm_metadata() {
+    use crate::native::client_browser::reconnect_tests::{peer, PeerMode};
+    use crate::native::client_protocol::{DISCONNECTED_RECOVERY, EXACT_OWNER_CONTINUATION};
+
+    for case in ["realm", "decision", "invalid-realm"] {
+        let mut original = peer(PeerMode::HoldFixedRead).await;
+        let broker = Arc::new(ClientSession::new());
+        let browser = Arc::new(ClientBrowser::new(broker.clone()));
+        let mut framed = FramedFixture::with_capabilities(
+            broker.clone(),
+            browser.clone(),
+            vec![
+                EXACT_OWNER_CONTINUATION.into(),
+                "terminal.close/1".into(),
+                DISCONNECTED_RECOVERY.into(),
+            ],
+        );
+        framed.ready().await.unwrap();
+        let opened = framed
+            .command(
+                "scope.open",
+                json!({
+                    "source":"connect", "context":"persistent", "endpoint":original.endpoint
+                }),
+                5,
+            )
+            .await
+            .unwrap();
+        let scope = opened["identityScope"].as_str().unwrap().to_owned();
+        framed.scope = Some(scope.clone());
+        framed
+            .command("scope.configure", fixture_configuration(&scope, None), 5)
+            .await
+            .unwrap();
+        framed
+            .command("network.routes.replace", fixture_routes(&scope), 5)
+            .await
+            .unwrap();
+        framed.registry = 1;
+        framed
+            .command("page.activate", json!({"identityScope":scope}), 5)
+            .await
+            .unwrap();
+        let (client, enrollment) = {
+            let owner = browser.owner.lock().await;
+            let owner = owner.as_ref().unwrap();
+            (
+                owner.manager.client.clone(),
+                owner.runtime.as_ref().unwrap().enrollment.clone(),
+            )
+        };
+        let ledger = client.debt_ledger().unwrap();
+        while original.received.try_recv().is_ok() {}
+        let command_start = original.commands.lock().unwrap().len();
+        framed.sequence += 1;
+        let sequence = framed.sequence;
+        framed
+            .write(
+                json!({"type":"request", "id":"environment-queued-eof", "generation":1,
+            "operationSeq":sequence, "timeoutMs":5000, "command":"session.environment",
+            "args":{"identityScope":scope}}),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            bounded(original.received.recv()).await.as_deref(),
+            Some("Browser.getVersion")
+        );
+        let (paused, release) = enrollment.hold_next_event_for_test();
+        original.emit.send(Message::Text(json!({
+            "method":"Runtime.executionContextCreated", "sessionId":"host-session",
+            "params":{"context":{"id":7,"uniqueId":"queued-world","name":"agent-browser-native-observation",
+                "auxData":{"frameId":"frame-host-session","isDefault":false}}}
+        }).to_string())).await.unwrap();
+        bounded(paused).await.unwrap();
+        let queued = if case == "decision" {
+            json!({"method":"Fetch.requestPaused", "sessionId":"host-session", "params":{
+                "requestId":"queued-fetch", "request":{"url":"http://127.0.0.1/queued", "method":"GET", "headers":{}}}})
+        } else {
+            json!({"method":"Runtime.executionContextDestroyed", "sessionId":"host-session", "params":{
+                "executionContextId":7, "executionContextUniqueId":if case == "realm" { "queued-world" } else { "wrong-world" }}})
+        };
+        original
+            .emit
+            .send(Message::Text(queued.to_string()))
+            .await
+            .unwrap();
+        original.emit.send(Message::Close(None)).await.unwrap();
+        bounded(original.task).await.unwrap();
+        let mut callbacks_retired = false;
+        let receipt = eof_recovery_result(
+            &mut framed,
+            "environment-queued-eof",
+            sequence,
+            &mut callbacks_retired,
+        )
+        .await;
+        assert_eq!(receipt["error"]["code"], "browser-failure");
+        assert_eq!(receipt["effects"], "unknown");
+        assert_eq!(receipt["scopeState"], "quarantined");
+        assert_eq!(
+            receipt["recovery"],
+            json!({"version":1,"identityScope":scope})
+        );
+        assert!(receipt.get("retention").is_none());
+        let before = ledger.snapshot();
+        assert_eq!(before.outstanding_commands, 1);
+        assert_eq!(before.input_debt, 0);
+        assert_eq!(before.object_debt, 0);
+        let closing = tokio::spawn(async move { framed.finish().await });
+        bounded(enrollment.wait_retired()).await;
+        release.send(()).unwrap();
+        let cleanup = tokio::time::timeout(Duration::from_secs(7), closing)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cleanup.is_ok(), case == "realm", "{case}: {cleanup:?}");
+        assert_eq!(
+            ledger.snapshot().outstanding_commands,
+            before.outstanding_commands
+        );
+        assert_eq!(ledger.snapshot().input_debt, before.input_debt);
+        assert_eq!(ledger.snapshot().object_debt, before.object_debt);
+        assert!(ledger.snapshot().integrity_lost);
+        assert!(ledger.check_admission(AdmissionClass::FixedRead).is_err());
+        assert_eq!(
+            original.commands.lock().unwrap()[command_start..].len(),
+            1,
+            "no cleanup RPC, mutation or read replay"
+        );
+    }
+}

@@ -970,6 +970,7 @@ mod tests {
             "browser.page/1",
             "browser.page-identity-fence/1",
             "browser.observe/1",
+            "browser.observe-continuation/1",
             "browser.observe-frame-policy/1",
             "browser.issuance-bound-references/1",
             "browser.trace-semantic/1",

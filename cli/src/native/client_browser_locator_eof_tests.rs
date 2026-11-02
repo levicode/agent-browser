@@ -259,7 +259,7 @@ impl LocatorModel {
             self.node(&args[2]["objectId"], 7);
             assert!(self.handles.get(object).unwrap().group.starts_with("native-metadata-"));
             assert_eq!(p["objectGroup"], self.handles.get(object).unwrap().group);
-            json!({"result":{"value":[{"attributes":{},"labels":[],"states":{"secure":false,"hidden":false},"text":"Purchase","rect":{"x":10,"y":20,"width":40,"height":20},"author":{"tag":"button","nodeType":1,"visible":true}}]}})
+            json!({"result":{"value":[{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":false},"text":"Purchase","rect":{"x":10,"y":20,"width":40,"height":20},"author":{"tag":"button","nodeType":1,"visible":true}}]}})
         } else if source.starts_with("function(expression, data, labels, safeNames, secureSelector, protectedAncestors, ...elements)") {
             let args = p["arguments"].as_array().unwrap();
             let expression: crate::native::client_observation::LocatorExpression = serde_json::from_value(purchase_expression()).unwrap();

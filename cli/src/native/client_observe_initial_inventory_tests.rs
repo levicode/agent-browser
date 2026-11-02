@@ -360,6 +360,7 @@ async fn dispatch_stops_before_semantics(race: Race) {
             prepared.context,
             prepared.request,
             prepared.operation,
+            prepared.semantic_operation,
             prepared.capture,
             prepared.trace,
             prepared.retirement_fence,

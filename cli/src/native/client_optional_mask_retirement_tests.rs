@@ -125,10 +125,10 @@ async fn optional_mask_retirement(case: Case) {
                         let values = request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|arg| {
                             let object = arg["objectId"].as_str().unwrap();
                             if object.ends_with("node-1") {
-                                json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
+                                json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}})
                             } else {
                                 assert!(object.ends_with("node-7"));
-                                json!({"attributes":{},"labels":[],"states":{},"rect":{"x":0,"y":0,"width":100,"height":80},"author":{"nodeType":1,"tag":"button","visible":true}})
+                                json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":{"x":0,"y":0,"width":100,"height":80},"author":{"nodeType":1,"tag":"button","visible":true}})
                             }
                         }).collect::<Vec<_>>();
                         json!({"result":{"value":values}})

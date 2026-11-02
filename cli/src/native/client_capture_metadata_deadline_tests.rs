@@ -19,13 +19,40 @@ async fn stalled_metadata_without_fallback_expires_without_screenshot_or_late_tr
     metadata_deadline(false).await;
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FinalPublicationChange {
+    None,
+    Loader,
+    Viewport,
+}
+
+#[tokio::test]
+async fn fallback_final_frame_change_never_publishes_pixels_or_references() {
+    metadata_deadline_case(true, FinalPublicationChange::Loader).await;
+}
+
+#[tokio::test]
+async fn fallback_final_viewport_change_never_publishes_pixels_or_references() {
+    metadata_deadline_case(true, FinalPublicationChange::Viewport).await;
+}
+
 async fn metadata_deadline(fallback: bool) {
+    metadata_deadline_case(fallback, FinalPublicationChange::None).await;
+}
+
+async fn metadata_deadline_case(fallback: bool, final_change: FinalPublicationChange) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let commands = Arc::new(Mutex::new(Vec::<Value>::new()));
     let log = commands.clone();
+    let transport_timing = Arc::new(Mutex::new(
+        Vec::<(Instant, Instant, String, &'static str)>::with_capacity(128),
+    ));
+    let peer_timing = transport_timing.clone();
     let captures = Arc::new(AtomicUsize::new(0));
     let capture_log = captures.clone();
+    let changed = Arc::new(AtomicUsize::new(0));
+    let peer_changed = changed.clone();
     let (stop, mut stopping) = oneshot::channel();
     // Encode the fixture before starting the original 80 ms operation budget.
     let mut bytes = std::io::Cursor::new(Vec::new());
@@ -54,11 +81,14 @@ async fn metadata_deadline(fallback: bool) {
         let mut metadata_replied = false;
         let mut metadata_released_at = None;
         let mut fallback_started = false;
+        let mut animations_restored = false;
+        let mut restored_geometry_read = false;
         loop {
             let message = tokio::select! {
                 _ = &mut stopping => break,
                 message = socket.next() => message.unwrap().unwrap(),
             };
+            let received_at = Instant::now();
             let request: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
             let method = request["method"].as_str().unwrap();
             // A test-owned transport fence after terminal settlement is not an
@@ -76,6 +106,15 @@ async fn metadata_deadline(fallback: bool) {
             assert_eq!(request["sessionId"], "session");
             log.lock().unwrap().push(request.clone());
             let group = request["params"]["objectGroup"].as_str();
+            let phase = if group == Some(peer_metadata_group.as_str()) {
+                "metadata"
+            } else if group == Some(peer_security_group.as_str()) {
+                "security"
+            } else if group.is_some_and(|group| group.starts_with("capture-source-")) {
+                "source-mask"
+            } else {
+                "other"
+            };
             if metadata_replied && metadata_released_at.is_none() {
                 assert_eq!(
                     method, "Runtime.releaseObjectGroup",
@@ -90,10 +129,31 @@ async fn metadata_deadline(fallback: bool) {
             }
             let result = match method {
                 "Page.getFrameTree" => {
-                    json!({"frameTree":{"frame":{"id":"frame","loaderId":"loader","url":"https://fixture.invalid/"}}})
+                    let loader = if restored_geometry_read
+                        && final_change == FinalPublicationChange::Loader
+                    {
+                        peer_changed.fetch_add(1, Ordering::SeqCst);
+                        "replaced-loader"
+                    } else {
+                        "loader"
+                    };
+                    json!({"frameTree":{"frame":{"id":"frame","loaderId":loader,"url":"https://fixture.invalid/"}}})
                 }
                 "Page.getLayoutMetrics" => {
-                    json!({"cssVisualViewport":{"clientWidth":10,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":10,"clientHeight":10}})
+                    let width = if restored_geometry_read
+                        && final_change == FinalPublicationChange::Viewport
+                    {
+                        peer_changed.fetch_add(1, Ordering::SeqCst);
+                        11
+                    } else {
+                        10
+                    };
+                    if animations_restored {
+                        // The first metrics read after restoration belongs to
+                        // geometry revalidation. Change only the final proof.
+                        restored_geometry_read = true;
+                    }
+                    json!({"cssVisualViewport":{"clientWidth":width,"clientHeight":10,"scale":1,"offsetX":0,"offsetY":0},"cssLayoutViewport":{"clientWidth":width,"clientHeight":10}})
                 }
                 "Page.createIsolatedWorld" => json!({"executionContextId":1}),
                 "DOM.getDocument" => {
@@ -227,6 +287,9 @@ async fn metadata_deadline(fallback: bool) {
                         request["params"]["playbackRate"].as_f64(),
                         Some(0.0 | 1.0)
                     ));
+                    if request["params"]["playbackRate"].as_f64() == Some(1.0) {
+                        animations_restored = true;
+                    }
                     json!({})
                 }
                 "DOMSnapshot.captureSnapshot" => {
@@ -259,6 +322,12 @@ async fn metadata_deadline(fallback: bool) {
                 ))
                 .await
                 .unwrap();
+            peer_timing.lock().unwrap().push((
+                received_at,
+                Instant::now(),
+                method.to_owned(),
+                phase,
+            ));
         }
         assert!(
             groups.is_empty(),
@@ -278,6 +347,12 @@ async fn metadata_deadline(fallback: bool) {
     let (mut operation, _cancel) = operation(sequence);
     let started = Instant::now();
     operation.deadline = started + Duration::from_millis(80);
+    if final_change != FinalPublicationChange::None {
+        // New refusal controls need enough time to prove a specific final
+        // identity/viewport rejection. The original two deadline controls keep
+        // their unchanged real 80ms budget and assertions.
+        operation.deadline = started + Duration::from_millis(800);
+    }
     let original_deadline = operation.deadline;
     let (_hold_guard, held) = hold_metadata(&operation);
     let mut task = dispatch.clone().start(
@@ -297,6 +372,7 @@ async fn metadata_deadline(fallback: bool) {
     tokio::time::timeout_at(original_deadline.into(), held.reached())
         .await
         .expect("must reach the actual metadata reply within the original budget");
+    let metadata_held_at = Instant::now();
     assert_eq!(held.metadata_calls(), 1);
     assert_eq!(held.releases(), 0);
     let mut handles = held.handles();
@@ -316,16 +392,93 @@ async fn metadata_deadline(fallback: bool) {
     ));
     // Only the original semantic/parent deadline releases the hold. There is
     // no cancellation, superseding request, injected error, or manual release.
-    let (output, cleanup) = tokio::time::timeout(Duration::from_secs(1), async {
-        tokio::join!(task.result, task.join)
-    })
-    .await
-    .expect("expired metadata must settle without manually releasing it");
+    let ((output, result_at), (cleanup, cleanup_at)) =
+        tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(async { (task.result.await, Instant::now()) }, async {
+                (task.join.await, Instant::now())
+            },)
+        })
+        .await
+        .expect("expired metadata must settle without manually releasing it");
     let completed = Instant::now();
     assert!(matches!(&cleanup, Ok(Ok(()))));
     let (settled, dirty) = settle_observation_dispatch(output, cleanup);
+    if completed >= original_deadline
+        || settled.result.is_err()
+        || std::env::var_os("E2E_METADATA_DEADLINE_TRACE").is_some()
+    {
+        let elapsed = |at: Instant| at.saturating_duration_since(started).as_micros();
+        eprintln!(
+            "metadata-deadline-timing fallback={fallback} held_us={} result_us={} cleanup_us={} completed_us={} parent_us={} result_ok={} dirty={dirty}",
+            elapsed(metadata_held_at),
+            elapsed(result_at),
+            elapsed(cleanup_at),
+            elapsed(completed),
+            elapsed(original_deadline),
+            settled.result.is_ok(),
+        );
+        for (index, (received, replied, method, phase)) in
+            transport_timing.lock().unwrap().iter().enumerate()
+        {
+            eprintln!(
+                "metadata-deadline-cdp index={index} method={method} phase={phase} received_us={} replied_us={}",
+                elapsed(*received),
+                elapsed(*replied),
+            );
+        }
+    }
     assert!(!dirty);
     assert_eq!(held.releases(), 1);
+    if final_change != FinalPublicationChange::None {
+        assert_eq!(
+            settled.result,
+            Err(if final_change == FinalPublicationChange::Loader {
+                ProtocolError::StaleReference
+            } else {
+                ProtocolError::StaleScope
+            })
+        );
+        assert!(changed.load(Ordering::SeqCst) > 0);
+        assert_eq!(captures.load(Ordering::SeqCst), 1);
+        assert!(refs.lock().unwrap().ref_ids().is_empty());
+        assert_eq!(dispatch.publication.lock().await.published_revision, 0);
+        assert_eq!(dispatch.publication.lock().await.observed_revision, 0);
+        let terminal_commands = commands.lock().unwrap().clone();
+        held.release();
+        tokio::task::yield_now().await;
+        client
+            .send_command("Browser.getVersion", None, None)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(*commands.lock().unwrap(), terminal_commands);
+        assert_eq!(held.metadata_calls(), 1);
+        assert_eq!(held.releases(), 1);
+        assert_eq!(client.pending_len().await, 0);
+        assert!(owner.targets.inventory().is_ok());
+        owner.blobs.check_budget_integrity().unwrap();
+        // Two maximum producers fill the default total quota. Any leaked
+        // pixel body or producer charge would prevent the second reservation.
+        let first = owner.blobs.reserve_producer(owner.scope.clone()).unwrap();
+        let second = owner.blobs.reserve_producer(owner.scope.clone()).unwrap();
+        drop((first, second));
+        stop.send(()).unwrap();
+        let (released, source_cycle, _, empty_mask_releases) = server.await.unwrap();
+        let mut released_metadata = released[&metadata_group].clone();
+        released_metadata.sort();
+        assert_eq!(released_metadata, handles);
+        assert_eq!(released.len(), 3);
+        assert_eq!(
+            released[&format!("capture-source-{sequence}-frame")],
+            ["source-holder"]
+        );
+        assert_eq!(empty_mask_releases, 2);
+        assert_eq!(
+            source_cycle,
+            ["holder", "verify", "verify", "remove", "release"]
+        );
+        return;
+    }
     if fallback {
         assert!(
             completed < original_deadline,

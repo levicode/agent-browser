@@ -6451,6 +6451,7 @@ mod tests {
             "page",
             "page-identity-fence",
             "observe",
+            "observe-continuation",
             "observe-frame-policy",
             "issuance-bound-references",
             "trace-semantic",

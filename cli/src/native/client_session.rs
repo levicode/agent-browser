@@ -868,7 +868,17 @@ impl ClientSession {
             .get(token)
             .and_then(|pending| pending.eval_window.as_ref())
         {
-            window.revoke();
+            // Capturing a shared root window grants no child ownership. A
+            // sibling route may settle while another callback still needs it.
+            if inner.operations.values().any(|operation| {
+                operation.callback_token.as_deref() == Some(token)
+                    && operation
+                        .eval_window
+                        .as_ref()
+                        .is_some_and(|issued| issued.same_window(window))
+            }) {
+                window.revoke();
+            }
         }
     }
     pub fn has_started(&self, sequence: u64) -> bool {
@@ -2434,6 +2444,163 @@ mod tests {
                 Some(window.clone()),
             )
             .unwrap()
+    }
+    #[tokio::test]
+    async fn eval_sibling_decision_does_not_revoke_another_live_callback() {
+        for settle_before_issue in [true, false] {
+            let broker = ClientSession::new();
+            let (ledger, root, window, _command) = open_eval_window(&broker).await;
+            let decision = eval_decision(&broker, &window);
+            let sibling = eval_decision(&broker, &window);
+            let competitor = eval_decision(&broker, &window);
+            let sibling_operation = broker
+                .admit_callback(1, 2, 5000, Some(&sibling.token))
+                .unwrap();
+            broker.start(1, 2).unwrap();
+            if settle_before_issue {
+                broker
+                    .resolve(1, &sibling.token, Decision::CancelAuth {})
+                    .unwrap();
+                broker.settle(1, 2, Effects::NotDispatched).unwrap();
+            }
+            let child = broker
+                .admit_callback(1, 3, 5000, Some(&decision.token))
+                .unwrap();
+            broker.start(1, 3).unwrap();
+            let permit = broker.issue_eval_child(&child, "scope").unwrap();
+            if !settle_before_issue {
+                broker
+                    .resolve(1, &sibling.token, Decision::CancelAuth {})
+                    .unwrap();
+                broker.settle(1, 2, Effects::NotDispatched).unwrap();
+            }
+            assert_eq!(
+                *sibling_operation.cancellation.borrow(),
+                CancelSignal::Requested
+            );
+            assert!(ledger.check_eval_input(&permit).is_ok());
+            assert!(child.deadline <= root.deadline);
+            assert!(matches!(
+                broker.admit_callback(1, 4, 5000, Some(&sibling.token)),
+                Err(ProtocolError::DecisionMissing)
+            ));
+            let second = broker
+                .admit_callback(1, 5, 5000, Some(&decision.token))
+                .unwrap();
+            broker.start(1, 5).unwrap();
+            assert!(broker.issue_eval_child(&second, "scope").is_err());
+            broker.settle(1, 5, Effects::NotDispatched).unwrap();
+            let other = broker
+                .admit_callback(1, 6, 5000, Some(&competitor.token))
+                .unwrap();
+            broker.start(1, 6).unwrap();
+            assert!(broker.issue_eval_child(&other, "scope").is_err());
+            assert!(ledger.check_eval_input(&permit).is_ok());
+            assert_eq!(ledger.snapshot().input_debt, 1);
+        }
+    }
+    #[tokio::test]
+    async fn eval_child_settlement_then_owner_decision_and_late_ack_never_reopens() {
+        for mode in ["selected", "revoked", "expired"] {
+            let broker = ClientSession::new();
+            let (ledger, _, window, command) = open_eval_window(&broker).await;
+            let decision = eval_decision(&broker, &window);
+            let sibling = eval_decision(&broker, &window);
+            let child = broker
+                .admit_callback(1, 2, 5000, Some(&decision.token))
+                .unwrap();
+            broker.start(1, 2).unwrap();
+            let permit = broker.issue_eval_child(&child, "scope").unwrap();
+            broker.settle(1, 2, Effects::NotDispatched).unwrap();
+            assert!(!broker.lock().unwrap().operations.contains_key(&2));
+            assert!(window.live_deadline("scope").is_none(), "{mode}");
+            match mode {
+                "selected" => broker
+                    .resolve(1, &decision.token, Decision::CancelAuth {})
+                    .unwrap(),
+                "revoked" => broker.revoke_decision(&decision.token).unwrap(),
+                "expired" => {
+                    broker
+                        .lock()
+                        .unwrap()
+                        .decisions
+                        .get_mut(&decision.token)
+                        .unwrap()
+                        .deadline = Instant::now();
+                    broker.expire_decisions().unwrap();
+                }
+                _ => unreachable!(),
+            }
+            assert!(ledger.check_eval_input(&permit).is_err(), "{mode}");
+            assert!(window.live_deadline("scope").is_none(), "{mode}");
+            assert_eq!(ledger.snapshot().input_debt, 1, "{mode}");
+            command.settle(
+                &serde_json::from_value(serde_json::json!({
+                    "id":1,"sessionId":"session","result":{"result":{"type":"undefined"}}
+                }))
+                .unwrap(),
+            );
+            assert_eq!(ledger.snapshot().input_debt, 0, "{mode}");
+            assert!(window.live_deadline("scope").is_none(), "{mode}");
+            let other = broker
+                .admit_callback(1, 3, 5000, Some(&sibling.token))
+                .unwrap();
+            broker.start(1, 3).unwrap();
+            assert!(broker.issue_eval_child(&other, "scope").is_err(), "{mode}");
+        }
+    }
+    #[tokio::test]
+    async fn eval_child_owner_decision_cancel_and_expiry_still_revoke() {
+        for mode in [
+            "selected",
+            "cancelled",
+            "expired",
+            "timer-expired",
+            "revoked",
+        ] {
+            let broker = ClientSession::new();
+            let (ledger, _, window, _command) = open_eval_window(&broker).await;
+            let decision = eval_decision(&broker, &window);
+            let sibling = eval_decision(&broker, &window);
+            let child = broker
+                .admit_callback(1, 2, 5000, Some(&decision.token))
+                .unwrap();
+            broker.start(1, 2).unwrap();
+            let permit = broker.issue_eval_child(&child, "scope").unwrap();
+            match mode {
+                "selected" => broker
+                    .resolve(1, &decision.token, Decision::CancelAuth {})
+                    .unwrap(),
+                "cancelled" => broker.cancel(1, child.sequence).unwrap(),
+                "expired" | "timer-expired" => {
+                    broker
+                        .lock()
+                        .unwrap()
+                        .decisions
+                        .get_mut(&decision.token)
+                        .unwrap()
+                        .deadline = Instant::now();
+                    if mode == "expired" {
+                        assert_eq!(
+                            broker.resolve(1, &decision.token, Decision::CancelAuth {}),
+                            Err(ProtocolError::DecisionExpired)
+                        );
+                    } else {
+                        broker.expire_decisions().unwrap();
+                    }
+                }
+                "revoked" => broker.revoke_decision(&decision.token).unwrap(),
+                _ => unreachable!(),
+            }
+            assert!(ledger.check_eval_input(&permit).is_err(), "{mode}");
+            assert!(window.live_deadline("scope").is_none(), "{mode}");
+            let other = broker
+                .admit_callback(1, 3, 5000, Some(&sibling.token))
+                .unwrap();
+            broker.start(1, 3).unwrap();
+            assert!(broker.issue_eval_child(&other, "scope").is_err(), "{mode}");
+            assert_eq!(ledger.snapshot().input_debt, 1, "{mode}");
+        }
     }
     #[tokio::test]
     async fn eval_child_requires_exact_started_channel_live_decision_and_owner() {

@@ -1137,6 +1137,13 @@ pub struct ClientEnrollment {
     #[cfg(test)]
     capture_test_gates: Mutex<HashMap<CaptureTestPoint, Arc<CaptureTestGate>>>,
     #[cfg(test)]
+    event_application_pause: Mutex<
+        Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    #[cfg(test)]
     retire_after_initialization_gate_error: AtomicBool,
 }
 type RegistrationResult = InitResult<Option<(Attribution, Option<IframeInitialization>)>>;
@@ -1193,6 +1200,8 @@ impl ClientEnrollment {
             capture_lifecycle: Mutex::new(CaptureLifecycleTrace::default()),
             #[cfg(test)]
             capture_test_gates: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            event_application_pause: Mutex::new(None),
             #[cfg(test)]
             retire_after_initialization_gate_error: AtomicBool::new(false),
         })
@@ -2932,6 +2941,20 @@ impl ClientEnrollment {
         drained?;
         self.check_capture_snapshot_locked(&index, watermark, snapshot, op)?;
         result
+    }
+    #[cfg(test)]
+    pub(crate) fn hold_next_event_for_test(
+        &self,
+    ) -> (
+        tokio::sync::oneshot::Receiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = tokio::sync::oneshot::channel();
+        let mut slot = self.event_application_pause.lock().unwrap();
+        assert!(slot.is_none());
+        *slot = Some((entered, released));
+        (waiting, release)
     }
     #[cfg(test)]
     async fn pause_capture_at(
@@ -6307,18 +6330,29 @@ impl ClientEnrollment {
                 biased;
                 _ = async { drop(stop.wait_for(|signal| *signal != CancelSignal::None).await); } => {
                     if *self.client.remote_connection_closed().borrow() {
-                        // A lifecycle stop may race delivery of native EOF. Drain
-                        // the already bounded dead-connection queue only to learn
-                        // its terminal status; overflow must never become EOF.
+                        // A lifecycle stop may race delivery of native EOF.
+                        // Apply queued realm facts before advancing their exact
+                        // watermark. Other work cannot be certified by EOF.
                         let end = loop {
                             match events.recv().await {
-                                Ok(event) => drop(event),
-                                Err(error) => break error,
+                                Ok(event) => {
+                                    if !matches!(event.method.as_str(),
+                                        "Runtime.executionContextCreated"
+                                        | "Runtime.executionContextDestroyed"
+                                        | "Runtime.executionContextsCleared") {
+                                        break Err(ProtocolError::CleanupFailed);
+                                    }
+                                    let sequence = event.sequence();
+                                    if let Err(error) = self.event_internal(&event, Some(event.budget_lease()), Some(sequence))
+                                        .and_then(|()| self.mark_event_applied(sequence)) {
+                                        break Err(error);
+                                    }
+                                },
+                                Err("control event stream closed") => break Ok(()),
+                                Err(_) => break Err(ProtocolError::CapacityExceeded),
                             }
                         };
-                        if end != "control event stream closed" {
-                            break Err(ProtocolError::CapacityExceeded);
-                        }
+                        if let Err(error) = end { break Err(error); }
                         match self.terminal_connection_proof() {
                             Ok(proof) => terminal = Some(proof),
                             Err(ProtocolError::StaleScope) => match events.terminal_received().map_err(|_| ProtocolError::ScopeUnavailable)
@@ -6354,6 +6388,16 @@ impl ClientEnrollment {
                     let sequence=event.sequence();
                     #[cfg(test)]
                     self.trace_capture_event(&event, sequence);
+                    #[cfg(test)]
+                    {
+                        // Scheduling only: the real reader, EOF and owner stop
+                        // continue while this consumer is not being polled.
+                        let pause = self.event_application_pause.lock().unwrap().take();
+                        if let Some((entered, release)) = pause {
+                            let _ = entered.send(());
+                            if release.await.is_err() { break Err(ProtocolError::CleanupFailed); }
+                        }
+                    }
                     #[cfg(test)]
                     if let Err(error) = self.pause_capture_at(CaptureTestPoint::BeforeEventApply, &self.operation()).await { break Err(error); }
                     if event.method == "Target.attachedToTarget" {
@@ -7913,6 +7957,15 @@ impl ClientEnrollment {
             );
         }
         drop(index);
+        if !is_child_session && entry.application && !entry.observation_only {
+            self.page.record_network_frame(
+                &entry.root,
+                &entry.session,
+                id,
+                frame.get("loaderId").and_then(Value::as_str),
+                new_document,
+            )?;
+        }
         if let Some(url) = frame
             .get("url")
             .and_then(Value::as_str)
@@ -8243,6 +8296,11 @@ impl ClientEnrollment {
         match event.method.as_str() {
             "Page.frameAttached" => {
                 self.bump_application_epoch()?;
+                let frame = field(&event.params, "frameId")?;
+                // This only restores counting of retained requests. Parent
+                // discovery may lag Page.enable; it grants no frame authority.
+                self.page
+                    .reset_network_frame(&entry.root, &entry.session, frame)?;
             }
             "Page.frameNavigated" => {
                 self.bump_application_epoch()?;
@@ -9742,6 +9800,7 @@ mod tests {
     include!("client_popup_preparation_tests.rs");
     include!("client_popup_interposition_test_helpers.rs");
     include!("client_popup_configuration_proof_stop_tests.rs");
+    include!("client_network_document_idle_tests.rs");
 
     // Reconstruction: test-only schedules use real configured/permit boundaries.
     impl ClientEnrollment {

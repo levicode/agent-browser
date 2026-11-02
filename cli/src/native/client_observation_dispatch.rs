@@ -678,6 +678,7 @@ pub(crate) struct PreparedDispatch {
     context: DispatchContext,
     request: DispatchRequest,
     operation: OperationLease,
+    semantic_operation: OperationLease,
     capture: Option<Arc<CaptureAdmission>>,
     trace: Option<TraceFence>,
     screenshot: Option<ScreenshotFailureWitness>,
@@ -1036,11 +1037,15 @@ impl ObservationDispatch {
         };
         screenshot_stage(screenshot, ScreenshotStage::PrepareFence);
         self.check_publication_fence(retirement_fence)?;
+        // Fix the reader cutoff once before queued/frame work can reduce its
+        // fallback reserve. That work keeps the original parent lease.
+        let semantic_operation = prepared_semantic_lease_at(&request, &operation, Instant::now());
         Ok(PreparedDispatch {
             retirement_fence,
             context,
             request,
             operation,
+            semantic_operation,
             capture,
             trace,
             screenshot: None,
@@ -1080,6 +1085,7 @@ impl ObservationDispatch {
             context,
             request,
             operation,
+            semantic_operation,
             capture,
             trace,
             screenshot,
@@ -1112,6 +1118,7 @@ impl ObservationDispatch {
                 context,
                 request,
                 operation,
+                semantic_operation,
                 capture,
                 trace,
                 retirement_fence,
@@ -2096,6 +2103,7 @@ impl ObservationDispatch {
         context: DispatchContext,
         request: DispatchRequest,
         operation: OperationLease,
+        semantic_operation: OperationLease,
         capture: Option<Arc<CaptureAdmission>>,
         trace: Option<TraceFence>,
         retirement_fence: u64,
@@ -2632,7 +2640,7 @@ impl ObservationDispatch {
                     witness.enter(ObserveFailureStage::Viewport);
                     screenshot_stage(screenshot, ScreenshotStage::SemanticViewport);
                     let observed_viewport = viewport(&capture_context.page, &operation).await?;
-                    let semantic = semantic_lease(&operation, request.options.pixel_fallback);
+                    let semantic = semantic_operation;
                     #[cfg(test)]
                     witness.enter(ObserveFailureStage::SemanticRead);
                     screenshot_stage(screenshot, ScreenshotStage::SemanticMetadata);
@@ -2774,6 +2782,7 @@ impl ObservationDispatch {
         // A clean restore must not turn a policy failure into a timeout and
         // thereby accidentally authorize fallback at a higher layer.
         let (mut value, mut pixels, fallback_cause) = result.map_err(failure)?;
+        let mut fallback_final_frames = None;
         #[cfg(test)]
         witness.enter(ObserveFailureStage::FinalProof);
         screenshot_stage(screenshot, ScreenshotStage::FinalGeometry);
@@ -2817,7 +2826,7 @@ impl ObservationDispatch {
                 producer = Some(context.blobs.reserve_bounded_producer(context.scope.clone(), client_capture::MAX_PNG_BYTES.min(context.blobs.producer_limit()))
                     .map_err(|error| failure(blob_error(error)))?);
             }
-            let (fresh_value, fresh_pixels, fresh_journal) = fresh_fallback(
+            let (fresh_value, fresh_pixels, fresh_journal, fresh_final_frames) = fresh_fallback(
                 &capture_context,
                 selector,
                 &mut staged,
@@ -2829,6 +2838,8 @@ impl ObservationDispatch {
             value = fresh_value;
             pixels = Some(fresh_pixels);
             journal = Some(fresh_journal);
+            observation_cleanup.fetch_or(fresh_final_frames.cleanup_integrity_lost, Ordering::SeqCst);
+            fallback_final_frames = Some(fresh_final_frames.frames);
         }
         screenshot_stage(screenshot, ScreenshotStage::FinalBarrier);
         if let Some(journal) = &journal {
@@ -2837,7 +2848,12 @@ impl ObservationDispatch {
         screenshot_stage(screenshot, ScreenshotStage::FinalScope);
         check(&capture_context.page, &operation).map_err(failure)?;
         screenshot_stage(screenshot, ScreenshotStage::FinalFrames);
-        let final_frames = if is_observe {
+        let final_frames = if let Some(frames) = fallback_final_frames {
+            // Fresh fallback already sampled exact frames after restoration.
+            // Its global barrier was just checked without suspension; this is
+            // the same final publication boundary, before the viewport read.
+            Ok(frames)
+        } else if is_observe {
             verified_semantic_frames_with_cleanup(&capture_context.page, &operation, Some(&observation_cleanup), screenshot).await
         } else {
             query_frames(&capture_context.page, &operation, Some(&observation_cleanup), screenshot, query_partition.as_ref().map(|proof| proof.diagnostic_phase(diagnostic::QueryScopeStage::FinalFrames)).as_ref()).await
@@ -3062,6 +3078,13 @@ impl SemanticDeadline {
     }
 }
 
+// Exact post-restoration sample for the immediately following publication tail.
+// Its global journal remains live; consume it before the final viewport read.
+struct FallbackFinalFrames {
+    frames: Vec<ObservationFrame>,
+    cleanup_integrity_lost: bool,
+}
+
 enum FallbackFailure {
     Protocol(ProtocolError),
     Capture(CaptureAttemptFailure),
@@ -3102,6 +3125,7 @@ async fn fresh_fallback<'a>(
         Value,
         super::client_capture::MaskedCapture,
         ProtectedReadJournal<'a>,
+        FallbackFinalFrames,
     ),
     DispatchFailure,
 > {
@@ -3190,17 +3214,20 @@ async fn fresh_fallback<'a>(
         .check()
         .map_err(|error| failure(protected_error(error)))?;
     check(&context.page, operation).map_err(failure)?;
-    same_frames(
-        &context.frames,
-        &verified_frames_with_cleanup(&context.page, operation, Some(&observation_cleanup))
+    let final_frames =
+        verified_frames_with_cleanup(&context.page, operation, Some(&observation_cleanup))
             .await
-            .map_err(failure)?,
-    )
-    .map_err(failure)?;
-    if viewport(&context.page, operation).await.map_err(failure)? != value["viewport"] {
-        return Err(failure(ProtocolError::StaleScope));
-    }
-    Ok((value, pixels, journal))
+            .map_err(failure)?;
+    same_frames(&context.frames, &final_frames).map_err(failure)?;
+    Ok((
+        value,
+        pixels,
+        journal,
+        FallbackFinalFrames {
+            frames: final_frames,
+            cleanup_integrity_lost: observation_cleanup.load(Ordering::SeqCst),
+        },
+    ))
 }
 
 fn validate_policy(policy: &ReadPolicy, request: &DispatchRequest) -> Result<(), ProtocolError> {
@@ -4337,6 +4364,17 @@ fn pixel_lease(operation: &OperationLease) -> OperationLease {
 fn semantic_lease(operation: &OperationLease, fallback: bool) -> OperationLease {
     semantic_lease_at(operation, fallback, Instant::now())
 }
+fn prepared_semantic_lease_at(
+    request: &DispatchRequest,
+    operation: &OperationLease,
+    now: Instant,
+) -> OperationLease {
+    semantic_lease_at(
+        operation,
+        matches!(request, DispatchRequest::Observe(request) if request.options.pixel_fallback),
+        now,
+    )
+}
 fn semantic_lease_at(operation: &OperationLease, fallback: bool, now: Instant) -> OperationLease {
     let remaining = operation.deadline.saturating_duration_since(now);
     let reserve = if fallback {
@@ -5228,6 +5266,7 @@ mod tests {
                     prepared.context,
                     prepared.request,
                     prepared.operation,
+                    prepared.semantic_operation,
                     prepared.capture,
                     prepared.trace,
                     prepared.retirement_fence,
@@ -6849,7 +6888,7 @@ mod tests {
                         } else if declaration.starts_with("function(expression") {
                             json!({"result":{"value":{"indices":[0],"redacted":[]}}})
                         } else if declaration.contains("const read=") {
-                            json!({"result":{"value":[{"attributes":{},"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]}})
+                            json!({"result":{"value":[{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":true},"text":"","rect":{"x":999,"y":999,"width":0,"height":0}}]}})
                         } else if declaration.contains("frameOwner") {
                             json!({"result":{"value":{"connected":true,"frameOwner":false}}})
                         } else {
@@ -6999,8 +7038,8 @@ mod tests {
                         } else if declaration.contains("const read=") {
                             let values = request["params"]["arguments"].as_array().unwrap().iter().skip(2).map(|argument| {
                                 match argument["objectId"].as_str().unwrap() {
-                                    "node-1" => json!({"attributes":{},"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}}),
-                                    "node-7" => json!({"attributes":{},"labels":[],"states":{"hidden":true},"rect":null,"author":{"nodeType":1,"tag":"iframe","visible":false}}),
+                                    "node-1" => json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{},"rect":null,"author":{"nodeType":9,"visible":true}}),
+                                    "node-7" => json!({"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"hidden":true},"rect":null,"author":{"nodeType":1,"tag":"iframe","visible":false}}),
                                     _ => panic!("unknown exact metadata receiver"),
                                 }
                             }).collect::<Vec<_>>();
@@ -7008,7 +7047,7 @@ mod tests {
                         } else if declaration
                             .starts_with("function(testId,secureSelector,boundedObservation")
                         {
-                            json!({"result":{"value":{"attributes":{},"labels":[],"states":{"hidden":true},"rect":null,"author":{"nodeType":1,"tag":"iframe","visible":false}}}})
+                            json!({"result":{"value":{"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"hidden":true},"rect":null,"author":{"nodeType":1,"tag":"iframe","visible":false}}}})
                         } else if declaration.contains("frameOwner") {
                             json!({"result":{"value":{"connected":true,"frameOwner":false}}})
                         } else {
@@ -7207,6 +7246,52 @@ mod tests {
         let expired = optional_observe_lease_at(&parent, now + Duration::from_millis(81));
         assert_eq!(expired.deadline, parent.deadline);
         assert_eq!(parent.deadline, now + Duration::from_millis(80));
+    }
+    #[test]
+    fn prepared_semantic_cutoff_is_not_reminted_after_initial_work() {
+        let now = Instant::now();
+        let mut parent = operation();
+        parent.deadline = now + Duration::from_millis(80);
+        let mut request = DispatchRequest::Observe(ObserveRequest {
+            continuation: Some(
+                crate::native::client_protocol::ObserveContinuationDescriptor {
+                    version: 1,
+                    token: "prepared-semantic-budget".into(),
+                    retired_operation_seq: parent.sequence - 1,
+                },
+            ),
+            options: ObserveFlags {
+                pixels: false,
+                pixel_fallback: true,
+                comparable: false,
+            },
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password]".into(),
+        });
+        let prepared = prepared_semantic_lease_at(&request, &parent, now);
+        let after_initial_work = now + Duration::from_millis(16);
+        let late = prepared_semantic_lease_at(&request, &parent, after_initial_work);
+        assert_eq!(prepared.deadline, now + Duration::from_millis(60));
+        assert_eq!(late.deadline, now + Duration::from_millis(64));
+        let reader = prepared;
+        assert_eq!(reader.deadline, now + Duration::from_millis(60));
+        assert!(reader.deadline < now + Duration::from_millis(70));
+        assert_eq!(reader.generation, parent.generation);
+        assert_eq!(reader.sequence, parent.sequence);
+        assert_eq!(reader.is_callback, parent.is_callback);
+        assert!(reader.cancellation.same_channel(&parent.cancellation));
+        assert_eq!(parent.deadline, now + Duration::from_millis(80));
+        if let DispatchRequest::Observe(request) = &mut request {
+            request.options.pixel_fallback = false;
+        }
+        assert_eq!(
+            prepared_semantic_lease_at(&request, &parent, now).deadline,
+            parent.deadline
+        );
+        assert_eq!(
+            prepared_semantic_lease_at(&diagnostic_trace(), &parent, now).deadline,
+            parent.deadline
+        );
     }
     #[test]
     fn fallback_reserves_bounded_time_without_resetting_parent_deadline() {

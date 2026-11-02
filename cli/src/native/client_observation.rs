@@ -1231,12 +1231,12 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
    }
  }
  const labelledSecure=labelNodes.some(n=>Element.prototype.querySelector.call(n,secureSelectorAll));
- let safePublicName=null;
+ let safePublicName=null,safePublicNameFromContent=false;
  if(e&&!secure&&(secureDescendants||labelledSecure)){
    if(referenced.length){const values=referenced.map(node=>safeLabelText(node));if(values.every(s=>s!==null))safePublicName=normalize(values.join(' '));}
    else if(e.hasAttribute('aria-label'))safePublicName=normalize(e.getAttribute('aria-label'));
    else if(labelNodes.length&&labelTexts.every(s=>s!==null))safePublicName=normalize(labelTexts.join(' '));
-   else if(secureDescendants)safePublicName=safeLabelText(e);
+   else if(secureDescendants){safePublicName=safeLabelText(e);safePublicNameFromContent=true;}
  }
  let selector=null;if(e&&e.id)selector='#'+CSS.escape(e.id);else if(e&&e.hasAttribute(testId))selector='['+CSS.escape(testId)+'='+JSON.stringify(e.getAttribute(testId))+']';
  const secureText=secure&&(!e||!Element.prototype.matches.call(e,'input,textarea,select'));
@@ -1400,7 +1400,7 @@ const METADATA: &str = r#"function(testId,secureSelector,boundedObservation=fals
  if(nativeOption)controlStates.selected=e.selected;
  else if(e&&e.getAttribute('aria-selected')!==null)controlStates.selected=e.getAttribute('aria-selected').toLowerCase()==='true';
  const author={tag,nodeType:this.nodeType,inline,breaking,action,suppress,skipsContent:!!style&&style.contentVisibility==='hidden',lineVisible:tag==='slot'?style.visibility==='visible':null,visible:this.nodeType===9||textVisible||!!e&&!hidden,text:authorText};
- return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,completePublicButtonNameFact,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
+ return {author,presentationConflict,decorativeImage,selectListbox,inputDatalist,conflictHeaderRole,controlStates,directCaptionName,editorPlaceholder,restrictedSvgLinkName,pageLevelLandmark,cellTableRole,formOwnName,singleCellHeader,completeContentNameFact,completeButtonContentName,completePublicButtonNameFact,simpleAssociatedName,completeEmptyReference,handlerProbe:boundedObservation&&!!e&&e instanceof HTMLElement&&!action&&inline&&!breaking&&!suppress&&(tag==='slot'?style.visibility==='visible':!hidden),editingHost,selector,safePublicName,safePublicNameFromContent,redactName:secureText||unsafeLabel,labels:secureText||unsafeLabel?[]:labels,secureDescendants,attributes:attrs,text:secure||boundedObservation||protectedEditor?null:safeText(this),
  value:secure||(boundedObservation&&checkable)?null:nativeValueControl?e.value:editingHost?editorValue:null,selection, inputPurpose:purpose,
  testId:e?e.getAttribute(testId):null, states:{secure,hidden,focused,disabled:!!e&&(Element.prototype.matches.call(e,':disabled')||e.getAttribute('aria-disabled')==='true')},
  rect:r?{x:r.x,y:r.y,width:r.width,height:r.height}:null};
@@ -2027,10 +2027,20 @@ fn project_node_with_refs(
             node.name = Some(fact.name);
         }
     }
-    node.safe_public_name = data["safePublicName"]
-        .as_str()
-        .filter(|v| !v.is_empty())
-        .map(str::to_owned);
+    let safe_name_from_content = match data.get("safePublicNameFromContent") {
+        Some(Value::Bool(value)) => *value,
+        _ => return Err(ObservationError::BackendFailure),
+    };
+    // Cleaning descendant text does not authorize a content name for main.
+    // Clear the shared safe name so queries and ancestor scrubbing agree.
+    node.safe_public_name = if safe_name_from_content && node.role.as_deref() == Some("main") {
+        None
+    } else {
+        data["safePublicName"]
+            .as_str()
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+    };
     if data["secureDescendants"] == true
         || data["redactName"] == true
         || node.safe_public_name.is_some()
@@ -4001,7 +4011,7 @@ fn readonly_pseudo_metadata(data: &Value, ax: &AXNode) -> Value {
     let protected = data["states"]["secure"] == true
         || data["secureDescendants"] == true
         || data["redactName"] == true;
-    json!({"author":{"visible":true},"__nativeReadonlyPseudo":true,"redactName":protected,"secureDescendants":data["secureDescendants"],"labels":[],"attributes":{},"states":{"secure":data["states"]["secure"]==true,"hidden":data["states"]["hidden"]==true,"disabled":true},"text":if protected{None}else{ax_string(&ax.name)},"rect":null})
+    json!({"author":{"visible":true},"__nativeReadonlyPseudo":true,"redactName":protected,"secureDescendants":data["secureDescendants"],"safePublicNameFromContent":false,"labels":[],"attributes":{},"states":{"secure":data["states"]["secure"]==true,"hidden":data["states"]["hidden"]==true,"disabled":true},"text":if protected{None}else{ax_string(&ax.name)},"rect":null})
 }
 
 // A CSS pseudo keeps its own native identity, but metadata executes against
@@ -10000,7 +10010,7 @@ mod tests {
         serde_json::from_value(json!({"nodeId":id,"backendDOMNodeId":backend,"role":{"type":"role","value":"button"},"name":{"type":"string","value":"Save"},"childIds":children})).unwrap()
     }
     fn metadata() -> Value {
-        json!({"author":{"tag":"button","action":true,"visible":true},"attributes":{},"labels":[],"states":{"secure":false,"hidden":false},"text":"Save","rect":{"x":1,"y":2,"width":3,"height":4}})
+        json!({"author":{"tag":"button","action":true,"visible":true},"attributes":{},"safePublicNameFromContent":false,"labels":[],"states":{"secure":false,"hidden":false},"text":"Save","rect":{"x":1,"y":2,"width":3,"height":4}})
     }
     async fn mock_client(fail_after_metadata: bool) -> (CdpClient, tokio::task::JoinHandle<()>) {
         use futures_util::{SinkExt, StreamExt};
@@ -11448,6 +11458,75 @@ mod tests {
         scrub_ancestor_content(&mut unproved);
         assert!(unproved.name.is_none());
     }
+    #[test]
+    fn secure_main_content_fallback_never_becomes_a_public_name() {
+        for (role, from_content, expected) in [
+            ("main", true, None),
+            ("main", false, Some("Unlock now")),
+            ("button", true, Some("Unlock now")),
+            ("heading", true, Some("Unlock now")),
+        ] {
+            let mut data = metadata();
+            data["attributes"]["role"] = json!(role);
+            if !from_content {
+                data["attributes"]["aria-label"] = json!("Unlock now");
+            }
+            data["safePublicName"] = json!("Unlock now");
+            data["safePublicNameFromContent"] = json!(from_content);
+            data["secureDescendants"] = json!(true);
+            let mut node = project_node(
+                &frame(),
+                2,
+                &ax("synthetic-secret", 2, &[]),
+                &mut observed_refs(),
+                1,
+                &data,
+                false,
+            )
+            .unwrap();
+            assert_eq!(node.name.as_deref(), expected);
+            assert_eq!(node.safe_public_name.as_deref(), expected);
+            let matching = query_match_metadata(&[node.clone()]).unwrap();
+            assert_eq!(matching[0]["name"].as_str(), expected);
+            scrub_ancestor_content(&mut node);
+            assert_eq!(node.name.as_deref(), expected);
+            assert!(!serde_json::to_string(&node)
+                .unwrap()
+                .contains("synthetic-secret"));
+        }
+    }
+
+    #[test]
+    fn secure_name_content_source_rejects_malformed_facts() {
+        for source in [
+            None,
+            Some(Value::Null),
+            Some(json!("true")),
+            Some(json!(1)),
+            Some(json!({})),
+        ] {
+            let mut data = metadata();
+            data["safePublicName"] = json!("Unlock now");
+            if let Some(source) = source {
+                data["safePublicNameFromContent"] = source;
+            } else {
+                data.as_object_mut()
+                    .unwrap()
+                    .remove("safePublicNameFromContent");
+            }
+            assert!(project_node(
+                &frame(),
+                2,
+                &ax("synthetic-secret", 2, &[]),
+                &mut observed_refs(),
+                1,
+                &data,
+                false,
+            )
+            .is_err());
+        }
+    }
+
     #[test]
     fn secure_inventory_keeps_public_password_labels_without_value() {
         let mut data = metadata();
