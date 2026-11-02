@@ -568,8 +568,11 @@ impl ReadonlyGroupCapture {
     pub(crate) fn new(name: &str) -> Self {
         Self { name: name.to_owned(), state: Arc::new(Mutex::new(ReadonlyGroupCaptureState::default())) }
     }
-    pub(crate) async fn scope<F: Future>(&self, future: F) -> F::Output {
-        READONLY_GROUP_CAPTURE.scope(self.clone(), future).await
+    pub(crate) fn scope<'a, F: Future + 'a>(
+        &'a self,
+        future: F,
+    ) -> impl Future<Output = F::Output> + 'a {
+        READONLY_GROUP_CAPTURE.scope(self.clone(), future)
     }
 }
 
@@ -6313,6 +6316,53 @@ pub(crate) mod tests {
         assert_eq!(state.targets.get("page").map(String::as_str), Some("target"));
         assert!(!state.targets.contains_key("child-session"));
         assert!(!state.retired);
+    }
+
+    #[test]
+    fn readonly_capture_scope_does_not_duplicate_large_future_storage() {
+        struct LargeFuture([u8; 64 * 1024]);
+        impl Future for LargeFuture {
+            type Output = ();
+            fn poll(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::hint::black_box(&self.0);
+                std::task::Poll::Pending
+            }
+        }
+        let capture = ReadonlyGroupCapture::new("native-query-layout");
+        let direct = READONLY_GROUP_CAPTURE.scope(capture.clone(), LargeFuture([0; 64 * 1024]));
+        let wrapped = capture.scope(LargeFuture([0; 64 * 1024]));
+        assert_eq!(std::mem::size_of_val(&wrapped), std::mem::size_of_val(&direct));
+    }
+
+    #[tokio::test]
+    async fn readonly_capture_scope_is_poll_local_and_cancellation_preserves_custody() {
+        let capture = ReadonlyGroupCapture::new("native-query-layout");
+        let observed = Arc::new(AtomicBool::new(false));
+        assert!(READONLY_GROUP_CAPTURE.try_with(|_| ()).is_err());
+        {
+            let future = std::future::poll_fn(|_| {
+                READONLY_GROUP_CAPTURE.with(|active| {
+                    assert!(Arc::ptr_eq(&active.state, &capture.state));
+                    assert_eq!(active.name, capture.name);
+                });
+                observed.store(true, Ordering::SeqCst);
+                std::task::Poll::<()>::Pending
+            });
+            let scoped = capture.scope(future);
+            assert!(!observed.load(Ordering::SeqCst));
+            assert!(READONLY_GROUP_CAPTURE.try_with(|_| ()).is_err());
+            tokio::pin!(scoped);
+            assert!(futures_util::poll!(&mut scoped).is_pending());
+            assert!(observed.load(Ordering::SeqCst));
+            assert!(READONLY_GROUP_CAPTURE.try_with(|_| ()).is_err());
+        }
+        assert!(READONLY_GROUP_CAPTURE.try_with(|_| ()).is_err());
+        let state = capture.state.lock().unwrap();
+        assert!(state.bound.is_none());
+        assert!(!state.consumed);
     }
 
     async fn readonly_capture_fixture() -> (Arc<OwnerDebtLedger>, OperationJournalHandle, ReadonlyGroupCapture) {
