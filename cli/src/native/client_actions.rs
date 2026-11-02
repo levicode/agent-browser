@@ -6210,7 +6210,7 @@ mod tests {
                         {
                             let count =
                                 request["params"]["arguments"].as_array().unwrap().len() - 2;
-                            let metadata = json!({"author":{"tag":"button","nodeType":1,"action":true,"visible":true},"attributes":{},"labels":[query_name],"states":{"secure":false,"hidden":false},"text":query_text,"value":query_name,"rect":{"x":0,"y":0,"width":100,"height":50}});
+                            let metadata = json!({"author":{"tag":"button","nodeType":1,"action":true,"visible":true},"attributes":{},"safePublicNameFromContent":false,"labels":[query_name],"states":{"secure":false,"hidden":false},"text":query_text,"value":query_name,"rect":{"x":0,"y":0,"width":100,"height":50}});
                             let mut batch = vec![metadata; count];
                             if mode == "strict-query-output-filter"
                                 && query_reads == 0

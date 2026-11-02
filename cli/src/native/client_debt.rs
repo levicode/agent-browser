@@ -4283,6 +4283,7 @@ impl Drop for CommandReservation {
                     }
                 }
                 let removed = remove_command(&mut state, self.id);
+                let abandoned_here = removed.is_some();
                 if let Some(id) = removed.and_then(|command| command.group_id) {
                     if state
                         .groups
@@ -4294,7 +4295,12 @@ impl Drop for CommandReservation {
                         }
                     }
                 }
-                self.status.set(CommandStatus::Abandoned);
+                // Only this Drop's actual removal proves abandonment. An exact
+                // destruction can already have removed the same unsent command;
+                // do not overwrite that terminal receipt with Abandoned.
+                if abandoned_here {
+                    self.status.set(CommandStatus::Abandoned);
+                }
             }
         }
     }
@@ -6641,6 +6647,62 @@ pub(crate) mod tests {
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
         assert_eq!(ledger.snapshot().object_debt, 1);
         assert!(!ledger.snapshot().integrity_lost);
+    }
+
+    #[test]
+    fn dropping_unsubmitted_reservation_preserves_actual_abandonment_status() {
+        let (ledger, journal) = owner();
+        let reservation = ledger.reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page")).unwrap();
+        let status = reservation.status();
+        assert_eq!(status.snapshot(), CommandStatus::Reserved);
+        drop(reservation);
+        assert_eq!(status.snapshot(), CommandStatus::Abandoned);
+        assert_eq!(ledger.snapshot().outstanding_commands, 0);
+    }
+    #[test]
+    fn dropping_already_destroyed_unsent_reservation_preserves_exact_terminal_receipt() {
+        let (ledger, journal) = owner();
+        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
+        let reservation = ledger.reserve_command(Some(&journal), "DOM.resolveNode",
+            Some(&json!({"backendNodeId":42,"executionContextId":9})), Some("page")).unwrap();
+        let status = reservation.status();
+        destroy_readonly_fixture_realm(&ledger);
+        assert_eq!(status.snapshot(), CommandStatus::Destroyed);
+        let before = ledger.snapshot();
+        drop(reservation);
+        assert_eq!(status.snapshot(), CommandStatus::Destroyed);
+        assert_eq!(ledger.snapshot(), before);
+    }
+
+    #[test]
+    fn dropping_old_destroyed_reservation_never_changes_new_command_or_its_status() {
+        let (ledger, journal) = owner();
+        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
+        let old = ledger.reserve_command(Some(&journal), "DOM.resolveNode",
+            Some(&json!({"backendNodeId":42,"executionContextId":9})), Some("page")).unwrap();
+        let old_status = old.status();
+        destroy_readonly_fixture_realm(&ledger);
+        let fresh = ledger.reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page")).unwrap();
+        let fresh_status = fresh.status();
+        let before = ledger.snapshot();
+        drop(old);
+        assert_eq!(old_status.snapshot(), CommandStatus::Destroyed);
+        assert_eq!(fresh_status.snapshot(), CommandStatus::Reserved);
+        assert_eq!(ledger.snapshot(), before);
+        drop(fresh);
+        assert_eq!(fresh_status.snapshot(), CommandStatus::Abandoned);
+    }
+    #[test]
+    fn dropping_missing_unsent_command_cannot_fabricate_a_terminal_receipt() {
+        let (ledger, journal) = owner();
+        let reservation = ledger.reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page")).unwrap();
+        let status = reservation.status();
+        // Synthetic abnormal absence, not a destruction event or abandonment.
+        remove_command(&mut ledger.state.lock().unwrap(), reservation.id).unwrap();
+        drop(reservation);
+        assert_eq!(status.snapshot(), CommandStatus::Reserved);
     }
 
     #[test]
