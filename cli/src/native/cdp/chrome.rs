@@ -13,6 +13,8 @@ use super::discovery::discover_cdp_url;
 use crate::ca_bundle::CaBundle;
 
 pub struct ChromeProcess {
+    #[cfg(all(feature = "acceptance-faults", target_os = "linux"))]
+    popup_relay: Option<super::popup_relay::RelayGuard>,
     child: Child,
     pub ws_url: String,
     temp_user_data_dir: Option<PathBuf>,
@@ -924,7 +926,9 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         Some(pid)
     };
 
-    Ok(ChromeProcess {
+    let process = ChromeProcess {
+        #[cfg(all(feature = "acceptance-faults", target_os = "linux"))]
+        popup_relay: None,
         child,
         ws_url,
         temp_user_data_dir,
@@ -933,7 +937,17 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         pgid,
         #[cfg(target_os = "linux")]
         xvfb,
-    })
+    };
+    #[cfg(all(feature = "acceptance-faults", target_os = "linux"))]
+    let process = {
+        let mut process = process;
+        if let Some((endpoint, relay)) = super::popup_relay::start(&process.ws_url)? {
+            process.ws_url = endpoint;
+            process.popup_relay = Some(relay);
+        }
+        process
+    };
+    Ok(process)
 }
 
 fn wait_for_devtools_active_port(
@@ -2509,6 +2523,8 @@ exec sleep 60
             // logic by creating a small helper process.
             let child = spawn_noop_child();
             let _process = ChromeProcess {
+                #[cfg(all(feature = "acceptance-faults", target_os = "linux"))]
+                popup_relay: None,
                 child,
                 ws_url: String::new(),
                 temp_user_data_dir: Some(dir.clone()),

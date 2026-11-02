@@ -972,6 +972,16 @@ fn isolated_client_env_allowed(key: &str) -> bool {
                 | "AGENT_BROWSER_INVOCATION_CUSTODY"
         )
         || (cfg!(feature = "acceptance-faults") && key == "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE")
+        // Only the Linux acceptance binary may transport the four reviewed
+        // managed-popup relay inputs to its own daemon. Never allow a prefix.
+        || (cfg!(all(feature = "acceptance-faults", target_os = "linux"))
+            && matches!(
+                key,
+                "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_SCRIPT"
+                    | "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_SCRIPT_SHA256"
+                    | "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_PYTHON"
+                    | "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_EVIDENCE"
+            ))
 }
 
 /// New opt-in protocol mode never reuses/restarts another named daemon and
@@ -1048,6 +1058,32 @@ fn test_isolated_client_env_acceptance_capture_is_exact_and_feature_gated() {
         "AGENT_BROWSER_INVOCATION_CUSTODY_EXTRA",
     ] {
         assert!(!isolated_client_env_allowed(removed));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn test_isolated_client_env_popup_relay_is_exact_and_feature_gated() {
+    for key in [
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_SCRIPT",
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_SCRIPT_SHA256",
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_PYTHON",
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_EVIDENCE",
+    ] {
+        assert_eq!(
+            isolated_client_env_allowed(key),
+            cfg!(all(feature = "acceptance-faults", target_os = "linux"))
+        );
+        assert!(!isolated_client_env_allowed(&format!("{key}_EXTRA")));
+    }
+    for key in [
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_",
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_ROOT",
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY",
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_SCRIPT_SHA",
+        "AGENT_BROWSER_ACCEPTANCE_POPUP_OTHER",
+    ] {
+        assert!(!isolated_client_env_allowed(key));
     }
 }
 
