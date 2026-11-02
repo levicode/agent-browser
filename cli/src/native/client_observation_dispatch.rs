@@ -2675,10 +2675,7 @@ impl ObservationDispatch {
                             let geometry = geometry.as_ref().ok_or(ProtocolError::PolicyDenied)?;
                             screenshot_stage(screenshot, ScreenshotStage::SemanticNodeGeometry);
                             if let Err(failure) = observation::project_observe_geometry(&capture_context.page.client, &frozen, &staged, geometry, &mut tree.roots, &operation).await {
-                                let mut detail = geometry_read_failure(&failure.error);
-                                if failure.error == super::client_geometry::GeometryError::StaleIdentity && !detail.1 {
-                                    detail.0 = diagnostic::ReadError::Geometry(node_geometry_read_origin(failure.origin));
-                                }
+                                let detail = node_geometry_read_failure(&failure.error, failure.origin);
                                 node_geometry_mixed_hard = failure.origin == super::client_geometry::NodeGeometryOrigin::MixedHard;
                                 node_negatives = failure.negatives;
                                 let error = geometry_error_with_cleanup(failure.error, &observation_cleanup);
@@ -2994,6 +2991,23 @@ fn node_negative_frames_match(
                 .any(|frame| frame.binding == *negative.binding())
         })
 }
+/// Attribute a refused Observe box command without changing its error or policy.
+/// Cleanup and mixed-hard failures retain the existing conservative attribution.
+fn node_geometry_read_failure(
+    error: &super::client_geometry::GeometryError,
+    origin: super::client_geometry::NodeGeometryOrigin,
+) -> (diagnostic::ReadError, bool) {
+    use super::client_geometry::{GeometryError, NodeGeometryOrigin};
+    let mut detail = geometry_read_failure(error);
+    if !detail.1
+        && (*error == GeometryError::StaleIdentity
+            || (*error == GeometryError::BackendFailure && origin == NodeGeometryOrigin::BoxRead))
+    {
+        detail.0 = diagnostic::ReadError::Geometry(node_geometry_read_origin(origin));
+    }
+    detail
+}
+
 fn node_geometry_read_origin(
     origin: super::client_geometry::NodeGeometryOrigin,
 ) -> diagnostic::GeometryReadError {
@@ -4521,6 +4535,31 @@ fn capture_error(error: CaptureReason) -> ProtocolError {
 mod tests {
     use super::super::element::ExactBinding;
     use super::*;
+
+    #[test]
+    fn observe_box_command_diagnostic_never_reclassifies_policy_or_cleanup() {
+        use super::super::client_geometry::{GeometryError as Error, NodeGeometryOrigin as Origin};
+        use diagnostic::{GeometryReadError as Kind, ReadError};
+        assert_eq!(
+            node_geometry_read_failure(&Error::BackendFailure, Origin::BoxRead),
+            (ReadError::Geometry(Kind::NodeBoxRead), false)
+        );
+        for origin in [Origin::Other, Origin::ResolveOther, Origin::MixedHard, Origin::BoxProofInvalid] {
+            assert_eq!(
+                node_geometry_read_failure(&Error::BackendFailure, origin),
+                geometry_read_failure(&Error::BackendFailure)
+            );
+        }
+        for error in [Error::Cancelled, Error::DeadlineExceeded, Error::Superseded, Error::InvalidGeometry,
+            Error::IncompleteInventory, Error::CleanupFailed { primary: Some(Box::new(Error::BackendFailure)) }] {
+            assert_eq!(node_geometry_read_failure(&error, Origin::BoxRead), geometry_read_failure(&error));
+        }
+        assert_eq!(
+            node_geometry_read_failure(&Error::StaleIdentity, Origin::BoxNodeNegative),
+            (ReadError::Geometry(Kind::NodeBoxNegative), false)
+        );
+        assert_eq!(geometry_error(Error::BackendFailure), ProtocolError::PolicyDenied);
+    }
 
     #[tokio::test]
     async fn publication_wait_preserves_typed_stop_on_actual_pending_lock() {

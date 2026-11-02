@@ -1457,19 +1457,31 @@ impl ClientEnrollment {
         ),
         ProtocolError,
     > {
+        use super::client_settlement_trace::{self as trace, TerminalEnrollmentRefusal};
+        let mut refusal = None;
+        macro_rules! terminal_guard {
+            ($predicate:expr, $reason:ident, $counts:expr) => {{
+                let rejected = $predicate;
+                if rejected { refusal = Some((TerminalEnrollmentRefusal::$reason, $counts)); }
+                rejected
+            }};
+        }
+
+        let result = async {
         if !matches!(&self.ownership, ScopeOwnership::BorrowedTargets(_))
             || !self.sealed.load(Ordering::Acquire)
             || self.supervisor.lock().await.is_some()
         {
+            refusal = Some((TerminalEnrollmentRefusal::EnrollmentLifecycle, None));
             return Err(ProtocolError::CleanupFailed);
         }
-        self.terminal_connection_proof()?
-            .check_client(&self.client)?;
+        self.terminal_connection_proof().map_err(|error| { refusal = Some((TerminalEnrollmentRefusal::EnrollmentTerminalProof, None)); error })?
+            .check_client(&self.client).map_err(|error| { refusal = Some((TerminalEnrollmentRefusal::EnrollmentClientIdentity, None)); error })?;
         let received = self
             .terminal_received
             .lock()
             .map_err(|_| ProtocolError::CleanupFailed)?
-            .ok_or(ProtocolError::CleanupFailed)?;
+            .ok_or_else(|| { refusal = Some((TerminalEnrollmentRefusal::EnrollmentTerminalWatermarkMissing, None)); ProtocolError::CleanupFailed })?;
         let root = self
             .active_root
             .lock()
@@ -1479,16 +1491,16 @@ impl ClientEnrollment {
             .index
             .lock()
             .map_err(|_| ProtocolError::CleanupFailed)?;
-        if index.failure.is_some()
-            || !index.reconciled
-            || index.applied_watermark != received
-            || !index.pending_enrollment.is_empty()
-            || !index.realm_pending.is_empty()
-            || index.realm_tickets != 0
-            || index.borrowed_restart.is_some()
-            || index.borrowed_blank.is_some()
-            || !index.retiring_pages.is_empty()
-            || index.sessions.values().any(|entry| {
+        if terminal_guard!(index.failure.is_some(), EnrollmentFailed, None)
+            || terminal_guard!(!index.reconciled, EnrollmentNotReconciled, None)
+            || terminal_guard!(index.applied_watermark != received, EnrollmentWatermark, Some([index.applied_watermark, received]))
+            || terminal_guard!(!index.pending_enrollment.is_empty(), EnrollmentPending, Some([index.pending_enrollment.len() as u64, 0]))
+            || terminal_guard!(!index.realm_pending.is_empty(), EnrollmentRealmPending, Some([index.realm_pending.len() as u64, 0]))
+            || terminal_guard!(index.realm_tickets != 0, EnrollmentRealmTickets, Some([index.realm_tickets as u64, 0]))
+            || terminal_guard!(index.borrowed_restart.is_some(), EnrollmentRestart, None)
+            || terminal_guard!(index.borrowed_blank.is_some(), EnrollmentBlank, None)
+            || terminal_guard!(!index.retiring_pages.is_empty(), EnrollmentRetiring, Some([index.retiring_pages.len() as u64, 0]))
+            || terminal_guard!(index.sessions.values().any(|entry| {
                 !entry.resumed
                     || entry.application == entry.observation_only
                     || !matches!(entry.kind.as_str(), "page" | "iframe")
@@ -1496,10 +1508,10 @@ impl ClientEnrollment {
                     || index.retired_observer_sessions.contains(&entry.session)
                     || index.retired_observer_targets.contains(&entry.target)
                     || index.borrowed_retired_targets.contains(&entry.target)
-            })
-            || !index.sessions.get(&root).is_some_and(|entry| {
+            }), EnrollmentSessionContract, None)
+            || terminal_guard!(!index.sessions.get(&root).is_some_and(|entry| {
                 entry.application && entry.root == root && entry.parent.is_none()
-            })
+            }), EnrollmentRootContract, None)
         {
             return Err(ProtocolError::CleanupFailed);
         }
@@ -1528,6 +1540,7 @@ impl ClientEnrollment {
                 ancestor = parent;
             }
             if !rooted {
+                refusal = Some((TerminalEnrollmentRefusal::EnrollmentAncestry, None));
                 return Err(ProtocolError::CleanupFailed);
             }
         }
@@ -1535,11 +1548,12 @@ impl ClientEnrollment {
             .client
             .debt_ledger()
             .ok_or(ProtocolError::CleanupFailed)?;
-        self.client.check_cleanup_owner(&Some(ledger.clone()))?;
+        self.client.check_cleanup_owner(&Some(ledger.clone())).map_err(|error| { refusal = Some((TerminalEnrollmentRefusal::EnrollmentCleanupOwner, None)); error })?;
         if !ledger.matches_owner(self.generation, &self.targets.identity_scope) {
+            refusal = Some((TerminalEnrollmentRefusal::EnrollmentLedgerOwner, None));
             return Err(ProtocolError::StaleScope);
         }
-        self.targets.require_eval_owner(&ledger)?;
+        self.targets.require_eval_owner(&ledger).map_err(|error| { refusal = Some((TerminalEnrollmentRefusal::EnrollmentRegistryOwner, None)); error })?;
         let bindings = index
             .sessions
             .values()
@@ -1551,9 +1565,16 @@ impl ClientEnrollment {
                 )
             })
             .collect::<Vec<_>>();
-        self.targets.check_terminal_read_only(&bindings)?;
-        ledger.check_terminal_read_only(&bindings, operations)?;
+        let (target_result, target_observation) = self.targets.check_terminal_read_only_observed(&bindings);
+        refusal = target_observation;
+        target_result?;
+        let (ledger_result, ledger_observation) = ledger.check_terminal_read_only_observed(&bindings, operations);
+        refusal = ledger_observation;
+        ledger_result?;
         Ok((ledger, bindings))
+        }.await;
+        if let Some((reason, counts)) = refusal { trace::terminal_enrollment_refusal(reason, counts); }
+        result
     }
     fn capture_final_local_eof(&self, received: u64) -> Result<FinalLocalEofProof, ProtocolError> {
         if !matches!(&self.ownership, ScopeOwnership::BorrowedTargets(_)) {

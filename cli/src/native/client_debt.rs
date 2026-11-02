@@ -2283,11 +2283,32 @@ impl OwnerDebtLedger {
     /// Sealed final-close evidence, not command settlement. Exact fully drained
     /// enrollment supplies the borrowed bindings; no host detach is invented.
     /// Every unacknowledged command remains in the ledger unchanged.
+    #[cfg(test)]
     pub(crate) fn check_terminal_read_only(
         &self,
         bindings: &[(String, String, bool)],
         operations: &[OperationKey],
     ) -> Result<(), ProtocolError> {
+        let (result, observation) = self.check_terminal_read_only_observed(bindings, operations);
+        if let Some((reason, counts)) = observation { super::client_settlement_trace::terminal_enrollment_refusal(reason, counts); }
+        result
+    }
+    pub(crate) fn check_terminal_read_only_observed(
+        &self,
+        bindings: &[(String, String, bool)],
+        operations: &[OperationKey],
+    ) -> (Result<(), ProtocolError>, Option<(super::client_settlement_trace::TerminalEnrollmentRefusal, Option<[u64; 2]>)>) {
+        use super::client_settlement_trace::TerminalEnrollmentRefusal;
+        let mut refusal = None;
+        macro_rules! terminal_guard {
+            ($predicate:expr, $reason:ident, $counts:expr) => {{
+                let rejected = $predicate;
+                if rejected { refusal = Some((TerminalEnrollmentRefusal::$reason, $counts)); }
+                rejected
+            }};
+        }
+
+        let result = (|| {
         let state = self
             .state
             .lock()
@@ -2296,44 +2317,40 @@ impl OwnerDebtLedger {
         // binding an existing borrowed session also sets it. Pending creation
         // is checked below through publication, created targets and each actual
         // command acquisition; never erase the historical marker to close.
-        if !state.remote_eof_only()
-            || !state
+        if terminal_guard!(!state.remote_eof_only(), LedgerNotRemoteEof, None)
+            || terminal_guard!(!state
                 .bootstrap
                 .as_ref()
-                .is_some_and(|bootstrap| bootstrap.published)
-            || state.context_creation_claimed
-            || state.eval_publication_pending
-            // The operation registry supplies a nonempty exact-owner proof.
-            // A reader ACK can settle the last passive command before its
-            // cancelled consumer fixes Unknown at EOF. Residual debt may thus
-            // be empty; it is not itself the authority to retire an operation.
-            || operations.is_empty()
-            || operations
+                .is_some_and(|bootstrap| bootstrap.published), LedgerBootstrapUnpublished, None)
+            || terminal_guard!(state.context_creation_claimed, LedgerContextCreation, None)
+            || terminal_guard!(state.eval_publication_pending, LedgerEvalPublication, None)
+            || terminal_guard!(operations.is_empty(), LedgerOperationsEmpty, None)
+            || terminal_guard!(operations
                 .iter()
-                .any(|key| key.generation != self.generation || key.operation_seq == 0)
-            || !state.objects.is_empty()
-            || !state.groups.is_empty()
-            || !state.created_targets.is_empty()
-            || !state.recording_targets.is_empty()
-            || bindings.is_empty()
-            || state.targets.len() != bindings.len()
-            || !bindings.iter().all(|(session, target, observer)| {
+                .any(|key| key.generation != self.generation || key.operation_seq == 0), LedgerOperationIdentity, None)
+            || terminal_guard!(!state.objects.is_empty(), LedgerObjects, Some([state.objects.len() as u64, 0]))
+            || terminal_guard!(!state.groups.is_empty(), LedgerGroups, Some([state.groups.len() as u64, 0]))
+            || terminal_guard!(!state.created_targets.is_empty(), LedgerCreatedTargets, Some([state.created_targets.len() as u64, 0]))
+            || terminal_guard!(!state.recording_targets.is_empty(), LedgerRecordingTargets, Some([state.recording_targets.len() as u64, 0]))
+            || terminal_guard!(bindings.is_empty(), LedgerBindingsEmpty, None)
+            || terminal_guard!(state.targets.len() != bindings.len(), LedgerTargetCount, Some([state.targets.len() as u64, bindings.len() as u64]))
+            || terminal_guard!(!bindings.iter().all(|(session, target, observer)| {
                 state.targets.get(session) == Some(target)
                     && match state.lifecycle_sessions.get(session) {
                         None => !observer,
                         Some(LifecycleSessionPurpose::Observer) => *observer,
                         _ => false,
                     }
-            })
-            || state
+            }), LedgerTargetBinding, None)
+            || terminal_guard!(state
                 .lifecycle_sessions
                 .keys()
-                .any(|session| !state.targets.contains_key(session))
-            || state
+                .any(|session| !state.targets.contains_key(session)), LedgerLifecycleBinding, None)
+            || terminal_guard!(state
                 .realms
                 .keys()
-                .any(|(session, _)| !state.targets.contains_key(session))
-            || state.commands.values().any(|command| {
+                .any(|(session, _)| !state.targets.contains_key(session)), LedgerRealmBinding, None)
+            || terminal_guard!(state.commands.values().any(|command| {
                 command.terminal_read != Some(TerminalReadKind::BrowserVersion)
                     || !command.submitted
                     || command.mutation
@@ -2347,13 +2364,14 @@ impl OwnerDebtLedger {
                     || command.provenance.session.is_some()
                     || command.release_object.is_some()
                     || command.group_id.is_some()
-            })
+            }), LedgerCommandContract, None)
         {
             return Err(ProtocolError::CleanupFailed);
         }
         Ok(())
+        })();
+        (result, refusal)
     }
-
     /// A read-only terminal check, never proof that EOF destroyed a borrowed
     /// context. Exact reader events must already have settled every obligation.
     pub(crate) fn check_final_local_eof(
@@ -6220,6 +6238,14 @@ pub(crate) mod tests {
             let result =
                 ledger.check_terminal_read_only(&[("page".into(), "target".into(), false)], &keys);
             assert_eq!(result.is_ok(), obstruction == "none", "{obstruction}");
+            let (observed_result, observation) = ledger.check_terminal_read_only_observed(
+                &[("page".into(), "target".into(), false)], &keys,
+            );
+            assert_eq!(observed_result, result, "diagnostic cannot change the guard");
+            assert_eq!(observation.is_some(), result.is_err(), "{obstruction}");
+            if obstruction == "created-target" {
+                assert_eq!(observation, Some((crate::native::client_settlement_trace::TerminalEnrollmentRefusal::LedgerCreatedTargets, Some([1, 0]))));
+            }
             assert_eq!(ledger.snapshot(), before, "proof must not settle debt");
             assert!(
                 ledger.state.lock().unwrap().root_creation_claimed,

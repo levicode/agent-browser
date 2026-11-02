@@ -1864,6 +1864,11 @@ async fn read_exact_box_inner(
             operation,
         )
         .await?;
+        // BoxRead denotes only a failed box command, not a later proof read.
+        // This is diagnostic attribution, never permission to continue a read.
+        if let Some(evidence) = evidence.as_mut() {
+            evidence.origin = NodeGeometryOrigin::Other;
+        }
         // Recheck the same object against the isolated realm document after
         // geometry, not merely the frame loader: adoption can keep a node connected.
         let mut params =

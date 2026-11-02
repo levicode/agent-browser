@@ -3025,6 +3025,7 @@ impl ClientTargets {
             self.seal();
         }
     }
+    #[cfg(test)]
     pub(crate) fn check_terminal_read_only(
         &self,
         bindings: &[(String, String, bool)],
@@ -3036,32 +3037,59 @@ impl ClientTargets {
         bindings: &[(String, String, bool)],
         commit: impl FnOnce() -> Result<T, ProtocolError>,
     ) -> Result<T, ProtocolError> {
+        let (result, observation) = self.with_terminal_read_only_observed(bindings, commit);
+        if let Some((reason, counts)) = observation { super::client_settlement_trace::terminal_enrollment_refusal(reason, counts); }
+        result
+    }
+    pub(crate) fn check_terminal_read_only_observed(
+        &self, bindings: &[(String, String, bool)],
+    ) -> (Result<(), ProtocolError>, Option<(super::client_settlement_trace::TerminalEnrollmentRefusal, Option<[u64; 2]>)>) {
+        self.with_terminal_read_only_observed(bindings, || Ok(()))
+    }
+    fn with_terminal_read_only_observed<T>(
+        &self,
+        bindings: &[(String, String, bool)],
+        commit: impl FnOnce() -> Result<T, ProtocolError>,
+    ) -> (Result<T, ProtocolError>, Option<(super::client_settlement_trace::TerminalEnrollmentRefusal, Option<[u64; 2]>)>) {
+        use super::client_settlement_trace::TerminalEnrollmentRefusal;
+        let mut refusal = None;
+        macro_rules! terminal_guard {
+            ($predicate:expr, $reason:ident, $counts:expr) => {{
+                let rejected = $predicate;
+                if rejected { refusal = Some((TerminalEnrollmentRefusal::$reason, $counts)); }
+                rejected
+            }};
+        }
+
+        let result = (|| {
         let state = self
             .state
             .lock()
             .map_err(|_| ProtocolError::CleanupFailed)?;
-        if !state.sealed
-            || state.integrity_lost
-            || !state.enrollment_ready
-            || state.reservations != 0
-            || state.resuming != 0
-            || state.protected_read.is_some()
-            || !state.bootstrap_creations.is_empty()
-            || !state.native_bootstrap_cleanup.is_empty()
-            || !state.bootstrap_cleanup_reservations.is_empty()
-            || state.unknown_bootstrap_create
-            || !state.auxiliary.is_empty()
-            || state.targets.len() != bindings.iter().filter(|(_, _, observer)| !observer).count()
-            || state.targets.values().any(|target| {
+        if terminal_guard!(!state.sealed, RegistryNotSealed, None)
+            || terminal_guard!(state.integrity_lost, RegistryIntegrityLost, None)
+            || terminal_guard!(!state.enrollment_ready, RegistryNotReady, None)
+            || terminal_guard!(state.reservations != 0, RegistryReservations, Some([state.reservations as u64, 0]))
+            || terminal_guard!(state.resuming != 0, RegistryResuming, Some([state.resuming as u64, 0]))
+            || terminal_guard!(state.protected_read.is_some(), RegistryProtectedRead, None)
+            || terminal_guard!(!state.bootstrap_creations.is_empty(), RegistryBootstrapCreations, Some([state.bootstrap_creations.len() as u64, 0]))
+            || terminal_guard!(!state.native_bootstrap_cleanup.is_empty(), RegistryBootstrapCleanup, Some([state.native_bootstrap_cleanup.len() as u64, 0]))
+            || terminal_guard!(!state.bootstrap_cleanup_reservations.is_empty(), RegistryCleanupReservations, Some([state.bootstrap_cleanup_reservations.len() as u64, 0]))
+            || terminal_guard!(state.unknown_bootstrap_create, RegistryUnknownCreation, None)
+            || terminal_guard!(!state.auxiliary.is_empty(), RegistryAuxiliary, Some([state.auxiliary.len() as u64, 0]))
+            || terminal_guard!(state.targets.len() != bindings.iter().filter(|(_, _, observer)| !observer).count(), RegistryTargetCount, Some([state.targets.len() as u64, bindings.iter().filter(|(_, _, observer)| !observer).count() as u64]))
+            || terminal_guard!(state.targets.values().any(|target| {
                 !target.capture_ready()
                     || !bindings.iter().any(|(session, id, observer)| {
                         !observer && session == &target.session_id && id == &target.target_id
                     })
-            })
+            }), RegistryTargetBinding, None)
         {
             return Err(ProtocolError::CleanupFailed);
         }
         commit()
+        })();
+        (result, refusal)
     }
     /// Final-local cleanup only: admission may already be sealed, but no
     /// accounting damage or unsettled exact resource/reservation is waived.
