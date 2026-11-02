@@ -4539,7 +4539,7 @@ mod tests {
     #[test]
     fn observe_box_command_diagnostic_never_reclassifies_policy_or_cleanup() {
         use super::super::client_geometry::{GeometryError as Error, NodeGeometryOrigin as Origin};
-        use diagnostic::{GeometryReadError as Kind, ReadError};
+        use super::diagnostic::{GeometryReadError as Kind, ReadError};
         assert_eq!(
             node_geometry_read_failure(&Error::BackendFailure, Origin::BoxRead),
             (ReadError::Geometry(Kind::NodeBoxRead), false)
