@@ -415,6 +415,7 @@ async fn semantic_deadline_then_mask_failure(reply: ProbeReply, sequence: u64) {
     let mut task = dispatch.clone().start(
         peer.owner.context(),
         DispatchRequest::Observe(ObserveRequest {
+            continuation: None,
             options: ObserveFlags {
                 pixels: false,
                 pixel_fallback: true,

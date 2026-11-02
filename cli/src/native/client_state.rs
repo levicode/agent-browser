@@ -1754,6 +1754,7 @@ mod tests {
                 .unwrap();
             sink.acknowledge_result_for_test(&ServerMessage::Result {
                 recovery: None,
+                observe_continuation: None,
                 retention: None,
                 id: "synthetic-state-fixture".into(),
                 generation: operation.generation,

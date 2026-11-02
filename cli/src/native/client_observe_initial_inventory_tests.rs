@@ -5,6 +5,7 @@ use super::*;
 
 fn request() -> DispatchRequest {
     DispatchRequest::Observe(ObserveRequest {
+        continuation: None,
         options: ObserveFlags::default(),
         test_id_attribute: "data-testid".into(),
         secure_field_selector: "input[type=password]".into(),
@@ -507,7 +508,7 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
     let same_owner = targets.owned_target("target").ok().map(|current| {
         original_attachment.same_attachment(&current) && current.capture_ready()
     });
-    let terminal = matches!(race, Race::Sealed | Race::ReleaseError);
+    let terminal = matches!(race, Race::Sealed | Race::ReleaseWrongSession);
     assert_eq!(outcome.effects, if terminal { Effects::Unknown } else { Effects::NotDispatched });
     assert_eq!(settled, if terminal { ScopeState::Quarantined } else { ScopeState::Usable });
     assert_eq!(broker.health().unwrap(), (1, settled));
@@ -520,7 +521,10 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
         assert_eq!(same_owner, Some(race != Race::Replacement));
         assert!(!snapshot.integrity_lost);
     }
-    if matches!(race, Race::HeldRelease | Race::AttachOtherHeldRelease) {
+    if matches!(
+        race,
+        Race::HeldRelease | Race::AttachOtherHeldRelease | Race::ReleaseError
+    ) {
         assert_eq!(snapshot.object_debt, 1);
         assert_eq!(snapshot.outstanding_commands, 1);
     } else if matches!(race, Race::Continuous | Race::AttachOtherContinuous | Race::Replacement) {
@@ -610,11 +614,69 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
         assert_eq!(broker.health().unwrap(), (1, ScopeState::Usable));
         assert!(original_attachment.same_attachment(&targets.owned_target("target").unwrap()));
     }
-    if race == Race::ReleaseError {
+    if matches!(race, Race::ReleaseError | Race::ReleaseWrongSession) {
         let replies = tokio::time::timeout(Duration::from_secs(1), release_fence_receipt.unwrap()).await.unwrap().unwrap();
-        assert_eq!(replies[0]["error"]["code"], -32000);
+        let requests = log.lock().unwrap();
+        let releases: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "Runtime.releaseObjectGroup")
+            .collect();
+        assert_eq!(releases.len(), 1);
+        assert_eq!(releases[0]["sessionId"], "session");
+        assert_eq!(replies[0]["id"], releases[0]["id"]);
+        assert_ne!(replies[0]["id"], replies[1]["id"]);
+        let final_frames: Vec<_> = requests
+            .iter()
+            .filter(|row| row["method"] == "Page.getFrameTree")
+            .collect();
+        assert_eq!(final_frames.len(), 4);
+        assert_eq!(replies[1]["id"], final_frames.last().unwrap()["id"]);
+        assert_eq!(replies[1]["sessionId"], "session");
+        assert!(replies[1].get("error").is_none());
+        assert!(replies[1]["result"]["frameTree"].is_object());
+        let rejected = ledger.operation_has_rejected_cleanup(journal_probe.key(), "scope");
+        if race == Race::ReleaseError {
+            // A valid error ACK retains this exact cleanup obligation. It is
+            // neither successful release nor transport/accounting corruption.
+            assert_eq!(replies[0]["sessionId"], releases[0]["sessionId"]);
+            assert_eq!(replies[0]["error"]["code"], -32000);
+            assert!(replies[0].get("result").is_none());
+            assert_eq!(rejected, Ok(true));
+            assert_eq!(
+                ledger.operation_has_rejected_cleanup(
+                    OperationKey {
+                        generation: 1,
+                        operation_seq: 2
+                    },
+                    "scope"
+                ),
+                Ok(false)
+            );
+            assert_eq!(journal_probe.snapshot().object_debt, 1);
+            assert!(!journal_probe.snapshot().integrity_lost);
+        } else {
+            // A reply for another session cannot acknowledge or merely reject
+            // the original release, even with its correct request id.
+            assert_eq!(replies[0]["sessionId"], "other-session");
+            assert!(replies[0]["result"].is_object());
+            assert!(replies[0].get("error").is_none());
+            assert_eq!(rejected, Err(ProtocolError::CleanupFailed));
+            assert!(snapshot.integrity_lost);
+            assert!(journal_probe.snapshot().integrity_lost);
+        }
     }
+    let commands_before_drain = log.lock().unwrap().clone();
     let drained = retained.drain().await;
+    assert_eq!(*log.lock().unwrap(), commands_before_drain);
+    assert_eq!(samples.load(Ordering::SeqCst), expected_samples);
+    if race == Race::ReleaseError {
+        assert_eq!(ledger.snapshot().object_debt, 1);
+        assert_eq!(ledger.snapshot().outstanding_commands, 1);
+        assert_eq!(
+            ledger.operation_has_rejected_cleanup(journal_probe.key(), "scope"),
+            Ok(true)
+        );
+    }
     assert_eq!(drained.is_err(), terminal);
     tokio::time::timeout(Duration::from_secs(1), client.close()).await.unwrap();
     tokio::time::timeout(Duration::from_secs(1), peer).await.unwrap().unwrap();
@@ -643,6 +705,10 @@ async fn observe_receipt_sealed_owner_stays_terminal() {
 #[tokio::test]
 async fn observe_receipt_failed_release_preserves_terminal_cleanup() {
     retained_observe_receipt_control(Race::ReleaseError, false).await;
+}
+#[tokio::test]
+async fn observe_receipt_wrong_session_release_preserves_terminal_cleanup() {
+    retained_observe_receipt_control(Race::ReleaseWrongSession, false).await;
 }
 
 #[tokio::test]

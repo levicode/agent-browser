@@ -19,6 +19,25 @@ const MAX_REGISTRIES: usize = 256;
 
 #[path = "client_operation_lease.rs"]
 mod operation_lease;
+/// Non-cloneable proof of uncancelled, usable settlement under the broker lock.
+pub(crate) struct ObservationSettlement {
+    key: super::client_debt::OperationKey,
+    deadline: Instant,
+    cancellation: watch::Receiver<CancelSignal>,
+}
+impl ObservationSettlement {
+    pub(crate) fn key(&self) -> super::client_debt::OperationKey {
+        self.key
+    }
+    pub(crate) fn matches(
+        &self,
+        deadline: Instant,
+        cancellation: &watch::Receiver<CancelSignal>,
+    ) -> bool {
+        self.deadline == deadline && self.cancellation.same_channel(cancellation)
+    }
+}
+
 pub use operation_lease::{CancelSignal, OperationLease};
 
 /// Closed broker decision made under the operation lock, before executor entry.
@@ -335,6 +354,18 @@ impl ClientSession {
         Ok(())
     }
 
+    /// Metadata proof that the original admitted operation has left usable custody.
+    pub(crate) fn observation_operation_settled(
+        &self,
+        key: super::client_debt::OperationKey,
+    ) -> bool {
+        self.lock().is_ok_and(|inner| {
+            inner.generation == key.generation
+                && inner.health == ScopeState::Usable
+                && inner.high_water >= key.operation_seq
+                && !inner.operations.contains_key(&key.operation_seq)
+        })
+    }
     pub fn health(&self) -> Result<(u64, ScopeState), ProtocolError> {
         let inner = self.lock()?;
         Ok((inner.generation, inner.health))
@@ -979,6 +1010,16 @@ impl ClientSession {
         effects: Effects,
         proof: Option<&super::client_operation_state::OperationRetentionProof>,
     ) -> Result<ScopeState, ProtocolError> {
+        self.settle_with_observation_proof(generation, sequence, effects, proof)
+            .map(|(state, _)| state)
+    }
+    pub(crate) fn settle_with_observation_proof(
+        &self,
+        generation: u64,
+        sequence: u64,
+        effects: Effects,
+        proof: Option<&super::client_operation_state::OperationRetentionProof>,
+    ) -> Result<(ScopeState, Option<ObservationSettlement>), ProtocolError> {
         let mut inner = self.lock()?;
         if inner.generation != generation {
             return Err(ProtocolError::StaleGeneration);
@@ -993,6 +1034,15 @@ impl ClientSession {
         {
             window.revoke();
         }
+        let observation_candidate = inner
+            .operations
+            .get(&sequence)
+            .filter(|operation| {
+                *operation.cancel.borrow() == CancelSignal::None
+                    && operation.callback_token.is_none()
+                    && Instant::now() < operation.deadline
+            })
+            .map(|operation| (operation.deadline, operation.cancel.subscribe()));
         let retained = effects == Effects::Unknown
             && proof.is_some_and(|proof| {
                 proof.matches(super::client_debt::OperationKey {
@@ -1033,7 +1083,17 @@ impl ClientSession {
                 }
             }
         }
-        Ok(inner.health)
+        let observation = observation_candidate
+            .filter(|_| effects == Effects::NotDispatched && inner.health == ScopeState::Usable)
+            .map(|(deadline, cancellation)| ObservationSettlement {
+                key: super::client_debt::OperationKey {
+                    generation,
+                    operation_seq: sequence,
+                },
+                deadline,
+                cancellation,
+            });
+        Ok((inner.health, observation))
     }
 
     pub fn register_routes(

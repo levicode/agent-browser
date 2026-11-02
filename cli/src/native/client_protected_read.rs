@@ -1075,6 +1075,7 @@ mod tests {
                     })
                 } else {
                     DispatchRequest::Observe(ObserveRequest {
+                        continuation: None,
                         options: ObserveFlags {
                             pixels: kind == "observe-pixels",
                             ..Default::default()

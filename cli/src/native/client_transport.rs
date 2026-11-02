@@ -37,6 +37,13 @@ pub trait ClientExecutor: Send + Sync + 'static {
     ) -> Option<super::client_terminal_artifacts::FrozenRecordingBatch> {
         None
     }
+    /// Called only after an ordinary failed read's broker settlement is usable.
+    fn offer_observe_continuation(
+        &self,
+        _settlement: super::client_session::ObservationSettlement,
+    ) -> Option<super::client_protocol::ObserveContinuationDescriptor> {
+        None
+    }
     fn capabilities(&self) -> Vec<String>;
     /// Optional shortening-only deadline for a later RPC belonging to an exact
     /// retained native lifecycle. This synchronous hook may take only short
@@ -50,6 +57,16 @@ pub trait ClientExecutor: Send + Sync + 'static {
         _args: &serde_json::Map<String, serde_json::Value>,
     ) -> Result<Option<std::time::Instant>, ProtocolError> {
         Ok(None)
+    }
+    /// Sequence-aware one-use admission; legacy deadline contracts remain unchanged.
+    fn admission_deadline_cap_for_sequence(
+        &self,
+        generation: u64,
+        _sequence: u64,
+        command: &str,
+        args: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<std::time::Instant>, ProtocolError> {
+        self.admission_deadline_cap(generation, command, args)
     }
     /// Reuse the producer's exact cleanup clock; absence grants no longer wait.
     fn begin_trace_cleanup(
@@ -1410,8 +1427,8 @@ where
                     let Some(Ok((sequence, outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
                     settlement_trace!(sequence, CompletionJoined);
                     let Some((id, generation, callback, scope)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
-                    let state = broker.settle_with_retention(generation, sequence, outcome.effects,
-                        if continuation_negotiated { outcome.retention.as_ref() } else { None }).unwrap_or(ScopeState::Quarantined);
+                    let (state, observation_settlement) = broker.settle_with_observation_proof(generation, sequence, outcome.effects,
+                        if continuation_negotiated { outcome.retention.as_ref() } else { None }).unwrap_or((ScopeState::Quarantined, None));
                     executor.fix_operation_result(super::client_debt::OperationKey { generation, operation_seq: sequence });
                     let unknown = outcome.effects == Effects::Unknown;
                     let recovery = if recovery_negotiated && !callback && unknown && state == ScopeState::Quarantined {
@@ -1426,7 +1443,14 @@ where
                         let batch = executor.take_terminal_recording(super::client_debt::OperationKey { generation, operation_seq: sequence }, scope.as_deref());
                         if terminal_recording_negotiated { terminal_recording = batch; }
                     }
+                    let observe_continuation = if required_capabilities.iter().any(|c| c == "browser.observe-continuation/1")
+                        && !callback && state == ScopeState::Usable
+                        && outcome.effects == Effects::NotDispatched
+                        && matches!(outcome.result, Err(ProtocolError::StaleScope)) {
+                        observation_settlement.and_then(|settlement| executor.offer_observe_continuation(settlement))
+                    } else { None };
                     let mut message = result_message(id, generation, sequence, outcome, state);
+                    if let ServerMessage::Result { observe_continuation: field, .. } = &mut message { *field = observe_continuation; }
                     if let ServerMessage::Result { recovery: field, .. } = &mut message { *field = recovery; }
                     if !enqueue(&sender, message, &broker) { settlement_trace!(sequence, ResultQueueFailed); break; }
                     settlement_trace!(sequence, ResultQueued);
@@ -1582,7 +1606,12 @@ where
                             operation_seq,
                             timeout_ms,
                             callback_token.as_deref(),
-                            executor.admission_deadline_cap(generation, &command, &args),
+                            executor.admission_deadline_cap_for_sequence(
+                                generation,
+                                operation_seq,
+                                &command,
+                                &args,
+                            ),
                         )
                     };
                     match admitted {
@@ -2029,6 +2058,7 @@ fn result_message(
         operation_seq,
         retention,
         recovery: None,
+        observe_continuation: None,
         ok,
         data,
         error,
@@ -2257,6 +2287,7 @@ fn respond<E: ClientExecutor>(
             (
                 ServerMessage::Result {
                     recovery: None,
+                    observe_continuation: None,
                     retention: None,
                     id,
                     generation,

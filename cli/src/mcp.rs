@@ -761,6 +761,8 @@ fn tool_profile_summaries() -> Vec<Value> {
 
 // Protected session trace captures are integration-only: the MCP screenshot
 // keeps pixels-only behavior, with no trace-purpose flag or separate tool.
+// Observe continuation belongs to the same persistent negotiated connection;
+// it cannot be represented by a stateless MCP call or replay an action.
 // Intentionally no session-connect MCP tool: a one-shot tool result cannot
 // proxy a persistent bidirectional JSON-line connection. Existing MCP tools
 // retain canonical one-shot command behavior; session clients use the CLI.

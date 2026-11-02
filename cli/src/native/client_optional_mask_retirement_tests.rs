@@ -243,6 +243,7 @@ async fn optional_mask_retirement(case: Case) {
     let mut task = dispatch.clone().start(
         owner.context(),
         DispatchRequest::Observe(ObserveRequest {
+            continuation: None,
             options: ObserveFlags {
                 pixels: true,
                 pixel_fallback: false,

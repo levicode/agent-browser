@@ -356,6 +356,7 @@ async fn acquisition_deadline(boundary: Boundary) {
     let mut task = dispatch.clone().start(
         owner.context(),
         DispatchRequest::Observe(ObserveRequest {
+            continuation: None,
             options: ObserveFlags {
                 pixels: false,
                 pixel_fallback: true,

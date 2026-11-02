@@ -4574,6 +4574,7 @@ mod bridge_tests {
             .unwrap();
         sink.acknowledge_result_for_test(&ServerMessage::Result {
             recovery: None,
+            observe_continuation: None,
             retention: None,
             id: "initial".into(),
             generation: 1,
@@ -5560,6 +5561,7 @@ mod bridge_tests {
         source
             .acknowledge_result_for_test(&ServerMessage::Result {
                 recovery: None,
+                observe_continuation: None,
                 retention: None,
                 id: "restart".into(),
                 generation: 1,

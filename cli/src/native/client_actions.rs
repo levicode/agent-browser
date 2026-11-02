@@ -4664,6 +4664,7 @@ impl FixtureOperations {
         };
         sink.acknowledge_result_for_test(&ServerMessage::Result {
             recovery: None,
+            observe_continuation: None,
             id: "synthetic-fixture-result".into(),
             generation: 1,
             operation_seq: self.sequence,
@@ -10298,6 +10299,7 @@ mod tests {
             .unwrap();
         sink.acknowledge_result_for_test(&ServerMessage::Result {
             recovery: None,
+            observe_continuation: None,
             id: "preparation-fixture-initialized".into(),
             generation: f.op.generation,
             operation_seq: f.op.sequence,

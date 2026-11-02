@@ -115,6 +115,7 @@ async fn missing_borrowed_root_can_end_only_after_exact_debt_free_remote_eof() {
         // fixture sink that silently skips callback retirement.
         sink.acknowledge_result_for_test(&ServerMessage::Result {
             recovery: None,
+            observe_continuation: None,
             id: "open".into(),
             generation: 1,
             operation_seq: 1,

@@ -109,6 +109,7 @@ fn operation(sequence: u64) -> (OperationLease, tokio::sync::watch::Sender<Cance
 }
 fn observe() -> DispatchRequest {
     DispatchRequest::Observe(ObserveRequest {
+        continuation: None,
         options: ObserveFlags::default(),
         test_id_attribute: "data-testid".into(),
         secure_field_selector: "input[type=password]".into(),
@@ -1254,6 +1255,7 @@ async fn capture_dispatch_case(case: CaptureDispatchCase) {
     }
     let request = if fallback {
         DispatchRequest::Observe(ObserveRequest {
+            continuation: None,
             options: ObserveFlags {
                 pixel_fallback: true,
                 ..Default::default()

@@ -283,6 +283,7 @@ async fn metadata_deadline(fallback: bool) {
     let mut task = dispatch.clone().start(
         owner.context(),
         DispatchRequest::Observe(ObserveRequest {
+            continuation: None,
             options: ObserveFlags {
                 pixels: false,
                 pixel_fallback: fallback,

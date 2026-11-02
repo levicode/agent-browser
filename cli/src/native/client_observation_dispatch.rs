@@ -340,7 +340,7 @@ pub struct DispatchFailure {
     pub identity_scope: String,
     pub cleanup_integrity_lost: bool,
 }
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObserveFlags {
     #[serde(default)]
@@ -350,9 +350,11 @@ pub struct ObserveFlags {
     #[serde(default)]
     pub comparable: bool,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ObserveRequest {
+    #[serde(default)]
+    pub continuation: Option<super::client_protocol::ObserveContinuationDescriptor>,
     pub options: ObserveFlags,
     pub test_id_attribute: String,
     pub secure_field_selector: String,
@@ -636,7 +638,24 @@ impl CaptureOwner {
             })
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObserveContinuationPhase {
+    Initial,
+    Eligible,
+    Offered,
+    Reserved(u64),
+    Consumed,
+}
+struct ObserveContinuation {
+    cancellation: tokio::sync::watch::Receiver<CancelSignal>,
+    request_digest: [u8; 32],
+    deadline: Instant,
+    retirement_fence: u64,
+    descriptor: super::client_protocol::ObserveContinuationDescriptor,
+    phase: ObserveContinuationPhase,
+}
 struct CaptureAdmission {
+    continuation: Mutex<Option<ObserveContinuation>>,
     owner: CaptureOwner,
     sequence: u64,
     retired: tokio::sync::watch::Sender<bool>,
@@ -672,6 +691,18 @@ pub struct ObservationDispatch {
     semantic_failure_for_test: Mutex<Option<ObservationError>>,
     #[cfg(test)]
     observed_cleanup_for_test: AtomicBool,
+    #[cfg(test)]
+    initial_inventory_probe_for_test:
+        Mutex<Option<tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>>>,
+}
+/// Only the real-browser joint test can pause an initial sample after its actual
+/// revision snapshot. The receiver creates real browser events; this seam does
+/// not change registry state, fabricate a failure, or supply capture results.
+#[cfg(test)]
+pub(crate) struct InitialInventorySampleForTest {
+    pub operation_seq: u64,
+    pub revision: u64,
+    pub resume: oneshot::Sender<()>,
 }
 struct Output {
     value: Value,
@@ -684,6 +715,8 @@ impl ObservationDispatch {
             semantic_failure_for_test: Mutex::new(None),
             #[cfg(test)]
             observed_cleanup_for_test: AtomicBool::new(false),
+            #[cfg(test)]
+            initial_inventory_probe_for_test: Mutex::new(None),
             refs,
             captures: Mutex::new(CaptureAuthority::default()),
             publication: tokio::sync::Mutex::new(Publication {
@@ -692,6 +725,18 @@ impl ObservationDispatch {
                 observed_revision: 0,
             }),
         })
+    }
+    #[cfg(test)]
+    pub(crate) fn set_initial_inventory_probe_for_test(
+        &self,
+        probe: tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>,
+    ) {
+        assert!(self
+            .initial_inventory_probe_for_test
+            .lock()
+            .unwrap()
+            .replace(probe)
+            .is_none());
     }
     /// The existing publication authority owns one retirement counter; this
     /// never replaces scope generation, target tenure or the shared ref map.
@@ -901,8 +946,54 @@ impl ObservationDispatch {
             } else if authority.latest.len() >= MAX_CAPTURE_OWNERS {
                 return Err(ProtocolError::CapacityExceeded);
             }
+            let continuation = if let DispatchRequest::Observe(request) = &request {
+                if let Some(descriptor) = &request.continuation {
+                    let previous = prior
+                        .and_then(|i| authority.latest.get(i))
+                        .ok_or(ProtocolError::StaleScope)?;
+                    let mut state = previous
+                        .continuation
+                        .lock()
+                        .map_err(|_| ProtocolError::ScopeUnavailable)?;
+                    let continuation = state.as_mut().ok_or(ProtocolError::StaleScope)?;
+                    // Consumption precedes validation: refused use cannot revive this ticket.
+                    let offered = continuation.phase
+                        == ObserveContinuationPhase::Reserved(operation.sequence);
+                    continuation.phase = ObserveContinuationPhase::Consumed;
+                    let mut original = request.clone();
+                    original.continuation = None;
+                    if !offered
+                        || descriptor != &continuation.descriptor
+                        || Self::observe_request_digest(&original) != continuation.request_digest
+                        || operation.sequence <= previous.sequence
+                        || operation.deadline > continuation.deadline
+                        || continuation.retirement_fence != authority.retirement_fence
+                        || !previous.owner.matches(&context.page, operation.generation)
+                        || !Self::continuation_owner_settled(&previous.owner, previous.sequence)
+                    {
+                        return Err(ProtocolError::StaleScope);
+                    }
+                    None
+                } else {
+                    Some(ObserveContinuation {
+                        cancellation: operation.cancellation.clone(),
+                        request_digest: Self::observe_request_digest(request),
+                        deadline: operation.deadline,
+                        retirement_fence,
+                        descriptor: super::client_protocol::ObserveContinuationDescriptor {
+                            version: 1,
+                            token: uuid::Uuid::new_v4().to_string(),
+                            retired_operation_seq: operation.sequence,
+                        },
+                        phase: ObserveContinuationPhase::Initial,
+                    })
+                }
+            } else {
+                None
+            };
             let (retired, _) = tokio::sync::watch::channel(false);
             let capture = Arc::new(CaptureAdmission {
+                continuation: Mutex::new(continuation),
                 owner,
                 sequence: operation.sequence,
                 retired,
@@ -1485,6 +1576,12 @@ impl ObservationDispatch {
         cleanup: &AtomicBool,
         screenshot: Option<&ScreenshotFailureWitness>,
     ) -> Result<Vec<ObservationFrame>, ProtocolError> {
+        #[cfg(test)]
+        let initial_probe = self
+            .initial_inventory_probe_for_test
+            .lock()
+            .unwrap()
+            .clone();
         let check_owner = || {
             self.check_initial_trace_owner(context, operation, retirement_fence)?;
             let capture = capture.ok_or(ProtocolError::StaleReference)?;
@@ -1514,6 +1611,8 @@ impl ObservationDispatch {
             screenshot,
             true,
             None,
+            #[cfg(test)]
+            initial_probe.as_ref(),
         )
         .await;
         let rejected = match first {
@@ -1521,6 +1620,7 @@ impl ObservationDispatch {
                 check_owner()?;
                 // The original successful-read contract permits accounted
                 // readonly disposal debt; it never requires a release ACK here.
+                Self::clear_observe_continuation(capture);
                 return Ok(inventory.frames);
             }
             Err(failure) => failure,
@@ -1546,9 +1646,19 @@ impl ObservationDispatch {
             screenshot,
             true,
             None,
+            #[cfg(test)]
+            initial_probe.as_ref(),
         )
         .await
-        .map_err(|failure| failure.record(screenshot))?;
+        .map_err(|failure| {
+            if failure.revision_only()
+                && check_owner().is_ok()
+                && Self::initial_trace_prefix_settled(context, operation, cleanup)
+            {
+                Self::mark_observe_continuation(capture);
+            }
+            failure.record(screenshot)
+        })?;
         check_owner()?;
         let ledger = context
             .page
@@ -1571,6 +1681,7 @@ impl ObservationDispatch {
         }
         // NEW readonly debt belongs to the accepted second sample, not to the
         // discarded first prefix. Its exact custody remains normally retained.
+        Self::clear_observe_continuation(capture);
         Ok(inventory.frames)
     }
     /// Enrich an independently sealed tree without giving its result deadline to
@@ -3216,10 +3327,19 @@ async fn verified_semantic_frames_with_cleanup(
     cleanup: Option<&AtomicBool>,
     screenshot: Option<&ScreenshotFailureWitness>,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
-    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, true, None)
-        .await
-        .map(|inventory| inventory.frames)
-        .map_err(|failure| failure.record(screenshot))
+    frame_inventory_attempt_impl(
+        page,
+        operation,
+        cleanup,
+        screenshot,
+        true,
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
+    .map(|inventory| inventory.frames)
+    .map_err(|failure| failure.record(screenshot))
 }
 pub async fn verified_frames(
     page: &BrowserExecutionLease,
@@ -3384,7 +3504,17 @@ async fn frame_inventory_attempt(
     cleanup: Option<&AtomicBool>,
     screenshot: Option<&ScreenshotFailureWitness>,
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
-    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, false, None).await
+    frame_inventory_attempt_impl(
+        page,
+        operation,
+        cleanup,
+        screenshot,
+        false,
+        None,
+        #[cfg(test)]
+        None,
+    )
+    .await
 }
 #[cfg(test)]
 pub(crate) async fn selected_query_frames_for_test(
@@ -3593,10 +3723,19 @@ async fn query_frames(
     screenshot: Option<&ScreenshotFailureWitness>,
     partition: Option<&super::client_enrollment::PageAcquisitionProof>,
 ) -> Result<Vec<ObservationFrame>, ProtocolError> {
-    frame_inventory_attempt_impl(page, operation, cleanup, screenshot, false, partition)
-        .await
-        .map(|inventory| inventory.frames)
-        .map_err(|error| error.record(screenshot))
+    frame_inventory_attempt_impl(
+        page,
+        operation,
+        cleanup,
+        screenshot,
+        false,
+        partition,
+        #[cfg(test)]
+        None,
+    )
+    .await
+    .map(|inventory| inventory.frames)
+    .map_err(|error| error.record(screenshot))
 }
 // Keep the original full-inventory application readiness/session proof even
 // when only one application renderer needs a tree. Non-renderer targets remain
@@ -3742,6 +3881,9 @@ async fn frame_inventory_attempt_impl(
     screenshot: Option<&ScreenshotFailureWitness>,
     readonly_disposal: bool,
     partition: Option<&super::client_enrollment::PageAcquisitionProof>,
+    #[cfg(test)] initial_probe: Option<
+        &tokio::sync::mpsc::UnboundedSender<InitialInventorySampleForTest>,
+    >,
 ) -> Result<VerifiedFrameInventory, FrameInventoryFailure> {
     check(page, operation)?;
     let (revision, targets, inventory_before) = if let Some(partition) = partition {
@@ -3753,6 +3895,25 @@ async fn frame_inventory_attempt_impl(
         page.targets
             .inventory_with_diagnostic(screenshot.is_some())?
     };
+    #[cfg(test)]
+    if let Some(probe) = initial_probe {
+        let (resume, resumed) = oneshot::channel();
+        probe
+            .send(InitialInventorySampleForTest {
+                operation_seq: operation.sequence,
+                revision,
+                resume,
+            })
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let mut cancellation = operation.cancellation.clone();
+        tokio::select! {
+            biased;
+            _ = cancellation.changed() => return Err((*cancellation.borrow()).error().unwrap_or(ProtocolError::Cancelled).into()),
+            _ = tokio::time::sleep_until(operation.deadline.into()) => return Err(ProtocolError::DeadlineExceeded.into()),
+            release = resumed => release.map_err(|_| ProtocolError::ScopeUnavailable)?,
+        }
+        check(page, operation)?;
+    }
     if let Some(witness) = screenshot {
         witness.revision(revision);
     }
@@ -4727,6 +4888,7 @@ mod tests {
         });
         assert!(ScreenshotFailureWitness::new(&pixels, &op, true).is_none());
         let observe = DispatchRequest::Observe(ObserveRequest {
+            continuation: None,
             options: ObserveFlags::default(),
             test_id_attribute: "data-testid".into(),
             secure_field_selector: "input[type=password]".into(),
@@ -4741,6 +4903,7 @@ mod tests {
     #[test]
     fn optional_pixel_witness_is_opt_in_and_keeps_pre_capture_refusal_before_cleanup() {
         let request = DispatchRequest::Observe(ObserveRequest {
+            continuation: None,
             options: ObserveFlags {
                 pixels: true,
                 ..ObserveFlags::default()
@@ -4834,6 +4997,7 @@ mod tests {
     #[test]
     fn semantic_read_witness_keeps_first_stage_and_does_not_invent_typed_scope_failure() {
         let request = DispatchRequest::Observe(ObserveRequest {
+            continuation: None,
             options: ObserveFlags::default(),
             test_id_attribute: "private-test-id".into(),
             secure_field_selector: "private-selector".into(),
@@ -4884,6 +5048,7 @@ mod tests {
     #[test]
     fn semantic_trace_retains_first_inventory_failure_without_enabling_capture() {
         let trace = DispatchRequest::TraceSemantic(ObserveRequest {
+            continuation: None,
             options: ObserveFlags::default(),
             test_id_attribute: "data-testid".into(),
             secure_field_selector: "input[type=password]".into(),
@@ -5871,6 +6036,7 @@ mod tests {
                     },
                 },
                 DispatchRequest::Observe(ObserveRequest {
+                    continuation: None,
                     options: ObserveFlags {
                         pixels,
                         pixel_fallback: fallback,
@@ -6586,6 +6752,7 @@ mod tests {
             },
         ] {
             let request = DispatchRequest::TraceSemantic(ObserveRequest {
+                continuation: None,
                 options: flags,
                 test_id_attribute: policy.test_id_attribute.clone(),
                 secure_field_selector: policy.secure_field_selector.clone(),
@@ -6933,6 +7100,7 @@ mod tests {
                 },
             },
             DispatchRequest::Observe(ObserveRequest {
+                continuation: None,
                 options: ObserveFlags {
                     pixels: false,
                     pixel_fallback,
@@ -7560,3 +7728,6 @@ mod node_identity_resample_fence_tests {
 #[cfg(test)]
 #[path = "client_observe_node_identity_chain_tests.rs"]
 mod node_identity_layered_chain_tests;
+
+#[path = "client_observe_continuation.rs"]
+mod observe_continuation;

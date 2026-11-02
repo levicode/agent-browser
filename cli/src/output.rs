@@ -3996,6 +3996,7 @@ Sessions:
   session connect --json     Persistent protocol; explicit one-use --session required
                              Negotiated trace captures do not publish semantic observations
                              terminal.close/1: cleanup-only close after quarantine
+                             browser.observe-continuation/1: one exact-owner fresh read
                              browser.fixture-read-fields/1: pure values, no refs or debt reset
 
 MCP:

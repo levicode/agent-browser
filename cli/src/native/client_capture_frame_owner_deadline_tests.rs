@@ -189,6 +189,7 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
             dispatch.clone().start(
                 owner.context(),
                 DispatchRequest::Observe(ObserveRequest {
+                    continuation: None,
                     options: ObserveFlags {
                         pixels: false,
                         pixel_fallback: true,

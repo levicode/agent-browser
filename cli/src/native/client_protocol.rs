@@ -389,6 +389,15 @@ pub struct RetentionDescriptor {
     pub object_debt: u32,
 }
 
+/// One-use authorization for a fresh read after exact clean settlement.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ObserveContinuationDescriptor {
+    pub version: u8,
+    pub token: String,
+    pub retired_operation_seq: u64,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum ServerMessage {
@@ -418,6 +427,11 @@ pub enum ServerMessage {
         retention: Option<RetentionDescriptor>,
         #[serde(skip_serializing_if = "Option::is_none")]
         recovery: Option<RecoveryDescriptor>,
+        #[serde(
+            rename = "observeContinuation",
+            skip_serializing_if = "Option::is_none"
+        )]
+        observe_continuation: Option<ObserveContinuationDescriptor>,
         #[serde(rename = "scopeState")]
         scope_state: ScopeState,
     },
@@ -678,6 +692,7 @@ mod tests {
             );
             let message = ServerMessage::Result {
                 recovery: None,
+                observe_continuation: None,
                 retention: None,
                 id: "frame".into(),
                 generation: 1,

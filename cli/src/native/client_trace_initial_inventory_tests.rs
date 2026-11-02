@@ -18,6 +18,7 @@ enum Race {
     Once,
     Continuous,
     AttachOtherContinuous,
+    AttachOtherTwice,
     AttachOtherHeldRelease,
     Cancel,
     Sealed,
@@ -101,16 +102,32 @@ impl Fixture {
     ) -> Self {
         if broker.is_some() {
             // These cases do not use the legacy peer-owned cancellation sender.
-            assert!(readonly && matches!(race,
-                Race::Continuous | Race::HeldRelease | Race::Replacement
-                    | Race::Sealed | Race::ReleaseError
-                    | Race::AttachOtherContinuous | Race::AttachOtherHeldRelease));
+            assert!(
+                readonly
+                    && matches!(
+                        race,
+                        Race::Continuous
+                            | Race::HeldRelease
+                            | Race::Replacement
+                            | Race::Sealed
+                            | Race::ReleaseError
+                            | Race::ReleaseWrongSession
+                            | Race::AttachOtherContinuous
+                            | Race::AttachOtherTwice
+                            | Race::AttachOtherHeldRelease
+                    )
+            );
         }
         let dispatch = ObservationDispatch::new(Arc::new(Mutex::new(RefMap::new())));
         let peer_dispatch = dispatch.clone();
         let targets = ClientTargets::new("context".into(), "scope".into());
-        let attach_other = matches!(race, Race::AttachOtherContinuous | Race::AttachOtherHeldRelease);
-        if attach_other { targets.enable_inventory_diagnostics_for_test(); }
+        let attach_other = matches!(
+            race,
+            Race::AttachOtherContinuous | Race::AttachOtherTwice | Race::AttachOtherHeldRelease
+        );
+        if attach_other {
+            targets.enable_inventory_diagnostics_for_test();
+        }
         ready(&targets).await;
         let attached_others = Arc::new(Mutex::new(Vec::new()));
         let peer_attached_others = attached_others.clone();
@@ -200,6 +217,7 @@ impl Fixture {
                             peer_samples.fetch_add(1, Ordering::SeqCst);
                             let invalidate = match race {
                                 Race::Continuous | Race::AttachOtherContinuous => true,
+                                Race::AttachOtherTwice => completed < 2,
                                 Race::Protected => completed == 1,
                                 Race::InvalidLoader | Race::HeldReleaseWithoutMutation => false,
                                 _ => completed == 0,
@@ -1100,3 +1118,6 @@ async fn trace_initial_inventory_settlement_requires_exact_current_owner() {
 
 #[path = "client_observe_initial_inventory_tests.rs"]
 mod observe_tests;
+
+#[path = "client_observe_continuation_tests.rs"]
+mod continuation_tests;

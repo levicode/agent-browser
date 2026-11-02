@@ -2999,6 +2999,31 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             .admission_deadline_cap(generation, command, args)
     }
 
+    fn offer_observe_continuation(
+        &self,
+        settlement: super::client_session::ObservationSettlement,
+    ) -> Option<super::client_protocol::ObserveContinuationDescriptor> {
+        if !self.broker.observation_operation_settled(settlement.key()) {
+            return None;
+        }
+        self.observation.offer_observe_continuation(settlement)
+    }
+
+    fn admission_deadline_cap_for_sequence(
+        &self,
+        generation: u64,
+        sequence: u64,
+        command: &str,
+        args: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Option<std::time::Instant>, ProtocolError> {
+        if command == "browser.observe" {
+            return self
+                .observation
+                .observe_deadline_cap(generation, sequence, args);
+        }
+        self.admission_deadline_cap(generation, command, args)
+    }
+
     fn capabilities(&self) -> Vec<String> {
         // Capabilities describe implemented, wired candidate contracts. External
         // acceptance evidence separately determines release readiness.
@@ -3015,6 +3040,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             "browser.page/1",
             super::client_protocol::PAGE_IDENTITY_FENCE,
             "browser.observe/1",
+            "browser.observe-continuation/1",
             "browser.observe-frame-policy/1",
             "browser.issuance-bound-references/1",
             "browser.trace-semantic/1",
@@ -3549,9 +3575,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let value = serde_json::Value::Object(args);
             let request = match command.as_str() {
                 "browser.observe" => serde_json::from_value(value).map(DispatchRequest::Observe),
-                "browser.trace" => {
-                    serde_json::from_value(value).map(DispatchRequest::TraceSemantic)
-                }
+                "browser.trace" => serde_json::from_value::<
+                    super::client_observation_dispatch::ObserveRequest,
+                >(value)
+                .and_then(|request| {
+                    if request.continuation.is_some() {
+                        return Err(<serde_json::Error as serde::de::Error>::custom(
+                            "trace cannot continue observation",
+                        ));
+                    }
+                    Ok(DispatchRequest::TraceSemantic(request))
+                }),
                 "fixture.correlate" => {
                     serde_json::from_value(value).map(DispatchRequest::Correlate)
                 }
@@ -7124,3 +7158,7 @@ mod recording_attempt_tests;
 #[cfg(test)]
 #[path = "client_activation_interruption_tests.rs"]
 mod activation_interruption_tests;
+
+#[cfg(all(test, unix))]
+#[path = "client_observe_joint_browser_tests.rs"]
+mod observe_joint_browser_tests;

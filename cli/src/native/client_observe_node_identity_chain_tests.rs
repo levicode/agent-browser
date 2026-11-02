@@ -366,6 +366,7 @@ async fn fixture(case: ReplyCase, multi: bool) -> Fixture {
         .prepare(
             context,
             DispatchRequest::Observe(ObserveRequest {
+                continuation: None,
                 options: ObserveFlags::default(),
                 test_id_attribute: "data-testid".into(),
                 secure_field_selector: "input[type=password]".into(),

@@ -61,6 +61,7 @@ impl Chain {
                 effects: Effects::Completed,
                 retention: None,
                 recovery: None,
+                observe_continuation: None,
                 scope_state: ScopeState::Usable,
             })
             .unwrap();
@@ -285,6 +286,7 @@ async fn same_client_foreign_network_is_refused_before_any_token_revocation() {
             effects: Effects::Completed,
             retention: None,
             recovery: None,
+            observe_continuation: None,
             scope_state: ScopeState::Usable,
         })
         .unwrap();

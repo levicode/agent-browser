@@ -9837,6 +9837,7 @@ mod tests {
         let scoped_sink = sink.stage_until_result(&stage_op, scope).unwrap();
         sink.acknowledge_result_for_test(&ServerMessage::Result {
             recovery: None,
+            observe_continuation: None,
             id: "initial".into(),
             generation: 1,
             operation_seq: 900,

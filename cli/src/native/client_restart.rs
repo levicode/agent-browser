@@ -1119,6 +1119,7 @@ mod tests {
             };
             let message = ServerMessage::Result {
                 recovery: None,
+                observe_continuation: None,
                 retention: None,
                 id: "reopen".into(),
                 generation: 1,
