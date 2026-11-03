@@ -113,6 +113,10 @@ pub(crate) struct DisconnectedRecoveryProof {
     key: OperationKey,
     ledger: std::sync::Arc<super::client_debt::OwnerDebtLedger>,
     deadline: Instant,
+    /// Transport-ordering controls need an exact receipt without a full
+    /// browser owner; production proofs never set this.
+    #[cfg(test)]
+    ordering_only: bool,
 }
 impl DisconnectedRecoveryProof {
     pub(crate) fn key(&self) -> OperationKey {
@@ -125,6 +129,10 @@ impl DisconnectedRecoveryProof {
         self.deadline
     }
     pub(crate) fn check(&self) -> Result<(), ProtocolError> {
+        #[cfg(test)]
+        if self.ordering_only {
+            return Ok(());
+        }
         if Instant::now() >= self.deadline {
             return Err(ProtocolError::DeadlineExceeded);
         }
@@ -132,6 +140,21 @@ impl DisconnectedRecoveryProof {
             return Err(ProtocolError::ScopeUnavailable);
         }
         Ok(())
+    }
+    /// Construct a receipt for transport-ordering controls only. Production
+    /// proofs always come from `OperationRegistry::recovery_candidate`.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        key: OperationKey,
+        ledger: std::sync::Arc<super::client_debt::OwnerDebtLedger>,
+        deadline: Instant,
+    ) -> Self {
+        Self {
+            key,
+            ledger,
+            deadline,
+            ordering_only: true,
+        }
     }
 }
 #[derive(Default)]
@@ -416,6 +439,8 @@ impl OperationRegistry {
             key,
             ledger,
             deadline,
+            #[cfg(test)]
+            ordering_only: false,
         };
         proof.check().ok()?;
         if !source.result_fixed

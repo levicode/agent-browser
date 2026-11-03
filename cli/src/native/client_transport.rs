@@ -1402,6 +1402,9 @@ where
     let mut terminal_control = false;
     let mut terminal_recording = None;
     let mut terminal_sequence = 0u64;
+    // Declared before the control lane: an explicit close must capture the
+    // unclaimed disconnected-recovery receipt before its quarantine seals it.
+    let closing_recovery = std::sync::Arc::new(std::sync::Mutex::new(None));
     // Retained across both phases: cancelling a read must not discard its prefix.
     let mut incoming_frame = Vec::new();
     let mut timer = tokio::time::interval(std::time::Duration::from_millis(25));
@@ -1696,6 +1699,15 @@ where
                         .is_ok_and(|(current, _)| current == generation) =>
                 {
                     settlement_trace!(0, CloseReceived);
+                    // The scope may still hold an unclaimed disconnected-recovery
+                    // receipt. Capture it before the quarantine below seals the
+                    // broker, which would permanently clear that proof. Only an
+                    // explicit close owns this receipt.
+                    if let Ok(mut slot) = closing_recovery.lock() {
+                        if slot.is_none() {
+                            *slot = broker.take_closing_recovery();
+                        }
+                    }
                     // Claim terminal authority before any other admitted task
                     // can submit a new application command on this generation.
                     let _ = broker.quarantine();
@@ -1720,18 +1732,6 @@ where
                         settlement_trace!(sequence, CancelQueued);
                     }
                 }
-            }
-        }
-    }
-    // The Close exchange may arrive while the scope still holds its unclaimed
-    // disconnected-recovery receipt. Declare the slot before the terminal lane
-    // so the receipt is captured either when Close is handled or here, before
-    // the seal below clears it. A sealed broker never re-offers that proof.
-    let closing_recovery = std::sync::Arc::new(std::sync::Mutex::new(None));
-    if closing_id.is_some() {
-        if let Ok(mut slot) = closing_recovery.lock() {
-            if slot.is_none() {
-                *slot = broker.take_closing_recovery();
             }
         }
     }
@@ -3094,6 +3094,88 @@ mod tests {
         assert_eq!(closed["type"], "closed");
         assert_eq!(closed["id"], "z");
         assert!(read_frame(&mut peer).await.unwrap().is_none());
+        assert!(serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn close_captures_an_offered_disconnected_recovery_before_quarantine() {
+        struct RecoveryCloseExecutor {
+            received: std::sync::atomic::AtomicBool,
+        }
+        impl ClientExecutor for RecoveryCloseExecutor {
+            fn capabilities(&self) -> Vec<String> {
+                vec![]
+            }
+            async fn execute(
+                &self,
+                _: String,
+                _: serde_json::Map<String, serde_json::Value>,
+                _: OperationLease,
+            ) -> NativeOutcome {
+                panic!("close never dispatches ordinary work");
+            }
+            async fn shutdown(&self) -> Result<(), ProtocolError> {
+                Ok(())
+            }
+            fn shutdown_with_recovery(
+                &self,
+                recovery: Option<super::super::client_operation_state::DisconnectedRecoveryProof>,
+            ) -> impl std::future::Future<Output = Result<(), ProtocolError>> + Send {
+                self.received
+                    .store(recovery.is_some(), std::sync::atomic::Ordering::SeqCst);
+                async { Ok(()) }
+            }
+        }
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        let broker = std::sync::Arc::new(ClientSession::new());
+        // The transport must take the receipt from the quarantined broker, so
+        // offer the exact owner proof before the close exchange starts.
+        broker.quarantine().unwrap();
+        let ledger = OwnerDebtLedger::new(1, "scope".to_owned());
+        ledger.observe_remote_eof();
+        let proof = super::super::client_operation_state::DisconnectedRecoveryProof::for_test(
+            OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            },
+            ledger,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        broker.offer_disconnected_recovery(proof).unwrap();
+        let executor = std::sync::Arc::new(RecoveryCloseExecutor {
+            received: std::sync::atomic::AtomicBool::new(false),
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker.clone(),
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        let ready = settlement_frame(&mut peer).await;
+        assert_eq!(ready["type"], "ready");
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        let closed = settlement_frame(&mut peer).await;
+        // The exact unclaimed receipt reached the executor, so a close after a
+        // lost connection is an ordinary proven retirement rather than an
+        // unproven receipt.
+        assert!(
+            executor.received.load(std::sync::atomic::Ordering::SeqCst),
+            "close did not hand the offered disconnected-recovery receipt to the executor"
+        );
+        assert_eq!(closed["type"], "closed");
+        assert_eq!(closed["id"], "z");
+        assert_eq!(closed["scopeState"], "closed");
+        assert!(closed.get("cleanup").is_none());
         assert!(serving.await.unwrap());
     }
     #[tokio::test]
