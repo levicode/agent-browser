@@ -70,6 +70,15 @@ async fn interposition_peer() -> (
                             assert_eq!(request["params"]["userGesture"], true);
                             Some(json!({"result":{"type":"object","value":{"value":{"ok":true,"value":null}}}}))
                         }
+                        "Runtime.evaluate"
+                            if request["params"]["expression"]
+                                == "String(globalThis.location && globalThis.location.href)" =>
+                        {
+                            // The paused initial-document probe sees a document
+                            // that already started; the future registration
+                            // covers it, so the one-shot does nothing.
+                            Some(json!({"result":{"type":"string","value":"https://fixture.invalid/path"}}))
+                        }
                         "Runtime.evaluate" => {
                             assert_eq!(request["params"]["expression"], "location.href");
                             None

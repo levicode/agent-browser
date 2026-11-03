@@ -5425,39 +5425,18 @@ impl ClientEnrollment {
                 .await
                 .map_err(|failure| self.initialization_component_failure(failure))?;
             if paused_new_page {
-                // Register the paused popup's init scripts as soon as the
-                // network boundary is configured. This browser may be shared
-                // with another CDP client, and that client can release the
-                // `waitForDebuggerOnStart` pause at any time: the first
-                // document that starts before this registration never sees the
-                // session's init scripts.
+                // Install the future-document init scripts immediately after
+                // the network boundary and before the remaining setup. This
+                // browser may be shared with another CDP client that can
+                // release the pause and start the first document at any
+                // moment. The already-created initial empty document is
+                // executed once after the frame inventory and emulation are in
+                // place, so its ready signal never precedes enrollment.
                 self.initialization_command(op, Some(&entry.session), "Page.enable", json!({}))
                     .await?;
-                // Create the main world before the first registration.
-                // Chromium runs registrations immediately for a paused new
-                // window; creating the world inside that first registration
-                // can re-enter new-document injection and execute only script
-                // zero twice. Runtime events are already subscribed.
-                observe_popup_setup(
-                    super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableEntered,
-                );
-                ServiceWorkerAdmission::observe(
-                    admission,
-                    WorkerAdmissionStep::RuntimeEnable,
-                    self.initialization_command(
-                        op,
-                        Some(&entry.session),
-                        "Runtime.enable",
-                        json!({}),
-                    ),
-                )
-                .await?;
-                observe_popup_setup(
-                    super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableAcknowledged,
-                );
                 let revision = self
                     .page
-                    .apply_to_paused_new_session_initialization(&lease, &entry.session, op)
+                    .apply_to_new_session_initialization(&lease, &entry.session, op)
                     .await
                     .map_err(|failure| self.initialization_component_failure(failure))?;
                 if revision != self.page.config_revision()? {
@@ -5498,28 +5477,31 @@ impl ClientEnrollment {
                     self.frame_tree(&entry, tree, 0)?;
                 }
             }
-            if !paused_new_page {
-                // Create the main world before registering scripts. For a
-                // paused new page the early registration above already created
-                // it. Runtime events are subscribed and resume remains after
-                // all ACKs.
-                observe_popup_setup(
-                    super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableEntered,
-                );
-                ServiceWorkerAdmission::observe(
-                    admission,
-                    WorkerAdmissionStep::RuntimeEnable,
-                    self.initialization_command(
-                        op,
-                        Some(&entry.session),
-                        "Runtime.enable",
-                        json!({}),
-                    ),
-                )
-                .await?;
-                observe_popup_setup(
-                    super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableAcknowledged,
-                );
+            // Create the main world before any script runs in it. For a
+            // paused new page this follows the frame inventory and emulation
+            // setup, so the one-shot initial-document execution (below) reports
+            // only after enrollment has registered everything it needs.
+            observe_popup_setup(
+                super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableEntered,
+            );
+            ServiceWorkerAdmission::observe(
+                admission,
+                WorkerAdmissionStep::RuntimeEnable,
+                self.initialization_command(op, Some(&entry.session), "Runtime.enable", json!({})),
+            )
+            .await?;
+            observe_popup_setup(
+                super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+            );
+            if paused_new_page {
+                let revision = self
+                    .page
+                    .run_paused_initial_document_scripts(&lease, &entry.session, op)
+                    .await
+                    .map_err(|failure| self.initialization_component_failure(failure))?;
+                if revision != self.page.config_revision()? {
+                    return Err(ProtocolError::StaleScope.into());
+                }
             }
             if page_target {
                 let revision = match initialization_revision {
@@ -19718,7 +19700,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn popup_runtime_ack_precedes_every_script_and_failure_never_resumes() {
+    async fn popup_initial_execution_waits_for_runtime_ack_and_failure_never_resumes() {
         for fail in [false, true] {
             let (owner, _notices, log, emit, server) = fixture("popup-runtime-held").await;
             owner
@@ -19793,9 +19775,12 @@ mod tests {
                 )
                 .unwrap()
                 .is_none());
+            // The future-document registrations are already installed; the
+            // initial-document execution and the resume still wait for the
+            // Runtime ACK.
             assert!(!log.lock().unwrap().iter().any(|request| matches!(
                 request["method"].as_str(),
-                Some("Page.addScriptToEvaluateOnNewDocument" | "Runtime.runIfWaitingForDebugger")
+                Some("Runtime.evaluate" | "Runtime.runIfWaitingForDebugger")
             )));
             let response = if fail {
                 json!({"id":runtime["id"],"error":{"code":-32000,"message":"synthetic runtime refusal"}})
@@ -19811,7 +19796,12 @@ mod tests {
                 .collect();
             if fail {
                 assert!(result.is_err());
-                assert!(scripts.is_empty());
+                // The registrations stay installed, but the initial document
+                // never ran a script and the pause was not released.
+                assert_eq!(scripts.len(), 4);
+                assert!(!commands
+                    .iter()
+                    .any(|request| request["method"] == "Runtime.evaluate"));
                 assert!(!commands
                     .iter()
                     .any(|request| request["method"] == "Runtime.runIfWaitingForDebugger"));
@@ -19820,7 +19810,7 @@ mod tests {
                 assert_eq!(scripts.len(), 4);
                 assert!(scripts
                     .iter()
-                    .all(|request| request["params"]["runImmediately"] == true));
+                    .all(|request| request["params"].get("runImmediately").is_none()));
                 // A duplicate attachment after resume also performs no script
                 // registration or resume. The cloned resumed flag is not the
                 // one-shot proof: exact session registration rejects duplicates.
@@ -19846,13 +19836,21 @@ mod tests {
                     .iter()
                     .position(|request| request["method"] == "Runtime.enable")
                     .unwrap();
+                let evaluate_pos = commands
+                    .iter()
+                    .position(|request| {
+                        request["sessionId"] == "popup-session"
+                            && request["method"] == "Runtime.evaluate"
+                    })
+                    .unwrap();
                 let resume_pos = commands
                     .iter()
                     .position(|request| request["method"] == "Runtime.runIfWaitingForDebugger")
                     .unwrap();
+                assert!(runtime_pos < evaluate_pos && evaluate_pos < resume_pos);
                 for (position, request) in commands.iter().enumerate() {
                     if request["method"] == "Page.addScriptToEvaluateOnNewDocument" {
-                        assert!(runtime_pos < position && position < resume_pos);
+                        assert!(position < runtime_pos);
                     }
                 }
             }
@@ -19896,13 +19894,13 @@ mod tests {
                 .collect();
             assert_eq!(scripts.len(), 2);
             assert!(scripts[0]["params"].get("runImmediately").is_none());
+            assert!(scripts[1]["params"].get("runImmediately").is_none());
             if receipt == Some(json!(true)) {
-                assert_eq!(scripts[1]["params"]["runImmediately"], true);
-                // The network boundary must be configured first, but another
-                // CDP client sharing this browser can release the debugger
-                // pause at any moment, so a paused new page's init registration
-                // must still precede the remaining DOM/frame setup and the
-                // resume itself.
+                // The network boundary must be configured first, but the
+                // future-document registration must precede the remaining DOM,
+                // emulation and frame setup and the resume. The initial empty
+                // document is executed once after that setup, so its ready
+                // signal never precedes enrollment.
                 let first_script = commands
                     .iter()
                     .position(|request| {
@@ -19910,6 +19908,17 @@ mod tests {
                             && request["method"] == "Page.addScriptToEvaluateOnNewDocument"
                     })
                     .unwrap();
+                let network = commands
+                    .iter()
+                    .position(|request| {
+                        request["sessionId"] == "popup-session"
+                            && request["method"] == "Network.enable"
+                    })
+                    .unwrap();
+                assert!(
+                    network < first_script,
+                    "the network boundary must precede paused init registration"
+                );
                 for later in ["DOM.enable", "Page.getFrameTree"] {
                     if let Some(index) = commands.iter().position(|request| {
                         request["sessionId"] == "popup-session" && request["method"] == later
@@ -19920,6 +19929,20 @@ mod tests {
                         );
                     }
                 }
+                let runtime = commands
+                    .iter()
+                    .position(|request| {
+                        request["sessionId"] == "popup-session"
+                            && request["method"] == "Runtime.enable"
+                    })
+                    .unwrap();
+                let evaluate = commands
+                    .iter()
+                    .position(|request| {
+                        request["sessionId"] == "popup-session"
+                            && request["method"] == "Runtime.evaluate"
+                    })
+                    .unwrap();
                 let resume = commands
                     .iter()
                     .position(|request| {
@@ -19928,11 +19951,9 @@ mod tests {
                     })
                     .unwrap();
                 assert!(
-                    first_script < resume,
-                    "paused init-script registration must precede the resume"
+                    first_script < runtime && runtime < evaluate && evaluate < resume,
+                    "paused setup must register, execute and resume in that order"
                 );
-            } else {
-                assert!(scripts[1]["params"].get("runImmediately").is_none());
             }
             owner.close().await.unwrap();
             owner.network.close().await.unwrap();

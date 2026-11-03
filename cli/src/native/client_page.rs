@@ -902,17 +902,57 @@ impl ClientPageState {
         self.apply_to_new_session_initialization_mode(page, session, op, false, true)
             .await
     }
-    /// Enrollment only: a new authorized application page attachment explicitly paused by CDP,
-    /// before its first resume. Ordinary init-script updates remain future-only.
-    pub(crate) async fn apply_to_paused_new_session_initialization(
+    /// Enrollment only: run the configured init scripts once in the initial
+    /// empty document of a paused new page, after the future-document
+    /// registrations were installed before resume. The first document may
+    /// already have started if another CDP client released the pause; a
+    /// non-empty document is left to the earlier registration. A user init
+    /// script that throws cannot fail enrollment, matching the
+    /// `Page.addScriptToEvaluateOnNewDocument` contract.
+    pub(crate) async fn run_paused_initial_document_scripts(
         &self,
         page: &BrowserExecutionLease,
         session: &str,
         op: &OperationLease,
     ) -> Result<u64, ObservedOperationFailure> {
-        self.apply_to_new_session_initialization_mode(page, session, op, true, true)
-            .await
+        self.validate_initialization(page, op)?;
+        let config = self.state()?.config.clone();
+        if config.scripts.is_empty() {
+            return Ok(config.revision);
+        }
+        let location = command_initialization_component(
+            page,
+            op,
+            Some(session),
+            "Runtime.evaluate",
+            json!({
+                "expression": "String(globalThis.location && globalThis.location.href)",
+                "returnByValue": true,
+            }),
+        )
+        .await?;
+        let href = location
+            .get("result")
+            .and_then(|result| result.get("value"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if href != "about:blank" {
+            return Ok(config.revision);
+        }
+        for source in &config.scripts {
+            command_initialization_component(
+                page,
+                op,
+                Some(session),
+                "Runtime.evaluate",
+                json!({"expression": source.as_ref()}),
+            )
+            .await?;
+            self.validate_initialization(page, op)?;
+        }
+        Ok(config.revision)
     }
+    /// Test-only registration evidence: successful ACK ordinals, never source/IDs.
     async fn apply_to_new_session_initialization_mode(
         &self,
         page: &BrowserExecutionLease,
@@ -2930,28 +2970,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn immediate_init_is_explicit_and_installed_once_per_session() {
+    async fn init_registration_is_future_only_and_the_initial_document_runs_once() {
         let (page, log, task) = mock("normal").await;
         let (op, _sender) = operation();
         let state = ClientPageState::new("scope".into(), "context".into());
         state.ensure_service_worker_policy(&page, &op).unwrap();
-        // Existing-page/update route never opts into current-world execution.
+        // Every route installs future-document registrations only. A paused
+        // attachment's already-created initial empty document is handled by a
+        // separate one-shot after the network boundary is configured.
         state
             .apply_to_new_session_initialization(&page, "existing", &op)
             .await
             .unwrap();
-        // Paused new attachment route opts in, but repeated application does
-        // not register or execute the already acknowledged script again.
-        state
-            .apply_to_paused_new_session_initialization(&page, "paused", &op)
-            .await
-            .unwrap();
-        state
-            .apply_to_paused_new_session_initialization(&page, "paused", &op)
-            .await
-            .unwrap();
         state
             .apply_to_new_session_initialization(&page, "paused", &op)
+            .await
+            .unwrap();
+        state
+            .run_paused_initial_document_scripts(&page, "paused", &op)
+            .await
+            .unwrap();
+        // Repeating neither re-registers nor re-executes.
+        state
+            .apply_to_new_session_initialization(&page, "paused", &op)
+            .await
+            .unwrap();
+        state
+            .run_paused_initial_document_scripts(&page, "paused", &op)
             .await
             .unwrap();
         let events = log.lock().unwrap();
@@ -2963,7 +3008,12 @@ mod tests {
         assert_eq!(scripts[0]["sessionId"], "existing");
         assert!(scripts[0]["params"].get("runImmediately").is_none());
         assert_eq!(scripts[1]["sessionId"], "paused");
-        assert_eq!(scripts[1]["params"]["runImmediately"], true);
+        assert!(scripts[1]["params"].get("runImmediately").is_none());
+        // The mock's current document is not about:blank, so the one-shot only
+        // probes the location and leaves the document to the registration.
+        assert!(events
+            .iter()
+            .any(|event| event["method"] == "Runtime.evaluate" && event["sessionId"] == "paused"));
         drop(events);
         task.abort();
     }
