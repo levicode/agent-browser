@@ -4564,8 +4564,16 @@ fn capture_error(error: CaptureReason) -> ProtocolError {
         CaptureReason::Superseded => ProtocolError::StaleReference,
         CaptureReason::BrowserFailure => ProtocolError::BrowserFailure,
         CaptureReason::BoundsExceeded => ProtocolError::CapacityExceeded,
-        CaptureReason::IncompleteFrames
-        | CaptureReason::UnsafeGeometry
+        // A frame inventory that moved between the semantic read and the
+        // geometry read is a repeatable race, not a policy refusal: the page
+        // was changing under the capture. Report it as stale so a caller with
+        // a usable scope can take a fresh capture instead of treating a
+        // transient layout change as a denied operation.
+        CaptureReason::IncompleteFrames => ProtocolError::StaleReference,
+        // The remaining reasons are proof failures: unsafe or opaque masking
+        // geometry cannot be published, and no retry makes an unprovable mask
+        // provable. They stay policy refusals.
+        CaptureReason::UnsafeGeometry
         | CaptureReason::UninspectableContent
         | CaptureReason::MaskingUnproven => ProtocolError::PolicyDenied,
     }
@@ -7504,6 +7512,13 @@ mod tests {
         assert_eq!(
             capture_error(CaptureReason::UnsafeGeometry),
             ProtocolError::PolicyDenied
+        );
+        // A frame inventory that moved under a read is a repeatable capture
+        // race; classifying it as a policy refusal made a transient layout
+        // change non-retryable.
+        assert_eq!(
+            capture_error(CaptureReason::IncompleteFrames),
+            ProtocolError::StaleReference
         );
         assert_eq!(
             capture_error(CaptureReason::Cancelled),
