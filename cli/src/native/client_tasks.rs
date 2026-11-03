@@ -304,7 +304,15 @@ impl RetainedTasks {
                 // retirement before finish_remote_eof seals the producer; after
                 // that transition retire correctly refuses IntegrityLost.
                 // This grants neither usable retention nor remote cleanup proof.
-                if outcome.effects == Effects::Unknown || remote_only {
+                //
+                // A lost settlement proof retires first for the same reason,
+                // whatever the public effects say: retirement revokes the
+                // operation's application submission and eval windows before
+                // the integrity-lost finish. Without it, a read-only dispatch
+                // that now settles as a non-dispatch would leave those claims
+                // in the ledger and the later close exchange could not prove
+                // cleanup.
+                if outcome.effects == Effects::Unknown || dirty || remote_only {
                     operations.retire(key);
                 }
                 let dirty = (if remote_only {
