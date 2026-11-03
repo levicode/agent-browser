@@ -6401,9 +6401,15 @@ mod tests {
                     );
                     assert!(outcome.retention.is_none());
                     assert_eq!(lost, dirty);
+                    // A trace capture installs page protection, so a lost
+                    // restore leaves the page uncertain. The non-trace leg is
+                    // the read-only control: a lost proof there settles as a
+                    // retryable non-dispatch and still quarantines through the
+                    // `lost` decision.
+                    let uncertain = dirty && trace;
                     assert_eq!(
                         outcome.effects,
-                        if dirty {
+                        if uncertain {
                             Effects::Unknown
                         } else {
                             Effects::NotDispatched
@@ -6411,7 +6417,7 @@ mod tests {
                     );
                     assert_eq!(
                         broker.settle(1, 1, outcome.effects).unwrap(),
-                        if dirty {
+                        if uncertain {
                             ScopeState::Quarantined
                         } else {
                             ScopeState::Usable
