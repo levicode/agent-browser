@@ -2910,29 +2910,15 @@ impl ClientBrowser {
         let drain_failed = self.gate.drained().await.is_err();
         self.tasks.seal().await;
         let mut task_cleanup_failed = self.tasks.drain_current().await.is_err();
-        // An unclaimed disconnected-recovery receipt is the exact owner evidence
-        // for the tasks drain just refused. Retire that disconnected owner before
-        // choosing the terminal read-only fallback, whose enrollment proof cannot
-        // accept the unreachable commands the lost connection left behind. The
-        // close is then an ordinary close of a locally proven retirement.
-        if task_cleanup_failed {
-            if let Some(proof) = closing_recovery.as_ref() {
-                let drained = self.tasks.drain_disconnected_for_close(proof).await.is_ok();
-                let retired = drained && self.tasks.retire_disconnected_owner(proof).is_ok();
-                if retired {
-                    cleanup_trace::terminal_cleanup_checkpoint(
-                        TerminalCleanupStage::TaskProof,
-                        true,
-                    );
-                    task_cleanup_failed = false;
-                }
-            }
-        }
         // Keep both journals in owner storage across cancellation or failed
         // final cleanup. A local take would drop unresolved retained resources.
         let mut owner = self.owner.lock().await;
-        let terminal_operations = if task_cleanup_failed {
-            match owner
+        let mut terminal_operations = None;
+        if task_cleanup_failed {
+            // The proven terminal read-only path keeps precedence so a scope the
+            // existing receipt already covers is never downgraded by the
+            // recovery fallback below.
+            terminal_operations = match owner
                 .as_ref()
                 .and_then(|owner| owner.manager.client.debt_ledger())
             {
@@ -2945,10 +2931,24 @@ impl ClientBrowser {
                     prepared.ok()
                 }
                 None => None,
+            };
+            // Only when that receipt refuses does an unclaimed disconnected
+            // recovery become the evidence: drain and retire that exact owner,
+            // then close it ordinarily as a locally proven retirement.
+            if terminal_operations.is_none() {
+                if let Some(proof) = closing_recovery.as_ref() {
+                    let drained = self.tasks.drain_disconnected_for_close(proof).await.is_ok();
+                    let retired = drained && self.tasks.retire_disconnected_owner(proof).is_ok();
+                    if retired {
+                        cleanup_trace::terminal_cleanup_checkpoint(
+                            TerminalCleanupStage::TaskProof,
+                            true,
+                        );
+                        task_cleanup_failed = false;
+                    }
+                }
             }
-        } else {
-            None
-        };
+        }
         let mut terminal = None;
         let cleaned = match (owner.as_mut(), terminal_operations.as_ref()) {
             (Some(owner), Some(operations)) => {
