@@ -522,7 +522,7 @@ async fn retained_observe_receipt_control(race: Race, acknowledge_after_receipt:
                     let cleanup = task.join.await;
                     // Observe the actual join. Never substitute Ok(cleanup).
                     let joined_clean = matches!(&cleanup, Ok(Ok(())));
-                    let (outcome, dirty) = settle_observation_dispatch(output, cleanup);
+                    let (outcome, dirty) = settle_observation_dispatch(output, cleanup, true);
                     *join_receipt.lock().unwrap() = Some((original_error, joined_clean, dirty));
                     let (outcome, dirty) =
                         settle_trace_screenshot(outcome, dirty, false, &receipt_journal);

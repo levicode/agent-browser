@@ -2213,6 +2213,25 @@ impl RetirementJournal {
 type ConnectionWatch =
     Arc<tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), ProtocolError>>>>>;
 
+/// Whether this dispatch can leave the page's own content changed. Only source
+/// protection and animation stabilization write to the page, and only when
+/// pixels are captured; every other observation request reads. Cleanup loss
+/// therefore proves page uncertainty for the former and nothing about
+/// application effects for the latter.
+pub(super) fn dispatch_modifies_page(
+    request: &super::client_observation_dispatch::DispatchRequest,
+) -> bool {
+    use super::client_observation_dispatch::DispatchRequest;
+    match request {
+        DispatchRequest::Observe(request) => {
+            request.options.pixels || request.options.pixel_fallback
+        }
+        DispatchRequest::Screenshot(_) | DispatchRequest::TraceSemantic(_) => true,
+        DispatchRequest::Query(_)
+        | DispatchRequest::ReadFields(_)
+        | DispatchRequest::Correlate(_) => false,
+    }
+}
 // This is the retained observation boundary used by ClientBrowser before the
 // transport settles the admitted operation in ClientSession.
 pub(super) fn settle_observation_dispatch(
@@ -2224,6 +2243,7 @@ pub(super) fn settle_observation_dispatch(
         Result<(), super::client_observation_dispatch::DispatchFailure>,
         tokio::task::JoinError,
     >,
+    modifies_page: bool,
 ) -> (super::client_transport::NativeOutcome, bool) {
     use super::client_protocol::Effects;
     use super::client_transport::NativeOutcome;
@@ -2236,7 +2256,15 @@ pub(super) fn settle_observation_dispatch(
             effects: Effects::Completed,
         },
         Ok(Err(failure)) => {
-            let effects = if cleanup_failed || failure.error == ProtocolError::CleanupFailed {
+            // Unknown claims the page may have changed. A read that cannot
+            // write page content has nothing to be uncertain about, even when
+            // its cleanup proof is lost: it settles as a retryable
+            // non-dispatch, and the lost proof still quarantines the scope
+            // through `dirty`. Only a dispatch that installs protection or
+            // animation changes can leave the page modified.
+            let effects = if (cleanup_failed || failure.error == ProtocolError::CleanupFailed)
+                && modifies_page
+            {
                 Effects::Unknown
             } else {
                 Effects::NotDispatched
@@ -2250,7 +2278,11 @@ pub(super) fn settle_observation_dispatch(
         _ => NativeOutcome {
             retention: None,
             result: Err(ProtocolError::CleanupFailed),
-            effects: Effects::Unknown,
+            effects: if modifies_page {
+                Effects::Unknown
+            } else {
+                Effects::NotDispatched
+            },
         },
     };
     let cleanup_failed =
@@ -3938,6 +3970,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             let receipt_cancellation = lease.cancellation.clone();
             let receipt_generation = lease.generation;
             let (semantic_send, semantic_receive) = tokio::sync::oneshot::channel();
+            // Captured before the request moves into the retained producer.
+            let modifies_page = dispatch_modifies_page(&request);
             let receive = self
                 .tasks
                 .start_operation_prepared(
@@ -3971,7 +4005,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                 }
                             }
                             let cleanup = task.join.await;
-                            let (mut outcome, mut dirty) = settle_observation_dispatch(output, cleanup);
+                            let (mut outcome, mut dirty) = settle_observation_dispatch(output, cleanup, modifies_page);
                             if (trace_screenshot || semantic_trace) && (std::time::Instant::now() >= receipt_deadline
                                 || *receipt_cancellation.borrow() != super::client_session::CancelSignal::None)
                             {
@@ -6352,6 +6386,7 @@ mod tests {
                                     cleanup_integrity_lost: dirty,
                                 })),
                                 Ok(Ok(())),
+                                trace,
                             );
                             settle_trace_screenshot(outcome, lost, trace, &journal)
                         })
@@ -6392,91 +6427,135 @@ mod tests {
         use super::super::client_observation_dispatch::DispatchFailure;
         use super::super::client_protocol::{Effects, ScopeState};
         use super::super::client_session::ClientSession;
-        for (error, dirty_dispatch, dirty_join, expected) in [
-            (
-                ProtocolError::DeadlineExceeded,
-                false,
-                false,
-                Effects::NotDispatched,
-            ),
-            (
-                ProtocolError::Cancelled,
-                false,
-                false,
-                Effects::NotDispatched,
-            ),
-            (
-                ProtocolError::BrowserFailure,
-                false,
-                false,
-                Effects::NotDispatched,
-            ),
-            (
-                ProtocolError::DeadlineExceeded,
-                true,
-                false,
-                Effects::Unknown,
-            ),
-            (ProtocolError::Cancelled, true, false, Effects::Unknown),
-            (ProtocolError::PolicyDenied, true, false, Effects::Unknown),
-            (
-                ProtocolError::DeadlineExceeded,
-                false,
-                true,
-                Effects::Unknown,
-            ),
-            (ProtocolError::CleanupFailed, false, false, Effects::Unknown),
+        for (error, dirty_dispatch, dirty_join) in [
+            (ProtocolError::DeadlineExceeded, false, false),
+            (ProtocolError::Cancelled, false, false),
+            (ProtocolError::BrowserFailure, false, false),
+            (ProtocolError::DeadlineExceeded, true, false),
+            (ProtocolError::Cancelled, true, false),
+            (ProtocolError::PolicyDenied, true, false),
+            (ProtocolError::DeadlineExceeded, false, true),
+            (ProtocolError::CleanupFailed, false, false),
         ] {
-            let broker = ClientSession::new();
-            let _lease = broker.admit(1, 1, 1_000).unwrap();
-            assert!(broker.start(1, 1).unwrap());
-            let failure = |error, cleanup_integrity_lost| DispatchFailure {
-                error,
-                identity_scope: "synthetic-scope".into(),
-                cleanup_integrity_lost,
-            };
-            let (outcome, dirty) = settle_observation_dispatch(
-                Ok(Err(failure(error.clone(), dirty_dispatch))),
-                Ok(if dirty_join {
-                    Err(failure(ProtocolError::CleanupFailed, true))
+            // A lost cleanup proof always quarantines the scope; only a
+            // dispatch that can write page content makes the application
+            // effects themselves uncertain.
+            let lost = dirty_dispatch || dirty_join || error == ProtocolError::CleanupFailed;
+            for modifies_page in [false, true] {
+                let broker = ClientSession::new();
+                let _lease = broker.admit(1, 1, 1_000).unwrap();
+                assert!(broker.start(1, 1).unwrap());
+                let failure = |error, cleanup_integrity_lost| DispatchFailure {
+                    error,
+                    identity_scope: "synthetic-scope".into(),
+                    cleanup_integrity_lost,
+                };
+                let (outcome, dirty) = settle_observation_dispatch(
+                    Ok(Err(failure(error.clone(), dirty_dispatch))),
+                    Ok(if dirty_join {
+                        Err(failure(ProtocolError::CleanupFailed, true))
+                    } else {
+                        Ok(())
+                    }),
+                    modifies_page,
+                );
+                assert_eq!(
+                    outcome.result,
+                    Err(error.clone()),
+                    "primary error must survive"
+                );
+                let uncertain = lost && modifies_page;
+                assert_eq!(
+                    outcome.effects,
+                    if uncertain {
+                        Effects::Unknown
+                    } else {
+                        Effects::NotDispatched
+                    },
+                    "{error:?}, dispatch={dirty_dispatch}, join={dirty_join}, modifies_page={modifies_page}"
+                );
+                assert_eq!(dirty, lost, "a lost proof still quarantines the scope");
+                if uncertain {
+                    assert_eq!(
+                        broker.settle(1, 1, outcome.effects).unwrap(),
+                        ScopeState::Quarantined
+                    );
+                    assert_eq!(
+                        broker.admit(1, 2, 1_000).err(),
+                        Some(ProtocolError::ScopeUnavailable)
+                    );
                 } else {
-                    Ok(())
-                }),
-            );
-            assert_eq!(
-                outcome.result,
-                Err(error.clone()),
-                "primary error must survive"
-            );
-            assert_eq!(
-                outcome.effects, expected,
-                "{error:?}, dispatch={dirty_dispatch}, join={dirty_join}"
-            );
-            let expected_state = if expected == Effects::Unknown {
-                ScopeState::Quarantined
-            } else {
-                ScopeState::Usable
-            };
-            assert_eq!(dirty, expected == Effects::Unknown);
-            assert_eq!(
-                broker.settle(1, 1, outcome.effects).unwrap(),
-                expected_state
-            );
-            assert_eq!(broker.health().unwrap(), (1, expected_state));
-            if expected_state == ScopeState::Usable {
-                let _next = broker.admit(1, 2, 1_000).unwrap();
-                assert!(broker.start(1, 2).unwrap());
-                assert_eq!(
-                    broker.settle(1, 2, Effects::NotDispatched).unwrap(),
-                    ScopeState::Usable
-                );
-            } else {
-                assert_eq!(
-                    broker.admit(1, 2, 1_000).err(),
-                    Some(ProtocolError::ScopeUnavailable)
-                );
+                    // A read cannot have committed page effects, so its
+                    // settlement alone stays usable; the caller's `dirty`
+                    // still quarantines through the operation journal.
+                    assert_eq!(
+                        broker.settle(1, 1, outcome.effects).unwrap(),
+                        ScopeState::Usable
+                    );
+                }
             }
         }
+    }
+
+    #[test]
+    fn only_page_writing_dispatches_can_settle_as_possibly_committed() {
+        use super::super::client_observation::{LocatorExpression, QueryOptions};
+        use super::super::client_observation_dispatch::{
+            CorrelateRequest, DispatchRequest, FieldReadRequest, ObserveFlags, ObserveRequest,
+            QueryPurpose, QueryRequest, ScreenshotPurpose, ScreenshotRequest,
+        };
+        let options = || QueryOptions {
+            expression: LocatorExpression::Selector {
+                selector: "#x".into(),
+            },
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password i]".into(),
+        };
+        let observe = |pixels, pixel_fallback| ObserveRequest {
+            continuation: None,
+            options: ObserveFlags {
+                pixels,
+                pixel_fallback,
+                comparable: false,
+            },
+            test_id_attribute: "data-testid".into(),
+            secure_field_selector: "input[type=password i]".into(),
+        };
+        // Reads only: no page content can change, whatever happens to cleanup.
+        for request in [
+            DispatchRequest::Query(QueryRequest {
+                options: options(),
+                purpose: QueryPurpose::Protected,
+            }),
+            DispatchRequest::ReadFields(FieldReadRequest {
+                options: options(),
+                fields: vec![],
+                broker: Arc::new(super::super::client_session::ClientSession::new()),
+            }),
+            DispatchRequest::Correlate(CorrelateRequest {
+                located: vec![],
+                observed: vec![],
+            }),
+            DispatchRequest::Observe(observe(false, false)),
+        ] {
+            assert!(!dispatch_modifies_page(&request));
+        }
+        // These install source protection or animation stabilization.
+        assert!(dispatch_modifies_page(&DispatchRequest::Observe(observe(
+            true, false
+        ))));
+        assert!(dispatch_modifies_page(&DispatchRequest::Observe(observe(
+            false, true
+        ))));
+        assert!(dispatch_modifies_page(&DispatchRequest::TraceSemantic(
+            observe(false, false)
+        )));
+        assert!(dispatch_modifies_page(&DispatchRequest::Screenshot(
+            ScreenshotRequest {
+                secure_field_selector: "input[type=password i]".into(),
+                purpose: ScreenshotPurpose::PixelsOnly,
+            }
+        )));
     }
 
     #[test]

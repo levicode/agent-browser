@@ -121,7 +121,7 @@ async fn settled_with_cancel(race: Race, cancel_before_settle: bool) -> Settled 
                     let output = task.result.await;
                     let cleanup = task.join.await;
                     assert!(matches!(cleanup, Ok(Ok(()))));
-                    let (outcome, dirty) = settle_observation_dispatch(output, cleanup);
+                    let (outcome, dirty) = settle_observation_dispatch(output, cleanup, true);
                     let (outcome, dirty) = settle_trace_screenshot(outcome, dirty, false, &receipt);
                     settle_protected_read(outcome, dirty, eligible, &receipt)
                 })
@@ -537,7 +537,7 @@ async fn continuation_rejected_original_cleanup_has_no_offer() {
                     let task = run.start_prepared(prepared);
                     let output = task.result.await;
                     let cleanup = task.join.await;
-                    let (outcome, dirty) = settle_observation_dispatch(output, cleanup);
+                    let (outcome, dirty) = settle_observation_dispatch(output, cleanup, true);
                     settle_protected_read(outcome, dirty, eligible, &receipt)
                 })
             },

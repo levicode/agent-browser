@@ -429,7 +429,7 @@ async fn acquisition_deadline(boundary: Boundary) {
     .expect("retained acquisition and cleanup must settle");
     let completed = Instant::now();
     assert!(matches!(&cleanup, Ok(Ok(()))));
-    let (settled, dirty) = settle_observation_dispatch(output, cleanup);
+    let (settled, dirty) = settle_observation_dispatch(output, cleanup, true);
     let fallback = boundary != Boundary::MissingAck;
     assert_eq!(dirty, !fallback);
     if fallback {

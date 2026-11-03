@@ -402,7 +402,7 @@ async fn metadata_deadline_case(fallback: bool, final_change: FinalPublicationCh
         .expect("expired metadata must settle without manually releasing it");
     let completed = Instant::now();
     assert!(matches!(&cleanup, Ok(Ok(()))));
-    let (settled, dirty) = settle_observation_dispatch(output, cleanup);
+    let (settled, dirty) = settle_observation_dispatch(output, cleanup, true);
     if completed >= original_deadline
         || settled.result.is_err()
         || std::env::var_os("E2E_METADATA_DEADLINE_TRACE").is_some()

@@ -97,7 +97,7 @@ impl ClientExecutor for Bridge {
                         let output = task.result.await;
                         let cleanup = task.join.await;
                         assert!(matches!(cleanup, Ok(Ok(()))));
-                        let (outcome, dirty) = settle_observation_dispatch(output, cleanup);
+                        let (outcome, dirty) = settle_observation_dispatch(output, cleanup, true);
                         let (outcome, dirty) =
                             settle_trace_screenshot(outcome, dirty, false, &receipt);
                         settle_protected_read(outcome, dirty, eligible, &receipt)

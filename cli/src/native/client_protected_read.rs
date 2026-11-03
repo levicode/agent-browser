@@ -968,6 +968,7 @@ mod tests {
                             } else {
                                 Ok(())
                             }),
+                            true,
                         );
                         if mode == "unknown" {
                             outcome.effects = Effects::Unknown;
@@ -1218,6 +1219,7 @@ mod tests {
                                 } else {
                                     Ok(())
                                 }),
+                                true,
                             );
                             if mode == "unknown" {
                                 outcome.effects = Effects::Unknown;

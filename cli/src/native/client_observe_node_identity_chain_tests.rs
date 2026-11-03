@@ -476,7 +476,7 @@ fn settle(failure: DispatchFailure) -> (super::super::client_transport::NativeOu
     // Calls the production outcome mapper with a completed local test task.
     // This does NOT prove public Observe owner-join or final release ACK success;
     // pending/rejected release custody is asserted independently in the ledger.
-    settle_observation_dispatch(Ok(Err(failure)), Ok(Ok(())))
+    settle_observation_dispatch(Ok(Err(failure)), Ok(Ok(())), true)
 }
 async fn close(fixture: Fixture) {
     assert!(!fixture

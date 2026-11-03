@@ -264,7 +264,7 @@ async fn frame_owner_deadline(withhold_release_ack: bool) {
         terminal.saturating_duration_since(deadline).as_micros()
     );
     assert!(matches!(&cleanup, Ok(Ok(()))));
-    let (settled, dirty) = settle_observation_dispatch(output, cleanup);
+    let (settled, dirty) = settle_observation_dispatch(output, cleanup, true);
     assert_eq!(settled.result, Err(ProtocolError::DeadlineExceeded));
     assert_eq!(settled.effects, Effects::NotDispatched);
     assert!(

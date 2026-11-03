@@ -4565,9 +4565,10 @@ fn capture_error(error: CaptureReason) -> ProtocolError {
         CaptureReason::BrowserFailure => ProtocolError::BrowserFailure,
         CaptureReason::BoundsExceeded => ProtocolError::CapacityExceeded,
         // A frame inventory that moved between the semantic read and the
-        // geometry read is a repeatable race, not a policy refusal: the page
-        // was changing under the capture. Report it as stale so a caller with
-        // a usable scope can take a fresh capture instead of treating a
+        // geometry read, or a geometry command that failed against the moving
+        // page, is a repeatable race, not a policy refusal: the page was
+        // changing under the capture. Report it as stale so a caller with a
+        // usable scope can take a fresh capture instead of treating a
         // transient layout change as a denied operation.
         CaptureReason::IncompleteFrames => ProtocolError::StaleReference,
         // The remaining reasons are proof failures: unsafe or opaque masking
@@ -4622,9 +4623,25 @@ mod tests {
             node_geometry_read_failure(&Error::StaleIdentity, Origin::BoxNodeNegative),
             (ReadError::Geometry(Kind::NodeBoxNegative), false)
         );
+        // A geometry command that failed proves no policy decision: the page
+        // moved under the read, so the caller may take a fresh capture. The
+        // diagnostic above still attributes the exact failed box read, while
+        // the public classification stays a retryable race.
         assert_eq!(
             geometry_error(Error::BackendFailure),
-            ProtocolError::PolicyDenied
+            ProtocolError::StaleReference
+        );
+        // Proven-unsafe or unprovable masking geometry remains a refusal.
+        for reason in [
+            CaptureReason::UnsafeGeometry,
+            CaptureReason::UninspectableContent,
+            CaptureReason::MaskingUnproven,
+        ] {
+            assert_eq!(capture_error(reason), ProtocolError::PolicyDenied);
+        }
+        assert_eq!(
+            capture_error(CaptureReason::CleanupFailed),
+            ProtocolError::CleanupFailed
         );
     }
 
@@ -4700,6 +4717,7 @@ mod tests {
                     let (outcome, lost) = super::super::client_browser::settle_observation_dispatch(
                         Ok(Err(failure)),
                         Ok(Ok(())),
+                        true,
                     );
                     assert_eq!(outcome.result, Err(expected));
                     let uncertain = dirty || error == ProtocolError::CleanupFailed;
@@ -4836,6 +4854,7 @@ mod tests {
                             } else {
                                 Ok(())
                             }),
+                            true,
                         );
                     assert_eq!(outcome.result, Err(code));
                     assert_eq!(dirty, dirty_dispatch || dirty_join);
@@ -6300,7 +6319,7 @@ mod tests {
             assert_eq!(error.cleanup_integrity_lost, integrity_lost_expected);
         }
         let (settled, integrity_lost) =
-            super::super::client_browser::settle_observation_dispatch(output, cleanup);
+            super::super::client_browser::settle_observation_dispatch(output, cleanup, true);
         assert_eq!(integrity_lost, integrity_lost_expected);
         assert_eq!(
             settled.effects,
@@ -7780,6 +7799,7 @@ mod fixture_acquisition_refusal_tests {
                     } else {
                         Ok(())
                     }),
+                    true,
                 );
                 assert_eq!(outcome.result, Err(code));
                 assert_eq!(dirty, dirty_dispatch || dirty_join);

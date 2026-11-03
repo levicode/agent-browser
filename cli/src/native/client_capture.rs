@@ -768,7 +768,13 @@ pub(crate) fn geometry_reason(reason: GeometryError) -> CaptureReason {
         GeometryError::Cancelled => CaptureReason::Cancelled,
         GeometryError::Superseded => CaptureReason::Superseded,
         GeometryError::DeadlineExceeded => CaptureReason::Deadline,
-        GeometryError::BackendFailure => CaptureReason::MaskingUnproven,
+        // A geometry command that failed proves nothing about a mask or about
+        // policy: the node, frame or layout it addressed was moving with the
+        // page. Source masks are proven separately while pixels are captured,
+        // so a failed read here is a capture race the caller resolves with a
+        // fresh capture, never a policy refusal. Reporting it as
+        // MaskingUnproven made a transient layout change look like a denial.
+        GeometryError::BackendFailure => CaptureReason::IncompleteFrames,
         GeometryError::CleanupFailed { .. } => CaptureReason::CleanupFailed,
     }
 }
@@ -1211,9 +1217,20 @@ mod tests {
         );
     }
     #[test]
-    fn geometry_proof_errors_never_become_optional_screenshot_failures() {
+    fn geometry_read_failures_are_retryable_capture_races_not_denials() {
+        // A geometry command that failed while the page moved proves nothing
+        // about a mask: the caller takes a fresh capture. Masking proof
+        // failures themselves stay policy refusals.
         assert_eq!(
             geometry_reason(GeometryError::BackendFailure),
+            CaptureReason::IncompleteFrames
+        );
+        assert_eq!(
+            geometry_reason(GeometryError::InvalidGeometry),
+            CaptureReason::UnsafeGeometry
+        );
+        assert_eq!(
+            source_mask_reason(ProtectedReadReason::BrowserFailure),
             CaptureReason::MaskingUnproven
         );
         assert_eq!(

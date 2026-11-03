@@ -451,7 +451,7 @@ async fn semantic_deadline_then_mask_failure(reply: ProbeReply, sequence: u64) {
         "failure and restoration must fit the unchanged 80 ms budget"
     );
     assert!(matches!(&cleanup, Ok(Ok(()))));
-    let (settled, dirty) = settle_observation_dispatch(output, cleanup);
+    let (settled, dirty) = settle_observation_dispatch(output, cleanup, true);
     assert!(!dirty);
     assert_eq!(settled.effects, Effects::NotDispatched);
     assert_eq!(settled.result, Err(reply.dispatch_error()));
