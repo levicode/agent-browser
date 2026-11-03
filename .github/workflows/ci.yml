@@ -39,7 +39,7 @@ jobs:
           node-version-file: .node-version
 
       - name: Run launcher tests
-        run: pnpm run test:launcher
+        run: node --test test/launcher.test.mjs
 
   docs:
     name: Docs (${{ matrix.environment }})
@@ -63,7 +63,9 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        # The fork postinstall requires a bundled native binary. This job does
+        # not build one, so skip lifecycle scripts here.
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Test original documentation contract
         run: pnpm --filter docs test
@@ -119,7 +121,9 @@ jobs:
         uses: pnpm/action-setup@v4
 
       - name: Install dependencies
-        run: pnpm install --filter dashboard
+        # The fork postinstall requires a bundled native binary. This job does
+        # not build one, so skip lifecycle scripts here.
+        run: pnpm install --filter dashboard --ignore-scripts
         working-directory: packages/dashboard
 
       - name: Build dashboard
@@ -143,7 +147,9 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        # The fork postinstall requires a bundled native binary. This job does
+        # not build one, so skip lifecycle scripts here.
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Test sandbox package
         run: pnpm --filter @agent-browser/sandbox test
@@ -165,7 +171,9 @@ jobs:
           cache: pnpm
 
       - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+        # The fork postinstall requires a bundled native binary. This job does
+        # not build one, so skip lifecycle scripts here.
+        run: pnpm install --frozen-lockfile --ignore-scripts
 
       - name: Typecheck Eve package
         run: pnpm --filter @agent-browser/eve typecheck
