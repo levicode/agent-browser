@@ -412,6 +412,27 @@ impl ClientSession {
         }
         inner.recovery.take().map(|transition| transition.source)
     }
+    /// End a settled reconnect's ownership of the quarantined recovery
+    /// transition only when the replacement was refused before any candidate
+    /// was staged. The source receipt then stays available to an explicit
+    /// close, which can prove the disconnected owner retired; a cancelled or
+    /// otherwise failed attempt keeps the transition dead, exactly as before.
+    pub(crate) fn release_refused_disconnected_recovery(&self, sequence: u64) -> bool {
+        let Ok(mut inner) = self.lock() else {
+            return false;
+        };
+        if inner.health != ScopeState::Quarantined {
+            return false;
+        }
+        let Some(recovery) = inner.recovery.as_mut() else {
+            return false;
+        };
+        if recovery.operation != Some(sequence) || recovery.candidate.is_some() {
+            return false;
+        }
+        recovery.operation = None;
+        true
+    }
     pub(crate) fn recovery_available(&self) -> bool {
         self.lock().is_ok_and(|inner| {
             inner.health == ScopeState::Quarantined
@@ -2171,6 +2192,48 @@ mod tests {
         assert!(broker.take_closing_recovery().is_none());
         broker.quarantine().unwrap();
         assert!(broker.take_closing_recovery().is_none());
+    }
+
+    #[test]
+    fn rejected_replacement_settlement_keeps_the_closing_recovery_receipt() {
+        let broker = ClientSession::new();
+        broker.quarantine().unwrap();
+        let ledger = super::super::client_debt::OwnerDebtLedger::new(1, "scope".to_owned());
+        ledger.observe_remote_eof();
+        let proof = super::super::client_operation_state::DisconnectedRecoveryProof::for_test(
+            super::super::client_debt::OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            },
+            ledger,
+            Instant::now() + Duration::from_secs(30),
+        );
+        broker.offer_disconnected_recovery(proof).unwrap();
+        // A reconnect attempt owns the transition while it runs.
+        let lease = broker
+            .admit_disconnected_reconnect(1, 2, 1_000, "scope")
+            .unwrap();
+        assert!(
+            broker.take_closing_recovery().is_none(),
+            "an in-flight reconnect still owns the transition"
+        );
+        assert_eq!(
+            broker.settle_with_retention(1, 2, Effects::NotDispatched, None),
+            Ok(ScopeState::Quarantined)
+        );
+        // Plain settlement alone keeps the transition owned, so a cancelled
+        // attempt cannot be reissued or reused by close.
+        assert!(broker.take_closing_recovery().is_none());
+        assert!(!broker.release_refused_disconnected_recovery(1));
+        // A replacement refused before any candidate was staged releases the
+        // ownership so the explicit close can still prove the disconnected
+        // owner retired.
+        assert!(broker.release_refused_disconnected_recovery(2));
+        assert!(
+            broker.take_closing_recovery().is_some(),
+            "a refused replacement left no closing recovery receipt"
+        );
+        drop(lease);
     }
 
     #[test]

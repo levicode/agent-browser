@@ -2520,6 +2520,25 @@ struct InteropReplacementPhaseOneSnapshot {
     enrollment: Arc<super::client_enrollment::ClientEnrollment>,
 }
 
+/// Commands that only read application state: no input, DOM or browser
+/// setting can be committed by them. `capture.screenshot` and
+/// `browser.trace` are deliberately absent because they own protected-read
+/// custody whose settlement is proven separately from application effects.
+fn command_is_read_only(command: &str) -> bool {
+    matches!(
+        command,
+        "page.url"
+            | "page.title"
+            | "session.environment"
+            | "context.cookies.get"
+            | "browser.observe"
+            | "browser.query"
+            | "fixture.query"
+            | "fixture.read-fields"
+            | "fixture.correlate"
+    )
+}
+
 pub struct ClientBrowser {
     #[cfg(test)]
     interop_replacement_phase_one_snapshot:
@@ -3101,6 +3120,9 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         } else {
             std::time::Duration::from_millis(250)
         }
+    }
+    fn command_can_mutate(&self, command: &str) -> bool {
+        !command_is_read_only(command)
     }
     fn cancel_operation_producer(&self, key: super::client_debt::OperationKey) {
         self.tasks.cancel_operation_producer(key);
@@ -4822,7 +4844,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 } else if navigation_settled {
                     Effects::Completed
                 } else if expired || (result.is_err() && mutating) {
-                    Effects::Unknown
+                    // An interrupted read has no mutation to be uncertain
+                    // about: a command that cannot commit input or browser
+                    // state settles as a retryable non-dispatch instead of
+                    // telling the caller the action may have committed.
+                    if command_is_read_only(&command) && !journal.snapshot().mutation_dispatched {
+                        Effects::NotDispatched
+                    } else {
+                        Effects::Unknown
+                    }
                 } else { Effects::Completed };
                 // Only interruption/success outcomes are normalized. Lost
                 // authority and cleanup failures must not become usable timeout
@@ -6432,6 +6462,40 @@ mod tests {
             assert_eq!(replacement.frame_policy, frozen);
         }
     }
+    #[test]
+    fn read_only_commands_cannot_claim_unknown_mutation() {
+        for command in [
+            "page.url",
+            "page.title",
+            "session.environment",
+            "context.cookies.get",
+            "browser.observe",
+            "browser.query",
+            "fixture.query",
+            "fixture.read-fields",
+            "fixture.correlate",
+        ] {
+            assert!(command_is_read_only(command), "{command}");
+        }
+        // Mutation-capable or separately-proven custody commands stay
+        // conservatively mutation-capable.
+        for command in [
+            "page.evaluate",
+            "page.navigate",
+            "browser.perform",
+            "browser.pointer",
+            "browser.keyboard.type",
+            "context.init-script",
+            "context.media",
+            "input.keyboard",
+            "capture.screenshot",
+            "browser.trace",
+            "state.capture",
+        ] {
+            assert!(!command_is_read_only(command), "{command}");
+        }
+    }
+
     #[test]
     fn hostname_configuration_rejects_control_data_without_changing_header_authority() {
         for site in ["example.com\nforeign", "example.com\0"] {

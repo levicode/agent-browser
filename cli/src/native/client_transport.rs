@@ -104,6 +104,14 @@ pub trait ClientExecutor: Send + Sync + 'static {
     fn cancellation_settlement_budget(&self, _command: &str) -> std::time::Duration {
         std::time::Duration::from_millis(250)
     }
+    /// Whether an admitted command can still commit application-visible
+    /// mutation. A read-only command that registered no mutation cannot have
+    /// committed one, so a missing receipt settles as `NotDispatched` instead
+    /// of `Unknown`. Conservatively defaults to mutation-capable: an
+    /// executor that cannot classify a command keeps the legacy Unknown.
+    fn command_can_mutate(&self, _command: &str) -> bool {
+        true
+    }
     /// Shutdown with the close exchange's unclaimed disconnected-recovery
     /// receipt, taken before the terminal lane seals the broker. The default
     /// ignores the receipt; an executor that can retire a disconnected owner
@@ -1397,7 +1405,8 @@ where
         sink_open.store(true, std::sync::atomic::Ordering::Release);
     }
     let mut operations = tokio::task::JoinSet::<(u64, NativeOutcome)>::new();
-    let mut pending = std::collections::HashMap::<u64, (String, u64, bool, Option<String>)>::new();
+    let mut pending =
+        std::collections::HashMap::<u64, (String, u64, bool, Option<String>, bool)>::new();
     let mut closing_id = None;
     let mut terminal_control = false;
     let mut terminal_recording = None;
@@ -1446,10 +1455,20 @@ where
                 completion = operations.join_next(), if !operations.is_empty() => {
                     let Some(Ok((sequence, outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
                     settlement_trace!(sequence, CompletionJoined);
-                    let Some((id, generation, callback, scope)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
+                    let Some((id, generation, callback, scope, _read_only)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
                     let (state, observation_settlement) = broker.settle_with_observation_proof(generation, sequence, outcome.effects,
                         if continuation_negotiated { outcome.retention.as_ref() } else { None }).unwrap_or((ScopeState::Quarantined, None));
                     executor.fix_operation_result(super::client_debt::OperationKey { generation, operation_seq: sequence });
+                    // A replacement refused before staging any candidate (for
+                    // example a different browser or scope identity) ends the
+                    // reconnect's ownership of the quarantined transition. Its
+                    // source receipt must stay available to the explicit close
+                    // that still has to prove the disconnected owner retired.
+                    if state == ScopeState::Quarantined
+                        && matches!(outcome.result, Err(ProtocolError::StaleScope))
+                    {
+                        broker.release_refused_disconnected_recovery(sequence);
+                    }
                     let unknown = outcome.effects == Effects::Unknown;
                     let recovery = if recovery_negotiated && !callback && unknown && state == ScopeState::Quarantined {
                         executor.disconnected_recovery_candidate(super::client_debt::OperationKey { generation, operation_seq: sequence })
@@ -1645,6 +1664,7 @@ where
                                     args.get("identityScope")
                                         .and_then(serde_json::Value::as_str)
                                         .map(str::to_owned),
+                                    !executor.command_can_mutate(&command),
                                 ),
                             );
                             let executor = executor.clone();
@@ -2001,8 +2021,10 @@ where
     } else {
         settlement_trace!(0, ShutdownUnproven);
     }
-    for (sequence, (id, generation, _callback, _scope)) in pending {
-        let effects = if broker.has_started(sequence) {
+    for (sequence, (id, generation, _callback, _scope, read_only)) in pending {
+        // A read-only command that never registered a mutation cannot have
+        // committed one; shutdown must not report it as possibly committed.
+        let effects = if broker.has_started(sequence) && !read_only {
             Effects::Unknown
         } else {
             Effects::NotDispatched
@@ -2250,6 +2272,7 @@ async fn execute_until_deadline<E: ClientExecutor>(
     // Captured before the command moves into the executor. A cancelled
     // navigation needs its own bounded interruption cleanup to settle.
     let settlement_budget = executor.cancellation_settlement_budget(&command);
+    let read_only_command = !executor.command_can_mutate(&command);
     settlement_trace!(sequence, ExecuteStarted);
     let execution = executor.execute(command, args, lease);
     tokio::pin!(execution);
@@ -2299,6 +2322,11 @@ async fn execute_until_deadline<E: ClientExecutor>(
         // An incapable executor or missing journal retains the legacy terminal
         // behavior. Executor entry is never promoted into reusable proof.
         None if !broker.has_started(sequence) => Effects::NotDispatched,
+        // The executor was admitted but had not registered its journal yet. A
+        // read-only command cannot commit a mutation, so no receipt is
+        // uncertainty about application effects; it is a retryable
+        // non-dispatch. Mutation-capable commands stay conservatively Unknown.
+        None if read_only_command => Effects::NotDispatched,
         None => Effects::Unknown,
     };
     let reason = if protected_cleanup_deadline
@@ -4563,6 +4591,78 @@ mod tests {
         assert_eq!(executor.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(broker.health().unwrap().1, ScopeState::Closed);
         assert!(broker.admit(1, 2, 1000).is_err());
+    }
+
+    /// An admitted read that registered no journal entry cannot have committed
+    /// application mutation. Its expired receipt grace must settle as
+    /// not-dispatched, leaving the scope usable for a retry, never Unknown.
+    struct ReadOnlyDeadlineExecutor {
+        broker: std::sync::Arc<ClientSession>,
+    }
+    impl ClientExecutor for ReadOnlyDeadlineExecutor {
+        fn capabilities(&self) -> Vec<String> {
+            vec![]
+        }
+        fn command_can_mutate(&self, command: &str) -> bool {
+            command != "browser.observe"
+        }
+        async fn execute(
+            &self,
+            command: String,
+            _: serde_json::Map<String, serde_json::Value>,
+            lease: OperationLease,
+        ) -> NativeOutcome {
+            assert_eq!(command, "browser.observe");
+            assert!(self.broker.start(lease.generation, lease.sequence).unwrap());
+            std::future::pending().await
+        }
+        async fn shutdown(&self) -> Result<(), ProtocolError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_deadline_without_a_registered_mutation_is_not_dispatched() {
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let executor = std::sync::Arc::new(ReadOnlyDeadlineExecutor {
+            broker: broker.clone(),
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![],
+            },
+            broker.clone(),
+            executor,
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        assert_eq!(settlement_frame(&mut peer).await["type"], "ready");
+        peer.get_mut().write_all(b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":1,\"timeoutMs\":100,\"command\":\"browser.observe\",\"args\":{}}\n").await.unwrap();
+        let result = settlement_frame(&mut peer).await;
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["id"], "r");
+        assert_eq!(result["operationSeq"], 1);
+        assert_eq!(result["ok"], false);
+        assert_eq!(result["effects"], "not-dispatched");
+        assert_eq!(result["scopeState"], "usable");
+        assert_eq!(result["error"]["code"], "deadline-exceeded");
+        // A usable scope still accepts the close exchange.
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        assert_eq!(settlement_frame(&mut peer).await["type"], "closed");
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), serving)
+                .await
+                .unwrap()
+                .unwrap()
+        );
     }
 
     async fn read_unobserved_retained_frame<R: AsyncBufRead + Unpin>(
