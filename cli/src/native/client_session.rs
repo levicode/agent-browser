@@ -393,6 +393,25 @@ impl ClientSession {
         });
         Ok(())
     }
+    /// Take the unclaimed disconnected-recovery receipt for an explicit close.
+    /// A reconnect that already owns the transition keeps it; an expired receipt
+    /// is not evidence and is left to the ordinary cleanup paths.
+    pub(crate) fn take_closing_recovery(
+        &self,
+    ) -> Option<super::client_operation_state::DisconnectedRecoveryProof> {
+        let mut inner = self.lock().ok()?;
+        if inner.health != ScopeState::Quarantined {
+            return None;
+        }
+        let recovery = inner.recovery.as_ref()?;
+        if recovery.operation.is_some() || recovery.candidate.is_some() {
+            return None;
+        }
+        if Instant::now() >= recovery.source.deadline() || recovery.source.check().is_err() {
+            return None;
+        }
+        inner.recovery.take().map(|transition| transition.source)
+    }
     pub(crate) fn recovery_available(&self) -> bool {
         self.lock().is_ok_and(|inner| {
             inner.health == ScopeState::Quarantined
@@ -2144,6 +2163,14 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn closing_takes_no_recovery_without_an_offered_transition() {
+        let broker = ClientSession::new();
+        assert!(broker.take_closing_recovery().is_none());
+        broker.quarantine().unwrap();
+        assert!(broker.take_closing_recovery().is_none());
     }
 
     #[test]

@@ -8,6 +8,20 @@ use crate::native::client_debt::{
 use crate::native::client_targets::{ClientTargets, OwnedTarget};
 use std::future::Future;
 
+#[test]
+fn cancelled_navigation_owns_its_bounded_interruption_cleanup_budget() {
+    use crate::native::client_transport::ClientExecutor;
+    let browser = ClientBrowser::new(Arc::new(ClientSession::new()));
+    assert_eq!(
+        browser.cancellation_settlement_budget("page.navigate"),
+        Duration::from_millis(2_500)
+    );
+    assert_eq!(
+        browser.cancellation_settlement_budget("browser.observe"),
+        Duration::from_millis(250)
+    );
+}
+
 async fn bounded<T>(future: impl Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(5), future)
         .await

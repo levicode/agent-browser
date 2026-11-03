@@ -2869,6 +2869,163 @@ impl ClientBrowser {
             .ok_or(ProtocolError::ScopeUnavailable)?
             .lease(permit)
     }
+
+    async fn shutdown_with_recovery_inner(
+        &self,
+        closing_recovery: Option<super::client_operation_state::DisconnectedRecoveryProof>,
+    ) -> Result<(), ProtocolError> {
+        // Transport takes a negotiated frozen batch before shutdown begins.
+        // Any unclaimed batch has no consumer and must release its old charge.
+        let mut terminal_recording_failed = match self.terminal_recording.lock() {
+            Ok(mut batch) => {
+                batch.take();
+                false
+            }
+            Err(_) => true,
+        };
+        // Only an explicit close owns this receipt; the transport captured it
+        // before sealing the broker, which never re-offers a recovery.
+        let stop_failed = self.stop_enrollment(true).is_err();
+        self.gate.seal();
+        // Signal retained preparation before joining any lifecycle lock holder.
+        let interop_failed = self.interop_preparation.shutdown().await.is_err();
+        let mut startup = self.startup_task.lock().await;
+        let supervisor_failed = match startup.as_mut() {
+            Some(task) => task.await.is_err(),
+            None => false,
+        };
+        *startup = None;
+        drop(startup);
+        // Close/EOF may beat a retained failed transition's result. That
+        // producer can freeze after the entry clear while shutdown joins it.
+        // Once joined, no late batch may outlive a successful cleanup receipt.
+        terminal_recording_failed |= match self.terminal_recording.lock() {
+            Ok(mut batch) => {
+                batch.take();
+                false
+            }
+            Err(_) => true,
+        };
+        let _lifecycle = self.lifecycle.lock().await;
+        let drain_failed = self.gate.drained().await.is_err();
+        self.tasks.seal().await;
+        let mut task_cleanup_failed = self.tasks.drain_current().await.is_err();
+        // An unclaimed disconnected-recovery receipt is the exact owner evidence
+        // for the tasks drain just refused. Retire that disconnected owner before
+        // choosing the terminal read-only fallback, whose enrollment proof cannot
+        // accept the unreachable commands the lost connection left behind. The
+        // close is then an ordinary close of a locally proven retirement.
+        if task_cleanup_failed {
+            if let Some(proof) = closing_recovery.as_ref() {
+                let drained = self.tasks.drain_disconnected_for_close(proof).await.is_ok();
+                let retired = drained && self.tasks.retire_disconnected_owner(proof).is_ok();
+                if retired {
+                    cleanup_trace::terminal_cleanup_checkpoint(
+                        TerminalCleanupStage::TaskProof,
+                        true,
+                    );
+                    task_cleanup_failed = false;
+                }
+            }
+        }
+        // Keep both journals in owner storage across cancellation or failed
+        // final cleanup. A local take would drop unresolved retained resources.
+        let mut owner = self.owner.lock().await;
+        let terminal_operations = if task_cleanup_failed {
+            match owner
+                .as_ref()
+                .and_then(|owner| owner.manager.client.debt_ledger())
+            {
+                Some(ledger) => {
+                    let prepared = self.tasks.prepare_terminal_read_only(&ledger).await;
+                    cleanup_trace::terminal_cleanup_checkpoint(
+                        TerminalCleanupStage::TaskProof,
+                        prepared.is_ok(),
+                    );
+                    prepared.ok()
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
+        let mut terminal = None;
+        let cleaned = match (owner.as_mut(), terminal_operations.as_ref()) {
+            (Some(owner), Some(operations)) => {
+                match owner.close_terminal_read_only(operations).await {
+                    Ok(proof) => {
+                        terminal = Some(proof);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            (Some(owner), None) => {
+                let closed = owner.close().await;
+                cleanup_trace::terminal_cleanup_checkpoint(
+                    TerminalCleanupStage::OrdinaryClose,
+                    closed.is_ok(),
+                );
+                closed
+            }
+            (None, _) => Ok(()),
+        };
+        if cleaned.is_ok() && terminal.is_none() {
+            *owner = None;
+        }
+        drop(owner);
+        let mut retained = self.retained_browser.lock().await;
+        let retained_failed = match retained.as_mut() {
+            Some(manager) => manager.close().await.is_err(),
+            None => false,
+        };
+        if !retained_failed {
+            *retained = None;
+        }
+        drop(retained);
+        // This task only watches native connection evidence and publishes an
+        // event. Stopping it never abandons CDP/resource cleanup. Retain the
+        // handle until its cancellation has settled.
+        let mut connection_watch = self.connection_watch.lock().await;
+        let watch_failed = match connection_watch.as_mut() {
+            Some(task) => {
+                task.abort();
+                match task.await {
+                    Ok(result) => result.is_err(),
+                    Err(error) => !error.is_cancelled(),
+                }
+            }
+            None => false,
+        };
+        *connection_watch = None;
+        if supervisor_failed
+            || interop_failed
+            || terminal_recording_failed
+            || stop_failed
+            || watch_failed
+            || drain_failed
+            || (task_cleanup_failed && terminal.is_none())
+            || retained_failed
+            || self
+                .startup_uncertain
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            cleanup_trace::terminal_cleanup_checkpoint(TerminalCleanupStage::ShutdownJoins, false);
+            return Err(ProtocolError::CleanupFailed);
+        }
+        cleanup_trace::terminal_cleanup_checkpoint(TerminalCleanupStage::ShutdownJoins, true);
+        cleaned?;
+        if let Some(proof) = terminal {
+            let committed = self.tasks.commit_terminal_read_only(proof);
+            cleanup_trace::terminal_cleanup_checkpoint(
+                TerminalCleanupStage::FinalCommit,
+                committed.is_ok(),
+            );
+            committed?;
+            *self.owner.lock().await = None;
+        }
+        Ok(())
+    }
 }
 
 impl super::client_transport::ClientExecutor for ClientBrowser {
@@ -2929,6 +3086,21 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
         key: super::client_debt::OperationKey,
     ) -> Option<super::client_operation_state::DisconnectedRecoveryProof> {
         self.tasks.recovery_candidate(key)
+    }
+    fn cancellation_settlement_budget(&self, command: &str) -> std::time::Duration {
+        // A cancelled navigation mints its interruption receipt from the exact
+        // aborted Page.navigate response, the Page.stopLoading ACK, and the
+        // unchanged loader/lifecycle witness under a bounded two-second cleanup.
+        // Give that proof time to finish instead of classifying a navigation
+        // that never committed as Unknown because the caller cancelled quickly.
+        // Worst case the caller sees the cancelled result up to ~2.25s later
+        // than the former 250ms receipt grace; the client's own settlement
+        // window (5s) is unchanged.
+        if command == "page.navigate" {
+            std::time::Duration::from_millis(2_500)
+        } else {
+            std::time::Duration::from_millis(250)
+        }
     }
     fn cancel_operation_producer(&self, key: super::client_debt::OperationKey) {
         self.tasks.cancel_operation_producer(key);
@@ -4694,137 +4866,13 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
     }
 
     async fn shutdown(&self) -> Result<(), ProtocolError> {
-        // Transport takes a negotiated frozen batch before shutdown begins.
-        // Any unclaimed batch has no consumer and must release its old charge.
-        let mut terminal_recording_failed = match self.terminal_recording.lock() {
-            Ok(mut batch) => {
-                batch.take();
-                false
-            }
-            Err(_) => true,
-        };
-        let stop_failed = self.stop_enrollment(true).is_err();
-        self.gate.seal();
-        // Signal retained preparation before joining any lifecycle lock holder.
-        let interop_failed = self.interop_preparation.shutdown().await.is_err();
-        let mut startup = self.startup_task.lock().await;
-        let supervisor_failed = match startup.as_mut() {
-            Some(task) => task.await.is_err(),
-            None => false,
-        };
-        *startup = None;
-        drop(startup);
-        // Close/EOF may beat a retained failed transition's result. That
-        // producer can freeze after the entry clear while shutdown joins it.
-        // Once joined, no late batch may outlive a successful cleanup receipt.
-        terminal_recording_failed |= match self.terminal_recording.lock() {
-            Ok(mut batch) => {
-                batch.take();
-                false
-            }
-            Err(_) => true,
-        };
-        let _lifecycle = self.lifecycle.lock().await;
-        let drain_failed = self.gate.drained().await.is_err();
-        self.tasks.seal().await;
-        let task_cleanup_failed = self.tasks.drain_current().await.is_err();
-        // Keep both journals in owner storage across cancellation or failed
-        // final cleanup. A local take would drop unresolved retained resources.
-        let mut owner = self.owner.lock().await;
-        let terminal_operations = if task_cleanup_failed {
-            match owner
-                .as_ref()
-                .and_then(|owner| owner.manager.client.debt_ledger())
-            {
-                Some(ledger) => {
-                    let prepared = self.tasks.prepare_terminal_read_only(&ledger).await;
-                    cleanup_trace::terminal_cleanup_checkpoint(
-                        TerminalCleanupStage::TaskProof,
-                        prepared.is_ok(),
-                    );
-                    prepared.ok()
-                }
-                None => None,
-            }
-        } else {
-            None
-        };
-        let mut terminal = None;
-        let cleaned = match (owner.as_mut(), terminal_operations.as_ref()) {
-            (Some(owner), Some(operations)) => {
-                match owner.close_terminal_read_only(operations).await {
-                    Ok(proof) => {
-                        terminal = Some(proof);
-                        Ok(())
-                    }
-                    Err(error) => Err(error),
-                }
-            }
-            (Some(owner), None) => {
-                let closed = owner.close().await;
-                cleanup_trace::terminal_cleanup_checkpoint(
-                    TerminalCleanupStage::OrdinaryClose,
-                    closed.is_ok(),
-                );
-                closed
-            }
-            (None, _) => Ok(()),
-        };
-        if cleaned.is_ok() && terminal.is_none() {
-            *owner = None;
-        }
-        drop(owner);
-        let mut retained = self.retained_browser.lock().await;
-        let retained_failed = match retained.as_mut() {
-            Some(manager) => manager.close().await.is_err(),
-            None => false,
-        };
-        if !retained_failed {
-            *retained = None;
-        }
-        drop(retained);
-        // This task only watches native connection evidence and publishes an
-        // event. Stopping it never abandons CDP/resource cleanup. Retain the
-        // handle until its cancellation has settled.
-        let mut connection_watch = self.connection_watch.lock().await;
-        let watch_failed = match connection_watch.as_mut() {
-            Some(task) => {
-                task.abort();
-                match task.await {
-                    Ok(result) => result.is_err(),
-                    Err(error) => !error.is_cancelled(),
-                }
-            }
-            None => false,
-        };
-        *connection_watch = None;
-        if supervisor_failed
-            || interop_failed
-            || terminal_recording_failed
-            || stop_failed
-            || watch_failed
-            || drain_failed
-            || (task_cleanup_failed && terminal.is_none())
-            || retained_failed
-            || self
-                .startup_uncertain
-                .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            cleanup_trace::terminal_cleanup_checkpoint(TerminalCleanupStage::ShutdownJoins, false);
-            return Err(ProtocolError::CleanupFailed);
-        }
-        cleanup_trace::terminal_cleanup_checkpoint(TerminalCleanupStage::ShutdownJoins, true);
-        cleaned?;
-        if let Some(proof) = terminal {
-            let committed = self.tasks.commit_terminal_read_only(proof);
-            cleanup_trace::terminal_cleanup_checkpoint(
-                TerminalCleanupStage::FinalCommit,
-                committed.is_ok(),
-            );
-            committed?;
-            *self.owner.lock().await = None;
-        }
-        Ok(())
+        self.shutdown_with_recovery_inner(None).await
+    }
+    fn shutdown_with_recovery(
+        &self,
+        recovery: Option<super::client_operation_state::DisconnectedRecoveryProof>,
+    ) -> impl std::future::Future<Output = Result<(), ProtocolError>> + Send {
+        self.shutdown_with_recovery_inner(recovery)
     }
 }
 

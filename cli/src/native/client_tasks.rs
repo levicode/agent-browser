@@ -453,12 +453,27 @@ impl RetainedTasks {
         &self,
         proof: &super::client_operation_state::DisconnectedRecoveryProof,
     ) -> Result<(), ProtocolError> {
+        self.drain_disconnected_until(proof, false).await
+    }
+    /// Explicit close variant: the caller already sealed this owner, so its own
+    /// seal is not evidence that a different close owns the transition.
+    pub(crate) async fn drain_disconnected_for_close(
+        &self,
+        proof: &super::client_operation_state::DisconnectedRecoveryProof,
+    ) -> Result<(), ProtocolError> {
+        self.drain_disconnected_until(proof, true).await
+    }
+    async fn drain_disconnected_until(
+        &self,
+        proof: &super::client_operation_state::DisconnectedRecoveryProof,
+        close_owned: bool,
+    ) -> Result<(), ProtocolError> {
         proof.check()?;
         let mut tasks = self.inner.lock().await;
         while let Some(result) = tasks.tasks.join_next().await {
             tasks.record(result);
         }
-        if tasks.closing
+        if (!close_owned && tasks.closing)
             || tasks.unscoped_failure
             || tasks.failures.iter().any(|failure| {
                 !failure.operation.is_some_and(|key| {

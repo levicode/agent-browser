@@ -464,7 +464,20 @@ pub enum ServerMessage {
         generation: u64,
         #[serde(rename = "scopeState")]
         scope_state: ScopeState,
+        /// Present only when the receipt could not prove every remote
+        /// obligation retired. The scope and transport are already gone; the
+        /// client must classify this as a cleanup failure, never as a corrupt
+        /// protocol. Proven closes omit the field.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cleanup: Option<CleanupState>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CleanupState {
+    Proven,
+    Unproven,
 }
 
 #[derive(Debug, Serialize)]
@@ -641,6 +654,39 @@ mod tests {
                 serde_json::json!({"code":expected})
             );
         }
+    }
+
+    #[test]
+    fn unproven_close_receipt_is_correlated_and_proven_close_keeps_its_shape() {
+        let proven = ServerMessage::Closed {
+            id: "close".into(),
+            generation: 1,
+            scope_state: ScopeState::Closed,
+            cleanup: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&proven).unwrap(),
+            serde_json::json!({
+                "type":"closed","id":"close","generation":1,"scopeState":"closed"
+            })
+        );
+        let unproven = ServerMessage::Closed {
+            id: "close".into(),
+            generation: 1,
+            scope_state: ScopeState::Quarantined,
+            cleanup: Some(CleanupState::Unproven),
+        };
+        assert_eq!(
+            serde_json::to_value(&unproven).unwrap(),
+            serde_json::json!({
+                "type":"closed","id":"close","generation":1,
+                "scopeState":"quarantined","cleanup":"unproven"
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(CleanupState::Proven).unwrap(),
+            "proven"
+        );
     }
 
     #[test]

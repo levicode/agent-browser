@@ -97,6 +97,23 @@ pub trait ClientExecutor: Send + Sync + 'static {
     ) -> Option<super::client_operation_state::DisconnectedRecoveryProof> {
         None
     }
+    /// Bounded executor cleanup after a caller cancel/deadline before the
+    /// transport must classify the operation Unknown. Commands that mint an
+    /// interruption receipt from their own bounded cleanup (navigation) report it
+    /// here; every other command keeps the short default grace.
+    fn cancellation_settlement_budget(&self, _command: &str) -> std::time::Duration {
+        std::time::Duration::from_millis(250)
+    }
+    /// Shutdown with the close exchange's unclaimed disconnected-recovery
+    /// receipt, taken before the terminal lane seals the broker. The default
+    /// ignores the receipt; an executor that can retire a disconnected owner
+    /// uses it to prove local retirement instead of refusing the close.
+    fn shutdown_with_recovery(
+        &self,
+        _recovery: Option<super::client_operation_state::DisconnectedRecoveryProof>,
+    ) -> impl std::future::Future<Output = Result<(), ProtocolError>> + Send {
+        self.shutdown()
+    }
     fn cancel_operation_producer(&self, _key: super::client_debt::OperationKey) {}
     fn fix_operation_result(&self, _key: super::client_debt::OperationKey) {}
     /// Independent publication retirement. The broker barrier is already set;
@@ -1706,6 +1723,18 @@ where
             }
         }
     }
+    // The Close exchange may arrive while the scope still holds its unclaimed
+    // disconnected-recovery receipt. Declare the slot before the terminal lane
+    // so the receipt is captured either when Close is handled or here, before
+    // the seal below clears it. A sealed broker never re-offers that proof.
+    let closing_recovery = std::sync::Arc::new(std::sync::Mutex::new(None));
+    if closing_id.is_some() {
+        if let Ok(mut slot) = closing_recovery.lock() {
+            if slot.is_none() {
+                *slot = broker.take_closing_recovery();
+            }
+        }
+    }
     settlement_trace!(0, ShutdownStarted);
     // Seal before cancelling native work. EOF never proves resource teardown.
     sink.close_publications();
@@ -1714,6 +1743,7 @@ where
     // Shutdown and control share one cutoff, never renewed by incoming traffic.
     // The executor starts even if the peer never asks for its receipt.
     let cutoff = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let recovery_for_shutdown = closing_recovery.clone();
     let shutdown = async {
         // Aborting schedules cancellation; joining proves execution guards dropped.
         let drained = tokio::time::timeout(std::time::Duration::from_secs(5), async {
@@ -1725,7 +1755,12 @@ where
             && matches!(
                 tokio::time::timeout_at(
                     cutoff.min(tokio::time::Instant::now() + std::time::Duration::from_secs(5)),
-                    executor.shutdown()
+                    executor.shutdown_with_recovery(
+                        recovery_for_shutdown
+                            .lock()
+                            .ok()
+                            .and_then(|mut slot| slot.take())
+                    )
                 )
                 .await,
                 Ok(Ok(()))
@@ -1813,6 +1848,11 @@ where
                     // Only one cleanup exchange owns the receipt. A repeated
                     // identical Close does not extend the cutoff or send twice.
                     if closing_id.as_ref().is_none_or(|owned| owned == &id) {
+                        if let Ok(mut slot) = closing_recovery.lock() {
+                            if slot.is_none() {
+                                *slot = broker.take_closing_recovery();
+                            }
+                        }
                         closing_id = Some(id);
                         terminal_recording.take();
                         continue;
@@ -2002,14 +2042,37 @@ where
                         .map(|(generation, _)| generation)
                         .unwrap_or(1),
                     scope_state: ScopeState::Closed,
+                    cleanup: None,
                 },
                 &broker,
             );
         }
+    } else if let Some(id) = closing_id {
+        // A close request is answered with a correlated receipt even when the
+        // daemon cannot prove that every remote obligation retired. The local
+        // scope and transport are gone; the receipt carries the unproven state
+        // so the client records a cleanup failure instead of treating the
+        // whole protocol as corrupt and wedging every later attempt.
+        // Every correlated outcome is already queued above; the results lane
+        // keeps this refusal behind them.
+        let generation = broker
+            .health()
+            .map(|(generation, _)| generation)
+            .unwrap_or(1);
+        enqueue(
+            &sender,
+            ServerMessage::Closed {
+                id,
+                generation,
+                scope_state: ScopeState::Quarantined,
+                cleanup: Some(CleanupState::Unproven),
+            },
+            &broker,
+        );
     } else {
-        // This terminal refusal follows every correlated outcome already
-        // queued above. The priority control lane must not overtake an Unknown
-        // result and erase its effects classification at the client.
+        // No close exchange owns this refusal. Keep the terminal error for the
+        // reader-failure path; it follows every correlated outcome already
+        // queued above so it cannot overtake an Unknown result.
         if sender
             .results
             .try_send(ServerMessage::Error {
@@ -2184,6 +2247,9 @@ async fn execute_until_deadline<E: ClientExecutor>(
     };
     let deadline = tokio::time::Instant::from_std(lease.deadline);
     let mut cancellation = lease.cancellation.clone();
+    // Captured before the command moves into the executor. A cancelled
+    // navigation needs its own bounded interruption cleanup to settle.
+    let settlement_budget = executor.cancellation_settlement_budget(&command);
     settlement_trace!(sequence, ExecuteStarted);
     let execution = executor.execute(command, args, lease);
     tokio::pin!(execution);
@@ -2210,7 +2276,7 @@ async fn execute_until_deadline<E: ClientExecutor>(
     } else {
         None
     };
-    let receipt_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(250);
+    let receipt_deadline = tokio::time::Instant::now() + settlement_budget;
     let grace_deadline = protected_cleanup_deadline
         .map_or(receipt_deadline, |cleanup| cleanup.min(receipt_deadline));
     executor.cancel_operation_producer(key);
@@ -2388,6 +2454,7 @@ fn respond<E: ClientExecutor>(
                     id,
                     generation,
                     scope_state: ScopeState::Closed,
+                    cleanup: None,
                 },
                 true,
             )
@@ -3037,10 +3104,14 @@ mod tests {
             .await
             .unwrap();
         executor.shutdown_release.notify_one();
+        // A close exchange owns the receipt even when teardown is unproven. The
+        // client records a cleanup failure from this correlated state instead of
+        // decoding a terminal error that invalidates the whole protocol.
         let failure = settlement_frame(&mut peer).await;
-        assert_eq!(failure["type"], "error");
+        assert_eq!(failure["type"], "closed");
         assert_eq!(failure["id"], "z");
-        assert_eq!(failure["error"]["code"], "cleanup-failed");
+        assert_eq!(failure["scopeState"], "quarantined");
+        assert_eq!(failure["cleanup"], "unproven");
         assert!(!serving.await.unwrap());
     }
     #[tokio::test]
@@ -3769,7 +3840,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_cleanup_never_emits_closed_or_releases_ownership_proof() {
+    async fn failed_cleanup_emits_correlated_unproven_receipt_without_releasing_proof() {
         let broker = std::sync::Arc::new(ClientSession::new());
         let executor = std::sync::Arc::new(StalledExecutor {
             broker: broker.clone(),
@@ -3797,9 +3868,11 @@ mod tests {
             .unwrap();
         let frame = read_frame(&mut client).await.unwrap().unwrap();
         let terminal: serde_json::Value = serde_json::from_slice(&frame).unwrap();
-        assert_eq!(terminal["type"], "error");
-        assert_eq!(terminal["error"]["code"], "cleanup-failed");
+        // The ownership proof stays unreleased; only the receipt is correlated.
+        assert_eq!(terminal["type"], "closed");
+        assert_eq!(terminal["id"], "z");
         assert_eq!(terminal["scopeState"], "quarantined");
+        assert_eq!(terminal["cleanup"], "unproven");
         assert!(!task.await.unwrap());
     }
 
