@@ -622,19 +622,28 @@ async fn settle_object_group<T>(
 }
 
 async fn settle_captured_object_group<T>(
-    client: &CdpClient, session: &str, group: &str,
-    result: Result<T, ObservationError>, lease: &OperationLease,
+    client: &CdpClient,
+    session: &str,
+    group: &str,
+    result: Result<T, ObservationError>,
+    lease: &OperationLease,
     capture: &client_debt::ReadonlyGroupCapture,
 ) -> Result<T, ObservationError> {
     if client.debt_ledger().is_none() {
         return settle_object_group(client, session, group, result, lease).await;
     }
-    if super::client_actions::release_captured_readonly_group_accounted(client, session, group, capture).await {
+    if super::client_actions::release_captured_readonly_group_accounted(
+        client, session, group, capture,
+    )
+    .await
+    {
         #[cfg(test)]
         equivalence_tests::after_group_release(lease, group);
         result.map_err(|error| settled_stop(error, lease))
     } else {
-        Err(ObservationError::CleanupFailed { primary: result.err().map(Box::new) })
+        Err(ObservationError::CleanupFailed {
+            primary: result.err().map(Box::new),
+        })
     }
 }
 
@@ -2357,7 +2366,7 @@ impl HiddenFrameProof {
                 .readonly_group_instance(&format!("native-hidden-proof-{}-{index}", lease.sequence))
                 .map_err(|_| ObservationError::ResourceLimit)?;
             let capture = client_debt::ReadonlyGroupCapture::new(&group);
-    let result = capture.scope(async {
+            let result = capture.scope(async {
                 validate_frame(client, parent, lease).await?;
                 validate_frame(client, child, lease).await?;
                 let backend = child.owner_backend_id.ok_or(ObservationError::BackendFailure)?;
@@ -3929,7 +3938,8 @@ async fn evaluate_query_diagnostic_inner(
     }).await;
     witness.observe(&result);
     witness.stage(Stage::Cleanup);
-    let result = settle_captured_object_group(client, session, &group, result, lease, &capture).await;
+    let result =
+        settle_captured_object_group(client, session, &group, result, lease, &capture).await;
     let nodes = result?;
     witness.stage(Stage::FrameFinal);
     validate_frame(client, frame, lease).await?;
@@ -4183,64 +4193,67 @@ async fn main_onclick_hint(
         .readonly_group_instance(&format!("native-onclick-{}-{backend}", lease.sequence))
         .map_err(|_| ObservationError::ResourceLimit)?;
     let capture = client_debt::ReadonlyGroupCapture::new(&group);
-    let result = capture.scope(async {
-        validate_frame(client, frame, lease).await?;
-        if !hint_boolean(
-            client,
-            session,
-            isolated_object,
-            EXACT_HINT_RECEIVER,
-            &group,
-            lease,
-        )
-        .await?
-        {
-            return Err(ObservationError::StaleReference);
-        }
-        let resolved = command(
-            client,
-            session,
-            "DOM.resolveNode",
-            json!({"backendNodeId":backend,"objectGroup":group}),
-            lease,
-        )
-        .await?;
-        if resolved["object"]["type"] != "object" || resolved["object"]["subtype"] != "node" {
-            return Err(ObservationError::BackendFailure);
-        }
-        let object = resolved["object"]["objectId"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .ok_or(ObservationError::BackendFailure)?;
-        let described = command(
-            client,
-            session,
-            "DOM.describeNode",
-            json!({"objectId":object,"depth":0}),
-            lease,
-        )
-        .await?;
-        if described["node"]["backendNodeId"].as_i64() != Some(backend)
-            || described["node"]["nodeType"] != 1
-        {
-            return Err(ObservationError::StaleReference);
-        }
-        let hint = hint_boolean(client, session, object, MAIN_ONCLICK_HINT, &group, lease).await?;
-        if !hint_boolean(
-            client,
-            session,
-            isolated_object,
-            EXACT_HINT_RECEIVER,
-            &group,
-            lease,
-        )
-        .await?
-        {
-            return Err(ObservationError::StaleReference);
-        }
-        validate_frame(client, frame, lease).await?;
-        Ok(hint)
-    }).await;
+    let result = capture
+        .scope(async {
+            validate_frame(client, frame, lease).await?;
+            if !hint_boolean(
+                client,
+                session,
+                isolated_object,
+                EXACT_HINT_RECEIVER,
+                &group,
+                lease,
+            )
+            .await?
+            {
+                return Err(ObservationError::StaleReference);
+            }
+            let resolved = command(
+                client,
+                session,
+                "DOM.resolveNode",
+                json!({"backendNodeId":backend,"objectGroup":group}),
+                lease,
+            )
+            .await?;
+            if resolved["object"]["type"] != "object" || resolved["object"]["subtype"] != "node" {
+                return Err(ObservationError::BackendFailure);
+            }
+            let object = resolved["object"]["objectId"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .ok_or(ObservationError::BackendFailure)?;
+            let described = command(
+                client,
+                session,
+                "DOM.describeNode",
+                json!({"objectId":object,"depth":0}),
+                lease,
+            )
+            .await?;
+            if described["node"]["backendNodeId"].as_i64() != Some(backend)
+                || described["node"]["nodeType"] != 1
+            {
+                return Err(ObservationError::StaleReference);
+            }
+            let hint =
+                hint_boolean(client, session, object, MAIN_ONCLICK_HINT, &group, lease).await?;
+            if !hint_boolean(
+                client,
+                session,
+                isolated_object,
+                EXACT_HINT_RECEIVER,
+                &group,
+                lease,
+            )
+            .await?
+            {
+                return Err(ObservationError::StaleReference);
+            }
+            validate_frame(client, frame, lease).await?;
+            Ok(hint)
+        })
+        .await;
     #[cfg(test)]
     if result.is_err() {
         // Fixed diagnostic only: page exception descriptions/values are private.
@@ -4406,7 +4419,8 @@ async fn read_batch_with_refs(
     if primary_failed {
         eprintln!("native-metadata-first-failure stage={}", diagnostic_stage);
     }
-    let result = settle_captured_object_group(client, session, &group, result, lease, &capture).await;
+    let result =
+        settle_captured_object_group(client, session, &group, result, lease, &capture).await;
     #[cfg(test)]
     if !primary_failed && result.is_err() {
         eprintln!("native-metadata-first-failure stage=ObjectGroupCleanup");
@@ -4882,7 +4896,7 @@ async fn enumerate_frames_impl(
                     .readonly_group_instance(&format!("native-frame-owner-{}", lease.sequence))
                     .map_err(|_| ObservationError::ResourceLimit)?;
                 let capture = client_debt::ReadonlyGroupCapture::new(&group);
-    let result = capture.scope(async {
+                let result = capture.scope(async {
                     let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":group}),lease).await?;
                     let object = resolved["object"]["objectId"].as_str().ok_or("Frame owner unavailable")?;
                     let value=command(client,&parent.binding.session,"Runtime.callFunctionOn",json!({"objectId":object,"functionDeclaration":FRAME_OWNER_GEOMETRY,"returnByValue":true,"objectGroup":group}),lease).await?;
@@ -4890,7 +4904,15 @@ async fn enumerate_frames_impl(
                 }).await;
                 // Includes malformed/exception handles: exact group custody is
                 // independent of whether the readonly proof was accepted.
-                settle_captured_object_group(client, &parent.binding.session, &group, result, lease, &capture).await?
+                settle_captured_object_group(
+                    client,
+                    &parent.binding.session,
+                    &group,
+                    result,
+                    lease,
+                    &capture,
+                )
+                .await?
             } else {
                 let resolved=command(client,&parent.binding.session,"DOM.resolveNode",json!({"backendNodeId":backend,"executionContextId":world["executionContextId"],"objectGroup":"native-frame-enumeration"}),lease).await?;
                 let object = resolved["object"]["objectId"]
@@ -5646,7 +5668,8 @@ async fn security_inventory_for_roots(
         }
         Ok(security)
     }).await;
-    let result = settle_captured_object_group(client, session, &group, result, lease, &capture).await;
+    let result =
+        settle_captured_object_group(client, session, &group, result, lease, &capture).await;
     result
 }
 

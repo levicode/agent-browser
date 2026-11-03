@@ -306,7 +306,14 @@ impl AcknowledgedNavigation {
         tasks: &RetainedTasks,
         events: &mut BoundedMethodEvents,
     ) -> Option<NavigationInterruptionProof> {
-        self.retire_before(page, operation, tasks, events, Instant::now() + Duration::from_secs(2)).await
+        self.retire_before(
+            page,
+            operation,
+            tasks,
+            events,
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await
     }
     async fn retire_before(
         mut self,
@@ -323,9 +330,7 @@ impl AcknowledgedNavigation {
             .operation_retention_status(key)
             .proof()
             .filter(|proof| proof.matches(key))?;
-        let deadline = retained
-            .retirement_deadline()
-            .min(stop_by);
+        let deadline = retained.retirement_deadline().min(stop_by);
         let cleanup = async {
             let watermark = events.watermark();
             self.boundary
@@ -517,7 +522,10 @@ pub(super) async fn trigger(
     };
     // Reserved/abandoned work never grants stop authority. A submitted command
     // remains owned by the exact CDP reader even if this waiter later expires.
-    if !matches!(status.snapshot(), CommandStatus::Submitted | CommandStatus::Acknowledged) {
+    if !matches!(
+        status.snapshot(),
+        CommandStatus::Submitted | CommandStatus::Acknowledged
+    ) {
         return Err(reason);
     }
     let key = journal.key();
@@ -546,12 +554,21 @@ pub(super) async fn trigger(
         if !status.is_error_ack() {
             if let Ok(response) = response {
                 if let Some(boundary) = AcknowledgedBoundary::from_ack(
-                    &response, &page.page_session_id, frame, previous_loader,
-                    requested_url, trigger_sequence,
+                    &response,
+                    &page.page_session_id,
+                    frame,
+                    previous_loader,
+                    requested_url,
+                    trigger_sequence,
                 ) {
                     *receipt = AcknowledgedNavigation {
-                        boundary, original: status, attachment, journal,
-                    }.retire_before(page, operation, tasks, events, deadline).await;
+                        boundary,
+                        original: status,
+                        attachment,
+                        journal,
+                    }
+                    .retire_before(page, operation, tasks, events, deadline)
+                    .await;
                 }
             }
         }

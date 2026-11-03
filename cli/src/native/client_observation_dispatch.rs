@@ -257,13 +257,19 @@ impl ScreenshotFailureWitness {
             if let Some(observer) = &self.receipt_for_test {
                 // Copy only the exact facts already consumed by this finish.
                 // No new inventory lookup or result/owner decision is made.
-                *observer.lock().unwrap() = Some((stage_for_test, initial_sample, prefix, inventory));
+                *observer.lock().unwrap() =
+                    Some((stage_for_test, initial_sample, prefix, inventory));
             }
             if let Some(inventory) = inventory {
                 diagnostic::frame_inventory_rejection(self.generation, self.sequence, inventory);
             }
             // Both original failure records take priority over new diagnostics.
-            diagnostic::observe_initial_acquisition(self.generation, self.sequence, initial_sample, prefix);
+            diagnostic::observe_initial_acquisition(
+                self.generation,
+                self.sequence,
+                initial_sample,
+                prefix,
+            );
         }
     }
     fn take_failure(&self, after: impl FnOnce() -> Option<u64>) -> Option<ScreenshotFailure> {
@@ -1485,7 +1491,10 @@ impl ObservationDispatch {
         context: &DispatchContext,
         operation: &OperationLease,
         cleanup: &AtomicBool,
-        diagnostic: Option<(&ScreenshotFailureWitness, diagnostic::ObserveInitialPrefixCheck)>,
+        diagnostic: Option<(
+            &ScreenshotFailureWitness,
+            diagnostic::ObserveInitialPrefixCheck,
+        )>,
     ) -> bool {
         use diagnostic::ObserveInitialPrefixRefusal as Refusal;
         let refused = |reason, debt: Option<[u32; 3]>| {
@@ -1494,7 +1503,8 @@ impl ObservationDispatch {
                     check,
                     refusal: reason,
                     debt: debt.map(|counts| counts.map(|count| count.min(u16::MAX as u32) as u16)),
-                    debt_capped: debt.map(|counts| counts.iter().any(|count| *count > u16::MAX as u32)),
+                    debt_capped: debt
+                        .map(|counts| counts.iter().any(|count| *count > u16::MAX as u32)),
                 });
             }
             false
@@ -1510,18 +1520,34 @@ impl ObservationDispatch {
         if !ledger.matches_owner(operation.generation, &context.scope.identity_scope) {
             return refused(Refusal::OwnerMismatch, None);
         }
-        if context.page.client.check_cleanup_owner(&Some(ledger.clone())).is_err() {
+        if context
+            .page
+            .client
+            .check_cleanup_owner(&Some(ledger.clone()))
+            .is_err()
+        {
             return refused(Refusal::CleanupOwnerRefused, None);
         }
-        if ledger.check_admission(super::client_debt::AdmissionClass::Reference).is_err() {
+        if ledger
+            .check_admission(super::client_debt::AdmissionClass::Reference)
+            .is_err()
+        {
             return refused(Refusal::AdmissionRefused, None);
         }
         let debt = ledger.snapshot();
         let counts = Some([debt.input_debt, debt.object_debt, debt.outstanding_commands]);
-        if debt.integrity_lost { return refused(Refusal::IntegrityLost, counts); }
-        if debt.input_debt != 0 { return refused(Refusal::InputDebt, counts); }
-        if debt.object_debt != 0 { return refused(Refusal::ObjectDebt, counts); }
-        if debt.outstanding_commands != 0 { return refused(Refusal::OutstandingCommands, counts); }
+        if debt.integrity_lost {
+            return refused(Refusal::IntegrityLost, counts);
+        }
+        if debt.input_debt != 0 {
+            return refused(Refusal::InputDebt, counts);
+        }
+        if debt.object_debt != 0 {
+            return refused(Refusal::ObjectDebt, counts);
+        }
+        if debt.outstanding_commands != 0 {
+            return refused(Refusal::OutstandingCommands, counts);
+        }
         true
     }
     async fn initial_trace_frames(
@@ -1610,7 +1636,9 @@ impl ObservationDispatch {
             Ok(())
         };
         check_owner()?;
-        if let Some(witness) = screenshot { witness.initial_sample(1); }
+        if let Some(witness) = screenshot {
+            witness.initial_sample(1);
+        }
         let first = frame_inventory_attempt_impl(
             &context.page,
             operation,
@@ -1636,16 +1664,28 @@ impl ObservationDispatch {
             return Err(rejected.record(screenshot));
         }
         check_owner()?;
-        if !Self::initial_trace_prefix_settled_with_diagnostic(context, operation, cleanup, screenshot.map(|witness| (witness, diagnostic::ObserveInitialPrefixCheck::BeforeYield))) {
+        if !Self::initial_trace_prefix_settled_with_diagnostic(
+            context,
+            operation,
+            cleanup,
+            screenshot.map(|witness| (witness, diagnostic::ObserveInitialPrefixCheck::BeforeYield)),
+        ) {
             return Err(rejected.record(screenshot));
         }
         tokio::task::yield_now().await;
         check_owner()?;
-        if !Self::initial_trace_prefix_settled_with_diagnostic(context, operation, cleanup, screenshot.map(|witness| (witness, diagnostic::ObserveInitialPrefixCheck::AfterYield))) {
+        if !Self::initial_trace_prefix_settled_with_diagnostic(
+            context,
+            operation,
+            cleanup,
+            screenshot.map(|witness| (witness, diagnostic::ObserveInitialPrefixCheck::AfterYield)),
+        ) {
             return Err(rejected.record(screenshot));
         }
         // No loop: the old sample is discarded and a second raced sample fails.
-        if let Some(witness) = screenshot { witness.initial_sample(2); }
+        if let Some(witness) = screenshot {
+            witness.initial_sample(2);
+        }
         let inventory = frame_inventory_attempt_impl(
             &context.page,
             operation,
@@ -4544,21 +4584,40 @@ mod tests {
             node_geometry_read_failure(&Error::BackendFailure, Origin::BoxRead),
             (ReadError::Geometry(Kind::NodeBoxRead), false)
         );
-        for origin in [Origin::Other, Origin::ResolveOther, Origin::MixedHard, Origin::BoxProofInvalid] {
+        for origin in [
+            Origin::Other,
+            Origin::ResolveOther,
+            Origin::MixedHard,
+            Origin::BoxProofInvalid,
+        ] {
             assert_eq!(
                 node_geometry_read_failure(&Error::BackendFailure, origin),
                 geometry_read_failure(&Error::BackendFailure)
             );
         }
-        for error in [Error::Cancelled, Error::DeadlineExceeded, Error::Superseded, Error::InvalidGeometry,
-            Error::IncompleteInventory, Error::CleanupFailed { primary: Some(Box::new(Error::BackendFailure)) }] {
-            assert_eq!(node_geometry_read_failure(&error, Origin::BoxRead), geometry_read_failure(&error));
+        for error in [
+            Error::Cancelled,
+            Error::DeadlineExceeded,
+            Error::Superseded,
+            Error::InvalidGeometry,
+            Error::IncompleteInventory,
+            Error::CleanupFailed {
+                primary: Some(Box::new(Error::BackendFailure)),
+            },
+        ] {
+            assert_eq!(
+                node_geometry_read_failure(&error, Origin::BoxRead),
+                geometry_read_failure(&error)
+            );
         }
         assert_eq!(
             node_geometry_read_failure(&Error::StaleIdentity, Origin::BoxNodeNegative),
             (ReadError::Geometry(Kind::NodeBoxNegative), false)
         );
-        assert_eq!(geometry_error(Error::BackendFailure), ProtocolError::PolicyDenied);
+        assert_eq!(
+            geometry_error(Error::BackendFailure),
+            ProtocolError::PolicyDenied
+        );
     }
 
     #[tokio::test]
@@ -7525,7 +7584,8 @@ mod tests {
     }
     #[test]
     fn observe_initial_diagnostic_keeps_sample_and_prefix_at_first_failure() {
-        let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
+        let witness =
+            ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
         witness.initial_sample(1);
         let prefix = diagnostic::ObserveInitialPrefix {
             check: diagnostic::ObserveInitialPrefixCheck::BeforeYield,
@@ -7553,7 +7613,8 @@ mod tests {
     #[test]
     fn observe_initial_second_sample_is_distinct_and_diagnostics_stay_opt_in() {
         assert!(ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), false).is_none());
-        let witness = ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
+        let witness =
+            ScreenshotFailureWitness::new(&diagnostic_trace(), &operation(), true).unwrap();
         witness.initial_sample(1);
         witness.initial_sample(2);
         witness.failure(&ProtocolError::StaleScope);
