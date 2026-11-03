@@ -5290,6 +5290,12 @@ impl ClientEnrollment {
             .lock()
             .map_err(|_| ProtocolError::ScopeUnavailable)?
             == entry.root;
+        let page_target = matches!(entry.kind.as_str(), "page" | "iframe");
+        let paused_new_page = entry.kind == "page"
+            && entry.init_paused_by_attachment
+            && !entry.observation_only
+            && !entry.resumed;
+        let mut initialization_revision: Option<u64> = None;
         #[cfg(test)]
         self.pause_component_boundary(CaptureTestPoint::BeforeNetworkPreparationBoundary, op)
             .await?;
@@ -5418,7 +5424,50 @@ impl ClientEnrollment {
                 )
                 .await
                 .map_err(|failure| self.initialization_component_failure(failure))?;
-            let page_target = matches!(entry.kind.as_str(), "page" | "iframe");
+            if paused_new_page {
+                // Register the paused popup's init scripts as soon as the
+                // network boundary is configured. This browser may be shared
+                // with another CDP client, and that client can release the
+                // `waitForDebuggerOnStart` pause at any time: the first
+                // document that starts before this registration never sees the
+                // session's init scripts.
+                self.initialization_command(op, Some(&entry.session), "Page.enable", json!({}))
+                    .await?;
+                // Create the main world before the first registration.
+                // Chromium runs registrations immediately for a paused new
+                // window; creating the world inside that first registration
+                // can re-enter new-document injection and execute only script
+                // zero twice. Runtime events are already subscribed.
+                observe_popup_setup(
+                    super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableEntered,
+                );
+                ServiceWorkerAdmission::observe(
+                    admission,
+                    WorkerAdmissionStep::RuntimeEnable,
+                    self.initialization_command(
+                        op,
+                        Some(&entry.session),
+                        "Runtime.enable",
+                        json!({}),
+                    ),
+                )
+                .await?;
+                observe_popup_setup(
+                    super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                );
+                let revision = self
+                    .page
+                    .apply_to_paused_new_session_initialization(&lease, &entry.session, op)
+                    .await
+                    .map_err(|failure| self.initialization_component_failure(failure))?;
+                if revision != self.page.config_revision()? {
+                    return Err(ProtocolError::StaleScope.into());
+                }
+                observe_popup_setup(
+                    super::client_settlement_trace::PopupSetupCheckpoint::ScriptsAcknowledged,
+                );
+                initialization_revision = Some(revision);
+            }
             if page_target {
                 // Chromium fixes includeWhitespace at the first DOM.enable (and
                 // DOM.getDocument implicitly enables with the default "none").
@@ -5432,8 +5481,10 @@ impl ClientEnrollment {
                 )
                 .await?;
                 self.initial_settings(&entry, op).await?;
-                self.initialization_command(op, Some(&entry.session), "Page.enable", json!({}))
-                    .await?;
+                if !paused_new_page {
+                    self.initialization_command(op, Some(&entry.session), "Page.enable", json!({}))
+                        .await?;
+                }
                 // Discover existing frames as well as future frame events.
                 let tree = self
                     .initialization_command(
@@ -5447,44 +5498,47 @@ impl ClientEnrollment {
                     self.frame_tree(&entry, tree, 0)?;
                 }
             }
-            // Create the main world before registering scripts. For an authorized application page
-            // whose new attachment explicitly reports waitingForDebugger, the
-            // registration below also executes in that existing paused world.
-            // Runtime events are already subscribed; resume remains after all ACKs.
-            // Entering the command future is not a wire-submission receipt.
-            observe_popup_setup(
-                super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableEntered,
-            );
-            ServiceWorkerAdmission::observe(
-                admission,
-                WorkerAdmissionStep::RuntimeEnable,
-                self.initialization_command(op, Some(&entry.session), "Runtime.enable", json!({})),
-            )
-            .await?;
-            observe_popup_setup(
-                super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableAcknowledged,
-            );
+            if !paused_new_page {
+                // Create the main world before registering scripts. For a
+                // paused new page the early registration above already created
+                // it. Runtime events are subscribed and resume remains after
+                // all ACKs.
+                observe_popup_setup(
+                    super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableEntered,
+                );
+                ServiceWorkerAdmission::observe(
+                    admission,
+                    WorkerAdmissionStep::RuntimeEnable,
+                    self.initialization_command(
+                        op,
+                        Some(&entry.session),
+                        "Runtime.enable",
+                        json!({}),
+                    ),
+                )
+                .await?;
+                observe_popup_setup(
+                    super::client_settlement_trace::PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                );
+            }
             if page_target {
-                let revision = if entry.kind == "page"
-                    && entry.init_paused_by_attachment
-                    && !entry.observation_only
-                    && !entry.resumed
-                {
-                    self.page
-                        .apply_to_paused_new_session_initialization(&lease, &entry.session, op)
-                        .await
-                } else {
-                    self.page
-                        .apply_to_new_session_initialization(&lease, &entry.session, op)
-                        .await
-                }
-                .map_err(|failure| self.initialization_component_failure(failure))?;
+                let revision = match initialization_revision {
+                    Some(revision) => revision,
+                    None => {
+                        let revision = self
+                            .page
+                            .apply_to_new_session_initialization(&lease, &entry.session, op)
+                            .await
+                            .map_err(|failure| self.initialization_component_failure(failure))?;
+                        observe_popup_setup(
+                            super::client_settlement_trace::PopupSetupCheckpoint::ScriptsAcknowledged,
+                        );
+                        revision
+                    }
+                };
                 if revision != self.page.config_revision()? {
                     return Err(ProtocolError::StaleScope.into());
                 }
-                observe_popup_setup(
-                    super::client_settlement_trace::PopupSetupCheckpoint::ScriptsAcknowledged,
-                );
                 #[cfg(test)]
                 if entry.kind == "page" {
                     self.pause_component_boundary(
@@ -19844,6 +19898,39 @@ mod tests {
             assert!(scripts[0]["params"].get("runImmediately").is_none());
             if receipt == Some(json!(true)) {
                 assert_eq!(scripts[1]["params"]["runImmediately"], true);
+                // The network boundary must be configured first, but another
+                // CDP client sharing this browser can release the debugger
+                // pause at any moment, so a paused new page's init registration
+                // must still precede the remaining DOM/frame setup and the
+                // resume itself.
+                let first_script = commands
+                    .iter()
+                    .position(|request| {
+                        request["sessionId"] == "popup-session"
+                            && request["method"] == "Page.addScriptToEvaluateOnNewDocument"
+                    })
+                    .unwrap();
+                for later in ["DOM.enable", "Page.getFrameTree"] {
+                    if let Some(index) = commands.iter().position(|request| {
+                        request["sessionId"] == "popup-session" && request["method"] == later
+                    }) {
+                        assert!(
+                            first_script < index,
+                            "{later} preceded paused init-script registration"
+                        );
+                    }
+                }
+                let resume = commands
+                    .iter()
+                    .position(|request| {
+                        request["sessionId"] == "popup-session"
+                            && request["method"] == "Runtime.runIfWaitingForDebugger"
+                    })
+                    .unwrap();
+                assert!(
+                    first_script < resume,
+                    "paused init-script registration must precede the resume"
+                );
             } else {
                 assert!(scripts[1]["params"].get("runImmediately").is_none());
             }
