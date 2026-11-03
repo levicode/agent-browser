@@ -378,6 +378,7 @@ async fn run_scheduled(
             async move {
                 let mut receipt = None;
                 let mut acknowledged = None;
+                let mut committed = false;
                 let pending = trigger(
                     &page,
                     &operation,
@@ -388,6 +389,7 @@ async fn run_scheduled(
                     &mut events,
                     Some((&owner, &mut receipt)),
                     &mut acknowledged,
+                    &mut committed,
                 );
                 let mut result = if ack_cancel_race {
                     ORIGINAL_RESPONSE_GATE.scope(producer_gate, pending).await

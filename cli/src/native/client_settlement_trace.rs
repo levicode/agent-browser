@@ -1543,6 +1543,10 @@ pub(crate) struct ReadonlyPrepareFailure {
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum TerminalCleanupStage {
     TaskProof,
+    RecoveryReceipt,
+    RecoveryCandidate,
+    RecoveryDrain,
+    RecoveryRetirement,
     OwnerPreconditions,
     RuntimeRelease,
     PersistentProbe,

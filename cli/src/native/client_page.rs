@@ -1277,11 +1277,17 @@ impl ClientPageState {
     ) -> (
         Result<Value, ProtocolError>,
         Option<NavigationInterruptionProof>,
+        bool,
     ) {
         if name != "page.navigate" {
-            return (self.execute(page, sessions, op, name, args).await, None);
+            return (
+                self.execute(page, sessions, op, name, args).await,
+                None,
+                false,
+            );
         }
         let mut proof = None;
+        let mut committed = false;
         let result = async {
             self.validate(page, op)?;
             let a = decode_navigation(args)?;
@@ -1292,12 +1298,13 @@ impl ClientPageState {
                 json!({"url":a.url}),
                 &a.wait_until,
                 Some((tasks, &mut proof)),
+                &mut committed,
             )
             .await?;
             Ok(Value::Null)
         }
         .await;
-        (result, proof)
+        (result, proof, committed)
     }
     /// The native dispatcher supplies only sessions proven owned by context_id.
     pub async fn execute(
@@ -1356,6 +1363,7 @@ impl ClientPageState {
             }
             "page.navigate" => {
                 let a = decode_navigation(args)?;
+                let mut committed = false;
                 self.navigate(
                     page,
                     op,
@@ -1363,14 +1371,24 @@ impl ClientPageState {
                     json!({"url":a.url}),
                     &a.wait_until,
                     None,
+                    &mut committed,
                 )
                 .await?;
                 Ok(Value::Null)
             }
             "page.reload" => {
                 let _: Empty = decode(args)?;
-                self.navigate(page, op, "Page.reload", json!({}), "load", None)
-                    .await?;
+                let mut committed = false;
+                self.navigate(
+                    page,
+                    op,
+                    "Page.reload",
+                    json!({}),
+                    "load",
+                    None,
+                    &mut committed,
+                )
+                .await?;
                 Ok(Value::Null)
             }
             "page.back" | "page.forward" => {
@@ -1391,6 +1409,7 @@ impl ClientPageState {
                         .get("id")
                         .and_then(Value::as_i64)
                         .ok_or(ProtocolError::BrowserFailure)?;
+                    let mut committed = false;
                     self.navigate(
                         page,
                         op,
@@ -1398,6 +1417,7 @@ impl ClientPageState {
                         json!({"entryId":id}),
                         "load",
                         None,
+                        &mut committed,
                     )
                     .await?;
                 }
@@ -1511,6 +1531,7 @@ impl ClientPageState {
             _ => Err(ProtocolError::UnsupportedCommand),
         }
     }
+    #[allow(clippy::too_many_arguments)]
     async fn navigate(
         &self,
         page: &BrowserExecutionLease,
@@ -1522,6 +1543,7 @@ impl ClientPageState {
             &super::client_tasks::RetainedTasks,
             &mut Option<NavigationInterruptionProof>,
         )>,
+        committed: &mut bool,
     ) -> Result<(), ProtocolError> {
         #[cfg(test)]
         page.client
@@ -1619,6 +1641,7 @@ impl ClientPageState {
                 .as_mut()
                 .map(|(tasks, receipt)| (*tasks, &mut **receipt)),
             &mut acknowledged,
+            committed,
         )
         .await;
         #[cfg(test)]

@@ -1470,7 +1470,15 @@ where
                         broker.release_refused_disconnected_recovery(sequence);
                     }
                     let unknown = outcome.effects == Effects::Unknown;
-                    let recovery = if recovery_negotiated && !callback && unknown && state == ScopeState::Quarantined {
+                    // A settled operation whose scope is quarantined owns the one
+                    // unclaimed disconnected-recovery receipt, whether it ended
+                    // Unknown or as a clean pre-dispatch refusal. A refused
+                    // reconnect over an owner that lost only its remote connection
+                    // is a clean refusal, yet the explicit close still needs that
+                    // receipt to prove local retirement. The candidate hook
+                    // validates the exact owner, so it cannot mint a receipt for a
+                    // locally failed producer.
+                    let recovery = if recovery_negotiated && !callback && state == ScopeState::Quarantined {
                         executor.disconnected_recovery_candidate(super::client_debt::OperationKey { generation, operation_seq: sequence })
                             .and_then(|proof| {
                                 let descriptor = RecoveryDescriptor { version: 1, identity_scope: proof.ledger().identity_scope().to_owned() };
@@ -3202,6 +3210,112 @@ mod tests {
         );
         assert_eq!(closed["type"], "closed");
         assert_eq!(closed["id"], "z");
+        assert_eq!(closed["scopeState"], "closed");
+        assert!(closed.get("cleanup").is_none());
+        assert!(serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn clean_refusal_on_a_remote_eof_owner_offers_the_closing_receipt() {
+        struct RefusalExecutor {
+            broker: std::sync::Arc<ClientSession>,
+            received: std::sync::atomic::AtomicBool,
+            ledger: std::sync::Arc<super::super::client_debt::OwnerDebtLedger>,
+        }
+        impl ClientExecutor for RefusalExecutor {
+            fn capabilities(&self) -> Vec<String> {
+                vec![super::super::client_protocol::DISCONNECTED_RECOVERY.to_owned()]
+            }
+            async fn execute(
+                &self,
+                _: String,
+                _: serde_json::Map<String, serde_json::Value>,
+                _: OperationLease,
+            ) -> NativeOutcome {
+                // The refused reconnect lost only the remote connection: its
+                // local producer finished cleanly before the broker quarantined.
+                self.broker.quarantine().unwrap();
+                NativeOutcome {
+                    retention: None,
+                    result: Err(ProtocolError::StaleScope),
+                    effects: Effects::NotDispatched,
+                }
+            }
+            fn disconnected_recovery_candidate(
+                &self,
+                key: super::super::client_debt::OperationKey,
+            ) -> Option<super::super::client_operation_state::DisconnectedRecoveryProof>
+            {
+                Some(
+                    super::super::client_operation_state::DisconnectedRecoveryProof::for_test(
+                        key,
+                        self.ledger.clone(),
+                        std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    ),
+                )
+            }
+            async fn shutdown(&self) -> Result<(), ProtocolError> {
+                Ok(())
+            }
+            fn shutdown_with_recovery(
+                &self,
+                recovery: Option<super::super::client_operation_state::DisconnectedRecoveryProof>,
+            ) -> impl std::future::Future<Output = Result<(), ProtocolError>> + Send {
+                self.received
+                    .store(recovery.is_some(), std::sync::atomic::Ordering::SeqCst);
+                async { Ok(()) }
+            }
+        }
+        let broker = std::sync::Arc::new(ClientSession::new());
+        let executor = std::sync::Arc::new(RefusalExecutor {
+            broker: broker.clone(),
+            received: std::sync::atomic::AtomicBool::new(false),
+            ledger: super::super::client_debt::OwnerDebtLedger::new(1, "scope".to_owned()),
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![
+                    super::super::client_protocol::DISCONNECTED_RECOVERY.to_owned()
+                ],
+            },
+            broker.clone(),
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        let ready = settlement_frame(&mut peer).await;
+        assert_eq!(ready["type"], "ready");
+        peer.get_mut()
+            .write_all(
+                b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":2,\"timeoutMs\":5000,\"command\":\"scope.reconnect\",\"args\":{\"identityScope\":\"scope\"}}\n",
+            )
+            .await
+            .unwrap();
+        let result = settlement_frame(&mut peer).await;
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["effects"], "not-dispatched");
+        assert_eq!(result["scopeState"], "quarantined");
+        // The clean refusal still owns the one unclaimed receipt an explicit
+        // close needs; without it the quarantined owner can never prove local
+        // retirement.
+        assert_eq!(
+            result["recovery"],
+            serde_json::json!({"version":1,"identityScope":"scope"})
+        );
+        peer.get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        let closed = settlement_frame(&mut peer).await;
+        assert!(
+            executor.received.load(std::sync::atomic::Ordering::SeqCst),
+            "close did not hand the refused reconnect's disconnected-recovery receipt to the executor"
+        );
+        assert_eq!(closed["type"], "closed");
         assert_eq!(closed["scopeState"], "closed");
         assert!(closed.get("cleanup").is_none());
         assert!(serving.await.unwrap());

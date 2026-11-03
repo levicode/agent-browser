@@ -608,7 +608,9 @@ impl PageActivation {
         dispatched: &mut bool,
     ) -> Result<(), ProtocolError> {
         // Recording and other result-only callers retain the original path.
-        self.ensure_inner(page, operation, dispatched, None).await
+        let mut prefix_completed = false;
+        self.ensure_inner(page, operation, dispatched, &mut prefix_completed, None)
+            .await
     }
     async fn ensure_with_retirement(
         &self,
@@ -617,11 +619,22 @@ impl PageActivation {
         dispatched: &mut bool,
         tasks: &super::client_tasks::RetainedTasks,
         command: ActivationCommand,
-    ) -> (Result<(), ProtocolError>, Option<NavigationInterruption>) {
+    ) -> (
+        Result<(), ProtocolError>,
+        Option<NavigationInterruption>,
+        bool,
+    ) {
         // No receipt survives from another ensure or from successful navigation.
         let mut receipt = None;
+        let mut prefix_completed = false;
         let result = self
-            .ensure_inner(page, operation, dispatched, Some((tasks, &mut receipt)))
+            .ensure_inner(
+                page,
+                operation,
+                dispatched,
+                &mut prefix_completed,
+                Some((tasks, &mut receipt)),
+            )
             .await;
         let interruption = match (receipt, result.as_ref().err()) {
             (Some(proof), Some(reason)) if activation_navigation_error(Some(reason)) => {
@@ -633,13 +646,14 @@ impl PageActivation {
             }
             _ => None,
         };
-        (result, interruption)
+        (result, interruption, prefix_completed)
     }
     async fn ensure_inner(
         &self,
         page: &BrowserExecutionLease,
         operation: &super::client_session::OperationLease,
         dispatched: &mut bool,
+        prefix_completed: &mut bool,
         retirement: Option<(
             &super::client_tasks::RetainedTasks,
             &mut Option<super::client_page::NavigationInterruptionProof>,
@@ -676,7 +690,7 @@ impl PageActivation {
             .activation_diagnostic("ensure-navigation", None, "entered", None, None);
         let arguments = serde_json::json!({"url":"about:blank","waitUntil":"domcontentloaded"});
         let navigation = if let Some((tasks, receipt)) = retirement {
-            let (result, proof) = self
+            let (result, proof, committed) = self
                 .page_state
                 .execute_with_retirement(
                     page,
@@ -692,6 +706,10 @@ impl PageActivation {
             if activation_navigation_error(result.as_ref().err()) {
                 *receipt = proof;
             }
+            // An accepted original navigation response proves the internal
+            // blank document committed even when the post-ACK stop witness
+            // could not be established.
+            *prefix_completed |= committed;
             result
         } else {
             self.page_state
@@ -713,6 +731,9 @@ impl PageActivation {
             None,
         );
         navigation?;
+        // The internal blank navigation committed. A later cancellation of the
+        // caller's command is a completed activation prefix, not Unknown.
+        *prefix_completed = true;
         #[cfg(test)]
         page.client
             .activation_diagnostic("ensure-flush", None, "entered", None, None);
@@ -2934,38 +2955,59 @@ impl ClientBrowser {
         let mut owner = self.owner.lock().await;
         let mut terminal_operations = None;
         if task_cleanup_failed {
-            // The proven terminal read-only path keeps precedence so a scope the
-            // existing receipt already covers is never downgraded by the
-            // recovery fallback below.
-            terminal_operations = match owner
-                .as_ref()
-                .and_then(|owner| owner.manager.client.debt_ledger())
-            {
-                Some(ledger) => {
-                    let prepared = self.tasks.prepare_terminal_read_only(&ledger).await;
+            // An explicit close may own an unclaimed disconnected-recovery
+            // receipt for this exact owner. That receipt proves local retirement
+            // of a scope that lost only its remote connection, then the owner is
+            // closed ordinarily. The read-only terminal proof cannot accept the
+            // non-terminal commands a lost ledger keeps, so it must not preempt
+            // that receipt: doing so left a provable close at task-proof's
+            // enrollment refusal (`ledger-command-contract`).
+            let mut recovery_retired = false;
+            cleanup_trace::terminal_cleanup_checkpoint(
+                TerminalCleanupStage::RecoveryReceipt,
+                closing_recovery.is_some(),
+            );
+            if let Some(proof) = closing_recovery.as_ref() {
+                let candidate =
+                    proof.check().is_ok() && self.tasks.recovery_candidate(proof.key()).is_some();
+                cleanup_trace::terminal_cleanup_checkpoint(
+                    TerminalCleanupStage::RecoveryCandidate,
+                    candidate,
+                );
+                let drained = self.tasks.drain_disconnected_for_close(proof).await.is_ok();
+                cleanup_trace::terminal_cleanup_checkpoint(
+                    TerminalCleanupStage::RecoveryDrain,
+                    drained,
+                );
+                let retired = drained && self.tasks.retire_disconnected_owner(proof).is_ok();
+                cleanup_trace::terminal_cleanup_checkpoint(
+                    TerminalCleanupStage::RecoveryRetirement,
+                    retired,
+                );
+                if retired {
                     cleanup_trace::terminal_cleanup_checkpoint(
                         TerminalCleanupStage::TaskProof,
-                        prepared.is_ok(),
+                        true,
                     );
-                    prepared.ok()
+                    task_cleanup_failed = false;
+                    recovery_retired = true;
                 }
-                None => None,
-            };
-            // Only when that receipt refuses does an unclaimed disconnected
-            // recovery become the evidence: drain and retire that exact owner,
-            // then close it ordinarily as a locally proven retirement.
-            if terminal_operations.is_none() {
-                if let Some(proof) = closing_recovery.as_ref() {
-                    let drained = self.tasks.drain_disconnected_for_close(proof).await.is_ok();
-                    let retired = drained && self.tasks.retire_disconnected_owner(proof).is_ok();
-                    if retired {
+            }
+            if !recovery_retired {
+                terminal_operations = match owner
+                    .as_ref()
+                    .and_then(|owner| owner.manager.client.debt_ledger())
+                {
+                    Some(ledger) => {
+                        let prepared = self.tasks.prepare_terminal_read_only(&ledger).await;
                         cleanup_trace::terminal_cleanup_checkpoint(
                             TerminalCleanupStage::TaskProof,
-                            true,
+                            prepared.is_ok(),
                         );
-                        task_cleanup_failed = false;
+                        prepared.ok()
                     }
-                }
+                    None => None,
+                };
             }
         }
         let mut terminal = None;
@@ -4631,6 +4673,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     return (NativeOutcome { retention: None, result: Err(error), effects: Effects::NotDispatched }, false);
                 }
                 let mut dispatched = false;
+                // The caller's own requested operation reached its dispatch,
+                // separate from the internal activation prefix.
+                let mut request_dispatched = false;
+                let mut activation_completed = false;
+                let mut navigation_committed = false;
                 let mut navigation_interruption = None;
                 let result = async {
                         if command != "page.navigate" && command != "page.activate" && command != "session.environment" && !command.starts_with("context.") && !page_active.load(std::sync::atomic::Ordering::SeqCst) {
@@ -4751,10 +4798,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         if command == "page.activate" {
                             // Provider recording needs original ensurePage semantics without
                             // starting the native encoder or navigating an already active page.
-                            let (activated, interruption) = activation.ensure_with_retirement(
+                            let (activated, interruption, completed) = activation.ensure_with_retirement(
                                 &page, &lease, &mut dispatched, &dispatch_tasks, ActivationCommand::Activate,
                             ).await;
                             navigation_interruption = interruption;
+                            activation_completed = completed;
                             #[cfg(test)]
                             page.client.activation_diagnostic("ensure-result", None, if activated.is_ok() { "ok" } else { "failed" }, activated.as_ref().err(), None);
                             activated?;
@@ -4778,10 +4826,11 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let sessions = attachments.iter().map(|target| target.session_id.clone()).collect::<Vec<_>>();
                         if command == "page.navigate" {
                             super::client_page::ClientPageState::validate_navigation(&serde_json::Value::Object(args.clone()))?;
-                            let (activated, interruption) = activation.ensure_with_retirement(
+                            let (activated, interruption, completed) = activation.ensure_with_retirement(
                                 &page, &lease, &mut dispatched, &dispatch_tasks, ActivationCommand::Navigate,
                             ).await;
                             navigation_interruption = interruption;
+                            activation_completed = completed;
                             activated?;
                         }
                         // The same native primitive implements both direct API
@@ -4807,21 +4856,23 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                             })
                         } else { None };
                         dispatched = true;
+                        request_dispatched = true;
                         let arguments = serde_json::Value::Object(args);
                         let execution = async {
                             if command == "context.media" {
                                 (page_state.execute_media_with_owner(
                                     &page, &lease, &arguments, &enrollment, &attachments,
-                                ).await, None)
+                                ).await, None, false)
                             } else {
                                 page_state.execute_with_retirement(
                                     &page, &sessions, &lease, &command, &arguments, &dispatch_tasks,
                                 ).await
                             }
                         };
-                        let (output, interruption) = if let Some(grant) = eval_grant {
+                        let (output, interruption, committed) = if let Some(grant) = eval_grant {
                             super::client_debt::eval_command_scope(grant, execution).await
                         } else { execution.await };
+                        navigation_committed = committed;
                         navigation_interruption = interruption.map(NavigationInterruption::Requested);
                         if navigation.is_some() {
                             let flushed = enrollment.flush_app_events(&page, &lease).await;
@@ -4839,9 +4890,26 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     || std::time::Instant::now() >= lease.deadline;
                 let navigation_settled = matches!(result, Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded))
                     && navigation_interruption.is_some_and(|proof| proof.confirms(&command, &result, &page, &lease, &journal));
+                // A completed activation prefix is a completed command prefix.
+                // The requested operation itself never dispatched, so a caller
+                // cancellation after it cannot be an ambiguous application
+                // effect: the only committed work is the proven prefix.
+                let activation_prefix_only = activation_completed
+                    && !request_dispatched
+                    && matches!(
+                        result,
+                        Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
+                    );
                 let effects = if !dispatched || matches!(result, Err(ProtocolError::InvalidArguments | ProtocolError::UnsupportedCommand)) {
                     Effects::NotDispatched
-                } else if navigation_settled {
+                } else if navigation_settled
+                    || activation_prefix_only
+                    || (navigation_committed
+                        && matches!(
+                            result,
+                            Err(ProtocolError::Cancelled | ProtocolError::DeadlineExceeded)
+                        ))
+                {
                     Effects::Completed
                 } else if expired || (result.is_err() && mutating) {
                     // An interrupted read has no mutation to be uncertain

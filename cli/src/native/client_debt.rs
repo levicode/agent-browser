@@ -4999,6 +4999,11 @@ fn classify(method: &str, _params: Option<&Value>, operation: bool) -> Classific
     };
     // Runtime.evaluate is not a fixed safe read. Native action call sites can
     // narrow this only with a static command_scope override.
+    // Page.setLifecycleEventsEnabled is session setup the navigation producer
+    // re-sends before every dispatch. It enables lifecycle events; it does not
+    // change the page, so an interrupted navigation that never submitted its
+    // Page.navigate must not inherit that setup as a possible application
+    // mutation.
     let mutation = !release
         && !matches!(
             method,
@@ -5006,6 +5011,7 @@ fn classify(method: &str, _params: Option<&Value>, operation: bool) -> Classific
                 | "Page.getFrameTree"
                 | "Page.getLayoutMetrics"
                 | "Page.getNavigationHistory"
+                | "Page.setLifecycleEventsEnabled"
                 | "DOM.describeNode"
                 | "DOM.resolveNode"
                 | "DOM.getBoxModel"
@@ -8675,6 +8681,41 @@ pub(crate) mod tests {
             assert_eq!(ledger.snapshot(), before, "{obstruction}");
             assert_eq!(journal.snapshot(), local_before, "{obstruction}");
         }
+    }
+
+    #[test]
+    fn navigation_lifecycle_setup_is_not_application_mutation() {
+        // The navigation producer re-enables lifecycle events before dispatch.
+        // An abort during that setup must settle as a clean non-dispatch rather
+        // than Unknown, so the setup command cannot record a possible mutation.
+        let (ledger, journal) = owner();
+        let setup = ledger
+            .reserve_command(
+                Some(&journal),
+                "Page.setLifecycleEventsEnabled",
+                Some(&json!({"enabled": true})),
+                Some("page"),
+            )
+            .unwrap()
+            .submit()
+            .unwrap();
+        assert!(!journal.snapshot().mutation_dispatched);
+        // The requested navigation itself still records possible application
+        // mutation, so an interrupted submitted navigate stays conservatively
+        // Unknown when its own receipt cannot be proven.
+        let navigate = ledger
+            .reserve_command(
+                Some(&journal),
+                "Page.navigate",
+                Some(&json!({"url": "https://example.test/"})),
+                Some("page"),
+            )
+            .unwrap()
+            .submit()
+            .unwrap();
+        assert!(journal.snapshot().mutation_dispatched);
+        setup.settle(&response(json!({})));
+        navigate.settle(&response(json!({})));
     }
 }
 

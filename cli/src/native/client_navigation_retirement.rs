@@ -414,6 +414,7 @@ pub(super) async fn trigger(
     events: &mut BoundedMethodEvents,
     retirement: Option<(&RetainedTasks, &mut Option<NavigationInterruptionProof>)>,
     acknowledged: &mut Option<AcknowledgedNavigation>,
+    committed: &mut bool,
 ) -> Result<Value, ProtocolError> {
     let Some((tasks, receipt)) = retirement else {
         return command(page, operation, Some(&page.page_session_id), method, args).await;
@@ -492,6 +493,7 @@ pub(super) async fn trigger(
                         ).map(|boundary| AcknowledgedNavigation {
                             boundary, original: status, attachment, journal,
                         });
+                        *committed = acknowledged.is_some();
                     }
                     return Ok(response);
                 }
@@ -561,6 +563,10 @@ pub(super) async fn trigger(
                     requested_url,
                     trigger_sequence,
                 ) {
+                    // The accepted original response proves this exact
+                    // navigation committed. A later stop witness is cleanup
+                    // evidence, not the effect boundary.
+                    *committed = true;
                     *receipt = AcknowledgedNavigation {
                         boundary,
                         original: status,
@@ -609,6 +615,20 @@ pub(super) async fn trigger(
         // cancellation nor a stop ACK drops the original navigation response.
         let (response, stopped) = tokio::join!(&mut original, stop);
         let response = response.ok()?;
+        // A successful original ACK proves the exact navigation committed even
+        // when its loader did not report ERR_ABORTED.
+        if AcknowledgedBoundary::from_ack(
+            &response,
+            &page.page_session_id,
+            frame,
+            previous_loader,
+            requested_url.clone(),
+            trigger_sequence,
+        )
+        .is_some()
+        {
+            *committed = true;
+        }
         let stop_status = stopped.ok()?;
         if status.snapshot() != CommandStatus::Acknowledged
             || stop_status.snapshot() != CommandStatus::Acknowledged
