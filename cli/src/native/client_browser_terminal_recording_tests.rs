@@ -987,12 +987,16 @@ async fn poisoned_terminal_recording_custody_never_proves_closed() {
         .await
         .unwrap();
     let response = fixture.read().await.unwrap();
-    assert_eq!(response["type"], "error");
+    // The close exchange owns a correlated receipt even when the poisoned
+    // custody cannot prove teardown. It must never claim closure: the receipt
+    // carries the quarantined health and the explicit unproven cleanup state.
+    assert_eq!(response["type"], "closed");
     assert_eq!(response["id"], "poison-close");
-    assert_eq!(response["error"]["code"], "cleanup-failed");
+    assert_eq!(response["scopeState"], "quarantined");
+    assert_eq!(response["cleanup"], "unproven");
     assert!(
         read_frame(&mut fixture.stream).await.unwrap().is_none(),
-        "poisoned custody falsely emitted Closed"
+        "poisoned custody falsely emitted a proven Closed receipt"
     );
     assert!(fixture.finish().await.is_err());
     assert_eq!(
