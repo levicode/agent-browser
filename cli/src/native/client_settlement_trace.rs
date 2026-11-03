@@ -1487,17 +1487,24 @@ pub(crate) fn observe_initial_acquisition(
     initial_sample: Option<u8>,
     prefix: Option<ObserveInitialPrefix>,
 ) {
-    if initial_sample.is_none() && prefix.is_none() { return; }
+    if initial_sample.is_none() && prefix.is_none() {
+        return;
+    }
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
-        record_capture(capture, sequence, Phase::ObserveInitialAcquisition, Facts {
-            generation: Some(generation),
-            initial_sample,
-            prefix_check: prefix.map(|value| value.check),
-            prefix_refusal: prefix.map(|value| value.refusal),
-            prefix_debt: prefix.and_then(|value| value.debt),
-            prefix_debt_capped: prefix.and_then(|value| value.debt_capped),
-            ..Facts::default()
-        });
+        record_capture(
+            capture,
+            sequence,
+            Phase::ObserveInitialAcquisition,
+            Facts {
+                generation: Some(generation),
+                initial_sample,
+                prefix_check: prefix.map(|value| value.check),
+                prefix_refusal: prefix.map(|value| value.refusal),
+                prefix_debt: prefix.and_then(|value| value.debt),
+                prefix_debt_capped: prefix.and_then(|value| value.debt_capped),
+                ..Facts::default()
+            },
+        );
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -1626,6 +1633,9 @@ pub(crate) enum TerminalEnrollmentRefusal {
     EnrollmentLedgerOwner,
     EnrollmentRegistryOwner,
 }
+/// First refused final-close guard together with its bounded counts, if the
+/// guard produced any. Observation is diagnostic only, never cleanup authority.
+pub(crate) type TerminalRefusalObservation = Option<(TerminalEnrollmentRefusal, Option<[u64; 2]>)>;
 
 /// Set once under the original target registry lock. No payload or runtime
 /// identifier is retained; ExplicitSeal intentionally leaves the caller unknown.
@@ -1666,16 +1676,25 @@ pub(crate) fn terminal_proof_refusal(
         );
     }
 }
-pub(crate) fn terminal_enrollment_refusal(reason: TerminalEnrollmentRefusal, counts: Option<[u64; 2]>) {
+pub(crate) fn terminal_enrollment_refusal(
+    reason: TerminalEnrollmentRefusal,
+    counts: Option<[u64; 2]>,
+) {
     // Caller releases every original enrollment/ledger/registry lock first.
     if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
-        record_capture(capture, 0, Phase::TerminalCleanupCheckpoint, Facts {
-            terminal_cleanup_stage: Some(TerminalCleanupStage::EnrollmentProof),
-            terminal_cleanup_ok: Some(false),
-            terminal_enrollment_refusal: Some(reason),
-            terminal_proof_counts: counts.filter(|values| values.iter().all(|value| *value <= SAFE_INTEGER)),
-            ..Facts::default()
-        });
+        record_capture(
+            capture,
+            0,
+            Phase::TerminalCleanupCheckpoint,
+            Facts {
+                terminal_cleanup_stage: Some(TerminalCleanupStage::EnrollmentProof),
+                terminal_cleanup_ok: Some(false),
+                terminal_enrollment_refusal: Some(reason),
+                terminal_proof_counts: counts
+                    .filter(|values| values.iter().all(|value| *value <= SAFE_INTEGER)),
+                ..Facts::default()
+            },
+        );
     }
 }
 
@@ -2584,13 +2603,18 @@ fn frame_inventory_rejection_into(
             ..Facts::default()
         },
     );
-    record_capture(capture, sequence, Phase::FrameInventoryAttribution, Facts {
-        generation: Some(generation),
-        frame_pass: Some(failure.pass),
+    record_capture(
+        capture,
+        sequence,
+        Phase::FrameInventoryAttribution,
+        Facts {
+            generation: Some(generation),
+            frame_pass: Some(failure.pass),
             last_attachment_ordinal: failure.last_attachment,
             selected_attachment_ordinal: failure.selected_attachment,
-        ..Facts::default()
-    });
+            ..Facts::default()
+        },
+    );
 }
 pub(crate) fn inventory_snapshot(
     generation: u64,
@@ -5370,7 +5394,15 @@ mod observe_initial_diagnostic_tests {
     #[test]
     fn observe_initial_diagnostic_wire_is_closed_bounded_and_optional() {
         let empty = serde_json::to_value(Facts::default()).unwrap();
-        for key in ["initialSample", "prefixCheck", "prefixRefusal", "prefixDebt", "prefixDebtCapped", "lastAttachmentOrdinal", "selectedAttachmentOrdinal"] {
+        for key in [
+            "initialSample",
+            "prefixCheck",
+            "prefixRefusal",
+            "prefixDebt",
+            "prefixDebtCapped",
+            "lastAttachmentOrdinal",
+            "selectedAttachmentOrdinal",
+        ] {
             assert!(empty.get(key).is_none());
         }
         let facts = Facts {
@@ -5397,22 +5429,28 @@ mod observe_initial_diagnostic_tests {
     #[test]
     fn observe_initial_full_records_fit_existing_cap_at_maximum_headers() {
         for (phase, facts) in [
-            (Phase::ObserveInitialAcquisition, Facts {
-                generation: Some(SAFE_INTEGER),
-                initial_sample: Some(2),
-                prefix_check: Some(ObserveInitialPrefixCheck::BeforeYield),
-                prefix_refusal: Some(ObserveInitialPrefixRefusal::OutstandingCommands),
-                prefix_debt: Some([u16::MAX; 3]),
-                prefix_debt_capped: Some(false),
-                ..Facts::default()
-            }),
-            (Phase::FrameInventoryAttribution, Facts {
-                generation: Some(SAFE_INTEGER),
-                frame_pass: Some(FrameInventoryPass::Protected),
-                last_attachment_ordinal: Some(SAFE_INTEGER),
-                selected_attachment_ordinal: Some(SAFE_INTEGER),
-                ..Facts::default()
-            }),
+            (
+                Phase::ObserveInitialAcquisition,
+                Facts {
+                    generation: Some(SAFE_INTEGER),
+                    initial_sample: Some(2),
+                    prefix_check: Some(ObserveInitialPrefixCheck::BeforeYield),
+                    prefix_refusal: Some(ObserveInitialPrefixRefusal::OutstandingCommands),
+                    prefix_debt: Some([u16::MAX; 3]),
+                    prefix_debt_capped: Some(false),
+                    ..Facts::default()
+                },
+            ),
+            (
+                Phase::FrameInventoryAttribution,
+                Facts {
+                    generation: Some(SAFE_INTEGER),
+                    frame_pass: Some(FrameInventoryPass::Protected),
+                    last_attachment_ordinal: Some(SAFE_INTEGER),
+                    selected_attachment_ordinal: Some(SAFE_INTEGER),
+                    ..Facts::default()
+                },
+            ),
         ] {
             let record = Record {
                 schema_version: 2,
@@ -5428,10 +5466,13 @@ mod observe_initial_diagnostic_tests {
                 facts,
             };
             let bytes = serde_json::to_vec(&record).unwrap();
-            assert!(bytes.len() + 1 <= MAX_RECORD_BYTES, "record plus LF: {}", bytes.len() + 1);
+            assert!(
+                bytes.len() + 1 <= MAX_RECORD_BYTES,
+                "record plus LF: {}",
+                bytes.len() + 1
+            );
         }
     }
-
 }
 
 #[cfg(test)]
@@ -5443,61 +5484,200 @@ mod terminal_enrollment_diagnostic_tests {
         assert!(empty.get("terminalEnrollmentRefusal").is_none());
         assert!(empty.get("terminalProofCounts").is_none());
         for (reason, name) in [
-            (TerminalEnrollmentRefusal::LedgerNotRemoteEof, "ledger-not-remote-eof"),
-            (TerminalEnrollmentRefusal::LedgerBootstrapUnpublished, "ledger-bootstrap-unpublished"),
-            (TerminalEnrollmentRefusal::LedgerContextCreation, "ledger-context-creation"),
-            (TerminalEnrollmentRefusal::LedgerEvalPublication, "ledger-eval-publication"),
-            (TerminalEnrollmentRefusal::LedgerOperationsEmpty, "ledger-operations-empty"),
-            (TerminalEnrollmentRefusal::LedgerOperationIdentity, "ledger-operation-identity"),
+            (
+                TerminalEnrollmentRefusal::LedgerNotRemoteEof,
+                "ledger-not-remote-eof",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerBootstrapUnpublished,
+                "ledger-bootstrap-unpublished",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerContextCreation,
+                "ledger-context-creation",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerEvalPublication,
+                "ledger-eval-publication",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerOperationsEmpty,
+                "ledger-operations-empty",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerOperationIdentity,
+                "ledger-operation-identity",
+            ),
             (TerminalEnrollmentRefusal::LedgerObjects, "ledger-objects"),
             (TerminalEnrollmentRefusal::LedgerGroups, "ledger-groups"),
-            (TerminalEnrollmentRefusal::LedgerCreatedTargets, "ledger-created-targets"),
-            (TerminalEnrollmentRefusal::LedgerRecordingTargets, "ledger-recording-targets"),
-            (TerminalEnrollmentRefusal::LedgerBindingsEmpty, "ledger-bindings-empty"),
-            (TerminalEnrollmentRefusal::LedgerTargetCount, "ledger-target-count"),
-            (TerminalEnrollmentRefusal::LedgerTargetBinding, "ledger-target-binding"),
-            (TerminalEnrollmentRefusal::LedgerLifecycleBinding, "ledger-lifecycle-binding"),
-            (TerminalEnrollmentRefusal::LedgerRealmBinding, "ledger-realm-binding"),
-            (TerminalEnrollmentRefusal::LedgerCommandContract, "ledger-command-contract"),
-            (TerminalEnrollmentRefusal::RegistryNotSealed, "registry-not-sealed"),
-            (TerminalEnrollmentRefusal::RegistryIntegrityLost, "registry-integrity-lost"),
-            (TerminalEnrollmentRefusal::RegistryNotReady, "registry-not-ready"),
-            (TerminalEnrollmentRefusal::RegistryReservations, "registry-reservations"),
-            (TerminalEnrollmentRefusal::RegistryResuming, "registry-resuming"),
-            (TerminalEnrollmentRefusal::RegistryProtectedRead, "registry-protected-read"),
-            (TerminalEnrollmentRefusal::RegistryBootstrapCreations, "registry-bootstrap-creations"),
-            (TerminalEnrollmentRefusal::RegistryBootstrapCleanup, "registry-bootstrap-cleanup"),
-            (TerminalEnrollmentRefusal::RegistryCleanupReservations, "registry-cleanup-reservations"),
-            (TerminalEnrollmentRefusal::RegistryUnknownCreation, "registry-unknown-creation"),
-            (TerminalEnrollmentRefusal::RegistryAuxiliary, "registry-auxiliary"),
-            (TerminalEnrollmentRefusal::RegistryTargetCount, "registry-target-count"),
-            (TerminalEnrollmentRefusal::RegistryTargetBinding, "registry-target-binding"),
-            (TerminalEnrollmentRefusal::EnrollmentFailed, "enrollment-failed"),
-            (TerminalEnrollmentRefusal::EnrollmentNotReconciled, "enrollment-not-reconciled"),
-            (TerminalEnrollmentRefusal::EnrollmentWatermark, "enrollment-watermark"),
-            (TerminalEnrollmentRefusal::EnrollmentPending, "enrollment-pending"),
-            (TerminalEnrollmentRefusal::EnrollmentRealmPending, "enrollment-realm-pending"),
-            (TerminalEnrollmentRefusal::EnrollmentRealmTickets, "enrollment-realm-tickets"),
-            (TerminalEnrollmentRefusal::EnrollmentRestart, "enrollment-restart"),
-            (TerminalEnrollmentRefusal::EnrollmentBlank, "enrollment-blank"),
-            (TerminalEnrollmentRefusal::EnrollmentRetiring, "enrollment-retiring"),
-            (TerminalEnrollmentRefusal::EnrollmentSessionContract, "enrollment-session-contract"),
-            (TerminalEnrollmentRefusal::EnrollmentRootContract, "enrollment-root-contract"),
-            (TerminalEnrollmentRefusal::EnrollmentLifecycle, "enrollment-lifecycle"),
-            (TerminalEnrollmentRefusal::EnrollmentAncestry, "enrollment-ancestry"),
-            (TerminalEnrollmentRefusal::EnrollmentTerminalProof, "enrollment-terminal-proof"),
-            (TerminalEnrollmentRefusal::EnrollmentClientIdentity, "enrollment-client-identity"),
-            (TerminalEnrollmentRefusal::EnrollmentTerminalWatermarkMissing, "enrollment-terminal-watermark-missing"),
-            (TerminalEnrollmentRefusal::EnrollmentCleanupOwner, "enrollment-cleanup-owner"),
-            (TerminalEnrollmentRefusal::EnrollmentLedgerOwner, "enrollment-ledger-owner"),
-            (TerminalEnrollmentRefusal::EnrollmentRegistryOwner, "enrollment-registry-owner"),
-] {
+            (
+                TerminalEnrollmentRefusal::LedgerCreatedTargets,
+                "ledger-created-targets",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerRecordingTargets,
+                "ledger-recording-targets",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerBindingsEmpty,
+                "ledger-bindings-empty",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerTargetCount,
+                "ledger-target-count",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerTargetBinding,
+                "ledger-target-binding",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerLifecycleBinding,
+                "ledger-lifecycle-binding",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerRealmBinding,
+                "ledger-realm-binding",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerCommandContract,
+                "ledger-command-contract",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryNotSealed,
+                "registry-not-sealed",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryIntegrityLost,
+                "registry-integrity-lost",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryNotReady,
+                "registry-not-ready",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryReservations,
+                "registry-reservations",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryResuming,
+                "registry-resuming",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryProtectedRead,
+                "registry-protected-read",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryBootstrapCreations,
+                "registry-bootstrap-creations",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryBootstrapCleanup,
+                "registry-bootstrap-cleanup",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryCleanupReservations,
+                "registry-cleanup-reservations",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryUnknownCreation,
+                "registry-unknown-creation",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryAuxiliary,
+                "registry-auxiliary",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryTargetCount,
+                "registry-target-count",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryTargetBinding,
+                "registry-target-binding",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentFailed,
+                "enrollment-failed",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentNotReconciled,
+                "enrollment-not-reconciled",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentWatermark,
+                "enrollment-watermark",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentPending,
+                "enrollment-pending",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRealmPending,
+                "enrollment-realm-pending",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRealmTickets,
+                "enrollment-realm-tickets",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRestart,
+                "enrollment-restart",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentBlank,
+                "enrollment-blank",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRetiring,
+                "enrollment-retiring",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentSessionContract,
+                "enrollment-session-contract",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRootContract,
+                "enrollment-root-contract",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentLifecycle,
+                "enrollment-lifecycle",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentAncestry,
+                "enrollment-ancestry",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentTerminalProof,
+                "enrollment-terminal-proof",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentClientIdentity,
+                "enrollment-client-identity",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentTerminalWatermarkMissing,
+                "enrollment-terminal-watermark-missing",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentCleanupOwner,
+                "enrollment-cleanup-owner",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentLedgerOwner,
+                "enrollment-ledger-owner",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRegistryOwner,
+                "enrollment-registry-owner",
+            ),
+        ] {
             let value = serde_json::to_value(Facts {
                 terminal_cleanup_stage: Some(TerminalCleanupStage::EnrollmentProof),
                 terminal_cleanup_ok: Some(false),
                 terminal_enrollment_refusal: Some(reason),
                 ..Facts::default()
-            }).unwrap();
+            })
+            .unwrap();
             assert_eq!(value.as_object().unwrap().len(), 3);
             assert_eq!(value["terminalEnrollmentRefusal"], name);
             assert_eq!(value["terminalCleanupStage"], "enrollment-proof");
@@ -5507,7 +5687,8 @@ mod terminal_enrollment_diagnostic_tests {
             terminal_enrollment_refusal: Some(TerminalEnrollmentRefusal::EnrollmentWatermark),
             terminal_proof_counts: Some([7, 9]),
             ..Facts::default()
-        }).unwrap();
+        })
+        .unwrap();
         assert_eq!(value["terminalProofCounts"], serde_json::json!([7, 9]));
     }
 }

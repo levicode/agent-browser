@@ -773,9 +773,14 @@ pub(crate) async fn release_captured_readonly_group_accounted(
         return release_readonly_group_accounted(client, session, group).await;
     }
     client_debt::command_scope(CommandCategory::CleanupObject, false, async {
-        client.handoff_captured_readonly_group_release(session, group, capture).is_ok()
-            && client.debt_ledger().is_some_and(|ledger| !ledger.snapshot().integrity_lost)
-    }).await
+        client
+            .handoff_captured_readonly_group_release(session, group, capture)
+            .is_ok()
+            && client
+                .debt_ledger()
+                .is_some_and(|ledger| !ledger.snapshot().integrity_lost)
+    })
+    .await
 }
 #[derive(Clone, Copy, Default)]
 struct ObjectReleaseOutcome {

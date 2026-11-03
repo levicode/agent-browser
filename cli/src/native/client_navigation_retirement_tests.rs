@@ -213,7 +213,12 @@ async fn run(reply: Reply, cause: Cause) -> (bool, u32, u32) {
 async fn run_mode(reply: Reply, cause: Cause, post_ack: bool) -> (bool, u32, u32) {
     run_scheduled(reply, cause, post_ack, false).await
 }
-async fn run_scheduled(reply: Reply, cause: Cause, post_ack: bool, ack_cancel_race: bool) -> (bool, u32, u32) {
+async fn run_scheduled(
+    reply: Reply,
+    cause: Cause,
+    post_ack: bool,
+    ack_cancel_race: bool,
+) -> (bool, u32, u32) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("ws://{}", listener.local_addr().unwrap());
     let (seen_tx, seen_rx) = oneshot::channel();
@@ -458,7 +463,10 @@ async fn run_scheduled(reply: Reply, cause: Cause, post_ack: bool, ack_cancel_ra
     .await
     .unwrap();
     if ack_cancel_race {
-        tokio::time::timeout(Duration::from_secs(1), selected_rx).await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(1), selected_rx)
+            .await
+            .unwrap()
+            .unwrap();
     } else if post_ack {
         tokio::time::timeout(Duration::from_secs(1), acknowledged_rx)
             .await
@@ -472,7 +480,9 @@ async fn run_scheduled(reply: Reply, cause: Cause, post_ack: bool, ack_cancel_ra
         broker.cancel(1, 1).unwrap();
         broker.cancel(1, 1).unwrap();
     }
-    if ack_cancel_race { race_gate.release.notify_one(); }
+    if ack_cancel_race {
+        race_gate.release.notify_one();
+    }
     if matches!(cause, Cause::CancelThenLoseReceiver) {
         drop(receive);
     } else {
@@ -872,7 +882,13 @@ async fn original_ack_selected_before_cancel_keeps_the_exact_terminal_proof() {
 
 #[tokio::test]
 async fn ack_cancel_race_still_rejects_wrong_loader_error_and_missing_terminal_events() {
-    for reply in [Reply::WrongLoader, Reply::OriginalError, Reply::StopError, Reply::PreBaselineStopped, Reply::LateOtherLoader] {
+    for reply in [
+        Reply::WrongLoader,
+        Reply::OriginalError,
+        Reply::StopError,
+        Reply::PreBaselineStopped,
+        Reply::LateOtherLoader,
+    ] {
         let (confirmed, stops, _) = run_scheduled(reply, Cause::Cancel, true, true).await;
         assert!(!confirmed, "accepted {reply:?}");
         assert!(stops <= 1);

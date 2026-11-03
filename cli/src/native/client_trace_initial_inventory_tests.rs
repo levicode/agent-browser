@@ -228,12 +228,27 @@ impl Fixture {
                                 // selected page/loader/tenure is never replaced by this mode.
                                 let target = format!("other-{}", completed + 1);
                                 let session = format!("other-session-{}", completed + 1);
-                                assert!(peer_targets.attached_enrolled_with_ancestry(
-                                    "context", target.clone(), session, "browser_ui".into(), None, true,
-                                ).unwrap());
+                                assert!(peer_targets
+                                    .attached_enrolled_with_ancestry(
+                                        "context",
+                                        target.clone(),
+                                        session,
+                                        "browser_ui".into(),
+                                        None,
+                                        true,
+                                    )
+                                    .unwrap());
                                 peer_targets.configured(&target).unwrap();
-                                peer_targets.resume_permit(&target).await.unwrap().complete().unwrap();
-                                peer_attached_others.lock().unwrap().push(peer_targets.owned_target(&target).unwrap());
+                                peer_targets
+                                    .resume_permit(&target)
+                                    .await
+                                    .unwrap()
+                                    .complete()
+                                    .unwrap();
+                                peer_attached_others
+                                    .lock()
+                                    .unwrap()
+                                    .push(peer_targets.owned_target(&target).unwrap());
                             } else if invalidate {
                                 peer_targets
                                     .invalidate_inventory_for(
@@ -315,8 +330,12 @@ impl Fixture {
                         assert!(instance > 0 && instance < u64::MAX);
                         assert_eq!(instance.to_string(), suffix);
                         releases += 1;
-                        if matches!(race, Race::HeldRelease | Race::AttachOtherHeldRelease | Race::HeldReleaseWithoutMutation)
-                            || (race == Race::HeldReleaseAfterReacquisition && releases == 2)
+                        if matches!(
+                            race,
+                            Race::HeldRelease
+                                | Race::AttachOtherHeldRelease
+                                | Race::HeldReleaseWithoutMutation
+                        ) || (race == Race::HeldReleaseAfterReacquisition && releases == 2)
                         {
                             continue;
                         }
@@ -438,18 +457,20 @@ impl Fixture {
             let lease = broker.admit(1, 1, 1_000).unwrap();
             assert!(broker.start(1, 1).unwrap());
             lease
-        } else { OperationLease {
-            is_callback: false,
-            generation: 1,
-            sequence: 1,
-            deadline: Instant::now()
-                + if readonly {
-                    Duration::from_millis(80)
-                } else {
-                    Duration::from_secs(if race == Race::Continuous { 1 } else { 5 })
-                },
-            cancellation,
-        }};
+        } else {
+            OperationLease {
+                is_callback: false,
+                generation: 1,
+                sequence: 1,
+                deadline: Instant::now()
+                    + if readonly {
+                        Duration::from_millis(80)
+                    } else {
+                        Duration::from_secs(if race == Race::Continuous { 1 } else { 5 })
+                    },
+                cancellation,
+            }
+        };
         let journal = ledger
             .operation(
                 OperationKey {

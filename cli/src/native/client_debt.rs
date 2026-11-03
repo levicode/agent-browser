@@ -566,7 +566,10 @@ pub(crate) enum ReadonlyRelease {
 }
 impl ReadonlyGroupCapture {
     pub(crate) fn new(name: &str) -> Self {
-        Self { name: name.to_owned(), state: Arc::new(Mutex::new(ReadonlyGroupCaptureState::default())) }
+        Self {
+            name: name.to_owned(),
+            state: Arc::new(Mutex::new(ReadonlyGroupCaptureState::default())),
+        }
     }
     pub(crate) fn scope<'a, F: Future + 'a>(
         &'a self,
@@ -2339,85 +2342,136 @@ impl OwnerDebtLedger {
         operations: &[OperationKey],
     ) -> Result<(), ProtocolError> {
         let (result, observation) = self.check_terminal_read_only_observed(bindings, operations);
-        if let Some((reason, counts)) = observation { super::client_settlement_trace::terminal_enrollment_refusal(reason, counts); }
+        if let Some((reason, counts)) = observation {
+            super::client_settlement_trace::terminal_enrollment_refusal(reason, counts);
+        }
         result
     }
     pub(crate) fn check_terminal_read_only_observed(
         &self,
         bindings: &[(String, String, bool)],
         operations: &[OperationKey],
-    ) -> (Result<(), ProtocolError>, Option<(super::client_settlement_trace::TerminalEnrollmentRefusal, Option<[u64; 2]>)>) {
+    ) -> (
+        Result<(), ProtocolError>,
+        super::client_settlement_trace::TerminalRefusalObservation,
+    ) {
         use super::client_settlement_trace::TerminalEnrollmentRefusal;
         let mut refusal = None;
         macro_rules! terminal_guard {
             ($predicate:expr, $reason:ident, $counts:expr) => {{
                 let rejected = $predicate;
-                if rejected { refusal = Some((TerminalEnrollmentRefusal::$reason, $counts)); }
+                if rejected {
+                    refusal = Some((TerminalEnrollmentRefusal::$reason, $counts));
+                }
                 rejected
             }};
         }
 
         let result = (|| {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::CleanupFailed)?;
-        // root_creation_claimed is an irreversible anti-duplicate marker:
-        // binding an existing borrowed session also sets it. Pending creation
-        // is checked below through publication, created targets and each actual
-        // command acquisition; never erase the historical marker to close.
-        if terminal_guard!(!state.remote_eof_only(), LedgerNotRemoteEof, None)
-            || terminal_guard!(!state
-                .bootstrap
-                .as_ref()
-                .is_some_and(|bootstrap| bootstrap.published), LedgerBootstrapUnpublished, None)
-            || terminal_guard!(state.context_creation_claimed, LedgerContextCreation, None)
-            || terminal_guard!(state.eval_publication_pending, LedgerEvalPublication, None)
-            || terminal_guard!(operations.is_empty(), LedgerOperationsEmpty, None)
-            || terminal_guard!(operations
-                .iter()
-                .any(|key| key.generation != self.generation || key.operation_seq == 0), LedgerOperationIdentity, None)
-            || terminal_guard!(!state.objects.is_empty(), LedgerObjects, Some([state.objects.len() as u64, 0]))
-            || terminal_guard!(!state.groups.is_empty(), LedgerGroups, Some([state.groups.len() as u64, 0]))
-            || terminal_guard!(!state.created_targets.is_empty(), LedgerCreatedTargets, Some([state.created_targets.len() as u64, 0]))
-            || terminal_guard!(!state.recording_targets.is_empty(), LedgerRecordingTargets, Some([state.recording_targets.len() as u64, 0]))
-            || terminal_guard!(bindings.is_empty(), LedgerBindingsEmpty, None)
-            || terminal_guard!(state.targets.len() != bindings.len(), LedgerTargetCount, Some([state.targets.len() as u64, bindings.len() as u64]))
-            || terminal_guard!(!bindings.iter().all(|(session, target, observer)| {
-                state.targets.get(session) == Some(target)
-                    && match state.lifecycle_sessions.get(session) {
-                        None => !observer,
-                        Some(LifecycleSessionPurpose::Observer) => *observer,
-                        _ => false,
-                    }
-            }), LedgerTargetBinding, None)
-            || terminal_guard!(state
-                .lifecycle_sessions
-                .keys()
-                .any(|session| !state.targets.contains_key(session)), LedgerLifecycleBinding, None)
-            || terminal_guard!(state
-                .realms
-                .keys()
-                .any(|(session, _)| !state.targets.contains_key(session)), LedgerRealmBinding, None)
-            || terminal_guard!(state.commands.values().any(|command| {
-                command.terminal_read != Some(TerminalReadKind::BrowserVersion)
-                    || !command.submitted
-                    || command.mutation
-                    || command.creation_slots != 0
-                    || command.owner_cleanup
-                    || command.acquisition.is_some()
-                    || !command
-                        .provenance
-                        .operation
-                        .is_some_and(|key| operations.contains(&key))
-                    || command.provenance.session.is_some()
-                    || command.release_object.is_some()
-                    || command.group_id.is_some()
-            }), LedgerCommandContract, None)
-        {
-            return Err(ProtocolError::CleanupFailed);
-        }
-        Ok(())
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::CleanupFailed)?;
+            // root_creation_claimed is an irreversible anti-duplicate marker:
+            // binding an existing borrowed session also sets it. Pending creation
+            // is checked below through publication, created targets and each actual
+            // command acquisition; never erase the historical marker to close.
+            if terminal_guard!(!state.remote_eof_only(), LedgerNotRemoteEof, None)
+                || terminal_guard!(
+                    !state
+                        .bootstrap
+                        .as_ref()
+                        .is_some_and(|bootstrap| bootstrap.published),
+                    LedgerBootstrapUnpublished,
+                    None
+                )
+                || terminal_guard!(state.context_creation_claimed, LedgerContextCreation, None)
+                || terminal_guard!(state.eval_publication_pending, LedgerEvalPublication, None)
+                || terminal_guard!(operations.is_empty(), LedgerOperationsEmpty, None)
+                || terminal_guard!(
+                    operations
+                        .iter()
+                        .any(|key| key.generation != self.generation || key.operation_seq == 0),
+                    LedgerOperationIdentity,
+                    None
+                )
+                || terminal_guard!(
+                    !state.objects.is_empty(),
+                    LedgerObjects,
+                    Some([state.objects.len() as u64, 0])
+                )
+                || terminal_guard!(
+                    !state.groups.is_empty(),
+                    LedgerGroups,
+                    Some([state.groups.len() as u64, 0])
+                )
+                || terminal_guard!(
+                    !state.created_targets.is_empty(),
+                    LedgerCreatedTargets,
+                    Some([state.created_targets.len() as u64, 0])
+                )
+                || terminal_guard!(
+                    !state.recording_targets.is_empty(),
+                    LedgerRecordingTargets,
+                    Some([state.recording_targets.len() as u64, 0])
+                )
+                || terminal_guard!(bindings.is_empty(), LedgerBindingsEmpty, None)
+                || terminal_guard!(
+                    state.targets.len() != bindings.len(),
+                    LedgerTargetCount,
+                    Some([state.targets.len() as u64, bindings.len() as u64])
+                )
+                || terminal_guard!(
+                    !bindings.iter().all(|(session, target, observer)| {
+                        state.targets.get(session) == Some(target)
+                            && match state.lifecycle_sessions.get(session) {
+                                None => !observer,
+                                Some(LifecycleSessionPurpose::Observer) => *observer,
+                                _ => false,
+                            }
+                    }),
+                    LedgerTargetBinding,
+                    None
+                )
+                || terminal_guard!(
+                    state
+                        .lifecycle_sessions
+                        .keys()
+                        .any(|session| !state.targets.contains_key(session)),
+                    LedgerLifecycleBinding,
+                    None
+                )
+                || terminal_guard!(
+                    state
+                        .realms
+                        .keys()
+                        .any(|(session, _)| !state.targets.contains_key(session)),
+                    LedgerRealmBinding,
+                    None
+                )
+                || terminal_guard!(
+                    state.commands.values().any(|command| {
+                        command.terminal_read != Some(TerminalReadKind::BrowserVersion)
+                            || !command.submitted
+                            || command.mutation
+                            || command.creation_slots != 0
+                            || command.owner_cleanup
+                            || command.acquisition.is_some()
+                            || !command
+                                .provenance
+                                .operation
+                                .is_some_and(|key| operations.contains(&key))
+                            || command.provenance.session.is_some()
+                            || command.release_object.is_some()
+                            || command.group_id.is_some()
+                    }),
+                    LedgerCommandContract,
+                    None
+                )
+            {
+                return Err(ProtocolError::CleanupFailed);
+            }
+            Ok(())
         })();
         (result, refusal)
     }
@@ -2770,12 +2824,18 @@ impl OwnerDebtLedger {
             return Err(ProtocolError::ScopeUnavailable);
         }
         if !Arc::ptr_eq(&journal.ledger, self)
-            || !bound.ledger.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, self))
+            || !bound
+                .ledger
+                .upgrade()
+                .is_some_and(|owner| Arc::ptr_eq(&owner, self))
             || bound.operation != journal.key()
             || bound.session != session
             || bound.provenance.operation != Some(journal.key())
             || bound.provenance.session.as_deref() != Some(session)
-            || state.targets.get(session).is_some_and(|target| bound.provenance.target.as_ref() != Some(target))
+            || state
+                .targets
+                .get(session)
+                .is_some_and(|target| bound.provenance.target.as_ref() != Some(target))
             || state.groups.iter().any(|(id, group)| {
                 *id != bound.id
                     && group.name == name
@@ -2787,7 +2847,10 @@ impl OwnerDebtLedger {
         // An old destruction receipt cannot stand for a reused context ID.
         if bound.destroyed.load(Ordering::SeqCst)
             && bound.provenance.realm.is_some_and(|(context, epoch)| {
-                state.realms.get(&(session.to_owned(), context)).is_some_and(|current| *current != epoch)
+                state
+                    .realms
+                    .get(&(session.to_owned(), context))
+                    .is_some_and(|current| *current != epoch)
             })
         {
             return Err(ProtocolError::StaleScope);
@@ -2805,15 +2868,23 @@ impl OwnerDebtLedger {
         if !Arc::ptr_eq(&journal.ledger, self) || capture.name != name {
             return Err(ProtocolError::StaleScope);
         }
-        let state = self.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
-        let mut receipt = capture.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let mut receipt = capture
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
         if state.retired || state.integrity_lost || receipt.consumed {
             return Err(ProtocolError::ScopeUnavailable);
         }
         let Some(bound) = receipt.bound.as_ref() else {
             // No actual registration: keep legacy strict disposal, not a no-op.
             receipt.consumed = true;
-            return Ok(ReadonlyReleaseAdmission::Finished(ReadonlyRelease::Uncaptured));
+            return Ok(ReadonlyReleaseAdmission::Finished(
+                ReadonlyRelease::Uncaptured,
+            ));
         };
         self.validate_captured_readonly_owner(&state, journal, session, name, bound)?;
         let result = if bound.unsubmitted_abandoned.load(Ordering::SeqCst) {
@@ -2821,7 +2892,10 @@ impl OwnerDebtLedger {
         } else if bound.destroyed.load(Ordering::SeqCst) {
             ReadonlyReleaseAdmission::Finished(ReadonlyRelease::Destroyed)
         } else {
-            let group = state.groups.get(&bound.id).ok_or(ProtocolError::StaleScope)?;
+            let group = state
+                .groups
+                .get(&bound.id)
+                .ok_or(ProtocolError::StaleScope)?;
             if group.name != name
                 || group.provenance != bound.provenance
                 || !Arc::ptr_eq(&group.destroyed, &bound.destroyed)
@@ -2844,7 +2918,10 @@ impl OwnerDebtLedger {
         bound: &CapturedReadonlyGroup,
         reservation: CommandReservation,
     ) -> Result<ReadonlyRelease, ProtocolError> {
-        let mut state = self.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| ProtocolError::ScopeUnavailable)?;
         self.validate_captured_readonly_owner(&state, journal, session, name, bound)?;
         if bound.destroyed.load(Ordering::SeqCst) {
             if let Some(command) = state.commands.get(&reservation.id) {
@@ -2864,7 +2941,8 @@ impl OwnerDebtLedger {
                 {
                     return Err(ProtocolError::StaleScope);
                 }
-                let command = remove_command(&mut state, reservation.id).expect("validated unsent release");
+                let command =
+                    remove_command(&mut state, reservation.id).expect("validated unsent release");
                 command.status.set(CommandStatus::Destroyed);
             } else if reservation.status.snapshot() != CommandStatus::Destroyed {
                 // Destruction after reservation may already have removed it.
@@ -2875,15 +2953,24 @@ impl OwnerDebtLedger {
             self.changed.notify_waiters();
             return Ok(ReadonlyRelease::Destroyed);
         }
-        let group = state.groups.get(&bound.id).ok_or(ProtocolError::StaleScope)?;
+        let group = state
+            .groups
+            .get(&bound.id)
+            .ok_or(ProtocolError::StaleScope)?;
         if group.name != name
             || group.provenance != bound.provenance
             || !Arc::ptr_eq(&group.destroyed, &bound.destroyed)
         {
             return Err(ProtocolError::StaleScope);
         }
-        let realm = group.realm_complete.then_some(group.provenance.realm).flatten();
-        let command = state.commands.get_mut(&reservation.id).ok_or(ProtocolError::StaleScope)?;
+        let realm = group
+            .realm_complete
+            .then_some(group.provenance.realm)
+            .flatten();
+        let command = state
+            .commands
+            .get_mut(&reservation.id)
+            .ok_or(ProtocolError::StaleScope)?;
         if command.group_id != Some(bound.id) || command.submitted {
             return Err(ProtocolError::StaleScope);
         }
@@ -3341,23 +3428,36 @@ impl OwnerDebtLedger {
         }) {
             return Err(ProtocolError::Cancelled);
         }
-        let readonly_capture = READONLY_GROUP_CAPTURE.try_with(Clone::clone).ok()
+        let readonly_capture = READONLY_GROUP_CAPTURE
+            .try_with(Clone::clone)
+            .ok()
             .filter(|capture| native_group.as_deref() == Some(capture.name.as_str()));
         if let Some(capture) = &readonly_capture {
-            let receipt = capture.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
-            if receipt.consumed { return Err(ProtocolError::StaleScope); }
-            if journal.is_none() || provenance.session.is_none()
+            let receipt = capture
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
+            if receipt.consumed {
+                return Err(ProtocolError::StaleScope);
+            }
+            if journal.is_none()
+                || provenance.session.is_none()
                 || (receipt.bound.is_none() && existing_group.is_some())
             {
                 return Err(ProtocolError::StaleScope);
             }
             if let Some(bound) = &receipt.bound {
                 if bound.destroyed.load(Ordering::SeqCst)
-                    || !bound.ledger.upgrade().is_some_and(|owner| Arc::ptr_eq(&owner, self))
+                    || !bound
+                        .ledger
+                        .upgrade()
+                        .is_some_and(|owner| Arc::ptr_eq(&owner, self))
                     || journal.map(OperationJournalHandle::key) != Some(bound.operation)
                     || provenance.session.as_deref() != Some(bound.session.as_str())
                     || existing_group != Some(bound.id)
-                { return Err(ProtocolError::StaleScope); }
+                {
+                    return Err(ProtocolError::StaleScope);
+                }
             }
         }
         let new_group_footprint = if native_group.is_some() && existing_group.is_none() {
@@ -3466,24 +3566,31 @@ impl OwnerDebtLedger {
             existing_group
         };
         if let Some(capture) = &readonly_capture {
-            let mut receipt = capture.state.lock().map_err(|_| ProtocolError::ScopeUnavailable)?;
+            let mut receipt = capture
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::ScopeUnavailable)?;
             let id = group_id.ok_or(ProtocolError::StaleScope)?;
             let group = state.groups.get(&id).ok_or(ProtocolError::StaleScope)?;
             if receipt.bound.is_none() {
                 receipt.bound = Some(CapturedReadonlyGroup {
                     ledger: Arc::downgrade(self),
                     operation: journal.ok_or(ProtocolError::StaleScope)?.key(),
-                    session: provenance.session.clone().ok_or(ProtocolError::StaleScope)?,
+                    session: provenance
+                        .session
+                        .clone()
+                        .ok_or(ProtocolError::StaleScope)?,
                     provenance: group.provenance.clone(),
-                    id, destroyed: group.destroyed.clone(),
+                    id,
+                    destroyed: group.destroyed.clone(),
                     unsubmitted_abandoned: group.unsubmitted_abandoned.clone(),
                 });
             }
         }
         if physical_creation_slots > 0 {
             if let Some(group) = group_id.and_then(|id| state.groups.get_mut(&id)) {
-                group.realm_complete &= provenance.realm.is_some()
-                    && provenance.realm == group.provenance.realm;
+                group.realm_complete &=
+                    provenance.realm.is_some() && provenance.realm == group.provenance.realm;
             }
         }
         let grouped_creation = group_id.is_some()
@@ -4090,7 +4197,9 @@ fn destroy_matching(
     let groups: HashSet<u64> = state
         .groups
         .iter()
-        .filter(|(_, group)| matches(&group.provenance) && (!realm_specific || group.realm_complete))
+        .filter(|(_, group)| {
+            matches(&group.provenance) && (!realm_specific || group.realm_complete)
+        })
         .map(|(id, _)| *id)
         .collect();
     for id in &groups {
@@ -6127,12 +6236,25 @@ pub(crate) mod tests {
             session_id: Some("page".into()),
             params: json!({"context":{"id":9}}),
         });
-        grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1","executionContextId":9}))
-            .await.submit().unwrap()
-            .settle(&response(json!({"object":{"objectId":"old-realm-node"}})));
-        let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
-            Some(&json!({"objectGroup":"native-query-1"})), Some("page")) .unwrap();
+        grouped(
+            &ledger,
+            &journal,
+            "native-query-1",
+            "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1","executionContextId":9}),
+        )
+        .await
+        .submit()
+        .unwrap()
+        .settle(&response(json!({"object":{"objectId":"old-realm-node"}})));
+        let reservation = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.releaseObjectGroup",
+                Some(&json!({"objectGroup":"native-query-1"})),
+                Some("page"),
+            )
+            .unwrap();
         let status = reservation.status();
         let release = reservation.submit().unwrap();
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
@@ -6158,12 +6280,25 @@ pub(crate) mod tests {
             session_id: Some("page".into()),
             params: json!({"context":{"id":9}}),
         });
-        grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1","executionContextId":9}))
-            .await.submit().unwrap()
-            .settle(&response(json!({"object":{"objectId":"old-realm-node"}})));
-        let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
-            Some(&json!({"objectGroup":"native-query-1"})), Some("page")) .unwrap();
+        grouped(
+            &ledger,
+            &journal,
+            "native-query-1",
+            "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1","executionContextId":9}),
+        )
+        .await
+        .submit()
+        .unwrap()
+        .settle(&response(json!({"object":{"objectId":"old-realm-node"}})));
+        let reservation = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.releaseObjectGroup",
+                Some(&json!({"objectGroup":"native-query-1"})),
+                Some("page"),
+            )
+            .unwrap();
         let status = reservation.status();
         let release = reservation.submit().unwrap();
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
@@ -6189,24 +6324,43 @@ pub(crate) mod tests {
             json!({"method":"Page.frameDetached","sessionId":"page","params":{"frameId":"child","reason":"remove"}}),
         ] {
             let (ledger, journal) = owner();
-            ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-                session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
-            grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-                json!({"objectGroup":"native-query-1","executionContextId":9}))
-                .await.submit().unwrap()
-                .settle(&response(json!({"object":{"objectId":"live-node"}})));
+            ledger.observe_event(&CdpEvent {
+                method: "Runtime.executionContextCreated".into(),
+                session_id: Some("page".into()),
+                params: json!({"context":{"id":9}}),
+            });
+            grouped(
+                &ledger,
+                &journal,
+                "native-query-1",
+                "DOM.resolveNode",
+                json!({"objectGroup":"native-query-1","executionContextId":9}),
+            )
+            .await
+            .submit()
+            .unwrap()
+            .settle(&response(json!({"object":{"objectId":"live-node"}})));
             ledger.observe_event(&CdpEvent {
                 method: event["method"].as_str().unwrap().into(),
                 session_id: event["sessionId"].as_str().map(str::to_owned),
                 params: event["params"].clone(),
             });
             assert_eq!(ledger.snapshot().object_debt, 1);
-            let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
-                Some(&json!({"objectGroup":"native-query-1"})), Some("page")) .unwrap();
+            let reservation = ledger
+                .reserve_command(
+                    Some(&journal),
+                    "Runtime.releaseObjectGroup",
+                    Some(&json!({"objectGroup":"native-query-1"})),
+                    Some("page"),
+                )
+                .unwrap();
             let status = reservation.status();
             let release = reservation.submit().unwrap();
-            release.settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
-                "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
+            release.settle(
+                &serde_json::from_value(json!({"id":2,"sessionId":"page",
+                "error":{"code":-32000,"message":"synthetic refused cleanup"}}))
+                .unwrap(),
+            );
             assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
             assert_eq!(ledger.snapshot().object_debt, 1);
             assert_eq!(ledger.snapshot().outstanding_commands, 1);
@@ -6215,22 +6369,44 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn readonly_group_unknown_creator_preserves_pending_and_rejected_cleanup_on_realm_destroy() {
+    async fn readonly_group_unknown_creator_preserves_pending_and_rejected_cleanup_on_realm_destroy(
+    ) {
         let (ledger, journal) = owner();
         ledger.observe_event(&CdpEvent {
             method: "Runtime.executionContextCreated".into(),
             session_id: Some("page".into()),
             params: json!({"context":{"id":9}}),
         });
-        grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1","executionContextId":9}))
-            .await.submit().unwrap()
-            .settle(&response(json!({"object":{"objectId":"known-node"}})));
+        grouped(
+            &ledger,
+            &journal,
+            "native-query-1",
+            "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1","executionContextId":9}),
+        )
+        .await
+        .submit()
+        .unwrap()
+        .settle(&response(json!({"object":{"objectId":"known-node"}})));
         // Same name is not proof that this creator belongs to realm 9.
-        let unknown = grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1"})).await.submit().unwrap();
-        let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
-            Some(&json!({"objectGroup":"native-query-1"})), Some("page")).unwrap();
+        let unknown = grouped(
+            &ledger,
+            &journal,
+            "native-query-1",
+            "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1"}),
+        )
+        .await
+        .submit()
+        .unwrap();
+        let reservation = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.releaseObjectGroup",
+                Some(&json!({"objectGroup":"native-query-1"})),
+                Some("page"),
+            )
+            .unwrap();
         let status = reservation.status();
         let release = reservation.submit().unwrap();
         assert_eq!(ledger.snapshot().outstanding_commands, 2);
@@ -6242,10 +6418,15 @@ pub(crate) mod tests {
         assert_eq!(status.snapshot(), CommandStatus::Submitted);
         assert_eq!(ledger.snapshot().object_debt, 1);
         assert_eq!(ledger.snapshot().outstanding_commands, 2);
-        release.settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
-            "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
+        release.settle(
+            &serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"synthetic refused cleanup"}}))
+            .unwrap(),
+        );
         assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
-        let _late_disposals = unknown.settle_for_delivery(&response(json!({"object":{"objectId":"unknown-live-node"}})));
+        let _late_disposals = unknown.settle_for_delivery(&response(
+            json!({"object":{"objectId":"unknown-live-node"}}),
+        ));
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
         assert_eq!(ledger.snapshot().object_debt, 1);
         assert!(!ledger.snapshot().integrity_lost);
@@ -6264,27 +6445,53 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn readonly_group_new_context_epoch_never_borrows_prior_realm_cleanup() {
         let (ledger, journal) = owner();
-        let created = CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("page".into()), params: json!({"context":{"id":9}}) };
+        let created = CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: json!({"context":{"id":9}}),
+        };
         ledger.observe_event(&created);
-        grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1","executionContextId":9}))
-            .await.submit().unwrap()
-            .settle(&response(json!({"object":{"objectId":"prior-epoch-node"}})));
+        grouped(
+            &ledger,
+            &journal,
+            "native-query-1",
+            "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1","executionContextId":9}),
+        )
+        .await
+        .submit()
+        .unwrap()
+        .settle(&response(json!({"object":{"objectId":"prior-epoch-node"}})));
         ledger.observe_event(&created);
         // Numeric context ID reuse must not merge distinct native realm epochs.
-        let refused = native_object_group("native-query-1", command_scope(
-            CommandCategory::ApplicationObject, false, async {
-                ledger.reserve_command(Some(&journal), "DOM.resolveNode",
-                    Some(&json!({"objectGroup":"native-query-1","executionContextId":9})), Some("page"))
-            })).await;
+        let refused = native_object_group(
+            "native-query-1",
+            command_scope(CommandCategory::ApplicationObject, false, async {
+                ledger.reserve_command(
+                    Some(&journal),
+                    "DOM.resolveNode",
+                    Some(&json!({"objectGroup":"native-query-1","executionContextId":9})),
+                    Some("page"),
+                )
+            }),
+        )
+        .await;
         assert!(matches!(refused, Err(ProtocolError::StaleScope)));
-        let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
-            Some(&json!({"objectGroup":"native-query-1"})), Some("page")).unwrap();
+        let reservation = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.releaseObjectGroup",
+                Some(&json!({"objectGroup":"native-query-1"})),
+                Some("page"),
+            )
+            .unwrap();
         let status = reservation.status();
         let release = reservation.submit().unwrap();
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextDestroyed".into(),
-            session_id: Some("page".into()), params: json!({"executionContextId":9}) });
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextDestroyed".into(),
+            session_id: Some("page".into()),
+            params: json!({"executionContextId":9}),
+        });
         assert_eq!(status.snapshot(), CommandStatus::Submitted);
         assert_eq!(ledger.snapshot().object_debt, 1);
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
@@ -6297,29 +6504,66 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn readonly_child_group_detach_discharges_only_child_and_preserves_parent_owner() {
         let (ledger, _parent) = owner();
-        let child = ledger.operation(OperationKey { generation: 7, operation_seq: 2 },
-            "child-target".into(), "child-session".into()).unwrap();
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("child-session".into()), params: json!({"context":{"id":9}}) });
-        let creation = native_object_group("native-query-2", command_scope(
-            CommandCategory::ApplicationObject, false, async {
-                ledger.reserve_command(Some(&child), "DOM.resolveNode",
-                    Some(&json!({"objectGroup":"native-query-2","executionContextId":9})), Some("child-session")).unwrap()
-            })).await.submit().unwrap();
-        creation.settle(&serde_json::from_value(json!({"id":1,"sessionId":"child-session",
-            "result":{"object":{"objectId":"child-node"}}})).unwrap());
-        let reservation = ledger.reserve_command(Some(&child), "Runtime.releaseObjectGroup",
-            Some(&json!({"objectGroup":"native-query-2"})), Some("child-session")).unwrap();
+        let child = ledger
+            .operation(
+                OperationKey {
+                    generation: 7,
+                    operation_seq: 2,
+                },
+                "child-target".into(),
+                "child-session".into(),
+            )
+            .unwrap();
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("child-session".into()),
+            params: json!({"context":{"id":9}}),
+        });
+        let creation = native_object_group(
+            "native-query-2",
+            command_scope(CommandCategory::ApplicationObject, false, async {
+                ledger
+                    .reserve_command(
+                        Some(&child),
+                        "DOM.resolveNode",
+                        Some(&json!({"objectGroup":"native-query-2","executionContextId":9})),
+                        Some("child-session"),
+                    )
+                    .unwrap()
+            }),
+        )
+        .await
+        .submit()
+        .unwrap();
+        creation.settle(
+            &serde_json::from_value(json!({"id":1,"sessionId":"child-session",
+            "result":{"object":{"objectId":"child-node"}}}))
+            .unwrap(),
+        );
+        let reservation = ledger
+            .reserve_command(
+                Some(&child),
+                "Runtime.releaseObjectGroup",
+                Some(&json!({"objectGroup":"native-query-2"})),
+                Some("child-session"),
+            )
+            .unwrap();
         let status = reservation.status();
         let _release = reservation.submit().unwrap();
-        ledger.observe_event(&CdpEvent { method: "Target.detachedFromTarget".into(),
-            session_id: Some("page".into()), params: json!({"sessionId":"child-session","targetId":"child-target"}) });
+        ledger.observe_event(&CdpEvent {
+            method: "Target.detachedFromTarget".into(),
+            session_id: Some("page".into()),
+            params: json!({"sessionId":"child-session","targetId":"child-target"}),
+        });
         assert_eq!(status.snapshot(), CommandStatus::Destroyed);
         assert_eq!(ledger.snapshot().outstanding_commands, 0);
         assert_eq!(ledger.snapshot().object_debt, 0);
         assert!(!ledger.snapshot().integrity_lost);
         let state = ledger.state.lock().unwrap();
-        assert_eq!(state.targets.get("page").map(String::as_str), Some("target"));
+        assert_eq!(
+            state.targets.get("page").map(String::as_str),
+            Some("target")
+        );
         assert!(!state.targets.contains_key("child-session"));
         assert!(!state.retired);
     }
@@ -6340,7 +6584,10 @@ pub(crate) mod tests {
         let capture = ReadonlyGroupCapture::new("native-query-layout");
         let direct = READONLY_GROUP_CAPTURE.scope(capture.clone(), LargeFuture([0; 64 * 1024]));
         let wrapped = capture.scope(LargeFuture([0; 64 * 1024]));
-        assert_eq!(std::mem::size_of_val(&wrapped), std::mem::size_of_val(&direct));
+        assert_eq!(
+            std::mem::size_of_val(&wrapped),
+            std::mem::size_of_val(&direct)
+        );
     }
 
     #[tokio::test]
@@ -6371,39 +6618,74 @@ pub(crate) mod tests {
         assert!(!state.consumed);
     }
 
-    async fn readonly_capture_fixture() -> (Arc<OwnerDebtLedger>, OperationJournalHandle, ReadonlyGroupCapture) {
+    async fn readonly_capture_fixture() -> (
+        Arc<OwnerDebtLedger>,
+        OperationJournalHandle,
+        ReadonlyGroupCapture,
+    ) {
         let (ledger, journal) = owner();
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: json!({"context":{"id":9}}),
+        });
         let capture = ReadonlyGroupCapture::new("native-query-1");
-        capture.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1","executionContextId":9})))
-            .await.submit().unwrap()
+        capture
+            .scope(grouped(
+                &ledger,
+                &journal,
+                "native-query-1",
+                "DOM.resolveNode",
+                json!({"objectGroup":"native-query-1","executionContextId":9}),
+            ))
+            .await
+            .submit()
+            .unwrap()
             .settle(&response(json!({"object":{"objectId":"known-node"}})));
         (ledger, journal, capture)
     }
     fn destroy_readonly_fixture_realm(ledger: &OwnerDebtLedger) {
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextDestroyed".into(),
-            session_id: Some("page".into()), params: json!({"executionContextId":9}) });
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextDestroyed".into(),
+            session_id: Some("page".into()),
+            params: json!({"executionContextId":9}),
+        });
     }
     #[tokio::test]
     async fn captured_readonly_destroyed_group_consumes_without_new_release_debt() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
         destroy_readonly_fixture_realm(&ledger);
         let before = ledger.snapshot();
-        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture),
-            Ok(ReadonlyRelease::Destroyed)));
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture),
+            Ok(ReadonlyRelease::Destroyed)
+        ));
         assert_eq!(ledger.snapshot(), before);
         assert_eq!(before.object_debt, 0);
         assert_eq!(before.outstanding_commands, 0);
-        assert_eq!(ledger.state.lock().unwrap().targets.get("page").map(String::as_str), Some("target"));
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert_eq!(
+            ledger
+                .state
+                .lock()
+                .unwrap()
+                .targets
+                .get("page")
+                .map(String::as_str),
+            Some("target")
+        );
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .is_err());
     }
     #[tokio::test]
     async fn captured_readonly_live_release_retains_exact_pending_command_until_destruction() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
-        let ReadonlyRelease::Reserved(reservation) = ledger.reserve_captured_readonly_release(
-            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("live group must retain real disposal") };
+        let ReadonlyRelease::Reserved(reservation) = ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .unwrap()
+        else {
+            panic!("live group must retain real disposal")
+        };
         let status = reservation.status();
         let _submitted = reservation.submit().unwrap();
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
@@ -6417,39 +6699,94 @@ pub(crate) mod tests {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
         destroy_readonly_fixture_realm(&ledger);
         let (foreign, foreign_journal) = owner();
-        assert!(foreign.reserve_captured_readonly_release(&foreign_journal, "page", "native-query-1", &capture).is_err());
-        let other = ledger.operation(OperationKey { generation: 7, operation_seq: 2 }, "target".into(), "page".into()).unwrap();
-        assert!(ledger.reserve_captured_readonly_release(&other, "page", "native-query-1", &capture).is_err());
-        assert!(ledger.reserve_captured_readonly_release(&journal, "foreign", "native-query-1", &capture).is_err());
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "other-group", &capture).is_err());
-        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture), Ok(ReadonlyRelease::Destroyed)));
+        assert!(foreign
+            .reserve_captured_readonly_release(&foreign_journal, "page", "native-query-1", &capture)
+            .is_err());
+        let other = ledger
+            .operation(
+                OperationKey {
+                    generation: 7,
+                    operation_seq: 2,
+                },
+                "target".into(),
+                "page".into(),
+            )
+            .unwrap();
+        assert!(ledger
+            .reserve_captured_readonly_release(&other, "page", "native-query-1", &capture)
+            .is_err());
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "foreign", "native-query-1", &capture)
+            .is_err());
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "other-group", &capture)
+            .is_err());
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture),
+            Ok(ReadonlyRelease::Destroyed)
+        ));
     }
     #[tokio::test]
     async fn captured_readonly_old_receipt_cannot_consume_reused_name_or_new_realm_group() {
         let (ledger, journal, old) = readonly_capture_fixture().await;
         destroy_readonly_fixture_realm(&ledger);
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: json!({"context":{"id":9}}),
+        });
         let fresh = ReadonlyGroupCapture::new("native-query-1");
-        fresh.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1","executionContextId":9})))
-            .await.submit().unwrap().settle(&response(json!({"object":{"objectId":"new-epoch-node"}})));
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &old).is_err());
+        fresh
+            .scope(grouped(
+                &ledger,
+                &journal,
+                "native-query-1",
+                "DOM.resolveNode",
+                json!({"objectGroup":"native-query-1","executionContextId":9}),
+            ))
+            .await
+            .submit()
+            .unwrap()
+            .settle(&response(json!({"object":{"objectId":"new-epoch-node"}})));
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &old)
+            .is_err());
         assert_eq!(ledger.snapshot().object_debt, 1);
-        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &fresh), Ok(ReadonlyRelease::Reserved(_))));
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &fresh),
+            Ok(ReadonlyRelease::Reserved(_))
+        ));
     }
     #[tokio::test]
     async fn captured_readonly_mixed_unknown_creator_never_acquires_destroyed_receipt() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
-        capture.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1"}))).await.submit().unwrap()
-            .settle(&response(json!({"object":{"objectId":"unknown-realm-node"}})));
+        capture
+            .scope(grouped(
+                &ledger,
+                &journal,
+                "native-query-1",
+                "DOM.resolveNode",
+                json!({"objectGroup":"native-query-1"}),
+            ))
+            .await
+            .submit()
+            .unwrap()
+            .settle(&response(
+                json!({"object":{"objectId":"unknown-realm-node"}}),
+            ));
         destroy_readonly_fixture_realm(&ledger);
-        let ReadonlyRelease::Reserved(reservation) = ledger.reserve_captured_readonly_release(
-            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("unknown member requires real cleanup") };
+        let ReadonlyRelease::Reserved(reservation) = ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .unwrap()
+        else {
+            panic!("unknown member requires real cleanup")
+        };
         let status = reservation.status();
-        reservation.submit().unwrap().settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
-            "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
+        reservation.submit().unwrap().settle(
+            &serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"synthetic refused cleanup"}}))
+            .unwrap(),
+        );
         assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
         assert_eq!(ledger.snapshot().object_debt, 1);
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
@@ -6458,113 +6795,230 @@ pub(crate) mod tests {
     async fn captured_readonly_unsent_abandonment_keeps_legacy_strict_disposal_not_destruction() {
         let (ledger, journal) = owner();
         let capture = ReadonlyGroupCapture::new("native-query-1");
-        drop(capture.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1"}))).await);
+        drop(
+            capture
+                .scope(grouped(
+                    &ledger,
+                    &journal,
+                    "native-query-1",
+                    "DOM.resolveNode",
+                    json!({"objectGroup":"native-query-1"}),
+                ))
+                .await,
+        );
         assert_eq!(ledger.snapshot().object_debt, 0);
-        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture), Ok(ReadonlyRelease::Uncaptured)));
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture),
+            Ok(ReadonlyRelease::Uncaptured)
+        ));
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .is_err());
     }
     #[tokio::test]
     async fn captured_readonly_integrity_loss_cannot_borrow_prior_destruction() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
         destroy_readonly_fixture_realm(&ledger);
         ledger.connection_lost();
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .is_err());
         assert!(ledger.snapshot().integrity_lost);
     }
     #[tokio::test]
     async fn captured_readonly_destruction_never_discharges_other_rejected_cleanup() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
-        let other = ledger.reserve_command(Some(&journal), "Runtime.releaseObject",
-            Some(&json!({"objectId":"unrelated-unproven-object"})), Some("page")).unwrap();
+        let other = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.releaseObject",
+                Some(&json!({"objectId":"unrelated-unproven-object"})),
+                Some("page"),
+            )
+            .unwrap();
         let status = other.status();
-        other.submit().unwrap().settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
-            "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
+        other.submit().unwrap().settle(
+            &serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"synthetic refused cleanup"}}))
+            .unwrap(),
+        );
         destroy_readonly_fixture_realm(&ledger);
-        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture), Ok(ReadonlyRelease::Destroyed)));
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture),
+            Ok(ReadonlyRelease::Destroyed)
+        ));
         assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
     }
 
     #[tokio::test]
-    async fn captured_readonly_destruction_between_claim_and_reserve_removes_only_own_unsent_release() {
+    async fn captured_readonly_destruction_between_claim_and_reserve_removes_only_own_unsent_release(
+    ) {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
-        let ReadonlyReleaseAdmission::Live(bound) = ledger.begin_captured_readonly_release(
-            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("live") };
-        assert!(ledger.begin_captured_readonly_release(&journal, "page", "native-query-1", &capture.clone()).is_err());
+        let ReadonlyReleaseAdmission::Live(bound) = ledger
+            .begin_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .unwrap()
+        else {
+            panic!("live")
+        };
+        assert!(ledger
+            .begin_captured_readonly_release(&journal, "page", "native-query-1", &capture.clone())
+            .is_err());
         destroy_readonly_fixture_realm(&ledger);
-        let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
-            Some(&json!({"objectGroup":"native-query-1"})), Some("page")).unwrap();
+        let reservation = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.releaseObjectGroup",
+                Some(&json!({"objectGroup":"native-query-1"})),
+                Some("page"),
+            )
+            .unwrap();
         let status = reservation.status();
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
-        assert!(matches!(ledger.finish_captured_readonly_release(&journal, "page", "native-query-1", &bound, reservation), Ok(ReadonlyRelease::Destroyed)));
+        assert!(matches!(
+            ledger.finish_captured_readonly_release(
+                &journal,
+                "page",
+                "native-query-1",
+                &bound,
+                reservation
+            ),
+            Ok(ReadonlyRelease::Destroyed)
+        ));
         assert_eq!(status.snapshot(), CommandStatus::Destroyed);
         assert_eq!(ledger.snapshot().outstanding_commands, 0);
         assert_eq!(ledger.snapshot().object_debt, 0);
     }
     #[tokio::test]
-    async fn captured_readonly_destruction_between_reserve_and_finish_accepts_only_destroyed_status() {
+    async fn captured_readonly_destruction_between_reserve_and_finish_accepts_only_destroyed_status(
+    ) {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
-        let ReadonlyReleaseAdmission::Live(bound) = ledger.begin_captured_readonly_release(
-            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("live") };
-        let reservation = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
-            Some(&json!({"objectGroup":"native-query-1"})), Some("page")).unwrap();
+        let ReadonlyReleaseAdmission::Live(bound) = ledger
+            .begin_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .unwrap()
+        else {
+            panic!("live")
+        };
+        let reservation = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.releaseObjectGroup",
+                Some(&json!({"objectGroup":"native-query-1"})),
+                Some("page"),
+            )
+            .unwrap();
         let status = reservation.status();
         destroy_readonly_fixture_realm(&ledger);
         assert_eq!(status.snapshot(), CommandStatus::Destroyed);
-        assert!(matches!(ledger.finish_captured_readonly_release(&journal, "page", "native-query-1", &bound, reservation), Ok(ReadonlyRelease::Destroyed)));
+        assert!(matches!(
+            ledger.finish_captured_readonly_release(
+                &journal,
+                "page",
+                "native-query-1",
+                &bound,
+                reservation
+            ),
+            Ok(ReadonlyRelease::Destroyed)
+        ));
         assert_eq!(ledger.snapshot().outstanding_commands, 0);
     }
     #[tokio::test]
     async fn captured_readonly_name_alone_cannot_mint_receipt_for_registered_group() {
         let (ledger, journal, original) = readonly_capture_fixture().await;
         let forged = ReadonlyGroupCapture::new("native-query-1");
-        let result = forged.scope(native_object_group("native-query-1", command_scope(
-            CommandCategory::ApplicationObject, false, async {
-                ledger.reserve_command(Some(&journal), "DOM.resolveNode",
-                    Some(&json!({"objectGroup":"native-query-1","executionContextId":9})), Some("page"))
-            }))).await;
+        let result = forged
+            .scope(native_object_group(
+                "native-query-1",
+                command_scope(CommandCategory::ApplicationObject, false, async {
+                    ledger.reserve_command(
+                        Some(&journal),
+                        "DOM.resolveNode",
+                        Some(&json!({"objectGroup":"native-query-1","executionContextId":9})),
+                        Some("page"),
+                    )
+                }),
+            ))
+            .await;
         assert!(matches!(result, Err(ProtocolError::StaleScope)));
         destroy_readonly_fixture_realm(&ledger);
-        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &forged), Ok(ReadonlyRelease::Uncaptured)));
-        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &original), Ok(ReadonlyRelease::Destroyed)));
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &forged),
+            Ok(ReadonlyRelease::Uncaptured)
+        ));
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &original),
+            Ok(ReadonlyRelease::Destroyed)
+        ));
     }
     #[tokio::test]
     async fn captured_readonly_context_epoch_reuse_without_new_group_refuses_old_receipt() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
         destroy_readonly_fixture_realm(&ledger);
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: json!({"context":{"id":9}}),
+        });
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .is_err());
         assert_eq!(ledger.snapshot().outstanding_commands, 0);
     }
     #[tokio::test]
     async fn captured_readonly_pending_unknown_creator_and_late_ack_preserve_cleanup_debt() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
-        let unknown = capture.scope(grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1"}))).await.submit().unwrap();
+        let unknown = capture
+            .scope(grouped(
+                &ledger,
+                &journal,
+                "native-query-1",
+                "DOM.resolveNode",
+                json!({"objectGroup":"native-query-1"}),
+            ))
+            .await
+            .submit()
+            .unwrap();
         destroy_readonly_fixture_realm(&ledger);
-        let ReadonlyRelease::Reserved(release) = ledger.reserve_captured_readonly_release(
-            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("unknown member needs cleanup") };
+        let ReadonlyRelease::Reserved(release) = ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .unwrap()
+        else {
+            panic!("unknown member needs cleanup")
+        };
         let status = release.status();
-        release.submit().unwrap().settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
-            "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
-        let _late_disposals = unknown.settle_for_delivery(&response(json!({"object":{"objectId":"late-node"}})));
+        release.submit().unwrap().settle(
+            &serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"synthetic refused cleanup"}}))
+            .unwrap(),
+        );
+        let _late_disposals =
+            unknown.settle_for_delivery(&response(json!({"object":{"objectId":"late-node"}})));
         assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
         assert_eq!(ledger.snapshot().object_debt, 1);
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .is_err());
     }
     #[tokio::test]
     async fn captured_readonly_rejected_release_never_turns_into_success_or_retry() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
-        let ReadonlyRelease::Reserved(release) = ledger.reserve_captured_readonly_release(
-            &journal, "page", "native-query-1", &capture).unwrap() else { panic!("live") };
+        let ReadonlyRelease::Reserved(release) = ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .unwrap()
+        else {
+            panic!("live")
+        };
         let status = release.status();
-        release.submit().unwrap().settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
-            "error":{"code":-32000,"message":"Object group not found"}})).unwrap());
+        release.submit().unwrap().settle(
+            &serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"Object group not found"}}))
+            .unwrap(),
+        );
         assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
         assert_eq!(ledger.snapshot().object_debt, 1);
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .is_err());
         assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
     }
     #[tokio::test]
@@ -6573,66 +7027,148 @@ pub(crate) mod tests {
         destroy_readonly_fixture_realm(&ledger);
         ledger.bind_context("context").unwrap();
         ledger.retire_after_context_destroy("context").unwrap();
-        assert!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture).is_err());
+        assert!(ledger
+            .reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture)
+            .is_err());
     }
 
     #[tokio::test]
     async fn captured_readonly_destroyed_receipt_preserves_unrelated_pending_input() {
         let (ledger, journal, capture) = readonly_capture_fixture().await;
-        let input = ledger.reserve_command(Some(&journal), "Input.dispatchKeyEvent", None, Some("page"))
-            .unwrap().submit().unwrap();
+        let input = ledger
+            .reserve_command(Some(&journal), "Input.dispatchKeyEvent", None, Some("page"))
+            .unwrap()
+            .submit()
+            .unwrap();
         destroy_readonly_fixture_realm(&ledger);
         let before = ledger.snapshot();
         assert!(before.input_debt > 0);
-        assert!(matches!(ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture), Ok(ReadonlyRelease::Destroyed)));
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(&journal, "page", "native-query-1", &capture),
+            Ok(ReadonlyRelease::Destroyed)
+        ));
         assert_eq!(ledger.snapshot(), before);
         input.settle(&response(json!({})));
     }
     #[tokio::test]
     async fn captured_readonly_child_detach_noop_preserves_parent_group() {
         let (ledger, parent, _parent_capture) = readonly_capture_fixture().await;
-        let child = ledger.operation(OperationKey { generation: 7, operation_seq: 2 },
-            "child-target".into(), "child-session".into()).unwrap();
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("child-session".into()), params: json!({"context":{"id":9}}) });
+        let child = ledger
+            .operation(
+                OperationKey {
+                    generation: 7,
+                    operation_seq: 2,
+                },
+                "child-target".into(),
+                "child-session".into(),
+            )
+            .unwrap();
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("child-session".into()),
+            params: json!({"context":{"id":9}}),
+        });
         let capture = ReadonlyGroupCapture::new("native-query-2");
-        let creation = capture.scope(native_object_group("native-query-2", command_scope(
-            CommandCategory::ApplicationObject, false, async {
-                ledger.reserve_command(Some(&child), "DOM.resolveNode",
-                    Some(&json!({"objectGroup":"native-query-2","executionContextId":9})), Some("child-session")).unwrap()
-            }))).await.submit().unwrap();
-        creation.settle(&serde_json::from_value(json!({"id":1,"sessionId":"child-session",
-            "result":{"object":{"objectId":"child-node"}}})).unwrap());
-        ledger.observe_event(&CdpEvent { method: "Target.detachedFromTarget".into(),
-            session_id: Some("page".into()), params: json!({"sessionId":"child-session","targetId":"child-target"}) });
+        let creation = capture
+            .scope(native_object_group(
+                "native-query-2",
+                command_scope(CommandCategory::ApplicationObject, false, async {
+                    ledger
+                        .reserve_command(
+                            Some(&child),
+                            "DOM.resolveNode",
+                            Some(&json!({"objectGroup":"native-query-2","executionContextId":9})),
+                            Some("child-session"),
+                        )
+                        .unwrap()
+                }),
+            ))
+            .await
+            .submit()
+            .unwrap();
+        creation.settle(
+            &serde_json::from_value(json!({"id":1,"sessionId":"child-session",
+            "result":{"object":{"objectId":"child-node"}}}))
+            .unwrap(),
+        );
+        ledger.observe_event(&CdpEvent {
+            method: "Target.detachedFromTarget".into(),
+            session_id: Some("page".into()),
+            params: json!({"sessionId":"child-session","targetId":"child-target"}),
+        });
         let before = ledger.snapshot();
         assert_eq!(before.object_debt, 1);
-        assert!(matches!(ledger.reserve_captured_readonly_release(&child, "child-session", "native-query-2", &capture), Ok(ReadonlyRelease::Destroyed)));
+        assert!(matches!(
+            ledger.reserve_captured_readonly_release(
+                &child,
+                "child-session",
+                "native-query-2",
+                &capture
+            ),
+            Ok(ReadonlyRelease::Destroyed)
+        ));
         assert_eq!(ledger.snapshot(), before);
-        assert_eq!(ledger.state.lock().unwrap().targets.get("page").map(String::as_str), Some("target"));
+        assert_eq!(
+            ledger
+                .state
+                .lock()
+                .unwrap()
+                .targets
+                .get("page")
+                .map(String::as_str),
+            Some("target")
+        );
         assert_eq!(parent.key().operation_seq, 1);
     }
 
     #[tokio::test]
     async fn readonly_group_unknown_creator_after_release_reservation_revokes_realm_retirement() {
         let (ledger, journal) = owner();
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
-        grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1","executionContextId":9}))
-            .await.submit().unwrap()
-            .settle(&response(json!({"object":{"objectId":"known-node"}})));
-        let release = ledger.reserve_command(Some(&journal), "Runtime.releaseObjectGroup",
-            Some(&json!({"objectGroup":"native-query-1"})), Some("page")).unwrap();
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: json!({"context":{"id":9}}),
+        });
+        grouped(
+            &ledger,
+            &journal,
+            "native-query-1",
+            "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1","executionContextId":9}),
+        )
+        .await
+        .submit()
+        .unwrap()
+        .settle(&response(json!({"object":{"objectId":"known-node"}})));
+        let release = ledger
+            .reserve_command(
+                Some(&journal),
+                "Runtime.releaseObjectGroup",
+                Some(&json!({"objectGroup":"native-query-1"})),
+                Some("page"),
+            )
+            .unwrap();
         let status = release.status();
         // The cleanup already inherited realm 9, but has not sealed the group.
-        assert!(ledger.state.lock().unwrap().commands[&release.id].provenance.realm.is_some());
-        let unknown = grouped(&ledger, &journal, "native-query-1", "DOM.resolveNode",
-            json!({"objectGroup":"native-query-1"})).await;
+        assert!(ledger.state.lock().unwrap().commands[&release.id]
+            .provenance
+            .realm
+            .is_some());
+        let unknown = grouped(
+            &ledger,
+            &journal,
+            "native-query-1",
+            "DOM.resolveNode",
+            json!({"objectGroup":"native-query-1"}),
+        )
+        .await;
         let unknown_status = unknown.status();
         let release = release.submit().unwrap();
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextDestroyed".into(),
-            session_id: Some("page".into()), params: json!({"executionContextId":9}) });
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextDestroyed".into(),
+            session_id: Some("page".into()),
+            params: json!({"executionContextId":9}),
+        });
         assert_eq!(status.snapshot(), CommandStatus::Submitted);
         assert_eq!(unknown_status.snapshot(), CommandStatus::Reserved);
         assert_eq!(ledger.snapshot().object_debt, 1);
@@ -6641,8 +7177,11 @@ pub(crate) mod tests {
         // destruction event or a fabricated realm proof. Drop only its custody.
         assert!(matches!(unknown.submit(), Err(ProtocolError::Cancelled)));
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
-        release.settle(&serde_json::from_value(json!({"id":2,"sessionId":"page",
-            "error":{"code":-32000,"message":"synthetic refused cleanup"}})).unwrap());
+        release.settle(
+            &serde_json::from_value(json!({"id":2,"sessionId":"page",
+            "error":{"code":-32000,"message":"synthetic refused cleanup"}}))
+            .unwrap(),
+        );
         assert_eq!(status.snapshot(), CommandStatus::RetainedRejected);
         assert_eq!(ledger.snapshot().outstanding_commands, 1);
         assert_eq!(ledger.snapshot().object_debt, 1);
@@ -6652,7 +7191,9 @@ pub(crate) mod tests {
     #[test]
     fn dropping_unsubmitted_reservation_preserves_actual_abandonment_status() {
         let (ledger, journal) = owner();
-        let reservation = ledger.reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page")).unwrap();
+        let reservation = ledger
+            .reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page"))
+            .unwrap();
         let status = reservation.status();
         assert_eq!(status.snapshot(), CommandStatus::Reserved);
         drop(reservation);
@@ -6662,10 +7203,19 @@ pub(crate) mod tests {
     #[test]
     fn dropping_already_destroyed_unsent_reservation_preserves_exact_terminal_receipt() {
         let (ledger, journal) = owner();
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
-        let reservation = ledger.reserve_command(Some(&journal), "DOM.resolveNode",
-            Some(&json!({"backendNodeId":42,"executionContextId":9})), Some("page")).unwrap();
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: json!({"context":{"id":9}}),
+        });
+        let reservation = ledger
+            .reserve_command(
+                Some(&journal),
+                "DOM.resolveNode",
+                Some(&json!({"backendNodeId":42,"executionContextId":9})),
+                Some("page"),
+            )
+            .unwrap();
         let status = reservation.status();
         destroy_readonly_fixture_realm(&ledger);
         assert_eq!(status.snapshot(), CommandStatus::Destroyed);
@@ -6678,13 +7228,24 @@ pub(crate) mod tests {
     #[test]
     fn dropping_old_destroyed_reservation_never_changes_new_command_or_its_status() {
         let (ledger, journal) = owner();
-        ledger.observe_event(&CdpEvent { method: "Runtime.executionContextCreated".into(),
-            session_id: Some("page".into()), params: json!({"context":{"id":9}}) });
-        let old = ledger.reserve_command(Some(&journal), "DOM.resolveNode",
-            Some(&json!({"backendNodeId":42,"executionContextId":9})), Some("page")).unwrap();
+        ledger.observe_event(&CdpEvent {
+            method: "Runtime.executionContextCreated".into(),
+            session_id: Some("page".into()),
+            params: json!({"context":{"id":9}}),
+        });
+        let old = ledger
+            .reserve_command(
+                Some(&journal),
+                "DOM.resolveNode",
+                Some(&json!({"backendNodeId":42,"executionContextId":9})),
+                Some("page"),
+            )
+            .unwrap();
         let old_status = old.status();
         destroy_readonly_fixture_realm(&ledger);
-        let fresh = ledger.reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page")).unwrap();
+        let fresh = ledger
+            .reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page"))
+            .unwrap();
         let fresh_status = fresh.status();
         let before = ledger.snapshot();
         drop(old);
@@ -6697,7 +7258,9 @@ pub(crate) mod tests {
     #[test]
     fn dropping_missing_unsent_command_cannot_fabricate_a_terminal_receipt() {
         let (ledger, journal) = owner();
-        let reservation = ledger.reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page")).unwrap();
+        let reservation = ledger
+            .reserve_command(Some(&journal), "Page.getFrameTree", None, Some("page"))
+            .unwrap();
         let status = reservation.status();
         // Synthetic abnormal absence, not a destruction event or abandonment.
         remove_command(&mut ledger.state.lock().unwrap(), reservation.id).unwrap();
@@ -7103,9 +7666,13 @@ pub(crate) mod tests {
                 ledger.check_terminal_read_only(&[("page".into(), "target".into(), false)], &keys);
             assert_eq!(result.is_ok(), obstruction == "none", "{obstruction}");
             let (observed_result, observation) = ledger.check_terminal_read_only_observed(
-                &[("page".into(), "target".into(), false)], &keys,
+                &[("page".into(), "target".into(), false)],
+                &keys,
             );
-            assert_eq!(observed_result, result, "diagnostic cannot change the guard");
+            assert_eq!(
+                observed_result, result,
+                "diagnostic cannot change the guard"
+            );
             assert_eq!(observation.is_some(), result.is_err(), "{obstruction}");
             if obstruction == "created-target" {
                 assert_eq!(observation, Some((crate::native::client_settlement_trace::TerminalEnrollmentRefusal::LedgerCreatedTargets, Some([1, 0]))));

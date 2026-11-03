@@ -2236,9 +2236,8 @@ impl ClientTargets {
             });
             let observed_tenure = diagnostic::inventory_enabled().then(|| tenure.clone());
             #[cfg(test)]
-            let observed_tenure = observed_tenure.or_else(|| {
-                state.inventory_diagnostics_for_test.then(|| tenure.clone())
-            });
+            let observed_tenure = observed_tenure
+                .or_else(|| state.inventory_diagnostics_for_test.then(|| tenure.clone()));
             let mut target = OwnedTarget {
                 target_id,
                 session_id,
@@ -3038,56 +3037,109 @@ impl ClientTargets {
         commit: impl FnOnce() -> Result<T, ProtocolError>,
     ) -> Result<T, ProtocolError> {
         let (result, observation) = self.with_terminal_read_only_observed(bindings, commit);
-        if let Some((reason, counts)) = observation { super::client_settlement_trace::terminal_enrollment_refusal(reason, counts); }
+        if let Some((reason, counts)) = observation {
+            super::client_settlement_trace::terminal_enrollment_refusal(reason, counts);
+        }
         result
     }
     pub(crate) fn check_terminal_read_only_observed(
-        &self, bindings: &[(String, String, bool)],
-    ) -> (Result<(), ProtocolError>, Option<(super::client_settlement_trace::TerminalEnrollmentRefusal, Option<[u64; 2]>)>) {
+        &self,
+        bindings: &[(String, String, bool)],
+    ) -> (
+        Result<(), ProtocolError>,
+        super::client_settlement_trace::TerminalRefusalObservation,
+    ) {
         self.with_terminal_read_only_observed(bindings, || Ok(()))
     }
     fn with_terminal_read_only_observed<T>(
         &self,
         bindings: &[(String, String, bool)],
         commit: impl FnOnce() -> Result<T, ProtocolError>,
-    ) -> (Result<T, ProtocolError>, Option<(super::client_settlement_trace::TerminalEnrollmentRefusal, Option<[u64; 2]>)>) {
+    ) -> (
+        Result<T, ProtocolError>,
+        super::client_settlement_trace::TerminalRefusalObservation,
+    ) {
         use super::client_settlement_trace::TerminalEnrollmentRefusal;
         let mut refusal = None;
         macro_rules! terminal_guard {
             ($predicate:expr, $reason:ident, $counts:expr) => {{
                 let rejected = $predicate;
-                if rejected { refusal = Some((TerminalEnrollmentRefusal::$reason, $counts)); }
+                if rejected {
+                    refusal = Some((TerminalEnrollmentRefusal::$reason, $counts));
+                }
                 rejected
             }};
         }
 
         let result = (|| {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| ProtocolError::CleanupFailed)?;
-        if terminal_guard!(!state.sealed, RegistryNotSealed, None)
-            || terminal_guard!(state.integrity_lost, RegistryIntegrityLost, None)
-            || terminal_guard!(!state.enrollment_ready, RegistryNotReady, None)
-            || terminal_guard!(state.reservations != 0, RegistryReservations, Some([state.reservations as u64, 0]))
-            || terminal_guard!(state.resuming != 0, RegistryResuming, Some([state.resuming as u64, 0]))
-            || terminal_guard!(state.protected_read.is_some(), RegistryProtectedRead, None)
-            || terminal_guard!(!state.bootstrap_creations.is_empty(), RegistryBootstrapCreations, Some([state.bootstrap_creations.len() as u64, 0]))
-            || terminal_guard!(!state.native_bootstrap_cleanup.is_empty(), RegistryBootstrapCleanup, Some([state.native_bootstrap_cleanup.len() as u64, 0]))
-            || terminal_guard!(!state.bootstrap_cleanup_reservations.is_empty(), RegistryCleanupReservations, Some([state.bootstrap_cleanup_reservations.len() as u64, 0]))
-            || terminal_guard!(state.unknown_bootstrap_create, RegistryUnknownCreation, None)
-            || terminal_guard!(!state.auxiliary.is_empty(), RegistryAuxiliary, Some([state.auxiliary.len() as u64, 0]))
-            || terminal_guard!(state.targets.len() != bindings.iter().filter(|(_, _, observer)| !observer).count(), RegistryTargetCount, Some([state.targets.len() as u64, bindings.iter().filter(|(_, _, observer)| !observer).count() as u64]))
-            || terminal_guard!(state.targets.values().any(|target| {
-                !target.capture_ready()
-                    || !bindings.iter().any(|(session, id, observer)| {
-                        !observer && session == &target.session_id && id == &target.target_id
-                    })
-            }), RegistryTargetBinding, None)
-        {
-            return Err(ProtocolError::CleanupFailed);
-        }
-        commit()
+            let state = self
+                .state
+                .lock()
+                .map_err(|_| ProtocolError::CleanupFailed)?;
+            if terminal_guard!(!state.sealed, RegistryNotSealed, None)
+                || terminal_guard!(state.integrity_lost, RegistryIntegrityLost, None)
+                || terminal_guard!(!state.enrollment_ready, RegistryNotReady, None)
+                || terminal_guard!(
+                    state.reservations != 0,
+                    RegistryReservations,
+                    Some([state.reservations as u64, 0])
+                )
+                || terminal_guard!(
+                    state.resuming != 0,
+                    RegistryResuming,
+                    Some([state.resuming as u64, 0])
+                )
+                || terminal_guard!(state.protected_read.is_some(), RegistryProtectedRead, None)
+                || terminal_guard!(
+                    !state.bootstrap_creations.is_empty(),
+                    RegistryBootstrapCreations,
+                    Some([state.bootstrap_creations.len() as u64, 0])
+                )
+                || terminal_guard!(
+                    !state.native_bootstrap_cleanup.is_empty(),
+                    RegistryBootstrapCleanup,
+                    Some([state.native_bootstrap_cleanup.len() as u64, 0])
+                )
+                || terminal_guard!(
+                    !state.bootstrap_cleanup_reservations.is_empty(),
+                    RegistryCleanupReservations,
+                    Some([state.bootstrap_cleanup_reservations.len() as u64, 0])
+                )
+                || terminal_guard!(
+                    state.unknown_bootstrap_create,
+                    RegistryUnknownCreation,
+                    None
+                )
+                || terminal_guard!(
+                    !state.auxiliary.is_empty(),
+                    RegistryAuxiliary,
+                    Some([state.auxiliary.len() as u64, 0])
+                )
+                || terminal_guard!(
+                    state.targets.len()
+                        != bindings.iter().filter(|(_, _, observer)| !observer).count(),
+                    RegistryTargetCount,
+                    Some([
+                        state.targets.len() as u64,
+                        bindings.iter().filter(|(_, _, observer)| !observer).count() as u64
+                    ])
+                )
+                || terminal_guard!(
+                    state.targets.values().any(|target| {
+                        !target.capture_ready()
+                            || !bindings.iter().any(|(session, id, observer)| {
+                                !observer
+                                    && session == &target.session_id
+                                    && id == &target.target_id
+                            })
+                    }),
+                    RegistryTargetBinding,
+                    None
+                )
+            {
+                return Err(ProtocolError::CleanupFailed);
+            }
+            commit()
         })();
         (result, refusal)
     }
@@ -5762,13 +5814,24 @@ mod owned_inventory_diagnostic_opt_in_tests {
         let untouched = ClientTargets::new("context".into(), "scope".into());
         assert!(!enabled.state.lock().unwrap().inventory_diagnostics_for_test);
         enabled.enable_inventory_diagnostics_for_test();
-        assert!(!untouched.state.lock().unwrap().inventory_diagnostics_for_test);
-        assert!(enabled.attached("context", "target".into(), "session".into(), "page".into()).unwrap());
+        assert!(
+            !untouched
+                .state
+                .lock()
+                .unwrap()
+                .inventory_diagnostics_for_test
+        );
+        assert!(enabled
+            .attached("context", "target".into(), "session".into(), "page".into())
+            .unwrap());
         let state = enabled.state.lock().unwrap();
         let history = state.revision_history.as_ref().unwrap();
         assert_eq!(state.revision, 1);
         assert_eq!(history.counts, [1, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(history.last.as_ref().unwrap().0, diagnostic::InventoryRevisionEvent::Attach);
+        assert_eq!(
+            history.last.as_ref().unwrap().0,
+            diagnostic::InventoryRevisionEvent::Attach
+        );
         assert!(state.targets["target"].diagnostic.unwrap().attachment > 0);
         assert!(untouched.state.lock().unwrap().targets.is_empty());
     }
