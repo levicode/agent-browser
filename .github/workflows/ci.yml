@@ -172,8 +172,12 @@ jobs:
 
       - name: Install dependencies
         # The fork postinstall requires a bundled native binary. This job does
-        # not build one, so skip lifecycle scripts here.
+        # not build one, so skip lifecycle scripts and prepare the workspace
+        # packages explicitly instead.
         run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Prepare workspace packages
+        run: pnpm --filter @agent-browser/eve run prepare
 
       - name: Typecheck Eve package
         run: pnpm --filter @agent-browser/eve typecheck
