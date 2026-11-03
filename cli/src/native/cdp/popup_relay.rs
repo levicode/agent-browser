@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const SCRIPT_SHA256: &str = "e928c2161272a1f89f4c11ee4b0d70e3a2a0eb0b70dc1776f59894adbb31c8cd";
+const SCRIPT_SHA256: &str = "61a10b503a9453a0c171f96f5847d3b60adbc9a31071b5b5e15a75fbc1aeb6f8";
 const PREFIX: &str = "AGENT_BROWSER_ACCEPTANCE_POPUP_RELAY_";
 const FAILURE: &str = "Acceptance popup relay unavailable";
 
