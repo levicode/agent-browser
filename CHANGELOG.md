@@ -1,8 +1,88 @@
 # agent-browser
 
-## 0.39.1
+## 0.39.4
 
 <!-- release:start -->
+
+### Bug Fixes
+
+- Fixed **`wait --download`** timing out when the download finished before the wait started, and moving the file to the requested path (#2027)
+- Fixed **`--allowed-domains` launches** failing with "Cannot find default execution context" on pages that embed cross-origin iframes (#2116)
+- Fixed **full-page screenshots** on high-DPI displays being twice the page size with the page in the top-left quarter (#2125)
+- Fixed **selector screenshots** being blank for elements outside the first viewport, after scrolling, or inside iframes (#2126)
+- Fixed **unresponsive tabs** permanently breaking a session; a wedged tab now fails with `page_wedged` and, in a launched browser, is replaced after a second timeout (#2100)
+- Fixed **`--pin-tab`** so another session cannot take a pinned tab with `tab <targetId>` (#2135)
+
+### Contributors
+
+- @Railly
+- @WianBroes
+- @justjavac
+- @aamirhullur
+- @zyz619963502zyz
+
+<!-- release:end -->
+
+## 0.39.3
+
+### Bug Fixes
+
+- Fixed **auth encryption keys** being overwritten when the configured key or existing key file is invalid, preserving access to previously saved credentials (#2178)
+- Fixed **project config trust** so auto-discovered files cannot set executable paths, browser arguments, or plugins; `plugin add` now writes the user config by default (#2180)
+- Fixed **MCP access limits** so tool arguments cannot override the server's network, file, policy, or host access settings (#2181)
+- Fixed **inspect WebSocket origins** so browser connections must come from the local Chrome DevTools origin (#2182)
+- Fixed **stale process cleanup** so daemon restarts, `close --all`, and dashboard shutdown check process identity before sending signals (#2183)
+- Fixed **copied Chrome profiles** so their saved preferences mark the copy as cleanly closed, avoiding repeated crash-restore prompts while retaining saved tabs (#2189)
+- Fixed **dashboard chat sessions** so commands stay in their thread's session, background turns remain attached to that session, and closed sessions stop their chat (#2190)
+- Fixed **Windows output capture** so detached daemons and dashboards do not hold the CLI's output pipes open, and MCP output draining is bounded after child exit (#2160)
+
+### Improvements
+
+- Improved **CDP startup attachment** so `connect` and `--cdp` wait up to two seconds for a debugging port that is still refusing connections (#2159)
+
+### Contributors
+
+- @lahfir
+- @holny
+- @pei711
+- @Muhtasham
+- @BetterAndBetterII
+- @dwin-gharibi
+
+## 0.39.2
+
+### Bug Fixes
+
+- Fixed **paused network requests** being lost when the CDP event receiver falls behind, preventing requests from remaining stalled (#2110)
+- Fixed **domain-filtered redirects** so `open` reports an error when the main document redirects to a blocked host (#2114)
+- Fixed **Eve compatibility** with the current tool contract and sandbox execution model (#2157)
+- Fixed **browser launch arguments** so commas and negative coordinates inside flag values are preserved in `--args` and `AGENT_BROWSER_ARGS` (#2141)
+- Fixed **MCP argument validation** so undeclared keys return an error instead of silently selecting default behavior (#2175)
+- Fixed **click and double-click targeting** so hidden, disabled, and off-viewport elements return an error instead of reporting success (#2173)
+- Fixed **CDP attachment persistence** so follow-up commands retain the attached browser (#2155)
+- Fixed **stale element references** so ambiguous recovery fails instead of selecting another element (#2145)
+- Fixed **target and session invalidation** when related CDP events arrive in the same batch (#2176)
+- Fixed **policy loading failures** so unreadable or invalid policy files deny actions instead of continuing without the policy (#2179)
+
+### Testing
+
+- Made **native E2E fixtures** independent of live websites and installed the required Obscura binary for engine verification (#2113)
+
+### Contributors
+
+- @Railly
+- @lahfir
+- @cmpadden
+- @holny
+- @KimHyeongRae0
+- @jin-2-kakaoent
+- @asif786ka
+- @tlq5l
+- @aniketsaurav18
+- @jerryfane
+
+## 0.39.1
+
 ### Bug Fixes
 
 - Fixed **duplicate command execution after a lost daemon response** so mutating and launch commands are no longer retried after any request bytes have been sent. CLI JSON and MCP responses report `outcome_unknown` so callers can inspect the result before retrying; read-only commands and failures before sending retain their retries (#2085)
@@ -11,7 +91,6 @@
 
 - @Railly
 - @rotemb-wond
-<!-- release:end -->
 
 ## 0.39.0
 

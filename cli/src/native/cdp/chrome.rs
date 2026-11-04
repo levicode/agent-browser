@@ -13,6 +13,8 @@ use super::discovery::discover_cdp_url;
 use crate::ca_bundle::CaBundle;
 
 pub struct ChromeProcess {
+    #[cfg(all(feature = "acceptance-faults", target_os = "linux"))]
+    popup_relay: Option<super::popup_relay::RelayGuard>,
     child: Child,
     pub ws_url: String,
     temp_user_data_dir: Option<PathBuf>,
@@ -924,7 +926,9 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         Some(pid)
     };
 
-    Ok(ChromeProcess {
+    let process = ChromeProcess {
+        #[cfg(all(feature = "acceptance-faults", target_os = "linux"))]
+        popup_relay: None,
         child,
         ws_url,
         temp_user_data_dir,
@@ -933,7 +937,17 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         pgid,
         #[cfg(target_os = "linux")]
         xvfb,
-    })
+    };
+    #[cfg(all(feature = "acceptance-faults", target_os = "linux"))]
+    let process = {
+        let mut process = process;
+        if let Some((endpoint, relay)) = super::popup_relay::start(&process.ws_url)? {
+            process.ws_url = endpoint;
+            process.popup_relay = Some(relay);
+        }
+        process
+    };
+    Ok(process)
 }
 
 fn wait_for_devtools_active_port(
@@ -1477,6 +1491,7 @@ const PROFILE_COPY_EXCLUDE_DIRS: &[&str] = &[
 /// The copy is best-effort: individual file failures (e.g., `SingletonLock`)
 /// are skipped with a warning. If the source profile directory is missing or
 /// the temp dir cannot be created, returns an error after cleaning up.
+/// A copied `Preferences` with `profile.exit_type` of `Crashed` is set to `Normal`, best effort.
 pub fn copy_chrome_profile(
     user_data_dir: &Path,
     profile_directory: &str,
@@ -1510,6 +1525,25 @@ pub fn copy_chrome_profile(
     if let Err(e) = copy_dir_recursive(&src_profile, &dst_profile) {
         let _ = std::fs::remove_dir_all(&temp_dir);
         return Err(format!("Failed to copy profile: {}", e));
+    }
+
+    let preferences_path = dst_profile.join("Preferences");
+    let normalized = (|| {
+        let bytes = std::fs::read(&preferences_path).ok()?;
+        let mut preferences: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let exit_type = preferences.pointer_mut("/profile/exit_type")?;
+        if exit_type.as_str() != Some("Crashed") {
+            return None;
+        }
+        *exit_type = serde_json::Value::String("Normal".to_string());
+        serde_json::to_vec(&preferences).ok()
+    })();
+    if let Some(bytes) = normalized {
+        let candidate = dst_profile.join(format!(".Preferences-{}.tmp", uuid::Uuid::new_v4()));
+        if std::fs::write(&candidate, bytes).is_ok() {
+            let _ = std::fs::rename(&candidate, &preferences_path);
+        }
+        let _ = std::fs::remove_file(&candidate);
     }
 
     Ok(temp_dir)
@@ -2489,6 +2523,8 @@ exec sleep 60
             // logic by creating a small helper process.
             let child = spawn_noop_child();
             let _process = ChromeProcess {
+                #[cfg(all(feature = "acceptance-faults", target_os = "linux"))]
+                popup_relay: None,
                 child,
                 ws_url: String::new(),
                 temp_user_data_dir: Some(dir.clone()),
@@ -2733,6 +2769,51 @@ exec sleep 60
             "fake-leveldb"
         );
         assert!(!temp.join("Default/Cache").exists());
+    }
+
+    #[test]
+    fn test_copy_chrome_profile_normalizes_crashed_exit_type() {
+        let compact = r#"{"a":1,"profile":{"exit_type":"Crashed","name":"x"}}"#;
+        let spaced = "{ \"profile\": { \"exit_type\" : \"Crashed\" } }";
+        for (name, prefs, normalized) in [
+            ("compact", Some(compact), true),
+            ("spaced", Some(spaced), true),
+            (
+                "normal",
+                Some(r#"{"profile":{"exit_type":"Normal"}}"#),
+                false,
+            ),
+            ("missing-field", Some(r#"{"profile":{}}"#), false),
+            (
+                "malformed",
+                Some(r#"{"profile":{"exit_type":"Crashed""#),
+                false,
+            ),
+            ("missing-file", None, false),
+        ] {
+            let src = TempDir::new(&format!("copy-exit-{name}"));
+            create_fake_local_state(&src, &[("Default", "Person 1")]);
+            create_fake_profile(&src, "Default");
+            if let Some(p) = prefs {
+                std::fs::write(src.join("Default/Preferences"), p).unwrap();
+            }
+            let temp = TempDir(copy_chrome_profile(&src, "Default").unwrap());
+            let copied = std::fs::read(temp.join("Default/Preferences")).ok();
+            match prefs {
+                None => assert!(copied.is_none(), "{name}"),
+                Some(p) if normalized => {
+                    let mut want: serde_json::Value = serde_json::from_str(p).unwrap();
+                    want["profile"]["exit_type"] = "Normal".into();
+                    let got: serde_json::Value = serde_json::from_slice(&copied.unwrap()).unwrap();
+                    assert_eq!(got, want, "{name}");
+                }
+                Some(p) => assert_eq!(copied.unwrap(), p.as_bytes(), "{name}"),
+            }
+            if let Some(p) = prefs {
+                let source = std::fs::read(src.join("Default/Preferences")).unwrap();
+                assert_eq!(source, p.as_bytes(), "{name}");
+            }
+        }
     }
 
     #[test]

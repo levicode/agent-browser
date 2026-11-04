@@ -7,7 +7,7 @@ use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::signal;
 use tokio::sync::{Notify, RwLock};
 
@@ -21,6 +21,9 @@ use super::stream::{IdleActivity, StreamServer};
 use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
 
 pub async fn run_daemon(session: &str) {
+    super::client_settlement_trace::initialize_cleanup();
+    #[cfg(feature = "acceptance-faults")]
+    super::client_settlement_trace::initialize();
     let socket_dir = get_daemon_socket_dir();
     if !socket_dir.exists() {
         let _ = fs::create_dir_all(&socket_dir);
@@ -250,6 +253,7 @@ async fn run_socket_server(
     // after a "close" command, instead of calling process::exit() which skips
     // destructors and can leave Chrome processes orphaned (issue #1113).
     let close_notify = Arc::new(Notify::new());
+    let client_gate = Arc::new(RwLock::new(()));
 
     let mut drain_interval = tokio::time::interval(Duration::from_millis(100));
     drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -267,8 +271,9 @@ async fn run_socket_server(
                         let idle_activity = idle_activity.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let gate = client_gate.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, idle_activity, sf, cn).await;
+                            handle_connection(stream, state, idle_activity, sf, cn, gate).await;
                         });
                     }
                     Err(e) => {
@@ -277,7 +282,7 @@ async fn run_socket_server(
                 }
             }
             _ = drain_interval.tick() => {
-                spawn_background_tick_if_idle(state.clone(), autosave_interval_ms);
+                spawn_legacy_background_tick(state.clone(), autosave_interval_ms, client_gate.clone());
             }
             _ = async {
                 match idle_sleep_pin {
@@ -292,6 +297,10 @@ async fn run_socket_server(
             s = async { idle_lock.as_mut().expect("idle lock armed").await }, if idle_lock.is_some() => {
                 idle_lock = None;
                 let mut s = s;
+                let Ok(_gate) = client_gate.try_read() else {
+                    idle_sleep_pin = idle_timeout_ms.map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                    continue;
+                };
                 // The timer may have expired while a command held the state
                 // lock. Command completion refreshes the shared activity
                 // clock before releasing that lock, so re-check it here.
@@ -395,6 +404,7 @@ async fn run_socket_server(
         )));
 
     let close_notify = Arc::new(Notify::new());
+    let client_gate = Arc::new(RwLock::new(()));
 
     let idle_sleep = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
     let mut idle_sleep_pin = idle_sleep.map(Box::pin);
@@ -415,8 +425,9 @@ async fn run_socket_server(
                         let idle_activity = idle_activity.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let gate = client_gate.clone();
                         tokio::spawn(async move {
-                            handle_connection(stream, state, idle_activity, sf, cn).await;
+                            handle_connection(stream, state, idle_activity, sf, cn, gate).await;
                         });
                     }
                     Err(e) => {
@@ -425,7 +436,7 @@ async fn run_socket_server(
                 }
             }
             _ = drain_interval.tick() => {
-                spawn_background_tick_if_idle(state.clone(), autosave_interval_ms);
+                spawn_legacy_background_tick(state.clone(), autosave_interval_ms, client_gate.clone());
             }
             _ = async {
                 match idle_sleep_pin {
@@ -440,6 +451,10 @@ async fn run_socket_server(
             s = async { idle_lock.as_mut().expect("idle lock armed").await }, if idle_lock.is_some() => {
                 idle_lock = None;
                 let mut s = s;
+                let Ok(_gate) = client_gate.try_read() else {
+                    idle_sleep_pin = idle_timeout_ms.map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
+                    continue;
+                };
                 if let Some(remaining) =
                     remaining_idle_timeout(&idle_activity, idle_timeout_ms.unwrap_or_default())
                 {
@@ -506,10 +521,36 @@ fn spawn_background_tick_if_idle(
     state: Arc<tokio::sync::Mutex<DaemonState>>,
     autosave_interval_ms: u64,
 ) -> bool {
+    spawn_background_tick_guarded(state, autosave_interval_ms, None)
+}
+
+/// Native-only sessions own their event pumps and resources in ClientBrowser;
+/// their empty legacy manager must not reserve admission even for a no-op tick.
+/// Legacy maintenance keeps its original non-blocking admission guard.
+fn spawn_legacy_background_tick(
+    state: Arc<tokio::sync::Mutex<DaemonState>>,
+    autosave_interval_ms: u64,
+    client_gate: Arc<RwLock<()>>,
+) -> bool {
+    if env::var_os("AGENT_BROWSER_CLIENT_ONLY").is_some() {
+        return false;
+    }
+    let Ok(guard) = client_gate.try_read_owned() else {
+        return false;
+    };
+    spawn_background_tick_guarded(state, autosave_interval_ms, Some(guard))
+}
+
+fn spawn_background_tick_guarded(
+    state: Arc<tokio::sync::Mutex<DaemonState>>,
+    autosave_interval_ms: u64,
+    admission: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
+) -> bool {
     let Ok(mut state) = state.try_lock_owned() else {
         return false;
     };
     tokio::spawn(async move {
+        let _admission = admission;
         let process_exited = state
             .browser
             .as_mut()
@@ -538,12 +579,111 @@ async fn handle_connection<S>(
     idle_activity: Arc<IdleActivity>,
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
+    client_gate: Arc<RwLock<()>>,
 ) where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
+
+    // The fixed non-JSON preface isolates bounded session framing from the
+    // legacy JSON path, whose existing payload size behavior remains unchanged.
+    let session_start = tokio::time::timeout(Duration::from_secs(5), async {
+        let available = buf_reader.fill_buf().await?;
+        if available.first() != Some(&b'A') {
+            return Ok::<bool, std::io::Error>(false);
+        }
+        let mut preface = vec![0; super::client_protocol::SOCKET_PREFACE.len()];
+        buf_reader.read_exact(&mut preface).await?;
+        if preface != super::client_protocol::SOCKET_PREFACE {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid session preface",
+            ));
+        }
+        Ok(true)
+    })
+    .await;
+    match session_start {
+        Ok(Ok(true)) => {
+            let hello = tokio::time::timeout(
+                Duration::from_secs(5),
+                super::client_transport::read_frame(&mut buf_reader),
+            )
+            .await;
+            let Ok(Ok(Some(bytes))) = hello else {
+                return;
+            };
+            let Ok(message @ super::client_protocol::ClientMessage::Hello { .. }) =
+                super::client_protocol::parse_frame(&bytes)
+            else {
+                return;
+            };
+            let hello_id = match &message {
+                super::client_protocol::ClientMessage::Hello { id, .. } => Some(id.clone()),
+                _ => None,
+            };
+            let Ok(_ownership) = client_gate.try_write_owned() else {
+                super::client_transport::refuse(
+                    &mut writer,
+                    hello_id,
+                    super::client_protocol::ProtocolError::ScopeUnavailable,
+                )
+                .await;
+                return;
+            };
+            // Negotiated sessions own their explicit executor and must never
+            // adopt an existing legacy browser.
+            let Ok(existing) = state.try_lock() else {
+                super::client_transport::refuse(
+                    &mut writer,
+                    hello_id,
+                    super::client_protocol::ProtocolError::ScopeUnavailable,
+                )
+                .await;
+                return;
+            };
+            if existing.browser.is_some()
+                || existing.appium.is_some()
+                || existing.webdriver_backend.is_some()
+                || existing.safari_driver.is_some()
+            {
+                drop(existing);
+                super::client_transport::refuse(
+                    &mut writer,
+                    hello_id,
+                    super::client_protocol::ProtocolError::ScopeUnavailable,
+                )
+                .await;
+                return;
+            }
+            drop(existing);
+            idle_activity.mark();
+            #[cfg(feature = "acceptance-faults")]
+            let teardown_proven =
+                super::client_transport::serve(buf_reader, writer, message, bytes.len() + 1).await;
+            #[cfg(not(feature = "acceptance-faults"))]
+            let teardown_proven = super::client_transport::serve(buf_reader, writer, message).await;
+            if !teardown_proven {
+                // Do not release the ownership guard while native cleanup is
+                // uncertain. Stop the daemon; its process exit owns containment.
+                close_notify.notify_one();
+                std::future::pending::<()>().await;
+            }
+            idle_activity.mark();
+            if env::var_os("AGENT_BROWSER_CLIENT_ONLY").is_some() {
+                close_notify.notify_one();
+            }
+            return;
+        }
+        Ok(Ok(false)) => {
+            if env::var_os("AGENT_BROWSER_CLIENT_ONLY").is_some() {
+                return;
+            }
+        }
+        _ => return,
+    }
 
     loop {
         line.clear();
@@ -581,6 +721,11 @@ async fn handle_connection<S>(
                     .unwrap_or_default()
                     .to_string();
 
+                let Ok(_admission) = client_gate.try_read() else {
+                    let response = b"{\"success\":false,\"error\":\"Daemon is owned by a negotiated client session\",\"code\":\"scope_owned\"}\n";
+                    let _ = writer.write_all(response).await;
+                    continue;
+                };
                 let response = {
                     let mut s = state.lock().await;
                     let response = execute_command(&cmd, &mut s).await;
@@ -595,6 +740,11 @@ async fn handle_connection<S>(
                 resp.push('\n');
                 if writer.write_all(resp.as_bytes()).await.is_err() {
                     break;
+                }
+                if response.get("code").and_then(Value::as_str) == Some("page_wedged") {
+                    if let Some(id) = response.get("id").and_then(Value::as_str) {
+                        state.lock().await.wedge_report_delivered(id);
+                    }
                 }
 
                 if close_completed_response(&action, &response) {
@@ -708,6 +858,201 @@ fn get_port_for_session(session: &str) -> u16 {
 mod tests {
     #[allow(unused_imports)]
     use super::*;
+
+    /// A scheduled legacy tick has not run yet when a buffered native hello
+    /// arrives. The native-only daemon has no legacy browser to maintain and
+    /// must admit the hello without weakening exclusive session ownership.
+    #[tokio::test]
+    async fn client_only_hello_survives_scheduled_legacy_background_tick() {
+        let environment = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_CLIENT_ONLY"]);
+        environment.set("AGENT_BROWSER_CLIENT_ONLY", "1");
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let activity = Arc::new(IdleActivity::new());
+        let gate = Arc::new(RwLock::new(()));
+        let (client, server) = tokio::io::duplex(8192);
+        let mut client = BufReader::new(client);
+        client
+            .get_mut()
+            .write_all(super::super::client_protocol::SOCKET_PREFACE)
+            .await
+            .unwrap();
+        client.get_mut().write_all(b"{\"type\":\"hello\",\"id\":\"h\",\"protocol\":\"agent-browser-session/1\",\"requiredCapabilities\":[]}\n{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n").await.unwrap();
+
+        // Scheduling captures the real production locks synchronously. Poll
+        // the buffered connection once before the current-thread runtime can
+        // run the spawned tick: this forces the admission race without sleeps.
+        spawn_legacy_background_tick(state.clone(), 30_000, gate.clone());
+        let mut connection = Box::pin(handle_connection(
+            server,
+            state.clone(),
+            activity,
+            None,
+            Arc::new(Notify::new()),
+            gate.clone(),
+        ));
+        let first_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(std::future::Future::poll(connection.as_mut(), context))
+        })
+        .await;
+        let task = first_poll.is_pending().then(|| tokio::spawn(connection));
+
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::client_transport::read_frame(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let ready: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(
+            ready["type"], "ready",
+            "cold native hello was refused: {ready}"
+        );
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::client_transport::read_frame(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let closed: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(closed["type"], "closed");
+        task.expect("native transport serves the accepted session")
+            .await
+            .unwrap();
+        assert!(state.lock().await.browser.is_none());
+        assert!(gate.try_read().is_ok());
+    }
+
+    #[tokio::test]
+    async fn client_session_negotiation_preserves_legacy_and_excludes_mutation() {
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let activity = Arc::new(IdleActivity::new());
+        let gate = Arc::new(RwLock::new(()));
+        let (client, server) = tokio::io::duplex(8192);
+        let task = tokio::spawn(handle_connection(
+            server,
+            state.clone(),
+            activity.clone(),
+            None,
+            Arc::new(Notify::new()),
+            gate.clone(),
+        ));
+        let mut client = BufReader::new(client);
+        client
+            .get_mut()
+            .write_all(super::super::client_protocol::SOCKET_PREFACE)
+            .await
+            .unwrap();
+        client.get_mut().write_all(b"{\"type\":\"hello\",\"id\":\"h\",\"protocol\":\"agent-browser-session/1\",\"requiredCapabilities\":[]}\n").await.unwrap();
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::client_transport::read_frame(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        let ready: Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(ready["type"], "ready");
+        let expected = vec![
+            "operation.continue-exact-owner/1",
+            "scope.reconnect-quarantined/1",
+            "terminal.recording-artifacts/1",
+            "browser.interop-context-replacement/1",
+            "browser.scope/1",
+            "browser.lifecycle/1",
+            "browser.persistent-page-reopen/1",
+            "browser.isolated-page-reopen/1",
+            "browser.evaluate/1",
+            "browser.page/1",
+            "browser.page-identity-fence/1",
+            "browser.observe/1",
+            "browser.observe-continuation/1",
+            "browser.observe-frame-policy/1",
+            "browser.issuance-bound-references/1",
+            "browser.trace-semantic/1",
+            "browser.query/1",
+            "browser.query-union/1",
+            "browser.fixture-read-fields/1",
+            "browser.actions/1",
+            "browser.network/1",
+            "browser.dialog/1",
+            "browser.download/1",
+            "browser.capture/1",
+            "browser.state/1",
+            "browser.recording/1",
+            "browser.blobs/1",
+        ];
+        #[cfg(feature = "acceptance-faults")]
+        let expected = expected
+            .into_iter()
+            .chain(std::iter::once("acceptance.faults/1"))
+            .collect::<Vec<_>>();
+        // Transport appends terminal closure after the executor capabilities,
+        // including after the feature-gated acceptance capability.
+        let expected = expected
+            .into_iter()
+            .chain(std::iter::once("terminal.close/1"))
+            .collect::<Vec<_>>();
+        assert_eq!(ready["capabilities"], serde_json::json!(expected));
+        let capabilities = ready["capabilities"].as_array().unwrap();
+        let unique = capabilities
+            .iter()
+            .map(|capability| capability.as_str().unwrap())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), capabilities.len());
+        assert!(gate.try_read().is_err());
+
+        let (legacy, server) = tokio::io::duplex(8192);
+        let legacy_task = tokio::spawn(handle_connection(
+            server,
+            state,
+            activity,
+            None,
+            Arc::new(Notify::new()),
+            gate.clone(),
+        ));
+        let mut legacy = BufReader::new(legacy);
+        legacy
+            .get_mut()
+            .write_all(b"{\"id\":\"l\",\"action\":\"click\",\"selector\":\"body\"}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        tokio::time::timeout(Duration::from_secs(2), legacy.read_line(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["code"],
+            "scope_owned"
+        );
+        drop(legacy);
+        legacy_task.await.unwrap();
+
+        client
+            .get_mut()
+            .write_all(b"{\"type\":\"close\",\"id\":\"z\",\"generation\":1}\n")
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(
+            Duration::from_secs(2),
+            super::super::client_transport::read_frame(&mut client),
+        )
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frame).unwrap()["scopeState"],
+            "closed"
+        );
+        task.await.unwrap();
+        assert!(gate.try_read().is_ok());
+    }
 
     #[test]
     fn test_resolve_idle_timeout_unset_applies_default() {
@@ -846,6 +1191,35 @@ mod tests {
             &direct
         ));
         assert!(close_completed_response("confirm", &confirmed));
+    }
+
+    #[tokio::test]
+    async fn legacy_background_tick_keeps_its_original_admission_guard() {
+        let environment = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_CLIENT_ONLY"]);
+        environment.remove("AGENT_BROWSER_CLIENT_ONLY");
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let gate = Arc::new(RwLock::new(()));
+
+        let exclusive = gate.clone().write_owned().await;
+        assert!(!spawn_legacy_background_tick(
+            state.clone(),
+            30_000,
+            gate.clone()
+        ));
+        assert_eq!(Arc::strong_count(&state), 1);
+        drop(exclusive);
+
+        assert!(spawn_legacy_background_tick(
+            state.clone(),
+            30_000,
+            gate.clone()
+        ));
+        assert!(state.try_lock().is_err());
+        assert!(gate.try_write().is_err());
+        let _ = tokio::time::timeout(Duration::from_secs(1), gate.write())
+            .await
+            .expect("legacy maintenance should release its admission guard");
+        assert!(state.try_lock().is_ok());
     }
 
     #[tokio::test]

@@ -152,6 +152,8 @@ agent-browser download <sel> <path>   # Click element to trigger download
 agent-browser wait --download [path]  # Wait for any download to complete
 ```
 
+`wait --download` returns the oldest download not yet claimed by an earlier wait, including one that finished before the command ran, so it can follow the command that triggered it. With `[path]`, the file is moved there; without it, the output is where the browser saved it. The move only applies to a browser agent-browser launched: over `--cdp`, `--auto-connect`, or a provider, the saved path comes from the remote endpoint, so `[path]` is rejected.
+
 Use `--download-path <dir>` (or `AGENT_BROWSER_DOWNLOAD_PATH` env) to set a default download directory. Without it, downloads go to a temporary directory that is deleted when the browser closes.
 
 See [Files & Clipboard](/files) for upload, download, local file, screenshot, PDF, and clipboard workflows.
@@ -736,7 +738,7 @@ Common tools include:
 - `agent_browser_eval`
 - `agent_browser_close`
 
-Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, `allowedDomains`, and `idleTimeout`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. The common `idleTimeout` string maps to `--idle-timeout`, accepts values such as `30s`, `5m`, `1h`, or raw milliseconds, and accepts `0` to disable idle shutdown. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
+Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, `allowedDomains`, and `idleTimeout`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. The common `idleTimeout` string maps to `--idle-timeout`, accepts values such as `30s`, `5m`, `1h`, or raw milliseconds, and accepts `0` to disable idle shutdown. Each tool also accepts `extraArgs` for per-command options and display or emulation flags such as `--engine`, but global flags that change network, file, policy, or host access (such as `--allowed-domains`, `--action-policy`, `--executable-path`, `--args`, and `--config`) are rejected and must be set in the MCP server's environment or config. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
 
 Tool invocations use the same config files and environment variables as the CLI. Use `session` in the tool arguments, or set `AGENT_BROWSER_SESSION`, to isolate browser state.
 

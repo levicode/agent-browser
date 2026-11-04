@@ -1,0 +1,5698 @@
+//! Closed-schema diagnostics. No payload or arbitrary strings.
+//! Acceptance phases remain opt-in behind their feature. Production cleanup
+//! capture has its own explicit environment opt-in and no protocol authority.
+//! The existing runner-owned append file is shared by the real proxy and daemon.
+//! Lock contention drops observations, never waits. Missing records are unknown.
+use std::cell::Cell;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+use serde::Serialize;
+
+use super::client_protocol::{ClientMessage, Effects, ProtocolError, ScopeState};
+// Acceptance-only diagnostics: closed phases and native operation sequence only.
+// Never serialize requests, IDs, browser values, or error descriptions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) enum SettlementPhase {
+    CleanupStarted,
+    CleanupFirstFailure,
+    CleanupResult,
+    RestartPostCreateRefused,
+    ScopeReplacementRefused,
+    InventorySnapshot,
+    TargetAttribution,
+    TargetLifecycle,
+    TargetInventory,
+    TargetInventorySummary,
+    TargetObservationLost,
+    ScreenshotFirstFailure,
+    ObserveInitialAcquisition,
+    FrameInventoryAttribution,
+    ProtectedCaptureFailure,
+    ObservationPixelResult,
+    FrameInventoryRejection,
+    ReadonlyPrepareFailure,
+    QueryScopeRefusal,
+    QueryReadFailure,
+    QueryCommandTiming,
+    QueryCommandSummary,
+    EvalAdmission,
+    UploadPreflightRefusal,
+    TerminalCleanupCheckpoint,
+    ServiceWorkerAdmission,
+    ExecuteStarted,
+    ExecuteReturned,
+    CancelObserved,
+    DeadlineObserved,
+    GraceReturned,
+    GraceExpired,
+    CompletionJoined,
+    ResultQueued,
+    ResultFlushed,
+    ControlFlushed,
+    CancelReceived,
+    CancelAccepted,
+    CancelRejected,
+    CancelQueued,
+    ReaderEnded,
+    ReaderRefused,
+    WriterFailed,
+    PublicationExpired,
+    HealthFailed,
+    CompletionLost,
+    ResultQueueFailed,
+    UnknownOutcome,
+    CloseReceived,
+    ControlQueueFailed,
+    ShutdownStarted,
+    ShutdownProven,
+    ShutdownUnproven,
+    PendingResultQueued,
+    CaptureLimitReached,
+    CaptureStarted,
+    ProxyDaemonSpawned,
+    PrefaceReturned,
+    CopyStarted,
+    CopyReturned,
+    SocketWriteEntered,
+    SocketWriteReturned,
+    SocketReadEntered,
+    SocketReadReturned,
+    InputHalfCloseEntered,
+    InputHalfCloseReturned,
+    OutputFlushEntered,
+    OutputFlushReturned,
+    ProxySummary,
+    FrameComplete,
+    FrameCleanEof,
+    FramePartialEof,
+    FrameIoError,
+    FrameOversize,
+    FrameParseRefused,
+    FrameDecoded,
+    FrameAdmissionRefused,
+    FrameSummary,
+    DetailLimit,
+}
+
+pub(crate) use SettlementPhase as Phase;
+
+const PATH_ENV: &str = "AGENT_BROWSER_ACCEPTANCE_PHASE_FILE";
+const CLEANUP_PATH_ENV: &str = "AGENT_BROWSER_CLEANUP_DIAGNOSTIC_FILE";
+const QUERY_PATH_ENV: &str = "AGENT_BROWSER_QUERY_DIAGNOSTIC_FILE";
+const QUERY_MAX_RECORDS: usize = 128;
+const QUERY_MAX_BYTES: usize = 64 * 1024;
+const MAX_RECORDS: usize = 2048;
+const MAX_BYTES: usize = 256 * 1024;
+const MAX_RECORD_BYTES: usize = 512;
+const SAFE_INTEGER: u64 = (1 << 53) - 1;
+const SOCKET_DETAIL_CALLS: u64 = 64;
+const FRAME_DETAIL_RECORDS: u64 = 128;
+const LIMIT_PHASE: &[u8] = b"\"phase\":\"CaptureLimitReached\"";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum Source {
+    Native,
+    Proxy,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum Leg {
+    ToNative,
+    FromNative,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum IoClass {
+    Ok,
+    Eof,
+    Interrupted,
+    WouldBlock,
+    BrokenPipe,
+    ConnectionReset,
+    ConnectionAborted,
+    NotConnected,
+    TimedOut,
+    UnexpectedEof,
+    WriteZero,
+    Other,
+}
+
+impl IoClass {
+    pub(crate) fn error(error: &io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::Interrupted => Self::Interrupted,
+            io::ErrorKind::WouldBlock => Self::WouldBlock,
+            io::ErrorKind::BrokenPipe => Self::BrokenPipe,
+            io::ErrorKind::ConnectionReset => Self::ConnectionReset,
+            io::ErrorKind::ConnectionAborted => Self::ConnectionAborted,
+            io::ErrorKind::NotConnected => Self::NotConnected,
+            io::ErrorKind::TimedOut => Self::TimedOut,
+            io::ErrorKind::UnexpectedEof => Self::UnexpectedEof,
+            io::ErrorKind::WriteZero => Self::WriteZero,
+            _ => Self::Other,
+        }
+    }
+    pub(crate) fn result<T>(result: &io::Result<T>) -> Self {
+        result
+            .as_ref()
+            .map(|_| Self::Ok)
+            .unwrap_or_else(Self::error)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum MessageKind {
+    Hello,
+    Request,
+    Cancel,
+    Decision,
+    Close,
+}
+
+#[derive(Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Facts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub eval: Option<EvalAdmissionFacts>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_scope_stage: Option<QueryScopeStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_read_stage: Option<QueryReadStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_read_error: Option<ObservationReadError>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readMs")]
+    pub query_read_ms: Option<[u16; 13]>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cmd")]
+    pub query_command: Option<[u16; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cmdMs")]
+    pub query_command_ms: Option<[u16; 5]>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cmdSummary")]
+    pub query_command_summary: Option<[u16; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query_scope_reason: Option<QueryScopeReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub upload_refusal: Option<UploadRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_cleanup_stage: Option<TerminalCleanupStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_cleanup_ok: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_proof_refusal: Option<TerminalProofRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_enrollment_refusal: Option<TerminalEnrollmentRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub terminal_proof_counts: Option<[u64; 2]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub restart_post_create_stage: Option<RestartPostCreateStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_replacement_stage: Option<ScopeReplacementStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_kind: Option<DiagnosticTargetKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_origin: Option<DiagnosticTargetOrigin>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_stage: Option<DiagnosticTargetStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_purpose: Option<DiagnosticTargetPurpose>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_classification: Option<DiagnosticTargetClassification>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_configured: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_resumed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_sampled: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target_observed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_ordinal: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_step: Option<WorkerAdmissionStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission_state: Option<WorkerAdmissionState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub waiting_for_debugger: Option<WorkerDebuggerWait>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_point: Option<InventoryPoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_observed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_sealed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_integrity_lost: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_first_loss: Option<InventoryFirstLoss>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_reservations: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_unconfigured: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub screenshot_stage: Option<ScreenshotStage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub initial_sample: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_check: Option<ObserveInitialPrefixCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_refusal: Option<ObserveInitialPrefixRefusal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_debt: Option<[u16; 3]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix_debt_capped: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected_attachment_ordinal: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub read_error: Option<ReadError>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "readDirty")]
+    pub read_cleanup_lost: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "pass")]
+    pub frame_pass: Option<FrameInventoryPass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sealed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub revision_mismatch: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reservations: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delta: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events: Option<[u16; 7]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exact: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_event: Option<InventoryRevisionEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_target: Option<InventoryRevisionTarget>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_phase: Option<ScreenshotCapturePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_capture_phase: Option<super::client_capture::CapturePhase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub protected_capture_reason: Option<super::client_capture::CaptureReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_budget_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pixels_available: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub early_semantic: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory_after_failure: Option<InventoryAfterFailure>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ack: Option<ReadonlyAck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fail_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<ReadonlyWindow>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub zero_input: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup: Option<ReadonlyCleanup>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_owner: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_attempt: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_lifecycle: Option<CleanupLifecycle>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_component: Option<CleanupComponent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_result: Option<CleanupResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effects: Option<Effects>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scope_state: Option<ScopeState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<ProtocolError>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon_pid: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub leg: Option<Leg>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub io: Option<IoClass>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub length: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calls: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outstanding: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_kind: Option<MessageKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frame_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consumed_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed_known: Option<bool>,
+}
+
+impl Facts {
+    fn clamp(&mut self, overflow: &mut bool) {
+        if let Some(eval) = &mut self.eval {
+            for value in [&mut eval.revision, &mut eval.epoch].into_iter().flatten() {
+                *value = bounded(*value, overflow);
+            }
+        }
+        for value in [
+            &mut self.generation,
+            &mut self.capture_budget_ms,
+            &mut self.attachment_ordinal,
+            &mut self.last_attachment_ordinal,
+            &mut self.selected_attachment_ordinal,
+            &mut self.inventory_ordinal,
+            &mut self.target_ordinal,
+            &mut self.parent_attachment_ordinal,
+            &mut self.root_attachment_ordinal,
+            &mut self.cleanup_owner,
+            &mut self.cleanup_attempt,
+            &mut self.length,
+            &mut self.total,
+            &mut self.calls,
+            &mut self.pending_bytes,
+            &mut self.frame_bytes,
+            &mut self.consumed_bytes,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            *value = bounded(*value, overflow);
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Record {
+    schema_version: u8,
+    source: Source,
+    pid: u32,
+    record: u64,
+    operation_seq: u64,
+    phase: Phase,
+    dropped_before: u64,
+    emitted_before: u64,
+    suppressed_before: u64,
+    overflow: bool,
+    #[serde(flatten)]
+    facts: Facts,
+}
+
+#[derive(Default)]
+struct Counters {
+    attempted: AtomicU64,
+    emitted: AtomicU64,
+    dropped: AtomicU64,
+    suppressed: AtomicU64,
+    overflow: AtomicBool,
+}
+
+fn bounded(value: u64, overflow: &mut bool) -> u64 {
+    *overflow |= value > SAFE_INTEGER;
+    value.min(SAFE_INTEGER)
+}
+
+// Keep the established atomic API for older supported compilers. Recent Rust
+// renamed fetch_update to try_update; switching would raise the compiler floor.
+#[allow(deprecated)]
+fn increment(value: &AtomicU64, amount: u64, overflow: &AtomicBool) -> u64 {
+    value
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            let sum = old.saturating_add(amount);
+            if sum > SAFE_INTEGER {
+                overflow.store(true, Ordering::Relaxed);
+            }
+            Some(sum.min(SAFE_INTEGER))
+        })
+        .unwrap_or_else(|old| old)
+}
+
+#[derive(Default)]
+struct RetainedRecord {
+    record: OnceLock<Record>,
+    lost: AtomicBool,
+}
+// Compile-time conservative RAM ceiling; not a measured runtime allocation.
+// Slot count follows the unchanged output record caps. Capture/allocator
+// metadata is additional; ordinary and query captures remain separate.
+const _: () = {
+    assert!(std::mem::size_of::<Record>() <= std::mem::size_of::<RetainedRecord>());
+    assert!(std::mem::size_of::<RetainedRecord>() <= 2048);
+    assert!(MAX_RECORDS * std::mem::size_of::<RetainedRecord>() <= 4 * 1024 * 1024);
+    assert!(QUERY_MAX_RECORDS * std::mem::size_of::<RetainedRecord>() <= 256 * 1024);
+};
+#[cfg(test)]
+type DrainHook = Arc<dyn Fn(DrainPoint) + Send + Sync>;
+
+struct Capture {
+    source: Source,
+    sink: Mutex<AppendSink>,
+    counters: Counters,
+    // Unique attempted ordinals own unique cells; never reused or renumbered.
+    retained: Box<[RetainedRecord]>,
+    next: AtomicUsize,
+    work: AtomicUsize,
+    failed: AtomicBool,
+    #[cfg(test)]
+    hook: Mutex<Option<DrainHook>>,
+}
+impl Capture {
+    fn new(source: Source, sink: AppendSink) -> Self {
+        let retained = (0..sink.max_records)
+            .map(|_| RetainedRecord::default())
+            .collect();
+        Self {
+            source,
+            sink: Mutex::new(sink),
+            counters: Counters::default(),
+            retained,
+            next: AtomicUsize::new(0),
+            work: AtomicUsize::new(0),
+            failed: AtomicBool::new(false),
+            #[cfg(test)]
+            hook: Mutex::new(None),
+        }
+    }
+    #[cfg(test)]
+    fn observe(&self, point: DrainPoint) {
+        let hook = self.hook.lock().unwrap().clone();
+        if let Some(hook) = hook {
+            hook(point);
+        }
+    }
+}
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DrainPoint {
+    Reserved,
+    Published,
+    Locked,
+    EmptyPrefix,
+    BeforeRelease,
+    Released,
+}
+
+static SINK: OnceLock<Option<Capture>> = OnceLock::new();
+
+pub(super) fn initialize() {
+    initialize_source(Source::Native);
+}
+pub(crate) fn initialize_proxy() {
+    initialize_source(Source::Proxy);
+}
+
+fn initialize_source(source: Source) {
+    // Only initialization opens the file. An absent start marker means capture
+    // unavailable, never that the process performed no operations.
+    let mut created = false;
+    let capture = SINK.get_or_init(|| {
+        created = true;
+        let path = PathBuf::from(std::env::var_os(PATH_ENV)?);
+        Some(Capture::new(
+            source,
+            AppendSink::open(&path, MAX_RECORDS, MAX_BYTES).ok()?,
+        ))
+    });
+    if created && capture.is_some() {
+        record_source(source, 0, Phase::CaptureStarted, Facts::default());
+    }
+}
+
+fn capture(source: Source) -> Option<&'static Capture> {
+    SINK.get()?
+        .as_ref()
+        .filter(|capture| capture.source == source)
+}
+
+pub(super) fn record(operation_seq: u64, phase: Phase, facts: Facts) {
+    record_source(Source::Native, operation_seq, phase, facts);
+}
+
+pub(crate) fn proxy_record(phase: Phase, facts: Facts) {
+    record_source(Source::Proxy, 0, phase, facts);
+}
+
+fn record_source(source: Source, operation_seq: u64, phase: Phase, facts: Facts) {
+    let Some(capture) = capture(source) else {
+        return;
+    };
+    record_capture(capture, operation_seq, phase, facts);
+}
+
+fn record_capture(capture: &Capture, operation_seq: u64, phase: Phase, mut facts: Facts) {
+    let source = capture.source;
+    let counters = &capture.counters;
+    let mut overflow = counters.overflow.load(Ordering::Relaxed);
+    let operation_seq = bounded(operation_seq, &mut overflow);
+    facts.clamp(&mut overflow);
+    if overflow {
+        counters.overflow.store(true, Ordering::Relaxed);
+    }
+    let record = Record {
+        schema_version: 2,
+        source,
+        pid: std::process::id(),
+        record: 0,
+        operation_seq,
+        phase,
+        dropped_before: 0,
+        emitted_before: 0,
+        suppressed_before: 0,
+        overflow,
+        facts,
+    };
+    publish_record(capture, record);
+}
+
+fn publish_record(capture: &Capture, mut record: Record) {
+    // No allocation, serialization, I/O, await, or user callback follows this
+    // reservation before publication (test-only pause hooks are excluded).
+    let ordinal = increment(&capture.counters.attempted, 1, &capture.counters.overflow);
+    let Some(slot) = usize::try_from(ordinal)
+        .ok()
+        .and_then(|n| capture.retained.get(n))
+    else {
+        increment(&capture.counters.dropped, 1, &capture.counters.overflow);
+        return;
+    };
+    if capture.failed.load(Ordering::Acquire) {
+        lose_retained(capture, ordinal as usize);
+        return;
+    }
+    record.record = ordinal;
+    if ordinal as usize == capture.retained.len() - 1 {
+        // Reserve the final cell for explicit exhaustion, even if earlier
+        // actual I/O loss left fewer physical rows in the append file.
+        record.phase = Phase::CaptureLimitReached;
+        record.operation_seq = 0;
+        record.facts = Facts::default();
+        // emit_locked counts the replaced observation once when this marker
+        // is acknowledged (or once as an I/O loss if it cannot be written).
+    }
+    #[cfg(test)]
+    capture.observe(DrainPoint::Reserved);
+    if slot.record.set(record).is_err() {
+        // Unreachable for a unique unsaturated ordinal; never hide a violation.
+        increment(&capture.counters.dropped, 1, &capture.counters.overflow);
+    }
+    #[cfg(test)]
+    capture.observe(DrainPoint::Published);
+    signal_drain(capture, ordinal as usize);
+}
+
+fn lose_retained(capture: &Capture, ordinal: usize) {
+    // Only undrained cells can be lost by a terminal internal failure. The
+    // per-cell bit reconciles reservations/publishers racing the failure scan.
+    if ordinal >= capture.next.load(Ordering::Acquire) {
+        if let Some(slot) = capture.retained.get(ordinal) {
+            if !slot.lost.swap(true, Ordering::AcqRel) {
+                increment(&capture.counters.dropped, 1, &capture.counters.overflow);
+            }
+        }
+    }
+}
+fn signal_drain(capture: &Capture, ordinal: usize) {
+    if capture.failed.load(Ordering::Acquire) {
+        lose_retained(capture, ordinal);
+        capture.work.swap(0, Ordering::AcqRel);
+        return;
+    }
+    if capture.work.fetch_add(1, Ordering::AcqRel) != 0 {
+        if capture.failed.load(Ordering::Acquire) {
+            lose_retained(capture, ordinal);
+            capture.work.swap(0, Ordering::AcqRel);
+        }
+        return;
+    }
+    let mut consumed = 1;
+    loop {
+        if capture.failed.load(Ordering::Acquire) {
+            lose_retained(capture, ordinal);
+            capture.work.swap(0, Ordering::AcqRel);
+            return;
+        }
+        {
+            // Only the work owner touches the sink. Release the mutex BEFORE
+            // relinquishing work ownership so a new owner cannot collide.
+            let Ok(mut sink) = capture.sink.try_lock() else {
+                // A poisoned/invariant-broken sink cannot certify completion.
+                capture.failed.store(true, Ordering::Release);
+                // Acquire completed publishers' notification release sequence
+                // before sampling their attempted frontier. Later publishers
+                // observe failed and reconcile their own cell's loss bit.
+                capture.work.swap(0, Ordering::AcqRel);
+                let admitted = capture
+                    .counters
+                    .attempted
+                    .load(Ordering::Acquire)
+                    .min(capture.retained.len() as u64) as usize;
+                for pending in capture.next.load(Ordering::Acquire)..admitted {
+                    lose_retained(capture, pending);
+                }
+                lose_retained(capture, ordinal);
+                capture.counters.overflow.store(true, Ordering::Release);
+                capture.work.swap(0, Ordering::AcqRel);
+                return;
+            };
+            #[cfg(test)]
+            capture.observe(DrainPoint::Locked);
+            let mut next = capture.next.load(Ordering::Relaxed);
+            while let Some(slot) = capture.retained.get(next) {
+                let Some(record) = slot.record.get() else {
+                    #[cfg(test)]
+                    capture.observe(DrainPoint::EmptyPrefix);
+                    break;
+                };
+                emit_locked(&mut sink, record.clone(), &capture.counters);
+                next += 1;
+                capture.next.store(next, Ordering::Relaxed);
+            }
+        }
+        #[cfg(test)]
+        capture.observe(DrainPoint::BeforeRelease);
+        let previous = capture.work.fetch_sub(consumed, Ordering::AcqRel);
+        if previous == consumed {
+            #[cfg(test)]
+            capture.observe(DrainPoint::Released);
+            return;
+        }
+        consumed = previous - consumed;
+    }
+}
+
+// This cell is diagnostic data only: it owns no client, task, native identity,
+// resource or authority. Hooks are atomics-only; cleanup never performs file I/O.
+// An attempt is activated only by a native lifecycle owner and is never used to
+// admit, retry, retire or classify the product result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum CleanupLifecycle {
+    ScopeEnd,
+    Restart,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+#[repr(u8)]
+pub(crate) enum CleanupComponent {
+    Callback = 1,
+    Dialog,
+    Interception,
+    Script,
+    Detach,
+    Recording,
+    Upload,
+    Containment,
+    Release,
+    Input,
+    Download,
+    Blob,
+    EnrollmentFallback,
+    RetainedTaskFallback,
+    OwnerFallback,
+}
+impl CleanupComponent {
+    fn from_code(value: u8) -> Option<Self> {
+        use CleanupComponent::*;
+        [
+            Callback,
+            Dialog,
+            Interception,
+            Script,
+            Detach,
+            Recording,
+            Upload,
+            Containment,
+            Release,
+            Input,
+            Download,
+            Blob,
+            EnrollmentFallback,
+            RetainedTaskFallback,
+            OwnerFallback,
+        ]
+        .into_iter()
+        .find(|component| *component as u8 == value)
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum CleanupResult {
+    Passed,
+    Failed,
+}
+
+static CLEANUP_SINK: OnceLock<Option<Capture>> = OnceLock::new();
+// Separate opt-in budget/file; ordinary lifecycle volume cannot consume it.
+// This remains best-effort: contention and I/O loss are explicit, not success.
+static QUERY_SINK: OnceLock<Option<Capture>> = OnceLock::new();
+static CLEANUP_OWNERS: AtomicU64 = AtomicU64::new(0);
+const MAX_CLEANUP_ATTEMPT: u64 = SAFE_INTEGER >> 8;
+
+pub(super) fn initialize_cleanup() {
+    let mut query_created = false;
+    let query_capture = QUERY_SINK.get_or_init(|| {
+        query_created = true;
+        query_capture(
+            std::env::var_os(QUERY_PATH_ENV)
+                .map(PathBuf::from)
+                .as_deref(),
+        )
+    });
+    if query_created {
+        if let Some(capture) = query_capture {
+            record_capture(capture, 0, Phase::CaptureStarted, Facts::default());
+        }
+    }
+    let mut created = false;
+    let capture = CLEANUP_SINK.get_or_init(|| {
+        created = true;
+        cleanup_capture(
+            std::env::var_os(CLEANUP_PATH_ENV)
+                .map(PathBuf::from)
+                .as_deref(),
+        )
+    });
+    if created {
+        if let Some(capture) = capture {
+            record_capture(capture, 0, Phase::CaptureStarted, Facts::default());
+        }
+    }
+}
+fn query_capture(path: Option<&Path>) -> Option<Capture> {
+    Some(Capture::new(
+        Source::Native,
+        AppendSink::open(path?, QUERY_MAX_RECORDS, QUERY_MAX_BYTES).ok()?,
+    ))
+}
+fn critical_query_refusal(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    stage: QueryScopeStage,
+    reason: QueryScopeReason,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::QueryScopeRefusal,
+        Facts {
+            generation: Some(generation),
+            query_scope_stage: Some(stage),
+            query_scope_reason: Some(reason),
+            ..Facts::default()
+        },
+    );
+}
+fn cleanup_capture(path: Option<&Path>) -> Option<Capture> {
+    Some(Capture::new(
+        Source::Native,
+        AppendSink::open(path?, MAX_RECORDS, MAX_BYTES).ok()?,
+    ))
+}
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryPoint {
+    RestartBegin,
+    RestartReady,
+    SettlementRefused,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct InventorySnapshot {
+    pub observed: bool,
+    pub sealed: bool,
+    pub integrity_lost: bool,
+    pub first_loss: Option<InventoryFirstLoss>,
+    pub reservations: usize,
+    pub unconfigured: usize,
+    pub attachments: Option<DiagnosticTargetInventory>,
+}
+
+pub(crate) const TARGET_SAMPLE_LIMIT: usize = 16;
+pub(crate) const TARGET_ORDINAL_LIMIT: u64 = 65_535;
+static TARGET_ORDINALS: AtomicU64 = AtomicU64::new(0);
+static ATTACHMENT_ORDINALS: AtomicU64 = AtomicU64::new(0);
+static INVENTORY_ORDINALS: AtomicU64 = AtomicU64::new(0);
+
+macro_rules! diagnostic_enum {
+    ($name:ident { $first:ident $(, $other:ident)* $(,)? }) => {
+        #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+        #[serde(rename_all = "kebab-case")]
+        pub(crate) enum $name { #[default] $first, $($other,)* }
+    };
+}
+diagnostic_enum!(DiagnosticTargetKind {
+    Unrecognized,
+    CdpOther,
+    Page,
+    Iframe,
+    Worker,
+    SharedWorker,
+    ServiceWorker,
+    Browser,
+    BrowserUi,
+    Tab,
+    Webview,
+    BackgroundPage
+});
+diagnostic_enum!(DiagnosticTargetOrigin {
+    Unclassified,
+    InitialDiscovery,
+    AutoAttach
+});
+diagnostic_enum!(DiagnosticTargetPurpose {
+    Unclassified,
+    Application,
+    StateBootstrap
+});
+diagnostic_enum!(DiagnosticTargetClassification {
+    PendingReservation,
+    UnreservedApplication,
+    ReservedApplication,
+    ReservedBootstrap,
+    ReservationRemainder
+});
+diagnostic_enum!(DiagnosticTargetStage {
+    Registered,
+    ConfigureStarted,
+    ConfigureAck,
+    ConfigureFailed,
+    InitImmediateEnter,
+    InitFutureEnter,
+    InitScriptAck,
+    ResumeEnter,
+    ResumeAck,
+    Resumed,
+    Detached,
+    RestartRetiring,
+    PurposeAssigned
+});
+
+impl DiagnosticTargetKind {
+    pub(crate) fn from_native(kind: &str) -> Self {
+        match kind {
+            "other" => Self::CdpOther,
+            "page" => Self::Page,
+            "iframe" => Self::Iframe,
+            "worker" => Self::Worker,
+            "shared_worker" => Self::SharedWorker,
+            "service_worker" => Self::ServiceWorker,
+            "browser" => Self::Browser,
+            "browser_ui" => Self::BrowserUi,
+            "tab" => Self::Tab,
+            "webview" => Self::Webview,
+            "background_page" => Self::BackgroundPage,
+            _ => Self::Unrecognized,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiagnosticAttachment {
+    pub attachment: u64,
+    pub target: u64,
+    pub generation: u64,
+    pub kind: DiagnosticTargetKind,
+    pub origin: DiagnosticTargetOrigin,
+    pub parent: u64,
+    pub root: u64,
+    pub stage: DiagnosticTargetStage,
+    pub purpose: DiagnosticTargetPurpose,
+    pub classification: DiagnosticTargetClassification,
+    pub configured: bool,
+    pub resumed: bool,
+}
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct DiagnosticTargetInventory {
+    pub observed: bool,
+    pub count: usize,
+    pub attachments: [Option<DiagnosticAttachment>; TARGET_SAMPLE_LIMIT],
+}
+pub(crate) fn next_target_ordinal() -> Option<u64> {
+    next_cleanup_ordinal(&TARGET_ORDINALS, TARGET_ORDINAL_LIMIT)
+}
+pub(crate) fn next_attachment_ordinal() -> Option<u64> {
+    next_cleanup_ordinal(&ATTACHMENT_ORDINALS, TARGET_ORDINAL_LIMIT)
+}
+
+pub(crate) fn target_observation_lost(generation: u64, sequence: u64) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::TargetObservationLost,
+            Facts {
+                generation: Some(generation),
+                ..Facts::default()
+            },
+        );
+    }
+}
+pub(crate) fn target_lifecycle(
+    generation: u64,
+    sequence: u64,
+    target: DiagnosticAttachment,
+    error: Option<ProtocolError>,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        target_lifecycle_into(capture, generation, sequence, target, error);
+    }
+}
+fn target_lifecycle_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    target: DiagnosticAttachment,
+    error: Option<ProtocolError>,
+) {
+    target_attribution_into(capture, generation, sequence, None, target);
+    record_capture(
+        capture,
+        sequence,
+        Phase::TargetLifecycle,
+        Facts {
+            generation: Some(generation),
+            attachment_ordinal: Some(target.attachment),
+            target_stage: Some(target.stage),
+            target_purpose: Some(target.purpose),
+            target_classification: Some(target.classification),
+            target_configured: Some(target.configured),
+            target_resumed: Some(target.resumed),
+            error,
+            ..Facts::default()
+        },
+    );
+}
+fn target_attribution_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    point: Option<InventoryPoint>,
+    target: DiagnosticAttachment,
+) {
+    target_attribution_record(
+        capture,
+        generation,
+        sequence,
+        point.map(|point| (point, 0)),
+        target,
+    );
+}
+fn target_attribution_record(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    inventory: Option<(InventoryPoint, u64)>,
+    target: DiagnosticAttachment,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::TargetAttribution,
+        Facts {
+            generation: Some(generation),
+            inventory_point: inventory.map(|v| v.0),
+            inventory_ordinal: inventory.map(|v| v.1),
+            attachment_ordinal: Some(target.attachment),
+            target_ordinal: Some(target.target),
+            target_kind: Some(target.kind),
+            target_origin: Some(target.origin),
+            parent_attachment_ordinal: Some(target.parent),
+            root_attachment_ordinal: Some(target.root),
+            ..Facts::default()
+        },
+    );
+}
+// Independent of a cleanup attempt: record the actual refused settlement before
+// quarantine mutates the registry. Only bounded facts reach the opt-in sink.
+pub(crate) fn inventory_enabled() -> bool {
+    CLEANUP_SINK.get().and_then(Option::as_ref).is_some()
+}
+
+// Independent of operation and cleanup ownership. These observations never admit,
+// resume or retry a target. In particular enter is not a wire-submission receipt.
+const MAX_DIAGNOSTIC_WORKERS: u64 = 8;
+const MAX_WORKER_RECORDS: u64 = 32;
+static DIAGNOSTIC_WORKERS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkerAdmissionStep {
+    OwnedAttachment,
+    AuxiliaryClassification,
+    Register,
+    Purpose,
+    ConfigGate,
+    NetworkEnable,
+    NetworkBypass,
+    FetchEnable,
+    RuntimeEnable,
+    RecursiveAutoattach,
+    Configured,
+    ResumePermit,
+    ResumeDebugger,
+    ConfigurationCommitted,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum WorkerAdmissionState {
+    Enter,
+    Done,
+    Failed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WorkerDebuggerWait {
+    True,
+    False,
+    Unknown,
+}
+impl From<Option<bool>> for WorkerDebuggerWait {
+    fn from(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::True,
+            Some(false) => Self::False,
+            None => Self::Unknown,
+        }
+    }
+}
+impl Serialize for WorkerDebuggerWait {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::True => serializer.serialize_bool(true),
+            Self::False => serializer.serialize_bool(false),
+            Self::Unknown => serializer.serialize_str("unknown"),
+        }
+    }
+}
+/// Stack-owned, scalar-only observation of one authorized service-worker attachment.
+/// The ordinal is process-local diagnostic data, never a target/session identity.
+pub(crate) struct ServiceWorkerAdmission {
+    generation: u64,
+    ordinal: u8,
+    waiting: WorkerDebuggerWait,
+    records: AtomicU64,
+}
+impl ServiceWorkerAdmission {
+    pub(crate) fn start(generation: u64, waiting: Option<bool>) -> Option<Self> {
+        let capture = CLEANUP_SINK.get().and_then(Option::as_ref)?;
+        Self::start_into(capture, &DIAGNOSTIC_WORKERS, generation, waiting)
+    }
+    fn start_into(
+        capture: &Capture,
+        workers: &AtomicU64,
+        generation: u64,
+        waiting: Option<bool>,
+    ) -> Option<Self> {
+        let ordinal = increment(workers, 1, &capture.counters.overflow);
+        if ordinal >= MAX_DIAGNOSTIC_WORKERS {
+            Self::limit(capture, ordinal == MAX_DIAGNOSTIC_WORKERS);
+            return None;
+        }
+        let result = Self {
+            generation,
+            ordinal: (ordinal + 1) as u8,
+            waiting: waiting.into(),
+            records: AtomicU64::new(0),
+        };
+        result.record_into(
+            capture,
+            WorkerAdmissionStep::OwnedAttachment,
+            WorkerAdmissionState::Done,
+        );
+        Some(result)
+    }
+    fn limit(capture: &Capture, first: bool) {
+        increment(&capture.counters.suppressed, 1, &capture.counters.overflow);
+        if first {
+            record_capture(capture, 0, Phase::CaptureLimitReached, Facts::default());
+        }
+    }
+    fn record_into(
+        &self,
+        capture: &Capture,
+        step: WorkerAdmissionStep,
+        state: WorkerAdmissionState,
+    ) {
+        let ordinal = increment(&self.records, 1, &capture.counters.overflow);
+        if ordinal >= MAX_WORKER_RECORDS {
+            Self::limit(capture, ordinal == MAX_WORKER_RECORDS);
+            return;
+        }
+        record_capture(
+            capture,
+            0,
+            Phase::ServiceWorkerAdmission,
+            Facts {
+                generation: Some(self.generation),
+                worker_ordinal: Some(self.ordinal),
+                admission_step: Some(step),
+                admission_state: Some(state),
+                waiting_for_debugger: Some(self.waiting),
+                ..Facts::default()
+            },
+        );
+    }
+    fn record(trace: Option<&Self>, step: WorkerAdmissionStep, state: WorkerAdmissionState) {
+        if let (Some(trace), Some(capture)) = (trace, CLEANUP_SINK.get().and_then(Option::as_ref)) {
+            trace.record_into(capture, step, state);
+        }
+    }
+    pub(crate) async fn observe<T, E>(
+        trace: Option<&Self>,
+        step: WorkerAdmissionStep,
+        future: impl std::future::Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        Self::record(trace, step, WorkerAdmissionState::Enter);
+        let result = future.await;
+        // For RPC steps only successful completion of the original await is done.
+        Self::record(
+            trace,
+            step,
+            if result.is_ok() {
+                WorkerAdmissionState::Done
+            } else {
+                WorkerAdmissionState::Failed
+            },
+        );
+        result
+    }
+    pub(crate) fn observe_sync<T, E>(
+        trace: Option<&Self>,
+        step: WorkerAdmissionStep,
+        action: impl FnOnce() -> Result<T, E>,
+    ) -> Result<T, E> {
+        Self::record(trace, step, WorkerAdmissionState::Enter);
+        let result = action();
+        Self::record(
+            trace,
+            step,
+            if result.is_ok() {
+                WorkerAdmissionState::Done
+            } else {
+                WorkerAdmissionState::Failed
+            },
+        );
+        result
+    }
+}
+
+/// Native optional-pixel publication facts, not an adapter transfer receipt.
+pub(crate) fn observation_pixel_result(
+    generation: u64,
+    sequence: u64,
+    accepted: bool,
+    pixels: bool,
+    early_semantic: bool,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        observation_pixel_result_into(
+            capture,
+            generation,
+            sequence,
+            accepted,
+            pixels,
+            early_semantic,
+        );
+    }
+}
+
+fn observation_pixel_result_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    accepted: bool,
+    pixels: bool,
+    early_semantic: bool,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ObservationPixelResult,
+        Facts {
+            generation: Some(generation),
+            accepted: Some(accepted),
+            pixels_available: Some(pixels),
+            early_semantic: Some(early_semantic),
+            ..Facts::default()
+        },
+    );
+}
+
+/// Original protected-capture refusal, before callers map it to an optional
+/// missing image. Reuses the default-off bounded cleanup sink without renderer data.
+pub(crate) fn protected_capture_failure(
+    operation: &super::client_session::OperationLease,
+    failure: super::client_capture::CaptureAttemptFailure,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        let remaining = operation
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        protected_capture_failure_into(
+            capture,
+            operation.generation,
+            operation.sequence,
+            failure,
+            remaining.as_millis().min(SAFE_INTEGER as u128) as u64,
+        );
+    }
+}
+fn protected_capture_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: super::client_capture::CaptureAttemptFailure,
+    capture_budget_ms: u64,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ProtectedCaptureFailure,
+        Facts {
+            generation: Some(generation),
+            protected_capture_phase: Some(failure.phase),
+            protected_capture_reason: Some(failure.reason),
+            capture_budget_ms: Some(capture_budget_ms),
+            ..Facts::default()
+        },
+    );
+}
+
+/// Closed call-site evidence for optional trace screenshots, not protocol authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScreenshotStage {
+    PrepareScope,
+    PreparePermit,
+    PreparePolicy,
+    PrepareOwner,
+    PrepareFence,
+    RunScope,
+    DebtAdmission,
+    UiAdmission,
+    PublicationAdmission,
+    ProducerReservation,
+    InitialFrames,
+    FrameInventoryFence,
+    ProtectedBarrier,
+    AnimationStabilization,
+    ProtectedFrames,
+    Geometry,
+    TraceMetadata,
+    SemanticViewport,
+    SemanticMetadata,
+    SemanticFrameGeometry,
+    SemanticNodeGeometry,
+    SemanticDocumentRoot,
+    SemanticFinalViewport,
+    Capture,
+    Restoration,
+    FinalGeometry,
+    FinalBarrier,
+    FinalScope,
+    FinalFrames,
+    FinalViewport,
+    BlobPublication,
+    Publication,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScreenshotCapturePhase {
+    NotEntered,
+    Admission,
+    IndependentCoverage,
+    SourceProtection,
+    RawCapture,
+    PostCaptureValidation,
+}
+/// Comparison with a later, best-effort inventory read. Never the atomic reject snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryAfterFailure {
+    NotSampled,
+    Unavailable,
+    Unchanged,
+    Changed,
+}
+// Closed typed read classifications retain no frame selector, node identity or
+// renderer message. Cleanup wrappers are represented separately, not erased.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadError {
+    Observation(ObservationReadError),
+    Geometry(GeometryReadError),
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ObservationReadError {
+    InvalidArguments,
+    InvalidLocator,
+    FrameNotFound,
+    FrameAmbiguous,
+    UnsupportedCapability,
+    StaleReference,
+    Superseded,
+    Cancelled,
+    DeadlineExceeded,
+    BackendFailure,
+    PolicyDenied,
+    ResourceLimit,
+    CleanupFailed,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum GeometryReadError {
+    InvalidGeometry,
+    IncompleteInventory,
+    StaleIdentity,
+    Cancelled,
+    Superseded,
+    DeadlineExceeded,
+    BackendFailure,
+    CleanupFailed,
+    NodeReferenceBinding,
+    NodeFrameBinding,
+    NodeResolveNegative,
+    NodeResolveBindingNegative,
+    NodeResolveProofInvalid,
+    NodeResolveOther,
+    NodeBoxRead,
+    NodeBoxNegative,
+    NodeBoxProofInvalid,
+    NodeMixedHard,
+    NodeMixedNegative,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ObserveInitialPrefixCheck {
+    BeforeYield,
+    AfterYield,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ObserveInitialPrefixRefusal {
+    LedgerUnavailable,
+    CleanupObserved,
+    OwnerMismatch,
+    CleanupOwnerRefused,
+    AdmissionRefused,
+    IntegrityLost,
+    InputDebt,
+    ObjectDebt,
+    OutstandingCommands,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ObserveInitialPrefix {
+    pub check: ObserveInitialPrefixCheck,
+    pub refusal: ObserveInitialPrefixRefusal,
+    pub debt: Option<[u16; 3]>,
+    pub debt_capped: Option<bool>,
+}
+pub(crate) struct ScreenshotFailure {
+    pub initial_sample: Option<u8>,
+    pub prefix: Option<ObserveInitialPrefix>,
+    pub stage: ScreenshotStage,
+    pub read_error: Option<ReadError>,
+    pub read_cleanup_lost: Option<bool>,
+    pub capture_phase: ScreenshotCapturePhase,
+    pub inventory_after_failure: InventoryAfterFailure,
+    pub error: ProtocolError,
+}
+pub(crate) fn screenshot_failure(generation: u64, sequence: u64, failure: ScreenshotFailure) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        screenshot_failure_into(capture, generation, sequence, failure);
+    }
+}
+fn screenshot_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: ScreenshotFailure,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ScreenshotFirstFailure,
+        Facts {
+            generation: Some(generation),
+            screenshot_stage: Some(failure.stage),
+            read_error: failure.read_error,
+            read_cleanup_lost: failure.read_cleanup_lost,
+            capture_phase: Some(failure.capture_phase),
+            inventory_after_failure: Some(failure.inventory_after_failure),
+            error: Some(failure.error),
+            ..Facts::default()
+        },
+    );
+}
+// Called after both original failure records. Missing diagnostics stay unknown.
+// The sample count describes initial acquisition, even for a later-stage fault.
+pub(crate) fn observe_initial_acquisition(
+    generation: u64,
+    sequence: u64,
+    initial_sample: Option<u8>,
+    prefix: Option<ObserveInitialPrefix>,
+) {
+    if initial_sample.is_none() && prefix.is_none() {
+        return;
+    }
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::ObserveInitialAcquisition,
+            Facts {
+                generation: Some(generation),
+                initial_sample,
+                prefix_check: prefix.map(|value| value.check),
+                prefix_refusal: prefix.map(|value| value.refusal),
+                prefix_debt: prefix.and_then(|value| value.debt),
+                prefix_debt_capped: prefix.and_then(|value| value.debt_capped),
+                ..Facts::default()
+            },
+        );
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyAck {
+    None,
+    Current,
+    Retired,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyWindow {
+    NotEntered,
+    Entered,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ReadonlyCleanup {
+    FailureObserved,
+    NotObserved,
+}
+pub(crate) struct ReadonlyPrepareFailure {
+    pub entry_us: u64,
+    pub ack_us: Option<u64>,
+    pub ack: ReadonlyAck,
+    pub wake_us: Option<u64>,
+    pub fail_us: Option<u64>,
+    pub window: ReadonlyWindow,
+    pub deadline: bool,
+    pub zero_input: bool,
+    pub cleanup: ReadonlyCleanup,
+    pub error: ProtocolError,
+}
+/// Closed metadata only. Observation cannot grant cleanup/recovery authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalCleanupStage {
+    TaskProof,
+    RecoveryReceipt,
+    RecoveryCandidate,
+    RecoveryDrain,
+    RecoveryRetirement,
+    OwnerPreconditions,
+    RuntimeRelease,
+    PersistentProbe,
+    EnrollmentProof,
+    LedgerCommandsPresent,
+    PhysicalClose,
+    OrdinaryClose,
+    ShutdownJoins,
+    FinalCommit,
+}
+/// First rejecting predicate in the original evaluation order, not a claim
+/// about the chronologically first failure across concurrent operations.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalProofRefusal {
+    TasksNotClosing,
+    UnscopedTaskFailure,
+    TaskOperationMissing,
+    TaskOwnerMismatch,
+    LedgerOwnerMismatch,
+    RegistryUnavailable,
+    ResultNotFixed,
+    ProducerNotIntegrityLost,
+    IntegrityReasonNotRemoteEof,
+    RetentionLocalProducerFailed,
+    RetentionDeadline,
+    RetentionOwnerAccountingLost,
+    RetentionReasonMissing,
+    LocalProducersUnfinished,
+    SubmissionNotRevoked,
+    MutationDispatched,
+    InputDebt,
+    ObjectDebt,
+    LocalIntegrityLost,
+    NoOwnerOperations,
+}
+/// First failed final-close guard, never cleanup authority. Counts are
+/// [observed, required], or [applied, received] for EnrollmentWatermark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TerminalEnrollmentRefusal {
+    LedgerNotRemoteEof,
+    LedgerBootstrapUnpublished,
+    LedgerContextCreation,
+    LedgerEvalPublication,
+    LedgerOperationsEmpty,
+    LedgerOperationIdentity,
+    LedgerObjects,
+    LedgerGroups,
+    LedgerCreatedTargets,
+    LedgerRecordingTargets,
+    LedgerBindingsEmpty,
+    LedgerTargetCount,
+    LedgerTargetBinding,
+    LedgerLifecycleBinding,
+    LedgerRealmBinding,
+    LedgerCommandContract,
+    RegistryNotSealed,
+    RegistryIntegrityLost,
+    RegistryNotReady,
+    RegistryReservations,
+    RegistryResuming,
+    RegistryProtectedRead,
+    RegistryBootstrapCreations,
+    RegistryBootstrapCleanup,
+    RegistryCleanupReservations,
+    RegistryUnknownCreation,
+    RegistryAuxiliary,
+    RegistryTargetCount,
+    RegistryTargetBinding,
+    EnrollmentFailed,
+    EnrollmentNotReconciled,
+    EnrollmentWatermark,
+    EnrollmentPending,
+    EnrollmentRealmPending,
+    EnrollmentRealmTickets,
+    EnrollmentRestart,
+    EnrollmentBlank,
+    EnrollmentRetiring,
+    EnrollmentSessionContract,
+    EnrollmentRootContract,
+    EnrollmentLifecycle,
+    EnrollmentAncestry,
+    EnrollmentTerminalProof,
+    EnrollmentClientIdentity,
+    EnrollmentTerminalWatermarkMissing,
+    EnrollmentCleanupOwner,
+    EnrollmentLedgerOwner,
+    EnrollmentRegistryOwner,
+}
+/// First refused final-close guard together with its bounded counts, if the
+/// guard produced any. Observation is diagnostic only, never cleanup authority.
+pub(crate) type TerminalRefusalObservation = Option<(TerminalEnrollmentRefusal, Option<[u64; 2]>)>;
+
+/// Set once under the original target registry lock. No payload or runtime
+/// identifier is retained; ExplicitSeal intentionally leaves the caller unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryFirstLoss {
+    ResumeIdentityMismatch,
+    ResumePermitDropped,
+    AuxiliaryCapacity,
+    QueryRevisionExhausted,
+    UnknownQueryRevisionExhausted,
+    ExplicitSeal,
+    InvalidRetirementAuthority,
+    AuxiliaryAckMismatch,
+    AuxiliaryAbandoned,
+    CreationAbandoned,
+    RetainedDeadlineSeal,
+    RetainedSettlementSeal,
+    RetainedCompletionSeal,
+}
+pub(crate) fn terminal_proof_refusal(
+    stage: TerminalCleanupStage,
+    key: Option<(u64, u64)>,
+    reason: TerminalProofRefusal,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            key.map_or(0, |(_, operation_seq)| operation_seq),
+            Phase::TerminalCleanupCheckpoint,
+            Facts {
+                generation: key.map(|(generation, _)| generation),
+                terminal_cleanup_stage: Some(stage),
+                terminal_cleanup_ok: Some(false),
+                terminal_proof_refusal: Some(reason),
+                ..Facts::default()
+            },
+        );
+    }
+}
+pub(crate) fn terminal_enrollment_refusal(
+    reason: TerminalEnrollmentRefusal,
+    counts: Option<[u64; 2]>,
+) {
+    // Caller releases every original enrollment/ledger/registry lock first.
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            0,
+            Phase::TerminalCleanupCheckpoint,
+            Facts {
+                terminal_cleanup_stage: Some(TerminalCleanupStage::EnrollmentProof),
+                terminal_cleanup_ok: Some(false),
+                terminal_enrollment_refusal: Some(reason),
+                terminal_proof_counts: counts
+                    .filter(|values| values.iter().all(|value| *value <= SAFE_INTEGER)),
+                ..Facts::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn terminal_cleanup_checkpoint(stage: TerminalCleanupStage, ok: bool) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        terminal_cleanup_checkpoint_into(capture, stage, ok);
+    }
+}
+fn terminal_cleanup_checkpoint_into(capture: &Capture, stage: TerminalCleanupStage, ok: bool) {
+    record_capture(
+        capture,
+        0,
+        Phase::TerminalCleanupCheckpoint,
+        Facts {
+            terminal_cleanup_stage: Some(stage),
+            terminal_cleanup_ok: Some(ok),
+            ..Facts::default()
+        },
+    );
+}
+
+/// An upload refusal observed before staging/dispatch. Not a final outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum UploadRefusal {
+    Unknown,
+    TargetResolution,
+    Label,
+    TextNode,
+    NotFileInput,
+    Disabled,
+    DirectoryMismatch,
+    MultipleMismatch,
+}
+impl UploadRefusal {
+    pub(crate) fn from_probe(value: Option<&str>) -> Self {
+        match value {
+            Some("label") => Self::Label,
+            Some("text-node") => Self::TextNode,
+            Some("not-file-input") => Self::NotFileInput,
+            Some("disabled") => Self::Disabled,
+            Some("directory-mismatch") => Self::DirectoryMismatch,
+            Some("multiple-mismatch") => Self::MultipleMismatch,
+            _ => Self::Unknown,
+        }
+    }
+}
+pub(crate) fn upload_preflight_refusal(
+    generation: u64,
+    sequence: u64,
+    refusal: UploadRefusal,
+    zero_input: bool,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        upload_preflight_refusal_into(capture, generation, sequence, refusal, zero_input);
+    }
+}
+fn upload_preflight_refusal_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    refusal: UploadRefusal,
+    zero_input: bool,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::UploadPreflightRefusal,
+        Facts {
+            generation: Some(generation),
+            upload_refusal: Some(refusal),
+            zero_input: Some(zero_input),
+            ..Facts::default()
+        },
+    );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum QueryScopeStage {
+    WarmWorlds,
+    InitialFrames,
+    InitialFramesEntry,
+    InitialFramesExit,
+    ProtectedFrames,
+    FinalFrames,
+    Classification,
+    Acquire,
+    Recheck,
+    BarrierAcquire,
+    BarrierCheck,
+    Publication,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum QueryScopeReason {
+    OwnerHealth,
+    OwnerIdentity,
+    IndexHealth,
+    PendingClassification,
+    SubscriptionChanged,
+    WatermarkPending,
+    AttributionChanged,
+    AttributionInvalid,
+    RegistryHealth,
+    CreationDebt,
+    UnclaimedAuxiliary,
+    GuardMismatch,
+    AlreadyProtected,
+    SelectedNotReady,
+    ForeignOwner,
+    UnclassifiedPurpose,
+    UnknownLineage,
+    RelatedNotReady,
+    UnretainedUnrelated,
+    TargetSetChanged,
+    SelectedTargetMissing,
+    DependencyRevisionChanged,
+    DependencySetChanged,
+    DependencyIdentityChanged,
+    TargetRevisionChanged,
+    UnknownRevisionChanged,
+    TargetCountChanged,
+    TargetIdentityChanged,
+    TargetLineageChanged,
+    EnrollmentTargetSetChanged,
+    OriginalBudget,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum QueryReadStage {
+    ReadAdmission,
+    ReadUi,
+    ReadFramesBefore,
+    FreshInventory,
+    FreshWorld,
+    FreshResolve,
+    FreshSample,
+    FreshCleanup,
+    FreshRootsFinal,
+    ReadFramesAfter,
+    ReadPublish,
+    FrameEntry,
+    FreshFields,
+    Ax,
+    Dom,
+    CandidatePlan,
+    Security,
+    Metadata,
+    QueryWorld,
+    CandidatePlanRoots,
+    CandidatePlanDomBackend,
+    CandidatePlanAttributes,
+    CandidatePlanDuplicateDom,
+    CandidatePlanAxRows,
+    CandidatePlanAxDecode,
+    CandidatePlanDuplicateAx,
+    CandidatePlanAuthorIds,
+    CandidatePlanMissingRecord,
+    CandidatePlanAxChild,
+    CandidatePlanDomObject,
+    CandidatePlanFallback,
+    QueryResolve,
+    QueryMatch,
+    CandidateConfirm,
+    SecurityConfirm,
+    MetadataConfirm,
+    Projection,
+    Cleanup,
+    FrameFinal,
+    LeaseFinal,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum EvalAdmissionStage {
+    Entry,
+    #[serde(rename = "wait")]
+    WaitRefused,
+    #[serde(rename = "capture")]
+    CaptureRefused,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum EvalAdmissionReason {
+    #[serde(rename = "entry")]
+    Frontier,
+    #[serde(rename = "fence")]
+    EntryFence,
+    #[serde(rename = "pending")]
+    PendingEnrollment,
+    Unresumed,
+    #[serde(rename = "retire")]
+    RetirementPending,
+    #[serde(rename = "health")]
+    RealmHealth,
+    #[serde(rename = "guard")]
+    OtherGuard,
+    #[serde(rename = "p-op")]
+    PreparationEntryOperation,
+    #[serde(rename = "p-entryid")]
+    PreparationEntryIdentity,
+    #[serde(rename = "p-permit")]
+    PreparationEntryPermit,
+    #[serde(rename = "p-ledger")]
+    PreparationEntryLedger,
+    #[serde(rename = "p-eowner")]
+    PreparationEntryOwner,
+    #[serde(rename = "p-stream")]
+    PreparationEntryStream,
+    #[serde(rename = "p-etarget")]
+    PreparationEntryTarget,
+    #[serde(rename = "p-failed")]
+    PreparationIndexFailure,
+    #[serde(rename = "p-index")]
+    PreparationIndexHealth,
+    #[serde(rename = "p-snap")]
+    PreparationLedgerSnapshot,
+    #[serde(rename = "p-empty")]
+    PreparationEmptyCohort,
+    #[serde(rename = "p-front")]
+    PreparationFrontier,
+    #[serde(rename = "p-cap")]
+    PreparationCohortCapacity,
+    #[serde(rename = "p-rootent")]
+    PreparationRootEntry,
+    #[serde(rename = "p-rootid")]
+    PreparationRootIdentity,
+    #[serde(rename = "p-active")]
+    PreparationRootActive,
+    #[serde(rename = "p-roottgt")]
+    PreparationRootTarget,
+    #[serde(rename = "p-rootfrm")]
+    PreparationRootFrame,
+    #[serde(rename = "p-mement")]
+    PreparationMemberEntry,
+    #[serde(rename = "p-memkind")]
+    PreparationMemberKind,
+    #[serde(rename = "p-memfrm")]
+    PreparationMemberFrame,
+    #[serde(rename = "p-missing")]
+    PreparationReceiptMissing,
+    #[serde(rename = "p-owner")]
+    PreparationReceiptOwner,
+    #[serde(rename = "p-origin")]
+    PreparationReceiptOrigin,
+    #[serde(rename = "p-binding")]
+    PreparationReceiptBinding,
+    #[serde(rename = "p-target")]
+    PreparationReceiptTarget,
+    #[serde(rename = "p-health")]
+    PreparationRegistryHealth,
+    #[serde(rename = "p-config")]
+    PreparationUnconfigured,
+    #[serde(rename = "p-term")]
+    PreparationReceiptTerminal,
+    #[serde(rename = "p-stage")]
+    PreparationReceiptStage,
+    #[serde(rename = "p-custody")]
+    PreparationReceiptCustody,
+    #[serde(rename = "p-ready")]
+    PreparationReceiptReadiness,
+    #[serde(rename = "p-confrev")]
+    PreparationConfiguration,
+    #[serde(rename = "p-fence")]
+    PreparationFence,
+    #[serde(rename = "p-c1s0")]
+    PreparationUnconfiguredConfigurationEnteredUnissued,
+    #[serde(rename = "p-c1s1")]
+    PreparationUnconfiguredConfigurationEnteredIssued,
+    #[serde(rename = "p-c1s2")]
+    PreparationUnconfiguredConfigurationEnteredCompleted,
+    #[serde(rename = "p-c1s3")]
+    PreparationUnconfiguredConfigurationEnteredReleased,
+    #[serde(rename = "p-c1sx")]
+    PreparationUnconfiguredConfigurationEnteredUnknown,
+    #[serde(rename = "p-c2s0")]
+    PreparationUnconfiguredRuntimeEnableEnteredUnissued,
+    #[serde(rename = "p-c2s1")]
+    PreparationUnconfiguredRuntimeEnableEnteredIssued,
+    #[serde(rename = "p-c2s2")]
+    PreparationUnconfiguredRuntimeEnableEnteredCompleted,
+    #[serde(rename = "p-c2s3")]
+    PreparationUnconfiguredRuntimeEnableEnteredReleased,
+    #[serde(rename = "p-c2sx")]
+    PreparationUnconfiguredRuntimeEnableEnteredUnknown,
+    #[serde(rename = "p-c3s0")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedUnissued,
+    #[serde(rename = "p-c3s1")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedIssued,
+    #[serde(rename = "p-c3s2")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedCompleted,
+    #[serde(rename = "p-c3s3")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedReleased,
+    #[serde(rename = "p-c3sx")]
+    PreparationUnconfiguredRuntimeEnableAcknowledgedUnknown,
+    #[serde(rename = "p-c4s0")]
+    PreparationUnconfiguredScriptsAcknowledgedUnissued,
+    #[serde(rename = "p-c4s1")]
+    PreparationUnconfiguredScriptsAcknowledgedIssued,
+    #[serde(rename = "p-c4s2")]
+    PreparationUnconfiguredScriptsAcknowledgedCompleted,
+    #[serde(rename = "p-c4s3")]
+    PreparationUnconfiguredScriptsAcknowledgedReleased,
+    #[serde(rename = "p-c4sx")]
+    PreparationUnconfiguredScriptsAcknowledgedUnknown,
+    #[serde(rename = "p-c5s0")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedUnissued,
+    #[serde(rename = "p-c5s1")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedIssued,
+    #[serde(rename = "p-c5s2")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedCompleted,
+    #[serde(rename = "p-c5s3")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedReleased,
+    #[serde(rename = "p-c5sx")]
+    PreparationUnconfiguredRecursiveAttachAcknowledgedUnknown,
+    #[serde(rename = "p-c6s0")]
+    PreparationUnconfiguredConfiguredCommitObservedUnissued,
+    #[serde(rename = "p-c6s1")]
+    PreparationUnconfiguredConfiguredCommitObservedIssued,
+    #[serde(rename = "p-c6s2")]
+    PreparationUnconfiguredConfiguredCommitObservedCompleted,
+    #[serde(rename = "p-c6s3")]
+    PreparationUnconfiguredConfiguredCommitObservedReleased,
+    #[serde(rename = "p-c6sx")]
+    PreparationUnconfiguredConfiguredCommitObservedUnknown,
+}
+/// Observed initializer checkpoints only. Entered does not prove wire submission;
+/// an acknowledged checkpoint does not authorize evaluation or certify later setup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum PopupSetupCheckpoint {
+    ConfigurationEntered = 1,
+    RuntimeEnableEntered = 2,
+    RuntimeEnableAcknowledged = 3,
+    ScriptsAcknowledged = 4,
+    RecursiveAttachAcknowledged = 5,
+    ConfiguredCommitObserved = 6,
+}
+impl PopupSetupCheckpoint {
+    pub(crate) fn from_code(code: u8) -> Option<Self> {
+        match code {
+            1 => Some(Self::ConfigurationEntered),
+            2 => Some(Self::RuntimeEnableEntered),
+            3 => Some(Self::RuntimeEnableAcknowledged),
+            4 => Some(Self::ScriptsAcknowledged),
+            5 => Some(Self::RecursiveAttachAcknowledged),
+            6 => Some(Self::ConfiguredCommitObserved),
+            _ => None,
+        }
+    }
+}
+/// Actual receipt stage sampled at the original unconfigured refusal. Unknown
+/// is not a completion or custody claim, and no terminal flag is inferred.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PopupReceiptStage {
+    Unissued,
+    Issued,
+    Completed,
+    Released,
+    Unknown,
+}
+impl PopupReceiptStage {
+    pub(crate) fn from_code(code: u8) -> Self {
+        match code {
+            0 => Self::Unissued,
+            1 => Self::Issued,
+            2 => Self::Completed,
+            3 => Self::Released,
+            _ => Self::Unknown,
+        }
+    }
+}
+/// The first predicate that refused private popup preparation at its original
+/// synchronous observation point. This is diagnostic data, never authority.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EvalPreparationRefusal {
+    EntryOperation,
+    EntryIdentity,
+    EntryPermit,
+    EntryLedger,
+    EntryOwner,
+    EntryStream,
+    EntryTarget,
+    IndexFailure,
+    IndexHealth,
+    LedgerSnapshot,
+    EmptyCohort,
+    Frontier,
+    CohortCapacity,
+    RootEntry,
+    RootIdentity,
+    RootActive,
+    RootTarget,
+    RootFrame,
+    MemberEntry,
+    MemberKind,
+    MemberFrame,
+    ReceiptMissing,
+    ReceiptOwner,
+    ReceiptOrigin,
+    ReceiptBinding,
+    ReceiptTarget,
+    RegistryHealth,
+    Unconfigured,
+    UnconfiguredAt(PopupSetupCheckpoint, PopupReceiptStage),
+    ReceiptTerminal,
+    ReceiptStage,
+    ReceiptCustody,
+    ReceiptReadiness,
+    Configuration,
+    Fence,
+}
+impl From<EvalPreparationRefusal> for EvalAdmissionReason {
+    fn from(reason: EvalPreparationRefusal) -> Self {
+        match reason {
+            EvalPreparationRefusal::EntryOperation => Self::PreparationEntryOperation,
+            EvalPreparationRefusal::EntryIdentity => Self::PreparationEntryIdentity,
+            EvalPreparationRefusal::EntryPermit => Self::PreparationEntryPermit,
+            EvalPreparationRefusal::EntryLedger => Self::PreparationEntryLedger,
+            EvalPreparationRefusal::EntryOwner => Self::PreparationEntryOwner,
+            EvalPreparationRefusal::EntryStream => Self::PreparationEntryStream,
+            EvalPreparationRefusal::EntryTarget => Self::PreparationEntryTarget,
+            EvalPreparationRefusal::IndexFailure => Self::PreparationIndexFailure,
+            EvalPreparationRefusal::IndexHealth => Self::PreparationIndexHealth,
+            EvalPreparationRefusal::LedgerSnapshot => Self::PreparationLedgerSnapshot,
+            EvalPreparationRefusal::EmptyCohort => Self::PreparationEmptyCohort,
+            EvalPreparationRefusal::Frontier => Self::PreparationFrontier,
+            EvalPreparationRefusal::CohortCapacity => Self::PreparationCohortCapacity,
+            EvalPreparationRefusal::RootEntry => Self::PreparationRootEntry,
+            EvalPreparationRefusal::RootIdentity => Self::PreparationRootIdentity,
+            EvalPreparationRefusal::RootActive => Self::PreparationRootActive,
+            EvalPreparationRefusal::RootTarget => Self::PreparationRootTarget,
+            EvalPreparationRefusal::RootFrame => Self::PreparationRootFrame,
+            EvalPreparationRefusal::MemberEntry => Self::PreparationMemberEntry,
+            EvalPreparationRefusal::MemberKind => Self::PreparationMemberKind,
+            EvalPreparationRefusal::MemberFrame => Self::PreparationMemberFrame,
+            EvalPreparationRefusal::ReceiptMissing => Self::PreparationReceiptMissing,
+            EvalPreparationRefusal::ReceiptOwner => Self::PreparationReceiptOwner,
+            EvalPreparationRefusal::ReceiptOrigin => Self::PreparationReceiptOrigin,
+            EvalPreparationRefusal::ReceiptBinding => Self::PreparationReceiptBinding,
+            EvalPreparationRefusal::ReceiptTarget => Self::PreparationReceiptTarget,
+            EvalPreparationRefusal::RegistryHealth => Self::PreparationRegistryHealth,
+            EvalPreparationRefusal::Unconfigured => Self::PreparationUnconfigured,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfigurationEntered,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredConfigurationEnteredUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableEntered,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredRuntimeEnableEnteredUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RuntimeEnableAcknowledged,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredRuntimeEnableAcknowledgedUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ScriptsAcknowledged,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredScriptsAcknowledgedUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::RecursiveAttachAcknowledged,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredRecursiveAttachAcknowledgedUnknown,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Unissued,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedUnissued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Issued,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedIssued,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Completed,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedCompleted,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Released,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedReleased,
+            EvalPreparationRefusal::UnconfiguredAt(
+                PopupSetupCheckpoint::ConfiguredCommitObserved,
+                PopupReceiptStage::Unknown,
+            ) => Self::PreparationUnconfiguredConfiguredCommitObservedUnknown,
+            EvalPreparationRefusal::ReceiptTerminal => Self::PreparationReceiptTerminal,
+            EvalPreparationRefusal::ReceiptStage => Self::PreparationReceiptStage,
+            EvalPreparationRefusal::ReceiptCustody => Self::PreparationReceiptCustody,
+            EvalPreparationRefusal::ReceiptReadiness => Self::PreparationReceiptReadiness,
+            EvalPreparationRefusal::Configuration => Self::PreparationConfiguration,
+            EvalPreparationRefusal::Fence => Self::PreparationFence,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum EvalWatermark {
+    Equal,
+    Behind,
+    Ahead,
+    #[serde(rename = "unk")]
+    Unknown,
+}
+/// Closed diagnostic counts only, never an admission or completion receipt.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EvalAdmissionFacts {
+    #[serde(rename = "s")]
+    pub stage: EvalAdmissionStage,
+    #[serde(rename = "c")]
+    pub reason: EvalAdmissionReason,
+    // realm_pending, realm_tickets, bits: reconciled=1, sealed=2, index_failure=4.
+    #[serde(rename = "h")]
+    pub health: Option<(u16, u16, u8)>,
+    // total, unregistered, application, observer, unresumed, frame, realm, page.
+    #[serde(rename = "p")]
+    pub pending: Option<[u16; 8]>,
+    // resume_pending, retained_initialization, missing exact target/session.
+    #[serde(rename = "t")]
+    pub targets: Option<[u16; 3]>,
+    // selected frame known, loader known, live realm known, target capture_ready.
+    #[serde(rename = "r")]
+    pub root: Option<[bool; 4]>,
+    #[serde(rename = "w")]
+    pub watermark: EvalWatermark,
+    #[serde(rename = "v")]
+    pub revision: Option<u64>,
+    #[serde(rename = "e")]
+    pub epoch: Option<u64>,
+}
+impl EvalAdmissionFacts {
+    pub(crate) fn unknown(stage: EvalAdmissionStage, reason: EvalAdmissionReason) -> Self {
+        Self {
+            stage,
+            reason,
+            health: None,
+            pending: None,
+            targets: None,
+            root: None,
+            watermark: EvalWatermark::Unknown,
+            revision: None,
+            epoch: None,
+        }
+    }
+}
+pub(crate) fn eval_admission(generation: u64, sequence: u64, facts: EvalAdmissionFacts) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_eval_admission(capture, generation, sequence, facts);
+    }
+}
+fn record_eval_admission(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    facts: EvalAdmissionFacts,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::EvalAdmission,
+        Facts {
+            generation: Some(generation),
+            eval: Some(facts),
+            ..Facts::default()
+        },
+    );
+}
+pub(crate) fn query_diagnostics_enabled() -> bool {
+    QUERY_SINK.get().and_then(Option::as_ref).is_some()
+}
+// Failure-only command prefix. Original failure is emitted first; bounded rows
+// follow in local ordinal order, then exactly one summary. Global record order
+// may interleave other operations; generation/sequence retain exact custody.
+pub(crate) fn query_command_timing(
+    generation: u64,
+    sequence: u64,
+    stage: QueryReadStage,
+    command: [u16; 3],
+    timing: [u16; 5],
+) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryCommandTiming,
+            Facts {
+                generation: Some(generation),
+                query_read_stage: Some(stage),
+                query_command: Some(command),
+                query_command_ms: Some(timing),
+                ..Facts::default()
+            },
+        );
+    }
+}
+pub(crate) fn query_command_summary(generation: u64, sequence: u64, summary: [u16; 3]) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryCommandSummary,
+            Facts {
+                generation: Some(generation),
+                query_command_summary: Some(summary),
+                ..Facts::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn query_read_failure(
+    generation: u64,
+    sequence: u64,
+    stage: QueryReadStage,
+    error: ObservationReadError,
+    timing: Option<[u16; 13]>,
+) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryReadFailure,
+            Facts {
+                generation: Some(generation),
+                query_read_stage: Some(stage),
+                query_read_error: Some(error),
+                query_read_ms: timing,
+                ..Facts::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn query_read_protocol_failure(
+    generation: u64,
+    sequence: u64,
+    stage: QueryReadStage,
+    error: ProtocolError,
+    timing: Option<[u16; 13]>,
+) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryReadFailure,
+            Facts {
+                generation: Some(generation),
+                query_read_stage: Some(stage),
+                error: Some(error),
+                query_read_ms: timing,
+                ..Facts::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn query_scope_refusal(
+    generation: u64,
+    sequence: u64,
+    stage: QueryScopeStage,
+    reason: QueryScopeReason,
+) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        critical_query_refusal(capture, generation, sequence, stage, reason);
+    }
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryScopeRefusal,
+            Facts {
+                generation: Some(generation),
+                query_scope_stage: Some(stage),
+                query_scope_reason: Some(reason),
+                ..Facts::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn query_target_refusal(
+    generation: u64,
+    sequence: u64,
+    stage: QueryScopeStage,
+    reason: QueryScopeReason,
+    target: Option<DiagnosticAttachment>,
+) {
+    if let Some(capture) = QUERY_SINK.get().and_then(Option::as_ref) {
+        critical_query_refusal(capture, generation, sequence, stage, reason);
+    }
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        record_capture(
+            capture,
+            sequence,
+            Phase::QueryScopeRefusal,
+            Facts {
+                generation: Some(generation),
+                query_scope_stage: Some(stage),
+                query_scope_reason: Some(reason),
+                attachment_ordinal: target.map(|value| value.attachment),
+                target_ordinal: target.map(|value| value.target),
+                target_kind: target.map(|value| value.kind),
+                ..Facts::default()
+            },
+        );
+    }
+}
+
+pub(crate) fn readonly_prepare_failure(
+    generation: u64,
+    sequence: u64,
+    failure: ReadonlyPrepareFailure,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        readonly_prepare_failure_into(capture, generation, sequence, failure);
+    }
+}
+fn readonly_prepare_failure_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: ReadonlyPrepareFailure,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ReadonlyPrepareFailure,
+        Facts {
+            generation: Some(generation),
+            entry_us: Some(failure.entry_us),
+            ack_us: failure.ack_us,
+            ack: Some(failure.ack),
+            wake_us: failure.wake_us,
+            fail_us: failure.fail_us,
+            window: Some(failure.window),
+            deadline: Some(failure.deadline),
+            zero_input: Some(failure.zero_input),
+            cleanup: Some(failure.cleanup),
+            error: Some(failure.error),
+            ..Facts::default()
+        },
+    );
+}
+// One atomic frame-inventory rejection, emitted only after its screenshot settles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum FrameInventoryPass {
+    Initial,
+    Protected,
+    Final,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum InventoryRevisionEvent {
+    Attach,
+    Detach,
+    Info,
+    Navigate,
+    SameDocument,
+    FrameDetach,
+    Unknown,
+    None,
+}
+impl InventoryRevisionEvent {
+    pub(crate) fn index(self) -> usize {
+        match self {
+            Self::Attach => 0,
+            Self::Detach => 1,
+            Self::Info => 2,
+            Self::Navigate => 3,
+            Self::SameDocument => 4,
+            Self::FrameDetach => 5,
+            Self::Unknown | Self::None => 6,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum InventoryRevisionTarget {
+    Same,
+    Other,
+    Unknown,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FrameInventoryRejection {
+    pub last_attachment: Option<u64>,
+    pub selected_attachment: Option<u64>,
+    pub pass: FrameInventoryPass,
+    pub sealed: bool,
+    pub revision_mismatch: bool,
+    pub reservations: bool,
+    pub delta: Option<u16>,
+    pub events: Option<[u16; 7]>,
+    pub exact: bool,
+    pub last_event: InventoryRevisionEvent,
+    pub last_target: InventoryRevisionTarget,
+}
+pub(crate) fn frame_inventory_rejection(
+    generation: u64,
+    sequence: u64,
+    failure: FrameInventoryRejection,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        frame_inventory_rejection_into(capture, generation, sequence, failure);
+    }
+}
+fn frame_inventory_rejection_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    failure: FrameInventoryRejection,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::FrameInventoryRejection,
+        Facts {
+            generation: Some(generation),
+            frame_pass: Some(failure.pass),
+            sealed: Some(failure.sealed),
+            revision_mismatch: Some(failure.revision_mismatch),
+            reservations: Some(failure.reservations),
+            delta: failure.delta,
+            events: failure.events,
+            exact: Some(failure.exact),
+            last_event: Some(failure.last_event),
+            last_target: Some(failure.last_target),
+            ..Facts::default()
+        },
+    );
+    record_capture(
+        capture,
+        sequence,
+        Phase::FrameInventoryAttribution,
+        Facts {
+            generation: Some(generation),
+            frame_pass: Some(failure.pass),
+            last_attachment_ordinal: failure.last_attachment,
+            selected_attachment_ordinal: failure.selected_attachment,
+            ..Facts::default()
+        },
+    );
+}
+pub(crate) fn inventory_snapshot(
+    generation: u64,
+    sequence: u64,
+    point: InventoryPoint,
+    snapshot: InventorySnapshot,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        inventory_snapshot_into(capture, generation, sequence, point, snapshot);
+    }
+}
+fn inventory_snapshot_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    point: InventoryPoint,
+    snapshot: InventorySnapshot,
+) {
+    let inventory_ordinal = snapshot
+        .attachments
+        .map(|_| next_cleanup_ordinal(&INVENTORY_ORDINALS, TARGET_ORDINAL_LIMIT).unwrap_or(0));
+    record_capture(
+        capture,
+        sequence,
+        Phase::InventorySnapshot,
+        Facts {
+            generation: Some(generation),
+            inventory_ordinal,
+            inventory_point: Some(point),
+            inventory_observed: Some(
+                snapshot.observed && snapshot.reservations <= 8192 && snapshot.unconfigured <= 8192,
+            ),
+            inventory_sealed: Some(snapshot.sealed),
+            inventory_integrity_lost: Some(snapshot.integrity_lost),
+            inventory_first_loss: snapshot.first_loss,
+            inventory_reservations: Some(snapshot.reservations.min(8192) as u64),
+            inventory_unconfigured: Some(snapshot.unconfigured.min(8192) as u64),
+            ..Facts::default()
+        },
+    );
+    if let Some(targets) = snapshot.attachments {
+        let sampled = targets.attachments.iter().flatten().count();
+        record_capture(
+            capture,
+            sequence,
+            Phase::TargetInventorySummary,
+            Facts {
+                generation: Some(generation),
+                inventory_point: Some(point),
+                inventory_ordinal,
+                target_count: Some(targets.count.min(8192) as u64),
+                target_sampled: Some(sampled as u64),
+                target_observed: Some(
+                    targets.observed
+                        && targets.count <= TARGET_SAMPLE_LIMIT
+                        && sampled == targets.count,
+                ),
+                ..Facts::default()
+            },
+        );
+        for target in targets.attachments.into_iter().flatten() {
+            target_attribution_record(
+                capture,
+                generation,
+                sequence,
+                Some((point, inventory_ordinal.unwrap_or(0))),
+                target,
+            );
+            record_capture(
+                capture,
+                sequence,
+                Phase::TargetInventory,
+                Facts {
+                    generation: Some(generation),
+                    inventory_point: Some(point),
+                    inventory_ordinal,
+                    attachment_ordinal: Some(target.attachment),
+                    target_purpose: Some(target.purpose),
+                    target_classification: Some(target.classification),
+                    target_configured: Some(target.configured),
+                    target_resumed: Some(target.resumed),
+                    ..Facts::default()
+                },
+            );
+        }
+    }
+}
+/// The exact post-create boundary returning an error, before restart seals
+/// the owner. These closed stages contain no browser/session/target payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum RestartPostCreateStage {
+    ValidateReplacement,
+    CleanupUploads,
+    BindOwner,
+    PublishIdentity,
+    RecordingReady,
+    PublishResult,
+}
+pub(crate) fn restart_post_create_refusal(
+    generation: u64,
+    sequence: u64,
+    stage: RestartPostCreateStage,
+    error: &ProtocolError,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        restart_post_create_refusal_into(capture, generation, sequence, stage, error);
+    }
+}
+fn restart_post_create_refusal_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    stage: RestartPostCreateStage,
+    error: &ProtocolError,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::RestartPostCreateRefused,
+        Facts {
+            generation: Some(generation),
+            restart_post_create_stage: Some(stage),
+            error: Some(error.clone()),
+            ..Facts::default()
+        },
+    );
+}
+
+/// The retained scope-replacement failure boundary, before replacement seals
+/// the owner. These closed stages contain no browser/session/target payload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum ScopeReplacementStage {
+    AcceptedState,
+    StopOwner,
+    StopConnectionWatch,
+    BeginTransition,
+    DrainOperations,
+    DrainTasks,
+    ValidateOldScope,
+    BeginPeerReplacement,
+    RetirePeerRendezvous,
+    ConfirmPeerRetirement,
+    ContainRelease,
+    RetireReferences,
+    ReplacementInventory,
+    AdoptPeerReplacement,
+    CreateNativeReplacement,
+    InitializeRuntime,
+    RestoreState,
+    RecordingReady,
+    PublishInitialization,
+    PublishResult,
+    CreatePeerRendezvous,
+}
+pub(crate) fn scope_replacement_refusal(
+    generation: u64,
+    sequence: u64,
+    stage: ScopeReplacementStage,
+    error: &ProtocolError,
+) {
+    if let Some(capture) = CLEANUP_SINK.get().and_then(Option::as_ref) {
+        scope_replacement_refusal_into(capture, generation, sequence, stage, error);
+    }
+}
+fn scope_replacement_refusal_into(
+    capture: &Capture,
+    generation: u64,
+    sequence: u64,
+    stage: ScopeReplacementStage,
+    error: &ProtocolError,
+) {
+    record_capture(
+        capture,
+        sequence,
+        Phase::ScopeReplacementRefused,
+        Facts {
+            generation: Some(generation),
+            scope_replacement_stage: Some(stage),
+            error: Some(error.clone()),
+            ..Facts::default()
+        },
+    );
+}
+
+// Exhaustion disables observation instead of aliasing a previous identity.
+#[allow(deprecated)]
+fn next_cleanup_ordinal(counter: &AtomicU64, limit: u64) -> Option<u64> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+            (old < limit).then(|| old + 1)
+        })
+        .ok()
+        .map(|old| old + 1)
+}
+pub(crate) struct CleanupDiagnostics {
+    generation: u64,
+    owner: u64,
+    attempts: AtomicU64,
+    // attempt in the upper bits, first component in the low byte; one CAS binds
+    // the component to its exact attempt even across a later lifecycle boundary.
+    active: AtomicU64,
+}
+impl CleanupDiagnostics {
+    pub(crate) fn new(generation: u64) -> Arc<Self> {
+        Arc::new(Self {
+            generation,
+            owner: next_cleanup_ordinal(&CLEANUP_OWNERS, SAFE_INTEGER).unwrap_or(0),
+            attempts: AtomicU64::new(0),
+            active: AtomicU64::new(0),
+        })
+    }
+    pub(crate) fn begin(
+        self: &Arc<Self>,
+        lifecycle: CleanupLifecycle,
+        sequence: u64,
+    ) -> Option<CleanupAttempt> {
+        self.begin_enabled(
+            lifecycle,
+            sequence,
+            CLEANUP_SINK.get().is_some_and(Option::is_some),
+        )
+    }
+    fn begin_enabled(
+        self: &Arc<Self>,
+        lifecycle: CleanupLifecycle,
+        sequence: u64,
+        enabled: bool,
+    ) -> Option<CleanupAttempt> {
+        if !enabled || self.owner == 0 {
+            return None;
+        }
+        let ordinal = next_cleanup_ordinal(&self.attempts, MAX_CLEANUP_ATTEMPT)?;
+        self.active
+            .compare_exchange(0, ordinal << 8, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()?;
+        Some(CleanupAttempt {
+            cell: self.clone(),
+            ordinal,
+            lifecycle,
+            sequence,
+        })
+    }
+    pub(crate) fn observer(self: &Arc<Self>) -> Option<CleanupObserver> {
+        let ordinal = self.active.load(Ordering::Relaxed) >> 8;
+        (ordinal != 0).then(|| CleanupObserver {
+            cell: self.clone(),
+            ordinal,
+        })
+    }
+    fn failure_for(&self, ordinal: u64, component: CleanupComponent) {
+        let active = self.active.load(Ordering::Relaxed);
+        if ordinal != 0 && active >> 8 == ordinal && active & 255 == 0 {
+            let _ = self.active.compare_exchange(
+                active,
+                active | component as u64,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+        }
+    }
+    #[cfg(test)]
+    fn failure(&self, component: CleanupComponent) {
+        self.failure_for(self.active.load(Ordering::Relaxed) >> 8, component);
+    }
+}
+#[derive(Clone)]
+pub(crate) struct CleanupObserver {
+    cell: Arc<CleanupDiagnostics>,
+    ordinal: u64,
+}
+impl CleanupObserver {
+    pub(crate) fn failure(&self, component: CleanupComponent) {
+        self.cell.failure_for(self.ordinal, component);
+    }
+    pub(crate) fn observe<T, E>(&self, component: CleanupComponent, result: &Result<T, E>) {
+        if result.is_err() {
+            self.failure(component);
+        }
+    }
+}
+pub(crate) fn observe_cleanup<T, E>(
+    observer: &Option<CleanupObserver>,
+    component: CleanupComponent,
+    result: &Result<T, E>,
+) {
+    if let Some(observer) = observer {
+        observer.observe(component, result);
+    }
+}
+pub(crate) struct CleanupAttempt {
+    cell: Arc<CleanupDiagnostics>,
+    ordinal: u64,
+    lifecycle: CleanupLifecycle,
+    sequence: u64,
+}
+impl CleanupAttempt {
+    pub(crate) fn observer(&self) -> CleanupObserver {
+        CleanupObserver {
+            cell: self.cell.clone(),
+            ordinal: self.ordinal,
+        }
+    }
+    // The caller has already settled its cleanup obligations and saved the
+    // original product result. Sink failures cannot change either. A hung or
+    // killed attempt has no completed snapshot and must remain unknown.
+    pub(crate) fn finish<T>(self, result: &Result<T, ProtocolError>) {
+        self.finish_into(result, CLEANUP_SINK.get().and_then(Option::as_ref));
+    }
+    fn finish_into<T>(self, result: &Result<T, ProtocolError>, capture: Option<&Capture>) {
+        let state = self.cell.active.swap(0, Ordering::Relaxed);
+        if state >> 8 != self.ordinal {
+            return;
+        }
+        let Some(capture) = capture else {
+            return;
+        };
+        let facts = || Facts {
+            generation: Some(self.cell.generation),
+            cleanup_owner: Some(self.cell.owner),
+            cleanup_attempt: Some(self.ordinal),
+            cleanup_lifecycle: Some(self.lifecycle),
+            ..Facts::default()
+        };
+        record_capture(capture, self.sequence, Phase::CleanupStarted, facts());
+        if let Some(component) = CleanupComponent::from_code((state & 255) as u8) {
+            record_capture(
+                capture,
+                self.sequence,
+                Phase::CleanupFirstFailure,
+                Facts {
+                    cleanup_component: Some(component),
+                    ..facts()
+                },
+            );
+        }
+        record_capture(
+            capture,
+            self.sequence,
+            Phase::CleanupResult,
+            Facts {
+                cleanup_result: Some(if result.is_ok() {
+                    CleanupResult::Passed
+                } else {
+                    CleanupResult::Failed
+                }),
+                error: result.as_ref().err().cloned(),
+                ..facts()
+            },
+        );
+    }
+}
+
+impl CleanupAttempt {
+    fn clear_abandoned(&self, mut state: u64) {
+        // At most one same-attempt transition can race us: zero component to
+        // first component. Two CAS attempts suffice; never clear a newer run.
+        for _ in 0..2 {
+            if state >> 8 != self.ordinal {
+                return;
+            }
+            match self
+                .cell
+                .active
+                .compare_exchange(state, 0, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(current) => state = current,
+            }
+        }
+    }
+}
+impl Drop for CleanupAttempt {
+    fn drop(&mut self) {
+        // Losing a waiter loses observation only. Retained cleanup is neither
+        // cancelled nor prolonged, and an old observer cannot tag a later run.
+        self.clear_abandoned(self.cell.active.load(Ordering::Relaxed));
+    }
+}
+
+fn suppress(source: Source) {
+    if let Some(capture) = capture(source) {
+        increment(&capture.counters.suppressed, 1, &capture.counters.overflow);
+    }
+}
+
+#[cfg(test)]
+fn emit(sink: &Mutex<AppendSink>, record: Record, counters: &Counters) {
+    let Ok(mut sink) = sink.try_lock() else {
+        increment(&counters.dropped, 1, &counters.overflow);
+        return;
+    };
+    emit_locked(&mut sink, record, counters);
+}
+fn emit_locked(sink: &mut AppendSink, mut record: Record, counters: &Counters) {
+    record.dropped_before = counters.dropped.load(Ordering::Relaxed);
+    record.emitted_before = counters.emitted.load(Ordering::Relaxed);
+    record.suppressed_before = counters.suppressed.load(Ordering::Relaxed);
+    record.overflow |= counters.overflow.load(Ordering::Relaxed);
+    match sink.append(&record) {
+        Ok(Appended::Record) => {
+            increment(&counters.emitted, 1, &counters.overflow);
+        }
+        Ok(Appended::Limit) => {
+            increment(&counters.emitted, 1, &counters.overflow);
+            increment(&counters.dropped, 1, &counters.overflow);
+        }
+        _ => {
+            increment(&counters.dropped, 1, &counters.overflow);
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Appended {
+    Record,
+    Limit,
+    Dropped,
+}
+#[cfg(test)]
+#[derive(Default)]
+struct SinkFault {
+    partial_after: Option<usize>,
+    read: bool,
+    unlock: bool,
+}
+struct AppendSink {
+    file: File,
+    max_records: usize,
+    max_bytes: usize,
+    stopped: bool,
+    #[cfg(test)]
+    fault: SinkFault,
+}
+
+impl AppendSink {
+    fn open(path: &Path, max_records: usize, max_bytes: usize) -> io::Result<Self> {
+        if !path.is_absolute() || !std::fs::symlink_metadata(path)?.is_file() {
+            return Err(io::Error::other(
+                "capture needs an existing absolute regular file",
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options.read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+        }
+        let file = options.open(path)?;
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("capture needs a regular file"));
+        }
+        Ok(Self {
+            file,
+            max_records,
+            max_bytes,
+            stopped: false,
+            #[cfg(test)]
+            fault: SinkFault::default(),
+        })
+    }
+
+    fn append(&mut self, record: &Record) -> io::Result<Appended> {
+        if self.stopped {
+            return Ok(Appended::Dropped);
+        }
+        self.file.try_lock().map_err(io::Error::other)?;
+        let result = self.append_locked(record);
+        let unlocked = self.file.unlock();
+        #[cfg(test)]
+        let unlocked = if self.fault.unlock {
+            Err(io::Error::other("synthetic unlock failure"))
+        } else {
+            unlocked
+        };
+        match result {
+            Ok(appended) => unlocked.map(|()| appended),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn write_line(&mut self, line: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(prefix) = self.fault.partial_after {
+            self.file.write_all(&line[..prefix.min(line.len())])?;
+            return Err(io::Error::other("synthetic partial write failure"));
+        }
+        self.file.write_all(line)
+    }
+
+    fn append_locked(&mut self, record: &Record) -> io::Result<Appended> {
+        let mut line = serde_json::to_vec(record).map_err(io::Error::other)?;
+        line.push(b'\n');
+        if line.len() > MAX_RECORD_BYTES {
+            return Ok(Appended::Dropped);
+        }
+        self.file.seek(SeekFrom::Start(0))?;
+        let mut prior = Vec::new();
+        #[cfg(test)]
+        if self.fault.read {
+            return Err(io::Error::other("synthetic read failure"));
+        }
+        Read::by_ref(&mut self.file)
+            .take(self.max_bytes as u64 + 1)
+            .read_to_end(&mut prior)?;
+        if prior.len() > self.max_bytes
+            || (!prior.is_empty() && !prior.ends_with(b"\n"))
+            || prior
+                .windows(LIMIT_PHASE.len())
+                .any(|part| part == LIMIT_PHASE)
+        {
+            self.stopped = true;
+            return Ok(Appended::Dropped);
+        }
+        let count = prior.iter().filter(|byte| **byte == b'\n').count();
+        let limited = record.phase == Phase::CaptureLimitReached
+            || count.saturating_add(1) >= self.max_records
+            || prior
+                .len()
+                .saturating_add(line.len())
+                .saturating_add(MAX_RECORD_BYTES)
+                > self.max_bytes;
+        if limited {
+            let marker = Record {
+                schema_version: 2,
+                source: record.source,
+                pid: record.pid,
+                record: record.record,
+                operation_seq: 0,
+                phase: Phase::CaptureLimitReached,
+                dropped_before: record.dropped_before,
+                emitted_before: record.emitted_before,
+                suppressed_before: record.suppressed_before,
+                overflow: record.overflow,
+                facts: Facts::default(),
+            };
+            line = serde_json::to_vec(&marker).map_err(io::Error::other)?;
+            line.push(b'\n');
+        }
+        if count >= self.max_records || prior.len().saturating_add(line.len()) > self.max_bytes {
+            self.stopped = true;
+            return Ok(Appended::Dropped);
+        }
+        // Any partial append makes this artifact terminally incomplete. Never
+        // repair, truncate, reopen or retry it after a write failure.
+        if let Err(error) = self.write_line(&line) {
+            self.stopped = true;
+            return Err(error);
+        }
+        self.stopped = limited;
+        Ok(if limited {
+            Appended::Limit
+        } else {
+            Appended::Record
+        })
+    }
+}
+
+#[derive(Default)]
+struct LegCounters {
+    calls: AtomicU64,
+    total: AtomicU64,
+    outstanding: AtomicBool,
+    overflow: AtomicBool,
+}
+static TO_NATIVE: LegCounters = LegCounters {
+    calls: AtomicU64::new(0),
+    total: AtomicU64::new(0),
+    outstanding: AtomicBool::new(false),
+    overflow: AtomicBool::new(false),
+};
+static FROM_NATIVE: LegCounters = LegCounters {
+    calls: AtomicU64::new(0),
+    total: AtomicU64::new(0),
+    outstanding: AtomicBool::new(false),
+    overflow: AtomicBool::new(false),
+};
+impl LegCounters {
+    fn entered(&self) -> u64 {
+        let ordinal = increment(&self.calls, 1, &self.overflow);
+        self.outstanding.store(true, Ordering::Relaxed);
+        ordinal
+    }
+    fn returned(&self, result: &io::Result<usize>) {
+        if let Ok(length) = result {
+            increment(&self.total, *length as u64, &self.overflow);
+        }
+        self.outstanding.store(false, Ordering::Relaxed);
+    }
+}
+impl Leg {
+    fn counters(self) -> &'static LegCounters {
+        match self {
+            Self::ToNative => &TO_NATIVE,
+            Self::FromNative => &FROM_NATIVE,
+        }
+    }
+}
+thread_local! { static ACTIVE_LEG: Cell<Option<Leg>> = const { Cell::new(None) }; }
+
+pub(crate) struct CopyGuard {
+    leg: Leg,
+    previous: Option<Leg>,
+}
+impl CopyGuard {
+    pub(crate) fn start(leg: Leg) -> Self {
+        let previous = ACTIVE_LEG.with(|active| active.replace(Some(leg)));
+        proxy_record(Phase::CopyStarted, leg_facts(leg));
+        Self { leg, previous }
+    }
+    pub(crate) fn returned(&self, result: &io::Result<u64>) {
+        let mut facts = leg_facts(self.leg);
+        facts.io = Some(IoClass::result(result));
+        facts.length = result.as_ref().ok().copied();
+        proxy_record(Phase::CopyReturned, facts);
+    }
+}
+impl Drop for CopyGuard {
+    fn drop(&mut self) {
+        ACTIVE_LEG.with(|active| active.set(self.previous));
+        proxy_record(Phase::ProxySummary, leg_facts(self.leg));
+    }
+}
+
+fn leg_facts(leg: Leg) -> Facts {
+    let counters = leg.counters();
+    if counters.overflow.load(Ordering::Relaxed) {
+        if let Some(capture) = capture(Source::Proxy) {
+            capture.counters.overflow.store(true, Ordering::Relaxed);
+        }
+    }
+    Facts {
+        leg: Some(leg),
+        total: Some(counters.total.load(Ordering::Relaxed)),
+        calls: Some(counters.calls.load(Ordering::Relaxed)),
+        outstanding: Some(counters.outstanding.load(Ordering::Relaxed)),
+        ..Default::default()
+    }
+}
+
+pub(crate) struct SocketCall {
+    leg: Leg,
+    detailed: bool,
+}
+pub(crate) fn socket_enter(leg: Leg, length: usize) -> Option<SocketCall> {
+    if capture(Source::Proxy).is_none() || ACTIVE_LEG.with(|active| active.get()) != Some(leg) {
+        return None;
+    }
+    let counters = leg.counters();
+    let ordinal = counters.entered();
+    let detailed = ordinal < SOCKET_DETAIL_CALLS;
+    if detailed {
+        let mut facts = leg_facts(leg);
+        facts.length = Some(length as u64);
+        proxy_record(
+            match leg {
+                Leg::ToNative => Phase::SocketWriteEntered,
+                Leg::FromNative => Phase::SocketReadEntered,
+            },
+            facts,
+        );
+    } else {
+        suppress(Source::Proxy);
+        if ordinal == SOCKET_DETAIL_CALLS {
+            proxy_record(Phase::DetailLimit, leg_facts(leg));
+        }
+    }
+    Some(SocketCall { leg, detailed })
+}
+
+pub(crate) fn socket_return(call: Option<SocketCall>, result: &io::Result<usize>) {
+    let Some(call) = call else {
+        return;
+    };
+    let counters = call.leg.counters();
+    counters.returned(result);
+    if !call.detailed {
+        suppress(Source::Proxy);
+        return;
+    }
+    let mut facts = leg_facts(call.leg);
+    facts.length = result.as_ref().ok().map(|length| *length as u64);
+    facts.io = Some(match (call.leg, result) {
+        (Leg::FromNative, Ok(0)) => IoClass::Eof,
+        _ => IoClass::result(result),
+    });
+    proxy_record(
+        match call.leg {
+            Leg::ToNative => Phase::SocketWriteReturned,
+            Leg::FromNative => Phase::SocketReadReturned,
+        },
+        facts,
+    );
+}
+
+pub(super) struct FrameTrace {
+    consumed: u64,
+    pending: u64,
+    frames: u64,
+    details: u64,
+    seed_known: bool,
+    overflow: bool,
+    #[cfg(test)]
+    last_phase: Option<Phase>,
+}
+impl FrameTrace {
+    pub(super) fn new(hello_bytes: Option<usize>) -> Self {
+        Self {
+            consumed: hello_bytes.unwrap_or(0) as u64,
+            pending: 0,
+            frames: 0,
+            details: 0,
+            seed_known: hello_bytes.is_some(),
+            overflow: false,
+            #[cfg(test)]
+            last_phase: None,
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn test_state(&self) -> (u64, u64, u64, Option<Phase>) {
+        (self.consumed, self.pending, self.frames, self.last_phase)
+    }
+    pub(super) fn consumed(&mut self, bytes: usize, pending: usize) {
+        self.consumed = bounded(
+            self.consumed.saturating_add(bytes as u64),
+            &mut self.overflow,
+        );
+        self.pending = bounded(pending as u64, &mut self.overflow);
+    }
+    fn facts(&self) -> Facts {
+        if self.overflow {
+            if let Some(capture) = capture(Source::Native) {
+                capture.counters.overflow.store(true, Ordering::Relaxed);
+            }
+        }
+        Facts {
+            consumed_bytes: Some(self.consumed),
+            pending_bytes: Some(self.pending),
+            calls: Some(self.frames),
+            seed_known: Some(self.seed_known),
+            ..Default::default()
+        }
+    }
+    pub(super) fn observe(
+        &mut self,
+        phase: Phase,
+        frame_bytes: Option<usize>,
+        io: Option<IoClass>,
+    ) {
+        if matches!(phase, Phase::FrameComplete) {
+            self.frames = bounded(self.frames.saturating_add(1), &mut self.overflow);
+        }
+        let mut facts = self.facts();
+        facts.frame_bytes = frame_bytes.map(|bytes| bytes as u64);
+        facts.io = io;
+        self.detail(0, phase, facts);
+    }
+    pub(super) fn message(&mut self, phase: Phase, message: &ClientMessage) {
+        let (sequence, facts) = self.message_facts(message);
+        self.detail(sequence, phase, facts);
+    }
+    fn message_facts(&self, message: &ClientMessage) -> (u64, Facts) {
+        let (kind, sequence, generation) = match message {
+            ClientMessage::Hello { .. } => (MessageKind::Hello, 0, None),
+            ClientMessage::Request {
+                operation_seq,
+                generation,
+                ..
+            } => (MessageKind::Request, *operation_seq, Some(*generation)),
+            ClientMessage::Cancel {
+                operation_seq,
+                generation,
+                ..
+            } => (MessageKind::Cancel, *operation_seq, Some(*generation)),
+            ClientMessage::Decision { generation, .. } => {
+                (MessageKind::Decision, 0, Some(*generation))
+            }
+            ClientMessage::Close { generation, .. } => (MessageKind::Close, 0, Some(*generation)),
+        };
+        let mut facts = self.facts();
+        facts.message_kind = Some(kind);
+        facts.generation = generation;
+        (sequence, facts)
+    }
+    fn detail(&mut self, sequence: u64, phase: Phase, facts: Facts) {
+        #[cfg(test)]
+        {
+            self.last_phase = Some(phase);
+        }
+        if self.details < FRAME_DETAIL_RECORDS {
+            self.details += 1;
+            record(sequence, phase, facts);
+        } else {
+            suppress(Source::Native);
+            if self.details == FRAME_DETAIL_RECORDS {
+                self.details += 1;
+                record(0, Phase::DetailLimit, self.facts());
+            }
+        }
+    }
+}
+impl Drop for FrameTrace {
+    fn drop(&mut self) {
+        record(0, Phase::FrameSummary, self.facts());
+    }
+}
+
+// These original acceptance-phase contracts remain feature-only. Production
+// cleanup coverage lives in cleanup_diagnostic_tests below.
+#[cfg(all(test, feature = "acceptance-faults"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_worker_admission_is_closed_process_local_and_bounded() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let workers = AtomicU64::new(0);
+        for index in 0..10 {
+            let waiting = [Some(true), Some(false), None][index % 3];
+            let trace = ServiceWorkerAdmission::start_into(&capture, &workers, 7, waiting);
+            assert_eq!(trace.is_some(), index < 8);
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                assert!(line.len() < MAX_RECORD_BYTES);
+                serde_json::from_str(line).unwrap()
+            })
+            .collect();
+        assert_eq!(values.len(), 9);
+        for (index, value) in values[..8].iter().enumerate() {
+            assert_eq!(value["phase"], "ServiceWorkerAdmission");
+            assert_eq!(value["operationSeq"], 0);
+            assert_eq!(value["workerOrdinal"], index + 1);
+            assert_eq!(value["generation"], 7);
+            assert_eq!(value["admissionStep"], "owned-attachment");
+            assert_eq!(value["admissionState"], "done");
+            assert_eq!(
+                value["waitingForDebugger"],
+                [
+                    serde_json::json!(true),
+                    serde_json::json!(false),
+                    serde_json::json!("unknown")
+                ][index % 3]
+            );
+            let keys: Vec<_> = value
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                keys,
+                [
+                    "admissionState",
+                    "admissionStep",
+                    "droppedBefore",
+                    "emittedBefore",
+                    "generation",
+                    "operationSeq",
+                    "overflow",
+                    "phase",
+                    "pid",
+                    "record",
+                    "schemaVersion",
+                    "source",
+                    "suppressedBefore",
+                    "waitingForDebugger",
+                    "workerOrdinal"
+                ]
+            );
+        }
+        assert_eq!(values[8]["phase"], "CaptureLimitReached");
+        assert_eq!(values[8]["suppressedBefore"], 1);
+    }
+
+    #[test]
+    fn service_worker_admission_never_exceeds_thirty_two_observations() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let trace =
+            ServiceWorkerAdmission::start_into(&capture, &AtomicU64::new(0), 1, None).unwrap();
+        for _ in 0..40 {
+            trace.record_into(
+                &capture,
+                WorkerAdmissionStep::NetworkEnable,
+                WorkerAdmissionState::Enter,
+            );
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let values: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value["phase"] == "ServiceWorkerAdmission")
+                .count(),
+            32
+        );
+        assert_eq!(
+            values
+                .iter()
+                .filter(|value| value["phase"] == "CaptureLimitReached")
+                .count(),
+            1
+        );
+        assert!(values.iter().all(|value| value["operationSeq"] == 0));
+    }
+
+    #[tokio::test]
+    async fn service_worker_observer_preserves_success_failure_and_pending_futures() {
+        assert_eq!(
+            ServiceWorkerAdmission::observe(None, WorkerAdmissionStep::NetworkEnable, async {
+                Ok::<_, u8>(41)
+            })
+            .await,
+            Ok(41)
+        );
+        assert_eq!(
+            ServiceWorkerAdmission::observe(None, WorkerAdmissionStep::FetchEnable, async {
+                Err::<u8, _>(42)
+            })
+            .await,
+            Err(42)
+        );
+        assert_eq!(
+            ServiceWorkerAdmission::observe_sync(None, WorkerAdmissionStep::Configured, || Err::<
+                u8,
+                _,
+            >(
+                43
+            )),
+            Err(43)
+        );
+        let pending = ServiceWorkerAdmission::observe(
+            None,
+            WorkerAdmissionStep::RuntimeEnable,
+            std::future::pending::<Result<(), u8>>(),
+        );
+        tokio::pin!(pending);
+        tokio::select! {
+            biased;
+            _ = &mut pending => panic!("observer completed an unacknowledged command"),
+            _ = std::future::ready(()) => {}
+        }
+    }
+
+    fn sample(ordinal: u64) -> Record {
+        Record {
+            schema_version: 2,
+            source: Source::Native,
+            pid: 7,
+            record: ordinal,
+            operation_seq: 11,
+            phase: Phase::ResultFlushed,
+            dropped_before: 0,
+            emitted_before: 0,
+            suppressed_before: 0,
+            overflow: false,
+            facts: Facts {
+                generation: Some(1),
+                effects: Some(Effects::NotDispatched),
+                scope_state: Some(ScopeState::Usable),
+                error: Some(ProtocolError::DeadlineExceeded),
+                accepted: None,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn acceptance_phase_schema_contains_only_closed_facts() {
+        let value = serde_json::to_value(sample(0)).unwrap();
+        let keys: Vec<_> = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "droppedBefore",
+                "effects",
+                "emittedBefore",
+                "error",
+                "generation",
+                "operationSeq",
+                "overflow",
+                "phase",
+                "pid",
+                "record",
+                "schemaVersion",
+                "scopeState",
+                "source",
+                "suppressedBefore"
+            ]
+        );
+        assert_eq!(value["effects"], "not-dispatched");
+        assert_eq!(value["error"], "deadline-exceeded");
+        let mut ack = sample(1);
+        ack.phase = Phase::CancelRejected;
+        ack.facts.effects = None;
+        ack.facts.accepted = Some(false);
+        ack.facts.error = Some(ProtocolError::OperationMissing);
+        let ack = serde_json::to_value(ack).unwrap();
+        assert_eq!(ack["accepted"], false);
+        assert_eq!(ack["error"], "operation-missing");
+        assert!(ack.get("effects").is_none());
+    }
+
+    #[test]
+    fn acceptance_phase_shared_file_record_bound_is_global_and_marked_once() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut first = AppendSink::open(file.path(), 3, 4096).unwrap();
+        let mut second = AppendSink::open(file.path(), 3, 4096).unwrap();
+        assert_eq!(first.append(&sample(0)).unwrap(), Appended::Record);
+        assert_eq!(second.append(&sample(1)).unwrap(), Appended::Record);
+        assert_eq!(first.append(&sample(2)).unwrap(), Appended::Limit);
+        assert_eq!(second.append(&sample(3)).unwrap(), Appended::Dropped);
+        let contents = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(contents.lines().count(), 3);
+        assert_eq!(contents.matches("CaptureLimitReached").count(), 1);
+        for line in contents.lines() {
+            serde_json::from_str::<serde_json::Value>(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn acceptance_phase_byte_bound_is_global_and_never_truncates_a_record() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut first = AppendSink::open(file.path(), 100, 1024).unwrap();
+        let mut second = AppendSink::open(file.path(), 100, 1024).unwrap();
+        let mut reached_limit = false;
+        for ordinal in 0..100 {
+            let sink = if ordinal % 2 == 0 {
+                &mut first
+            } else {
+                &mut second
+            };
+            if sink.append(&sample(ordinal)).unwrap() != Appended::Record {
+                reached_limit = true;
+                break;
+            }
+        }
+        assert!(reached_limit);
+        let contents = std::fs::read(file.path()).unwrap();
+        assert!(contents.len() <= 1024);
+        assert!(contents.ends_with(b"\n"));
+        assert_eq!(
+            String::from_utf8_lossy(&contents)
+                .matches("CaptureLimitReached")
+                .count(),
+            1
+        );
+        assert_eq!(second.append(&sample(101)).unwrap(), Appended::Dropped);
+        assert_eq!(std::fs::read(file.path()).unwrap(), contents);
+    }
+
+    #[test]
+    fn acceptance_phase_refuses_unowned_paths_or_incomplete_existing_records() {
+        assert!(AppendSink::open(Path::new("relative.jsonl"), MAX_RECORDS, MAX_BYTES).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        assert!(AppendSink::open(directory.path(), MAX_RECORDS, MAX_BYTES).is_err());
+        assert!(AppendSink::open(
+            &directory.path().join("missing.jsonl"),
+            MAX_RECORDS,
+            MAX_BYTES
+        )
+        .is_err());
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"partial").unwrap();
+        let mut sink = AppendSink::open(file.path(), MAX_RECORDS, MAX_BYTES).unwrap();
+        assert_eq!(sink.append(&sample(0)).unwrap(), Appended::Dropped);
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"partial");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn acceptance_phase_refuses_symlink_and_fifo_targets_without_opening_them() {
+        use std::os::unix::ffi::OsStrExt;
+        let directory = tempfile::tempdir().unwrap();
+        let target = tempfile::NamedTempFile::new().unwrap();
+        let link = directory.path().join("phase-link");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        assert!(AppendSink::open(&link, MAX_RECORDS, MAX_BYTES).is_err());
+        let fifo = directory.path().join("phase-fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // A private test FIFO with no peer would block an ordinary write open.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        assert!(AppendSink::open(&fifo, MAX_RECORDS, MAX_BYTES).is_err());
+        assert!(std::fs::read(target.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn acceptance_phase_contention_drops_without_waiting_and_marks_next_record() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let sink = Mutex::new(AppendSink::open(file.path(), MAX_RECORDS, MAX_BYTES).unwrap());
+        let counters = Counters::default();
+        let held = sink.lock().unwrap();
+        emit(&sink, sample(0), &counters);
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
+        drop(held);
+        emit(&sink, sample(1), &counters);
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        assert_eq!(value["record"], 1);
+        assert_eq!(value["droppedBefore"], 1);
+    }
+
+    #[test]
+    fn acceptance_phase_file_lock_and_write_failures_only_drop_capture() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.path())
+            .unwrap();
+        other.lock().unwrap();
+        let sink = Mutex::new(AppendSink::open(file.path(), MAX_RECORDS, MAX_BYTES).unwrap());
+        let counters = Counters::default();
+        emit(&sink, sample(0), &counters);
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 1);
+        other.unlock().unwrap();
+        let read_only = Mutex::new(AppendSink {
+            file: File::open(file.path()).unwrap(),
+            max_records: MAX_RECORDS,
+            max_bytes: MAX_BYTES,
+            stopped: false,
+            #[cfg(test)]
+            fault: SinkFault::default(),
+        });
+        emit(&read_only, sample(1), &counters);
+        assert_eq!(counters.dropped.load(Ordering::Relaxed), 2);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn acceptance_phase_scalar_counters_preserve_short_zero_and_error_results() {
+        let counters = LegCounters::default();
+        let results = [
+            Ok(3),
+            Err(io::Error::from(io::ErrorKind::Interrupted)),
+            Ok(0),
+            Err(io::Error::from(io::ErrorKind::BrokenPipe)),
+            Ok(2),
+        ];
+        for (ordinal, result) in results.iter().enumerate() {
+            assert_eq!(counters.entered(), ordinal as u64);
+            assert!(counters.outstanding.load(Ordering::Relaxed));
+            let before = result.as_ref().map(|n| *n).map_err(|e| e.kind());
+            counters.returned(result);
+            assert_eq!(result.as_ref().map(|n| *n).map_err(|e| e.kind()), before);
+            assert!(!counters.outstanding.load(Ordering::Relaxed));
+        }
+        assert_eq!(counters.calls.load(Ordering::Relaxed), 5);
+        assert_eq!(counters.total.load(Ordering::Relaxed), 5);
+        for _ in 0..SOCKET_DETAIL_CALLS {
+            counters.entered();
+            counters.returned(&Ok(1));
+        }
+        assert_eq!(
+            counters.total.load(Ordering::Relaxed),
+            5 + SOCKET_DETAIL_CALLS
+        );
+        assert_eq!(
+            IoClass::result(&Err::<(), _>(io::Error::other(
+                "https://secret.invalid/path?token=do-not-serialize"
+            ))),
+            IoClass::Other
+        );
+    }
+
+    #[test]
+    fn acceptance_phase_saturates_safe_integer_counters_and_facts() {
+        let counter = AtomicU64::new(SAFE_INTEGER - 1);
+        let overflow = AtomicBool::new(false);
+        assert_eq!(increment(&counter, u64::MAX, &overflow), SAFE_INTEGER - 1);
+        assert_eq!(counter.load(Ordering::Relaxed), SAFE_INTEGER);
+        assert!(overflow.load(Ordering::Relaxed));
+        let mut facts = Facts {
+            generation: Some(u64::MAX),
+            total: Some(u64::MAX),
+            ..Default::default()
+        };
+        let mut clipped = false;
+        facts.clamp(&mut clipped);
+        assert!(clipped);
+        assert_eq!(facts.generation, Some(SAFE_INTEGER));
+        assert_eq!(facts.total, Some(SAFE_INTEGER));
+    }
+
+    #[test]
+    fn acceptance_phase_proxy_and_frame_shapes_are_closed_and_payload_free() {
+        let mut record = sample(1);
+        record.source = Source::Proxy;
+        record.phase = Phase::SocketWriteReturned;
+        record.facts = Facts {
+            leg: Some(Leg::ToNative),
+            io: Some(IoClass::Ok),
+            length: Some(3),
+            total: Some(7),
+            calls: Some(2),
+            outstanding: Some(false),
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["source"], "proxy");
+        assert_eq!(value["leg"], "to-native");
+        assert_eq!(value["io"], "ok");
+        assert!(value.get("generation").is_none());
+        let mut frame = FrameTrace::new(Some(15));
+        frame.consumed(9, 9);
+        assert_eq!(frame.test_state(), (24, 9, 0, None));
+        frame.consumed(2, 0);
+        frame.observe(Phase::FrameComplete, Some(11), None);
+        assert_eq!(frame.test_state(), (26, 0, 1, Some(Phase::FrameComplete)));
+        for _ in 0..FRAME_DETAIL_RECORDS * 2 {
+            frame.observe(Phase::FrameCleanEof, None, None);
+        }
+        assert_eq!(frame.details, FRAME_DETAIL_RECORDS + 1);
+        assert_eq!(frame.facts().consumed_bytes, Some(26));
+        assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
+    }
+
+    #[test]
+    fn acceptance_phase_largest_summary_and_detail_fit_record_bound() {
+        let mut record = sample(SAFE_INTEGER);
+        record.pid = u32::MAX;
+        record.operation_seq = SAFE_INTEGER;
+        record.dropped_before = SAFE_INTEGER;
+        record.emitted_before = SAFE_INTEGER;
+        record.suppressed_before = SAFE_INTEGER;
+        record.overflow = true;
+        for facts in [
+            Facts {
+                leg: Some(Leg::FromNative),
+                io: Some(IoClass::ConnectionAborted),
+                length: Some(SAFE_INTEGER),
+                total: Some(SAFE_INTEGER),
+                calls: Some(SAFE_INTEGER),
+                outstanding: Some(false),
+                ..Default::default()
+            },
+            Facts {
+                generation: Some(SAFE_INTEGER),
+                message_kind: Some(MessageKind::Decision),
+                consumed_bytes: Some(SAFE_INTEGER),
+                pending_bytes: Some(SAFE_INTEGER),
+                calls: Some(SAFE_INTEGER),
+                seed_known: Some(false),
+                ..Default::default()
+            },
+        ] {
+            record.phase = Phase::FrameAdmissionRefused;
+            record.facts = facts;
+            assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
+        }
+    }
+
+    #[test]
+    fn acceptance_phase_decoded_message_and_io_error_never_serialize_secrets() {
+        let sentinel = "private-token-https://secret.invalid/path-command";
+        let trace = FrameTrace::new(Some(123));
+        let message = ClientMessage::Request {
+            id: sentinel.into(),
+            generation: 1,
+            operation_seq: 10,
+            timeout_ms: 2000,
+            callback_token: Some(sentinel.into()),
+            command: sentinel.into(),
+            args: serde_json::json!({"key": sentinel})
+                .as_object()
+                .unwrap()
+                .clone(),
+        };
+        let (sequence, facts) = trace.message_facts(&message);
+        let mut record = sample(0);
+        record.operation_seq = sequence;
+        record.phase = Phase::FrameDecoded;
+        record.facts = facts;
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(!json.contains(sentinel));
+        assert!(!json.contains("private"));
+        assert!(!json.contains("https"));
+        assert!(!json.contains("command"));
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["messageKind"], "request");
+        assert_eq!(value["operationSeq"], 10);
+        assert_eq!(value["generation"], 1);
+        record.phase = Phase::FrameIoError;
+        record.operation_seq = 0;
+        record.facts = trace.facts();
+        record.facts.io = Some(IoClass::error(&io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            sentinel,
+        )));
+        let json = serde_json::to_string(&record).unwrap();
+        assert!(json.contains("broken-pipe"));
+        assert!(!json.contains(sentinel));
+    }
+
+    #[test]
+    fn acceptance_phase_write_failure_stops_without_repair_or_retry() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut sink = AppendSink {
+            file: File::open(file.path()).unwrap(),
+            max_records: MAX_RECORDS,
+            max_bytes: MAX_BYTES,
+            stopped: false,
+            #[cfg(test)]
+            fault: SinkFault::default(),
+        };
+        assert!(sink.append(&sample(0)).is_err());
+        assert!(sink.stopped);
+        assert_eq!(sink.append(&sample(1)).unwrap(), Appended::Dropped);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+#[path = "client_cleanup_diagnostic_tests.rs"]
+mod cleanup_tests;
+
+// Terminal cleanup diagnostics are also present in the production ELF.
+#[cfg(test)]
+mod terminal_cleanup_tests {
+    use super::*;
+    #[test]
+    fn terminal_cleanup_checkpoints_have_closed_payloads() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        terminal_cleanup_checkpoint_into(
+            &capture,
+            TerminalCleanupStage::LedgerCommandsPresent,
+            false,
+        );
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::FinalCommit, true);
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let records: Vec<serde_json::Value> = text
+            .lines()
+            .map(|line| {
+                assert!(line.len() < MAX_RECORD_BYTES);
+                serde_json::from_str(line).unwrap()
+            })
+            .collect();
+        let checkpoints: Vec<_> = records
+            .iter()
+            .filter(|value| value["phase"] == "TerminalCleanupCheckpoint")
+            .collect();
+        assert_eq!(checkpoints.len(), 2);
+        assert_eq!(
+            checkpoints[0]["terminalCleanupStage"],
+            "ledger-commands-present"
+        );
+        assert_eq!(checkpoints[0]["terminalCleanupOk"], false);
+        assert_eq!(checkpoints[1]["terminalCleanupStage"], "final-commit");
+        assert_eq!(checkpoints[1]["terminalCleanupOk"], true);
+        for value in checkpoints {
+            assert_eq!(value["operationSeq"], 0);
+            assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "schemaVersion"
+                    | "source"
+                    | "pid"
+                    | "record"
+                    | "operationSeq"
+                    | "phase"
+                    | "droppedBefore"
+                    | "emittedBefore"
+                    | "suppressedBefore"
+                    | "overflow"
+                    | "terminalCleanupStage"
+                    | "terminalCleanupOk"
+            )));
+        }
+    }
+}
+
+#[cfg(test)]
+mod protected_capture_diagnostic_tests {
+    use super::*;
+    use crate::native::client_capture::{CaptureAttemptFailure, CapturePhase, CaptureReason};
+
+    #[test]
+    fn optional_pixel_native_result_uses_only_three_boolean_result_facts() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        observation_pixel_result_into(&capture, 1, 2, true, false, true);
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert!(text.trim().len() < MAX_RECORD_BYTES);
+        let value: serde_json::Value = serde_json::from_str(text.trim()).unwrap();
+        assert_eq!(value["phase"], "ObservationPixelResult");
+        assert_eq!(value["accepted"], true);
+        assert_eq!(value["pixelsAvailable"], false);
+        assert_eq!(value["earlySemantic"], true);
+        assert!(value.as_object().unwrap().keys().all(|key| matches!(
+            key.as_str(),
+            "schemaVersion"
+                | "source"
+                | "pid"
+                | "record"
+                | "operationSeq"
+                | "phase"
+                | "droppedBefore"
+                | "emittedBefore"
+                | "suppressedBefore"
+                | "overflow"
+                | "generation"
+                | "accepted"
+                | "pixelsAvailable"
+                | "earlySemantic"
+        )));
+    }
+
+    #[test]
+    fn protected_capture_refusal_keeps_original_phase_reason_and_bounded_payload() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        protected_capture_failure_into(
+            &capture,
+            u64::MAX,
+            u64::MAX,
+            CaptureAttemptFailure {
+                phase: CapturePhase::IndependentCoverage,
+                reason: CaptureReason::UnsafeGeometry,
+            },
+            u64::MAX,
+        );
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        let line = text
+            .lines()
+            .find(|line| line.contains("ProtectedCaptureFailure"))
+            .unwrap();
+        assert!(line.len() < MAX_RECORD_BYTES);
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["protectedCapturePhase"], "independent-coverage");
+        assert_eq!(value["protectedCaptureReason"], "unsafe-geometry");
+        assert_eq!(value["captureBudgetMs"], SAFE_INTEGER);
+        assert_eq!(value["generation"], SAFE_INTEGER);
+        assert_eq!(value["operationSeq"], SAFE_INTEGER);
+        assert!(value.as_object().unwrap().keys().all(|key| matches!(
+            key.as_str(),
+            "schemaVersion"
+                | "source"
+                | "pid"
+                | "record"
+                | "operationSeq"
+                | "phase"
+                | "droppedBefore"
+                | "emittedBefore"
+                | "suppressedBefore"
+                | "overflow"
+                | "generation"
+                | "protectedCapturePhase"
+                | "protectedCaptureReason"
+                | "captureBudgetMs"
+        )));
+    }
+}
+
+#[cfg(test)]
+mod upload_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn upload_preflight_is_closed_bounded_and_does_not_serialize_probe_text() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let sentinel = "private renderer value";
+        for (value, expected) in [
+            (Some("label"), "label"),
+            (Some("disabled"), "disabled"),
+            (Some(sentinel), "unknown"),
+            (None, "unknown"),
+        ] {
+            upload_preflight_refusal_into(&capture, 1, 2, UploadRefusal::from_probe(value), true);
+            let text = std::fs::read_to_string(file.path()).unwrap();
+            let line = text.lines().last().unwrap();
+            assert!(line.len() < MAX_RECORD_BYTES);
+            assert!(!line.contains(sentinel));
+            let record: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(record["phase"], "UploadPreflightRefusal");
+            assert_eq!(record["uploadRefusal"], expected);
+            assert_eq!(record["zeroInput"], true);
+            assert!(record.get("effects").is_none());
+        }
+    }
+}
+
+#[cfg(test)]
+mod query_scope_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn query_scope_diagnostics_are_closed_and_contain_no_target_payload() {
+        let value = serde_json::to_value(Facts {
+            generation: Some(3),
+            query_scope_stage: Some(QueryScopeStage::Recheck),
+            query_scope_reason: Some(QueryScopeReason::WatermarkPending),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":3,"queryScopeStage":"recheck","queryScopeReason":"watermark-pending"})
+        );
+        assert_eq!(
+            serde_json::to_value(Phase::QueryScopeRefusal).unwrap(),
+            "QueryScopeRefusal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_target_kind_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn query_target_kind_distinguishes_exact_other_from_unrecognized_without_raw_values() {
+        assert_eq!(
+            DiagnosticTargetKind::from_native("other"),
+            DiagnosticTargetKind::CdpOther
+        );
+        assert_eq!(
+            DiagnosticTargetKind::from_native("browser_ui"),
+            DiagnosticTargetKind::BrowserUi
+        );
+        for raw in ["", "unlisted-private-kind", "OTHER", "other-private-suffix"] {
+            assert_eq!(
+                DiagnosticTargetKind::from_native(raw),
+                DiagnosticTargetKind::Unrecognized
+            );
+            assert_eq!(
+                serde_json::to_value(DiagnosticTargetKind::from_native(raw)).unwrap(),
+                "unrecognized"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(DiagnosticTargetKind::from_native("other")).unwrap(),
+            "cdp-other"
+        );
+    }
+    #[test]
+    fn query_lineage_refusal_reasons_are_distinct_closed_labels() {
+        assert_eq!(
+            serde_json::to_value(QueryScopeReason::ForeignOwner).unwrap(),
+            "foreign-owner"
+        );
+        assert_eq!(
+            serde_json::to_value(QueryScopeReason::UnclassifiedPurpose).unwrap(),
+            "unclassified-purpose"
+        );
+        assert_eq!(
+            serde_json::to_value(QueryScopeReason::UnknownLineage).unwrap(),
+            "unknown-lineage"
+        );
+        let value = serde_json::to_value(Facts {
+            generation: Some(1),
+            attachment_ordinal: Some(5),
+            target_ordinal: Some(5),
+            target_kind: Some(DiagnosticTargetKind::CdpOther),
+            query_scope_stage: Some(QueryScopeStage::Acquire),
+            query_scope_reason: Some(QueryScopeReason::UnknownLineage),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":1,"attachmentOrdinal":5,"targetOrdinal":5,"targetKind":"cdp-other","queryScopeStage":"acquire","queryScopeReason":"unknown-lineage"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod restart_post_create_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn restart_post_create_refusal_has_closed_bounded_schema() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let error = ProtocolError::StaleScope;
+        for (stage, label) in [
+            (
+                RestartPostCreateStage::ValidateReplacement,
+                "validate-replacement",
+            ),
+            (RestartPostCreateStage::CleanupUploads, "cleanup-uploads"),
+            (RestartPostCreateStage::BindOwner, "bind-owner"),
+            (RestartPostCreateStage::PublishIdentity, "publish-identity"),
+            (RestartPostCreateStage::RecordingReady, "recording-ready"),
+            (RestartPostCreateStage::PublishResult, "publish-result"),
+        ] {
+            restart_post_create_refusal_into(&capture, 3, 5, stage, &error);
+            let text = std::fs::read_to_string(file.path()).unwrap();
+            let line = text.lines().last().unwrap();
+            assert!(line.len() < MAX_RECORD_BYTES);
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["phase"], "RestartPostCreateRefused");
+            assert_eq!(value["restartPostCreateStage"], label);
+            assert_eq!(value["error"], "stale-scope");
+            assert_eq!(value["generation"], 3);
+            assert_eq!(value["operationSeq"], 5);
+            assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "schemaVersion"
+                    | "source"
+                    | "pid"
+                    | "record"
+                    | "operationSeq"
+                    | "phase"
+                    | "droppedBefore"
+                    | "emittedBefore"
+                    | "suppressedBefore"
+                    | "overflow"
+                    | "generation"
+                    | "restartPostCreateStage"
+                    | "error"
+            )));
+        }
+        assert_eq!(error, ProtocolError::StaleScope);
+    }
+    #[test]
+    fn restart_post_create_facts_do_not_add_outcome_or_identity_authority() {
+        let value = serde_json::to_value(Facts {
+            generation: Some(1),
+            restart_post_create_stage: Some(RestartPostCreateStage::BindOwner),
+            error: Some(ProtocolError::StaleScope),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":1,"restartPostCreateStage":"bind-owner","error":"stale-scope"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_frame_phase_schema_test {
+    use super::QueryScopeStage;
+    #[test]
+    fn query_frame_phase_diagnostic_is_closed_and_content_free() {
+        for (phase, value) in [
+            (QueryScopeStage::WarmWorlds, "warm-worlds"),
+            (QueryScopeStage::InitialFrames, "initial-frames"),
+            (QueryScopeStage::InitialFramesEntry, "initial-frames-entry"),
+            (QueryScopeStage::InitialFramesExit, "initial-frames-exit"),
+            (QueryScopeStage::ProtectedFrames, "protected-frames"),
+            (QueryScopeStage::FinalFrames, "final-frames"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(phase).unwrap(),
+                serde_json::json!(value)
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod critical_query_stream_tests {
+    use super::*;
+    #[test]
+    fn critical_query_stream_is_independent_bounded_and_closed() {
+        let ordinary = tempfile::NamedTempFile::new().unwrap();
+        let critical = tempfile::NamedTempFile::new().unwrap();
+        let ordinary_capture = Capture::new(
+            Source::Native,
+            AppendSink::open(ordinary.path(), 2, 2048).unwrap(),
+        );
+        for _ in 0..8 {
+            record_capture(
+                &ordinary_capture,
+                0,
+                Phase::TargetLifecycle,
+                Facts::default(),
+            );
+        }
+        let capture = query_capture(Some(critical.path())).unwrap();
+        record_capture(&capture, 0, Phase::CaptureStarted, Facts::default());
+        critical_query_refusal(
+            &capture,
+            9,
+            17,
+            QueryScopeStage::FinalFrames,
+            QueryScopeReason::WatermarkPending,
+        );
+        let lines = std::fs::read_to_string(critical.path()).unwrap();
+        let values: Vec<serde_json::Value> = lines
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(values.len(), 2);
+        let refusal = &values[1];
+        assert_eq!(refusal["phase"], "QueryScopeRefusal");
+        assert_eq!(refusal["generation"], 9);
+        assert_eq!(refusal["operationSeq"], 17);
+        assert_eq!(refusal["queryScopeStage"], "final-frames");
+        assert_eq!(refusal["queryScopeReason"], "watermark-pending");
+        assert_eq!(refusal["droppedBefore"], 0);
+        for key in [
+            "targetOrdinal",
+            "attachmentOrdinal",
+            "targetKind",
+            "url",
+            "selector",
+            "payload",
+        ] {
+            assert!(refusal.get(key).is_none());
+        }
+        for _ in 0..QUERY_MAX_RECORDS + 5 {
+            critical_query_refusal(
+                &capture,
+                9,
+                18,
+                QueryScopeStage::Acquire,
+                QueryScopeReason::UnknownLineage,
+            );
+        }
+        let bytes = std::fs::read(critical.path()).unwrap();
+        assert!(bytes.len() <= QUERY_MAX_BYTES);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.lines().count() <= QUERY_MAX_RECORDS);
+        assert_eq!(text.matches("CaptureLimitReached").count(), 1);
+        assert!(capture.counters.dropped.load(Ordering::Relaxed) > 0);
+    }
+    #[test]
+    fn critical_query_internal_owner_violation_is_terminal_not_complete() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = query_capture(Some(file.path())).unwrap();
+        let held = capture.sink.lock().unwrap();
+        critical_query_refusal(
+            &capture,
+            1,
+            3,
+            QueryScopeStage::Acquire,
+            QueryScopeReason::UnknownLineage,
+        );
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 1);
+        drop(held);
+        critical_query_refusal(
+            &capture,
+            1,
+            4,
+            QueryScopeStage::InitialFrames,
+            QueryScopeReason::WatermarkPending,
+        );
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+        assert!(capture.failed.load(Ordering::Acquire));
+        assert!(capture.counters.overflow.load(Ordering::Acquire));
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn critical_query_stream_requires_explicit_existing_regular_file() {
+        assert!(query_capture(None).is_none());
+        assert!(query_capture(Some(Path::new("relative.jsonl"))).is_none());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(query_capture(Some(dir.path())).is_none());
+        assert!(query_capture(Some(&dir.path().join("missing.jsonl"))).is_none());
+    }
+}
+
+#[cfg(test)]
+mod scope_replacement_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn scope_replacement_refusal_has_closed_bounded_schema() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = cleanup_capture(Some(file.path())).unwrap();
+        let error = ProtocolError::Cancelled;
+        for (stage, label) in [
+            (ScopeReplacementStage::AcceptedState, "accepted-state"),
+            (ScopeReplacementStage::StopOwner, "stop-owner"),
+            (
+                ScopeReplacementStage::StopConnectionWatch,
+                "stop-connection-watch",
+            ),
+            (ScopeReplacementStage::BeginTransition, "begin-transition"),
+            (ScopeReplacementStage::DrainOperations, "drain-operations"),
+            (ScopeReplacementStage::DrainTasks, "drain-tasks"),
+            (
+                ScopeReplacementStage::ValidateOldScope,
+                "validate-old-scope",
+            ),
+            (
+                ScopeReplacementStage::BeginPeerReplacement,
+                "begin-peer-replacement",
+            ),
+            (
+                ScopeReplacementStage::RetirePeerRendezvous,
+                "retire-peer-rendezvous",
+            ),
+            (
+                ScopeReplacementStage::ConfirmPeerRetirement,
+                "confirm-peer-retirement",
+            ),
+            (ScopeReplacementStage::ContainRelease, "contain-release"),
+            (ScopeReplacementStage::RetireReferences, "retire-references"),
+            (
+                ScopeReplacementStage::ReplacementInventory,
+                "replacement-inventory",
+            ),
+            (
+                ScopeReplacementStage::AdoptPeerReplacement,
+                "adopt-peer-replacement",
+            ),
+            (
+                ScopeReplacementStage::CreateNativeReplacement,
+                "create-native-replacement",
+            ),
+            (
+                ScopeReplacementStage::InitializeRuntime,
+                "initialize-runtime",
+            ),
+            (ScopeReplacementStage::RestoreState, "restore-state"),
+            (ScopeReplacementStage::RecordingReady, "recording-ready"),
+            (
+                ScopeReplacementStage::PublishInitialization,
+                "publish-initialization",
+            ),
+            (ScopeReplacementStage::PublishResult, "publish-result"),
+            (
+                ScopeReplacementStage::CreatePeerRendezvous,
+                "create-peer-rendezvous",
+            ),
+        ] {
+            scope_replacement_refusal_into(&capture, 3, 5, stage, &error);
+            let text = std::fs::read_to_string(file.path()).unwrap();
+            let line = text.lines().last().unwrap();
+            assert!(line.len() < MAX_RECORD_BYTES);
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(value["phase"], "ScopeReplacementRefused");
+            assert_eq!(value["scopeReplacementStage"], label);
+            assert_eq!(value["error"], "cancelled");
+            assert_eq!(value["generation"], 3);
+            assert_eq!(value["operationSeq"], 5);
+            assert!(value.as_object().unwrap().keys().all(|key| matches!(
+                key.as_str(),
+                "schemaVersion"
+                    | "source"
+                    | "pid"
+                    | "record"
+                    | "operationSeq"
+                    | "phase"
+                    | "droppedBefore"
+                    | "emittedBefore"
+                    | "suppressedBefore"
+                    | "overflow"
+                    | "generation"
+                    | "scopeReplacementStage"
+                    | "error"
+            )));
+        }
+        assert_eq!(error, ProtocolError::Cancelled);
+    }
+    #[test]
+    fn scope_replacement_facts_do_not_add_outcome_or_identity_authority() {
+        let value = serde_json::to_value(Facts {
+            generation: Some(1),
+            scope_replacement_stage: Some(ScopeReplacementStage::StopOwner),
+            error: Some(ProtocolError::Cancelled),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":1,"scopeReplacementStage":"stop-owner","error":"cancelled"})
+        );
+    }
+}
+
+#[cfg(test)]
+mod query_read_schema_tests {
+    use super::*;
+    #[test]
+    fn query_read_receipt_is_closed_and_contains_no_scope_or_renderer_payload() {
+        let value = serde_json::to_value(Facts {
+            generation: Some(1),
+            query_read_stage: Some(QueryReadStage::Metadata),
+            query_read_error: Some(ObservationReadError::BackendFailure),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"generation":1,"queryReadStage":"metadata","queryReadError":"backend-failure"})
+        );
+        assert_eq!(
+            serde_json::to_value(Phase::QueryReadFailure).unwrap(),
+            "QueryReadFailure"
+        );
+    }
+    #[test]
+    fn timed_field_failure_fits_unchanged_record_bound() {
+        let record = Record {
+            schema_version: 2,
+            source: Source::Native,
+            pid: u32::MAX,
+            record: SAFE_INTEGER,
+            operation_seq: SAFE_INTEGER,
+            phase: Phase::QueryReadFailure,
+            dropped_before: SAFE_INTEGER,
+            emitted_before: SAFE_INTEGER,
+            suppressed_before: SAFE_INTEGER,
+            overflow: true,
+            facts: Facts {
+                generation: Some(SAFE_INTEGER),
+                query_read_stage: Some(QueryReadStage::ReadFramesBefore),
+                query_read_error: Some(ObservationReadError::UnsupportedCapability),
+                query_read_ms: Some([u16::MAX; 13]),
+                ..Facts::default()
+            },
+        };
+        assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
+        assert_eq!(QUERY_MAX_RECORDS, 128);
+        assert_eq!(QUERY_MAX_BYTES, 64 * 1024);
+    }
+    #[test]
+    fn split_target_differences_have_fixed_serialization() {
+        let reasons = [
+            (
+                QueryScopeReason::SelectedTargetMissing,
+                "selected-target-missing",
+            ),
+            (
+                QueryScopeReason::DependencyRevisionChanged,
+                "dependency-revision-changed",
+            ),
+            (
+                QueryScopeReason::DependencySetChanged,
+                "dependency-set-changed",
+            ),
+            (
+                QueryScopeReason::DependencyIdentityChanged,
+                "dependency-identity-changed",
+            ),
+            (
+                QueryScopeReason::TargetRevisionChanged,
+                "target-revision-changed",
+            ),
+            (
+                QueryScopeReason::UnknownRevisionChanged,
+                "unknown-revision-changed",
+            ),
+            (QueryScopeReason::TargetCountChanged, "target-count-changed"),
+            (
+                QueryScopeReason::TargetIdentityChanged,
+                "target-identity-changed",
+            ),
+            (
+                QueryScopeReason::TargetLineageChanged,
+                "target-lineage-changed",
+            ),
+            (
+                QueryScopeReason::EnrollmentTargetSetChanged,
+                "enrollment-target-set-changed",
+            ),
+        ];
+        for (reason, text) in reasons {
+            assert_eq!(serde_json::to_value(reason).unwrap(), text);
+        }
+    }
+}
+
+#[cfg(test)]
+mod candidate_schema_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn candidate_schema_stages_are_closed_static_strings() {
+        for (stage, expected) in [
+            (QueryReadStage::CandidatePlanRoots, "candidate-plan-roots"),
+            (
+                QueryReadStage::CandidatePlanDomBackend,
+                "candidate-plan-dom-backend",
+            ),
+            (
+                QueryReadStage::CandidatePlanAttributes,
+                "candidate-plan-attributes",
+            ),
+            (
+                QueryReadStage::CandidatePlanDuplicateDom,
+                "candidate-plan-duplicate-dom",
+            ),
+            (
+                QueryReadStage::CandidatePlanAxRows,
+                "candidate-plan-ax-rows",
+            ),
+            (
+                QueryReadStage::CandidatePlanAxDecode,
+                "candidate-plan-ax-decode",
+            ),
+            (
+                QueryReadStage::CandidatePlanDuplicateAx,
+                "candidate-plan-duplicate-ax",
+            ),
+            (
+                QueryReadStage::CandidatePlanAuthorIds,
+                "candidate-plan-author-ids",
+            ),
+            (
+                QueryReadStage::CandidatePlanMissingRecord,
+                "candidate-plan-missing-record",
+            ),
+            (
+                QueryReadStage::CandidatePlanAxChild,
+                "candidate-plan-ax-child",
+            ),
+            (
+                QueryReadStage::CandidatePlanDomObject,
+                "candidate-plan-dom-object",
+            ),
+            (
+                QueryReadStage::CandidatePlanFallback,
+                "candidate-plan-fallback",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(stage).unwrap(), expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod eval_admission_schema_tests {
+    use super::*;
+    fn maximum() -> EvalAdmissionFacts {
+        EvalAdmissionFacts {
+            stage: EvalAdmissionStage::CaptureRefused,
+            reason: EvalAdmissionReason::Unresumed,
+            health: Some((u16::MAX, u16::MAX, 7)),
+            pending: Some([u16::MAX; 8]),
+            targets: Some([u16::MAX; 3]),
+            root: Some([false; 4]),
+            watermark: EvalWatermark::Behind,
+            revision: Some(SAFE_INTEGER),
+            epoch: Some(SAFE_INTEGER),
+        }
+    }
+    #[test]
+    fn eval_admission_closed_schema_and_worst_case_record_fit_existing_limit() {
+        let record = Record {
+            schema_version: 2,
+            source: Source::Native,
+            pid: u32::MAX,
+            record: SAFE_INTEGER,
+            operation_seq: SAFE_INTEGER,
+            phase: Phase::EvalAdmission,
+            dropped_before: SAFE_INTEGER,
+            emitted_before: SAFE_INTEGER,
+            suppressed_before: SAFE_INTEGER,
+            overflow: false,
+            facts: Facts {
+                generation: Some(SAFE_INTEGER),
+                eval: Some(maximum()),
+                ..Facts::default()
+            },
+        };
+        let bytes = serde_json::to_vec(&record).unwrap();
+        assert!(bytes.len() < MAX_RECORD_BYTES, "{}", bytes.len());
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["phase"], "EvalAdmission");
+        let eval = value["eval"].as_object().unwrap();
+        let mut keys = eval.keys().map(String::as_str).collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["c", "e", "h", "p", "r", "s", "t", "v", "w"]);
+        assert_eq!(eval["s"], "capture");
+        assert_eq!(eval["c"], "unresumed");
+        assert_eq!(eval["p"].as_array().unwrap().len(), 8);
+        assert_eq!(eval["t"].as_array().unwrap().len(), 3);
+        assert_eq!(eval["r"].as_array().unwrap().len(), 4);
+        assert!(!String::from_utf8(bytes).unwrap().contains("identityScope"));
+    }
+    #[test]
+    fn eval_admission_unknown_is_not_zero_or_success_and_numbers_clamp() {
+        let unknown = EvalAdmissionFacts::unknown(
+            EvalAdmissionStage::WaitRefused,
+            EvalAdmissionReason::OtherGuard,
+        );
+        let value = serde_json::to_value(unknown).unwrap();
+        for key in ["h", "p", "t", "r", "v", "e"] {
+            assert!(value[key].is_null());
+        }
+        assert_eq!(value["w"], "unk");
+        let mut facts = Facts {
+            eval: Some(EvalAdmissionFacts {
+                revision: Some(u64::MAX),
+                epoch: Some(u64::MAX),
+                ..maximum()
+            }),
+            ..Facts::default()
+        };
+        let mut overflow = false;
+        facts.clamp(&mut overflow);
+        assert!(overflow);
+        let value = serde_json::to_value(facts).unwrap();
+        assert_eq!(value["eval"]["v"], SAFE_INTEGER);
+        assert_eq!(value["eval"]["e"], SAFE_INTEGER);
+    }
+    #[test]
+    fn eval_admission_reuses_query_cap_and_explicit_loss_without_new_sink() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = query_capture(Some(file.path())).unwrap();
+        for _ in 0..QUERY_MAX_RECORDS + 4 {
+            record_eval_admission(&capture, 1, 2, maximum());
+        }
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(text.lines().count(), QUERY_MAX_RECORDS);
+        assert_eq!(text.matches("CaptureLimitReached").count(), 1);
+        assert!(text.lines().all(|line| line.len() < MAX_RECORD_BYTES));
+        assert!(query_capture(None).is_none());
+        let absent = file.path().with_extension("not-created");
+        assert!(!absent.exists());
+        assert!(query_capture(Some(&absent)).is_none());
+        assert!(!absent.exists());
+    }
+
+    #[test]
+    fn preparation_refusal_codes_are_closed_and_fit_the_existing_reason_budget() {
+        let reasons = [
+            (EvalPreparationRefusal::EntryOperation, "p-op"),
+            (EvalPreparationRefusal::EntryIdentity, "p-entryid"),
+            (EvalPreparationRefusal::EntryPermit, "p-permit"),
+            (EvalPreparationRefusal::EntryLedger, "p-ledger"),
+            (EvalPreparationRefusal::EntryOwner, "p-eowner"),
+            (EvalPreparationRefusal::EntryStream, "p-stream"),
+            (EvalPreparationRefusal::EntryTarget, "p-etarget"),
+            (EvalPreparationRefusal::IndexFailure, "p-failed"),
+            (EvalPreparationRefusal::IndexHealth, "p-index"),
+            (EvalPreparationRefusal::LedgerSnapshot, "p-snap"),
+            (EvalPreparationRefusal::EmptyCohort, "p-empty"),
+            (EvalPreparationRefusal::Frontier, "p-front"),
+            (EvalPreparationRefusal::CohortCapacity, "p-cap"),
+            (EvalPreparationRefusal::RootEntry, "p-rootent"),
+            (EvalPreparationRefusal::RootIdentity, "p-rootid"),
+            (EvalPreparationRefusal::RootActive, "p-active"),
+            (EvalPreparationRefusal::RootTarget, "p-roottgt"),
+            (EvalPreparationRefusal::RootFrame, "p-rootfrm"),
+            (EvalPreparationRefusal::MemberEntry, "p-mement"),
+            (EvalPreparationRefusal::MemberKind, "p-memkind"),
+            (EvalPreparationRefusal::MemberFrame, "p-memfrm"),
+            (EvalPreparationRefusal::ReceiptMissing, "p-missing"),
+            (EvalPreparationRefusal::ReceiptOwner, "p-owner"),
+            (EvalPreparationRefusal::ReceiptOrigin, "p-origin"),
+            (EvalPreparationRefusal::ReceiptBinding, "p-binding"),
+            (EvalPreparationRefusal::ReceiptTarget, "p-target"),
+            (EvalPreparationRefusal::RegistryHealth, "p-health"),
+            (EvalPreparationRefusal::Unconfigured, "p-config"),
+            (EvalPreparationRefusal::ReceiptTerminal, "p-term"),
+            (EvalPreparationRefusal::ReceiptStage, "p-stage"),
+            (EvalPreparationRefusal::ReceiptCustody, "p-custody"),
+            (EvalPreparationRefusal::ReceiptReadiness, "p-ready"),
+            (EvalPreparationRefusal::Configuration, "p-confrev"),
+            (EvalPreparationRefusal::Fence, "p-fence"),
+        ];
+        assert_eq!(reasons.len(), 34);
+        let mut codes = std::collections::BTreeSet::new();
+        for (reason, code) in reasons {
+            assert!(codes.insert(code));
+            let reason = EvalAdmissionReason::from(reason);
+            assert_eq!(serde_json::to_value(reason).unwrap(), code);
+            // Reuse every original fact; the existing longest reason is nine
+            // bytes. No field, scalar width, counter, or record limit is reduced.
+            assert!(code.len() <= "unresumed".len());
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: SAFE_INTEGER,
+                phase: Phase::EvalAdmission,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: false,
+                facts: Facts {
+                    generation: Some(SAFE_INTEGER),
+                    eval: Some(EvalAdmissionFacts {
+                        reason,
+                        ..maximum()
+                    }),
+                    ..Facts::default()
+                },
+            };
+            let mut bytes = serde_json::to_vec(&record).unwrap();
+            bytes.push(b'\n');
+            assert!(
+                bytes.len() <= MAX_RECORD_BYTES,
+                "{code}: {} bytes including LF",
+                bytes.len()
+            );
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["eval"]["c"], code);
+            assert_eq!(value["pid"], u32::MAX);
+            for field in [
+                "record",
+                "operationSeq",
+                "generation",
+                "droppedBefore",
+                "emittedBefore",
+                "suppressedBefore",
+            ] {
+                assert_eq!(value[field], SAFE_INTEGER);
+            }
+            let mut keys = value["eval"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            keys.sort_unstable();
+            assert_eq!(keys, vec!["c", "e", "h", "p", "r", "s", "t", "v", "w"]);
+        }
+        // Outbound diagnostics have no native string parser or fallback variant.
+        // The paired consumer schema must continue to reject every unknown code.
+        assert!(!codes.contains("p-unknown"));
+        assert!(!codes.contains("PRIVATE"));
+    }
+    include!("client_popup_setup_schema_tests.rs");
+}
+
+#[cfg(test)]
+mod query_command_schema_tests {
+    use super::*;
+    #[test]
+    fn maximum_command_rows_and_summary_fit_original_line_cap() {
+        for (phase, facts) in [
+            (
+                Phase::QueryCommandTiming,
+                Facts {
+                    generation: Some(SAFE_INTEGER),
+                    query_read_stage: Some(QueryReadStage::CandidatePlanMissingRecord),
+                    query_command: Some([23, 7, 6]),
+                    query_command_ms: Some([u16::MAX; 5]),
+                    ..Facts::default()
+                },
+            ),
+            (
+                Phase::QueryCommandSummary,
+                Facts {
+                    generation: Some(SAFE_INTEGER),
+                    query_command_summary: Some([u16::MAX, 24, 15]),
+                    ..Facts::default()
+                },
+            ),
+        ] {
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: SAFE_INTEGER,
+                phase,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: false,
+                facts,
+            };
+            let bytes = serde_json::to_vec(&record).unwrap();
+            assert!(bytes.len() < MAX_RECORD_BYTES, "{}", bytes.len());
+            let object: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let keys: std::collections::BTreeSet<_> = object
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            let mut expected = std::collections::BTreeSet::from([
+                "schemaVersion",
+                "source",
+                "pid",
+                "record",
+                "operationSeq",
+                "phase",
+                "droppedBefore",
+                "emittedBefore",
+                "suppressedBefore",
+                "overflow",
+                "generation",
+            ]);
+            if matches!(phase, Phase::QueryCommandTiming) {
+                expected.extend(["queryReadStage", "cmd", "cmdMs"]);
+            } else {
+                expected.insert("cmdSummary");
+            }
+            assert_eq!(keys, expected);
+        }
+    }
+}
+
+#[cfg(test)]
+mod popup_startup_diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn startup_stages_are_closed_and_fit_existing_record_limit() {
+        for (stage, encoded) in [
+            (
+                DiagnosticTargetStage::InitImmediateEnter,
+                "init-immediate-enter",
+            ),
+            (DiagnosticTargetStage::InitFutureEnter, "init-future-enter"),
+            (DiagnosticTargetStage::InitScriptAck, "init-script-ack"),
+            (DiagnosticTargetStage::ResumeEnter, "resume-enter"),
+            (DiagnosticTargetStage::ResumeAck, "resume-ack"),
+        ] {
+            assert_eq!(serde_json::to_value(stage).unwrap(), encoded);
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: SAFE_INTEGER,
+                phase: Phase::TargetLifecycle,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: true,
+                facts: Facts {
+                    generation: Some(SAFE_INTEGER),
+                    attachment_ordinal: Some(TARGET_ORDINAL_LIMIT),
+                    target_stage: Some(stage),
+                    target_purpose: Some(DiagnosticTargetPurpose::StateBootstrap),
+                    target_classification: Some(
+                        DiagnosticTargetClassification::ReservationRemainder,
+                    ),
+                    target_configured: Some(false),
+                    target_resumed: Some(false),
+                    ..Facts::default()
+                },
+            };
+            assert!(serde_json::to_vec(&record).unwrap().len() < MAX_RECORD_BYTES);
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_capture_tests {
+    use super::*;
+    use std::sync::Barrier;
+
+    fn capture(cap: usize, bytes: usize) -> (tempfile::NamedTempFile, Arc<Capture>) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = Arc::new(Capture::new(
+            Source::Native,
+            AppendSink::open(file.path(), cap, bytes).unwrap(),
+        ));
+        (file, capture)
+    }
+    fn record(capture: &Capture) {
+        record_capture(capture, 0, Phase::TargetLifecycle, Facts::default());
+    }
+    fn rows(file: &tempfile::NamedTempFile) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(file.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+    fn ordered(file: &tempfile::NamedTempFile, capture: &Capture, count: usize) {
+        let rows = rows(file);
+        assert_eq!(rows.len(), count);
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row["record"], i);
+            assert_eq!(row["droppedBefore"], 0);
+            assert_eq!(row["emittedBefore"], i);
+            assert_eq!(row["overflow"], false);
+        }
+        assert_eq!(capture.next.load(Ordering::Relaxed), count);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 0);
+    }
+    fn pause_once(capture: &Capture, point: DrainPoint) -> (Arc<Barrier>, Arc<Barrier>) {
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let (a, b) = (entered.clone(), release.clone());
+        let once = AtomicBool::new(false);
+        *capture.hook.lock().unwrap() = Some(Arc::new(move |seen| {
+            if seen == point && !once.swap(true, Ordering::AcqRel) {
+                a.wait();
+                b.wait();
+            }
+        }));
+        (entered, release)
+    }
+    #[test]
+    fn held_drainer_retains_concurrent_startup_burst_and_terminal() {
+        let (file, capture) = capture(128, 64 * 1024);
+        let (entered, release) = pause_once(&capture, DrainPoint::Locked);
+        let owner = capture.clone();
+        let thread = std::thread::spawn(move || record(&owner));
+        entered.wait();
+        // More than the actual S14 concurrent browser-ui startup burst.
+        for _ in 0..24 {
+            record(&capture);
+        }
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::ShutdownJoins, true);
+        assert!(rows(&file).is_empty());
+        release.wait();
+        thread.join().unwrap();
+        ordered(&file, &capture, 26);
+        assert_eq!(
+            rows(&file).last().unwrap()["phase"],
+            "TerminalCleanupCheckpoint"
+        );
+    }
+    #[test]
+    fn earlier_reserved_hole_never_reorders_later_publication() {
+        let (file, capture) = capture(16, 8192);
+        let (entered, release) = pause_once(&capture, DrainPoint::Reserved);
+        let owner = capture.clone();
+        let thread = std::thread::spawn(move || record(&owner));
+        entered.wait();
+        record(&capture);
+        record(&capture);
+        assert!(rows(&file).is_empty());
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        release.wait();
+        thread.join().unwrap();
+        ordered(&file, &capture, 3);
+    }
+    #[test]
+    fn consumed_before_notification_is_not_written_twice() {
+        let (file, capture) = capture(16, 8192);
+        let (entered, release) = pause_once(&capture, DrainPoint::Published);
+        let owner = capture.clone();
+        let thread = std::thread::spawn(move || record(&owner));
+        entered.wait();
+        record(&capture);
+        ordered(&file, &capture, 2);
+        release.wait();
+        thread.join().unwrap();
+        ordered(&file, &capture, 2);
+    }
+    #[test]
+    fn empty_prefix_and_release_handoffs_do_not_strand_last_record() {
+        for point in [
+            DrainPoint::EmptyPrefix,
+            DrainPoint::BeforeRelease,
+            DrainPoint::Released,
+        ] {
+            let (file, capture) = capture(16, 8192);
+            let weak = Arc::downgrade(&capture);
+            let once = AtomicBool::new(false);
+            *capture.hook.lock().unwrap() = Some(Arc::new(move |seen| {
+                if seen == point && !once.swap(true, Ordering::AcqRel) {
+                    record(&weak.upgrade().unwrap());
+                }
+            }));
+            record(&capture);
+            ordered(&file, &capture, 2);
+        }
+    }
+    #[test]
+    fn terminal_failure_scan_and_late_publisher_count_each_cell_once() {
+        let (file, capture) = capture(16, 8192);
+        let (entered, release) = pause_once(&capture, DrainPoint::Reserved);
+        let owner = capture.clone();
+        let thread = std::thread::spawn(move || record(&owner));
+        entered.wait();
+        let held = capture.sink.lock().unwrap();
+        record(&capture); // Explicitly violate the sole-drainer lock invariant.
+        assert!(capture.failed.load(Ordering::Acquire));
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 2);
+        drop(held);
+        release.wait();
+        thread.join().unwrap();
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 2);
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::ShutdownJoins, true);
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 3);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn final_retained_slot_marks_limit_once_and_never_grows() {
+        let (file, capture) = capture(3, 8192);
+        for _ in 0..8 {
+            record(&capture);
+        }
+        let rows = rows(&file);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[2]["phase"], "CaptureLimitReached");
+        assert_eq!(capture.retained.len(), 3);
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 6);
+        assert_eq!(capture.counters.emitted.load(Ordering::Relaxed), 3);
+        assert_eq!(capture.next.load(Ordering::Relaxed), 3);
+        assert_eq!(capture.work.load(Ordering::Relaxed), 0);
+    }
+    #[test]
+    fn external_file_lock_loss_is_not_replayed_or_called_complete() {
+        let (file, capture) = capture(16, 8192);
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(file.path())
+            .unwrap();
+        other.lock().unwrap();
+        record(&capture);
+        other.unlock().unwrap();
+        record(&capture);
+        let rows = rows(&file);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["record"], 1);
+        assert_eq!(rows[0]["droppedBefore"], 1);
+        assert_eq!(capture.next.load(Ordering::Relaxed), 2);
+    }
+    #[test]
+    fn partial_prior_file_stays_terminal_and_unmodified() {
+        let (file, capture) = capture(16, 8192);
+        std::fs::write(file.path(), b"partial").unwrap();
+        record(&capture);
+        record(&capture);
+        assert_eq!(std::fs::read(file.path()).unwrap(), b"partial");
+        assert_eq!(capture.counters.dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(capture.counters.emitted.load(Ordering::Relaxed), 0);
+        assert!(capture.sink.lock().unwrap().stopped);
+    }
+    #[test]
+    fn retained_payload_memory_is_fixed_and_reported() {
+        let slot = std::mem::size_of::<RetainedRecord>();
+        eprintln!(
+            "retained Record={} slot={} native={} query={} bytes",
+            std::mem::size_of::<Record>(),
+            slot,
+            slot * MAX_RECORDS,
+            slot * QUERY_MAX_RECORDS
+        );
+        assert!(slot <= 2048, "closed Facts growth needs renewed RAM review");
+        assert_eq!(MAX_RECORDS, 2048);
+        assert_eq!(MAX_BYTES, 256 * 1024);
+        assert_eq!(QUERY_MAX_RECORDS, 128);
+        assert_eq!(QUERY_MAX_BYTES, 64 * 1024);
+    }
+}
+
+#[cfg(test)]
+mod retained_capture_boundary_tests {
+    use super::*;
+    fn capture(cap: usize, bytes: usize) -> (tempfile::NamedTempFile, Arc<Capture>) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let capture = Arc::new(Capture::new(
+            Source::Native,
+            AppendSink::open(file.path(), cap, bytes).unwrap(),
+        ));
+        (file, capture)
+    }
+    fn record(capture: &Capture) {
+        record_capture(capture, 0, Phase::TargetLifecycle, Facts::default());
+    }
+    #[test]
+    fn unpublished_reservation_blocks_terminal_and_is_not_complete() {
+        let (file, capture) = capture(16, 8192);
+        // Simulate a thread preempted immediately after its unique reservation.
+        assert_eq!(
+            increment(&capture.counters.attempted, 1, &capture.counters.overflow),
+            0
+        );
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::ShutdownJoins, true);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+        assert_eq!(capture.next.load(Ordering::Acquire), 0);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        // Zero drop counter/EOF is deliberately not a terminal completeness proof.
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn retained_two_tenures_do_not_rebind_same_target_ordinal() {
+        let (file, capture) = capture(16, 8192);
+        let weak = Arc::downgrade(&capture);
+        let once = AtomicBool::new(false);
+        *capture.hook.lock().unwrap() = Some(Arc::new(move |point| {
+            if point == DrainPoint::Locked && !once.swap(true, Ordering::AcqRel) {
+                record_capture(
+                    &weak.upgrade().unwrap(),
+                    8,
+                    Phase::TargetAttribution,
+                    Facts {
+                        target_ordinal: Some(9),
+                        attachment_ordinal: Some(2),
+                        generation: Some(1),
+                        ..Facts::default()
+                    },
+                );
+            }
+        }));
+        record_capture(
+            &capture,
+            7,
+            Phase::TargetAttribution,
+            Facts {
+                target_ordinal: Some(9),
+                attachment_ordinal: Some(1),
+                generation: Some(1),
+                ..Facts::default()
+            },
+        );
+        let rows: Vec<serde_json::Value> = std::fs::read_to_string(file.path())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["attachmentOrdinal"], 1);
+        assert_eq!(rows[1]["attachmentOrdinal"], 2);
+        assert_eq!(rows[0]["operationSeq"], 7);
+        assert_eq!(rows[1]["operationSeq"], 8);
+        assert_eq!(rows[0]["targetOrdinal"], 9);
+        assert_eq!(rows[1]["targetOrdinal"], 9);
+    }
+    #[test]
+    fn maximum_retained_burst_is_bounded_even_when_byte_cap_stops_earlier() {
+        let (file, capture) = capture(MAX_RECORDS, MAX_BYTES);
+        let weak = Arc::downgrade(&capture);
+        let once = AtomicBool::new(false);
+        *capture.hook.lock().unwrap() = Some(Arc::new(move |point| {
+            if point == DrainPoint::Locked && !once.swap(true, Ordering::AcqRel) {
+                for _ in 1..MAX_RECORDS {
+                    record(&weak.upgrade().unwrap());
+                }
+            }
+        }));
+        record(&capture);
+        let bytes = std::fs::read(file.path()).unwrap();
+        assert!(bytes.len() <= MAX_BYTES);
+        let text = std::str::from_utf8(&bytes).unwrap();
+        assert!(text.lines().count() <= MAX_RECORDS);
+        assert_eq!(text.matches("CaptureLimitReached").count(), 1);
+        assert_eq!(capture.next.load(Ordering::Acquire), MAX_RECORDS);
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        assert!(!capture.failed.load(Ordering::Acquire));
+        assert_eq!(
+            capture.counters.attempted.load(Ordering::Acquire),
+            MAX_RECORDS as u64
+        );
+        assert_eq!(
+            capture.counters.emitted.load(Ordering::Acquire)
+                + capture.counters.dropped.load(Ordering::Acquire),
+            MAX_RECORDS as u64 + 1
+        );
+    }
+    #[test]
+    fn partial_write_is_terminal_and_never_repaired_or_replayed() {
+        let (file, capture) = capture(16, 8192);
+        capture.sink.lock().unwrap().fault.partial_after = Some(7);
+        record(&capture);
+        let bytes = std::fs::read(file.path()).unwrap();
+        assert_eq!(bytes.len(), 7);
+        capture.sink.lock().unwrap().fault.partial_after = None;
+        record(&capture);
+        assert_eq!(std::fs::read(file.path()).unwrap(), bytes);
+        assert!(capture.sink.lock().unwrap().stopped);
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 2);
+        assert_eq!(capture.counters.emitted.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn read_and_unlock_failures_remain_explicit_not_retried() {
+        let (file, capture) = capture(16, 8192);
+        capture.sink.lock().unwrap().fault.read = true;
+        record(&capture);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+        capture.sink.lock().unwrap().fault.read = false;
+        capture.sink.lock().unwrap().fault.unlock = true;
+        record(&capture); // Physical row may exist despite unacknowledged unlock.
+        assert_eq!(
+            std::fs::read_to_string(file.path())
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+        assert_eq!(capture.counters.emitted.load(Ordering::Acquire), 0);
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 2);
+        capture.sink.lock().unwrap().fault.unlock = false;
+        record(&capture);
+        let text = std::fs::read_to_string(file.path()).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        let last: serde_json::Value = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+        assert_eq!(last["record"], 2);
+        assert_eq!(last["droppedBefore"], 2);
+        // emitted counts successful append+unlock acknowledgment, not all
+        // possibly physical writes. Existing fail-closed loss is preserved.
+        assert_eq!(last["emittedBefore"], 0);
+    }
+    #[test]
+    fn poisoned_internal_sink_is_terminal_not_a_successful_tail() {
+        let (file, capture) = capture(16, 8192);
+        let other = capture.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = other.sink.lock().unwrap();
+            panic!("synthetic sink poison");
+        })
+        .join();
+        record(&capture);
+        terminal_cleanup_checkpoint_into(&capture, TerminalCleanupStage::ShutdownJoins, true);
+        assert!(capture.failed.load(Ordering::Acquire));
+        assert!(capture.counters.overflow.load(Ordering::Acquire));
+        assert_eq!(capture.work.load(Ordering::Acquire), 0);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+    #[test]
+    fn oversized_closed_record_is_lost_once_and_never_replayed() {
+        let (file, capture) = capture(16, 8192);
+        let facts = Facts {
+            query_read_ms: Some([u16::MAX; 13]),
+            query_command_ms: Some([u16::MAX; 5]),
+            generation: Some(SAFE_INTEGER),
+            attachment_ordinal: Some(SAFE_INTEGER),
+            target_ordinal: Some(SAFE_INTEGER),
+            inventory_ordinal: Some(SAFE_INTEGER),
+            parent_attachment_ordinal: Some(SAFE_INTEGER),
+            root_attachment_ordinal: Some(SAFE_INTEGER),
+            target_kind: Some(DiagnosticTargetKind::ServiceWorker),
+            target_origin: Some(DiagnosticTargetOrigin::InitialDiscovery),
+            target_stage: Some(DiagnosticTargetStage::ConfigureStarted),
+            target_purpose: Some(DiagnosticTargetPurpose::StateBootstrap),
+            target_classification: Some(DiagnosticTargetClassification::ReservationRemainder),
+            ..Facts::default()
+        };
+        record_capture(&capture, 0, Phase::TargetLifecycle, facts);
+        let first = capture.retained[0].record.get().unwrap();
+        assert!(serde_json::to_vec(first).unwrap().len() + 1 > MAX_RECORD_BYTES);
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+        record(&capture);
+        let row: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file.path()).unwrap()).unwrap();
+        assert_eq!(row["record"], 1);
+        assert_eq!(row["droppedBefore"], 1);
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn impossible_counter_overflow_does_not_reuse_an_earlier_cell() {
+        let (file, capture) = capture(16, 8192);
+        capture
+            .counters
+            .attempted
+            .store(SAFE_INTEGER, Ordering::Release);
+        record(&capture);
+        assert!(capture.counters.overflow.load(Ordering::Acquire));
+        assert_eq!(capture.counters.dropped.load(Ordering::Acquire), 1);
+        assert!(capture
+            .retained
+            .iter()
+            .all(|slot| slot.record.get().is_none()));
+        assert!(std::fs::read(file.path()).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod refusal_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn new_failure_facts_serialize_only_closed_scalars() {
+        let value = serde_json::to_value(Facts {
+            terminal_cleanup_stage: Some(TerminalCleanupStage::TaskProof),
+            terminal_cleanup_ok: Some(false),
+            terminal_proof_refusal: Some(TerminalProofRefusal::ObjectDebt),
+            inventory_first_loss: Some(InventoryFirstLoss::ResumePermitDropped),
+            ..Facts::default()
+        })
+        .unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 4);
+        assert_eq!(object["terminalCleanupStage"], "task-proof");
+        assert_eq!(object["terminalCleanupOk"], false);
+        assert_eq!(object["terminalProofRefusal"], "object-debt");
+        assert_eq!(object["inventoryFirstLoss"], "resume-permit-dropped");
+    }
+}
+
+#[cfg(test)]
+mod observe_initial_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn observe_initial_diagnostic_wire_is_closed_bounded_and_optional() {
+        let empty = serde_json::to_value(Facts::default()).unwrap();
+        for key in [
+            "initialSample",
+            "prefixCheck",
+            "prefixRefusal",
+            "prefixDebt",
+            "prefixDebtCapped",
+            "lastAttachmentOrdinal",
+            "selectedAttachmentOrdinal",
+        ] {
+            assert!(empty.get(key).is_none());
+        }
+        let facts = Facts {
+            initial_sample: Some(1),
+            prefix_check: Some(ObserveInitialPrefixCheck::BeforeYield),
+            prefix_refusal: Some(ObserveInitialPrefixRefusal::ObjectDebt),
+            prefix_debt: Some([0, u16::MAX, u16::MAX]),
+            prefix_debt_capped: Some(true),
+            last_attachment_ordinal: Some(5),
+            selected_attachment_ordinal: Some(1),
+            ..Facts::default()
+        };
+        let value = serde_json::to_value(facts).unwrap();
+        assert_eq!(value["initialSample"], 1);
+        assert_eq!(value["prefixCheck"], "before-yield");
+        assert_eq!(value["prefixRefusal"], "object-debt");
+        assert_eq!(value["prefixDebt"], serde_json::json!([0, 65535, 65535]));
+        assert_eq!(value["prefixDebtCapped"], true);
+        assert_eq!(value["lastAttachmentOrdinal"], 5);
+        assert_eq!(value["selectedAttachmentOrdinal"], 1);
+        assert_eq!(value.as_object().unwrap().len(), 7);
+        assert!(serde_json::to_vec(&value).unwrap().len() < MAX_RECORD_BYTES);
+    }
+    #[test]
+    fn observe_initial_full_records_fit_existing_cap_at_maximum_headers() {
+        for (phase, facts) in [
+            (
+                Phase::ObserveInitialAcquisition,
+                Facts {
+                    generation: Some(SAFE_INTEGER),
+                    initial_sample: Some(2),
+                    prefix_check: Some(ObserveInitialPrefixCheck::BeforeYield),
+                    prefix_refusal: Some(ObserveInitialPrefixRefusal::OutstandingCommands),
+                    prefix_debt: Some([u16::MAX; 3]),
+                    prefix_debt_capped: Some(false),
+                    ..Facts::default()
+                },
+            ),
+            (
+                Phase::FrameInventoryAttribution,
+                Facts {
+                    generation: Some(SAFE_INTEGER),
+                    frame_pass: Some(FrameInventoryPass::Protected),
+                    last_attachment_ordinal: Some(SAFE_INTEGER),
+                    selected_attachment_ordinal: Some(SAFE_INTEGER),
+                    ..Facts::default()
+                },
+            ),
+        ] {
+            let record = Record {
+                schema_version: 2,
+                source: Source::Native,
+                pid: u32::MAX,
+                record: SAFE_INTEGER,
+                operation_seq: SAFE_INTEGER,
+                phase,
+                dropped_before: SAFE_INTEGER,
+                emitted_before: SAFE_INTEGER,
+                suppressed_before: SAFE_INTEGER,
+                overflow: false,
+                facts,
+            };
+            let bytes = serde_json::to_vec(&record).unwrap();
+            assert!(
+                bytes.len() + 1 <= MAX_RECORD_BYTES,
+                "record plus LF: {}",
+                bytes.len() + 1
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod terminal_enrollment_diagnostic_tests {
+    use super::*;
+    #[test]
+    fn terminal_enrollment_refusals_are_closed_and_optional() {
+        let empty = serde_json::to_value(Facts::default()).unwrap();
+        assert!(empty.get("terminalEnrollmentRefusal").is_none());
+        assert!(empty.get("terminalProofCounts").is_none());
+        for (reason, name) in [
+            (
+                TerminalEnrollmentRefusal::LedgerNotRemoteEof,
+                "ledger-not-remote-eof",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerBootstrapUnpublished,
+                "ledger-bootstrap-unpublished",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerContextCreation,
+                "ledger-context-creation",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerEvalPublication,
+                "ledger-eval-publication",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerOperationsEmpty,
+                "ledger-operations-empty",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerOperationIdentity,
+                "ledger-operation-identity",
+            ),
+            (TerminalEnrollmentRefusal::LedgerObjects, "ledger-objects"),
+            (TerminalEnrollmentRefusal::LedgerGroups, "ledger-groups"),
+            (
+                TerminalEnrollmentRefusal::LedgerCreatedTargets,
+                "ledger-created-targets",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerRecordingTargets,
+                "ledger-recording-targets",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerBindingsEmpty,
+                "ledger-bindings-empty",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerTargetCount,
+                "ledger-target-count",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerTargetBinding,
+                "ledger-target-binding",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerLifecycleBinding,
+                "ledger-lifecycle-binding",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerRealmBinding,
+                "ledger-realm-binding",
+            ),
+            (
+                TerminalEnrollmentRefusal::LedgerCommandContract,
+                "ledger-command-contract",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryNotSealed,
+                "registry-not-sealed",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryIntegrityLost,
+                "registry-integrity-lost",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryNotReady,
+                "registry-not-ready",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryReservations,
+                "registry-reservations",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryResuming,
+                "registry-resuming",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryProtectedRead,
+                "registry-protected-read",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryBootstrapCreations,
+                "registry-bootstrap-creations",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryBootstrapCleanup,
+                "registry-bootstrap-cleanup",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryCleanupReservations,
+                "registry-cleanup-reservations",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryUnknownCreation,
+                "registry-unknown-creation",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryAuxiliary,
+                "registry-auxiliary",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryTargetCount,
+                "registry-target-count",
+            ),
+            (
+                TerminalEnrollmentRefusal::RegistryTargetBinding,
+                "registry-target-binding",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentFailed,
+                "enrollment-failed",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentNotReconciled,
+                "enrollment-not-reconciled",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentWatermark,
+                "enrollment-watermark",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentPending,
+                "enrollment-pending",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRealmPending,
+                "enrollment-realm-pending",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRealmTickets,
+                "enrollment-realm-tickets",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRestart,
+                "enrollment-restart",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentBlank,
+                "enrollment-blank",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRetiring,
+                "enrollment-retiring",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentSessionContract,
+                "enrollment-session-contract",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRootContract,
+                "enrollment-root-contract",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentLifecycle,
+                "enrollment-lifecycle",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentAncestry,
+                "enrollment-ancestry",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentTerminalProof,
+                "enrollment-terminal-proof",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentClientIdentity,
+                "enrollment-client-identity",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentTerminalWatermarkMissing,
+                "enrollment-terminal-watermark-missing",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentCleanupOwner,
+                "enrollment-cleanup-owner",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentLedgerOwner,
+                "enrollment-ledger-owner",
+            ),
+            (
+                TerminalEnrollmentRefusal::EnrollmentRegistryOwner,
+                "enrollment-registry-owner",
+            ),
+        ] {
+            let value = serde_json::to_value(Facts {
+                terminal_cleanup_stage: Some(TerminalCleanupStage::EnrollmentProof),
+                terminal_cleanup_ok: Some(false),
+                terminal_enrollment_refusal: Some(reason),
+                ..Facts::default()
+            })
+            .unwrap();
+            assert_eq!(value.as_object().unwrap().len(), 3);
+            assert_eq!(value["terminalEnrollmentRefusal"], name);
+            assert_eq!(value["terminalCleanupStage"], "enrollment-proof");
+            assert_eq!(value["terminalCleanupOk"], false);
+        }
+        let value = serde_json::to_value(Facts {
+            terminal_enrollment_refusal: Some(TerminalEnrollmentRefusal::EnrollmentWatermark),
+            terminal_proof_counts: Some([7, 9]),
+            ..Facts::default()
+        })
+        .unwrap();
+        assert_eq!(value["terminalProofCounts"], serde_json::json!([7, 9]));
+    }
+}

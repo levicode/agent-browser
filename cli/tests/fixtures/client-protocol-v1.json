@@ -1,0 +1,942 @@
+{
+  "protocol": "agent-browser-session/1",
+  "validClient": [
+    {
+      "type": "hello",
+      "id": "h1",
+      "protocol": "agent-browser-session/1",
+      "requiredCapabilities": []
+    },
+    {
+      "type": "request",
+      "id": "r1",
+      "generation": 1,
+      "operationSeq": 1,
+      "timeoutMs": 1000,
+      "command": "session.status",
+      "args": {}
+    },
+    {
+      "type": "cancel",
+      "id": "c1",
+      "generation": 1,
+      "operationSeq": 1
+    },
+    {
+      "type": "decision",
+      "id": "d1",
+      "generation": 1,
+      "token": "opaque-token",
+      "decision": {
+        "kind": "abort"
+      }
+    },
+    {
+      "type": "close",
+      "id": "z1",
+      "generation": 1
+    },
+    {
+      "type": "request",
+      "id": "child",
+      "generation": 1,
+      "operationSeq": 2,
+      "timeoutMs": 1000,
+      "command": "title",
+      "args": {},
+      "callbackToken": "opaque-token"
+    }
+  ],
+  "invalidClient": [
+    {
+      "type": "cancel",
+      "id": "c",
+      "generation": 1,
+      "operationSeq": 1,
+      "unknown": true
+    },
+    {
+      "id": "old",
+      "action": "click"
+    },
+    {
+      "type": "decision",
+      "id": "d",
+      "generation": 1,
+      "token": "t",
+      "decision": {
+        "kind": "abort",
+        "script": "bad"
+      }
+    }
+  ],
+  "server": [
+    {
+      "type": "ready",
+      "id": "h1",
+      "protocol": "agent-browser-session/1",
+      "sessionId": "opaque-session",
+      "generation": 1,
+      "capabilities": [],
+      "limits": {
+        "maxFrameBytes": 1048576,
+        "maxPendingOperations": 64,
+        "maxPendingDecisions": 256,
+        "maxTimeoutMs": 3600000
+      },
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "r1",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": true,
+      "data": {},
+      "effects": "completed",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "r2",
+      "generation": 1,
+      "operationSeq": 2,
+      "ok": false,
+      "error": {
+        "code": "scope-unavailable"
+      },
+      "effects": "unknown",
+      "scopeState": "quarantined"
+    },
+    {
+      "type": "control-result",
+      "id": "c1",
+      "generation": 1,
+      "accepted": true,
+      "scopeState": "usable"
+    },
+    {
+      "type": "control-result",
+      "id": "d1",
+      "generation": 1,
+      "accepted": false,
+      "error": {
+        "code": "decision-missing"
+      },
+      "scopeState": "usable"
+    },
+    {
+      "type": "event",
+      "generation": 1,
+      "sequence": 1,
+      "event": "registry-released",
+      "payload": {
+        "registryVersion": 1
+      }
+    },
+    {
+      "type": "error",
+      "error": {
+        "code": "invalid-frame"
+      },
+      "scopeState": "quarantined"
+    },
+    {
+      "type": "closed",
+      "id": "z1",
+      "generation": 1,
+      "scopeState": "closed"
+    }
+  ],
+  "errorCodes": [
+    "invalid-frame",
+    "unsupported-protocol",
+    "unsupported-capability",
+    "stale-generation",
+    "scope-unavailable",
+    "sequence-reused",
+    "invalid-sequence",
+    "invalid-timeout",
+    "capacity-exceeded",
+    "operation-missing",
+    "decision-missing",
+    "decision-expired",
+    "decision-kind-mismatch",
+    "registry-missing",
+    "registry-in-use",
+    "identifier-exhausted",
+    "unsupported-command",
+    "deadline-exceeded",
+    "cancelled",
+    "invalid-arguments",
+    "browser-failure",
+    "stale-scope",
+    "cleanup-failed",
+    "stale-reference",
+    "policy-denied",
+    "not-actionable",
+    "locator-not-found",
+    "content-length-mismatch",
+    "redirect-body-unavailable",
+    "intercepted-pointer",
+    "checked-state-unchanged",
+    "checked-control-replaced",
+    "fill-unsupported-target",
+    "no-editable-focus",
+    "tap-target-replaced-before-press"
+  ],
+  "validDecision": [
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": [],
+      "bodyBase64": ""
+    },
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": [],
+      "bodyHandle": "blob-opaque"
+    },
+    {
+      "kind": "continue",
+      "overrides": {
+        "bodyHandle": "blob-opaque"
+      }
+    },
+    {
+      "kind": "fallback",
+      "overrides": {}
+    }
+  ],
+  "invalidDecision": [
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": []
+    },
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": [],
+      "bodyBase64": "",
+      "bodyHandle": "blob-opaque"
+    },
+    {
+      "kind": "continue",
+      "overrides": {
+        "bodyBase64": "",
+        "bodyHandle": "blob-opaque"
+      }
+    },
+    {
+      "kind": "fulfill",
+      "status": 200,
+      "headers": [],
+      "bodyHandle": ""
+    }
+  ],
+  "frameErrors": [
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 1,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 2,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 63,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 2
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 1,
+          "count": 2
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 2,
+          "count": 2
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 63,
+          "count": 100000
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      },
+      "effects": "unknown",
+      "scopeState": "quarantined"
+    }
+  ],
+  "invalidFrameErrors": [
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found"
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous"
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "cancelled",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": null
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0,
+          "selector": "private"
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        },
+        "extra": true
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": -1,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0.5,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 64,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 9007199254740992,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": "0",
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": -1
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0.5
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 1
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 2
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 100001
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": "0"
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 1
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": -1
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 2.5
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 100001
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": "2"
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    },
+    {
+      "type": "error",
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      },
+      "scopeState": "quarantined"
+    },
+    {
+      "type": "control-result",
+      "id": "control",
+      "generation": 1,
+      "accepted": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      },
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": true,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable",
+      "data": {}
+    },
+    {
+      "type": "event",
+      "generation": 1,
+      "sequence": 1,
+      "event": "synthetic",
+      "payload": {},
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      }
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-not-found",
+        "frameSelection": {
+          "index": 0,
+          "count": 0
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable",
+      "frameSelection": {
+        "index": 0,
+        "count": 0
+      }
+    },
+    {
+      "type": "error",
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 2
+        }
+      },
+      "scopeState": "quarantined"
+    },
+    {
+      "type": "control-result",
+      "id": "control",
+      "generation": 1,
+      "accepted": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 2
+        }
+      },
+      "scopeState": "usable"
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": true,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 2
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable",
+      "data": {}
+    },
+    {
+      "type": "event",
+      "generation": 1,
+      "sequence": 1,
+      "event": "synthetic",
+      "payload": {},
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 2
+        }
+      }
+    },
+    {
+      "type": "result",
+      "id": "frame",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "frame-ambiguous",
+        "frameSelection": {
+          "index": 0,
+          "count": 2
+        }
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable",
+      "frameSelection": {
+        "index": 0,
+        "count": 2
+      }
+    }
+  ],
+  "selectorErrors": [
+    {
+      "type": "result",
+      "id": "selector",
+      "generation": 1,
+      "operationSeq": 1,
+      "ok": false,
+      "error": {
+        "code": "invalid-locator"
+      },
+      "effects": "not-dispatched",
+      "scopeState": "usable"
+    }
+  ]
+}

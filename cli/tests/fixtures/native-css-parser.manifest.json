@@ -1,0 +1,8 @@
+{
+  "pinnedSha256": "852e40f938e72e6129b6c9a8bde3f4cc6cfe5cecb5ac734b6b06c8ad1fde42bf",
+  "sourceSha256": "e18611d8466297dd5925904156f0737868ce063d4143c358924011b87068db81",
+  "fileSha256": "b39c63ffbb6e2fa9a8dec58e042d04ba338898a4eaf827288c8fe24ff8cce8e2",
+  "functions": 134,
+  "loops": 26,
+  "catches": 1
+}

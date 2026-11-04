@@ -1,0 +1,12 @@
+{
+  "upstreamInjectedSha256": "852e40f938e72e6129b6c9a8bde3f4cc6cfe5cecb5ac734b6b06c8ad1fde42bf",
+  "upstreamSliceSha256": "c413f28ff830165629389ca87e223fb9488341a6046325575cd6460bd3193a3a",
+  "helperSha256": "2ce059152f59776aaeb4b0e5843b388fa2f716d9b3b10c2113e1981361ecf76c",
+  "functions": 74,
+  "loops": 12,
+  "domReads": 27,
+  "nativeAtoms": 3,
+  "rectCalls": 2,
+  "policyAdapterImplemented": true,
+  "generatorTypeScript": "5.9.3"
+}

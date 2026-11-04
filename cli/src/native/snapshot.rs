@@ -476,7 +476,6 @@ pub async fn take_snapshot(
     };
 
     let mut tracker = RoleNameTracker::new();
-    let mut next_ref: usize = ref_map.next_ref_num();
 
     let mut nodes_with_refs: Vec<(usize, usize)> = Vec::new();
 
@@ -530,15 +529,12 @@ pub async fn take_snapshot(
             if let Some(existing) = ref_map.durable_ref(session_id, frame_id, backend_node_id) {
                 existing.to_string()
             } else {
-                let allocated = format!("e{}", next_ref);
-                next_ref += 1;
+                let allocated = ref_map.allocate_ref();
                 ref_map.remember_durable_ref(session_id, frame_id, backend_node_id, &allocated);
                 allocated
             }
         } else {
-            let allocated = format!("e{}", next_ref);
-            next_ref += 1;
-            allocated
+            ref_map.allocate_ref()
         };
 
         ref_map.add_with_frame(
@@ -562,8 +558,6 @@ pub async fn take_snapshot(
             }
         }
     }
-
-    ref_map.set_next_ref_num(next_ref);
 
     if options.urls {
         let link_nodes: Vec<(usize, i64)> = tree_nodes

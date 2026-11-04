@@ -2,7 +2,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -526,6 +526,11 @@ pub struct RecordingState {
     pub captured_count: u64,
     pub contact_sheet_frame_count: u64,
     pub capture_task: Option<tokio::task::JoinHandle<Result<(), String>>>,
+    /// Negotiated encoder proof: true only after explicit child wait (or no child).
+    pub(crate) encoder_complete: Arc<AtomicBool>,
+    // Successful encoder output is independent of the remote stop/cleanup ACK.
+    pub(crate) encoder_succeeded: Arc<AtomicBool>,
+    pub(crate) cleanup_task_failed: bool,
     pub shared_frame_count: Option<Arc<AtomicU64>>,
     pub shared_captured_count: Option<Arc<AtomicU64>>,
     pub shared_contact_sheet_count: Option<Arc<AtomicU64>>,
@@ -554,6 +559,9 @@ impl RecordingState {
             captured_count: 0,
             contact_sheet_frame_count: 0,
             capture_task: None,
+            encoder_complete: Arc::new(AtomicBool::new(true)),
+            encoder_succeeded: Arc::new(AtomicBool::new(false)),
+            cleanup_task_failed: false,
             shared_frame_count: None,
             shared_captured_count: None,
             shared_contact_sheet_count: None,
@@ -695,7 +703,58 @@ pub fn recording_stop(state: &mut RecordingState) -> Result<Value, String> {
     Ok(result)
 }
 
+/// Optional negotiated recording projection. Ordinary CLI defaults remain PNG
+/// at the browser viewport size; negotiated Web recording uses JPEG frames.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CaptureOptions {
+    pub size: Option<(u32, u32)>,
+    pub jpeg: bool,
+    pub quality: Option<u8>,
+    /// Native producer budget; absent for ordinary CLI recording.
+    pub output_limit: Option<usize>,
+}
+impl CaptureOptions {
+    pub fn validate(self) -> Result<Self, String> {
+        if self
+            .output_limit
+            .is_some_and(|v| v == 0 || v > 512 * 1024 * 1024)
+            || self.quality.is_some_and(|v| v > 100)
+            || (!self.jpeg && self.quality.is_some())
+            || self.size.is_some_and(|(w, h)| {
+                w == 0
+                    || h == 0
+                    || w > 16384
+                    || h > 16384
+                    || u64::from(w) * u64::from(h) > 64_000_000
+            })
+        {
+            return Err("Invalid native recording capture options".into());
+        }
+        Ok(self)
+    }
+    fn screencast(self) -> Value {
+        let mut value = json!({"format":if self.jpeg{"jpeg"}else{"png"},"everyNthFrame":1});
+        if let Some(quality) = self.quality {
+            value["quality"] = json!(quality);
+        }
+        if let Some((width, height)) = self.size {
+            value["maxWidth"] = json!(width);
+            value["maxHeight"] = json!(height);
+        }
+        value
+    }
+}
+
+#[cfg(test)]
 fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::process::Command {
+    build_ffmpeg_command_with_options(output_path, fps, cursor, CaptureOptions::default())
+}
+fn build_ffmpeg_command_with_options(
+    output_path: &str,
+    fps: u32,
+    cursor: bool,
+    options: CaptureOptions,
+) -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("ffmpeg");
     let high_fps = fps > HIGH_FPS_THRESHOLD;
 
@@ -714,13 +773,13 @@ fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::pro
             "-f",
             "image2pipe",
             "-c:v",
-            if cursor { "ppm" } else { "png" },
+            if cursor { "ppm" } else if options.jpeg { "mjpeg" } else { "png" },
             "-framerate",
             &fps.to_string(),
             "-i",
             "pipe:0",
         ])
-        .args(["-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2"])
+        .args(["-vf", &options.size.map(|(width,height)|format!("scale={width}:{height}:force_original_aspect_ratio=decrease,pad=ceil({width}/2)*2:ceil({height}/2)*2:0:0")).unwrap_or_else(||"pad=ceil(iw/2)*2:ceil(ih/2)*2".into())])
         .args(["-fps_mode", "vfr"]);
 
     if output_extension(output_path).as_deref() == Some("webm") {
@@ -729,6 +788,13 @@ fn build_ffmpeg_command(output_path: &str, fps: u32, cursor: bool) -> tokio::pro
             .args(["-deadline", "realtime", "-cpu-used", "4"]);
     } else {
         cmd.args(["-c:v", "libx264", "-preset", "ultrafast"]);
+    }
+
+    if let Some(limit) = options.output_limit {
+        // ffmpeg closes the output when the cap is reached. The final packet
+        // can overshoot, so the artifact reader still enforces the exact quota
+        // and refuses an oversized result instead of reporting truncated success.
+        cmd.args(["-fs", &limit.to_string()]);
     }
 
     // One encoder thread keeps CPU away from the browser at ordinary rates;
@@ -1305,6 +1371,17 @@ pub async fn attach_capture_session(
         .ok_or("Failed to resolve recording target")?
         .to_string();
 
+    attach_capture_session_to_target(client, &target_id, shared).await
+}
+
+/// Negotiated caller has already reserved this exact owned target. No target
+/// discovery or primary-session subscription occurs in this helper.
+pub(crate) async fn attach_capture_session_to_target(
+    client: &CdpClient,
+    target_id: &str,
+    shared: &SharedCaptureSession,
+) -> Result<String, String> {
+    let target_id = target_id.to_owned();
     if let Ok(mut guard) = shared.lock() {
         *guard = Some(CaptureSession {
             target_id: target_id.clone(),
@@ -1344,15 +1421,24 @@ pub async fn attach_capture_session(
 /// Detach a capture session that was attached for recording. This is best
 /// effort because the page or browser may already be gone.
 pub async fn detach_capture_session(client: &CdpClient, capture_session: &str) {
-    let _ = tokio::time::timeout(
-        TEARDOWN_TIMEOUT,
-        client.send_command(
-            "Target.detachFromTarget",
-            Some(json!({ "sessionId": capture_session })),
-            None,
-        ),
+    let _ = detach_capture_session_checked(client, capture_session).await;
+}
+pub(crate) async fn detach_capture_session_checked(
+    client: &CdpClient,
+    capture_session: &str,
+) -> bool {
+    matches!(
+        tokio::time::timeout(
+            TEARDOWN_TIMEOUT,
+            client.send_command(
+                "Target.detachFromTarget",
+                Some(json!({"sessionId":capture_session})),
+                None
+            ),
+        )
+        .await,
+        Ok(Ok(_))
     )
-    .await;
 }
 
 fn ffmpeg_launch_error(error: impl std::fmt::Display) -> String {
@@ -1426,6 +1512,24 @@ pub struct InitialRecordingFrame {
     pub device_height: f64,
 }
 
+/// Capture-session and encoder-process cleanup are independent proofs. A
+/// killed/dropped child is not claimed terminal until its explicit wait ended.
+struct RecordingCleanupProof {
+    output: Option<Arc<AtomicBool>>,
+    remote_complete: bool,
+    encoder_complete: Arc<AtomicBool>,
+}
+impl Drop for RecordingCleanupProof {
+    fn drop(&mut self) {
+        if let Some(output) = &self.output {
+            output.store(
+                self.remote_complete && self.encoder_complete.load(Ordering::SeqCst),
+                Ordering::SeqCst,
+            );
+        }
+    }
+}
+
 /// Drain Chrome independently from the encoder so FFmpeg cannot stall frame ACKs.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_recording_task(
@@ -1445,8 +1549,142 @@ pub fn spawn_recording_task(
     shared_contact_sheet_count: Arc<AtomicU64>,
     cancel_rx: oneshot::Receiver<()>,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
+    spawn_recording_task_with_options(
+        client,
+        capture_session,
+        initial_frame,
+        output_path,
+        fps,
+        shared_count,
+        shared_captured,
+        cursor,
+        shared_cursor,
+        cursor_overlays,
+        iframe_sessions,
+        contact_sheet_path,
+        contact_sheet_threshold,
+        shared_contact_sheet_count,
+        cancel_rx,
+        CaptureOptions::default(),
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_recording_task_with_options(
+    client: Arc<CdpClient>,
+    capture_session: String,
+    initial_frame: InitialRecordingFrame,
+    output_path: String,
+    fps: u32,
+    shared_count: Arc<AtomicU64>,
+    shared_captured: Arc<AtomicU64>,
+    cursor: bool,
+    shared_cursor: SharedRecordingCursor,
+    cursor_overlays: SharedCursorOverlays,
+    iframe_sessions: Vec<String>,
+    contact_sheet_path: Option<String>,
+    contact_sheet_threshold: f64,
+    shared_contact_sheet_count: Arc<AtomicU64>,
+    cancel_rx: oneshot::Receiver<()>,
+    options: CaptureOptions,
+    ready: Option<oneshot::Sender<Result<(), String>>>,
+    cleanup_complete: Option<Arc<AtomicBool>>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
+    spawn_recording_task_with_session_proof(
+        client,
+        capture_session,
+        initial_frame,
+        output_path,
+        fps,
+        shared_count,
+        shared_captured,
+        cursor,
+        shared_cursor,
+        cursor_overlays,
+        iframe_sessions,
+        contact_sheet_path,
+        contact_sheet_threshold,
+        shared_contact_sheet_count,
+        cancel_rx,
+        options,
+        ready,
+        cleanup_complete,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
+/// Closed receipt minted only by the exact capture task after a negative start
+/// ACK, positive remote cleanup and successful terminal encoder join. It is not
+/// permission to reuse a scope: ClientActions must recheck its original owner.
+#[derive(Default)]
+pub(crate) struct RecordingStartReceipt {
+    refusal: Mutex<
+        Option<(
+            Arc<CdpClient>,
+            String,
+            super::client_debt::CommandStatusHandle,
+        )>,
+    >,
+}
+impl RecordingStartReceipt {
+    pub(crate) fn matches(&self, client: &Arc<CdpClient>, session: &str) -> bool {
+        self.refusal.lock().is_ok_and(|receipt| {
+            receipt.as_ref().is_some_and(|(original, capture, status)| {
+                Arc::ptr_eq(original, client) && capture == session && status.is_error_ack()
+            })
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn spawn_recording_task_with_session_proof(
+    client: Arc<CdpClient>,
+    capture_session: String,
+    initial_frame: InitialRecordingFrame,
+    output_path: String,
+    fps: u32,
+    shared_count: Arc<AtomicU64>,
+    shared_captured: Arc<AtomicU64>,
+    cursor: bool,
+    shared_cursor: SharedRecordingCursor,
+    cursor_overlays: SharedCursorOverlays,
+    iframe_sessions: Vec<String>,
+    contact_sheet_path: Option<String>,
+    contact_sheet_threshold: f64,
+    shared_contact_sheet_count: Arc<AtomicU64>,
+    cancel_rx: oneshot::Receiver<()>,
+    options: CaptureOptions,
+    ready: Option<oneshot::Sender<Result<(), String>>>,
+    cleanup_complete: Option<Arc<AtomicBool>>,
+    detach_complete: Option<Arc<AtomicBool>>,
+    encoder_complete: Option<Arc<AtomicBool>>,
+    encoder_succeeded: Option<Arc<AtomicBool>>,
+    startup_receipt: Option<Arc<RecordingStartReceipt>>,
+) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
         let fps = validate_fps(fps)?;
+        let options = options.validate()?;
+        // The negotiated first-start receipt covers the fixed cursor-free,
+        // no-contact-sheet path only. Best-effort overlay removal is not a
+        // cleanup ACK and must never authorize reusable failure if that path
+        // gains additional renderer-owned work in the future.
+        let receipt_eligible = startup_receipt.is_some()
+            && !cursor
+            && iframe_sessions.is_empty()
+            && contact_sheet_path.is_none()
+            && cursor_overlays
+                .try_lock()
+                .is_ok_and(|overlays| overlays.is_empty());
+        let mut cleanup = RecordingCleanupProof {
+            output: cleanup_complete,
+            remote_complete: false,
+            encoder_complete: encoder_complete.unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
+        };
         if cursor {
             let mut sessions = iframe_sessions;
             sessions.push(capture_session.clone());
@@ -1475,12 +1713,18 @@ pub fn spawn_recording_task(
             }
             (None, None)
         };
-        let encoder = tokio::spawn(encode_stream(
+        let acknowledge_first_frame = ready.is_some();
+        let (first_frame_tx, first_frame_rx) = oneshot::channel();
+        let encoder = tokio::spawn(encode_stream_with_options(
             output_path,
             fps,
             false,
             shared_cursor.clone(),
             frame_rx,
+            options,
+            acknowledge_first_frame.then_some(first_frame_tx),
+            Some(cleanup.encoder_complete.clone()),
+            encoder_succeeded,
         ));
 
         // Chrome does not reliably emit an initial PNG screencast frame for a
@@ -1496,22 +1740,57 @@ pub fn spawn_recording_task(
         };
         let seeded = seed_recording_outputs(&frame_tx, contact_tx.as_ref(), frame).await;
         shared_captured.fetch_add(1, Ordering::Relaxed);
-
-        let started = match seeded {
-            Ok(()) => client
-                .send_command(
-                    "Page.startScreencast",
-                    Some(json!({
-                        "format": "png",
-                        "everyNthFrame": 1,
-                    })),
-                    Some(&capture_session),
-                )
-                .await
-                .map_err(|error| format!("Failed to start screencast: {error}")),
-            Err(error) => Err(error),
+        let seeded = match seeded {
+            Ok(()) if acknowledge_first_frame => {
+                tokio::time::timeout(Duration::from_secs(3), first_frame_rx)
+                    .await
+                    .map_err(|_| "Native recording first frame timed out".to_string())
+                    .and_then(|result| {
+                        result.map_err(|_| "Native recording first frame unavailable".to_string())
+                    })
+            }
+            result => result,
         };
 
+        let mut start_status = None;
+        let started = match seeded {
+            Ok(()) => {
+                let params = options.screencast();
+                match client.reserve_tracked_command(
+                    "Page.startScreencast",
+                    Some(&params),
+                    Some(&capture_session),
+                ) {
+                    Ok(reservation) => {
+                        start_status = reservation.as_ref().map(|reservation| reservation.status());
+                        client
+                            .send_reserved_command(
+                                "Page.startScreencast",
+                                Some(params),
+                                Some(&capture_session),
+                                reservation,
+                            )
+                            .await
+                            .map_err(|error| format!("Failed to start screencast: {error}"))
+                    }
+                    Err(error) => Err(format!("Failed to start screencast: {error}")),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let refused_start = started.is_err()
+            && start_status
+                .as_ref()
+                .is_some_and(|status| status.is_error_ack());
+
+        if let Some(ready) = ready {
+            let _ = ready.send(
+                started
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|_| "Native recording startup failed".to_string()),
+            );
+        }
         let captured = match started {
             Ok(_) => {
                 collect_frames(
@@ -1525,57 +1804,69 @@ pub fn spawn_recording_task(
                 )
                 .await
             }
-            Err(error) => Err(error),
+            Err(error) => {
+                drop(frame_tx);
+                drop(contact_tx);
+                Err(error)
+            }
         };
 
         client.unsubscribe_session(&capture_session);
 
-        // Best effort: the page may already be closed.
-        let _ = tokio::time::timeout(
-            TEARDOWN_TIMEOUT,
-            client.send_command_no_params("Page.stopScreencast", Some(&capture_session)),
-        )
-        .await;
+        // Ordinary CLI remains best-effort. Negotiated callers additionally
+        // receive cleanup integrity independently of encoder/file validity.
+        let terminal_before_stop = *client.remote_connection_closed().borrow();
+        let stopped = !terminal_before_stop
+            && matches!(
+                tokio::time::timeout(
+                    TEARDOWN_TIMEOUT,
+                    client.send_command_no_params("Page.stopScreencast", Some(&capture_session)),
+                )
+                .await,
+                Ok(Ok(_))
+            );
         remove_cursor_overlays(&client, &cursor_overlays).await;
-        detach_capture_session(&client, &capture_session).await;
-
-        if let Err(error) = captured {
-            if error == "Recording encoder stopped unexpectedly" {
-                return match encoder.await {
-                    Ok(Err(encoder_error)) => Err(encoder_error),
-                    Ok(Ok(_)) => Err(error),
-                    Err(join_error) => {
-                        Err(format!("Recording encoder task failed: {}", join_error))
-                    }
-                };
-            }
-            encoder.abort();
-            let _ = encoder.await;
-            if error == "Contact sheet analyzer stopped unexpectedly" {
-                return match contact_worker.take() {
-                    Some(worker) => match worker.await {
-                        Ok(Err(contact_error)) => Err(contact_error),
-                        Ok(Ok(_)) => Err(error),
-                        Err(join_error) => {
-                            Err(format!("Contact sheet task failed: {}", join_error))
-                        }
-                    },
-                    None => Err(error),
-                };
-            }
-            return Err(error);
+        let terminal_before_detach = *client.remote_connection_closed().borrow();
+        let detached = !terminal_before_detach
+            && detach_capture_session_checked(&client, &capture_session).await;
+        if let Some(proof) = &detach_complete {
+            proof.store(detached, Ordering::SeqCst);
         }
+        cleanup.remote_complete = stopped && detached;
+
+        // Never abort the encoder: it owns the actual child wait. Both output
+        // workers are joined even when capture or one worker has failed.
         let streamed = encoder
             .await
-            .map_err(|e| format!("Recording encoder task failed: {}", e))??;
-        shared_count.store(streamed, Ordering::Relaxed);
-        let contact_sheet_count = match contact_worker {
+            .map_err(|e| format!("Recording encoder task failed: {}", e))
+            .and_then(|result| result);
+        let contact_sheet_count = match contact_worker.take() {
             Some(worker) => worker
                 .await
-                .map_err(|e| format!("Contact sheet task failed: {}", e))??,
-            None => 0,
+                .map_err(|e| format!("Contact sheet task failed: {}", e))
+                .and_then(|result| result),
+            None => Ok(0),
         };
+        // A ready error alone is not reusable failure evidence. The exact
+        // refused start must be followed by both successful cleanup ACKs and
+        // a successful joined encoder. Unknown/missing replies never qualify.
+        if receipt_eligible
+            && refused_start
+            && cleanup.remote_complete
+            && streamed.is_ok()
+            && contact_sheet_count.is_ok()
+        {
+            if let (Some(receipt), Some(status)) = (startup_receipt, start_status) {
+                if let Ok(mut refusal) = receipt.refusal.lock() {
+                    *refusal = Some((client.clone(), capture_session.clone(), status));
+                }
+            }
+        }
+        let streamed = streamed?;
+        let contact_sheet_count = contact_sheet_count?;
+        shared_count.store(streamed, Ordering::Relaxed);
         shared_contact_sheet_count.store(contact_sheet_count, Ordering::Relaxed);
+        captured?;
 
         Ok(())
     })
@@ -1591,17 +1882,39 @@ pub async fn capture_initial_image(
     client: &CdpClient,
     session_id: &str,
 ) -> Result<InitialRecordingFrame, String> {
-    let viewport = client
-        .send_command(
+    capture_initial_image_with_options(client, session_id, CaptureOptions::default()).await
+}
+pub async fn capture_initial_image_with_options(
+    client: &CdpClient,
+    session_id: &str,
+    options: CaptureOptions,
+) -> Result<InitialRecordingFrame, String> {
+    let options = options.validate()?;
+    let viewport = super::client_debt::command_scope(
+        super::client_debt::CommandCategory::ApplicationRead,
+        false,
+        client.send_command(
             "Runtime.evaluate",
             Some(json!({
                 "expression": "[window.innerWidth, window.innerHeight]",
                 "returnByValue": true,
             })),
             Some(session_id),
-        )
-        .await
-        .map_err(|error| format!("Failed to read initial recording viewport: {error}"))?;
+        ),
+    )
+    .await
+    .map_err(|error| format!("Failed to read initial recording viewport: {error}"))?;
+    for handle in [
+        viewport["result"]["objectId"].as_str(),
+        viewport["exceptionDetails"]["exception"]["objectId"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !super::client_actions::release_object_accounted(client, session_id, handle).await {
+            return Err("Initial recording viewport handle cleanup unavailable".into());
+        }
+    }
     let dimensions = viewport
         .pointer("/result/value")
         .and_then(Value::as_array)
@@ -1611,14 +1924,24 @@ pub async fn capture_initial_image(
             width.is_finite() && *width > 0.0 && height.is_finite() && *height > 0.0
         })
         .ok_or_else(|| "Initial recording viewport returned invalid dimensions".to_string())?;
-    let result = client
-        .send_command(
+    let result = super::client_debt::command_scope(
+        super::client_debt::CommandCategory::ApplicationRead,
+        false,
+        client.send_command(
             "Page.captureScreenshot",
-            Some(json!({"format": "png", "fromSurface": true})),
+            Some({
+                let mut params =
+                    json!({"format":if options.jpeg{"jpeg"}else{"png"},"fromSurface":true});
+                if let Some(quality) = options.quality {
+                    params["quality"] = json!(quality);
+                }
+                params
+            }),
             Some(session_id),
-        )
-        .await
-        .map_err(|error| format!("Failed to capture initial recording frame: {error}"))?;
+        ),
+    )
+    .await
+    .map_err(|error| format!("Failed to capture initial recording frame: {error}"))?;
     let image_data = decode_frame_data(&result)
         .ok_or_else(|| "Initial recording screenshot returned no image data".to_string())?;
     Ok(InitialRecordingFrame {
@@ -1648,13 +1971,14 @@ async fn collect_frames(
                 let Some(event) = event else { break };
                 if event.method == "Page.screencastFrame" {
                     if let Some(sid) = event.params.get("sessionId").and_then(Value::as_i64) {
-                        let _ = client
+                        client
                             .send_command_no_wait(
                                 "Page.screencastFrameAck",
                                 Some(json!({ "sessionId": sid })),
                                 Some(capture_session),
                             )
-                            .await;
+                            .await
+                            .map_err(|_| FRAME_ACK_UNAVAILABLE.to_string())?;
                     }
                     let decoded = decode_frame_data(&event.params);
                     if let Some(bytes) = decoded {
@@ -1806,87 +2130,138 @@ fn render_cursor_frame(
     Ok(bytes)
 }
 
+#[cfg(test)]
 async fn encode_stream(
     output_path: String,
     fps: u32,
     cursor: bool,
     shared_cursor: SharedRecordingCursor,
-    mut frames: mpsc::Receiver<CapturedVideoFrame>,
+    frames: mpsc::Receiver<CapturedVideoFrame>,
 ) -> Result<u64, String> {
-    let mut command = build_ffmpeg_command(&output_path, fps, cursor);
-    let mut ffmpeg = spawn_ffmpeg_command(&mut command)?;
-    let mut stdin = ffmpeg
-        .stdin
-        .take()
-        .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
-    let mut interval = tokio::time::interval(frame_period(fps));
-    // Catch up after short pipe stalls instead of shortening the video.
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
-    let mut latest: Option<CapturedVideoFrame> = None;
-    let mut decoded = None;
-    let mut written = 0u64;
-
-    loop {
-        tokio::select! {
-            frame = frames.recv() => {
-                let Some(frame) = frame else { break };
-                if frame.captured_at.elapsed() > MAX_ENCODER_LAG {
-                    return Err("Recording encoder fell more than 500 ms behind capture".to_string());
-                }
-                if latest.is_none() {
-                    interval.reset_at(frame.captured_at);
-                }
-                latest = Some(frame);
+    encode_stream_with_options(
+        output_path,
+        fps,
+        cursor,
+        shared_cursor,
+        frames,
+        CaptureOptions::default(),
+        None,
+        None,
+        None,
+    )
+    .await
+}
+#[allow(clippy::too_many_arguments)]
+async fn encode_stream_with_options(
+    output_path: String,
+    fps: u32,
+    cursor: bool,
+    shared_cursor: SharedRecordingCursor,
+    mut frames: mpsc::Receiver<CapturedVideoFrame>,
+    options: CaptureOptions,
+    mut first_frame: Option<oneshot::Sender<()>>,
+    encoder_complete: Option<Arc<AtomicBool>>,
+    encoder_succeeded: Option<Arc<AtomicBool>>,
+) -> Result<u64, String> {
+    let mut command = build_ffmpeg_command_with_options(&output_path, fps, cursor, options);
+    let mut ffmpeg = match spawn_ffmpeg_command(&mut command) {
+        Ok(child) => child,
+        Err(error) => {
+            // No process was created, so there is no child wait outstanding.
+            if let Some(complete) = &encoder_complete {
+                complete.store(true, Ordering::SeqCst);
             }
-            tick = interval.tick() => {
-                if tick.elapsed() > MAX_ENCODER_LAG && latest.is_some() {
-                    return Err("Recording encoder fell more than 500 ms behind capture".to_string());
+            return Err(error);
+        }
+    };
+    let produced: Result<u64, String> = async {
+        let mut stdin = ffmpeg
+            .stdin
+            .take()
+            .ok_or_else(|| "Failed to open ffmpeg stdin".to_string())?;
+        let mut interval = tokio::time::interval(frame_period(fps));
+        // Catch up after short pipe stalls instead of shortening the video.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
+        let mut latest: Option<CapturedVideoFrame> = None;
+        let mut decoded = None;
+        let mut written = 0u64;
+
+        loop {
+            tokio::select! {
+                frame = frames.recv() => {
+                    let Some(frame) = frame else { break };
+                    if frame.captured_at.elapsed() > MAX_ENCODER_LAG {
+                        return Err("Recording encoder fell more than 500 ms behind capture".to_string());
+                    }
+                    if latest.is_none() {
+                        interval.reset_at(frame.captured_at);
+                    }
+                    latest = Some(frame);
                 }
-                let Some(frame) = latest.as_ref() else { continue };
-                let output_timestamp = cursor_timestamp();
-                let history = shared_cursor
-                    .lock()
-                    .map(|history| history.clone())
-                    .unwrap_or_default();
-                if cursor {
-                    let bytes =
-                        render_cursor_frame(frame, &history, output_timestamp, &mut decoded)?;
-                    write_encoder_bytes(&mut stdin, &bytes).await?;
-                } else {
-                    write_encoder_bytes(&mut stdin, &frame.image_data).await?;
+                tick = interval.tick() => {
+                    if tick.elapsed() > MAX_ENCODER_LAG && latest.is_some() {
+                        return Err("Recording encoder fell more than 500 ms behind capture".to_string());
+                    }
+                    let Some(frame) = latest.as_ref() else { continue };
+                    let output_timestamp = cursor_timestamp();
+                    let history = shared_cursor
+                        .lock()
+                        .map(|history| history.clone())
+                        .unwrap_or_default();
+                    if cursor {
+                        let bytes =
+                            render_cursor_frame(frame, &history, output_timestamp, &mut decoded)?;
+                        write_encoder_bytes(&mut stdin, &bytes).await?;
+                    } else {
+                        write_encoder_bytes(&mut stdin, &frame.image_data).await?;
+                    }
+                    written += 1;
+                    if let Some(first_frame) = first_frame.take() { let _ = first_frame.send(()); }
                 }
-                written += 1;
             }
         }
+
+        let Some(frame) = latest.as_ref() else {
+            return Err("No frames captured".to_string());
+        };
+        let output_timestamp = cursor_timestamp();
+        let final_image = if cursor {
+            let history = shared_cursor
+                .lock()
+                .map(|history| history.clone())
+                .unwrap_or_default();
+            render_cursor_frame(frame, &history, output_timestamp, &mut decoded)?
+        } else {
+            frame.image_data.as_ref().clone()
+        };
+        // Include the final image even when the take stops before its first tick.
+        write_encoder_bytes(&mut stdin, &final_image).await?;
+        written += 1;
+        drop(stdin);
+        Ok(written)
+    }.await;
+    // Any producer error closes stdin before killing and explicitly waiting.
+    // kill_on_drop alone is not evidence of process termination.
+    if produced.is_err() {
+        let _ = ffmpeg.start_kill();
     }
-
-    let Some(frame) = latest.as_ref() else {
-        return Err("No frames captured".to_string());
-    };
-    let output_timestamp = cursor_timestamp();
-    let final_image = if cursor {
-        let history = shared_cursor
-            .lock()
-            .map(|history| history.clone())
-            .unwrap_or_default();
-        render_cursor_frame(frame, &history, output_timestamp, &mut decoded)?
-    } else {
-        frame.image_data.as_ref().clone()
-    };
-    // Include the final image even when the take stops before its first tick.
-    write_encoder_bytes(&mut stdin, &final_image).await?;
-    written += 1;
-    drop(stdin);
-
     let output = ffmpeg
         .wait_with_output()
         .await
         .map_err(|e| format!("ffmpeg wait failed: {}", e))?;
+    if let Some(complete) = encoder_complete {
+        complete.store(true, Ordering::SeqCst);
+    }
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(format!("ffmpeg failed: {}", ffmpeg_error_tail(&stderr)));
     }
-    Ok(written)
+    if produced.is_ok() {
+        if let Some(succeeded) = encoder_succeeded {
+            succeeded.store(true, Ordering::SeqCst);
+        }
+    }
+    produced
 }
 
 fn scale_cursor_dimensions(
@@ -1945,6 +2320,8 @@ fn cursor_for_video_frame(
     }
 }
 
+pub(crate) const FRAME_ACK_UNAVAILABLE: &str = "Recording frame acknowledgement unavailable";
+
 pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), String> {
     if let Some(tx) = state.cancel_tx.take() {
         let _ = tx.send(());
@@ -1954,20 +2331,24 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
         cursor.enabled = false;
     }
 
-    let counter = state.shared_frame_count.take();
-    let captured = state.shared_captured_count.take();
-    let contact_sheet = state.shared_contact_sheet_count.take();
-    let handle = state.capture_task.take();
-
-    let result = if let Some(h) = handle {
-        match h.await {
+    // Borrow rather than take the join handle across await. If a caller is
+    // cancelled, the scope owner still owns the task and can finish cleanup.
+    let result = if let Some(handle) = state.capture_task.as_mut() {
+        match handle.await {
             Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(e) => Err(format!("Recording task panicked: {}", e)),
+            Ok(Err(error)) => Err(error),
+            Err(_) => {
+                state.cleanup_task_failed = true;
+                Err("Recording task failed".to_string())
+            }
         }
     } else {
         Ok(())
     };
+    state.capture_task.take();
+    let counter = state.shared_frame_count.take();
+    let captured = state.shared_captured_count.take();
+    let contact_sheet = state.shared_contact_sheet_count.take();
 
     if let Some(c) = counter {
         state.frame_count = c.load(Ordering::Relaxed);
@@ -1990,6 +2371,95 @@ pub async fn stop_recording_task(state: &mut RecordingState) -> Result<(), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_options_preserve_cli_defaults_and_apply_jpeg_size() {
+        assert_eq!(
+            CaptureOptions::default().screencast(),
+            json!({"format":"png","everyNthFrame":1})
+        );
+        let options = CaptureOptions {
+            size: Some((801, 601)),
+            jpeg: true,
+            quality: Some(72),
+            output_limit: Some(4096),
+        }
+        .validate()
+        .unwrap();
+        assert_eq!(
+            options.screencast(),
+            json!({"format":"jpeg","everyNthFrame":1,"quality":72,"maxWidth":801,"maxHeight":601})
+        );
+        let command = build_ffmpeg_command_with_options("fixture.webm", 24, false, options);
+        let arguments: Vec<_> = command
+            .as_std()
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(arguments.windows(2).any(|values| values == ["-fs", "4096"]));
+        assert!(arguments.iter().any(|value| value == "mjpeg"));
+        assert!(arguments.iter().any(|value| value == "libvpx"));
+        assert!(arguments
+            .iter()
+            .any(|value| value.contains("scale=801:601") && value.contains("pad=ceil(801/2)*2")));
+        for invalid in [
+            CaptureOptions {
+                size: Some((0, 10)),
+                ..Default::default()
+            },
+            CaptureOptions {
+                size: Some((16384, 16384)),
+                ..Default::default()
+            },
+            CaptureOptions {
+                quality: Some(10),
+                ..Default::default()
+            },
+            CaptureOptions {
+                jpeg: true,
+                quality: Some(101),
+                ..Default::default()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+        }
+    }
+
+    #[test]
+    fn cleanup_proof_requires_remote_ack_and_terminal_encoder_wait() {
+        for remote in [false, true] {
+            for encoder in [false, true] {
+                let output = Arc::new(AtomicBool::new(false));
+                let proof = RecordingCleanupProof {
+                    output: Some(output.clone()),
+                    remote_complete: remote,
+                    encoder_complete: Arc::new(AtomicBool::new(encoder)),
+                };
+                drop(proof);
+                assert_eq!(output.load(Ordering::SeqCst), remote && encoder);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_stop_retains_encoder_join_until_scope_cleanup() {
+        let mut state = RecordingState::new();
+        let (release, wait) = tokio::sync::oneshot::channel::<()>();
+        state.capture_task = Some(tokio::spawn(async move {
+            let _ = wait.await;
+            Ok(())
+        }));
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            stop_recording_task(&mut state)
+        )
+        .await
+        .is_err());
+        assert!(state.capture_task.is_some());
+        release.send(()).unwrap();
+        stop_recording_task(&mut state).await.unwrap();
+        assert!(state.capture_task.is_none());
+    }
 
     #[test]
     fn cursor_history_only_collects_during_cursor_recordings() {
@@ -3093,5 +3563,51 @@ mod tests {
             .and_then(|i| args.get(i + 1))
             .map(String::as_str);
         assert_eq!(threads, Some("1"));
+    }
+    #[tokio::test]
+    #[ignore = "hosted ffmpeg; actual failed encoder exit cannot certify terminal video"]
+    async fn encoder_failure_joins_without_minting_successful_output_proof() {
+        for invalid_frame in [false, true] {
+            let path = std::env::temp_dir().join(format!(
+                "native-negative-video-{}.webm",
+                uuid::Uuid::new_v4()
+            ));
+            let (sender, frames) = mpsc::channel(2);
+            if invalid_frame {
+                sender
+                    .send(CapturedVideoFrame {
+                        sequence: 0,
+                        image_data: Arc::new(b"not an image".to_vec()),
+                        elapsed: Duration::ZERO,
+                        captured_at: tokio::time::Instant::now(),
+                        timestamp: cursor_timestamp(),
+                        device_width: 64.0,
+                        device_height: 64.0,
+                    })
+                    .await
+                    .unwrap();
+            }
+            drop(sender);
+            let joined = Arc::new(AtomicBool::new(false));
+            let succeeded = Arc::new(AtomicBool::new(false));
+            let output = encode_stream_with_options(
+                path.to_string_lossy().into_owned(),
+                30,
+                false,
+                Arc::new(Mutex::new(RecordingCursorHistory::default())),
+                frames,
+                CaptureOptions::default(),
+                None,
+                Some(joined.clone()),
+                Some(succeeded.clone()),
+            )
+            .await;
+            assert!(output.is_err());
+            assert!(joined.load(Ordering::SeqCst));
+            assert!(!succeeded.load(Ordering::SeqCst));
+            if path.exists() {
+                std::fs::remove_file(path).unwrap();
+            }
+        }
     }
 }

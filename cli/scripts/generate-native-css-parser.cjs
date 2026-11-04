@@ -1,0 +1,24 @@
+const fs=require('node:fs'),crypto=require('node:crypto');
+const ts=require(process.env.TYPESCRIPT_LIB || require.resolve('typescript'));
+if(ts.version!=='5.9.3')throw Error('TypeScript generator pin5.9.3');
+const core=process.env.PLAYWRIGHT_CORE_DIR;
+if(JSON.parse(fs.readFileSync(core+'/package.json','utf8')).version!=='1.64.1')throw Error('Playwright source pin');
+const bundle=fs.readFileSync(core+'/lib/coreBundle.js','utf8');
+const line=bundle.split('\n').find(s=>/^\s*source\d* = /.test(s)&&s.includes('packages/injected/src/injectedScript.ts'));
+const raw=require('node:vm').runInNewContext(line.slice(line.indexOf('=')+1).trim().replace(/;$/,''),{}, {timeout:1000});
+const sha=crypto.createHash('sha256').update(raw).digest('hex');if(sha!=='852e40f938e72e6129b6c9a8bde3f4cc6cfe5cecb5ac734b6b06c8ad1fde42bf')throw Error('source pin');
+const source=raw.slice(raw.indexOf('// packages/isomorphic/cssTokenizer.ts'),raw.indexOf('// packages/isomorphic/selectorParser.ts'));
+const names=raw.match(/var customCSSNames = .*?;/)[0];
+const packetRoot=process.env.RAW_CSS_PACKET_ROOT||require('node:path').resolve(__dirname,'../..');
+const sf=ts.createSourceFile('pinned.js',source+names,ts.ScriptTarget.ESNext,true,ts.ScriptKind.JS),f=ts.factory;
+const call=n=>f.createCallExpression(f.createIdentifier(n),undefined,[]),stmt=n=>f.createExpressionStatement(call(n));
+let functions=0,loops=0,catches=0;
+const tx=ts.transform(sf,[ctx=>{function visit(node){let n=ts.visitEachChild(node,visit,ctx);
+ if(ts.isCatchClause(n)){catches++;const name=n.variableDeclaration.name;n=f.updateCatchClause(n,n.variableDeclaration,f.updateBlock(n.block,[f.createIfStatement(f.createBinaryExpression(name,f.createToken(ts.SyntaxKind.EqualsEqualsEqualsToken),f.createIdentifier('__limit')),f.createThrowStatement(name)),...n.block.statements]));}
+ if(ts.isForStatement(n)||ts.isForOfStatement(n)||ts.isForInStatement(n)||ts.isWhileStatement(n)||ts.isDoStatement(n)){loops++;const b=f.createBlock([stmt('__step'),...(ts.isBlock(n.statement)?n.statement.statements:[n.statement])],true);if(ts.isForStatement(n))n=f.updateForStatement(n,n.initializer,n.condition,n.incrementor,b);else if(ts.isForOfStatement(n))n=f.updateForOfStatement(n,n.awaitModifier,n.initializer,n.expression,b);else if(ts.isForInStatement(n))n=f.updateForInStatement(n,n.initializer,n.expression,b);else if(ts.isWhileStatement(n))n=f.updateWhileStatement(n,n.expression,b);else n=f.updateDoStatement(n,b,n.expression);}
+ if((ts.isFunctionDeclaration(n)||ts.isFunctionExpression(n)||ts.isArrowFunction(n)||ts.isMethodDeclaration(n)||ts.isConstructorDeclaration(n))&&n.body){functions++;const body=ts.isBlock(n.body)?n.body:f.createBlock([f.createReturnStatement(n.body)],true);const b=f.createBlock([stmt('__enter'),f.createTryStatement(body,undefined,f.createBlock([stmt('__leave')],true))],true);
+ if(ts.isFunctionDeclaration(n))n=f.updateFunctionDeclaration(n,n.modifiers,n.asteriskToken,n.name,n.typeParameters,n.parameters,n.type,b);else if(ts.isFunctionExpression(n))n=f.updateFunctionExpression(n,n.modifiers,n.asteriskToken,n.name,n.typeParameters,n.parameters,n.type,b);else if(ts.isArrowFunction(n))n=f.updateArrowFunction(n,n.modifiers,n.typeParameters,n.parameters,n.type,n.equalsGreaterThanToken,b);else if(ts.isMethodDeclaration(n))n=f.updateMethodDeclaration(n,n.modifiers,n.asteriskToken,n.name,n.questionToken,n.typeParameters,n.parameters,n.type,b);else n=f.updateConstructorDeclaration(n,n.modifiers,n.parameters,b);}
+ return n;}return n=>ts.visitNode(n,visit);}]);
+const body=ts.createPrinter({newLine:ts.NewLineKind.LineFeed}).printFile(tx.transformed[0]);tx.dispose();
+const out=`// Copyright (c) Microsoft Corporation. Licensed under Apache-2.0.\n// Guarded parser only, derived from pinned Playwright1.64.1; no DOM execution.\nfunction createRawCssParser(__step, __limit) {\nlet __depth=0;\nfunction __enter(){__step();if(__depth>=256)throw __limit;++__depth;}\nfunction __leave(){--__depth;}\n${body}\nreturn function parseRawCss(source) {\n if(typeof source!=='string')throw new TypeError('CSS source must be a string');\n let bytes=0;for(let i=0;i<source.length;i++){__step();const c=source.charCodeAt(i);if(c<128)bytes++;else if(c<2048)bytes+=2;else if(c>=0xd800&&c<=0xdbff&&source.charCodeAt(i+1)>=0xdc00&&source.charCodeAt(i+1)<=0xdfff){bytes+=4;i++;__step();}else bytes+=3;if(bytes>65536)throw __limit;}\n return parseCSS(source,customCSSNames);\n};\n}\n`;
+const dest=packetRoot+'/cli/src/native/client_observation/selector_css_parser.js';fs.mkdirSync(require('node:path').dirname(dest),{recursive:true});fs.writeFileSync(dest,out);fs.writeFileSync(packetRoot+'/cli/tests/fixtures/native-css-parser.manifest.json',JSON.stringify({pinnedSha256:sha,sourceSha256:crypto.createHash('sha256').update(source+names).digest('hex'),fileSha256:crypto.createHash('sha256').update(out).digest('hex'),functions,loops,catches},null,2)+'\n');

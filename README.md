@@ -620,7 +620,7 @@ Common tools include:
 - `agent_browser_eval`
 - `agent_browser_close`
 
-Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, and `allowedDomains`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
+Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, and `allowedDomains`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. Each tool also accepts `extraArgs` for per-command options and display or emulation flags such as `--engine`, but global flags that change network, file, policy, or host access (such as `--allowed-domains`, `--action-policy`, `--executable-path`, `--args`, and `--config`) are rejected and must be set in the MCP server's environment or config. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
 
 Example MCP client config:
 
@@ -773,8 +773,9 @@ With `--pin-tab`:
 - If the bound tab is closed, commands fail with a `tab_gone` error (exit code 1) instead of silently acting on another tab. JSON responses carry `"code": "tab_gone"` and recovery metadata in `data.targetId` plus optional `data.lastUrl`
 - `tab list`, `tab new`, and `tab <ref>` still work in that state, so an agent can recover by binding a new tab
 - Tabs opened by other sessions or the user never steal the pinned session's active tab
+- Another session cannot take a pinned tab with `tab <ref>` while the pinning session is running; the switch fails with `tab_locked` naming the owner
 
-The flag is sticky per session: pass it once and later commands and daemon restarts keep the strict semantics. Pass `--no-pin-tab` to explicitly turn the pin off again.
+The flag is sticky per session: pass it once and later commands keep the strict semantics. Daemon restarts keep the pin; an explicit `close` releases it so other sessions can take the tab, and the next `--pin-tab` command pins again. Pass `--no-pin-tab` to explicitly turn the pin off again.
 
 `data.lastUrl` is emitted only for sanitized HTTP(S) URLs and `about:blank`. HTTP(S) credentials, query strings, and fragments are removed, and opaque URLs such as `data:` are omitted. Batch output exposes the same object as `result`.
 
@@ -875,7 +876,7 @@ agent-browser includes security features for safe AI agent deployments. All feat
 - **Plugin System**: Extend agent-browser with external executable plugins. Plugins run out-of-process over the `agent-browser.plugin.v1` stdio JSON protocol and declare capabilities such as `credential.read`, `browser.provider`, `launch.mutate`, or `command.run`.
 - **Content Boundary Markers**: Wrap page output in delimiters so LLMs can distinguish tool output from untrusted content: `--content-boundaries`
 - **Domain Allowlist**: Restrict navigation to trusted domains (wildcards like `*.example.com` also match the bare domain): `--allowed-domains "example.com,*.example.com"`. Sub-resource requests (scripts, images, fetch), WebSocket/EventSource connections, and `sendBeacon` calls to non-allowed domains are blocked. WebRTC peer connections are disabled in supported Chromium sessions while the allowlist is active to prevent STUN, TURN, and DNS traffic from bypassing HTTP interception. Dedicated and shared workers are guarded with a bootstrap wrapper; if a page CSP forbids that wrapper, the worker fails closed rather than running without the allowlist guard. Pre-existing CDP sessions, auto-connect, Chrome profiles, direct-page provider plugins, agent-browser restore or state-file replay, raw Chrome args that select profiles, restore sessions, or open startup pages, iOS, and Safari reject this option because agent-browser cannot install equivalent containment before page scripts run. Include any CDN domains your target pages depend on (e.g., `*.cdn.example.com`).
-- **Action Policy**: Gate destructive actions with a static policy file: `--action-policy ./policy.json`
+- **Action Policy**: Gate destructive actions with a static policy file: `--action-policy ./policy.json`; a missing or invalid file blocks every command except `close`
 - **Action Confirmation**: Require explicit approval for sensitive action categories: `--confirm-actions eval,download`
 - **Output Length Limits**: Prevent context flooding: `--max-output 50000`
 
@@ -901,11 +902,11 @@ agent-browser plugin add @company/agent-browser-plugin-vault --name vault
 agent-browser plugin add org/agent-browser-plugin-cloud-browser
 ```
 
-References are resolved by shape: `name` uses npm, `@scope/name` uses npm, and `owner/repo` uses GitHub. `plugin add` writes `./agent-browser.json` by default; use `--global` for `~/.agent-browser/config.json`.
+References are resolved by shape: `name` uses npm, `@scope/name` uses npm, and `owner/repo` uses GitHub. `plugin add` writes `~/.agent-browser/config.json` by default; use `--project` for `./agent-browser.json` (only used with `--config`).
 
 Plugin packages should support `plugin.manifest` so `plugin add` can discover their name and capabilities automatically. If a plugin does not support manifests, pass `--capability <name>` during add.
 
-Plugins can also be configured manually in `agent-browser.json`:
+Plugins can also be configured manually in `~/.agent-browser/config.json` (or a file loaded with `--config`):
 
 ```json
 {
@@ -1159,7 +1160,7 @@ agent-browser --model openai/gpt-4o chat "take a screenshot" # Override model
 
 The `chat` command translates natural language instructions into agent-browser commands, executes them, and streams the AI response. In interactive mode, type `quit` to exit. Use `--json` for structured output suitable for agent consumption.
 
-Chat runs one agent-browser command per tool call. A `;` or `&&` inside a quoted argument is kept as text, so JSON parameters can contain them. Chat can load bundled skills with `skills get <name>` and use page WebMCP tools: it fetches a tool's input schema with `webmcp list <tool> --frame <frame-id> --json`, then calls `webmcp invoke` with the same `--frame`.
+Chat runs one agent-browser command per tool call. A `;` or `&&` inside a quoted argument is kept as text, so JSON parameters can contain them. Chat can load bundled skills with `skills get <name>` and use page WebMCP tools: it fetches a tool's input schema with `webmcp list <tool> --frame <frame-id> --json`, then calls `webmcp invoke` with the same `--frame`. Chat runs in the selected session and cannot create or switch sessions; use New Session in the dashboard for a new one. Chat commands cannot set global flags other than `--json` and `--annotate`.
 
 **Dashboard usage:**
 
@@ -1176,7 +1177,9 @@ Create an `agent-browser.json` file to set persistent defaults instead of repeat
 3. `AGENT_BROWSER_*` environment variables override config file values
 4. CLI flags override everything
 
-**Example `agent-browser.json`:**
+The auto-discovered `./agent-browser.json` cannot set `executablePath`, `args` or `plugins` (they are ignored with a warning); set them in `~/.agent-browser/config.json`, env vars or flags, or load the file explicitly with `--config ./agent-browser.json`.
+
+**Example config file:**
 
 ```json
 {
@@ -1245,6 +1248,8 @@ export AGENT_BROWSER_DEFAULT_TIMEOUT=45000
 ```
 
 > **Note:** Setting this above 30000 (30s) may cause EAGAIN errors on slow operations because the CLI's read timeout will expire before the daemon responds. Read-only commands (`snapshot`, `url`, `get text`, ...) are retried automatically. A command that changes the page or launches the browser is not re-sent once the daemon received it, since it may already have run; it fails with code `outcome_unknown` instead.
+
+> **Note:** If a command times out because the page stopped responding (for example a script stuck in `while(true){}`), the command fails with code `page_wedged`. When agent-browser launched the browser and the next command also times out, it replaces the stuck tab with a blank one, so later commands work again after you navigate. A page that recovers in between keeps its tab. With `--cdp` or `--auto-connect`, the tab belongs to your browser and is left as is. The tab is also left as is when an action policy denies `tab_new` or `tab_close` or requires confirmation for them.
 
 | Variable                        | Description                              |
 | ------------------------------- | ---------------------------------------- |
@@ -1539,6 +1544,8 @@ agent-browser --cdp "wss://your-browser-service.com/cdp?token=..." snapshot
 ```
 
 The session stays attached until `agent-browser close`. Later commands without a connection flag run against the same browser, as if you passed `--cdp` again. If that browser goes away, commands fail instead of launching a local one.
+
+If the debugging port is not open yet, `connect` and `--cdp` wait up to 2 seconds for it before failing.
 
 The `--cdp` flag accepts either:
 
@@ -2051,3 +2058,31 @@ Apache-2.0
 ## Obscura (experimental)
 
 Use `--engine obscura --executable-path /path/to/obscura` to launch a local Obscura binary. Obscura v0.2.2 has accessibility, iframe, and rendering limitations; use Chrome when fidelity matters. See the [engine documentation](https://agent-browser.dev/engines/obscura) for setup, configuration, and MCP usage, and the [contributor guide](AGENTS.md#obscura-adapter) for source-build testing.
+
+## Persistent client protocol
+
+Clients requiring `browser.observe-continuation/1` may receive an `observeContinuation` descriptor on a clean `browser.observe` initial-inventory refusal. After the original read has settled, send at most one new `browser.observe` with that descriptor as `continuation`, the unchanged options and policy fields, and the remaining original timeout. Native binds it to the original attachment, weak owner identities, retired operation sequence and absolute deadline; cancellation, replacement, outstanding or rejected cleanup debt, and repeated consumption refuse it. Each operation keeps its existing two-sample bound. This capability does not authorize retries of actions, navigation, or other reads, and has no one-shot CLI or MCP equivalent.
+
+`agent-browser --session <dedicated-name> session connect --json` opens a negotiated JSON-line connection over stdin/stdout. Use a dedicated `--session` name. Send an `agent-browser-session/1` hello with `requiredCapabilities`; inspect `ready.capabilities` before sending operations. The negotiated capabilities describe the implemented contract; requiring an absent capability fails before operations. Advertising a handler is not a claim of browser acceptance or full feature parity. An existing launched browser or another client owner is refused rather than silently adopted.
+
+Integrations requiring `browser.fixture-read-fields/1` may use `fixture.read-fields` with `identityScope`, the existing locator `expression`, configured `testIdAttribute` and `secureFieldSelector`, and a nonempty unique `fields` list. The closed fields are `role`, `name`, `text`, `value`, `selection`, `testId`, `inputPurpose`, `states`, `level`, `attributes`, `selector`, and `framePath`; geometry (`rect`) is excluded. The result contains only `identityScope` and a bounded `values` array, each carrying requested fields plus mandatory `states.secure`. Secure values remain withheld. No references, observation revisions, children, or action authority are published. Ordinary `fixture.query` is unchanged. Old binaries lacking the capability are unsupported, with no fallback query or arbitrary JavaScript.
+
+A native-verified live callback may read these current values in its exact resource scope even while unrelated input debt is retained. This is independent read authority, not parent-causal permission or a transaction-consistency guarantee. Native checks the admitted started operation, callback decision, cancellation channel, deadline, owner, target attachment, and frame/session/loader both before acquisition and before delivery. Settled, expired, cancelled, forged, cross-scope, or retired authority fails closed. The read neither clears nor transfers input debt, so no later input or reference acquisition is authorized by its success.
+
+Ordinary reference reads wait for exact retained input settlement within their original operation budget before UI admission or acquisition. They publish no reference and dispatch no input while blocked. Owner retirement or cleanup-integrity loss fails closed; cancellation acknowledgment never revives quarantine. Normal CLI and stateless MCP behavior is unchanged: field reads require the persistent negotiated connection and its native callback envelope, not a new one-shot tool.
+
+For integrations with negotiated protected capture, `capture.screenshot` accepts an optional closed `purpose`: `pixelsOnly` (the default) or `trace`. Trace output adds the native Page `viewportRef`, exact captured `viewport`, and `location` to the protected image descriptor. It does not publish a semantic root, advance semantic revisions, or replace node membership. Trace capture cannot supersede an explicit observation; a newly admitted observation rejects an older trace. The normal CLI and MCP screenshot remain pixels-only; no new CLI flag or MCP tool is introduced.
+
+
+Each UTF-8 JSON frame is limited to 1 MiB. Required capability failures, unknown fields, stale generations and replayed operation sequences fail explicitly. Cancellation acknowledgment does not prove browser effects stopped; only a terminal result with native scope health may authorize reuse. Never automatically replay an operation after transport loss. Large screenshots and response bodies will require bounded artifact handles, not oversized frames.
+
+Clients requiring `terminal.close/1` retain cleanup-only control after a quarantined result. Native shutdown starts immediately; within a fixed ten-second control window, the client may send one same-generation `close` and receive its correlated `closed` only after proven teardown and the original operation results. No request, callback or reconnect authority is restored, and the original unknown-effects result is unchanged. Cleanup failure remains an error; EOF is never a cleanup receipt. This transport capability has no one-shot MCP equivalent.
+
+
+The CLI inserts a fixed socket preface; clients on stdin/stdout only exchange JSON. Socket preface/hello negotiation has a five-second timeout. Legacy JSON commands retain their framing and payload-size behavior; an idle connection must begin sending within five seconds. Legacy browser mutation is refused while the daemon is exclusively owned by a negotiated client. The persistent connection intentionally has no one-shot MCP tool equivalent; existing MCP tools remain unchanged.
+
+The negotiated entrypoint requires an explicit dedicated session name and accepts only `--session`, `--namespace`, and `--json`. It bypasses project/user configuration, plugin loading and inherited browser-launch environment settings. Only transport socket-directory and namespace settings are retained. An already-running named daemon is never adopted or restarted. The dedicated daemon exits after proven scope teardown. Dedicated names are one-use: choose a fresh unique name for every connection, including after a failed startup or a clean close. A small admission marker remains to reject reuse and prevent crash-time ownership races. Ordinary CLI commands retain their existing configuration behavior.
+
+Request decisions use exactly one body source: `bodyBase64` or a sealed, scope-bound `bodyHandle`. Fulfillment requires one; continue/fallback overrides may omit both to preserve the current body. A handle is transferred only when its decision is accepted. Rejected decisions leave the upload releasable. Large-body storage is a separately negotiated extension; the narrow scope/evaluation executor does not advertise it and refuses handles without consuming the decision token.
+
+The native callback bridge is an internal implementation pending capability admission and browser acceptance. It does not change the narrow advertised session capabilities. Callback requests retain their original route registry and scope identity; JavaScript performs its own pattern matching and fallback selection. Large request bodies use read-only `postDataHandle` aliases, read in bounded chunks with `network.body.read`; these aliases cannot be submitted as upload handles or released by the client. Response events expose headers immediately, while body reads wait independently for completion. Download metadata distinguishes native-owned local files from provider-owned resources; provider metadata exposes only a validated basename under the configured provider directory, never an arbitrary remote file path. Application HTTP credentials are never sent to proxy challenges. Callback admission shares the native protected-read gate, while decision and cancellation control remain independent.

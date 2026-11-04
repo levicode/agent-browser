@@ -80,7 +80,7 @@ agent-browser mcp --tools all
 agent-browser mcp --tools core,network,react
 ```
 
-Configure the MCP client to launch `agent-browser` with `["mcp"]`. The server defaults to MCP protocol 2025-11-25 and accepts older supported client protocol versions during initialization. The default tools profile is `core`, which keeps MCP context small for everyday browser automation. Use `--tools all` for the full typed CLI parity surface, or combine profiles with commas, such as `--tools core,network,react`. Profiles are `core`, `network`, `state`, `debug`, `tabs`, `react`, `mobile`, and `all`; the `debug` profile includes accessibility audits, plugin registry, and command.run tools. Each tool accepts typed arguments plus `extraArgs` for advanced CLI flags and exact CLI parity. Undeclared argument keys are rejected with an invalid-params error that names them. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions, while `idleTimeout` maps to `--idle-timeout`. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally. Use the tool `session` argument or `AGENT_BROWSER_SESSION` to isolate browser sessions.
+Configure the MCP client to launch `agent-browser` with `["mcp"]`. The server defaults to MCP protocol 2025-11-25 and accepts older supported client protocol versions during initialization. The default tools profile is `core`, which keeps MCP context small for everyday browser automation. Use `--tools all` for the full typed CLI parity surface, or combine profiles with commas, such as `--tools core,network,react`. Profiles are `core`, `network`, `state`, `debug`, `tabs`, `react`, `mobile`, and `all`; the `debug` profile includes accessibility audits, plugin registry, and command.run tools. Each tool accepts typed arguments plus `extraArgs` for per-command options and display or emulation flags such as `--engine`; global flags that change network, file, policy, or host access (such as `--allowed-domains`, `--action-policy`, `--executable-path`, `--args`, and `--config`) are rejected in `extraArgs` and must be set in the MCP server's environment or config, and structured `allowedDomains` is rejected when the server already sets allowed domains. Undeclared argument keys are rejected with an invalid-params error that names them. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions, while `idleTimeout` maps to `--idle-timeout`. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally. Use the tool `session` argument or `AGENT_BROWSER_SESSION` to isolate browser sessions.
 
 ## eve agent integration
 
@@ -442,6 +442,8 @@ agent-browser doctor --json              # structured output for programmatic co
 
 **"Ref not found" / "Element not found: @eN"** Page changed since the snapshot. Run `agent-browser snapshot -i` again, then use the new refs.
 
+**`page_wedged` error or warning** The page stopped responding, for example a script stuck in a loop. When agent-browser launched the browser and the tab times out twice in a row, it is replaced by a blank one: navigate again and take a fresh snapshot. With `--cdp` or `--auto-connect`, or when policy gates `tab_new` or `tab_close`, the tab is left alone; close it or switch tabs.
+
 **"Stale ref ... cannot be recovered"** The element was replaced and duplicates make the match ambiguous, so the action did not run. Run `agent-browser snapshot -i` and use a fresh ref.
 
 **Element exists in the DOM but not in the snapshot** It's probably off-screen or not yet rendered. Try:
@@ -575,6 +577,7 @@ That pulls in:
 - `references/snapshot-refs.md` — deep dive on the snapshot + ref model
 - `references/authentication.md` — auth vault, credential plugins, credential handling
 - `references/trust-boundaries.md` — safety rules for driving a real browser
+- Negotiated integrations use `fixture.read-fields` only with `browser.fixture-read-fields/1`: current pure values, no refs or input-debt forgiveness. See `references/session-management.md`.
 - `references/session-management.md` — persistence, multi-session workflows
 - `references/profiling.md` — Chrome DevTools tracing and profiling
 - `references/video-recording.md` — video capture options
@@ -582,3 +585,19 @@ That pulls in:
 - `references/proxy-support.md`: proxy configuration and CA certificates for HTTPS interception proxies
 - `references/webgpu.md` — screenshots/video of WebGPU pages (three.js, Babylon.js), Linux/CI setup
 - `templates/*` — starter shell scripts for auth, capture, form automation
+
+## Persistent client protocol
+
+Clients requiring `browser.observe-continuation/1` may receive an `observeContinuation` descriptor on a clean `browser.observe` initial-inventory refusal. After the original read has settled, send at most one new `browser.observe` with that descriptor as `continuation`, the unchanged options and policy fields, and the remaining original timeout. Native binds it to the original attachment, weak owner identities, retired operation sequence and absolute deadline; cancellation, replacement, outstanding or rejected cleanup debt, and repeated consumption refuse it. Each operation keeps its existing two-sample bound. This capability does not authorize retries of actions, navigation, or other reads, and has no one-shot CLI or MCP equivalent.
+
+`agent-browser --session <dedicated-name> session connect --json` opens a negotiated JSON-line connection over stdin/stdout. Use a dedicated `--session` name. Send an `agent-browser-session/1` hello with `requiredCapabilities`; inspect `ready.capabilities` before sending operations. The negotiated capabilities describe the implemented contract; requiring an absent capability fails before operations. Advertising a handler is not a claim of browser acceptance or full feature parity. An existing launched browser or another client owner is refused rather than silently adopted.
+
+Each UTF-8 JSON frame is limited to 1 MiB. Required capability failures, unknown fields, stale generations and replayed operation sequences fail explicitly. Cancellation acknowledgment does not prove browser effects stopped; only a terminal result with native scope health may authorize reuse. Never automatically replay an operation after transport loss. Large screenshots and response bodies will require bounded artifact handles, not oversized frames.
+
+The CLI inserts a fixed socket preface; clients on stdin/stdout only exchange JSON. Socket preface/hello negotiation has a five-second timeout. Legacy JSON commands retain their framing and payload-size behavior; an idle connection must begin sending within five seconds. Legacy browser mutation is refused while the daemon is exclusively owned by a negotiated client. The persistent connection intentionally has no one-shot MCP tool equivalent; existing MCP tools remain unchanged.
+
+The negotiated entrypoint requires an explicit dedicated session name and accepts only `--session`, `--namespace`, and `--json`. It bypasses project/user configuration, plugin loading and inherited browser-launch environment settings. Only transport socket-directory and namespace settings are retained. An already-running named daemon is never adopted or restarted. The dedicated daemon exits after proven scope teardown. Dedicated names are one-use: choose a fresh unique name for every connection, including after a failed startup or a clean close. A small admission marker remains to reject reuse and prevent crash-time ownership races. Ordinary CLI commands retain their existing configuration behavior.
+
+Request decisions use exactly one body source: `bodyBase64` or a sealed, scope-bound `bodyHandle`. Fulfillment requires one; continue/fallback overrides may omit both to preserve the current body. A handle is transferred only when its decision is accepted. Rejected decisions leave the upload releasable. Large-body storage is a separately negotiated extension; the narrow scope/evaluation executor does not advertise it and refuses handles without consuming the decision token.
+
+Do not assume callback, response-body, or download commands are available merely because the native bridge source exists. Require the corresponding negotiated capability; the initial scope/evaluation capability set remains narrow until browser acceptance.

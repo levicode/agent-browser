@@ -7,6 +7,113 @@ use std::process::{exit, Command, ExitStatus, Stdio};
 const LAST_KNOWN_GOOD_URL: &str =
     "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json";
 
+// This is deliberately not a public mirror option. Production builds compile out
+// both the fixture source and its environment read.
+#[derive(Debug)]
+enum InstallSource {
+    Production,
+    #[cfg(any(test, feature = "acceptance-faults"))]
+    Fixture {
+        manifest: String,
+        archive: String,
+    },
+}
+
+impl InstallSource {
+    fn select() -> Result<Self, String> {
+        #[cfg(feature = "acceptance-faults")]
+        {
+            Self::from_override(std::env::var("AGENT_BROWSER_ACCEPTANCE_INSTALL_MANIFEST"))
+        }
+        #[cfg(not(feature = "acceptance-faults"))]
+        {
+            Ok(Self::Production)
+        }
+    }
+
+    #[cfg(any(test, feature = "acceptance-faults"))]
+    fn from_override(value: Result<String, std::env::VarError>) -> Result<Self, String> {
+        match value {
+            Ok(value) => Self::fixture(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::Production),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                Err("Invalid acceptance installer manifest".into())
+            }
+        }
+    }
+
+    #[cfg(any(test, feature = "acceptance-faults"))]
+    fn fixture(value: &str) -> Result<Self, String> {
+        // Parse the literal spelling, not a URL library's normalized alias.
+        let port = value
+            .strip_prefix("http://127.0.0.1:")
+            .and_then(|value| value.strip_suffix("/manifest.json"))
+            .filter(|port| !port.is_empty() && !port.starts_with('0'))
+            .filter(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+            .and_then(|port| port.parse::<u16>().ok())
+            .filter(|port| *port != 0)
+            .ok_or("Invalid acceptance installer manifest")?;
+        Ok(Self::Fixture {
+            manifest: value.to_string(),
+            archive: format!("http://127.0.0.1:{port}/archive.zip"),
+        })
+    }
+
+    fn manifest_url(&self) -> &str {
+        match self {
+            Self::Production => LAST_KNOWN_GOOD_URL,
+            #[cfg(any(test, feature = "acceptance-faults"))]
+            Self::Fixture { manifest, .. } => manifest,
+        }
+    }
+
+    fn fixture_mode(&self) -> bool {
+        match self {
+            Self::Production => false,
+            #[cfg(any(test, feature = "acceptance-faults"))]
+            Self::Fixture { .. } => true,
+        }
+    }
+
+    fn validate_archive(&self, url: &str) -> Result<(), String> {
+        #[cfg(any(test, feature = "acceptance-faults"))]
+        if let Self::Fixture { archive, .. } = self {
+            if url != archive {
+                return Err("Invalid acceptance installer archive".into());
+            }
+        }
+        let _ = url;
+        Ok(())
+    }
+
+    fn validate_version(&self, version: &str) -> Result<(), String> {
+        if self.fixture_mode()
+            && !version
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+        {
+            return Err("Invalid acceptance installer version".into());
+        }
+        Ok(())
+    }
+
+    fn client(&self) -> Result<reqwest::Client, String> {
+        if !self.fixture_mode() {
+            return http_client();
+        }
+        // Neither inherited proxies nor redirects may escape the literal loopback
+        // source. Keep production TLS options and deadlines, without relaxing trust.
+        crate::tls::apply_to_reqwest(reqwest::Client::builder(), &crate::tls::process_options())?
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .user_agent(format!("agent-browser/{}", env!("CARGO_PKG_VERSION")))
+            .timeout(std::time::Duration::from_secs(120))
+            .connect_timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| format!("Failed to create HTTP client: {}", format_reqwest_error(&e)))
+    }
+}
+
 pub fn get_browsers_dir() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
@@ -182,13 +289,20 @@ fn platform_key() -> &'static str {
     }
 }
 
-async fn fetch_download_url() -> Result<(String, String), String> {
-    let client = http_client()?;
+async fn fetch_download_url(source: &InstallSource) -> Result<(String, String), String> {
+    let client = source.client()?;
     let resp = client
-        .get(LAST_KNOWN_GOOD_URL)
+        .get(source.manifest_url())
         .send()
         .await
         .map_err(|e| format!("Failed to fetch version info: {}", format_reqwest_error(&e)))?;
+
+    if source.fixture_mode() && !resp.status().is_success() {
+        return Err(format!(
+            "Acceptance installer manifest returned HTTP {}",
+            resp.status()
+        ));
+    }
 
     let body: serde_json::Value = resp
         .json()
@@ -223,6 +337,8 @@ async fn fetch_download_url() -> Result<(String, String), String> {
         })
         .ok_or_else(|| format!("No download URL found for platform: {}", platform))?;
 
+    source.validate_version(&version)?;
+    source.validate_archive(&url)?;
     Ok((version, url))
 }
 
@@ -245,8 +361,9 @@ fn http_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("Failed to create HTTP client: {}", format_reqwest_error(&e)))
 }
 
-async fn download_bytes(url: &str) -> Result<Vec<u8>, String> {
-    let client = http_client()?;
+async fn download_bytes(url: &str, source: &InstallSource) -> Result<Vec<u8>, String> {
+    source.validate_archive(url)?;
+    let client = source.client()?;
     let max_retries = 3;
     let mut last_err = String::new();
 
@@ -410,6 +527,11 @@ pub fn run_install(with_deps: bool) {
         exit(1);
     }
 
+    let source = InstallSource::select().unwrap_or_else(|error| {
+        eprintln!("{} {}", color::error_indicator(), error);
+        exit(1);
+    });
+
     let is_linux = cfg!(target_os = "linux");
 
     if is_linux {
@@ -439,7 +561,7 @@ pub fn run_install(with_deps: bool) {
             exit(1);
         });
 
-    let (version, url) = match rt.block_on(fetch_download_url()) {
+    let (version, url) = match rt.block_on(fetch_download_url(&source)) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{} {}", color::error_indicator(), e);
@@ -463,7 +585,7 @@ pub fn run_install(with_deps: bool) {
     println!("  Downloading Chrome {} for {}", version, platform_key());
     println!("  {}", url);
 
-    let bytes = match rt.block_on(download_bytes(&url)) {
+    let bytes = match rt.block_on(download_bytes(&url, &source)) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("{} {}", color::error_indicator(), e);
@@ -868,6 +990,136 @@ mod tests {
         request
     }
 
+    // Shared default/feature tests preserve the exact acceptance-faults test delta.
+    #[test]
+    fn fixture_manifest_requires_canonical_literal_loopback() {
+        for port in [1, 80, 65535] {
+            let url = format!("http://127.0.0.1:{port}/manifest.json");
+            let source = InstallSource::fixture(&url).unwrap();
+            assert_eq!(source.manifest_url(), url);
+            assert!(source
+                .validate_archive(&format!("http://127.0.0.1:{port}/archive.zip"))
+                .is_ok());
+        }
+        for value in [
+            "",
+            "http://127.0.0.1/manifest.json",
+            "http://127.0.0.1:0/manifest.json",
+            "http://127.0.0.1:01/manifest.json",
+            "http://127.0.0.1:+1/manifest.json",
+            "http://127.0.0.1:65536/manifest.json",
+            "http://127.0.0.1:/manifest.json",
+            "http://127.0.0.1:１/manifest.json",
+            "http://localhost:1/manifest.json",
+            "http://127.1:1/manifest.json",
+            "http://2130706433:1/manifest.json",
+            "http://0x7f000001:1/manifest.json",
+            "http://127.0.0.2:1/manifest.json",
+            "http://10.0.0.1:1/manifest.json",
+            "http://192.168.0.1:1/manifest.json",
+            "http://[::1]:1/manifest.json",
+            "http://%31%32%37.0.0.1:1/manifest.json",
+            "http://@127.0.0.1:1/manifest.json",
+            "http://user@127.0.0.1:1/manifest.json",
+            "http://user:pass@127.0.0.1:1/manifest.json",
+            "https://127.0.0.1:1/manifest.json",
+            "//127.0.0.1:1/manifest.json",
+            "http://127.0.0.1:1/manifest.json?",
+            "http://127.0.0.1:1/manifest.json#",
+            "http://127.0.0.1:1//manifest.json",
+            "http://127.0.0.1:1/./manifest.json",
+            "http://127.0.0.1:1/%6danifest.json",
+            "http://127.0.0.1:1/archive.zip",
+            " http://127.0.0.1:1/manifest.json",
+            "http://127.0.0.1:1/manifest.json\n",
+            "http://127.0.0.1: 1/manifest.json",
+            r"http://127.0.0.1:1\manifest.json",
+        ] {
+            assert!(InstallSource::fixture(value).is_err(), "accepted {value:?}");
+        }
+    }
+
+    #[test]
+    fn fixture_source_selection_rejects_present_invalid_overrides() {
+        assert!(matches!(
+            InstallSource::from_override(Err(std::env::VarError::NotPresent)).unwrap(),
+            InstallSource::Production
+        ));
+        assert!(InstallSource::from_override(Ok(String::new())).is_err());
+        assert!(
+            InstallSource::from_override(Err(std::env::VarError::NotUnicode(
+                std::ffi::OsString::from("invalid Unicode override")
+            )))
+            .is_err()
+        );
+        assert!(
+            InstallSource::from_override(Ok("http://127.0.0.1:80/manifest.json".into()))
+                .unwrap()
+                .fixture_mode()
+        );
+    }
+
+    #[test]
+    fn fixture_archive_and_version_stay_on_selected_source() {
+        let source = InstallSource::fixture("http://127.0.0.1:80/manifest.json").unwrap();
+        for value in [
+            "http://127.0.0.1/archive.zip",
+            "http://127.0.0.1:81/archive.zip",
+            "http://localhost:80/archive.zip",
+            "https://127.0.0.1:80/archive.zip",
+            "http://127.0.0.1:80/manifest.json",
+            "http://127.0.0.1:80/archive.zip?",
+            "http://127.0.0.1:80/archive.zip#",
+            "http://@127.0.0.1:80/archive.zip",
+            "http://127.0.0.1:080/archive.zip",
+            "http://127.0.0.1:80/a/../archive.zip",
+            "http://127.0.0.1:80/%61rchive.zip",
+        ] {
+            assert!(
+                source.validate_archive(value).is_err(),
+                "accepted {value:?}"
+            );
+        }
+        assert!(source.validate_version("999.0.0.1").is_ok());
+        for version in ["", ".1", "1.", "1..2", "../path", "1/a", "１"] {
+            assert!(source.validate_version(version).is_err());
+        }
+        assert_eq!(
+            InstallSource::Production.manifest_url(),
+            LAST_KNOWN_GOOD_URL
+        );
+        assert!(InstallSource::Production
+            .validate_archive("https://official.example/chrome.zip")
+            .is_ok());
+        assert!(InstallSource::Production
+            .validate_version("unchanged-production-semantics")
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn fixture_manifest_and_archive_refuse_redirects() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let source =
+            InstallSource::fixture(&format!("http://127.0.0.1:{port}/manifest.json")).unwrap();
+        let server = tokio::spawn(async move {
+            let response = b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/escaped\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+            accept_once(&listener, response).await;
+            accept_once(&listener, response).await;
+        });
+        assert!(fetch_download_url(&source)
+            .await
+            .unwrap_err()
+            .contains("302"));
+        assert!(
+            download_bytes(&format!("http://127.0.0.1:{port}/archive.zip"), &source)
+                .await
+                .unwrap_err()
+                .contains("302")
+        );
+        server.await.unwrap();
+    }
+
     #[test]
     fn resolve_apt_deps_prefers_available_t64_variants() {
         let deps = resolve_apt_deps_with(|pkg| matches!(pkg, "libasound2t64" | "libgtk-3-0t64"));
@@ -923,7 +1175,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{}/test.zip", port);
-        let result = download_bytes(&url).await;
+        let result = download_bytes(&url, &InstallSource::Production).await;
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), body);
         server.await.unwrap();
@@ -940,7 +1192,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{}/test.zip", port);
-        let result = download_bytes(&url).await;
+        let result = download_bytes(&url, &InstallSource::Production).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -967,7 +1219,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{}/test.zip", port);
-        let result = download_bytes(&url).await;
+        let result = download_bytes(&url, &InstallSource::Production).await;
         assert!(
             result.is_ok(),
             "expected success after retries: {:?}",
@@ -991,7 +1243,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{}/test.zip", port);
-        let result = download_bytes(&url).await;
+        let result = download_bytes(&url, &InstallSource::Production).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
@@ -1014,7 +1266,7 @@ mod tests {
         });
 
         let url = format!("http://127.0.0.1:{}/test.zip", port);
-        let result = download_bytes(&url).await;
+        let result = download_bytes(&url, &InstallSource::Production).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("HTTP 403"));
         server.await.unwrap();
@@ -1051,7 +1303,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let result = rt.block_on(download_bytes("http://127.0.0.1:1/test.zip"));
+        let result = rt.block_on(download_bytes(
+            "http://127.0.0.1:1/test.zip",
+            &InstallSource::Production,
+        ));
         assert!(result.is_err());
         let err = result.unwrap_err();
         // The new code should include the root cause (connection refused)
