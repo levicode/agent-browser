@@ -4042,16 +4042,6 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 },
                 outcome = &mut retained => outcome,
             };
-            // A request that cannot write page content has no application
-            // effects to be uncertain about. The dispatch boundary already
-            // settles that way, but the readiness settlement and a lost
-            // retained completion can still promote the same read to Unknown.
-            // The scope keeps its dirty/quarantine decision and the primary
-            // error; only the public effects label changes.
-            let mut outcome = outcome;
-            if !modifies_page && outcome.effects == Effects::Unknown {
-                outcome.effects = Effects::NotDispatched;
-            }
             return finish(outcome);
         }
         if matches!(
