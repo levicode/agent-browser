@@ -4042,6 +4042,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 },
                 outcome = &mut retained => outcome,
             };
+            // Paired with levicode/e2e#49: a page-read-only observation has no
+            // application effects to be uncertain about, even when the scope is
+            // quarantined, so its disconnected-owner receipt may carry the clean
+            // non-dispatch. The client accepts that shape for read-only commands
+            // only; page-writing captures keep Unknown. Re-applies 0a41b89
+            // without e080539's usable-scope narrowing; both reverts stay in
+            // history.
+            let mut outcome = outcome;
+            if !modifies_page && outcome.effects == Effects::Unknown {
+                outcome.effects = Effects::NotDispatched;
+            }
             return finish(outcome);
         }
         if matches!(
