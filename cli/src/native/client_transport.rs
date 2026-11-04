@@ -1453,7 +1453,7 @@ where
                     continue;
                 },
                 completion = operations.join_next(), if !operations.is_empty() => {
-                    let Some(Ok((sequence, mut outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
+                    let Some(Ok((sequence, outcome))) = completion else { settlement_trace!(0, CompletionLost); break; };
                     settlement_trace!(sequence, CompletionJoined);
                     let Some((id, generation, callback, scope, _read_only)) = pending.remove(&sequence) else { settlement_trace!(sequence, CompletionLost); break; };
                     let (state, observation_settlement) = broker.settle_with_observation_proof(generation, sequence, outcome.effects,
@@ -1469,32 +1469,22 @@ where
                     {
                         broker.release_refused_disconnected_recovery(sequence);
                     }
-                    // A settled failed operation whose scope is quarantined owns
-                    // the one unclaimed disconnected-recovery receipt, whether it
-                    // ended Unknown or as a clean pre-dispatch refusal. A refused
+                    let unknown = outcome.effects == Effects::Unknown;
+                    // A settled operation whose scope is quarantined owns the one
+                    // unclaimed disconnected-recovery receipt, whether it ended
+                    // Unknown or as a clean pre-dispatch refusal. A refused
                     // reconnect over an owner that lost only its remote connection
                     // is a clean refusal, yet the explicit close still needs that
                     // receipt to prove local retirement. The candidate hook
                     // validates the exact owner, so it cannot mint a receipt for a
                     // locally failed producer.
-                    let recovery = if recovery_negotiated && !callback && outcome.result.is_err() && state == ScopeState::Quarantined {
+                    let recovery = if recovery_negotiated && !callback && state == ScopeState::Quarantined {
                         executor.disconnected_recovery_candidate(super::client_debt::OperationKey { generation, operation_seq: sequence })
                             .and_then(|proof| {
                                 let descriptor = RecoveryDescriptor { version: 1, identity_scope: proof.ledger().identity_scope().to_owned() };
                                 broker.offer_disconnected_recovery(proof).ok().map(|()| descriptor)
                             })
                     } else { None };
-                    // The quarantine receipt is a closed wire shape: a failed
-                    // result with effects unknown and no retention. A page-read
-                    // settlement may have been normalized to a non-dispatch
-                    // because it cannot change page content, but the receipt is
-                    // about the disconnected owner, not the read's application
-                    // effects. Restore the contract shape whenever one travels.
-                    if recovery.is_some() {
-                        outcome.effects = Effects::Unknown;
-                        outcome.retention = None;
-                    }
-                    let unknown = outcome.effects == Effects::Unknown;
                     let recoverable = recovery.is_some();
                     if !recoverable && !callback && outcome.result.is_err() && state == ScopeState::Quarantined {
                         let batch = executor.take_terminal_recording(super::client_debt::OperationKey { generation, operation_seq: sequence }, scope.as_deref());

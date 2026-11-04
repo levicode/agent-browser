@@ -4046,17 +4046,10 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             // effects to be uncertain about. The dispatch boundary already
             // settles that way, but the readiness settlement and a lost
             // retained completion can still promote the same read to Unknown.
-            // Only a scope that is still usable takes the correction: once the
-            // scope is quarantined, Unknown is the closed quarantine/recovery
-            // shape the client needs (a disconnected-owner receipt travels
-            // only as a failed unknown result), so it is preserved there. The
-            // primary error and the dirty/quarantine decision never change.
+            // The scope keeps its dirty/quarantine decision and the primary
+            // error; only the public effects label changes.
             let mut outcome = outcome;
-            let scope_usable = self
-                .broker
-                .health()
-                .is_ok_and(|(_, state)| state == super::client_protocol::ScopeState::Usable);
-            if !modifies_page && scope_usable && outcome.effects == Effects::Unknown {
+            if !modifies_page && outcome.effects == Effects::Unknown {
                 outcome.effects = Effects::NotDispatched;
             }
             return finish(outcome);
