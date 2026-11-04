@@ -4749,8 +4749,15 @@ pub(crate) const FRAME_OWNER_GEOMETRY: &str = r#"function(){
                 if(this.ownerDocument!==document||!this.isConnected)throw new Error('Frame owner moved');
                 const r=this.getBoundingClientRect();let e=this,parts=[];
                 while(e&&e.nodeType===1){if(e.id){parts.unshift('#'+CSS.escape(e.id));break;}let p=e.parentElement;let index=p?Array.from(p.children).indexOf(e)+1:1;parts.unshift(e.localName+':nth-child('+index+')');e=p;}
-                return {x:r.x+this.clientLeft,y:r.y+this.clientTop,selector:parts.join(' > ')};
+                return {x:r.x+this.clientLeft,y:r.y+this.clientTop,selector:parts.join(' > '),localName:this.localName};
             }"#;
+
+/// <object>/<embed> child documents are opaque plugin content, not author
+/// document inventory. Their owner element stays in the semantic tree as a
+/// leaf; the plugin document is omitted rather than denying the whole page.
+fn opaque_plugin_frame(owner: &Value) -> bool {
+    matches!(owner["localName"].as_str(), Some("object" | "embed"))
+}
 
 /// Enumerate only the executor's owned page and attached frame sessions. Missing
 /// renderer ownership is an error, never permission to attach an arbitrary tab.
@@ -4929,6 +4936,13 @@ async fn enumerate_frames_impl(
                 settle_owner_object(client, &parent.binding.session, object, value).await?
             };
             let data = &value["result"]["value"];
+            // <object>/<embed> child documents are opaque plugin content, not
+            // author document inventory. Their owner element stays in the tree
+            // as an opaque leaf; never let an unprovable plugin frame deny the
+            // whole page's observation.
+            if opaque_plugin_frame(data) {
+                continue;
+            }
             descriptor.offset_x =
                 parent.offset_x + data["x"].as_f64().ok_or("Frame offset unavailable")?;
             descriptor.offset_y =
@@ -12414,5 +12428,23 @@ mod node_identity_resample_merge_tests {
         };
         assert!(result.negatives.is_empty());
         assert_eq!(result.origin, NodeGeometryOrigin::Other);
+    }
+}
+
+
+#[cfg(test)]
+mod opaque_plugin_frame_tests {
+    use super::opaque_plugin_frame;
+    use serde_json::json;
+
+    #[test]
+    fn object_and_embed_owner_frames_are_opaque_plugin_content() {
+        for tag in ["object", "embed"] {
+            assert!(opaque_plugin_frame(&json!({"localName": tag})));
+        }
+        for tag in ["iframe", "frame", "", "OBJECT"] {
+            assert!(!opaque_plugin_frame(&json!({"localName": tag})));
+        }
+        assert!(!opaque_plugin_frame(&json!({})));
     }
 }
