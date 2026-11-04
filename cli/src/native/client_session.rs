@@ -468,11 +468,21 @@ impl ClientSession {
             return Err(ProtocolError::SequenceReused);
         }
         inner.high_water = sequence;
-        let recovery = inner
-            .recovery
-            .as_ref()
-            .ok_or(ProtocolError::ScopeUnavailable)?;
-        recovery.source.check()?;
+        // A quarantined scope without a usable recovery transition is a stale
+        // scope, not an unavailable one: the caller's exact scope is gone and
+        // the clean refusal is the same one a different-identity reconnect
+        // receives. A hard ScopeUnavailable here makes the transport stop
+        // servicing the explicit close, which can then no longer prove the old
+        // owner retired.
+        let Some(recovery) = inner.recovery.as_ref() else {
+            return Err(ProtocolError::StaleScope);
+        };
+        // An invalidated or expired receipt is equally stale: it may have been
+        // contaminated by a later local loss or passed its retirement bound.
+        recovery
+            .source
+            .check()
+            .map_err(|_| ProtocolError::StaleScope)?;
         if recovery.operation.is_some() || recovery.source.ledger().identity_scope() != scope {
             return Err(ProtocolError::StaleScope);
         }
@@ -2234,6 +2244,22 @@ mod tests {
             "a refused replacement left no closing recovery receipt"
         );
         drop(lease);
+    }
+
+    #[test]
+    fn quarantined_reconnect_without_an_offered_receipt_is_a_clean_stale_scope() {
+        let broker = ClientSession::new();
+        broker.quarantine().unwrap();
+        // The client observes the loss event and asks for an exact-scope
+        // recovery, but no receipt was ever offered for this quarantine. That
+        // is a stale scope (the same clean refusal a refused replacement gets),
+        // not a hard transport failure that stops servicing the close.
+        assert_eq!(
+            broker
+                .admit_disconnected_reconnect(1, 2, 1_000, "scope")
+                .err(),
+            Some(ProtocolError::StaleScope)
+        );
     }
 
     #[test]

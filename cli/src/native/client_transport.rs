@@ -1465,7 +1465,11 @@ where
                     // source receipt must stay available to the explicit close
                     // that still has to prove the disconnected owner retired.
                     if state == ScopeState::Quarantined
-                        && matches!(outcome.result, Err(ProtocolError::StaleScope))
+                        && outcome.effects == Effects::NotDispatched
+                        && matches!(
+                            outcome.result,
+                            Err(ProtocolError::StaleScope | ProtocolError::ScopeUnavailable)
+                        )
                     {
                         broker.release_refused_disconnected_recovery(sequence);
                     }
@@ -1502,6 +1506,30 @@ where
                     if !enqueue(&sender, message, &broker) { settlement_trace!(sequence, ResultQueueFailed); break; }
                     settlement_trace!(sequence, ResultQueued);
                     if !recoverable && ((unknown && state != ScopeState::Usable) || state == ScopeState::Quarantined) {
+                        // This settlement is not itself a recovery receipt (a
+                        // clean refused reconnect releases the transition; an
+                        // unknown loss may never have offered one), but the
+                        // quarantined broker can still hold the old owner's
+                        // unclaimed receipt. The read loop is about to stop
+                        // servicing ordinary requests, so capture that receipt
+                        // exactly as an explicit Close would: the shutdown lane
+                        // then proves retirement instead of reporting cleanup
+                        // unproven because the client's Close arrived too late.
+                        if state == ScopeState::Quarantined {
+                            if let Ok(mut slot) = closing_recovery.lock() {
+                                if slot.is_none() {
+                                    // An owner with an unresolved dispatched
+                                    // input has remote debt that local EOF
+                                    // retirement cannot prove; keep that close
+                                    // unproven exactly as before.
+                                    if let Some(proof) = broker.take_closing_recovery() {
+                                        if proof.ledger().snapshot().input_debt == 0 {
+                                            *slot = Some(proof);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         terminal_control = terminal_close_negotiated;
                         settlement_trace!(sequence, UnknownOutcome); break;
                     }
@@ -1715,6 +1743,20 @@ where
                                 break;
                             }
                             if state == ScopeState::Quarantined && !broker.recovery_available() {
+                                // Even when no *new* receipt is available for
+                                // this admission, the broker may still hold the
+                                // old owner's unclaimed close receipt. Capture
+                                // it before leaving the ordinary lane so the
+                                // shutdown can prove retirement.
+                                if let Ok(mut slot) = closing_recovery.lock() {
+                                    if slot.is_none() {
+                                        if let Some(proof) = broker.take_closing_recovery() {
+                                            if proof.ledger().snapshot().input_debt == 0 {
+                                                *slot = Some(proof);
+                                            }
+                                        }
+                                    }
+                                }
                                 terminal_control = terminal_close_negotiated;
                                 break;
                             }
@@ -3319,6 +3361,126 @@ mod tests {
         assert_eq!(closed["scopeState"], "closed");
         assert!(closed.get("cleanup").is_none());
         assert!(serving.await.unwrap());
+    }
+    #[tokio::test]
+    async fn quarantined_settlement_keeps_the_previously_offered_closing_receipt() {
+        struct LateCloseExecutor {
+            received: std::sync::atomic::AtomicBool,
+            candidate: Option<super::super::client_operation_state::DisconnectedRecoveryProof>,
+        }
+        impl ClientExecutor for LateCloseExecutor {
+            fn capabilities(&self) -> Vec<String> {
+                vec![super::super::client_protocol::DISCONNECTED_RECOVERY.to_owned()]
+            }
+            async fn execute(
+                &self,
+                _: String,
+                _: serde_json::Map<String, serde_json::Value>,
+                _: OperationLease,
+            ) -> NativeOutcome {
+                // A refused reconnect over the quarantined owner: clean, no
+                // candidate staged and no new receipt minted by this settle.
+                NativeOutcome {
+                    retention: None,
+                    result: Err(ProtocolError::StaleScope),
+                    effects: Effects::NotDispatched,
+                }
+            }
+            fn disconnected_recovery_candidate(
+                &self,
+                _: super::super::client_debt::OperationKey,
+            ) -> Option<super::super::client_operation_state::DisconnectedRecoveryProof>
+            {
+                self.candidate.clone()
+            }
+            async fn shutdown(&self) -> Result<(), ProtocolError> {
+                Ok(())
+            }
+            fn shutdown_with_recovery(
+                &self,
+                recovery: Option<super::super::client_operation_state::DisconnectedRecoveryProof>,
+            ) -> impl std::future::Future<Output = Result<(), ProtocolError>> + Send {
+                self.received
+                    .store(recovery.is_some(), std::sync::atomic::Ordering::SeqCst);
+                async {
+                    // Hold the shutdown lane open so the explicit Close can
+                    // arrive after the ordinary reader lane stopped, exactly as
+                    // a real bounded teardown would.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    Ok(())
+                }
+            }
+        }
+        use super::super::client_debt::{OperationKey, OwnerDebtLedger};
+        let broker = std::sync::Arc::new(ClientSession::new());
+        broker.quarantine().unwrap();
+        let ledger = OwnerDebtLedger::new(1, "scope".to_owned());
+        ledger.observe_remote_eof();
+        let proof = super::super::client_operation_state::DisconnectedRecoveryProof::for_test(
+            OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            },
+            ledger,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
+        // The transport already holds the old owner's unclaimed receipt before
+        // the reconnect request, exactly as a refusal settled earlier would.
+        broker.offer_disconnected_recovery(proof).unwrap();
+        let executor = std::sync::Arc::new(LateCloseExecutor {
+            received: std::sync::atomic::AtomicBool::new(false),
+            candidate: None,
+        });
+        let (peer, server) = tokio::io::duplex(8192);
+        let (reader, writer) = tokio::io::split(server);
+        let serving = tokio::spawn(serve_with_executor(
+            tokio::io::BufReader::new(reader),
+            writer,
+            ClientMessage::Hello {
+                id: "h".into(),
+                protocol: PROTOCOL.into(),
+                required_capabilities: vec![
+                    super::super::client_protocol::DISCONNECTED_RECOVERY.to_owned()
+                ],
+            },
+            broker.clone(),
+            executor.clone(),
+        ));
+        let mut peer = tokio::io::BufReader::new(peer);
+        let ready = settlement_frame(&mut peer).await;
+        assert_eq!(ready["type"], "ready");
+        peer.get_mut()
+            .write_all(
+                b"{\"type\":\"request\",\"id\":\"r\",\"generation\":1,\"operationSeq\":2,\"timeoutMs\":5000,\"command\":\"scope.reconnect\",\"args\":{\"identityScope\":\"scope\"}}\n",
+            )
+            .await
+            .unwrap();
+        let result = settlement_frame(&mut peer).await;
+        assert_eq!(result["type"], "result");
+        assert_eq!(result["effects"], "not-dispatched");
+        assert_eq!(result["scopeState"], "quarantined");
+        // This settle minted no receipt of its own, so the read loop leaves the
+        // ordinary lane. The already offered receipt must travel to the
+        // shutdown lane even though the client's Close has not arrived yet.
+        let mut handed_off = false;
+        for _ in 0..200 {
+            if executor.received.load(std::sync::atomic::Ordering::SeqCst) {
+                handed_off = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(
+            handed_off,
+            "a quarantined settlement dropped the already offered closing receipt"
+        );
+        // The terminal lane owns only this refusal; releasing the peer ends it.
+        peer.get_mut().shutdown().await.unwrap();
+        assert!(serving.await.unwrap());
+        assert_eq!(
+            broker.health().map(|(_, state)| state),
+            Ok(ScopeState::Closed)
+        );
     }
     #[tokio::test]
     async fn terminal_close_cleanup_failure_is_correlated_after_unknown() {
