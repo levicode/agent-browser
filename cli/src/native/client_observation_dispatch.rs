@@ -1902,7 +1902,7 @@ impl ObservationDispatch {
             value["pixels"] = json!({"identityScope":identity,"handle":image.handle,"size":image.size,
                 "sha256":image.sha256,"mediaType":"image/png","width":pixels.width,"height":pixels.height,
                 "scale":pixels.scale,"maskedRegionCount":pixels.masked_region_count});
-            let publish = bounded_result(&value);
+            let publish = fit_observation_result(&mut value);
             if let Err(error) = publish {
                 if !release_handles(blobs, scope, &handles) {
                     cleanup_lost.store(true, Ordering::SeqCst);
@@ -2765,7 +2765,7 @@ impl ObservationDispatch {
                             return Err(ProtocolError::StaleScope);
                         }
                         screenshot_stage(screenshot, ScreenshotStage::FinalScope);
-                        bounded_result(&value)?;
+                        fit_observation_result(&mut value)?;
                         check(&capture_context.page, &operation)?;
                         // A provisional CDP payload is not semantic completion
                         // if its reader already rejected the reply's identity.
@@ -2786,6 +2786,7 @@ impl ObservationDispatch {
                         ).await);
                         return Ok((Value::Null, None, None));
                     }
+                    fit_observation_result(&mut value)?;
                     Ok((value, None, None))
                 }
             }
@@ -2931,7 +2932,7 @@ impl ObservationDispatch {
         witness.enter(ObserveFailureStage::Publication);
         screenshot_stage(screenshot, ScreenshotStage::Publication);
         let publish = (async {
-            bounded_result(&value)?;
+            fit_observation_result(&mut value)?;
             check(&capture_context.page, &operation)?;
             if let Some(journal) = &journal {
                 journal.check_async().await.map_err(protected_error)?;
@@ -3341,6 +3342,84 @@ fn bounded_result(value: &Value) -> Result<(), ProtocolError> {
         value,
     )
     .map_err(|_| ProtocolError::CapacityExceeded)
+}
+/// Fit a captured semantic tree to the frame budget the way the Chromium
+/// harness did: keep the document root and the first nodes in document order
+/// that serialize within the result bound, and mark the capture `truncated`
+/// so a reader never treats the listing as a complete screen. Dropped nodes
+/// keep their staged refs unpublished; retained nodes keep their exact refs.
+/// A query result is never silently discarded this way: only a value with a
+/// semantic `root` tree is truncated, everything else keeps the hard bound.
+fn fit_observation_result(value: &mut Value) -> Result<(), ProtocolError> {
+    const BUDGET: usize = super::client_protocol::MAX_FRAME_BYTES - 16 * 1024;
+    fn fits(value: &Value) -> bool {
+        serde_json::to_vec(value).is_ok_and(|bytes| bytes.len() <= BUDGET)
+    }
+    fn count(node: &Value) -> usize {
+        1 + node
+            .get("children")
+            .and_then(Value::as_array)
+            .map_or(0, |children| children.iter().map(count).sum())
+    }
+    fn prune(node: &Value, budget: &mut usize) -> Option<Value> {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
+        let mut kept_node = node.clone();
+        if let Some(object) = kept_node.as_object_mut() {
+            object.remove("children");
+        }
+        if let Some(children) = node.get("children").and_then(Value::as_array) {
+            let mut kept_children = Vec::new();
+            for child in children {
+                match prune(child, budget) {
+                    Some(child) => kept_children.push(child),
+                    None => break,
+                }
+            }
+            if !kept_children.is_empty() {
+                kept_node["children"] = Value::Array(kept_children);
+            }
+        }
+        Some(kept_node)
+    }
+    if fits(value) {
+        return Ok(());
+    }
+    let Some(root) = value.get("root").filter(|root| root.is_object()) else {
+        return Err(ProtocolError::CapacityExceeded);
+    };
+    let total = count(root);
+    if total <= 1 {
+        return Err(ProtocolError::CapacityExceeded);
+    }
+    let mut low = 1usize;
+    let mut high = total;
+    let mut fitted: Option<Value> = None;
+    while low <= high {
+        let middle = (low + high) / 2;
+        let mut budget = middle;
+        let Some(pruned) = prune(root, &mut budget) else {
+            break;
+        };
+        let mut candidate = value.clone();
+        candidate["root"] = pruned;
+        candidate["truncated"] = Value::Bool(true);
+        if fits(&candidate) {
+            fitted = Some(candidate);
+            low = middle + 1;
+        } else {
+            high = middle - 1;
+        }
+    }
+    match fitted {
+        Some(candidate) => {
+            *value = candidate;
+            Ok(())
+        }
+        None => Err(ProtocolError::CapacityExceeded),
+    }
 }
 fn release_handles(blobs: &BlobStore, scope: &BlobScope, handles: &[String]) -> bool {
     let mut clean = true;
@@ -7555,6 +7634,61 @@ mod tests {
             bounded_result(
                 &json!({"text":"x".repeat(super::super::client_protocol::MAX_FRAME_BYTES)})
             ),
+            Err(ProtocolError::CapacityExceeded)
+        );
+    }
+    #[test]
+    fn observation_trees_are_truncated_to_the_frame_budget_not_refused() {
+        let children = (0..6000)
+            .map(|index| {
+                json!({
+                    "ref": {"id": format!("e{index}"), "revision": "1"},
+                    "role": "listitem",
+                    "name": format!("node {index}"),
+                    "attributes": {"data": "x".repeat(64)},
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut value = json!({
+            "identityScope": "scope",
+            "revision": "1",
+            "root": {"ref": {"id": "r0", "revision": "1"}, "role": "document",
+                "attributes": {}, "children": children},
+            "viewportRef": {"id": "r0", "revision": "1"},
+            "truncated": false,
+        });
+        assert!(
+            serde_json::to_vec(&value).unwrap().len()
+                > super::super::client_protocol::MAX_FRAME_BYTES
+        );
+        fit_observation_result(&mut value).unwrap();
+        assert!(
+            serde_json::to_vec(&value).unwrap().len()
+                <= super::super::client_protocol::MAX_FRAME_BYTES - 16 * 1024
+        );
+        assert_eq!(value["truncated"], json!(true));
+        assert_eq!(value["root"]["role"], json!("document"));
+        assert_eq!(value["root"]["ref"]["id"], json!("r0"));
+        let kept = value["root"]["children"].as_array().unwrap();
+        assert!(!kept.is_empty() && kept.len() < 6000);
+        assert_eq!(kept[0]["ref"]["id"], json!("e0"));
+        assert_eq!(
+            kept.last().unwrap()["ref"]["id"],
+            json!(format!("e{}", kept.len() - 1))
+        );
+    }
+    #[test]
+    fn observation_truncation_keeps_small_and_non_tree_results_unchanged() {
+        let mut small = json!({
+            "identityScope": "scope",
+            "root": {"ref": {"id": "r0", "revision": "1"}, "role": "document"},
+            "truncated": false,
+        });
+        fit_observation_result(&mut small).unwrap();
+        assert_eq!(small["truncated"], json!(false));
+        let mut text = json!({"text": "x".repeat(super::super::client_protocol::MAX_FRAME_BYTES)});
+        assert_eq!(
+            fit_observation_result(&mut text),
             Err(ProtocolError::CapacityExceeded)
         );
     }
