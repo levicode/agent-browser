@@ -179,8 +179,14 @@ impl ScreenshotFailureWitness {
         let mut map = serde_json::Map::new();
         if let Ok(phases) = self.phases.lock() {
             for (name, micros) in phases.iter() {
-                let current = map.get(*name).and_then(serde_json::Value::as_u64).unwrap_or(0);
-                map.insert((*name).to_owned(), serde_json::Value::from(current + micros));
+                let current = map
+                    .get(*name)
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                map.insert(
+                    (*name).to_owned(),
+                    serde_json::Value::from(current + micros),
+                );
             }
         }
         serde_json::Value::Object(map)
@@ -1181,7 +1187,10 @@ impl ObservationDispatch {
                 matches!(&request, DispatchRequest::Observe(request) if request.options.pixels);
             let diagnostic_generation = operation.generation;
             let diagnostic_sequence = operation.sequence;
-            let observation_request = matches!(&request, DispatchRequest::Observe(_) | DispatchRequest::TraceSemantic(_));
+            let observation_request = matches!(
+                &request,
+                DispatchRequest::Observe(_) | DispatchRequest::TraceSemantic(_)
+            );
             let run = self.run(
                 context,
                 request,
