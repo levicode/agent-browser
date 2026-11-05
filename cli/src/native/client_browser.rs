@@ -2316,10 +2316,15 @@ pub(super) fn settle_trace_screenshot(
     expected: &super::client_debt::OperationJournalHandle,
 ) -> (super::client_transport::NativeOutcome, bool) {
     if trace_screenshot && dirty {
-        outcome.result = Err(ProtocolError::CleanupFailed);
-        outcome.effects = super::client_protocol::Effects::Unknown;
+        // A semantic trace / trace screenshot owns only disposable evidence.
+        // Its cleanup failure must not seal the page targets or leave a
+        // quarantine that blocks the next observe and its close proof. Record
+        // the trace's own lost evidence as a clean refusal; the page scope
+        // stays usable.
+        outcome.result = Err(ProtocolError::StaleReference);
+        outcome.effects = super::client_protocol::Effects::NotDispatched;
         outcome.retention = None;
-        return (outcome, true);
+        return (outcome, false);
     }
     settle_protected_read(outcome, dirty, trace_screenshot, expected)
 }
