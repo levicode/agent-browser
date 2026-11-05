@@ -50,7 +50,7 @@ fn admit(
 ) -> OperationLease {
     let cap = custody.admission_deadline_cap(1, "scope.interop.adopt", &args(id));
     let op = broker
-        .admit_callback_capped(1, sequence, 60000, None, cap)
+        .admit_callback_capped(1, sequence, 60000, None, cap, None)
         .unwrap();
     assert!(broker.start(1, sequence).unwrap());
     op

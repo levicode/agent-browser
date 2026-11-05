@@ -196,7 +196,7 @@ async fn continuation_recovers_exact_settled_other_attach_race_with_fresh_operat
     assert_eq!(cap, Some(s.deadline));
     let op = s
         .broker
-        .admit_callback_capped(1, 2, 60000, None, Ok(cap))
+        .admit_callback_capped(1, 2, 60000, None, Ok(cap), None)
         .unwrap();
     assert!(s.broker.start(1, 2).unwrap());
     assert_eq!(op.deadline, s.deadline);
@@ -301,7 +301,7 @@ async fn continuation_rejects_owner_replacement_after_reservation_before_prepare
     let cap = s.dispatch.observe_deadline_cap(1, 2, &args(&ticket));
     let op = s
         .broker
-        .admit_callback_capped(1, 2, 60_000, None, cap)
+        .admit_callback_capped(1, 2, 60_000, None, cap, None)
         .unwrap();
     assert!(s.broker.start(1, 2).unwrap());
     let before = s.log.lock().unwrap().len();
@@ -341,7 +341,7 @@ async fn continuation_cannot_chain_a_second_two_sample_race() {
     let cap = s.dispatch.observe_deadline_cap(1, 2, &args(&ticket));
     let op = s
         .broker
-        .admit_callback_capped(1, 2, 60000, None, cap)
+        .admit_callback_capped(1, 2, 60000, None, cap, None)
         .unwrap();
     assert!(s.broker.start(1, 2).unwrap());
     let journal = s
@@ -411,7 +411,7 @@ async fn continuation_reservation_is_spent_on_cancel_before_prepare() {
     let cap = s.dispatch.observe_deadline_cap(1, 2, &args(&ticket));
     let op = s
         .broker
-        .admit_callback_capped(1, 2, 60000, None, cap)
+        .admit_callback_capped(1, 2, 60000, None, cap, None)
         .unwrap();
     s.broker.cancel(1, 2).unwrap();
     drop(op);

@@ -7,7 +7,7 @@ fn later_rpc_has_real_new_identity_but_same_original_deadline() {
     assert!(broker.start(1, 1).unwrap());
     broker.settle(1, 1, Effects::Completed).unwrap();
     let adopt = broker
-        .admit_callback_capped(1, 2, 60000, None, Ok(Some(prepare.deadline)))
+        .admit_callback_capped(1, 2, 60000, None, Ok(Some(prepare.deadline)), None)
         .unwrap();
     assert_eq!(adopt.sequence, 2);
     assert!(!adopt.cancellation.same_channel(&prepare.cancellation));
@@ -38,7 +38,7 @@ fn expired_lifetime_and_mismatched_ticket_reject_and_consume_sequence() {
         };
         let broker = ClientSession::new();
         assert!(matches!(
-            broker.admit_callback_capped(1, 1, 5000, None, cap),
+            broker.admit_callback_capped(1, 1, 5000, None, cap, None),
             Err(error) if error == expected
         ));
         assert!(broker.lock().unwrap().operations.is_empty());
@@ -56,7 +56,14 @@ fn cap_never_extends_requested_or_callback_parent_deadline() {
     let broker = ClientSession::new();
     let before = Instant::now();
     let parent = broker
-        .admit_callback_capped(1, 1, 5000, None, Ok(Some(before + Duration::from_secs(60))))
+        .admit_callback_capped(
+            1,
+            1,
+            5000,
+            None,
+            Ok(Some(before + Duration::from_secs(60))),
+            None,
+        )
         .unwrap();
     assert!(parent.deadline < before + Duration::from_secs(6));
     let decision = broker
@@ -75,6 +82,7 @@ fn cap_never_extends_requested_or_callback_parent_deadline() {
             60000,
             Some(&decision.token),
             Ok(Some(before + Duration::from_secs(30))),
+            None,
         )
         .unwrap();
     assert!(child.deadline <= parent.deadline);

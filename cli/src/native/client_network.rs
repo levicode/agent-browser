@@ -22,10 +22,13 @@ use super::client_blobs::{
 };
 use super::client_browser::BrowserExecutionLease;
 use super::client_debt::ScopeCleanupCommand;
-use super::client_protocol::{Decision, DecisionNotice, ProtocolError, RequestOverrides};
+use super::client_protocol::{
+    Decision, DecisionNotice, ProtocolError, RequestOverrides, MAX_TIMEOUT_MS,
+};
 use super::client_session::{
     CancelSignal, ClientSession, DecisionKind, DecisionLease, DecisionOutcome, DecisionOwner,
     ObservedOperationFailure, OperationLease, ParkedRouteRegistry, RouteRegistryTransfer,
+    DEFAULT_DECISION_TIMEOUT_MS,
 };
 use super::client_settlement_trace::{ServiceWorkerAdmission, WorkerAdmissionStep};
 use super::client_transport::ClientEventSink;
@@ -1737,7 +1740,11 @@ impl ClientNetwork {
             None
         };
         let captured = if event.method == "Fetch.requestPaused" {
-            Some(self.capture_request(&session.session_id, DecisionOwner::Scope, 30_000)?)
+            Some(self.capture_request(
+                &session.session_id,
+                DecisionOwner::Scope,
+                self.callback_decision_timeout_ms(),
+            )?)
         } else {
             None
         };
@@ -2616,7 +2623,7 @@ impl ClientNetwork {
             self.scope.generation,
             DecisionOwner::Scope,
             DecisionKind::Authentication,
-            30_000,
+            self.callback_decision_timeout_ms(),
             None,
             Some(self.scope.identity_scope.clone()),
             self.client.debt_ledger().and_then(|ledger| {
@@ -2624,7 +2631,7 @@ impl ClientNetwork {
             }),
         )?;
         let _token = self.track_token(session, &lease.token)?;
-        sink.emit("network.auth".into(),json!({"identityScope":self.scope.identity_scope,"origin":parsed.origin().ascii_serialization(),"source":"Server","scheme":challenge.get("scheme"),"realm":challenge.get("realm")}),Some(DecisionNotice{token:lease.token,timeout_ms:30_000}))?;
+        sink.emit("network.auth".into(),json!({"identityScope":self.scope.identity_scope,"origin":parsed.origin().ascii_serialization(),"source":"Server","scheme":challenge.get("scheme"),"realm":challenge.get("realm")}),Some(decision_notice(&lease)))?;
         let response = match lease
             .outcome
             .await
@@ -2662,7 +2669,7 @@ impl ClientNetwork {
             self.scope.generation,
             DecisionOwner::Scope,
             DecisionKind::Dialog,
-            30_000,
+            self.callback_decision_timeout_ms(),
             None,
             Some(self.scope.identity_scope.clone()),
             self.client.debt_ledger().and_then(|ledger| {
@@ -2673,10 +2680,7 @@ impl ClientNetwork {
         sink.emit(
             "dialog.opened".into(),
             json!({"identityScope":self.scope.identity_scope,"type":kind,"message":message}),
-            Some(DecisionNotice {
-                token: lease.token,
-                timeout_ms: 30_000,
-            }),
+            Some(decision_notice(&lease)),
         )?;
         let (accept, prompt) = match lease
             .outcome
@@ -3210,6 +3214,15 @@ impl ClientNetwork {
         )?;
         *current = Some(version);
         Ok(())
+    }
+
+    /// Scope-owned callbacks are decided in the remaining budget of the live
+    /// client operation that can be blocked on them. A background callback has
+    /// no outer operation and keeps the fixed decision policy window.
+    fn callback_decision_timeout_ms(&self) -> u64 {
+        self.broker
+            .callback_decision_timeout_ms(self.scope.generation, &self.scope.identity_scope)
+            .unwrap_or(DEFAULT_DECISION_TIMEOUT_MS)
     }
 
     fn capture_request(
@@ -3857,6 +3870,20 @@ fn safe_basename(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
 }
+/// Report the lease's actual remaining time. The client bounds its handler by
+/// this notice, so it must match the deadline the broker enforces.
+fn decision_notice(lease: &DecisionLease) -> DecisionNotice {
+    let remaining = lease
+        .deadline
+        .saturating_duration_since(std::time::Instant::now());
+    DecisionNotice {
+        token: lease.token.clone(),
+        timeout_ms: u64::try_from(remaining.as_millis())
+            .unwrap_or(MAX_TIMEOUT_MS)
+            .clamp(1, MAX_TIMEOUT_MS),
+    }
+}
+
 struct TokenCleanup<'a> {
     network: &'a ClientNetwork,
     token: String,
@@ -6194,6 +6221,95 @@ mod bridge_tests {
             panic!("expected event")
         };
         (event, payload, decision)
+    }
+    /// Old native returned a fixed 30s decision notice here; the operation in
+    /// flight was ignored, so a handler that outlived 30s failed inside a 60s
+    /// outer budget. The notice and the broker's deadline now follow it.
+    #[tokio::test]
+    async fn route_and_dialog_decisions_follow_the_live_outer_operation_budget() {
+        let (network, mut events, _commands, server) = fixture().await;
+        network.replace_routes(1, vec!["route".into()]).unwrap();
+        let scope = network.scope.identity_scope.clone();
+        network
+            .broker
+            .admit_callback_capped(1, 1, 60_000, None, Ok(None), Some(&scope))
+            .unwrap();
+        assert!(network.broker.start(1, 1).unwrap());
+        network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"route-request","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}).unwrap();
+        let (name, _payload, notice) = next_event(&mut events).await;
+        assert_eq!(name, "network.request");
+        let notice = notice.expect("route decision");
+        assert!(
+            notice.timeout_ms > 30_000 && notice.timeout_ms <= 60_000,
+            "route notice {} did not follow the 60s outer operation",
+            notice.timeout_ms
+        );
+        network
+            .event(&CdpEvent {
+                method: "Page.javascriptDialogOpening".into(),
+                session_id: Some("owned".into()),
+                params: json!({"type":"alert","message":"synthetic"}),
+            })
+            .unwrap();
+        let (name, _payload, notice) = next_event(&mut events).await;
+        assert_eq!(name, "dialog.opened");
+        let notice = notice.expect("dialog decision");
+        assert!(
+            notice.timeout_ms > 30_000 && notice.timeout_ms <= 60_000,
+            "dialog notice {} did not follow the 60s outer operation",
+            notice.timeout_ms
+        );
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    /// A callback that arrives with no operation in flight keeps the fixed
+    /// policy window: the change follows an outer budget, it never enlarges it.
+    #[tokio::test]
+    async fn background_callback_keeps_the_fixed_decision_window() {
+        let (network, mut events, _commands, server) = fixture().await;
+        network.replace_routes(1, vec!["route".into()]).unwrap();
+        network.event(&CdpEvent{method:"Fetch.requestPaused".into(),session_id:Some("owned".into()),params:json!({"requestId":"background-request","request":{"url":"https://synthetic.test/","method":"GET","headers":{}}})}).unwrap();
+        let (name, _payload, notice) = next_event(&mut events).await;
+        assert_eq!(name, "network.request");
+        let notice = notice.expect("route decision");
+        assert!(
+            notice.timeout_ms <= DEFAULT_DECISION_TIMEOUT_MS
+                && notice.timeout_ms > DEFAULT_DECISION_TIMEOUT_MS - 1_000,
+            "background notice {} left the fixed policy window",
+            notice.timeout_ms
+        );
+        network.close().await.unwrap();
+        server.abort();
+    }
+
+    /// An outer budget below the old 30s window now bounds the decision too.
+    #[tokio::test]
+    async fn callback_decision_window_shrinks_below_the_fixed_policy() {
+        let (network, mut events, _commands, server) = fixture().await;
+        let scope = network.scope.identity_scope.clone();
+        network
+            .broker
+            .admit_callback_capped(1, 1, 5_000, None, Ok(None), Some(&scope))
+            .unwrap();
+        assert!(network.broker.start(1, 1).unwrap());
+        network
+            .event(&CdpEvent {
+                method: "Page.javascriptDialogOpening".into(),
+                session_id: Some("owned".into()),
+                params: json!({"type":"confirm","message":"synthetic"}),
+            })
+            .unwrap();
+        let (name, _payload, notice) = next_event(&mut events).await;
+        assert_eq!(name, "dialog.opened");
+        let notice = notice.expect("dialog decision");
+        assert!(
+            notice.timeout_ms <= 5_000 && notice.timeout_ms > 4_000,
+            "dialog notice {} did not follow the 5s outer operation",
+            notice.timeout_ms
+        );
+        network.close().await.unwrap();
+        server.abort();
     }
     #[tokio::test]
     async fn cleanup_failure_still_joins_every_retained_blocking_reader() {

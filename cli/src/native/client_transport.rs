@@ -1703,6 +1703,8 @@ where
                                 &command,
                                 &args,
                             ),
+                            args.get("identityScope")
+                                .and_then(serde_json::Value::as_str),
                         )
                     };
                     match admitted {

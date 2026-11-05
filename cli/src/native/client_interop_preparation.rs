@@ -533,7 +533,7 @@ mod publication_tests {
         let prepare = broker.admit(1, 1, 5000).unwrap();
         broker.settle(1, 1, Effects::Completed).unwrap();
         let operation = broker
-            .admit_callback_capped(1, 2, 5000, None, Ok(Some(prepare.deadline)))
+            .admit_callback_capped(1, 2, 5000, None, Ok(Some(prepare.deadline)), None)
             .unwrap();
         assert!(broker.start(1, 2).unwrap());
         let custody = InteropPreparation::new(Arc::new(tokio::sync::Mutex::new(None)), broker);
