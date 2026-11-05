@@ -98,6 +98,19 @@ function selectChain(parts, scope, root, depth = 0) {
       roots = roots.filter(root => { matcherStep(); return visibleRoot(root, part.body); });
       continue;
     }
+    // Playwright's role engine is a descendant query over the current root:
+    // it never returns the root itself, descends through open shadow roots in
+    // document order, and filters by ARIA role, states, hidden and name.
+    if (part.engine === 'role') {
+      const found = new Set();
+      for (const current of roots) {
+        matcherStep();
+        for (const element of roleQueryAll(current, part.body)) found.add(element);
+      }
+      roots = [...found];
+      if (roots.length > 100000) throw matcherLimit;
+      continue;
+    }
     if (part.engine === 'text' || part.engine === 'text:light') {
       const textMatches = new Set();
       for (const current of roots) {

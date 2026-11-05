@@ -1402,3 +1402,139 @@ async fn chromium_svg_title_idref_public_names_contract() {
     );
     result.unwrap();
 }
+
+/// The raw `role=` engine against a real Chromium page. This is the browser
+/// gate for typed bodies, ARIA matching and the chain root rule: the frozen
+/// e2e#55 ledger supplies the oracle, and these cases pin the same semantics
+/// inside the native repository.
+#[tokio::test]
+#[ignore = "hosted Chromium: raw role typed body, ARIA matching and root rules"]
+async fn chromium_raw_role_engine_matches_typed_bodies_and_root_rules() {
+    async fn matched(
+        browser: &BrowserManager,
+        frames: &[ObservationFrame],
+        refs: &mut RefMap,
+        op: &OperationLease,
+        selector: &str,
+    ) -> Result<Vec<String>, ObservationError> {
+        let options: QueryOptions = serde_json::from_value(json!({
+            "expression": {"kind": "selector", "selector": selector}
+        }))
+        .unwrap();
+        let result = query(&browser.client, frames, refs, "raw-role", 1, &options, op).await?;
+        Ok(result
+            .nodes
+            .into_iter()
+            .map(|node| node.test_id.unwrap_or_default())
+            .collect())
+    }
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let session = browser.active_session_id()?;
+        evaluate_on(
+            &browser.client,
+            session,
+            r#"(() => {
+                document.body.innerHTML = [
+                    '<input data-testid="input-button" type="button" value="Alpha Button">',
+                    '<button data-testid="save">Save</button>',
+                    '<button data-testid="save-draft">Save draft</button>',
+                    '<div data-testid="custom-save" role="button" aria-label="Save">custom</div>',
+                    '<input data-testid="submit-save" type="submit" value="Save">',
+                    '<button data-testid="disabled-save" disabled>Save disabled</button>',
+                    '<button data-testid="hidden-save" hidden>Hidden Save</button>',
+                    '<button data-testid="pressed" aria-pressed="true">Pressed</button>',
+                    '<button data-testid="expanded" aria-expanded="true">Expanded</button>',
+                    '<div data-testid="tab-a" role="tab" aria-selected="true">Tab A</div>',
+                    '<div data-testid="tab-b" role="tab" aria-selected="false">Tab B</div>',
+                    '<input data-testid="check" type="checkbox" aria-label="Wifi" checked>',
+                    '<h2 data-testid="heading-two">Section two</h2>',
+                    '<h3 data-testid="heading-three">Section three</h3>',
+                    '<div data-testid="described" role="button" aria-label="Described" aria-describedby="desc">x</div>',
+                    '<span id="desc">Help text</span>',
+                    '<button data-testid="content-name">Generated</button>',
+                    '<style>[data-testid="content-name"]::before{content:"Before "}</style>',
+                    '<section data-testid="section-a" aria-label="Section A"><span data-testid="span-a">Alpha</span></section>',
+                    '<div data-testid="shadow-host"></div>',
+                    '<div data-testid="closed-host"></div>',
+                ].join('');
+                const open = document.querySelector('[data-testid="shadow-host"]').attachShadow({ mode: 'open' });
+                open.innerHTML = '<button data-testid="shadow-save">Shadow Save</button>';
+                const closed = document.querySelector('[data-testid="closed-host"]').attachShadow({ mode: 'closed' });
+                closed.innerHTML = '<button data-testid="closed-save">Closed Save</button>';
+                return true;
+            })()"#,
+        )
+        .await?;
+        let (op, _tx) = operation();
+        let inventory = frames(&browser, &op).await;
+        let mut refs = RefMap::new();
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "role=button",
+                &[
+                    "input-button", "save", "save-draft", "custom-save", "submit-save",
+                    "disabled-save", "pressed", "expanded", "described", "content-name", "shadow-save",
+                ],
+            ),
+            ("role=button[name=\"Save\"]", &["save", "custom-save", "submit-save"]),
+            ("role=button[name=\"save\"i]", &["save", "custom-save", "submit-save"]),
+            (
+                "role=button[name=/^Save/]",
+                &["save", "save-draft", "custom-save", "submit-save", "disabled-save"],
+            ),
+            ("role=button[name=\"Shadow Save\"]", &["shadow-save"]),
+            ("role=button[name=\"Before Generated\"]", &["content-name"]),
+            ("role=button[disabled]", &["disabled-save"]),
+            ("role=button[pressed]", &["pressed"]),
+            ("role=button[expanded]", &["expanded"]),
+            ("role=checkbox[checked]", &["check"]),
+            ("role=heading[level=2]", &["heading-two"]),
+            ("role=tab[selected]", &["tab-a"]),
+            ("role=button[description=\"Help text\"]", &["described"]),
+            (
+                "role=button[include-hidden]",
+                &[
+                    "input-button", "save", "save-draft", "custom-save", "submit-save",
+                    "disabled-save", "hidden-save", "pressed", "expanded", "described",
+                    "content-name", "shadow-save",
+                ],
+            ),
+            ("role=button >> nth=0", &["input-button"]),
+            ("role=button[name=\"Save\"] >> nth=0", &["save"]),
+            ("css=[data-testid=\"shadow-host\"] >> role=button", &["shadow-save"]),
+            ("css=[data-testid=\"closed-host\"] >> role=button", &[]),
+            ("role=region", &["section-a"]),
+            // The role engine never returns the chain root: the section starts
+            // the descendant search and does not match itself.
+            ("css=[data-testid=\"section-a\"] >> role=region", &[]),
+        ];
+        for (selector, expected) in cases {
+            let actual = matched(&browser, &inventory, &mut refs, &op, selector)
+                .await
+                .map_err(|error| format!("{selector}: {error:?}"))?;
+            let expected: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
+            assert_eq!(actual, expected, "{selector}");
+        }
+        for selector in [
+            "role=",
+            "role=button[wat]",
+            "role=button[name]",
+            "role=button[level=x]",
+            "role=button[name=/[/]",
+            "role=button[checked=false]",
+        ] {
+            assert_eq!(
+                matched(&browser, &inventory, &mut refs, &op, selector).await,
+                Err(ObservationError::InvalidLocator),
+                "{selector}"
+            );
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    browser.close().await.unwrap();
+    result.unwrap();
+}

@@ -81,6 +81,14 @@ fn malformed_protocol_arguments_are_not_relabelled_as_user_selectors() {
     let expression = LocatorExpression::Selector {
         selector: "role=button".into(),
     };
+    assert_eq!(validate_expression(&expression, 0), Ok(false));
+    assert_eq!(
+        compile_selector_expression(&expression).unwrap()["nativeParts"],
+        json!([{"engine": "role", "body": "button"}])
+    );
+    let expression = LocatorExpression::Selector {
+        selector: "internal:role=button".into(),
+    };
     assert_eq!(
         validate_expression(&expression, 0),
         Err(ObservationError::UnsupportedCapability)
@@ -162,6 +170,21 @@ fn attribute_engines_compile_inside_the_existing_chain() {
     }
     for selector in [
         "role=button",
+        "role=button[name=\"Save\"][checked=false]",
+        "role=heading[level=2] >> nth=0",
+        "css=section >> role=checkbox",
+    ] {
+        let expression = LocatorExpression::Selector {
+            selector: selector.into(),
+        };
+        assert_eq!(validate_expression(&expression, 0), Ok(false), "{selector}");
+        assert!(
+            compile_selector_expression(&expression).is_ok(),
+            "{selector}"
+        );
+    }
+    for selector in [
+        "role=",
         "data-k=row",
         "div >>",
         "*data-testid=row >> css=div >> nth=0",
