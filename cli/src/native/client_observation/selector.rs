@@ -200,11 +200,19 @@ fn append<'a>(
     }
     // Playwright's attribute engines accept an empty body, which matches an
     // empty attribute value. The visible engine compares its body to "true",
-    // so an empty body is meaningful there too. Every other engine rejects one.
+    // so an empty body is meaningful there too. The raw text engine hands its
+    // authored body to createTextMatcher without validating it: an empty body
+    // is the lax empty substring, every text fact contains it, and a lax query
+    // keeps only the elements that match as "self", so the engine accepts it
+    // and returns matches instead of an error. text:light is the same engine
+    // over the light tree, so the same body rule applies. Every other engine
+    // rejects an empty body.
     let attribute_engine = engine.strip_suffix(":light").unwrap_or(engine);
     if body.trim_matches(js_whitespace).is_empty()
         && engine != "nth"
         && engine != "visible"
+        && engine != "text"
+        && engine != "text:light"
         && !matches!(
             attribute_engine,
             "id" | "data-testid" | "data-test-id" | "data-test"
@@ -570,8 +578,44 @@ mod tests {
             let selector = format!("{engine}=");
             assert_eq!(parse(&selector).unwrap()[0].body, "", "{selector}");
         }
-        for selector in ["css=", "css:light=", "xpath=", "text="] {
+        for selector in ["css=", "css:light=", "xpath="] {
             assert_eq!(parse(selector), Err(ParseError::Invalid), "{selector}");
+        }
+    }
+
+    #[test]
+    fn raw_text_engine_accepts_an_empty_body_as_the_lax_empty_substring() {
+        // createTextMatcher does not validate the authored raw text body. An
+        // empty body becomes the lax empty substring, which every text fact
+        // contains, so the pinned engine accepts it. text:light is the same
+        // engine over the light tree and follows the same body rule.
+        for (source, engine) in [
+            ("text=", "text"),
+            ("text:light=", "text:light"),
+            ("text=   ", "text"),
+            ("css=li >> text=", "text"),
+            ("text= >> nth=0", "text"),
+            ("*text=", "text"),
+        ] {
+            let parts = parse(source).unwrap();
+            let part = parts
+                .iter()
+                .find(|part| part.engine == engine)
+                .unwrap_or_else(|| panic!("{source} did not parse an {engine} part"));
+            assert_eq!(part.body, "", "{source}");
+        }
+        // The empty body stays invalid for the engines this adapter still
+        // refuses: unparsed CSS/XPath, the typed role body and the internal
+        // leaf engines (the #26 increment keeps its own empty-body refusal).
+        for selector in [
+            "css=",
+            "css:light=",
+            "xpath=",
+            "xpath:light=",
+            "role=",
+            "internal:text=",
+        ] {
+            assert!(parse(selector).is_err(), "{selector}");
         }
     }
 
