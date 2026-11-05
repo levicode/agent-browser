@@ -756,3 +756,6 @@ mod terminal_recording_tests;
 
 #[path = "client_browser_read_fields_tests.rs"]
 mod read_fields_tests;
+
+#[path = "client_evaluate_transfer_tests.rs"]
+mod evaluate_transfer_tests;

@@ -3305,6 +3305,7 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
             super::client_protocol::PERSISTENT_PAGE_REOPEN,
             super::client_protocol::ISOLATED_PAGE_REOPEN,
             "browser.evaluate/1",
+            super::client_protocol::EVALUATE_BLOBS,
             "browser.page/1",
             super::client_protocol::PAGE_IDENTITY_FENCE,
             "browser.observe/1",
@@ -3531,9 +3532,15 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 Ok(None)
             }
             "page.evaluate"
-                if args.len() == 2
+                if (args.len() == 2
                     && args.get("source").is_some_and(serde_json::Value::is_string)
-                    && args.contains_key("argument") =>
+                    && args.contains_key("argument"))
+                    // A negotiated staged request names one sealed blob and no
+                    // inline payload; the transfer module resolves it later.
+                    || (args.len() == 1
+                        && args
+                            .get("requestHandle")
+                            .is_some_and(serde_json::Value::is_string)) =>
             {
                 Ok(None)
             }
@@ -4667,6 +4674,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                                 runtime.network.clone(),
                                 runtime.enrollment.clone(),
                                 runtime.activation.clone(),
+                                runtime.blobs.clone(),
+                                runtime.scope.clone(),
                             )
                         })
                     })
@@ -4681,6 +4690,8 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                 network,
                 enrollment,
                 activation,
+                blobs,
+                blob_scope,
             )) = captured
             else {
                 return finish(NativeOutcome {
@@ -4689,6 +4700,23 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     effects: Effects::NotDispatched,
                 });
             };
+            // Blob staging is negotiated per connection; legacy clients keep the
+            // single-frame contract and must not see a staged request accepted.
+            let evaluate_blobs = self
+                .event_sink
+                .get()
+                .is_some_and(|sink| sink.evaluate_blobs_negotiated());
+            if command == "page.evaluate" && !lease.is_callback && evaluate_blobs {
+                if let Err(error) =
+                    super::client_evaluate_transfer::resolve_request(&mut args, &blobs, &blob_scope)
+                {
+                    return finish(NativeOutcome {
+                        retention: None,
+                        result: Err(error),
+                        effects: Effects::NotDispatched,
+                    });
+                }
+            }
             let broker = self.broker.clone();
             let dispatch_tasks = self.tasks.clone();
             #[cfg(test)]
@@ -4917,6 +4945,17 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                         let (output, interruption, committed) = if let Some(grant) = eval_grant {
                             super::client_debt::eval_command_scope(grant, execution).await
                         } else { execution.await };
+                        // One oversized evaluation result must never end the
+                        // client transport. Negotiated connections receive a
+                        // bounded blob descriptor; others a clean refusal.
+                        let output = if command == "page.evaluate" && !lease.is_callback {
+                            super::client_evaluate_transfer::finish_result(
+                                output,
+                                evaluate_blobs,
+                                &blobs,
+                                &blob_scope,
+                            )
+                        } else { output };
                         navigation_committed = committed;
                         navigation_interruption = interruption.map(NavigationInterruption::Requested);
                         if navigation.is_some() {

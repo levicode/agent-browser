@@ -23,6 +23,8 @@ pub mod client_debt;
 #[allow(dead_code)]
 pub mod client_enrollment;
 #[allow(dead_code)]
+pub(crate) mod client_evaluate_transfer;
+#[allow(dead_code)]
 pub mod client_geometry;
 #[allow(dead_code)]
 pub mod client_network;

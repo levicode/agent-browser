@@ -359,6 +359,9 @@ pub const ISOLATED_PAGE_REOPEN: &str = "browser.isolated-page-reopen/1";
 pub const PERSISTENT_PAGE_REOPEN: &str = "browser.persistent-page-reopen/1";
 /// Optional exact Page constraint on navigation after a separately acknowledged activation.
 pub const PAGE_IDENTITY_FENCE: &str = "browser.page-identity-fence/1";
+/// Opt-in blob staging for `page.evaluate` requests and results that exceed one
+/// frame. Requires `browser.blobs/1`; the 1 MiB frame bound itself is unchanged.
+pub const EVALUATE_BLOBS: &str = "browser.evaluate-blobs/1";
 /// Terminal immutable recording bytes only; never browser operation admission.
 pub const TERMINAL_RECORDING_ARTIFACTS: &str = "terminal.recording-artifacts/1";
 /// Operation-owned private PW context retirement/creation during reset/restore.

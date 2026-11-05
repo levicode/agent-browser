@@ -230,6 +230,7 @@ pub struct ClientEventSink {
     barrier: Option<std::sync::Arc<EventBarrier>>,
     persistent_page_reopen: std::sync::Arc<std::sync::atomic::AtomicBool>,
     isolated_page_reopen: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    evaluate_blobs: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 impl ClientEventSink {
     pub(crate) fn isolated_page_reopen_negotiated(&self) -> bool {
@@ -238,6 +239,10 @@ impl ClientEventSink {
     }
     pub(crate) fn persistent_page_reopen_negotiated(&self) -> bool {
         self.persistent_page_reopen
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+    pub(crate) fn evaluate_blobs_negotiated(&self) -> bool {
+        self.evaluate_blobs
             .load(std::sync::atomic::Ordering::Acquire)
     }
     #[cfg(test)]
@@ -254,6 +259,7 @@ impl ClientEventSink {
                 barrier: None,
                 persistent_page_reopen: Default::default(),
                 isolated_page_reopen: Default::default(),
+                evaluate_blobs: Default::default(),
             },
             receiver,
         )
@@ -1212,6 +1218,7 @@ where
         barrier: None,
         persistent_page_reopen: Default::default(),
         isolated_page_reopen: Default::default(),
+        evaluate_blobs: Default::default(),
     };
     let (drain, mut drain_requested) = tokio::sync::oneshot::channel::<()>();
     let (failed, mut failure) = tokio::sync::oneshot::channel::<()>();
@@ -1366,6 +1373,15 @@ where
             && capabilities
                 .iter()
                 .any(|capability| capability == ISOLATED_PAGE_REOPEN),
+        std::sync::atomic::Ordering::Release,
+    );
+    sink.evaluate_blobs.store(
+        required_capabilities
+            .iter()
+            .any(|capability| capability == EVALUATE_BLOBS)
+            && capabilities
+                .iter()
+                .any(|capability| capability == EVALUATE_BLOBS),
         std::sync::atomic::Ordering::Release,
     );
     let terminal_recording_negotiated = terminal_close_negotiated
@@ -4143,6 +4159,7 @@ mod tests {
             barrier: None,
             persistent_page_reopen: Default::default(),
             isolated_page_reopen: Default::default(),
+            evaluate_blobs: Default::default(),
         };
         let threads: Vec<_> = (0..16)
             .map(|_| {
