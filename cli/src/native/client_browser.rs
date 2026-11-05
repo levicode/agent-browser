@@ -6763,6 +6763,7 @@ mod tests {
             "persistent-page-reopen",
             "isolated-page-reopen",
             "evaluate",
+            "evaluate-blobs",
             "page",
             "page-identity-fence",
             "observe",
