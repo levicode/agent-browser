@@ -817,6 +817,7 @@ async fn trace_initial_inventory_discards_old_bindings_and_recovers_without_fail
             Some(&witness),
         ))
         .await
+        .map(|inventory| inventory.frames)
         .unwrap();
     assert_eq!(frames.len(), 1);
     assert_eq!(frames[0].binding.loader, "fresh-loader");

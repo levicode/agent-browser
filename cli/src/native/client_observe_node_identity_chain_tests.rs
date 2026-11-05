@@ -385,6 +385,7 @@ async fn fixture(case: ReplyCase, multi: bool) -> Fixture {
         context: CaptureContext {
             page: prepared.context.page,
             frames,
+            opaque_frames: HashSet::new(),
             inventory_complete: true,
         },
         operation: prepared.operation,

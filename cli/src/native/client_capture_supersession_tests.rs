@@ -1870,6 +1870,7 @@ async fn short_optional_headroom_publishes_without_producer_or_cdp_work() {
             let context = CaptureContext {
                 page: prepared.context.page,
                 frames: vec![],
+                opaque_frames: HashSet::new(),
                 inventory_complete: true,
             };
             dispatch

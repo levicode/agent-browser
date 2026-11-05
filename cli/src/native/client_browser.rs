@@ -4276,14 +4276,14 @@ impl super::client_transport::ClientExecutor for ClientBrowser {
                     let _ui = ui_permit;
                     let _input = input_permit;
                     let preflight = async {
-                        let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_action_frame_inventory(&page, &lease, || {
+                        let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions, opaque_frames } = super::client_observation_dispatch::verified_action_frame_inventory(&page, &lease, || {
                             page.permit.check()?;
                             if !attachment.same_attachment(&page.targets.owned_target(&page.target_id)?) { return Err(ProtocolError::StaleScope); }
                             if !action_broker.check_application_publication(lease.generation)? { return Err(ProtocolError::StaleReference); }
                             action_tasks.check_input_dispatch(journal.key())?;
                             observation.check_publication_fence(publication_fence)
                         }).await?;
-                        let geometry = super::client_geometry::GeometrySnapshot::capture(&page.client, &page.page_session_id, &frames, &lease).await.map_err(|error| {
+                        let geometry = super::client_geometry::GeometrySnapshot::capture_excluding_opaque(&page.client, &page.page_session_id, &frames, &opaque_frames, &lease).await.map_err(|error| {
                             use super::client_geometry::GeometryError;
                             match error {
                                 GeometryError::CleanupFailed { .. } => ProtocolError::CleanupFailed,
@@ -5255,8 +5255,8 @@ impl ClientBrowser {
                 };
                 replacement.publish_ready(&context, || next.permit.check()).await?;
                 if actions.is_recording_armed().await? {
-                    let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
-                    let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
+                    let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions, opaque_frames } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
+                    let geometry = super::client_geometry::GeometrySnapshot::capture_excluding_opaque(&next.client, &next.page_session_id, &frames, &opaque_frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
                     actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page: &next, operation: &operation, page_state: &page_state, refs: &references, revision, iframe_sessions: &sessions, observation_frames: &frames, blobs: &blobs, geometry: &geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| failure.error)?;
                 }
@@ -5409,8 +5409,8 @@ impl ClientBrowser {
                 }
                 restart_failure_stage = Some(RestartPostCreateStage::RecordingReady);
                 if actions.is_recording_armed().await? {
-                    let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
-                    let geometry = super::client_geometry::GeometrySnapshot::capture(&next.client, &next.page_session_id, &frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
+                    let super::client_observation_dispatch::VerifiedFrameInventory { frames, iframe_sessions: sessions, opaque_frames } = super::client_observation_dispatch::verified_frame_inventory(&next, &operation).await?;
+                    let geometry = super::client_geometry::GeometrySnapshot::capture_excluding_opaque(&next.client, &next.page_session_id, &frames, &opaque_frames, &operation).await.map_err(|_| ProtocolError::BrowserFailure)?;
                     let (revision, references) = observation.snapshot_for_action(&operation).await?;
                     actions.recording_page_opened(super::client_actions::ActionContext { observation_after: None, observed_revision: 0, page:&next, operation:&operation, page_state:&page_state, refs:&references, revision, iframe_sessions:&sessions, observation_frames:&frames, blobs:&blobs, geometry:&geometry, realm_authority: super::client_actions::ActionRealmAuthority::Enrolled(&enrollment) }).await.map_err(|failure| { dirty |= failure.cleanup_failed; failure.error })?;
                 }
@@ -5810,14 +5810,16 @@ impl ClientBrowser {
                                 let super::client_observation_dispatch::VerifiedFrameInventory {
                                     frames,
                                     iframe_sessions: sessions,
+                                    opaque_frames,
                                 } = super::client_observation_dispatch::verified_frame_inventory(
                                     &page, &operation,
                                 )
                                 .await?;
-                                let geometry = super::client_geometry::GeometrySnapshot::capture(
+                                let geometry = super::client_geometry::GeometrySnapshot::capture_excluding_opaque(
                                     &page.client,
                                     &page.page_session_id,
                                     &frames,
+                                    &opaque_frames,
                                     &operation,
                                 )
                                 .await
@@ -6269,18 +6271,21 @@ impl ClientBrowser {
                             let super::client_observation_dispatch::VerifiedFrameInventory {
                                 frames,
                                 iframe_sessions: sessions,
+                                opaque_frames,
                             } = super::client_observation_dispatch::verified_frame_inventory(
                                 &page, &operation,
                             )
                             .await?;
-                            let geometry = super::client_geometry::GeometrySnapshot::capture(
-                                &page.client,
-                                &page.page_session_id,
-                                &frames,
-                                &operation,
-                            )
-                            .await
-                            .map_err(|_| ProtocolError::BrowserFailure)?;
+                            let geometry =
+                                super::client_geometry::GeometrySnapshot::capture_excluding_opaque(
+                                    &page.client,
+                                    &page.page_session_id,
+                                    &frames,
+                                    &opaque_frames,
+                                    &operation,
+                                )
+                                .await
+                                .map_err(|_| ProtocolError::BrowserFailure)?;
                             let (revision, references) =
                                 observation.snapshot_for_action(&operation).await?;
                             actions

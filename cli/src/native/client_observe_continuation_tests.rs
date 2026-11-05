@@ -241,6 +241,7 @@ async fn continuation_recovers_exact_settled_other_attach_race_with_fresh_operat
             None,
         ))
         .await
+        .map(|inventory| inventory.frames)
         .unwrap();
     assert_eq!(frames.len(), 1);
     assert_eq!(s.samples.load(Ordering::SeqCst), 3);

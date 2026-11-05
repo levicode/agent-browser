@@ -5,7 +5,7 @@ use crate::native::cdp::client::CdpClient;
 use crate::native::client_actions::{
     ActionContext, ActionFailure, ActionRealmAuthority, ClientActions,
 };
-use crate::native::client_browser::ExecutionGate;
+use crate::native::client_browser::{ExecutionGate, OwnedBrowser};
 use crate::native::client_geometry::{GeometrySnapshot, BOX_PROOF};
 use crate::native::client_page::ClientPageState;
 use crate::native::client_protocol::Effects;
@@ -881,4 +881,142 @@ async fn e2e_three_object_plugin_frames_do_not_stale_the_semantic_inventory() {
         "author iframe keeps its owner path: {:?}",
         author.frame_path
     );
+}
+
+/// levicode/agent-browser#28 real fixture: a hash-routed page that mounts three
+/// `<object>` plugin documents used to deny the whole screen with
+/// `stale-reference`, because the geometry proof counted the deliberately
+/// omitted plugin subtrees as missing inventory. This uses real Chromium, the
+/// production semantic inventory and the production geometry proof, and drives
+/// the same real hash navigation the UAT page uses.
+#[tokio::test]
+#[ignore = "hosted Chromium: three <object> plugin documents and a hash route must not deny the whole screen"]
+async fn chromium_object_hash_route_geometry_accepts_proven_opaque_subtrees() {
+    let mut owner = OwnedBrowser::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let gate = Arc::new(ExecutionGate::default());
+    let mut page = owner.lease(gate.enter(false).unwrap()).unwrap();
+    let (cancel, cancellation) = tokio::sync::watch::channel(CancelSignal::None);
+    let operation = OperationLease {
+        is_callback: false,
+        generation: 1,
+        sequence: 1,
+        deadline: Instant::now() + Duration::from_secs(20),
+        cancellation,
+    };
+    let setup = page
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({
+                "expression": r##"new Promise(resolve => {
+                    document.body.innerHTML = '<nav><a id="to-label" href="#/account_label">labels</a></nav><div id="plugins"></div><div id="app"><h1>Home</h1></div>';
+                    for (let index = 0; index < 3; index += 1) {
+                        const plugin = document.createElement('object');
+                        plugin.type = 'text/html';
+                        plugin.data = 'about:blank';
+                        plugin.width = 1;
+                        plugin.height = 1;
+                        plugin.dataset['plugin'] = String(index);
+                        document.getElementById('plugins').append(plugin);
+                    }
+                    const rows = Array.from({ length: 40 }, (_, index) => '<tr><td>row ' + index + '</td><td>' + 'x'.repeat(24) + '</td></tr>').join('');
+                    const render = () => {
+                        document.getElementById('app').innerHTML = location.hash.indexOf('#/account_label') === 0
+                            ? '<h1>Labels</h1><table><tbody>' + rows + '</tbody></table>'
+                            : '<h1>Home</h1>';
+                    };
+                    window.addEventListener('hashchange', render);
+                    location.hash = '#/home';
+                    setTimeout(() => resolve(document.querySelectorAll('object').length), 300);
+                })"##,
+                "awaitPromise": true,
+                "returnByValue": true
+            })),
+            Some(&page.page_session_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        setup["result"]["value"],
+        json!(3),
+        "three plugin documents mounted"
+    );
+    let inventory = observation::enumerate_semantic_frames(
+        &page.client,
+        &page.page_session_id,
+        &HashMap::new(),
+        &operation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        inventory.frames.len(),
+        1,
+        "author inventory is the main document"
+    );
+    assert_eq!(
+        inventory.opaque_frame_roots.len(),
+        3,
+        "three opaque plugin subtrees"
+    );
+    let opaque: HashSet<String> = inventory.opaque_frame_roots.iter().cloned().collect();
+    // The pre-fix strict proof is the regression: plugin frames read as missing.
+    assert_eq!(
+        GeometrySnapshot::capture(
+            &page.client,
+            &page.page_session_id,
+            &inventory.frames,
+            &operation
+        )
+        .await
+        .unwrap_err(),
+        crate::native::client_geometry::GeometryError::IncompleteInventory
+    );
+    let geometry = GeometrySnapshot::capture_excluding_opaque(
+        &page.client,
+        &page.page_session_id,
+        &inventory.frames,
+        &opaque,
+        &operation,
+    )
+    .await
+    .unwrap();
+    geometry.revalidate(&page.client, &operation).await.unwrap();
+    // Same-document hash navigation must keep the same published inventory.
+    let switched = page
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":"location.hash = '#/account_label'; true","returnByValue":true})),
+            Some(&page.page_session_id),
+        )
+        .await
+        .unwrap();
+    assert_eq!(switched["result"]["value"], json!(true));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after = observation::enumerate_semantic_frames(
+        &page.client,
+        &page.page_session_id,
+        &HashMap::new(),
+        &operation,
+    )
+    .await
+    .unwrap();
+    assert_eq!(after.frames.len(), 1);
+    assert_eq!(after.opaque_frame_roots.len(), 3);
+    let after_opaque: HashSet<String> = after.opaque_frame_roots.iter().cloned().collect();
+    let geometry = GeometrySnapshot::capture_excluding_opaque(
+        &page.client,
+        &page.page_session_id,
+        &after.frames,
+        &after_opaque,
+        &operation,
+    )
+    .await
+    .unwrap();
+    geometry.revalidate(&page.client, &operation).await.unwrap();
+    drop(cancel);
+    owner.close().await.unwrap();
 }
