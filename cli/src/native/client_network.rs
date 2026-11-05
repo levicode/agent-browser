@@ -3218,7 +3218,8 @@ impl ClientNetwork {
 
     /// Scope-owned callbacks are decided in the remaining budget of the live
     /// client operation that can be blocked on them. A background callback has
-    /// no outer operation and keeps the fixed decision policy window.
+    /// no outer operation and keeps the fixed decision policy window, and a
+    /// shorter outer operation never shrinks that window below the policy.
     fn callback_decision_timeout_ms(&self) -> u64 {
         self.broker
             .callback_decision_timeout_ms(self.scope.generation, &self.scope.identity_scope)
@@ -6283,14 +6284,14 @@ mod bridge_tests {
         server.abort();
     }
 
-    /// An outer budget below the old 30s window now bounds the decision too.
+    /// A shorter outer budget never removes the fixed decision policy floor.
     #[tokio::test]
-    async fn callback_decision_window_shrinks_below_the_fixed_policy() {
+    async fn callback_decision_window_keeps_the_fixed_floor_below_a_shorter_outer_budget() {
         let (network, mut events, _commands, server) = fixture().await;
         let scope = network.scope.identity_scope.clone();
         network
             .broker
-            .admit_callback_capped(1, 1, 5_000, None, Ok(None), Some(&scope))
+            .admit_callback_capped(1, 1, 1_000, None, Ok(None), Some(&scope))
             .unwrap();
         assert!(network.broker.start(1, 1).unwrap());
         network
@@ -6303,9 +6304,13 @@ mod bridge_tests {
         let (name, _payload, notice) = next_event(&mut events).await;
         assert_eq!(name, "dialog.opened");
         let notice = notice.expect("dialog decision");
+        // A 1s operation whose settlement releases the callback reservation
+        // must not expire the decision first: that loss quarantined the scope
+        // after a login redirect tap.
         assert!(
-            notice.timeout_ms <= 5_000 && notice.timeout_ms > 4_000,
-            "dialog notice {} did not follow the 5s outer operation",
+            notice.timeout_ms > DEFAULT_DECISION_TIMEOUT_MS - 1_000
+                && notice.timeout_ms <= DEFAULT_DECISION_TIMEOUT_MS,
+            "dialog notice {} shrank below the fixed policy for a 1s operation",
             notice.timeout_ms
         );
         network.close().await.unwrap();

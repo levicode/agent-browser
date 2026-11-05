@@ -804,6 +804,13 @@ impl ClientSession {
     /// pending decision. A background callback has no outer operation and keeps
     /// [`DEFAULT_DECISION_TIMEOUT_MS`]. The longest live root operation wins so
     /// a callback is never cut off before the operation still waiting on it.
+    ///
+    /// The window never shrinks below [`DEFAULT_DECISION_TIMEOUT_MS`]. A short
+    /// outer operation can be the exact owner whose settlement releases the
+    /// callback's UI reservation, so copying its remaining budget expires the
+    /// decision at the instant the reservation becomes available and
+    /// quarantines the scope. Shrinking only removed budget the fixed policy
+    /// already granted; the floor restores that budget without inventing more.
     pub(crate) fn callback_decision_timeout_ms(
         &self,
         generation: u64,
@@ -827,6 +834,7 @@ impl ClientSession {
             .map(|remaining| {
                 u64::try_from(remaining.as_millis())
                     .unwrap_or(MAX_TIMEOUT_MS)
+                    .max(DEFAULT_DECISION_TIMEOUT_MS)
                     .clamp(1, MAX_TIMEOUT_MS)
             })
     }
@@ -3886,9 +3894,12 @@ mod tests {
         let _child = broker
             .admit_callback_capped(1, 2, 90_000, Some(&decision.token), Ok(None), Some("scope"))
             .unwrap();
-        assert_eq!(
-            broker.callback_decision_timeout_ms(1, "scope"),
-            Some(window)
+        // Wall time advances between the two reads, so compare within a
+        // millisecond instead of an exact count.
+        let later = broker.callback_decision_timeout_ms(1, "scope").unwrap();
+        assert!(
+            later <= window && window - later <= 2,
+            "{window} then {later}"
         );
         // Settlement removes the outer operation and restores the fixed policy.
         broker.settle(1, 1, Effects::NotDispatched).unwrap();
@@ -3897,14 +3908,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn callback_decision_window_shrinks_with_a_smaller_outer_budget() {
+    async fn callback_decision_window_keeps_the_fixed_floor_for_a_short_outer_operation() {
         let broker = ClientSession::new();
         let outer = broker
-            .admit_callback_capped(1, 1, 10_000, None, Ok(None), Some("scope"))
+            .admit_callback_capped(1, 1, 1_000, None, Ok(None), Some("scope"))
             .unwrap();
         assert!(broker.start(1, 1).unwrap());
         let window = broker.callback_decision_timeout_ms(1, "scope").unwrap();
-        assert!(window <= 10_000 && window > 9_000, "{window}");
+        // A short operation must not shrink the decision below the fixed policy.
+        assert!(
+            window >= DEFAULT_DECISION_TIMEOUT_MS && window < DEFAULT_DECISION_TIMEOUT_MS + 1_000,
+            "{window}"
+        );
         let lease = broker
             .decision_scoped(
                 1,
@@ -3915,8 +3930,9 @@ mod tests {
                 Some("scope".into()),
             )
             .unwrap();
-        // The decision expires with the outer operation, not at the old 30s floor.
-        assert!(lease.deadline <= outer.deadline + Duration::from_millis(5));
+        // The decision outlives the operation that supplied the budget, so the
+        // callback can still be admitted after that operation settles.
+        assert!(lease.deadline > outer.deadline);
     }
 }
 
