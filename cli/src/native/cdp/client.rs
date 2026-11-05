@@ -1800,6 +1800,26 @@ impl CdpClient {
             method,
             params,
             session_id,
+            None,
+            &mut AdmissionObservation::default(),
+        )
+        .await
+    }
+    /// Reply wait bounded by the caller's operation budget instead of the
+    /// generic command default. A renderer may hold an acknowledgement while a
+    /// JavaScript dialog is open; the enclosing operation still owns the wait.
+    pub async fn send_command_until(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        reply_deadline: std::time::Instant,
+    ) -> Result<Value, String> {
+        self.send_command_observed(
+            method,
+            params,
+            session_id,
+            Some(reply_deadline),
             &mut AdmissionObservation::default(),
         )
         .await
@@ -1979,7 +1999,7 @@ impl CdpClient {
         session_id: Option<&str>,
     ) -> Result<Value, ActionCommandFailure> {
         let mut stop = AdmissionObservation::requested();
-        self.send_command_observed(method, params, session_id, &mut stop)
+        self.send_command_observed(method, params, session_id, None, &mut stop)
             .await
             .map_err(|_message| ActionCommandFailure {
                 #[cfg(test)]
@@ -2044,6 +2064,7 @@ impl CdpClient {
             Some(params),
             Some(session),
             reservation,
+            None,
             &mut stop,
         )
         .await
@@ -2062,6 +2083,7 @@ impl CdpClient {
         method: &str,
         params: Option<Value>,
         session_id: Option<&str>,
+        reply_deadline: Option<std::time::Instant>,
         stop: &mut AdmissionObservation,
     ) -> Result<Value, String> {
         let reservation =
@@ -2073,7 +2095,14 @@ impl CdpClient {
             reservation.as_ref().map(|_| ()).map_err(String::as_str),
         );
         let result = self
-            .send_reserved_command_observed(method, params, session_id, reservation?, stop)
+            .send_reserved_command_observed(
+                method,
+                params,
+                session_id,
+                reservation?,
+                reply_deadline,
+                stop,
+            )
             .await;
         #[cfg(test)]
         self.activation_command_diagnostic(
@@ -2639,6 +2668,7 @@ impl CdpClient {
             params,
             session_id,
             reservation,
+            None,
             &mut AdmissionObservation::default(),
         )
         .await
@@ -2649,6 +2679,7 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
         reservation: Option<CommandReservation>,
+        reply_deadline: Option<std::time::Instant>,
         stop: &mut AdmissionObservation,
     ) -> Result<Value, String> {
         if reservation
@@ -2673,6 +2704,7 @@ impl CdpClient {
                 session_id,
                 reservation,
                 None,
+                reply_deadline,
                 stop,
             ),
         )
@@ -2736,10 +2768,12 @@ impl CdpClient {
             session_id,
             reservation,
             cleanup_owner,
+            None,
             &mut AdmissionObservation::default(),
         )
         .await
     }
+    #[allow(clippy::too_many_arguments)]
     async fn send_reserved_command_bound_observed(
         &self,
         method: &str,
@@ -2747,6 +2781,7 @@ impl CdpClient {
         session_id: Option<&str>,
         reservation: Option<CommandReservation>,
         cleanup_owner: Option<(Option<Arc<OwnerDebtLedger>>, std::time::Instant)>,
+        reply_deadline: Option<std::time::Instant>,
         stop: &mut AdmissionObservation,
     ) -> Result<Value, String> {
         let response = self
@@ -2759,7 +2794,8 @@ impl CdpClient {
                 stop,
             )
             .await?;
-        self.await_command_response(method, response, None).await
+        self.await_command_response(method, response, reply_deadline)
+            .await
     }
 
     async fn submit_reserved_command_bound(

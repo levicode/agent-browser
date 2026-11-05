@@ -343,11 +343,19 @@ async fn command(
     method: &str,
     args: Value,
 ) -> Result<Value, ProtocolError> {
-    bounded(
-        page,
-        op,
-        page.client.send_command(method, Some(args), session),
-    )
+    // A renderer holds an input acknowledgement while a JavaScript dialog is
+    // open. Bound that reply wait by this operation's remaining budget instead
+    // of the generic command default; `bounded` still applies the same absolute
+    // deadline. Other page commands keep their existing default.
+    bounded(page, op, async {
+        if method.starts_with("Input.") {
+            page.client
+                .send_command_until(method, Some(args), session, op.deadline)
+                .await
+        } else {
+            page.client.send_command(method, Some(args), session).await
+        }
+    })
     .await
 }
 #[derive(Deserialize)]

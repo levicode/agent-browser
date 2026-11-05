@@ -16,6 +16,9 @@ use super::client_protocol::{
 const MAX_OPERATIONS: usize = 64;
 const MAX_DECISIONS: usize = 256;
 const MAX_REGISTRIES: usize = 256;
+/// Fixed decision policy for a callback with no live outer client operation.
+/// A callback decided while an operation runs follows its remaining budget.
+pub(crate) const DEFAULT_DECISION_TIMEOUT_MS: u64 = 30_000;
 
 #[path = "client_operation_lease.rs"]
 mod operation_lease;
@@ -125,6 +128,9 @@ struct Operation {
     callback_depth: usize,
     deadline: Instant,
     started: bool,
+    /// Exact client identity scope captured from the request that admitted it.
+    /// Scope-owned callbacks follow this operation's remaining budget.
+    identity_scope: Option<String>,
     cancel: watch::Sender<CancelSignal>,
 }
 
@@ -506,6 +512,7 @@ impl ClientSession {
                 callback_depth: 0,
                 deadline,
                 started: false,
+                identity_scope: Some(scope.to_owned()),
                 cancel,
             },
         );
@@ -676,7 +683,14 @@ impl ClientSession {
         timeout_ms: u64,
         callback_token: Option<&str>,
     ) -> Result<OperationLease, ProtocolError> {
-        self.admit_callback_capped(generation, sequence, timeout_ms, callback_token, Ok(None))
+        self.admit_callback_capped(
+            generation,
+            sequence,
+            timeout_ms,
+            callback_token,
+            Ok(None),
+            None,
+        )
     }
 
     /// A retained native lifecycle may shorten a later RPC to its original
@@ -691,6 +705,7 @@ impl ClientSession {
         timeout_ms: u64,
         callback_token: Option<&str>,
         deadline_cap: Result<Option<Instant>, ProtocolError>,
+        identity_scope: Option<&str>,
     ) -> Result<OperationLease, ProtocolError> {
         let mut inner = self.lock()?;
         Self::check(&inner, generation)?;
@@ -770,6 +785,7 @@ impl ClientSession {
                 callback_depth,
                 deadline,
                 started: false,
+                identity_scope: identity_scope.map(str::to_owned),
                 cancel,
             },
         );
@@ -780,6 +796,39 @@ impl ClientSession {
             deadline,
             cancellation,
         })
+    }
+
+    /// Scope-owned route/auth/dialog decisions follow the remaining budget of
+    /// the live client operation that can be blocked on them. Nested callback
+    /// children never supply this budget: they are already capped by their own
+    /// pending decision. A background callback has no outer operation and keeps
+    /// [`DEFAULT_DECISION_TIMEOUT_MS`]. The longest live root operation wins so
+    /// a callback is never cut off before the operation still waiting on it.
+    pub(crate) fn callback_decision_timeout_ms(
+        &self,
+        generation: u64,
+        identity_scope: &str,
+    ) -> Option<u64> {
+        let inner = self.lock().ok()?;
+        if inner.generation != generation || identity_scope.is_empty() {
+            return None;
+        }
+        let now = Instant::now();
+        inner
+            .operations
+            .values()
+            .filter(|operation| {
+                operation.started
+                    && operation.callback_token.is_none()
+                    && operation.identity_scope.as_deref() == Some(identity_scope)
+            })
+            .filter_map(|operation| operation.deadline.checked_duration_since(now))
+            .max()
+            .map(|remaining| {
+                u64::try_from(remaining.as_millis())
+                    .unwrap_or(MAX_TIMEOUT_MS)
+                    .clamp(1, MAX_TIMEOUT_MS)
+            })
     }
 
     /// Called immediately before entering an action, not when dequeued earlier.
@@ -3805,6 +3854,69 @@ mod tests {
             background.outcome.await.unwrap(),
             DecisionOutcome::Selected(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn callback_decision_window_follows_the_live_outer_operation() {
+        let broker = ClientSession::new();
+        // No live operation: the fixed policy window remains the bound.
+        assert_eq!(broker.callback_decision_timeout_ms(1, "scope"), None);
+        let outer = broker
+            .admit_callback_capped(1, 1, 60_000, None, Ok(None), Some("scope"))
+            .unwrap();
+        // A queued operation that has not started never supplies callback budget.
+        assert_eq!(broker.callback_decision_timeout_ms(1, "scope"), None);
+        assert!(broker.start(1, 1).unwrap());
+        let window = broker.callback_decision_timeout_ms(1, "scope").unwrap();
+        assert!(window > 30_000 && window <= 60_000, "{window}");
+        // The window is scope-exact; a sibling scope never supplies it.
+        assert_eq!(broker.callback_decision_timeout_ms(1, "other-scope"), None);
+        // A nested callback child is capped by its own pending decision and can
+        // neither replace nor enlarge the outer operation's budget.
+        let decision = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Dialog,
+                5_000,
+                None,
+                Some("scope".into()),
+            )
+            .unwrap();
+        let _child = broker
+            .admit_callback_capped(1, 2, 90_000, Some(&decision.token), Ok(None), Some("scope"))
+            .unwrap();
+        assert_eq!(
+            broker.callback_decision_timeout_ms(1, "scope"),
+            Some(window)
+        );
+        // Settlement removes the outer operation and restores the fixed policy.
+        broker.settle(1, 1, Effects::NotDispatched).unwrap();
+        assert_eq!(broker.callback_decision_timeout_ms(1, "scope"), None);
+        assert!(outer.deadline > std::time::Instant::now());
+    }
+
+    #[tokio::test]
+    async fn callback_decision_window_shrinks_with_a_smaller_outer_budget() {
+        let broker = ClientSession::new();
+        let outer = broker
+            .admit_callback_capped(1, 1, 10_000, None, Ok(None), Some("scope"))
+            .unwrap();
+        assert!(broker.start(1, 1).unwrap());
+        let window = broker.callback_decision_timeout_ms(1, "scope").unwrap();
+        assert!(window <= 10_000 && window > 9_000, "{window}");
+        let lease = broker
+            .decision_scoped(
+                1,
+                DecisionOwner::Scope,
+                DecisionKind::Dialog,
+                window,
+                None,
+                Some("scope".into()),
+            )
+            .unwrap();
+        // The decision expires with the outer operation, not at the old 30s floor.
+        assert!(lease.deadline <= outer.deadline + Duration::from_millis(5));
     }
 }
 
