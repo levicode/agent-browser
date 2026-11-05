@@ -151,6 +151,8 @@ fn raster_png_dimensions_and_truncated_or_invalid_header_contract() {
         secure_nodes: Vec::new(),
         count: 0,
         masks: Vec::new(),
+        uninspected: Vec::new(),
+        uninspected_total: 0,
     };
     let result = raster_mask(&bytes, viewport, &proof, "png-fixture").unwrap();
     assert_eq!((result.width, result.height), (2, 2));
