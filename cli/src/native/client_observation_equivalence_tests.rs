@@ -1538,3 +1538,136 @@ async fn chromium_raw_role_engine_matches_typed_bodies_and_root_rules() {
     browser.close().await.unwrap();
     result.unwrap();
 }
+
+/// The raw internal leaf engines and Playwright's capture rewrite against a
+/// real Chromium page. The frozen e2e#55 ledger supplies the oracle for these
+/// shapes (internal:text/has-text/has-not-text/label/attr/testid/role and a
+/// capture before the last part); this gate pins the same semantics in the
+/// native repository, including the internal:role substring rewrite and the
+/// refusal rules that stay local.
+#[tokio::test]
+#[ignore = "hosted Chromium: internal leaf engines and non-final capture"]
+async fn chromium_raw_internal_engines_and_non_final_capture() {
+    async fn matched(
+        browser: &BrowserManager,
+        frames: &[ObservationFrame],
+        refs: &mut RefMap,
+        op: &OperationLease,
+        selector: &str,
+    ) -> Result<Vec<String>, ObservationError> {
+        let options: QueryOptions = serde_json::from_value(json!({
+            "expression": {"kind": "selector", "selector": selector}
+        }))
+        .unwrap();
+        let result = query(
+            &browser.client,
+            frames,
+            refs,
+            "raw-internal",
+            1,
+            &options,
+            op,
+        )
+        .await?;
+        Ok(result
+            .nodes
+            .into_iter()
+            .map(|node| node.test_id.unwrap_or_default())
+            .collect())
+    }
+    let mut browser = BrowserManager::launch(Default::default(), None)
+        .await
+        .unwrap();
+    let result = async {
+        let session = browser.active_session_id()?;
+        evaluate_on(
+            &browser.client,
+            session,
+            r#"(() => {
+                document.body.innerHTML = [
+                    '<p data-testid="p-alpha">Alpha Beta</p>',
+                    '<p data-testid="p-inner"><span data-testid="s-inner">Alpha inner</span></p>',
+                    '<ul data-testid="list">',
+                    '  <li data-testid="li-1">Alpha one</li>',
+                    '  <li data-testid="li-2">Beta two</li>',
+                    '  <li data-testid="li-3">Gamma three</li>',
+                    '</ul>',
+                    '<section data-testid="sec-a"><span data-testid="span-a">Alpha</span></section>',
+                    '<section data-testid="sec-b"><span data-testid="span-b">Beta</span></section>',
+                    '<button data-testid="btn-save">Save</button>',
+                    '<button data-testid="btn-save-draft">Save draft</button>',
+                    '<div data-testid="btn-custom" role="button" aria-label="Save">custom save</div>',
+                    '<input data-testid="btn-submit" type="submit" value="Save">',
+                    '<div data-testid="div-title" title="Alpha title">has title</div>',
+                    '<span data-testid="x">test id x</span>',
+                    '<label data-testid="label-alpha" for="labelled-input">Alpha label text</label>',
+                    '<input id="labelled-input" data-testid="labelled-input">',
+                    '<span id="by-label" data-testid="by-label">Alpha by label</span>',
+                    '<input data-testid="labelledby-input" aria-labelledby="by-label">',
+                ].join('');
+                return true;
+            })()"#,
+        )
+        .await?;
+        let (op, _tx) = operation();
+        let inventory = frames(&browser, &op).await;
+        let mut refs = RefMap::new();
+        let cases: &[(&str, &[&str])] = &[
+            (r#"internal:text="Alpha inner""#, &["s-inner"]),
+            (r#"internal:text="Alpha""#, &["span-a"]),
+            (r#"css=li >> internal:has-text="Alpha one""#, &["li-1"]),
+            (r#"css=li >> internal:has-text="alpha"i"#, &["li-1"]),
+            (
+                r#"css=li >> internal:has-not-text="beta"i"#,
+                &["li-1", "li-3"],
+            ),
+            (
+                r#"internal:label="Alpha label text""#,
+                &["labelled-input"],
+            ),
+            (r#"internal:label="Alpha by label""#, &["labelledby-input"]),
+            (r#"internal:attr=[title="Alpha title"i]"#, &["div-title"]),
+            (r#"internal:testid=[data-testid="x"s]"#, &["x"]),
+            (
+                r#"internal:role=button[name="Save"]"#,
+                &["btn-save", "btn-custom", "btn-submit"],
+            ),
+            // internal:role keeps the pinned internal name rewrite: a
+            // case-insensitive `=` becomes a substring test, unlike `role=`.
+            (
+                r#"internal:role=button[name="av"i]"#,
+                &["btn-save", "btn-save-draft", "btn-custom", "btn-submit"],
+            ),
+            (r#"role=button[name="av"i]"#, &[]),
+            // A capture before the last part is the captured prefix plus an
+            // internal:has over the tail, not an invalid locator.
+            (r#"*css=section >> css=span"#, &["sec-a", "sec-b"]),
+            (r#"*css=li >> css=span"#, &[]),
+            (r#"css=section >> *text=Alpha >> css=span"#, &[]),
+            (r#"css=section >> *css=span"#, &["span-a", "span-b"]),
+        ];
+        for (selector, expected) in cases {
+            let actual = matched(&browser, &inventory, &mut refs, &op, selector)
+                .await
+                .map_err(|error| format!("{selector}: {error:?}"))?;
+            let expected: Vec<String> = expected.iter().map(|id| (*id).to_string()).collect();
+            assert_eq!(actual, expected, "{selector}");
+        }
+        for selector in [
+            r#"*css=li >> nth=0"#,
+            r#"*css=section >> *css=span"#,
+            r#"internal:control=enter-frame"#,
+        ] {
+            assert!(
+                matched(&browser, &inventory, &mut refs, &op, selector)
+                    .await
+                    .is_err(),
+                "{selector}"
+            );
+        }
+        Ok::<(), String>(())
+    }
+    .await;
+    browser.close().await.unwrap();
+    result.unwrap();
+}

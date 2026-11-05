@@ -62,7 +62,7 @@ function compilePublicProjection(x) {
 function evaluatePublicProjection(x, scope = all, root = document) {
   matcherStep();
   switch (x.kind) {
-    case 'selector': return selectChain(x.nativeParts, scope, root);
+    case 'selector': return selectChain(rawSelectorEntryParts(x), scope, root);
     case 'query': {
       const roots = x.scope ? evaluatePublicProjection(x.scope, scope, root) : null;
       const candidates = roots ? scope.filter(i => roots.some(parent => contains(parent, i))) : scope;

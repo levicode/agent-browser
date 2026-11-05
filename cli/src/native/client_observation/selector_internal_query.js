@@ -7,7 +7,7 @@ const rawInternalSelectorUnsupported = {};
 const rawInternalEngines = new Set(['internal:has', 'internal:has-not', 'internal:and', 'internal:or', 'internal:chain']);
 const rawInternalCompiledParts = new WeakSet();
 const rawInternalCompiledCache = new WeakMap();
-const rawInternalPlainEngines = new Set(['css', 'css:light', 'xpath', 'xpath:light', 'nth', 'visible', 'text', 'text:light', 'role', 'id', 'id:light', 'data-testid', 'data-testid:light', 'data-test-id', 'data-test-id:light', 'data-test', 'data-test:light']);
+const rawInternalPlainEngines = new Set(['css', 'css:light', 'xpath', 'xpath:light', 'nth', 'visible', 'text', 'text:light', 'role', 'internal:text', 'internal:has-text', 'internal:has-not-text', 'internal:label', 'internal:attr', 'internal:testid', 'internal:role', 'id', 'id:light', 'data-testid', 'data-testid:light', 'data-test-id', 'data-test-id:light', 'data-test', 'data-test:light']);
 function rawInternalCharge(source) {
   if (typeof source !== 'string') throw rawInternalSelectorError;
   let bytes = 0;
@@ -222,4 +222,71 @@ function evaluateRawInternalPart(part, roots, scope, originalRoot, depth = 0) {
     } else if (Boolean(matches.length) === (part.engine === 'internal:has')) found.add(root);
   }
   return [...found];
+}
+
+// Playwright 1.64.1 InjectedScript.querySelectorAll capture branch. A capture
+// that is not the last part is not a separate engine: the captured part ends
+// the prefix and the authored tail becomes an internal:has body, exactly as
+// the pinned rewrite does. The nested body is serialized back to authored
+// source because the adapter's has compiler reads JSON source, not a parsed
+// AST; every part keeps its engine name and authored body.
+function rawSelectorEntryParts(x) {
+  const parts = x.nativeParts;
+  const capture = x.nativeCapture;
+  if (capture === undefined || capture === null) return parts;
+  const tail = parts.slice(capture + 1);
+  if (!tail.length) return parts.slice(0, capture + 1);
+  let source = '';
+  for (const part of tail) source += (source ? ' >> ' : '') + part.engine + '=' + part.body;
+  return [...parts.slice(0, capture + 1), { engine: 'internal:has', body: JSON.stringify(source) }];
+}
+
+// Playwright 1.64.1 createAttributeMatcher: a regexp tests the value, an exact
+// case-sensitive part compares it, and every other part is a case-insensitive
+// substring test. Reached only after the CSS name/attribute lookup, so the
+// value is always a string.
+function rawAttributeMatcher(attribute, refusal) {
+  const { value, caseSensitive } = attribute;
+  if (value instanceof RegExp) {
+    return actual => { value.lastIndex = 0; return !!actual.match(value); };
+  }
+  if (caseSensitive) return actual => actual === value;
+  if (typeof value !== 'string') throw refusal;
+  const lowerCaseValue = value.toLowerCase();
+  return actual => actual.toLowerCase().includes(lowerCaseValue);
+}
+
+// Playwright 1.64.1 getElementLabels without the optional skipRefsInsideElement
+// mode the label engine does not pass: aria-labelledby, then a non-empty
+// aria-label, then the native labels list for labelable controls. Text facts
+// reuse the bounded raw text acquisition, so a protected label is unavailable
+// instead of being invented.
+function rawElementLabels(element) {
+  matcherStep();
+  const labelledBy = roleGetAriaLabelledByElements(element);
+  if (labelledBy) {
+    const facts = [];
+    for (const label of labelledBy) {
+      const value = rawTextFacts(label);
+      if (value !== null) facts.push(value);
+    }
+    return facts;
+  }
+  const ariaLabel = element.getAttribute('aria-label');
+  if (ariaLabel !== null && !!ariaLabel.trim()) {
+    return [{ full: ariaLabel, normalized: roleNormalizeWhiteSpace(ariaLabel), immediate: [ariaLabel] }];
+  }
+  const isNonHiddenInput = element.nodeName === 'INPUT' && element.type !== 'hidden';
+  if (['BUTTON', 'METER', 'OUTPUT', 'PROGRESS', 'SELECT', 'TEXTAREA'].includes(element.nodeName) || isNonHiddenInput) {
+    const labels = element.labels;
+    if (labels) {
+      const facts = [];
+      for (const label of labels) {
+        const value = rawTextFacts(label);
+        if (value !== null) facts.push(value);
+      }
+      return facts;
+    }
+  }
+  return [];
 }

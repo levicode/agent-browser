@@ -55,9 +55,9 @@ function rawElementTextMatch(element, matcher) {
   }
   return 'self';
 }
-function selectRawText(root, body, light, allowed) {
+function selectRawText(root, body, light, allowed, internal = false) {
   let compiled;
-  try { compiled = compileSelectorTextMatcher(body, false); } catch { throw rawTextSelectorError; }
+  try { compiled = compileSelectorTextMatcher(body, internal); } catch { throw rawTextSelectorError; }
   const { matcher, kind } = compiled;
   const result = [];
   let lastDidNotMatchSelf = null;
@@ -66,7 +66,7 @@ function selectRawText(root, body, light, allowed) {
     if (kind === 'lax' && lastDidNotMatchSelf && lastDidNotMatchSelf.contains(element)) return;
     const matches = rawElementTextMatch(element, matcher);
     if (matches === 'none') lastDidNotMatchSelf = element;
-    if (matches === 'self' || (matches === 'selfAndChildren' && kind === 'strict')) result.push(element);
+    if (matches === 'self' || (matches === 'selfAndChildren' && kind === 'strict' && !internal)) result.push(element);
   };
   const rootIndex = root.nodeType === 1 ? selectorIndex.get(root) : undefined;
   if (rootIndex !== undefined && allowed.has(rootIndex)) append(root);

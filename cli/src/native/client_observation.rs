@@ -3328,7 +3328,7 @@ const MATCH_QUERY: &str = concat!(
     r#"
  function evaluate(x,scope=all,root=document) {
   switch(x.kind) {
-   case 'selector': return selectChain(x.nativeParts,scope,root);
+   case 'selector': return selectChain(rawSelectorEntryParts(x),scope,root);
    case 'query': {
     const roots=x.scope?evaluate(x.scope,scope,root):null;
     let candidates=roots?scope.filter(i=>roots.some(root=>contains(root,i))):scope;
@@ -5011,11 +5011,11 @@ async fn enumerate_frames_impl(
 }
 
 /// Parse selector syntax without dispatch or native request reclassification.
-fn parse_selector(source: &str) -> Result<Vec<selector::Part<'_>>, ObservationError> {
+fn parse_selector(source: &str) -> Result<selector::Parsed<'_>, ObservationError> {
     if source.is_empty() {
         return Err(ObservationError::InvalidArguments);
     }
-    selector::parse(source).map_err(|error| match error {
+    selector::parse_with_capture(source).map_err(|error| match error {
         selector::ParseError::Invalid => ObservationError::InvalidLocator,
         selector::ParseError::TrailingSyntax => ObservationError::BackendFailure,
         selector::ParseError::Unsupported => ObservationError::UnsupportedCapability,
@@ -5030,12 +5030,20 @@ fn compile_selector_expression(expression: &LocatorExpression) -> Result<Value, 
         if value["kind"] == "selector" {
             let selector = value["selector"]
                 .as_str()
-                .ok_or(ObservationError::InvalidArguments)?;
-            let parts = parse_selector(selector)?
+                .ok_or(ObservationError::InvalidArguments)?
+                .to_owned();
+            let parsed = parse_selector(&selector)?;
+            let parts = parsed
+                .parts
                 .into_iter()
                 .map(|part| json!({"engine": part.engine, "body": part.body}))
                 .collect::<Vec<_>>();
             value["nativeParts"] = json!(parts);
+            // The renderer performs Playwright's capture rewrite: the captured
+            // part ends the prefix and a following tail becomes internal:has.
+            if let Some(capture) = parsed.capture {
+                value["nativeCapture"] = json!(capture);
+            }
         }
         for key in ["source", "scope", "has", "left", "right"] {
             if let Some(child) = value.get_mut(key) {
