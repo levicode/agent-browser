@@ -613,3 +613,29 @@ async fn continuation_rejected_original_cleanup_has_no_offer() {
     peer.await.unwrap();
     drop(readonly_replies);
 }
+
+#[tokio::test]
+async fn trace_cleanup_failure_is_contained_as_trace_local_loss() {
+    let s = settled(Race::AttachOtherTwice).await;
+    let journal = s
+        .ledger
+        .operation(
+            OperationKey {
+                generation: 1,
+                operation_seq: 1,
+            },
+            "target".into(),
+            "session".into(),
+        )
+        .unwrap();
+    let outcome = crate::native::client_transport::NativeOutcome {
+        result: Ok(json!({})),
+        effects: Effects::Completed,
+        retention: None,
+    };
+    let (outcome, dirty) = settle_trace_screenshot(outcome, true, true, &journal);
+    assert!(!dirty);
+    assert_eq!(outcome.effects, Effects::NotDispatched);
+    assert_eq!(outcome.result, Err(ProtocolError::StaleReference));
+    s.finish().await;
+}
